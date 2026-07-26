@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -53,7 +54,7 @@ class _IndexStub:
 
 class StrictProjectIndexWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
-        scratch = Path("D:/bun/tmp/codex/bugkiller-plugin/strict-workflow-tests")
+        scratch = Path(os.environ["CODEX_TASK_TEMP"]) / "strict-workflow"
         scratch.mkdir(parents=True, exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self.directory.cleanup)

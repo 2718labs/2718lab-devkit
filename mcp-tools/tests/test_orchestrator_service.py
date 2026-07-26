@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -25,9 +26,9 @@ from orchestrator.store import SQLiteStore  # noqa: E402
 
 class OrchestratorServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(
-            dir="D:/bun/tmp/codex/bugkiller-plugin/orch-03-card"
-        )
+        scratch_root = Path(os.environ["CODEX_TASK_TEMP"]) / "orchestrator-service"
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        self.tempdir = tempfile.TemporaryDirectory(dir=scratch_root)
         self.store = SQLiteStore(Path(self.tempdir.name) / "orchestrator.sqlite")
         self.service = OrchestratorService(self.store)
         self.addCleanup(self.tempdir.cleanup)

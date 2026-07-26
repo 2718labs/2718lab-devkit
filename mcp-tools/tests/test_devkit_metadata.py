@@ -31,8 +31,11 @@ class DevKitMetadataTests(unittest.TestCase):
         forbidden = {
             "private marketplace": "pidan" + "-local-plugins",
             "task scratch root": "D:" + "\\bun\\tmp",
+            "task scratch root (slash)": "D:" + "/bun/tmp",
             "long-term source checkout": "G:" + "\\2718lab",
+            "long-term source checkout (slash)": "G:" + "/2718lab",
             "private home profile": "C:" + "\\Users\\pidan",
+            "private home profile (slash)": "C:" + "/Users/pidan",
             "private key block": "-----BEGIN " + "PRIVATE KEY-----",
             "obsolete public repo owner": "https://github.com/2718lab" + "/",
         }

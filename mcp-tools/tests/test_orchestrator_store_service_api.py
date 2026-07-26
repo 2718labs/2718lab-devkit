@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import sys
 import tempfile
@@ -24,9 +25,7 @@ from orchestrator.store import (
 
 class SQLiteStoreServiceApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        scratch_root = Path(
-            "D:/bun/tmp/codex/bugkiller-plugin/orchestrator-store-tests"
-        )
+        scratch_root = Path(os.environ["CODEX_TASK_TEMP"]) / "orchestrator-store"
         scratch_root.mkdir(parents=True, exist_ok=True)
         self._temporary_directory = tempfile.TemporaryDirectory(dir=scratch_root)
         self._database = Path(self._temporary_directory.name) / "orchestrator.sqlite"

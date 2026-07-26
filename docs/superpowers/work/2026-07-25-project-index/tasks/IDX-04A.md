@@ -10,8 +10,8 @@ must change for the index-first team model.
 
 ## Context
 
-- Use a fresh self-index database below
-  `D:/bun/tmp/codex/bugkiller-plugin/routing-audit`.
+- Use a fresh self-index database in the task-scoped temporary root's
+  `routing-audit/` subdirectory.
 - Query only `skills/bugkiller`, `skills/work-methodology`, `agents`, and
   `README.md`.
 - Required policy: Luna/Terra for mechanical/read-only work; only a host-
