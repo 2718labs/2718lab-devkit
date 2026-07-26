@@ -83,3 +83,48 @@ def test_codex_plugin_repository_rejects_invalid_manifest_version() -> None:
 
     assert result.returncode == 1
     assert "[CODEX_VER]" in result.stdout
+
+
+def test_codex_plugin_accepts_v_prefixed_release_tag() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo = Path(temporary) / "2718lab-devkit"
+        (repo / ".codex-plugin").mkdir(parents=True)
+        write_common_release_files(repo)
+        (repo / ".codex-plugin" / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": "2718lab-devkit",
+                    "version": "0.2.0",
+                    "description": "Codex development toolkit.",
+                    "author": {"name": "2718lab"},
+                    "repository": "https://github.com/2718labs/2718lab-devkit",
+                    "license": "AGPL-3.0",
+                }
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        identity = [
+            "-c",
+            "user.name=2718lab",
+            "-c",
+            "user.email=2718lab@example.invalid",
+        ]
+        subprocess.run(
+            ["git", *identity, "commit", "-m", "initial"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", *identity, "tag", "-a", "v0.2.0", "-m", "v0.2.0"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        result = run_check(repo)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[TAG]" not in result.stdout

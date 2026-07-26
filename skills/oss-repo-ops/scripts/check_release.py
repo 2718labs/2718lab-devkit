@@ -307,15 +307,17 @@ def check_tag_consistency(repo: Path, version: str | None) -> None:
     if out.returncode != 0:
         return
     tags = [t.strip() for t in out.stdout.splitlines() if t.strip()]
+    bare = version[1:] if version.startswith("v") else version
+    accepted_tags = {bare, f"v{bare}"}
     if not tags:
         warn(
             "TAG",
             f"当前 HEAD 没有 tag —— 发版时记得 git tag {version} 并保持与 metadata.version 一致",
         )
-    elif version not in tags:
+    elif accepted_tags.isdisjoint(tags):
         warn(
             "TAG",
-            f"metadata.version={version} 不在 HEAD 的 tag {tags} 里 —— 三处版本(tag/Release/metadata)必须一致",
+            f"metadata.version={version} 与 HEAD 的 tag {tags} 不一致 —— 三处版本(tag/Release/metadata)必须一致",
         )
 
 
