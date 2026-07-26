@@ -1,0 +1,21 @@
+{
+  "name": "2718lab-devkit",
+  "version": "0.2.0",
+  "description": "2718lab 工程基础设施技能包，提供确定性项目索引、耐久任务编排、受控恢复，以及 AstrBot、MCP、Python 与开源交付规范。",
+  "author": {
+    "name": "2718lab",
+    "url": "https://github.com/2718labs"
+  },
+  "homepage": "https://github.com/2718labs/2718lab-devkit",
+  "repository": "https://github.com/2718labs/2718lab-devkit",
+  "license": "AGPL-3.0",
+  "keywords": [
+    "astrbot",
+    "mcp",
+    "fastmcp",
+    "python-engineering",
+    "open-source",
+    "chatbot-plugin",
+    "skills"
+  ]
+}

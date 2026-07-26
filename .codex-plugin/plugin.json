@@ -1,0 +1,42 @@
+{
+  "name": "2718lab-devkit",
+  "version": "0.2.0",
+  "description": "Codex engineering infrastructure for deterministic project intelligence, durable workflow orchestration, safe recovery, and reusable 2718lab engineering skills.",
+  "author": {
+    "name": "2718lab",
+    "url": "https://github.com/2718labs"
+  },
+  "homepage": "https://github.com/2718labs/2718lab-devkit",
+  "repository": "https://github.com/2718labs/2718lab-devkit",
+  "license": "AGPL-3.0",
+  "keywords": [
+    "astrbot",
+    "mcp",
+    "fastmcp",
+    "python-engineering",
+    "open-source",
+    "chatbot-plugin",
+    "skills"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "2718lab DevKit",
+    "shortDescription": "\u9879\u76ee\u667a\u80fd\u3001\u8010\u4e45\u7f16\u6392\u4e0e\u5de5\u7a0b\u4ea4\u4ed8\u5de5\u5177\u5305",
+    "longDescription": "面向 Codex 的工程基础设施插件，提供所有领域 Skill 共用的确定性项目索引、耐久任务编排、检查点、受控恢复与多 Agent 角色，以及 AstrBot、MCP、Python 和开源仓库工程规范。Bugkiller 是建立在共享底座上的专门缺陷工作流。",
+    "developerName": "2718lab",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Skills",
+      "MCP",
+      "Agents"
+    ],
+    "websiteURL": "https://github.com/2718labs/2718lab-devkit",
+    "defaultPrompt": [
+      "\u4e3a\u5f53\u524d\u4ed3\u5e93\u540c\u6b65\u9879\u76ee\u7d22\u5f15\uff0c\u67e5\u8be2\u8fd9\u6b21\u6539\u52a8\u7684\u5f71\u54cd\u8303\u56f4\uff0c\u5e76\u7ed9\u51fa\u6709\u6765\u6e90\u7684\u7ed3\u8bba\u3002",
+      "\u628a\u8fd9\u4e2a\u591a\u6b65\u9aa4\u5de5\u7a0b\u9700\u6c42\u6ce8\u518c\u4e3a\u8010\u4e45 DAG\uff0c\u6309\u5199\u5165\u8303\u56f4\u548c\u9a8c\u8bc1\u95e8\u7981\u6267\u884c\u3002",
+      "\u6309 2718lab \u89c4\u8303\u521b\u5efa\u6216\u8bc4\u5ba1\u4e00\u4e2a AstrBot \u63d2\u4ef6\u3001Python \u9879\u76ee\u6216 MCP \u670d\u52a1\u3002",
+      "\u4f7f\u7528 Bugkiller \u5bf9\u8fd9\u4e2a\u5df2\u590d\u73b0\u7f3a\u9677\u8fdb\u884c\u5206\u8bca\u3001\u4fee\u590d\u548c\u56de\u5f52\u9a8c\u8bc1\u3002"
+    ]
+  }
+}

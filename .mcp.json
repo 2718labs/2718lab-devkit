@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "2718lab-tools": {
+      "command": "python",
+      "args": ["mcp-tools/server.py"],
+      "cwd": ".",
+      "env_vars": [
+        "DEVKIT_HOME",
+        "BUGKILLER_HOME",
+        "PLUGIN_DATA",
+        "CODEX_HOME"
+      ]
+    }
+  }
+}

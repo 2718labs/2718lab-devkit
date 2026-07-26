@@ -1,0 +1,4 @@
+interface:
+  display_name: 2718lab DevKit
+  short_description: Shared engineering intelligence, orchestration, and delivery roles.
+  default_prompt: Use the shared engineering runtime and the smallest suitable 2718lab role for this task.

@@ -1,0 +1,30 @@
+{
+  "name": "2718lab-devkit",
+  "owner": {
+    "name": "2718labs",
+    "url": "https://github.com/2718labs"
+  },
+  "description": "2718lab engineering infrastructure for project intelligence, durable orchestration, and reusable engineering skills.",
+  "version": "0.2.0",
+  "plugins": [
+    {
+      "name": "2718lab-devkit",
+      "source": "./",
+      "description": "Deterministic project intelligence, durable workflow orchestration, shared Agent roles, and reusable engineering skills.",
+      "version": "0.2.0",
+      "author": {
+        "name": "2718labs",
+        "url": "https://github.com/2718labs"
+      },
+      "homepage": "https://github.com/2718labs/2718lab-devkit",
+      "repository": "https://github.com/2718labs/2718lab-devkit",
+      "license": "AGPL-3.0",
+      "keywords": [
+        "project-intelligence",
+        "workflow-orchestration",
+        "multi-agent",
+        "engineering"
+      ]
+    }
+  ]
+}

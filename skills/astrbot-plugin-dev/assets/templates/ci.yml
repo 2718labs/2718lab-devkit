@@ -1,0 +1,41 @@
+# 放到 .github/workflows/ci.yml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "check ."
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "format --check ."
+
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate metadata.yaml
+        run: |
+          python - <<'EOF'
+          import sys, yaml
+          meta = yaml.safe_load(open("metadata.yaml", encoding="utf-8"))
+          required = ["name", "desc", "version", "author"]
+          missing = [k for k in required if not isinstance(meta.get(k), str) or not meta[k]]
+          assert not missing, f"metadata.yaml 缺少必填字段: {missing}"
+          assert meta["name"].isidentifier(), "name 必须是合法 Python 标识符"
+          assert "repo" in meta, "团队规范要求填写 repo"
+          assert "astrbot_version" in meta, "团队规范要求声明 astrbot_version"
+          print("metadata.yaml OK")
+          EOF
+      - name: Check entry file
+        run: test -f main.py || test -f "$(python -c 'import yaml;print(yaml.safe_load(open("metadata.yaml"))["name"])').py"
+      - name: Check requirements installable
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt --dry-run; fi

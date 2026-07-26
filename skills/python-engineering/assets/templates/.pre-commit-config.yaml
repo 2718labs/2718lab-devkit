@@ -1,0 +1,14 @@
+# ruff(check + format)与 pyright 三个 hook。
+# rev 字段落地时用 `pre-commit autoupdate` 拉到最新,不要手填猜测的版本号。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: <pin-latest>              # 落地前跑一次 `uv run pre-commit autoupdate` 自动填入真实最新 tag
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: <pin-latest>              # 同上,autoupdate 后再提交
+    hooks:
+      - id: pyright

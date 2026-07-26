@@ -1,0 +1,63 @@
+[project]
+name = "2718lab-devkit"
+version = "0.2.0"
+description = "Engineering infrastructure for deterministic project intelligence, durable workflow orchestration, safe recovery, and reusable skills across Codex and Claude Code."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0"
+authors = [{ name = "2718lab" }]
+dependencies = [
+    "mcp>=1,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/2718labs/2718lab-devkit"
+Repository = "https://github.com/2718labs/2718lab-devkit"
+Issues = "https://github.com/2718labs/2718lab-devkit/issues"
+Changelog = "https://github.com/2718labs/2718lab-devkit/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0",
+    "pyright>=1.1",
+    "pytest>=8.0",
+    "pyyaml>=6.0",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+extend-exclude = [
+    "**/*.md",
+    "skills/astrbot-plugin-dev/assets/templates",
+    "skills/mcp-server-dev/assets/templates",
+    "skills/oss-repo-ops/assets/templates",
+    "skills/python-engineering/assets/templates",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+include = [
+    "mcp-tools/bugkiller",
+    "mcp-tools/orchestrator",
+    "mcp-tools/project_index",
+    "mcp-tools/server.py",
+]
+pythonVersion = "3.11"
+reportMissingImports = true
+
+[tool.pytest.ini_options]
+testpaths = [
+    "mcp-tools/tests",
+    "skills/oss-repo-ops/tests",
+    "skills/python-engineering/tests",
+    "skills/work-methodology/tests",
+]
+addopts = "-ra"

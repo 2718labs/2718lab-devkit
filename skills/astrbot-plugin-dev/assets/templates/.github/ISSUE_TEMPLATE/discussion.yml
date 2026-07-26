@@ -1,0 +1,165 @@
+name: '❓ 使用咨询 / 问题讨论'
+description: 提交咨询、排查思路或开放性讨论。
+title: '[Discussion] '
+labels: [ 'type/discussion' ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您抽出时间发起讨论！如果您暂时不能确定这是否是插件 Bug，或者希望先进行使用咨询、兼容性排查、方案讨论，都可以使用该模板。
+
+  - type: textarea
+    attributes:
+      label: 你想实现什么？
+      description: 请描述你的目标、预期效果，或你当前想确认的问题。
+      placeholder: >
+        如: 我希望插件在满足某个条件后自动发送消息，但当前不确定是配置问题、平台限制还是插件行为如此。
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 当前实际情况
+      description: 请描述你目前观察到的现象、输出结果或不符合预期的行为。
+      placeholder: >
+        如: 插件已经加载成功，但没有按预期触发；后台没有明显报错，只能看到部分调试日志。
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 你已经尝试过哪些方法？
+      description: 请简要说明你已经做过的排查、对照或临时处理方式。
+      placeholder: >
+        如: 已检查配置项、重启 AstrBot、切换适配器环境、提高日志等级、对照 README 重新配置。
+    validations:
+      required: true
+
+  - type: dropdown
+    attributes:
+      label: 你目前对问题性质的判断
+      description: 这有助于我们更快判断后续应继续讨论、补文档，还是转为 Bug。
+      options:
+        - '不确定，想先确认是否为预期行为'
+        - '可能是插件 Bug，但还不能确定'
+        - '更像是配置、部署或适配器相关问题'
+        - '更像是使用方式或文档理解问题'
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: 插件版本
+      description: 请填写你当前使用的插件版本。
+      placeholder: '如: v1.2.0'
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: AstrBot 版本
+      description: 请填写你当前使用的 AstrBot 版本。
+      placeholder: '如: v4.22.1'
+    validations:
+      required: true
+
+  - type: dropdown
+    attributes:
+      label: 部署方式
+      description: 请选择最接近的一项。
+      options:
+        - 'uv 一键部署'
+        - 'Docker / Docker Compose 部署'
+        - 'RainYun 一键云部署'
+        - 'AstrBot App 桌面应用部署'
+        - 'AstrBot Launcher 部署'
+        - 'Replit 部署'
+        - 'AUR 部署'
+        - 'BT-Panel 部署'
+        - '1Panel 部署'
+        - 'CasaOS 部署'
+        - '手动部署（CLI / 源码 / uv）'
+        - '其他'
+        - '不确定'
+    validations:
+      required: true
+
+  - type: dropdown
+    attributes:
+      label: 使用的消息平台适配器
+      description: 请选择你当前主要使用或排查的平台。如涉及多个平台，请先选最主要的一个，并在补充说明中写明其他平台。
+      options:
+        - 'QQ 官方机器人 (Websockets 方式)'
+        - 'QQ 官方机器人 (Webhook 方式)'
+        - 'OneBot v11 (原 QQ 个人号)'
+        - '企微应用'
+        - '企微智能机器人'
+        - '微信公众号'
+        - '个人微信'
+        - '飞书'
+        - '钉钉'
+        - 'Telegram'
+        - 'LINE'
+        - 'Slack'
+        - 'Misskey'
+        - 'Discord'
+        - 'KOOK'
+        - 'Satori (接入 Satori)'
+        - 'Satori (使用 server-satori)'
+        - 'Matrix (社区提供)'
+        - 'VoceChat (社区提供)'
+        - '其他平台'
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: 其他平台名称（如选择“其他平台”请填写）
+      description: 如果你上面选择了“其他平台”，请在这里补充实际平台名称；否则可留空。
+      placeholder: '如: 某某社区适配器 / 自定义平台'
+
+  - type: dropdown
+    attributes:
+      label: 操作系统
+      description: 你当前主要运行在什么操作系统上？
+      options:
+        - 'Windows'
+        - 'macOS'
+        - 'Linux'
+        - 'Other'
+        - 'Not sure'
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 补充说明（可选）
+      description: 如果涉及多个平台、多个 AstrBot 版本、特殊部署环境或自定义适配器，请在这里补充。
+      placeholder: >
+        如: 同样的问题在 Telegram 与 QQ 官机都可复现；使用反向代理；部署在 NAS / 云服务器等。
+
+  - type: textarea
+    attributes:
+      label: 相关配置、日志或截图
+      description: 如相关配置片段、控制台输出、截图等。涉及隐私信息时请先脱敏。
+      placeholder: >
+        请尽量提供能帮助定位问题的配置、日志或截图。
+
+  - type: checkboxes
+    attributes:
+      label: 你愿意在结论明确后提交 PR 或协助补充文档吗？
+      description: 这不是必需的，但如果你愿意参与后续修复或补充说明，会非常有帮助。
+      options:
+        - label: 是的，我愿意在问题明确后协助推进。
+
+  - type: checkboxes
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: >
+            我已阅读并同意遵守该项目的 [行为准则](https://docs.github.com/zh/site-policy/github-terms/github-community-code-of-conduct)。
+          required: true
+
+  - type: markdown
+    attributes:
+      value: '感谢您填写我们的表单！'

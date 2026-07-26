@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible 2718lab-devkit defect
+labels: ["bug"]
+body:
+  - type: input
+    id: devkit-version
+    attributes:
+      label: 2718lab-devkit version
+      placeholder: 0.2.0
+    validations:
+      required: true
+  - type: input
+    id: host-version
+    attributes:
+      label: Host and version
+      description: Include the Codex or Claude Code version, host type, and operating system.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Project index
+        - Durable workflow orchestration
+        - Shared Agent roles
+        - Bundled engineering skill
+        - 2718lab-tools MCP server
+        - Specialized Bugkiller workflow
+        - Plugin installation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Describe the smallest reliable reproduction and expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Remove tokens, private paths, chat content, and other secrets.
+      render: shell
