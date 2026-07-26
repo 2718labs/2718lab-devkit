@@ -14,8 +14,6 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.13"]
-    env:
-      CODEX_TASK_TEMP: ${{ runner.temp }}/2718lab-devkit
     steps:
       - uses: actions/checkout@v6
       - name: Install uv
@@ -32,4 +30,6 @@ jobs:
       - name: Type check
         run: uv run pyright
       - name: Test
+        env:
+          CODEX_TASK_TEMP: ${{ runner.temp }}/2718lab-devkit
         run: uv run pytest
