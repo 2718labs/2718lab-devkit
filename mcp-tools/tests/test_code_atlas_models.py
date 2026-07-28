@@ -148,6 +148,17 @@ def test_frozen_json_round_trips_arrays_and_objects_unambiguously(payload: objec
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [[['a', 1]], {"pairs": [["a", 1]]}, {"nested": [["a", 1], {"x": []}]}],
+)
+def test_freeze_json_is_idempotent_for_tagged_containers(payload: object) -> None:
+    first = freeze_json(payload)
+    second = freeze_json(first)
+    assert second == first
+    assert thaw_json(second) == payload
+
+
+@pytest.mark.parametrize(
     "fragment",
     [
         "GITHUB_TOKEN=ghp_exampleSecret123",

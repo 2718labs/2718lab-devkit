@@ -26,6 +26,10 @@ def _pairs_are_object(value: tuple[Any, ...]) -> bool:
 
 def freeze_json(value: Any) -> FrozenJson:
     """Recursively make a JSON-like value immutable."""
+    if isinstance(value, FrozenObject):
+        return FrozenObject((key, freeze_json(item)) for key, item in value)
+    if isinstance(value, FrozenArray):
+        return FrozenArray(freeze_json(item) for item in value)
     if isinstance(value, Mapping):
         return FrozenObject(sorted(((str(key), freeze_json(item)) for key, item in value.items()), key=lambda item: item[0]))
     if isinstance(value, tuple) and _pairs_are_object(value):
