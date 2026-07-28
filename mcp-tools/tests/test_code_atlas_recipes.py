@@ -324,7 +324,15 @@ def test_loader_rejects_kind_dependent_and_placeholder_contracts(
     assert captured.value.code == code
 
 
-@pytest.mark.parametrize("body", [b"${bad-name}\n", b"${bad\n", b"${outer${inner}}\n"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"${bad-name}\n",
+        b"${bad\n",
+        b"${outer${inner}}\n",
+        b'value = "${test_name}}"\n',
+    ],
+)
 def test_loader_rejects_malformed_template_placeholder_syntax(
     tmp_path: Path, body: bytes
 ) -> None:

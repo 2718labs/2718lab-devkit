@@ -39,7 +39,10 @@ from code_atlas.security import (
     MAX_GRAPH_NODES,
     MAX_PACKET_BYTES,
 )
-from code_atlas.service import CodeAtlasService
+from code_atlas.service import (
+    CodeAtlasService,
+    _placeholder_names as _local_placeholder_names,
+)
 from code_atlas.store import AtlasStore
 from project_index.models import (
     CoverageGap,
@@ -1287,6 +1290,16 @@ def test_local_hydration_rejects_loader_invalid_semantics(
             replace(
                 _observed_manifest(
                     recipe_id="",
+                    intent_id="python.invalid-test-placeholder-closer",
+                    repository_signature=repository_signature,
+                ),
+                tests=(AtlasTestSpec(("pytest", "${path_000}}")),),
+            )
+        ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
                     intent_id="python.oversized-test-command",
                     repository_signature=repository_signature,
                 ),
@@ -2115,3 +2128,114 @@ def test_render_supports_a_bundled_prepend_with_docstring_target(
     assert result.status is AtlasStatus.READY
     assert result.patch_candidate.startswith("--- a/src/guards.py\n")
     assert "@@ -2,0 +3,2 @@" in result.patch_candidate
+
+
+def test_render_substitutes_each_placeholder_exactly_once() -> None:
+    manifest = RecipeManifest(
+        recipe_id="sha256:" + "a" * 64,
+        recipe_key="python.single-pass-substitution",
+        version=1,
+        intent_id="python.single-pass-substitution",
+        language_name="python",
+        language_extractor_version="1",
+        repository_signature="",
+        layer="local",
+        manifest_hash="sha256:" + "b" * 64,
+        slots=(
+            SlotSpec("path", "relative_python_path"),
+            SlotSpec("first", "single_line_text"),
+            SlotSpec("second", "single_line_text"),
+        ),
+        operations=(
+            TemplateOperation("create_python_file", "path", "sha256:" + "c" * 64),
+        ),
+        provenance_kind="observed",
+        provenance_source="fixture",
+    )
+
+    rendered = render_patch(
+        manifest,
+        {"path": "generated.py", "first": "${second}", "second": "injected"},
+        source_files={},
+        snapshot_paths=(),
+        template_reader=lambda _hash: b'first = "${first}"\nsecond = "${second}"\n',
+    )
+
+    assert '+first = "${second}"' in rendered.patch_candidate
+    assert '+second = "injected"' in rendered.patch_candidate
+
+
+def test_render_rejects_text_slot_interpolation_inside_test_argv() -> None:
+    manifest = RecipeManifest(
+        recipe_id="sha256:" + "a" * 64,
+        recipe_key="python.argv-injection",
+        version=1,
+        intent_id="python.argv-injection",
+        language_name="python",
+        language_extractor_version="1",
+        repository_signature="",
+        layer="local",
+        manifest_hash="sha256:" + "b" * 64,
+        slots=(
+            SlotSpec("path", "relative_python_path"),
+            SlotSpec("text", "single_line_text"),
+        ),
+        tests=(AtlasTestSpec(("python", "-c", "${text}")),),
+        operations=(
+            TemplateOperation("create_python_file", "path", "sha256:" + "c" * 64),
+        ),
+        provenance_kind="observed",
+        provenance_source="fixture",
+    )
+
+    with pytest.raises(AtlasError) as captured:
+        render_patch(
+            manifest,
+            {"path": "generated.py", "text": "import os; os.system('bad')"},
+            source_files={},
+            snapshot_paths=(),
+            template_reader=lambda _hash: b'payload = "${text}"\n',
+        )
+
+    assert captured.value.code == "test_spec_invalid"
+
+
+def test_render_rejects_an_unmatched_placeholder_closer() -> None:
+    manifest = RecipeManifest(
+        recipe_id="sha256:" + "a" * 64,
+        recipe_key="python.placeholder-closer",
+        version=1,
+        intent_id="python.placeholder-closer",
+        language_name="python",
+        language_extractor_version="1",
+        repository_signature="",
+        layer="local",
+        manifest_hash="sha256:" + "b" * 64,
+        slots=(
+            SlotSpec("path", "relative_python_path"),
+            SlotSpec("name", "single_line_text"),
+        ),
+        operations=(
+            TemplateOperation("create_python_file", "path", "sha256:" + "c" * 64),
+        ),
+        provenance_kind="observed",
+        provenance_source="fixture",
+    )
+
+    with pytest.raises(AtlasError) as captured:
+        render_patch(
+            manifest,
+            {"path": "generated.py", "name": "safe"},
+            source_files={},
+            snapshot_paths=(),
+            template_reader=lambda _hash: b'value = "${name}}"\n',
+        )
+
+    assert captured.value.code == "template_placeholder_invalid"
+
+
+def test_local_recipe_placeholder_validator_rejects_an_unmatched_closer() -> None:
+    with pytest.raises(AtlasError) as captured:
+        _local_placeholder_names("${path_000}}")
+
+    assert captured.value.code == "malformed_local_recipe"

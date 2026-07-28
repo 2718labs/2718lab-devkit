@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import sys
 import threading
@@ -30,6 +31,7 @@ from code_atlas.models import (
     TestSpec as AtlasTestSpec,
 )
 from code_atlas.canonical import canonical_hash, canonical_json
+from code_atlas import store as store_module
 from code_atlas.store import AtlasStore, StoreConflictError
 from code_atlas.security import MAX_GRAPH_NODES, MAX_PACKET_BYTES, MAX_TEMPLATE_BYTES
 
@@ -631,41 +633,63 @@ def test_verified_packet_and_bounded_cas_reads_use_public_boundaries(
     store.close()
 
 
-def test_open_readonly_store_does_not_create_or_mutate_runtime_files(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "code-atlas.sqlite3"
-    cas_root = tmp_path / "code-atlas-cas"
-    writable = AtlasStore(database, cas_root)
-    writable.close()
-    before = {
-        path.relative_to(tmp_path).as_posix(): path.read_bytes()
-        for path in tmp_path.rglob("*")
+def _durable_file_state(
+    root: Path,
+) -> dict[str, tuple[bytes, tuple[int, int, int, int, int]]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            path.read_bytes(),
+            (
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+                path.lstat().st_mode,
+                path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+            ),
+        )
+        for path in root.rglob("*")
         if path.is_file()
     }
 
-    readonly = AtlasStore.open_readonly(database, cas_root)
+
+def test_open_readonly_store_uses_a_scratch_snapshot_without_touching_durable_files(
+    tmp_path: Path,
+) -> None:
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    scratch = tmp_path / "readonly-scratch"
+    scratch.mkdir()
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    before = _durable_file_state(durable)
+
+    readonly = AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
     try:
         assert readonly.schema_version() == 1
+        assert _durable_file_state(durable) == before
     finally:
         readonly.close()
 
-    after = {
-        path.relative_to(tmp_path).as_posix(): path.read_bytes()
-        for path in tmp_path.rglob("*")
-        if path.is_file()
-    }
+    after = _durable_file_state(durable)
     assert after == before
+    assert not tuple(scratch.iterdir())
 
 
 def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:
-    database = tmp_path / "code-atlas.sqlite3"
-    cas_root = tmp_path / "code-atlas-cas"
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    scratch = tmp_path / "readonly-scratch"
+    scratch.mkdir()
     writable = AtlasStore(database, cas_root)
     node = AtlasNode.create(NodeKind.INTENT, {"intent_id": "python.wal"})
     writable.put_nodes((node,))
+    before = _durable_file_state(durable)
 
-    readonly = AtlasStore.open_readonly(database, cas_root)
+    readonly = AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
     try:
         graph = readonly.graph_query(
             (node.node_id,),
@@ -675,6 +699,87 @@ def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:
             byte_budget=MAX_PACKET_BYTES,
         )
         assert graph.nodes == (node,)
+        assert _durable_file_state(durable) == before
     finally:
         readonly.close()
         writable.close()
+
+
+def test_open_readonly_fails_closed_when_the_source_database_is_replaced_mid_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    scratch = tmp_path / "readonly-scratch"
+    scratch.mkdir()
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement.write_bytes(database.read_bytes())
+    original_copy = store_module._copy_snapshot_file
+
+    def replace_after_copy(
+        source: Path, destination: Path
+    ) -> tuple[int, int, int, int, int]:
+        copied = original_copy(source, destination)
+        if source == database:
+            os.replace(replacement, database)
+        return copied
+
+    monkeypatch.setattr(store_module, "_copy_snapshot_file", replace_after_copy)
+
+    with pytest.raises(StoreConflictError):
+        AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
+
+
+def test_open_readonly_fails_closed_when_the_live_wal_is_replaced_mid_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    scratch = tmp_path / "readonly-scratch"
+    scratch.mkdir()
+    writable = AtlasStore(database, cas_root)
+    writable.put_nodes((AtlasNode.create(NodeKind.INTENT, {"intent_id": "wal"}),))
+    wal = Path(str(database) + "-wal")
+    replacement = tmp_path / "replacement-wal"
+    replacement.write_bytes(wal.read_bytes())
+    original_copy = store_module._copy_snapshot_file
+
+    def replace_after_copy(
+        source: Path, destination: Path
+    ) -> tuple[int, int, int, int, int]:
+        copied = original_copy(source, destination)
+        if source == wal:
+            os.replace(replacement, wal)
+        return copied
+
+    monkeypatch.setattr(store_module, "_copy_snapshot_file", replace_after_copy)
+    try:
+        with pytest.raises(StoreConflictError):
+            AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
+    finally:
+        writable.close()
+
+
+def test_open_readonly_rejects_a_scratch_root_that_overlaps_durable_data(
+    tmp_path: Path,
+) -> None:
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    before = _durable_file_state(durable)
+
+    with pytest.raises(StoreConflictError):
+        AtlasStore.open_readonly(database, cas_root, scratch_root=durable)
+
+    assert _durable_file_state(durable) == before

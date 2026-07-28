@@ -145,6 +145,8 @@ def _placeholder_names(text: str, *, code: str) -> set[str]:
             _error(code)
         names.add(name)
         cursor = end + 1
+        if cursor < len(text) and text[cursor] == "}":
+            _error(code)
     return names
 
 

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import os
-import shutil
 import stat
 import sys
 import tempfile
@@ -46,6 +47,12 @@ def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
         value.st_size,
         value.st_mtime_ns,
     )
+
+
+def _object_identity(value: os.stat_result) -> tuple[int, int, int]:
+    """Return the stable file-object identity used to detect replacement."""
+
+    return _identity(value)[:3]
 
 
 def _unsafe_status(path: Path, value: os.stat_result) -> bool:
@@ -227,20 +234,232 @@ def _fsync_directory(path: Path) -> None:
                 pass
 
 
-def _remove_stage(stage: Path | None, parent: Path) -> None:
+def _capture_output_parent(parent: Path) -> tuple[int, int, int]:
+    """Validate and identify the current output parent object."""
+
+    safe_parent = _safe_output_parent(parent)
+    try:
+        value = safe_parent.lstat()
+    except OSError as exc:
+        raise PromotionError("promotion_output_unsafe") from exc
+    if _unsafe_status(safe_parent, value) or not stat.S_ISDIR(value.st_mode):
+        raise PromotionError("promotion_output_unsafe")
+    return _object_identity(value)
+
+
+def _assert_current_stage(
+    parent: Path,
+    parent_identity: tuple[int, int, int],
+    stage: Path,
+    stage_identity: tuple[int, int, int],
+) -> None:
+    """Fail closed before a write if parent/stage lookup was redirected."""
+
+    try:
+        if _capture_output_parent(parent) != parent_identity:
+            raise PromotionError("promotion_output_raced")
+        value = stage.lstat()
+    except PromotionError:
+        raise
+    except OSError as exc:
+        raise PromotionError("promotion_output_raced") from exc
+    if (
+        _unsafe_status(stage, value)
+        or not stat.S_ISDIR(value.st_mode)
+        or _object_identity(value) != stage_identity
+        or stage.parent != parent
+    ):
+        raise PromotionError("promotion_output_raced")
+
+
+def _make_stage_parent(
+    stage: Path,
+    relative: str,
+    directories: dict[Path, tuple[int, int, int]],
+) -> Path:
+    """Create exactly the known stage directories; reject a substituted path."""
+
+    current = stage
+    for component in relative.split("/")[:-1]:
+        current = current / component
+        known = directories.get(current)
+        try:
+            value = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir()
+                value = current.lstat()
+            except OSError as exc:
+                raise PromotionError("promotion_write_failed") from exc
+            if _unsafe_status(current, value) or not stat.S_ISDIR(value.st_mode):
+                raise PromotionError("promotion_write_failed")
+            directories[current] = _object_identity(value)
+            continue
+        except OSError as exc:
+            raise PromotionError("promotion_write_failed") from exc
+        if (
+            known is None
+            or _unsafe_status(current, value)
+            or not stat.S_ISDIR(value.st_mode)
+            or _object_identity(value) != known
+        ):
+            raise PromotionError("promotion_write_failed")
+    return current
+
+
+def _verify_stage_file(
+    path: Path,
+    expected: bytes,
+    identity: tuple[int, int, int],
+) -> None:
+    """Verify one file without accepting replacement between verification steps."""
+
+    try:
+        before = path.lstat()
+        if (
+            _unsafe_status(path, before)
+            or not stat.S_ISREG(before.st_mode)
+            or _object_identity(before) != identity
+        ):
+            raise PromotionError("promotion_write_failed")
+        actual = path.read_bytes()
+        after = path.lstat()
+    except PromotionError:
+        raise
+    except OSError as exc:
+        raise PromotionError("promotion_write_failed") from exc
+    if (
+        _object_identity(after) != identity
+        or actual != expected
+        or _digest(actual) != _digest(expected)
+    ):
+        raise PromotionError("promotion_write_failed")
+
+
+def _atomic_noreplace_directory(stage: Path, destination: Path) -> None:
+    """Atomically publish a directory only if the destination is absent."""
+
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move_file = kernel32.MoveFileExW
+        move_file.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+        move_file.restype = ctypes.c_int
+        if move_file(str(stage), str(destination), 0):
+            return
+        error = ctypes.get_last_error()
+        if error in {80, 183}:
+            raise FileExistsError(error, "destination exists", str(destination))
+        raise OSError(error, "MoveFileExW failed", str(destination))
+    if os.name == "posix":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        if (
+            renameat2(
+                -100,
+                os.fsencode(stage),
+                -100,
+                os.fsencode(destination),
+                1,
+            )
+            == 0
+        ):
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, "destination exists", str(destination))
+        raise OSError(error, "renameat2 failed", str(destination))
+    raise OSError(errno.ENOSYS, "atomic no-replace promotion is unavailable")
+
+
+def _remove_stage(
+    stage: Path | None,
+    parent: Path,
+    parent_identity: tuple[int, int, int] | None,
+    stage_identity: tuple[int, int, int] | None,
+    files: dict[Path, tuple[int, int, int]],
+    directories: dict[Path, tuple[int, int, int]],
+) -> None:
+    """Remove only the still-owned stage entries; never recurse through a race."""
+
     if (
         stage is None
+        or parent_identity is None
+        or stage_identity is None
         or stage.parent != parent
         or not stage.name.startswith(_STAGE_PREFIX)
     ):
         return
     try:
-        value = stage.lstat()
-        if _unsafe_status(stage, value) or not stat.S_ISDIR(value.st_mode):
+        if _capture_output_parent(parent) != parent_identity:
             return
-        shutil.rmtree(stage)
-    except OSError:
+        stage_status = stage.lstat()
+        if (
+            _unsafe_status(stage, stage_status)
+            or not stat.S_ISDIR(stage_status.st_mode)
+            or _object_identity(stage_status) != stage_identity
+        ):
+            return
+        for path, identity in sorted(
+            files.items(), key=lambda item: len(item[0].parts), reverse=True
+        ):
+            try:
+                value = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                _unsafe_status(path, value)
+                or not stat.S_ISREG(value.st_mode)
+                or _object_identity(value) != identity
+            ):
+                continue
+            path.unlink()
+        for path, identity in sorted(
+            directories.items(), key=lambda item: len(item[0].parts), reverse=True
+        ):
+            try:
+                value = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                _unsafe_status(path, value)
+                or not stat.S_ISDIR(value.st_mode)
+                or _object_identity(value) != identity
+            ):
+                continue
+            path.rmdir()
+        stage.rmdir()
+    except (OSError, PromotionError):
         return
+
+
+def _prepare_readonly_scratch(
+    parent: Path, parent_identity: tuple[int, int, int]
+) -> Path:
+    """Create a verified sibling scratch root without entering durable data."""
+
+    scratch = parent / ".code-atlas-export-scratch"
+    try:
+        scratch.mkdir(exist_ok=True)
+        value = scratch.lstat()
+    except OSError as exc:
+        raise PromotionError("promotion_output_unsafe") from exc
+    if (
+        _unsafe_status(scratch, value)
+        or not stat.S_ISDIR(value.st_mode)
+        or _capture_output_parent(parent) != parent_identity
+    ):
+        raise PromotionError("promotion_output_raced")
+    return scratch
 
 
 def _build_files(store: AtlasStore, manifest: RecipeManifest) -> dict[str, bytes]:
@@ -276,44 +495,89 @@ def _build_files(store: AtlasStore, manifest: RecipeManifest) -> dict[str, bytes
     return files
 
 
-def _write_bundle(parent: Path, output: Path, files: dict[str, bytes]) -> None:
+def _write_bundle(
+    parent: Path,
+    output: Path,
+    files: dict[str, bytes],
+    *,
+    expected_parent_identity: tuple[int, int, int] | None = None,
+) -> None:
     stage: Path | None = None
+    parent_identity: tuple[int, int, int] | None = None
+    stage_identity: tuple[int, int, int] | None = None
+    owned_files: dict[Path, tuple[int, int, int]] = {}
+    owned_directories: dict[Path, tuple[int, int, int]] = {}
     try:
+        parent_identity = _capture_output_parent(parent)
+        if (
+            expected_parent_identity is not None
+            and parent_identity != expected_parent_identity
+        ):
+            raise PromotionError("promotion_output_raced")
         stage = Path(tempfile.mkdtemp(prefix=_STAGE_PREFIX, dir=parent))
         value = stage.lstat()
         if _unsafe_status(stage, value) or not stat.S_ISDIR(value.st_mode):
-            raise PromotionError("promotion_write_failed")
+            raise PromotionError("promotion_output_raced")
+        stage_identity = _object_identity(value)
+        _assert_current_stage(parent, parent_identity, stage, stage_identity)
         for relative, body in sorted(files.items()):
+            _assert_current_stage(parent, parent_identity, stage, stage_identity)
             target = stage.joinpath(*relative.split("/"))
-            target.parent.mkdir(parents=True, exist_ok=True)
+            _make_stage_parent(stage, relative, owned_directories)
+            _assert_current_stage(parent, parent_identity, stage, stage_identity)
             _write_file(target, body)
+            try:
+                target_status = target.lstat()
+            except OSError as exc:
+                _assert_current_stage(parent, parent_identity, stage, stage_identity)
+                raise PromotionError("promotion_write_failed") from exc
+            if _unsafe_status(target, target_status) or not stat.S_ISREG(
+                target_status.st_mode
+            ):
+                raise PromotionError("promotion_write_failed")
+            owned_files[target] = _object_identity(target_status)
+            _assert_current_stage(parent, parent_identity, stage, stage_identity)
             _fsync_directory(target.parent)
         for relative, expected in files.items():
             target = stage.joinpath(*relative.split("/"))
-            try:
-                if target.read_bytes() != expected or _digest(
-                    target.read_bytes()
-                ) != _digest(expected):
-                    raise PromotionError("promotion_write_failed")
-            except OSError as exc:
-                raise PromotionError("promotion_write_failed") from exc
+            _assert_current_stage(parent, parent_identity, stage, stage_identity)
+            identity = owned_files.get(target)
+            if identity is None:
+                raise PromotionError("promotion_write_failed")
+            _verify_stage_file(target, expected, identity)
         _fsync_directory(stage)
+        _assert_current_stage(parent, parent_identity, stage, stage_identity)
         try:
-            output.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            raise PromotionError("promotion_output_raced")
-        try:
-            os.rename(stage, output)
+            _atomic_noreplace_directory(stage, output)
         except FileExistsError as exc:
             raise PromotionError("promotion_output_raced") from exc
         except OSError as exc:
             raise PromotionError("promotion_write_failed") from exc
+        try:
+            if _capture_output_parent(parent) != parent_identity:
+                raise PromotionError("promotion_output_raced")
+            output_status = output.lstat()
+        except PromotionError:
+            raise
+        except OSError as exc:
+            raise PromotionError("promotion_output_raced") from exc
+        if (
+            _unsafe_status(output, output_status)
+            or not stat.S_ISDIR(output_status.st_mode)
+            or _object_identity(output_status) != stage_identity
+        ):
+            raise PromotionError("promotion_output_raced")
         stage = None
         _fsync_directory(parent)
     finally:
-        _remove_stage(stage, parent)
+        _remove_stage(
+            stage,
+            parent,
+            parent_identity,
+            stage_identity,
+            owned_files,
+            owned_directories,
+        )
 
 
 def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
@@ -327,6 +591,7 @@ def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
     ):
         raise PromotionError("promotion_recipe_invalid")
     parent = _safe_output_parent(output.parent)
+    initial_parent_identity = _capture_output_parent(parent)
     final = output.absolute()
     if not final.name or _contains_plugin_cache(final):
         raise PromotionError("promotion_output_unsafe")
@@ -342,10 +607,12 @@ def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
         if _unsafe_status(final, existing):
             raise PromotionError("promotion_output_unsafe")
         raise PromotionError("promotion_output_exists")
+    scratch = _prepare_readonly_scratch(parent, initial_parent_identity)
     try:
         store = AtlasStore.open_readonly(
             durable_root / "code-atlas.sqlite3",
             durable_root / "code-atlas-cas",
+            scratch_root=scratch,
         )
     except StoreConflictError as exc:
         raise PromotionError("promotion_db_open_failed") from exc
@@ -359,7 +626,14 @@ def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
             raise PromotionError("promotion_recipe_invalid") from exc
     finally:
         store.close()
-    _write_bundle(parent, final, files)
+    if _capture_output_parent(parent) != initial_parent_identity:
+        raise PromotionError("promotion_output_raced")
+    _write_bundle(
+        parent,
+        final,
+        files,
+        expected_parent_identity=initial_parent_identity,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import hashlib
+import os
+import sqlite3
 from pathlib import Path
 
 from dataclasses import replace
 
 import sys
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -212,3 +217,252 @@ def test_export_promotes_one_verified_local_recipe_deterministically(
         if path.is_file()
     }
     assert after == before
+
+
+def test_bundle_publish_does_not_call_check_then_os_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "bundle"
+
+    def forbidden_rename(*_args, **_kwargs) -> None:
+        raise AssertionError("final promotion must use atomic no-replace")
+
+    monkeypatch.setattr(exporter.os, "rename", forbidden_rename)
+
+    exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
+
+    assert (output / "receipt.txt").read_bytes() == b"verified\n"
+
+
+def test_native_atomic_noreplace_never_overwrites_an_existing_directory(
+    tmp_path: Path,
+) -> None:
+    exporter = _export_module()
+    stage = tmp_path / "stage"
+    destination = tmp_path / "destination"
+    stage.mkdir()
+    destination.mkdir()
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_bytes(b"keep")
+
+    try:
+        exporter._atomic_noreplace_directory(stage, destination)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        if exc.errno == errno.ENOSYS:
+            pytest.skip("atomic no-replace directory promotion is unavailable")
+        raise
+    else:
+        pytest.fail("atomic no-replace promotion overwrote an existing directory")
+
+    assert stage.exists()
+    assert sentinel.read_bytes() == b"keep"
+
+
+def test_bundle_publish_rejects_a_destination_created_at_atomic_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "bundle"
+
+    def contender(_stage: Path, destination: Path) -> None:
+        destination.mkdir()
+        (destination / "attacker.txt").write_bytes(b"keep")
+        raise FileExistsError(destination)
+
+    monkeypatch.setattr(exporter, "_atomic_noreplace_directory", contender)
+
+    with pytest.raises(exporter.PromotionError, match="promotion_output_raced"):
+        exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
+
+    assert (output / "attacker.txt").read_bytes() == b"keep"
+
+
+def test_bundle_publish_fails_closed_when_the_output_parent_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    outside = tmp_path / "outside"
+    parent.mkdir()
+    output = parent / "bundle"
+    original_write = exporter._write_file
+    replaced = False
+
+    def replace_parent_after_first_write(path: Path, body: bytes) -> None:
+        nonlocal replaced
+        original_write(path, body)
+        if not replaced:
+            replaced = True
+            os.replace(parent, outside)
+            parent.mkdir()
+
+    monkeypatch.setattr(exporter, "_write_file", replace_parent_after_first_write)
+
+    with pytest.raises(exporter.PromotionError, match="promotion_output_raced"):
+        exporter._write_bundle(
+            parent,
+            output,
+            {"a.txt": b"first\n", "b.txt": b"second\n"},
+        )
+
+    assert not output.exists()
+    assert not tuple(outside.rglob("b.txt"))
+
+
+def test_export_refuses_parent_replacement_between_validation_and_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    data_root = tmp_path / "durable"
+    recipe_id = _stored_local_recipe(data_root)
+    parent = tmp_path / "output-parent"
+    outside = tmp_path / "outside"
+    parent.mkdir()
+    output = parent / "bundle"
+    original_write_bundle = exporter._write_bundle
+
+    def replace_parent_then_write(*args, **kwargs) -> None:
+        os.replace(parent, outside)
+        parent.mkdir()
+        return original_write_bundle(*args, **kwargs)
+
+    monkeypatch.setattr(exporter, "_write_bundle", replace_parent_then_write)
+
+    with pytest.raises(exporter.PromotionError, match="promotion_output_raced"):
+        exporter.export_recipe(data_root, recipe_id, output)
+
+    assert not output.exists()
+    assert not (outside / "bundle").exists()
+
+
+def test_export_rejects_tampered_recipe_metadata_and_cas_without_writing_output(
+    tmp_path: Path,
+) -> None:
+    exporter = _export_module()
+    data_root = tmp_path / "durable"
+    recipe_id = _stored_local_recipe(data_root)
+    template = b"def ${symbol_000}() -> int:\n    return 1\n"
+    digest = hashlib.sha256(template).hexdigest()
+    blob = data_root / "code-atlas-cas" / "sha256" / digest[:2] / digest[2:]
+    blob.write_bytes(b"def ${symbol_000}() -> int:\n    return 2\n")
+    cas_output = tmp_path / "cas-output"
+
+    assert (
+        exporter.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--recipe-id",
+                recipe_id,
+                "--output",
+                str(cas_output),
+            ]
+        )
+        == 1
+    )
+    assert not cas_output.exists()
+    blob.write_bytes(template)
+
+    connection = sqlite3.connect(data_root / "code-atlas.sqlite3")
+    try:
+        connection.execute(
+            "UPDATE atlas_recipes SET manifest_hash=? WHERE recipe_id=?",
+            ("sha256:" + "f" * 64, recipe_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    metadata_output = tmp_path / "metadata-output"
+
+    assert (
+        exporter.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--recipe-id",
+                recipe_id,
+                "--output",
+                str(metadata_output),
+            ]
+        )
+        == 1
+    )
+    assert not metadata_output.exists()
+
+
+def test_export_rejects_existing_overlap_and_linked_output_paths(
+    tmp_path: Path,
+) -> None:
+    exporter = _export_module()
+    data_root = tmp_path / "durable"
+    recipe_id = _stored_local_recipe(data_root)
+    existing = tmp_path / "existing-output"
+    existing.mkdir()
+    sentinel = existing / "sentinel.txt"
+    sentinel.write_bytes(b"do-not-overwrite")
+
+    assert (
+        exporter.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--recipe-id",
+                recipe_id,
+                "--output",
+                str(existing),
+            ]
+        )
+        == 1
+    )
+    assert sentinel.read_bytes() == b"do-not-overwrite"
+
+    overlap = data_root / "must-not-write"
+    assert (
+        exporter.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--recipe-id",
+                recipe_id,
+                "--output",
+                str(overlap),
+            ]
+        )
+        == 1
+    )
+    assert not overlap.exists()
+
+    real_parent = tmp_path / "real-parent"
+    linked_parent = tmp_path / "linked-parent"
+    real_parent.mkdir()
+    try:
+        os.symlink(real_parent, linked_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable for this test account")
+    linked_output = linked_parent / "bundle"
+
+    assert (
+        exporter.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--recipe-id",
+                recipe_id,
+                "--output",
+                str(linked_output),
+            ]
+        )
+        == 1
+    )
+    assert not (real_parent / "bundle").exists()

@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
 import uuid
 from dataclasses import fields
 from pathlib import Path
@@ -88,43 +89,190 @@ def _assert_safe_existing_path(path: Path, *, require_regular: bool = False) -> 
         raise StoreConflictError()
 
 
-def _remove_owned_ephemera(
-    items: tuple[tuple[Path, tuple[int, int, int, int, int]], ...],
-) -> None:
-    """Remove only a SQLite sidecar this reader proved it created."""
+def _object_identity(value: os.stat_result) -> tuple[int, int, int]:
+    """Return only the stable object identity of a file or directory."""
 
-    for path, identity in items:
-        try:
-            _assert_safe_existing_path(path, require_regular=True)
-            # SQLite updates sidecar size/timestamps while a read-only WAL
-            # connection is live.  Keep the stable file-object identity check
-            # so a replacement is never removed, while allowing its own
-            # transient WAL/SHM metadata changes to be cleaned up on close.
-            if _file_identity(path.lstat())[:3] == identity[:3]:
-                path.unlink()
-        except (OSError, StoreConflictError):
-            continue
+    return _file_identity(value)[:3]
 
 
-def _capture_owned_sidecars(
-    sidecars: tuple[Path, ...], absent_before: set[Path]
-) -> tuple[tuple[Path, tuple[int, int, int, int, int]], ...]:
-    """Capture safe SQLite sidecars that were absent before this open."""
+def _safe_regular_identity(
+    path: Path, *, optional: bool = False
+) -> tuple[int, int, int, int, int] | None:
+    """Read a file identity without resolving links or accepting a race."""
 
-    created: list[tuple[Path, tuple[int, int, int, int, int]]] = []
-    for sidecar in sidecars:
-        if sidecar not in absent_before:
-            continue
-        try:
-            sidecar_status = sidecar.lstat()
-        except FileNotFoundError:
-            continue
-        if _unsafe_file_status(sidecar, sidecar_status) or not stat.S_ISREG(
-            sidecar_status.st_mode
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise StoreConflictError() from None
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    if _unsafe_file_status(path, before) or not stat.S_ISREG(before.st_mode):
+        raise StoreConflictError()
+    _assert_safe_existing_path(path, require_regular=True)
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    if _file_identity(before) != _file_identity(after):
+        raise StoreConflictError()
+    return _file_identity(after)
+
+
+def _snapshot_source_state(
+    database: Path,
+) -> tuple[tuple[int, int, int, int, int], tuple[int, int, int, int, int] | None]:
+    """Capture the exact durable DB/WAL generation used by a snapshot."""
+
+    database_identity = _safe_regular_identity(database)
+    if database_identity is None:
+        raise StoreConflictError()
+    return database_identity, _safe_regular_identity(
+        Path(str(database) + "-wal"), optional=True
+    )
+
+
+def _copy_snapshot_file(
+    source: Path, destination: Path
+) -> tuple[int, int, int, int, int]:
+    """Copy one stable no-follow source file into an exclusive scratch path."""
+
+    before = _safe_regular_identity(source)
+    if before is None:
+        raise StoreConflictError()
+    source_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    try:
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+        )
+        opened = os.fstat(source_descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != before:
+            raise StoreConflictError()
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        while True:
+            chunk = os.read(source_descriptor, 65_536)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_descriptor, chunk[offset:])
+                if written <= 0:
+                    raise StoreConflictError()
+                offset += written
+        if _file_identity(os.fstat(source_descriptor)) != before:
+            raise StoreConflictError()
+        os.fsync(destination_descriptor)
+    except StoreConflictError:
+        raise
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    finally:
+        if destination_descriptor is not None:
+            try:
+                os.close(destination_descriptor)
+            except OSError:
+                pass
+        if source_descriptor is not None:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                pass
+    if _safe_regular_identity(source) != before:
+        raise StoreConflictError()
+    return before
+
+
+def _capture_snapshot_files(
+    stage: Path,
+) -> tuple[tuple[Path, tuple[int, int, int]], ...]:
+    """Capture only the direct regular files that SQLite may later clean up."""
+
+    _assert_safe_existing_path(stage)
+    try:
+        stage_status = stage.lstat()
+        if _unsafe_file_status(stage, stage_status) or not stat.S_ISDIR(
+            stage_status.st_mode
         ):
             raise StoreConflictError()
-        created.append((sidecar, _file_identity(sidecar_status)))
-    return tuple(created)
+        records: list[tuple[Path, tuple[int, int, int]]] = []
+        for child in stage.iterdir():
+            value = child.lstat()
+            if _unsafe_file_status(child, value) or not stat.S_ISREG(value.st_mode):
+                raise StoreConflictError()
+            records.append((child, _object_identity(value)))
+        return tuple(records)
+    except StoreConflictError:
+        raise
+    except OSError as exc:
+        raise StoreConflictError() from exc
+
+
+def _cleanup_readonly_snapshot(
+    stage: Path | None,
+    scratch: Path | None,
+    scratch_identity: tuple[int, int, int] | None,
+    stage_identity: tuple[int, int, int] | None,
+    files: tuple[tuple[Path, tuple[int, int, int]], ...],
+) -> None:
+    """Remove only a still-proven private snapshot; never recurse blindly."""
+
+    if (
+        stage is None
+        or scratch is None
+        or scratch_identity is None
+        or stage_identity is None
+        or stage.parent != scratch
+    ):
+        return
+    try:
+        _assert_safe_existing_path(scratch)
+        scratch_status = scratch.lstat()
+        stage_status = stage.lstat()
+        if (
+            _unsafe_file_status(scratch, scratch_status)
+            or _unsafe_file_status(stage, stage_status)
+            or not stat.S_ISDIR(scratch_status.st_mode)
+            or not stat.S_ISDIR(stage_status.st_mode)
+            or _object_identity(scratch_status) != scratch_identity
+            or _object_identity(stage_status) != stage_identity
+        ):
+            return
+        for path, identity in files:
+            try:
+                value = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                _unsafe_file_status(path, value)
+                or not stat.S_ISREG(value.st_mode)
+                or _object_identity(value) != identity
+            ):
+                continue
+            path.unlink()
+        stage.rmdir()
+    except (OSError, StoreConflictError):
+        return
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Check lexical containment without resolving through a possible link."""
+
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        try:
+            right.relative_to(left)
+            return True
+        except ValueError:
+            return False
 
 
 class StoreConflictError(ValueError):
@@ -171,70 +319,108 @@ class AtlasStore:
 
     @classmethod
     def open_readonly(
-        cls, database_path: str | Path, cas_root: str | Path
+        cls,
+        database_path: str | Path,
+        cas_root: str | Path,
+        *,
+        scratch_root: str | Path,
     ) -> "AtlasStore":
-        """Open an existing Atlas database without creating or mutating it.
+        """Open a stable durable DB/WAL copy without touching the durable root.
 
-        SQLite's ``mode=ro`` deliberately remains WAL-aware; using
-        ``immutable=1`` here would hide a valid, uncheckpointed WAL file.
+        SQLite's WAL-aware ``mode=ro`` can create ``-shm`` state beside the
+        database.  The reader therefore operates exclusively on a verified
+        caller-owned scratch snapshot, preserving a live durable WAL while
+        never creating, deleting, or writing a durable sidecar.
         """
 
-        database = Path(database_path)
-        cas = Path(cas_root)
+        database = Path(database_path).absolute()
+        cas = Path(cas_root).absolute()
+        scratch = Path(scratch_root).absolute()
         connection: sqlite3.Connection | None = None
-        created_sidecars: tuple[tuple[Path, tuple[int, int, int, int, int]], ...] = ()
-        sidecars: tuple[Path, ...] = ()
-        absent_before: set[Path] = set()
+        stage: Path | None = None
+        scratch_identity: tuple[int, int, int] | None = None
+        stage_identity: tuple[int, int, int] | None = None
+        snapshot_files: tuple[tuple[Path, tuple[int, int, int]], ...] = ()
         try:
             _assert_safe_existing_path(database, require_regular=True)
             _assert_safe_existing_path(cas)
-            if not stat.S_ISDIR(cas.lstat().st_mode):
+            _assert_safe_existing_path(scratch)
+            if not stat.S_ISDIR(cas.lstat().st_mode) or not stat.S_ISDIR(
+                scratch.lstat().st_mode
+            ):
                 raise StoreConflictError()
-            sidecars = (Path(str(database) + "-wal"), Path(str(database) + "-shm"))
-            for sidecar in sidecars:
-                try:
-                    value = sidecar.lstat()
-                except FileNotFoundError:
-                    absent_before.add(sidecar)
-                else:
-                    if _unsafe_file_status(sidecar, value) or not stat.S_ISREG(
-                        value.st_mode
-                    ):
-                        raise StoreConflictError()
-            uri = database.absolute().as_uri() + "?mode=ro"
+            if _paths_overlap(scratch, database.parent) or _paths_overlap(scratch, cas):
+                raise StoreConflictError()
+            scratch_status = scratch.lstat()
+            if _unsafe_file_status(scratch, scratch_status):
+                raise StoreConflictError()
+            scratch_identity = _object_identity(scratch_status)
+            source_state = _snapshot_source_state(database)
+            stage = Path(tempfile.mkdtemp(prefix=".code-atlas-readonly-", dir=scratch))
+            stage_status = stage.lstat()
+            if _unsafe_file_status(stage, stage_status) or not stat.S_ISDIR(
+                stage_status.st_mode
+            ):
+                raise StoreConflictError()
+            stage_identity = _object_identity(stage_status)
+            if _object_identity(scratch.lstat()) != scratch_identity:
+                raise StoreConflictError()
+            snapshot_database = stage / "code-atlas.sqlite3"
+            _copy_snapshot_file(database, snapshot_database)
+            if source_state[1] is not None:
+                _copy_snapshot_file(
+                    Path(str(database) + "-wal"),
+                    Path(str(snapshot_database) + "-wal"),
+                )
+            if _snapshot_source_state(database) != source_state:
+                raise StoreConflictError()
+            _assert_safe_existing_path(stage)
+            if _object_identity(stage.lstat()) != stage_identity:
+                raise StoreConflictError()
+            uri = snapshot_database.absolute().as_uri() + "?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=30.0)
             connection.execute("PRAGMA query_only=ON")
-            created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
             row = connection.execute(
                 "SELECT value FROM atlas_metadata WHERE key='schema_version'"
             ).fetchone()
-            created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
             if row is None or row[0] != "1":
                 raise StoreConflictError()
+            if _snapshot_source_state(database) != source_state:
+                raise StoreConflictError()
+            snapshot_files = _capture_snapshot_files(stage)
             instance = cls.__new__(cls)
-            instance._database_path = database
+            instance._database_path = snapshot_database
             instance._cas_root = cas
             instance._conn = connection
-            instance._readonly_ephemera = created_sidecars
+            instance._readonly_snapshot = (
+                stage,
+                scratch,
+                scratch_identity,
+                stage_identity,
+                snapshot_files,
+            )
             return instance
-        except (OSError, sqlite3.Error, ValueError) as exc:
+        except Exception as exc:
             if connection is not None:
                 try:
-                    created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+            if stage is not None:
+                try:
+                    snapshot_files = _capture_snapshot_files(stage)
                 except StoreConflictError:
                     pass
-                connection.close()
-            _remove_owned_ephemera(created_sidecars)
+            _cleanup_readonly_snapshot(
+                stage,
+                scratch,
+                scratch_identity,
+                stage_identity,
+                snapshot_files,
+            )
+            if isinstance(exc, StoreConflictError):
+                raise
             raise StoreConflictError() from exc
-        except Exception:
-            if connection is not None:
-                try:
-                    created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
-                except StoreConflictError:
-                    pass
-                connection.close()
-            _remove_owned_ephemera(created_sidecars)
-            raise
 
     def _migrate(self) -> None:
         self._conn.execute("BEGIN IMMEDIATE")
@@ -261,8 +447,12 @@ class AtlasStore:
             raise
 
     def close(self) -> None:
-        self._conn.close()
-        _remove_owned_ephemera(getattr(self, "_readonly_ephemera", ()))
+        try:
+            self._conn.close()
+        finally:
+            snapshot = getattr(self, "_readonly_snapshot", None)
+            if snapshot is not None:
+                _cleanup_readonly_snapshot(*snapshot)
 
     def schema_version(self) -> int:
         return int(

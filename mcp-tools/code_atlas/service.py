@@ -189,6 +189,8 @@ def _placeholder_names(value: str) -> frozenset[str]:
             raise AtlasError("malformed_local_recipe")
         names.add(name)
         cursor = end + 1
+        if cursor < len(value) and value[cursor] == "}":
+            raise AtlasError("malformed_local_recipe")
     return frozenset(names)
 
 

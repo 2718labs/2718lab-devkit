@@ -25,6 +25,7 @@ from .security import (
 
 
 _PLACEHOLDER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PLACEHOLDER_TOKEN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _PYTHON_ARG_SLOT_TYPES = frozenset(
     {"relative_python_path", "python_identifier", "python_qualified_name"}
 )
@@ -65,6 +66,8 @@ def _placeholder_names(value: str, *, code: str) -> frozenset[str]:
             _fail(code)
         names.add(name)
         cursor = end + 1
+        if cursor < len(value) and value[cursor] == "}":
+            _fail(code)
 
 
 def _exactly_one_lf(text: str, *, code: str) -> None:
@@ -130,10 +133,16 @@ def validate_bindings(
 
 
 def _substitute(text: str, bindings: Mapping[str, str]) -> str:
-    rendered = text
-    for name in sorted(bindings):
-        rendered = rendered.replace("${" + name + "}", bindings[name])
-    return rendered
+    """Replace only original complete tokens, never tokens created by a value."""
+
+    def replacement(match: re.Match[str]) -> str:
+        name = match.group(1)
+        try:
+            return bindings[name]
+        except KeyError:
+            _fail("template_placeholder_invalid")
+
+    return _PLACEHOLDER_TOKEN.sub(replacement, text)
 
 
 def _template_text(
