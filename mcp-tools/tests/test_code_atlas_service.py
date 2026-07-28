@@ -193,6 +193,8 @@ def _observed_manifest(
     recipe_id: str,
     intent_id: str,
     repository_signature: str,
+    superseded_ids: tuple[str, ...] = (),
+    quarantine_state: str | None = None,
 ) -> RecipeManifest:
     slots = (SlotSpec("path_000", "relative_python_path"),)
     manifest = _manifest(
@@ -214,6 +216,8 @@ def _observed_manifest(
                 canonical_hash({"template": intent_id}),
             ),
         ),
+        superseded_ids=superseded_ids,
+        quarantine_state=quarantine_state,
         provenance_kind="observed",
         provenance_source="accepted_task",
     )
@@ -977,6 +981,236 @@ def test_prepare_uses_local_repository_priority_and_preserves_ties(
     )
 
 
+def test_observed_local_compatibility_metadata_selects_explicit_superseder(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
+    intent_id = "python.observed-supersession"
+    older = _put_local_recipe(
+        atlas_environment.store,
+        _observed_manifest(
+            recipe_id="",
+            intent_id=intent_id,
+            repository_signature=repository_signature,
+        ),
+    )
+    absent_superseded_id = "sha256:" + "0" * 64
+    newer = _put_local_recipe(
+        atlas_environment.store,
+        _observed_manifest(
+            recipe_id="",
+            intent_id=intent_id,
+            repository_signature=repository_signature,
+            superseded_ids=tuple(sorted((absent_superseded_id, older.recipe_id))),
+        ),
+    )
+
+    assert newer.manifest_hash == older.manifest_hash
+    result = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id=intent_id,
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+
+    assert result.status is AtlasStatus.READY
+    assert result.packet is not None
+    assert result.packet.recipe_id == newer.recipe_id
+    assert result.candidate_recipe_ids == (newer.recipe_id,)
+
+
+def test_quarantined_observed_superseder_suppresses_older_local_recipe(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
+    intent_id = "python.quarantined-supersession"
+    older = _put_local_recipe(
+        atlas_environment.store,
+        _observed_manifest(
+            recipe_id="",
+            intent_id=intent_id,
+            repository_signature=repository_signature,
+        ),
+    )
+    quarantined = _put_local_recipe(
+        atlas_environment.store,
+        _observed_manifest(
+            recipe_id="",
+            intent_id=intent_id,
+            repository_signature=repository_signature,
+            superseded_ids=(older.recipe_id,),
+            quarantine_state="quarantined",
+        ),
+    )
+
+    result = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id=intent_id,
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+
+    assert result.status is AtlasStatus.RECIPE_QUARANTINED
+    assert result.packet is None
+    assert result.candidate_recipe_ids == (quarantined.recipe_id,)
+
+
+def test_observed_local_compatibility_metadata_rejects_invalid_values(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
+    first_id = "sha256:" + "1" * 64
+    duplicate_id = "sha256:" + "e" * 64
+    invalid_manifests = (
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.invalid-superseded-hash",
+            repository_signature=repository_signature,
+            superseded_ids=("not-a-hash",),
+        ),
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.duplicate-superseded-id",
+            repository_signature=repository_signature,
+            superseded_ids=(duplicate_id, duplicate_id),
+        ),
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.noncanonical-superseded-order",
+            repository_signature=repository_signature,
+            superseded_ids=(duplicate_id, first_id),
+        ),
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.oversized-superseded-ids",
+            repository_signature=repository_signature,
+            superseded_ids=tuple(
+                f"sha256:{index:064x}" for index in range(MAX_GRAPH_NODES + 1)
+            ),
+        ),
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.invalid-local-quarantine-state",
+            repository_signature=repository_signature,
+            quarantine_state="ready",
+        ),
+    )
+    for manifest in invalid_manifests:
+        _put_local_recipe(atlas_environment.store, manifest)
+        result = atlas_environment.service.prepare(
+            workspace=str(atlas_environment.root),
+            snapshot_id=snapshot.snapshot_id,
+            intent_id=manifest.intent_id,
+            language="python",
+            target_paths=("tests/test_feature.py",),
+        )
+        assert result.status is AtlasStatus.NO_VERIFIED_RECIPE
+        assert result.packet is None
+        assert "malformed_local_recipe" in result.reasons
+
+
+def test_observed_local_quarantine_payload_must_match_root_metadata(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
+    mismatches = ((None, "quarantined"), ("quarantined", None))
+    for index, (payload_state, root_state) in enumerate(mismatches):
+        intent_id = f"python.quarantine-mismatch-{index}"
+        manifest = _observed_manifest(
+            recipe_id="",
+            intent_id=intent_id,
+            repository_signature=repository_signature,
+            quarantine_state=payload_state,
+        )
+        root = AtlasNode.create(
+            NodeKind.RECIPE,
+            _recipe_payload(manifest),
+            extractor_id="python-ast",
+            extractor_version="1",
+            provenance="observed",
+            source_hashes=(manifest.manifest_hash,),
+            quarantine_state=root_state,
+        )
+        atlas_environment.store.put_nodes((root,))
+        atlas_environment.store.put_recipe(replace(manifest, recipe_id=root.node_id))
+        result = atlas_environment.service.prepare(
+            workspace=str(atlas_environment.root),
+            snapshot_id=snapshot.snapshot_id,
+            intent_id=intent_id,
+            language="python",
+            target_paths=("tests/test_feature.py",),
+        )
+        assert result.status is AtlasStatus.NO_VERIFIED_RECIPE
+        assert result.packet is None
+        assert "malformed_local_recipe" in result.reasons
+
+
+def test_observed_local_root_superseded_timestamp_is_rejected(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
+    manifest = _observed_manifest(
+        recipe_id="",
+        intent_id="python.root-superseded-timestamp",
+        repository_signature=repository_signature,
+    )
+    root = AtlasNode.create(
+        NodeKind.RECIPE,
+        _recipe_payload(manifest),
+        extractor_id="python-ast",
+        extractor_version="1",
+        provenance="observed",
+        source_hashes=(manifest.manifest_hash,),
+        superseded_at="2026-07-29T00:00:00Z",
+    )
+    atlas_environment.store.put_nodes((root,))
+    atlas_environment.store.put_recipe(replace(manifest, recipe_id=root.node_id))
+
+    result = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id=manifest.intent_id,
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+
+    assert result.status is AtlasStatus.NO_VERIFIED_RECIPE
+    assert result.packet is None
+    assert "malformed_local_recipe" in result.reasons
+
+
 def test_local_hydration_rejects_loader_invalid_semantics(
     atlas_environment: AtlasEnvironment,
 ) -> None:
@@ -1194,18 +1428,43 @@ def test_local_observed_manifest_requires_extractor_shape_and_source_hash(
     assert "malformed_local_recipe" in created_at_rejected.reasons
 
 
+def test_graph_query_rejects_sentinel_local_discovery_before_traversal(
+    atlas_environment: AtlasEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identifiers = tuple(f"sha256:{index:064x}" for index in range(MAX_GRAPH_NODES + 1))
+    limits: list[int] = []
+
+    def sentinel_recipes(_intent_id: str, *, limit: int) -> tuple[str, ...]:
+        limits.append(limit)
+        return identifiers
+
+    def fail_if_traversed(*_args, **_kwargs):
+        raise AssertionError("sentinel roots must fail before graph traversal")
+
+    monkeypatch.setattr(atlas_environment.store, "recipes_for_intent", sentinel_recipes)
+    monkeypatch.setattr(atlas_environment.store, "graph_query", fail_if_traversed)
+
+    with pytest.raises(AtlasError) as error:
+        atlas_environment.service.graph_query(intent_id="python.discovery-sentinel")
+
+    assert error.value.code == "too_many_roots"
+    assert limits == [MAX_GRAPH_NODES + 1]
+
+
 def test_prepare_stops_before_hydrating_unbounded_local_discovery(
     atlas_environment: AtlasEnvironment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot = atlas_environment.index.sync(atlas_environment.root)
     identifiers = tuple(f"sha256:{index:064x}" for index in range(MAX_GRAPH_NODES + 1))
+    limits: list[int] = []
 
-    monkeypatch.setattr(
-        atlas_environment.store,
-        "recipes_for_intent",
-        lambda _intent_id: identifiers,
-    )
+    def sentinel_recipes(_intent_id: str, *, limit: int) -> tuple[str, ...]:
+        limits.append(limit)
+        return identifiers
+
+    monkeypatch.setattr(atlas_environment.store, "recipes_for_intent", sentinel_recipes)
 
     def fail_if_hydrated(*_args, **_kwargs):
         raise AssertionError("local recipes must not be hydrated beyond the bound")
@@ -1223,6 +1482,7 @@ def test_prepare_stops_before_hydrating_unbounded_local_discovery(
     assert result.packet is None
     assert result.candidate_recipe_ids == ()
     assert result.reasons == ("candidate_limit_exceeded",)
+    assert limits == [MAX_GRAPH_NODES + 1]
 
 
 def test_local_payload_and_template_body_are_fail_closed(

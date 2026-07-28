@@ -68,6 +68,8 @@ _LOCAL_SLOT_TYPES = frozenset({"relative_python_path", "python_identifier"})
 _LOCAL_CONSTRAINT_KINDS = frozenset({"path_suffix", "required_symbol"})
 _LOCAL_OPERATION_KINDS = frozenset({"create_python_file", "append_python_nodes"})
 _LOCAL_DISCOVERY_LIMIT = MAX_GRAPH_NODES + 1
+_MAX_LOCAL_SUPERSEDED_IDS = MAX_GRAPH_NODES
+_LOCAL_QUARANTINE_STATES = (None, "quarantined")
 _BODY_KEYS = frozenset(
     {
         "body",
@@ -462,9 +464,10 @@ class CodeAtlasService:
             for recipe in self._bundled_manifests
             if normalize_intent_id(recipe.intent_id) == normalized
         )
-        return tuple(
-            sorted(set((*bundled, *self._store.recipes_for_intent(normalized))))
-        )
+        local = self._store.recipes_for_intent(normalized, limit=_LOCAL_DISCOVERY_LIMIT)
+        if len(local) >= _LOCAL_DISCOVERY_LIMIT:
+            raise AtlasError("too_many_roots")
+        return tuple(sorted(set((*bundled, *local))))
 
     def _merged_graph(
         self, roots: tuple[str, ...]
@@ -679,7 +682,7 @@ class CodeAtlasService:
             or root.provenance != "observed"
             or root.created_at is not None
             or root.superseded_at is not None
-            or root.quarantine_state is not None
+            or root.quarantine_state not in _LOCAL_QUARANTINE_STATES
         ):
             raise AtlasError("malformed_local_recipe")
         payload = thaw_json(root.payload)
@@ -703,8 +706,13 @@ class CodeAtlasService:
             or data["provenance_kind"] != "observed"
             or data["provenance_source"] != "accepted_task"
             or data["schema_version"] != "1"
-            or data["quarantine_state"] is not None
-            or data["superseded_ids"] != []
+            or data["quarantine_state"] not in _LOCAL_QUARANTINE_STATES
+            or root.quarantine_state != data["quarantine_state"]
+            or not isinstance(data["superseded_ids"], list)
+            or len(data["superseded_ids"]) > _MAX_LOCAL_SUPERSEDED_IDS
+            or any(not _is_hash(recipe_id) for recipe_id in data["superseded_ids"])
+            or len(set(data["superseded_ids"])) != len(data["superseded_ids"])
+            or data["superseded_ids"] != sorted(data["superseded_ids"])
         ):
             raise AtlasError("malformed_local_recipe")
         slots = _strict_slots(data["slots"])
@@ -755,7 +763,9 @@ class CodeAtlasService:
     ) -> tuple[tuple[RecipeManifest, ...], bool, bool]:
         manifests: list[RecipeManifest] = []
         malformed = False
-        recipe_ids = self._store.recipes_for_intent(intent_id)
+        recipe_ids = self._store.recipes_for_intent(
+            intent_id, limit=_LOCAL_DISCOVERY_LIMIT
+        )
         if len(recipe_ids) >= _LOCAL_DISCOVERY_LIMIT:
             return (), False, True
         for recipe_id in recipe_ids:
