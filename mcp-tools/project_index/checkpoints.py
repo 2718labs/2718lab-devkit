@@ -155,6 +155,7 @@ class CheckpointService:
         checkpoint, entries = self._load_verified_checkpoint(checkpoint_id)
         if checkpoint.workflow_id != workflow_id or checkpoint.task_id != task_id:
             raise _error("WORKTREE_UNOWNED")
+        verified_blobs = self._load_and_verify_blobs(entries)
         by_path = {entry.path: entry for entry in entries}
         output: list[CheckpointFile] = []
         used_bytes = 0
@@ -164,7 +165,7 @@ class CheckpointService:
             entry = by_path.get(path)
             if entry is None or entry.kind != "file" or entry.blob_hash is None:
                 raise _error("SCOPE_ESCAPE")
-            body = self._load_and_verify_blobs((entry,))[entry.blob_hash]
+            body = verified_blobs[entry.blob_hash]
             used_bytes += len(body)
             if used_bytes > byte_budget:
                 raise _error("SCOPE_ESCAPE")

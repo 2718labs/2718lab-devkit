@@ -697,3 +697,64 @@ def test_snapshot_file_body_is_not_stored_in_the_index_database(tmp_path: Path) 
     )
     service.close()
     assert marker not in database.read_bytes()
+
+
+@pytest.mark.parametrize("byte_budget", (0, -1, True, 1.5))
+def test_snapshot_file_reader_rejects_invalid_budgets(
+    tmp_path: Path, byte_budget: int | float
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "module.py").write_bytes(b"VALUE = 1\n")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    with pytest.raises(IndexError):
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=byte_budget
+        )
+    service.close()
+
+
+def test_snapshot_file_reader_rejects_stale_foreign_and_unsafe_inputs(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    foreign = tmp_path / "foreign"
+    workspace.mkdir()
+    foreign.mkdir()
+    (workspace / "a.py").write_bytes(b"A\n")
+    (workspace / "b.py").write_bytes(b"B\n")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    for paths in (
+        (),
+        ("b.py", "a.py"),
+        ("a.py", "a.py"),
+        (".",),
+        ("..",),
+        ("build/x.py",),
+        ("a.py:stream",),
+    ):
+        with pytest.raises(IndexError):
+            service.read_snapshot_files(
+                workspace, snapshot.snapshot_id, paths, byte_budget=1024
+            )
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            foreign, snapshot.snapshot_id, ("a.py",), byte_budget=1024
+        )
+    assert captured.value.code == "NOT_FOUND"
+    (workspace / "added.py").write_bytes(b"added\n")
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("a.py",), byte_budget=1024
+        )
+    assert captured.value.code == "INDEX_STALE"
+    (workspace / "added.py").unlink()
+    (workspace / "a.py").unlink()
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("a.py",), byte_budget=1024
+        )
+    assert captured.value.code == "INDEX_STALE"
+    service.close()

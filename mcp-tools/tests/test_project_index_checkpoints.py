@@ -784,3 +784,35 @@ def test_checkpoint_file_reader_rejects_tampered_cas_body(
             byte_budget=4096,
         ),
     )
+
+
+def test_checkpoint_file_reader_verifies_all_cas_payloads(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "requested.py").write_bytes(b"requested\n")
+    (scope / "other.py").write_bytes(b"other\n")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    other = next(
+        entry
+        for entry in service._load_entries(checkpoint.checkpoint_id)
+        if entry.path == "scope/other.py"
+    )
+    assert other.blob_hash is not None
+    service._blob_path(other.blob_hash).write_bytes(b"tampered\n")
+    _assert_error(
+        "INDEX_CORRUPT",
+        lambda: service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id=checkpoint.task_id,
+            paths=("scope/requested.py",),
+            byte_budget=4096,
+        ),
+    )
