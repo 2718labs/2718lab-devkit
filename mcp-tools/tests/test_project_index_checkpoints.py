@@ -894,3 +894,61 @@ def test_checkpoint_file_reader_scope_order_ownership_and_missing_cas(
             byte_budget=4,
         ),
     )
+
+
+def test_checkpoint_file_reader_rejects_aggregate_directory_and_missing_entries(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "a.py").write_bytes(b"aa")
+    (scope / "b.py").write_bytes(b"bb")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    for paths, budget in (
+        (("scope/a.py", "scope/b.py"), 3),
+        (("scope",), 8),
+        (("scope/missing.py",), 8),
+    ):
+        with pytest.raises(IndexError):
+            service.read_files_for_task(
+                checkpoint.checkpoint_id,
+                workflow_id=checkpoint.workflow_id,
+                task_id=checkpoint.task_id,
+                paths=paths,
+                byte_budget=budget,
+            )
+
+
+def test_checkpoint_file_reader_is_independent_of_expired_lease(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "module.py").write_bytes(b"lease-independent")
+    ownership = _ownership(repository.worktree)
+    checkpoint = service.create(
+        ownership, index_service.sync(repository.worktree).snapshot_id
+    )
+    monkeypatch.setattr(
+        service,
+        "_require_checkpoint_owner",
+        lambda *args: pytest.fail("reader must not validate lease ownership"),
+    )
+    assert (
+        service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=ownership.workflow_id,
+            task_id=ownership.task_id,
+            paths=("scope/module.py",),
+            byte_budget=1024,
+        )[0].body
+        == b"lease-independent"
+    )

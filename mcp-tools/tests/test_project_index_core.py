@@ -833,7 +833,7 @@ def test_snapshot_file_reader_rejects_absolute_drive_and_unc_paths(
     service.close()
 
 
-def test_snapshot_file_reader_rejects_directory_link_and_preserves_inputs(
+def test_snapshot_file_reader_rejects_directory_and_preserves_inputs(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "repo"
@@ -856,6 +856,27 @@ def test_snapshot_file_reader_rejects_directory_link_and_preserves_inputs(
         service.read_snapshot_files(
             workspace, snapshot.snapshot_id, ("folder",), byte_budget=64
         )
+    assert database.read_bytes() == database_before
+    assert (
+        tuple(
+            sorted(
+                (path.relative_to(workspace).as_posix(), path.read_bytes())
+                for path in workspace.rglob("*")
+                if path.is_file()
+            )
+        )
+        == workspace_before
+    )
+    service.close()
+
+
+def test_snapshot_file_reader_rejects_symlink_probe(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = workspace / "source.py"
+    source.write_bytes(b"marker")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
     link = workspace / "link.py"
     try:
         link.symlink_to(source)
@@ -865,12 +886,4 @@ def test_snapshot_file_reader_rejects_directory_link_and_preserves_inputs(
         service.read_snapshot_files(
             workspace, snapshot.snapshot_id, ("link.py",), byte_budget=64
         )
-    assert database.read_bytes() == database_before
-    assert tuple(
-        sorted(
-            (path.relative_to(workspace).as_posix(), path.read_bytes())
-            for path in workspace.rglob("*")
-            if path.is_file()
-        )
-    ) == workspace_before + (("link.py", b"marker"),)
     service.close()
