@@ -233,6 +233,102 @@ def test_loader_rejects_malformed_nested_types(
     assert captured.value.code == code
 
 
+@pytest.mark.parametrize(
+    ("name", "mutate", "code"),
+    [
+        (
+            "append target symbol",
+            lambda item: item["operations"][0].__setitem__(
+                "target_symbol_slot", "tool_name"
+            ),
+            "invalid_operation",
+        ),
+        (
+            "prepend separator",
+            lambda item: item["operations"][0].__setitem__("separator", "\n\n"),
+            "invalid_operation",
+        ),
+        (
+            "argv missing slot",
+            lambda item: item["tests"][0].__setitem__("argv", ["python", "${missing}"]),
+            "invalid_test_spec",
+        ),
+        (
+            "argv malformed placeholder",
+            lambda item: item["tests"][0].__setitem__(
+                "argv", ["python", "${bad-name}"]
+            ),
+            "invalid_test_spec",
+        ),
+        (
+            "invalid slot type",
+            lambda item: item["slots"][0].__setitem__("type", "unknown"),
+            "invalid_slots",
+        ),
+        (
+            "nonpositive version",
+            lambda item: item.__setitem__("version", 0),
+            "invalid_recipe",
+        ),
+    ],
+)
+def test_loader_rejects_kind_dependent_and_placeholder_contracts(
+    tmp_path: Path, name: str, mutate, code: str
+) -> None:
+    root = copied_assets(tmp_path)
+    manifest = (
+        "python-validation-guard.json"
+        if name == "prepend separator"
+        else "python-fastmcp-read-tool.json"
+    )
+    rewrite_manifest(root, manifest, mutate)
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == code
+
+
+@pytest.mark.parametrize("body", [b"${bad-name}\n", b"${bad\n", b"${outer${inner}}\n"])
+def test_loader_rejects_malformed_template_placeholder_syntax(
+    tmp_path: Path, body: bytes
+) -> None:
+    root = copied_assets(tmp_path)
+    digest = hashlib.sha256(body).hexdigest()
+    (root / "templates" / "sha256" / digest).write_bytes(body)
+    rewrite_manifest(
+        root,
+        "python-validation-guard.json",
+        lambda item: item["operations"][0].__setitem__(
+            "template_hash", "sha256:" + digest
+        ),
+    )
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == "invalid_template_placeholder"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "code"),
+    [
+        (
+            lambda item: item["constraints"][0].__setitem__("kind", "unknown"),
+            "invalid_constraint",
+        ),
+        (
+            lambda item: item["constraints"][0].__setitem__("value", 7),
+            "invalid_constraint",
+        ),
+    ],
+)
+def test_loader_rejects_unsupported_bundled_constraints(
+    tmp_path: Path, mutate, code: str
+) -> None:
+    root = copied_assets(tmp_path)
+    rewrite_manifest(root, "python-fastmcp-read-tool.json", mutate)
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == code
+
+
 def test_loader_rejects_junction_or_reparse_asset_components(
     tmp_path: Path, monkeypatch
 ) -> None:

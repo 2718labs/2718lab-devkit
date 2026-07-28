@@ -35,7 +35,7 @@ from .security import (
 
 
 _HASH = re.compile(r"^sha256:([0-9a-f]{64})$")
-_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_PLACEHOLDER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOP_LEVEL = frozenset(
     {
         "schema_version",
@@ -116,6 +116,22 @@ def _recipe_node(recipe: RecipeManifest) -> AtlasNode:
         provenance="declared",
         source_hashes=(recipe.manifest_hash,),
     )
+
+
+def _placeholder_names(text: str, *, code: str) -> set[str]:
+    """Parse complete, non-nested ``${python_identifier}`` placeholders."""
+    names: set[str] = set()
+    cursor = 0
+    while (start := text.find("${", cursor)) != -1:
+        end = text.find("}", start + 2)
+        if end == -1:
+            _error(code)
+        name = text[start + 2 : end]
+        if "${" in name or not _PLACEHOLDER_NAME.fullmatch(name):
+            _error(code)
+        names.add(name)
+        cursor = end + 1
+    return names
 
 
 class BundledRecipeLoader:
@@ -278,9 +294,13 @@ class BundledRecipeLoader:
             ConstraintSpec(**_object(value, _CONSTRAINT)) for value in constraints_data
         )
         if any(
-            not value.kind or value.subject not in slot_names for value in constraints
+            value.kind not in {"path_suffix", "required_symbol"}
+            or value.subject not in slot_names
+            or not isinstance(value.value, str)
+            or not value.value
+            for value in constraints
         ):
-            _error()
+            _error("invalid_constraint")
         dependencies_data = item["dependencies"]
         if not isinstance(dependencies_data, list):
             _error()
@@ -316,6 +336,12 @@ class BundledRecipeLoader:
             for spec in tests
         ):
             _error()
+        if any(
+            not _placeholder_names(argument, code="invalid_test_spec") <= slot_names
+            for spec in tests
+            for argument in spec.argv
+        ):
+            _error("invalid_test_spec")
         operations_data = item["operations"]
         if not isinstance(operations_data, list) or not operations_data:
             _error()
@@ -330,6 +356,20 @@ class BundledRecipeLoader:
                 isinstance(operation[key], str)
                 for key in ("kind", "path_slot", "template_hash")
             ):
+                _error("invalid_operation")
+            if operation["kind"] == "append_python_nodes" and set(operation) != {
+                "kind",
+                "path_slot",
+                "template_hash",
+                "separator",
+            }:
+                _error("invalid_operation")
+            if operation["kind"] == "prepend_function_body" and set(operation) != {
+                "kind",
+                "path_slot",
+                "template_hash",
+                "target_symbol_slot",
+            }:
                 _error("invalid_operation")
             if "separator" in operation and not isinstance(operation["separator"], str):
                 _error("invalid_operation")
@@ -367,7 +407,9 @@ class BundledRecipeLoader:
             ):
                 _error("invalid_operation")
             body = self._blob(_text(operation["template_hash"]))
-            placeholders = set(_PLACEHOLDER.findall(body.decode("utf-8")))
+            placeholders = _placeholder_names(
+                body.decode("utf-8"), code="invalid_template_placeholder"
+            )
             if not placeholders <= slot_names:
                 _error("undeclared_placeholder")
             operations.append(
