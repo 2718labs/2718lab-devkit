@@ -17,11 +17,11 @@ def task_scratch(name: str) -> Path:
         or Path(name).is_absolute()
         or Path(name).name != name
     ):
-        raise ValueError("name must be one safe path component")
+        raise ValueError("scratch name must be one safe path component")
 
     base = Path(os.environ.get("CODEX_TASK_TEMP", tempfile.gettempdir())).resolve()
     scratch = (base / name).resolve()
     if scratch.parent != base:
-        raise ValueError("scratch path escapes task temp root")
+        raise ValueError("scratch name must be one safe path component")
     scratch.mkdir(parents=True, exist_ok=True)
     return scratch
