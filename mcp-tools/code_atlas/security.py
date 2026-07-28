@@ -25,13 +25,28 @@ GENERATED_COMPONENTS = frozenset({
 })
 
 _DRIVE_PATH = re.compile(r"^[A-Za-z]:")
-_CREDENTIAL = re.compile(
-    r"(?ix)(?:\b(?:github[_-]?token|aws[_-]?secret[_-]?access[_-]?key|"
-    r"api[_-]?key|access[_-]?token|token|secret|password)\b\s*(?:=|:)\s*['\"]?\S+|"
-    r"\bauthorization\s*:\s*bearer\s+\S+|-----begin\s+[a-z\s]*private\s+key-----)"
+_ASSIGNMENT = re.compile(r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*([^\s]+)")
+_RAW_TOKEN = re.compile(r"(?i)(?:^|\s)(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]{8,})(?:$|\s)")
+_BEARER_OR_PRIVATE_KEY = re.compile(
+    r"(?ix)(?:\bauthorization\s*:\s*bearer\s+\S+|-----begin\s+[a-z\s]*private\s+key-----)"
+)
+_SENSITIVE_KEY_SUFFIXES = (
+    "API_KEY", "ACCESS_TOKEN", "TOKEN", "PASSWORD", "PASSWD", "SECRET_ACCESS_KEY",
+    "CLIENT_SECRET", "SECRET", "PRIVATE_KEY", "AUTHORIZATION",
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
 _QUALIFIED_NAME = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
+
+
+def _contains_credential(text: str) -> bool:
+    """Detect credentials without returning or retaining their values."""
+    if _RAW_TOKEN.search(text) or _BEARER_OR_PRIVATE_KEY.search(text):
+        return True
+    for match in _ASSIGNMENT.finditer(text):
+        key = match.group(1).upper()
+        if any(key == suffix or key.endswith(f"_{suffix}") for suffix in _SENSITIVE_KEY_SUFFIXES):
+            return True
+    return False
 
 
 def validate_candidate_path(path: str | os.PathLike[str], workspace: str | os.PathLike[str] | None = None) -> str:
@@ -90,8 +105,7 @@ def validate_fragment(fragment: str | bytes, *, max_bytes: int = MAX_TEMPLATE_BY
         raise AtlasError("invalid_fragment")
     if any(ord(char) < 32 and char not in "\t\n\r" for char in text):
         raise AtlasError("unsafe_fragment")
-    redacted = _CREDENTIAL.sub("[REDACTED]", text)
-    if redacted != text:
+    if _contains_credential(text):
         raise AtlasError("credential_detected")
     return text
 

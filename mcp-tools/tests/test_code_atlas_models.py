@@ -166,6 +166,13 @@ def test_freeze_json_is_idempotent_for_tagged_containers(payload: object) -> Non
         "token = exampleSecret123",
         "Authorization: Bearer abcdefghijklmnop",
         "-----BEGIN PRIVATE KEY-----",
+        "OPENAI_API_KEY=sk-exampleSecret123",
+        "MY_GITHUB_TOKEN=ghp_exampleSecret123",
+        "DATABASE_PASSWORD=exampleSecret123",
+        "SERVICE_ACCESS_TOKEN=exampleSecret123",
+        "CLIENT_SECRET=exampleSecret123",
+        "sk-exampleSecret123",
+        "ghp_exampleSecret123",
     ],
 )
 def test_fragment_rejects_credentials_without_returning_them(fragment: str) -> None:
