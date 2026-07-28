@@ -1172,7 +1172,7 @@ def _stream_cas_blob(
             retained = 0
             remaining = opened.st_size
             while remaining:
-                chunk = stream.read(_READ_CHUNK_SIZE)
+                chunk = stream.read(min(_READ_CHUNK_SIZE, remaining))
                 if not chunk or len(chunk) > remaining:
                     raise _error("INDEX_CORRUPT")
                 digest.update(chunk)
@@ -1182,7 +1182,7 @@ def _stream_cas_blob(
                         raise _error("INDEX_CORRUPT")
                     retained += len(chunk)
                     chunks.append(chunk)
-            if stream.read(_READ_CHUNK_SIZE):
+            if stream.read(1):
                 raise _error("INDEX_CORRUPT")
         _safe_storage_directory(cas_root, path.parent, create=False)
         after = path.lstat()
