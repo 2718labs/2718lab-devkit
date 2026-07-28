@@ -32,6 +32,8 @@ from .models import (
 from .security import (
     MAX_CHANGED_FILES,
     MAX_COMMAND_SPEC_BYTES,
+    MAX_GRAPH_EDGES,
+    MAX_GRAPH_NODES,
     MAX_RECIPE_BYTES,
     MAX_SLOT_COUNT,
     MAX_TEMPLATE_BYTES,
@@ -325,7 +327,7 @@ def _binding_hash(
 
 
 def _valid_command_spec(value: object) -> tuple[str, ...] | None:
-    if not isinstance(value, tuple) or not value:
+    if not isinstance(value, tuple):
         return None
     if any(not isinstance(part, str) or not part for part in value):
         return None
@@ -336,6 +338,63 @@ def _valid_command_spec(value: object) -> tuple[str, ...] | None:
     if byte_count > MAX_COMMAND_SPEC_BYTES:
         return None
     return value
+
+
+def _receipt_command_spec(value: object, *, kind: object) -> tuple[str, ...] | None:
+    spec = _valid_command_spec(value)
+    if spec is None or kind not in {"command", "write"}:
+        return None
+    if kind == "command" and not spec:
+        return None
+    return spec
+
+
+def _metadata_exceeds_graph_budget(request: ExtractionRequest) -> bool:
+    """Bound all task metadata before any graph fan-out is materialized."""
+
+    scope_count = len(request.write_scope)
+    before_count = len(request.before_files)
+    after_count = len(request.after_files)
+    changed_count = len(request.changed_nodes)
+    coverage_count = len(request.coverage_gaps)
+    receipt_count = len(request.execution_receipts)
+    metadata_count = (
+        scope_count
+        + before_count
+        + after_count
+        + changed_count
+        + coverage_count
+        + receipt_count
+    )
+    if metadata_count > MAX_GRAPH_NODES:
+        return True
+
+    path_upper_bound = before_count + after_count
+    source_upper_bound = 1 + path_upper_bound + changed_count
+    receipt_node_upper_bound = 1 + receipt_count
+    verification_upper_bound = 1 + receipt_count
+    episode_node_upper_bound = (
+        2 + source_upper_bound + receipt_node_upper_bound + verification_upper_bound
+    )
+    episode_edge_upper_bound = (
+        1
+        + source_upper_bound
+        + receipt_node_upper_bound
+        + verification_upper_bound * (1 + source_upper_bound)
+    )
+    recipe_node_upper_bound = 2 + path_upper_bound + (2 * MAX_SLOT_COUNT)
+    recipe_edge_upper_bound = (
+        3
+        + source_upper_bound
+        + path_upper_bound
+        + (2 * MAX_SLOT_COUNT)
+        + receipt_node_upper_bound
+        + verification_upper_bound
+    )
+    return (
+        episode_node_upper_bound + recipe_node_upper_bound > MAX_GRAPH_NODES
+        or episode_edge_upper_bound + recipe_edge_upper_bound > MAX_GRAPH_EDGES
+    )
 
 
 def _validate_receipts(
@@ -364,7 +423,8 @@ def _validate_receipts(
         if not isinstance(receipt, BoundExecutionReceipt):
             _safe_gap(gaps, "VERIFICATION_FAILED", detail="invalid_receipt")
             continue
-        spec = _valid_command_spec(receipt.command_spec)
+        raw_spec = _valid_command_spec(receipt.command_spec)
+        spec = _receipt_command_spec(receipt.command_spec, kind=receipt.kind)
         binding_mismatch = (
             receipt.workflow_id != request.workflow_id
             or receipt.task_id != request.task_id
@@ -375,8 +435,11 @@ def _validate_receipts(
             or output_hash is None
             or receipt.input_hash != input_hash
             or receipt.output_hash != output_hash
-            or spec is None
-            or receipt.command_spec_hash != canonical_hash(spec)
+            or raw_spec is None
+            or (
+                raw_spec is not None
+                and receipt.command_spec_hash != canonical_hash(raw_spec)
+            )
         )
         if binding_mismatch:
             _safe_gap(gaps, "SNAPSHOT_MISMATCH", detail="receipt_binding")
@@ -604,6 +667,27 @@ class PythonRecipeExtractor:
     languages = frozenset({"python"})
 
     def extract(self, request: ExtractionRequest) -> ExtractionResult:
+        intent = (
+            normalize_intent_id(request.intent_id)
+            if isinstance(request.intent_id, str)
+            else ""
+        )
+        if _metadata_exceeds_graph_budget(request):
+            artifacts = self._build_episode(
+                request,
+                intent,
+                {},
+                {},
+                (),
+                compact=True,
+            )
+            return ExtractionResult(
+                eligible=False,
+                gaps=(ExtractionGap("SIZE_LIMIT", detail="metadata_budget"),),
+                nodes=artifacts.nodes,
+                edges=artifacts.edges,
+                episode_id=artifacts.episode.node_id,
+            )
         gaps: list[ExtractionGap] = []
         scope = _normalize_scope(request.write_scope, gaps=gaps)
         before = _observe_files(request.before_files, gaps=gaps)
@@ -615,11 +699,6 @@ class PythonRecipeExtractor:
             or request.task_kind.strip().casefold() != "code"
         ):
             _safe_gap(gaps, "UNSUPPORTED_EDIT_SHAPE", detail="task_kind")
-        intent = (
-            normalize_intent_id(request.intent_id)
-            if isinstance(request.intent_id, str)
-            else ""
-        )
         if not intent:
             _safe_gap(gaps, "UNSUPPORTED_EDIT_SHAPE", detail="intent")
         if not all(
@@ -767,6 +846,8 @@ class PythonRecipeExtractor:
         before: Mapping[str, _ObservedFile],
         after: Mapping[str, _ObservedFile],
         paths: Sequence[str],
+        *,
+        compact: bool = False,
     ) -> _EpisodeArtifacts:
         source_hashes = tuple(
             value
@@ -783,6 +864,13 @@ class PythonRecipeExtractor:
             "provenance": "observed",
             "source_hashes": source_hashes,
         }
+        emitted_paths: Sequence[str] = () if compact else paths
+        emitted_changed_nodes: Sequence[IndexNode] = (
+            () if compact else request.changed_nodes
+        )
+        emitted_receipts: Sequence[BoundExecutionReceipt] = (
+            () if compact else request.execution_receipts
+        )
         episode = AtlasNode.create(
             NodeKind.TASK_EPISODE,
             {
@@ -823,7 +911,7 @@ class PythonRecipeExtractor:
             **options,
         )
         source_evidence = [summary_source]
-        for path in paths:
+        for path in emitted_paths:
             before_file = before.get(path)
             after_file = after.get(path)
             source_evidence.append(
@@ -847,8 +935,8 @@ class PythonRecipeExtractor:
                     **options,
                 )
             )
-        touched_paths = set(paths)
-        for changed_node in request.changed_nodes:
+        touched_paths = set(emitted_paths)
+        for changed_node in emitted_changed_nodes:
             if not isinstance(changed_node, IndexNode):
                 continue
             path = _normalize_relative_path(changed_node.path)
@@ -892,7 +980,7 @@ class PythonRecipeExtractor:
                 **options,
             )
         ]
-        for receipt in request.execution_receipts:
+        for receipt in emitted_receipts:
             if not isinstance(receipt, BoundExecutionReceipt):
                 continue
             receipt_node = AtlasNode.create(

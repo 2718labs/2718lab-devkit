@@ -22,7 +22,12 @@ from code_atlas.extractors import (
     render_operations,
 )
 from code_atlas.models import AtlasError, TemplateOperation
-from code_atlas.security import MAX_RECIPE_BYTES, MAX_TEMPLATE_BYTES
+from code_atlas.security import (
+    MAX_GRAPH_EDGES,
+    MAX_GRAPH_NODES,
+    MAX_RECIPE_BYTES,
+    MAX_TEMPLATE_BYTES,
+)
 from code_atlas.store import AtlasStore
 from project_index.checkpoints import CheckpointFile
 from project_index.models import CoverageGap, IndexNode, SnapshotFile
@@ -112,7 +117,7 @@ def _bind(request: ExtractionRequest) -> ExtractionRequest:
                 request,
                 receipt_id="write-1",
                 kind="write",
-                command_spec=("apply_patch",),
+                command_spec=(),
             ),
             _receipt(
                 request,
@@ -319,6 +324,97 @@ def test_python_append_shape_round_trips_and_is_repeatable() -> None:
     )
     assert "return value > 0" not in serialized
     assert "from src.guards import VALUE" not in serialized
+
+
+@pytest.mark.parametrize(
+    "metadata_kind", ["changed_nodes", "receipts", "coverage_gaps"]
+)
+def test_graph_metadata_budget_returns_a_bounded_compact_episode(
+    metadata_kind: str,
+) -> None:
+    request = _primary_request()
+    if metadata_kind == "changed_nodes":
+        node = request.changed_nodes[0]
+        request = replace(
+            request,
+            changed_nodes=tuple(
+                replace(node, node_id=f"changed-node-{index}") for index in range(250)
+            ),
+        )
+    elif metadata_kind == "receipts":
+        request = replace(
+            request,
+            execution_receipts=(
+                request.execution_receipts[0],
+                *(
+                    _receipt(
+                        request,
+                        receipt_id=f"command-{index}",
+                        kind="command",
+                        command_spec=("python", "-m", "pytest", str(index)),
+                    )
+                    for index in range(250)
+                ),
+            ),
+        )
+    else:
+        request = replace(
+            request,
+            coverage_gaps=tuple(
+                CoverageGap(
+                    "src/guards.py",
+                    f"GAP_{index}",
+                    f"atlas-fake-coverage-{index}",
+                )
+                for index in range(250)
+            ),
+        )
+
+    result = PythonRecipeExtractor().extract(request)
+
+    assert result.eligible is False
+    assert _codes(result) == ("SIZE_LIMIT",)
+    assert result.episode_id
+    assert any(node.kind.value == "TaskEpisode" for node in result.nodes)
+    assert len(result.nodes) <= MAX_GRAPH_NODES
+    assert len(result.edges) <= MAX_GRAPH_EDGES
+
+
+def test_empty_write_receipt_is_a_valid_canonical_task9_binding() -> None:
+    request = _primary_request()
+    write = replace(
+        request.execution_receipts[0],
+        command_spec=(),
+        command_spec_hash=canonical_hash(()),
+    )
+    request = replace(
+        request,
+        execution_receipts=(write, request.execution_receipts[1]),
+    )
+
+    result = PythonRecipeExtractor().extract(request)
+
+    assert result.eligible is True
+    assert result.gaps == ()
+
+
+def test_empty_command_receipt_is_still_a_verification_failure() -> None:
+    request = _primary_request()
+    command = replace(
+        request.execution_receipts[1],
+        command_spec=(),
+        command_spec_hash=canonical_hash(()),
+    )
+    request = replace(
+        request,
+        execution_receipts=(request.execution_receipts[0], command),
+    )
+
+    result = PythonRecipeExtractor().extract(request)
+
+    assert result.eligible is False
+    assert "VERIFICATION_FAILED" in _codes(result)
+    assert "SNAPSHOT_MISMATCH" not in _codes(result)
 
 
 def test_created_python_file_round_trips() -> None:
