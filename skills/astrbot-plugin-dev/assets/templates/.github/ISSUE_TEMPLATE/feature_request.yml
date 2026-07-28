@@ -1,0 +1,108 @@
+name: '🎉 功能建议'
+description: 提交建议帮助我们改进。
+title: '[Feature] '
+labels: [ 'type/feat' ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您抽出时间提出新功能建议，请准确解释您的想法。
+
+  - type: textarea
+    attributes:
+      label: 描述
+      description: 简短描述您的功能建议。
+      placeholder: >
+        请简要说明你希望新增、改进或调整的功能。
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 使用场景
+      description: 你想要发生什么？
+      placeholder: >
+        一个清晰且具体的描述这个功能的使用场景。
+    validations:
+      required: true
+
+  - type: dropdown
+    attributes:
+      label: 你希望该功能主要服务于哪个消息平台？
+      description: 请选择最主要的平台。如该建议希望兼容全部平台，可选择“其他平台”并在下方补充说明中填写“全平台”或具体范围。
+      options:
+        - 'QQ 官方机器人 (Websockets 方式)'
+        - 'QQ 官方机器人 (Webhook 方式)'
+        - 'OneBot v11 (原 QQ 个人号)'
+        - '企微应用'
+        - '企微智能机器人'
+        - '微信公众号'
+        - '个人微信'
+        - '飞书'
+        - '钉钉'
+        - 'Telegram'
+        - 'LINE'
+        - 'Slack'
+        - 'Misskey'
+        - 'Discord'
+        - 'KOOK'
+        - 'Satori (接入 Satori)'
+        - 'Satori (使用 server-satori)'
+        - 'Matrix (社区提供)'
+        - 'VoceChat (社区提供)'
+        - '其他平台'
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: 其他平台名称（如选择“其他平台”请填写）
+      description: 如果你上面选择了“其他平台”，请在这里补充实际平台名称；否则可留空。
+      placeholder: '如: 全平台 / 自定义适配器 / 某社区平台'
+
+  - type: dropdown
+    attributes:
+      label: 当前主要部署方式（可选）
+      description: 如果该建议与你的运行环境有关，请选择最接近的一项。
+      options:
+        - 'uv 一键部署'
+        - 'Docker / Docker Compose 部署'
+        - 'RainYun 一键云部署'
+        - 'AstrBot App 桌面应用部署'
+        - 'AstrBot Launcher 部署'
+        - 'Replit 部署'
+        - 'AUR 部署'
+        - 'BT-Panel 部署'
+        - '1Panel 部署'
+        - 'CasaOS 部署'
+        - '手动部署（CLI / 源码 / uv）'
+        - '其他'
+        - '不确定'
+
+  - type: textarea
+    attributes:
+      label: 补充说明（可选）
+      description: >
+        如该建议与 AstrBot 版本、插件版本、多个平台兼容性或特殊部署环境有关，请在这里补充。
+      placeholder: >
+        如: 希望 Telegram、飞书和 QQ 官机表现一致；当前部署在 Docker；建议优先支持 XX 功能等。
+
+  - type: checkboxes
+    attributes:
+      label: 你愿意提交 PR 吗?
+      description: >
+        这不是必须的，但我们欢迎您的贡献。
+      options:
+        - label: 是的, 我愿意提交PR!
+
+  - type: checkboxes
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: >
+            我已阅读并同意遵守该项目的 [行为准则](https://docs.github.com/zh/site-policy/github-terms/github-community-code-of-conduct)。
+          required: true
+
+  - type: markdown
+    attributes:
+      value: '感谢您填写我们的表单！'

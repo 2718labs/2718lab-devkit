@@ -1,0 +1,45 @@
+# 库/CLI 模板(src-layout,发布到 PyPI 或会被 import 的项目用这个)
+# 使用方法:复制本文件到新项目根目录,把所有 <package_name> / <package-name> 占位符替换掉,
+# 再跑一次 `uv init --build-backend uv`(或手动核对 [build-system] 里的 uv_build 版本号是否与本地 uv 一致)。
+
+[project]
+name = "<package-name>"              # PyPI/仓库名,可用连字符;import 时会自动变成下划线版本
+version = "0.1.0"                    # 唯一版本来源。必须合法 PEP 440:禁止 "v" 前缀、禁止裸连字符预发布(如 "1.0.0-alpha")
+description = "一句话描述这个项目。"
+readme = "README.md"
+requires-python = ">=3.10"           # 3.9 已 EOL(2025-10);新项目建议 >=3.11
+dependencies = [
+    # "httpx>=0.27",                 # 用下界 >=,禁止无理由 == 钉死
+]
+
+[project.scripts]
+# <package_name> = "<package_name>.cli:main"   # 有 CLI 入口才需要,没有就删掉本节
+
+[dependency-groups]                  # 开发工具进这里,不进 dependencies
+dev = [
+    "ruff>=0.8",
+    "pyright>=1.1",
+    "pytest>=8.0",
+]
+
+# 纯 Python 项目用 uv_build;有构建脚本或 C 扩展改用 hatchling(见 references/pyproject-reference.md 第 3 节)
+# 后端字符串逐字照抄,不要自创变体
+[build-system]
+requires = ["uv_build>=0.8.3,<0.9.0"]  # 版本号以 `uv init` 实际生成的为准
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"             # 对齐 requires-python 下界
+
+[tool.ruff.lint]
+# 默认零配置只有 E4/E7/E9/F,这里显式加了 I(import 排序)和 UP(语法升级建议)
+select = ["E4", "E7", "E9", "F", "I", "UP"]
+
+[tool.pyright]
+typeCheckingMode = "standard"        # off / basic / standard / strict,团队最低要求 standard
+include = ["src"]
+pythonVersion = "3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

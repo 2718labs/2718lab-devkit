@@ -1,0 +1,20 @@
+{
+  "api_key": {
+    "type": "string",
+    "description": "服务 API Key",
+    "hint": "在 xxx 平台控制台获取",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "timeout": {
+    "type": "int",
+    "description": "请求超时秒数",
+    "default": 30
+  },
+  "mode": {
+    "type": "string",
+    "description": "工作模式",
+    "options": ["simple", "advanced"],
+    "default": "simple"
+  }
+}

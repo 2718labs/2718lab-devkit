@@ -1,0 +1,90 @@
+name: '🎨 设计 / 交互建议'
+title: '[Design] '
+description: 提交 UI、交互流程或使用体验方面的建议。
+labels: [ 'type/design' ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您抽出时间提出设计或交互建议！如果您对管理面板、配置流程、信息展示、反馈机制或整体使用体验有改进想法，欢迎通过该模板与我们分享。
+
+  - type: textarea
+    attributes:
+      label: 你想改进的设计或交互是什么？
+      description: 请描述当前存在的问题，或你希望优化的体验环节。
+      placeholder: >
+        如: 某个配置流程步骤较多，状态反馈不够明显，用户不容易判断当前是否已经生效。
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 当前体验中的问题
+      description: 请说明当前设计让你感到困惑、不顺畅或效率较低的地方。
+      placeholder: >
+        如: 用户需要频繁切换页面才能完成配置；错误提示过于简短；成功状态缺少明确反馈。
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 建议的改进方案
+      description: 请描述你的改进思路。可以是文字说明、流程建议、信息层级调整，或交互草案。
+      placeholder: >
+        如: 将相关配置集中展示，增加分组标题、状态提示和默认示例，减少首次使用的理解成本。
+    validations:
+      required: true
+
+  - type: dropdown
+    attributes:
+      label: 建议主要涉及哪一类设计问题？
+      description: 请选择最接近的一项。
+      multiple: false
+      options:
+        - '管理面板 UI 布局'
+        - '配置流程与交互逻辑'
+        - '提示文案与状态反馈'
+        - '信息展示与可读性'
+        - '移动端或小屏适配体验'
+        - '其他'
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 使用场景
+      description: 请描述该设计建议最常出现在哪类使用场景中。
+      placeholder: >
+        如: 初次安装插件时、调整配置时、查看运行状态时、排查异常时等。
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: 参考资料（可选）
+      description: >
+        如原型图、截图、示意图、竞品案例或你整理的流程说明，都可以附在这里。
+      placeholder: >
+        可粘贴截图链接、原型说明、参考界面或其他辅助材料。
+    validations:
+      required: false
+
+  - type: checkboxes
+    attributes:
+      label: 你愿意参与后续设计讨论或提交 PR 吗？
+      description: >
+        这不是必须的，但如果你愿意继续参与，我们会非常欢迎。
+      options:
+        - label: 是的，我愿意继续参与设计讨论或提交 PR!
+
+  - type: checkboxes
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: >
+            我已阅读并同意遵守该项目的 [行为准则](https://docs.github.com/zh/site-policy/github-terms/github-community-code-of-conduct)。
+          required: true
+
+  - type: markdown
+    attributes:
+      value: "感谢您填写我们的表单！"

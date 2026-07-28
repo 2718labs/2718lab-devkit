@@ -1,0 +1,41 @@
+{
+  "name": "2718lab-devkit",
+  "version": "0.2.0+codex.20260725190515",
+  "description": "2718lab development toolkit with Bugkiller workflow orchestration, plugin-bundled roles, and MCP coordination.",
+  "author": {
+    "name": "2718lab",
+    "url": "https://github.com/2718lab"
+  },
+  "homepage": "https://github.com/2718lab/2718lab-devkit",
+  "repository": "https://github.com/2718lab/2718lab-devkit",
+  "license": "AGPL-3.0",
+  "keywords": [
+    "astrbot",
+    "mcp",
+    "fastmcp",
+    "python-engineering",
+    "open-source",
+    "chatbot-plugin",
+    "skills"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "2718lab DevKit",
+    "shortDescription": "Bugkiller \u4e0e 2718lab \u5de5\u7a0b\u5f00\u53d1\u5de5\u5177\u5305",
+    "longDescription": "\u9762\u5411 Codex \u7684 Bugkiller \u591a\u4ee3\u7406\u5de5\u4f5c\u6d41\uff0c\u4ee5\u53ca AstrBot \u63d2\u4ef6\u3001MCP \u670d\u52a1\u3001Python \u5de5\u7a0b\u3001\u5f00\u6e90\u4ed3\u5e93\u8fd0\u8425\u4e0e\u4ea4\u4ed8\u9a8c\u8bc1\u5de5\u5177\u5305\u3002",
+    "developerName": "2718lab",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Skills",
+      "MCP",
+      "Agents"
+    ],
+    "websiteURL": "https://github.com/2718lab/2718lab-devkit",
+    "defaultPrompt": [
+      "\u7528 Bugkiller \u5206\u8bca\u3001\u4fee\u590d\u5e76\u9a8c\u8bc1\u5f53\u524d\u4ed3\u5e93\u4e2d\u7684\u8fd9\u4e2a\u95ee\u9898\u3002",
+      "\u6309 2718lab \u89c4\u8303\u521b\u5efa\u4e00\u4e2a AstrBot \u63d2\u4ef6\u3002",
+      "\u6309 2718lab \u89c4\u8303\u521b\u5efa\u6216\u68c0\u67e5\u4e00\u4e2a Python MCP \u670d\u52a1\u3002"
+    ]
+  }
+}

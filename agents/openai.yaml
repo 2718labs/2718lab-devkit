@@ -1,0 +1,4 @@
+interface:
+  display_name: Bugkiller
+  short_description: Bounded bug triage, patching, and verification workflow.
+  default_prompt: Triage this bug through Bugkiller with the assigned task card and direct contracts.

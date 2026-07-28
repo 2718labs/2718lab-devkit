@@ -1,0 +1,14 @@
+# 必填四项:name / desc / version / author;团队强制补 repo 与 astrbot_version
+name: astrbot_plugin_example        # 全小写、下划线、合法 Python 标识符;安装时目录会重命名为它
+display_name: 示例插件               # 展示名(AstrBot >= v4.5.0)
+desc: 一句话描述插件功能。
+short_desc: 市场卡片短描述。
+version: v0.1.0                     # 与 git tag、CHANGELOG 三处一致
+author: YourTeamName
+repo: https://github.com/yourteam/astrbot_plugin_example   # 不带 .git 后缀;不填用户无法更新
+astrbot_version: ">=4.16,<5"        # PEP 440,不带 v 前缀;按实测最低版本填
+support_platforms:                  # 按实测填写;合法值见 api-reference / 官方文档(全量合法值见 guidelines.md 3.5)
+  - aiocqhttp
+  # 官方 helloworld 模板列出的完整平台清单供参考(逐一实测过再填,没测过的平台不要照抄):
+  # aiocqhttp, qq_official, telegram, wecom, lark, dingtalk, discord, slack, kook,
+  # vocechat, weixin_official_account, satori, misskey, line
