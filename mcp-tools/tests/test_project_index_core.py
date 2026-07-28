@@ -758,3 +758,27 @@ def test_snapshot_file_reader_rejects_stale_foreign_and_unsafe_inputs(
         )
     assert captured.value.code == "INDEX_STALE"
     service.close()
+
+
+def test_snapshot_file_reader_captures_each_target_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "module.py").write_bytes(b"VALUE = 1\n")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    observed: list[str] = []
+    original = service_module._capture_regular_file
+
+    def counted(path: Path) -> bytes:
+        observed.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(service_module, "_capture_regular_file", counted)
+    files = service.read_snapshot_files(
+        workspace, snapshot.snapshot_id, ("module.py",), byte_budget=1024
+    )
+    assert files[0].body == b"VALUE = 1\n"
+    assert observed.count("module.py") == 1
+    service.close()

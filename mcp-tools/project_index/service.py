@@ -433,6 +433,24 @@ class ProjectIndexService:
         root = self._canonical_workspace(workspace)
         return self._require_snapshot(root, snapshot_id)
 
+    def _assert_current_with_files(
+        self,
+        root: Path,
+        snapshot_id: str,
+        captured_files: Sequence[SourceFile],
+    ) -> IndexSnapshot:
+        snapshot = self._require_snapshot(root, snapshot_id)
+        expected = self._store.file_hashes(snapshot.snapshot_id)
+        current = {source.path: source.content_hash for source in captured_files}
+        if any(
+            expected.get(path) != current.get(path)
+            for path in set(expected).union(current)
+        ):
+            raise IndexError(
+                "INDEX_STALE", "project index snapshot does not match the workspace"
+            )
+        return snapshot
+
     def snapshot_facts(self, workspace: str | Path, snapshot_id: str) -> SnapshotFacts:
         root = self._canonical_workspace(workspace)
         snapshot = self._require_snapshot(root, snapshot_id)
@@ -468,8 +486,15 @@ class ProjectIndexService:
             raise IndexError("INVALID_QUERY", "byte_budget must be a positive integer")
         normalized_paths = self._normalize_read_paths(paths)
         root = self._canonical_workspace(workspace)
-        self.assert_current(root, snapshot_id)
+        snapshot = self._require_snapshot(root, snapshot_id)
+        captured_files = self._collect_files(
+            root,
+            self._store.include_paths(snapshot.snapshot_id),
+            error_code="INDEX_STALE",
+        )
+        self._assert_current_with_files(root, snapshot_id, captured_files)
         expected_hashes = self._store.file_hashes(snapshot_id)
+        captured_by_path = {source.path: source for source in captured_files}
         files: list[SnapshotFile] = []
         used_bytes = 0
         for relative_path in normalized_paths:
@@ -478,11 +503,12 @@ class ProjectIndexService:
                 raise IndexError(
                     "NOT_FOUND", "project index source file was not snapshotted"
                 )
-            body = _read_verified_workspace_file(root, relative_path)
-            if _content_hash(body) != expected_hash:
+            source = captured_by_path.get(relative_path)
+            if source is None or source.content_hash != expected_hash:
                 raise IndexError(
                     "INDEX_STALE", "project index source hash no longer matches"
                 )
+            body = source.data
             used_bytes += len(body)
             if used_bytes > byte_budget:
                 raise IndexError("INVALID_QUERY", "byte_budget exceeded")
@@ -554,7 +580,11 @@ class ProjectIndexService:
         return normalized
 
     def _collect_files(
-        self, root: Path, include_paths: Sequence[str]
+        self,
+        root: Path,
+        include_paths: Sequence[str],
+        *,
+        error_code: str = "INDEX_UNAVAILABLE",
     ) -> tuple[SourceFile, ...]:
         files: list[SourceFile] = []
         database_names = {
@@ -585,11 +615,12 @@ class ProjectIndexService:
                 ):
                     continue
                 try:
-                    data = full_path.read_bytes()
-                except OSError as exc:
+                    data = _capture_regular_file(full_path)
+                except IndexError as exc:
+                    if exc.code == error_code:
+                        raise
                     raise IndexError(
-                        "INDEX_UNAVAILABLE",
-                        f"workspace file is unreadable: {relative_path}",
+                        error_code, f"workspace file is unreadable: {relative_path}"
                     ) from exc
                 content_hash = _content_hash(data)
                 try:
@@ -741,14 +772,18 @@ def _verified_workspace_file(root: Path, relative_path: str) -> Path:
     return candidate
 
 
-def _read_verified_workspace_file(root: Path, relative_path: str) -> bytes:
-    candidate = _verified_workspace_file(root, relative_path)
+def _capture_regular_file(candidate: Path) -> bytes:
     try:
         before = candidate.lstat()
         if _unsafe_stat_result(before) or not stat.S_ISREG(before.st_mode):
             raise IndexError("INDEX_STALE", "project index source path is not regular")
         descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-        with os.fdopen(descriptor, "rb") as stream:
+        try:
+            stream = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
             opened = os.fstat(stream.fileno())
             if _unsafe_stat_result(opened) or not stat.S_ISREG(opened.st_mode):
                 raise IndexError(
