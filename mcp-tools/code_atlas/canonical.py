@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from types import MappingProxyType
 from typing import Any
 
 
@@ -16,7 +15,7 @@ FrozenJson = Any
 def freeze_json(value: Any) -> FrozenJson:
     """Recursively make a JSON-like value immutable."""
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): freeze_json(item) for key, item in value.items()})
+        return tuple(sorted(((str(key), freeze_json(item)) for key, item in value.items()), key=lambda item: item[0]))
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return tuple(freeze_json(item) for item in value)
     return value
@@ -27,6 +26,8 @@ def thaw_json(value: FrozenJson) -> Any:
     if isinstance(value, Mapping):
         return {str(key): thaw_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
+        if all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value):
+            return {key: thaw_json(item) for key, item in value}
         return [thaw_json(item) for item in value]
     return value
 
@@ -48,15 +49,32 @@ def canonical_hash(value: Any) -> str:
     return f"sha256:{digest}"
 
 
-def canonical_id(value: Any) -> str:
-    """Return the canonical identifier for content-addressed Atlas data."""
-    return canonical_hash(value)
+def canonical_id(
+    kind: str,
+    payload: Any,
+    *,
+    schema_version: str = "1",
+    extractor_id: str = "",
+    extractor_version: str = "",
+    provenance: str = "declared",
+    source_hashes: tuple[str, ...] | list[str] = (),
+) -> str:
+    """Hash exactly the immutable node identity fields."""
+    return canonical_hash({
+        "kind": kind,
+        "schema_version": schema_version,
+        "extractor_id": extractor_id,
+        "extractor_version": extractor_version,
+        "provenance": provenance,
+        "payload": payload,
+        "source_hashes": list(source_hashes),
+    })
 
 
-_INTENT_SEPARATORS = re.compile(r"[^a-z0-9]+")
+_INTENT_SEPARATORS = re.compile(r"[^a-z0-9.]+")
 
 
 def normalize_intent_id(value: str) -> str:
     """Normalize a human intent label to a stable dotted identifier."""
-    normalized = _INTENT_SEPARATORS.sub("-", value.strip().casefold()).strip("-")
-    return normalized.replace("-", ".", 1) if "." not in normalized and "-" in normalized else normalized
+    normalized = _INTENT_SEPARATORS.sub("-", value.strip().casefold())
+    return re.sub(r"\.{2,}", ".", normalized).strip("-.")

@@ -43,7 +43,8 @@ def validate_candidate_path(path: str | os.PathLike[str], workspace: str | os.Pa
     if any(part.casefold() in GENERATED_COMPONENTS for part in parts):
         raise AtlasError("generated_path")
     filename = parts[-1]
-    if ".generated." in filename or filename.endswith("_pb2.py"):
+    lowered_filename = filename.casefold()
+    if ".generated." in lowered_filename or lowered_filename.endswith("_pb2.py"):
         raise AtlasError("generated_path")
     if workspace is not None:
         root = Path(workspace).resolve()
@@ -108,7 +109,8 @@ def validate_slot_value(slot_type: str, value: str) -> str:
         return value
     if slot_type == "python_statement_block":
         try:
-            ast.parse(value, mode="exec")
+            tree = ast.parse(value, mode="exec")
+            compile(tree, "<slot>", "exec")
         except SyntaxError as exc:
             raise AtlasError("invalid_slot_value") from exc
         return value

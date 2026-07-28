@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
-from typing import Any, ClassVar
+from typing import Any
 
 from .canonical import canonical_id, freeze_json, thaw_json
 
 
-class AtlasError(RuntimeError):
+class AtlasError(ValueError):
     """A safe Atlas failure whose rendered message is its stable code."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
-        super().__init__(code)
+        super().__init__(message or code)
 
 
 class NodeKind(str, Enum):
@@ -66,6 +66,8 @@ def _serialize(value: Any) -> Any:
     if is_dataclass(value):
         return {item.name: _serialize(getattr(value, item.name)) for item in fields(value)}
     if isinstance(value, tuple):
+        if all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value):
+            return thaw_json(value)
         return [_serialize(item) for item in value]
     return thaw_json(value)
 
@@ -76,15 +78,24 @@ class _Record:
         return {item.name: _serialize(getattr(self, item.name)) for item in fields(self)}
 
 
+_PROVENANCE_VALUES = frozenset({"observed", "resolved", "declared"})
+
+
+def _validate_provenance(provenance: str) -> str:
+    if provenance not in _PROVENANCE_VALUES:
+        raise AtlasError("invalid_provenance", "invalid provenance")
+    return provenance
+
+
 @dataclass(frozen=True, slots=True)
 class AtlasNode(_Record):
     node_id: str
     kind: NodeKind
     payload: Any
-    schema_version: str = "0.3"
-    extractor_id: str = "code_atlas"
-    extractor_version: str = "0.3.0"
-    provenance: Any = field(default_factory=dict)
+    schema_version: str = "1"
+    extractor_id: str = ""
+    extractor_version: str = ""
+    provenance: str = "declared"
     source_hashes: tuple[str, ...] = ()
     created_at: str | None = None
     superseded_at: str | None = None
@@ -92,7 +103,7 @@ class AtlasNode(_Record):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", freeze_json(self.payload))
-        object.__setattr__(self, "provenance", freeze_json(self.provenance))
+        object.__setattr__(self, "provenance", _validate_provenance(self.provenance))
         object.__setattr__(self, "source_hashes", tuple(self.source_hashes))
 
     @classmethod
@@ -101,29 +112,22 @@ class AtlasNode(_Record):
         kind: NodeKind,
         payload: Any,
         *,
-        schema_version: str = "0.3",
-        extractor_id: str = "code_atlas",
-        extractor_version: str = "0.3.0",
-        provenance: Any = None,
+        schema_version: str = "1",
+        extractor_id: str = "",
+        extractor_version: str = "",
+        provenance: str = "declared",
         source_hashes: tuple[str, ...] | list[str] = (),
         created_at: str | None = None,
         superseded_at: str | None = None,
         quarantine_state: str | None = None,
     ) -> "AtlasNode":
-        identity = {
-            "kind": kind.value,
-            "schema_version": schema_version,
-            "extractor_id": extractor_id,
-            "extractor_version": extractor_version,
-            "provenance": {} if provenance is None else provenance,
-            "payload": payload,
-            "source_hashes": list(source_hashes),
-        }
         return cls(
-            node_id=canonical_id(identity), kind=kind, payload=payload,
+            node_id=canonical_id(kind.value, payload, schema_version=schema_version,
+                                 extractor_id=extractor_id, extractor_version=extractor_version,
+                                 provenance=provenance, source_hashes=source_hashes), kind=kind, payload=payload,
             schema_version=schema_version, extractor_id=extractor_id,
             extractor_version=extractor_version,
-            provenance={} if provenance is None else provenance,
+            provenance=provenance,
             source_hashes=tuple(source_hashes), created_at=created_at,
             superseded_at=superseded_at, quarantine_state=quarantine_state,
         )
@@ -153,32 +157,32 @@ class AtlasEdge(_Record):
     source_kind: NodeKind
     target_kind: NodeKind
     payload: Any = field(default_factory=dict)
-    schema_version: str = "0.3"
-    provenance: Any = field(default_factory=dict)
+    schema_version: str = "1"
+    provenance: str = "declared"
     created_at: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", freeze_json(self.payload))
-        object.__setattr__(self, "provenance", freeze_json(self.provenance))
+        object.__setattr__(self, "provenance", _validate_provenance(self.provenance))
 
     @classmethod
     def create(
         cls, relation: EdgeRelation, source: AtlasNode, target: AtlasNode, *, payload: Any = None,
-        schema_version: str = "0.3", provenance: Any = None, created_at: str | None = None,
+        schema_version: str = "1", provenance: str = "declared", created_at: str | None = None,
     ) -> "AtlasEdge":
         allowed_source, allowed_target = _ENDPOINTS[relation]
         if source.kind not in allowed_source or target.kind not in allowed_target:
-            raise AtlasError("invalid_edge_endpoints")
+            raise AtlasError("invalid_edge_endpoints", "invalid edge endpoints")
         identity = {
             "relation": relation.value, "source_id": source.node_id, "target_id": target.node_id,
-            "schema_version": schema_version, "provenance": {} if provenance is None else provenance,
+            "schema_version": schema_version, "provenance": provenance,
             "payload": {} if payload is None else payload,
         }
         return cls(
             edge_id=canonical_id(identity), relation=relation, source_id=source.node_id,
             target_id=target.node_id, source_kind=source.kind, target_kind=target.kind,
             payload={} if payload is None else payload, schema_version=schema_version,
-            provenance={} if provenance is None else provenance, created_at=created_at,
+            provenance=provenance, created_at=created_at,
         )
 
 
@@ -228,7 +232,7 @@ class TemplateOperation(_Record):
 class RecipeManifest(_Record):
     recipe_id: str
     recipe_key: str
-    version: str
+    version: int
     intent_id: str
     language_name: str
     language_extractor_version: str
@@ -244,11 +248,13 @@ class RecipeManifest(_Record):
     operations: tuple[TemplateOperation, ...] = ()
     provenance_kind: str = ""
     provenance_source: str = ""
-    schema_version: str = "0.3"
+    schema_version: str = "1"
     superseded_ids: tuple[str, ...] = ()
     quarantine_state: str | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.version, bool) or not isinstance(self.version, int):
+            raise AtlasError("invalid_version", "invalid version")
         for name in ("slots", "constraints", "dependencies", "tests", "operations", "superseded_ids"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
@@ -268,7 +274,7 @@ class GraphQueryResult(_Record):
 class ImplementationPacket(_Record):
     packet_id: str
     trace_id: str
-    workspace_id: str
+    workspace: str
     snapshot_id: str
     recipe_id: str
     node_ids: tuple[str, ...] = ()
@@ -330,7 +336,7 @@ class ExtractionGap(_Record):
 class ExtractionResult(_Record):
     eligible: bool
     manifest: RecipeManifest | None = None
-    bindings: Any = field(default_factory=dict)
+    original_bindings: Any = field(default_factory=dict)
     gaps: tuple[ExtractionGap, ...] = ()
     nodes: tuple[AtlasNode, ...] = ()
     edges: tuple[AtlasEdge, ...] = ()
@@ -338,7 +344,7 @@ class ExtractionResult(_Record):
     episode_id: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "bindings", freeze_json(self.bindings))
+        object.__setattr__(self, "original_bindings", freeze_json(self.original_bindings))
         for name in ("gaps", "nodes", "edges", "blobs"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 

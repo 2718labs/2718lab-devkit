@@ -1,12 +1,26 @@
 """Deterministic, data-only contracts for Code Atlas."""
 
-from .models import AtlasEdge, AtlasError, AtlasNode, AtlasStatus, EdgeRelation, NodeKind
+from .canonical import canonical_hash, canonical_id, canonical_json, freeze_json, normalize_intent_id, thaw_json
+from .models import (
+    AcceptanceProjection, AtlasEdge, AtlasError, AtlasNode, AtlasStatus, ConstraintSpec,
+    DependencySpec, EdgeRelation, ExtractionGap, ExtractionResult, GraphQueryResult,
+    ImplementationPacket, IngestionReceipt, NodeKind, PreparationResult, RecipeManifest,
+    RenderResult, SlotSpec, TemplateOperation, TestSpec,
+)
+from .security import (
+    GENERATED_COMPONENTS, MAX_CHANGED_FILES, MAX_COMMAND_SPEC_BYTES, MAX_GRAPH_DEPTH,
+    MAX_GRAPH_EDGES, MAX_GRAPH_NODES, MAX_PACKET_BYTES, MAX_RECIPE_BYTES, MAX_SLOT_COUNT,
+    MAX_TEMPLATE_BYTES, validate_candidate_path, validate_fragment, validate_slot_value,
+)
 
 __all__ = [
-    "AtlasEdge",
-    "AtlasError",
-    "AtlasNode",
-    "AtlasStatus",
-    "EdgeRelation",
-    "NodeKind",
+    "AcceptanceProjection", "AtlasEdge", "AtlasError", "AtlasNode", "AtlasStatus",
+    "ConstraintSpec", "DependencySpec", "EdgeRelation", "ExtractionGap", "ExtractionResult",
+    "GENERATED_COMPONENTS", "GraphQueryResult", "ImplementationPacket", "IngestionReceipt",
+    "MAX_CHANGED_FILES", "MAX_COMMAND_SPEC_BYTES", "MAX_GRAPH_DEPTH", "MAX_GRAPH_EDGES",
+    "MAX_GRAPH_NODES", "MAX_PACKET_BYTES", "MAX_RECIPE_BYTES", "MAX_SLOT_COUNT",
+    "MAX_TEMPLATE_BYTES", "NodeKind", "PreparationResult", "RecipeManifest", "RenderResult",
+    "SlotSpec", "TemplateOperation", "TestSpec", "canonical_hash", "canonical_id",
+    "canonical_json", "freeze_json", "normalize_intent_id", "thaw_json",
+    "validate_candidate_path", "validate_fragment", "validate_slot_value",
 ]
