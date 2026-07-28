@@ -17,13 +17,12 @@ if str(MCP_TOOLS) not in sys.path:
 from orchestrator.models import Task, Workflow, WorkflowKind  # noqa: E402
 from orchestrator.service import OrchestratorService, ServiceError  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
+from temp_support import task_scratch  # noqa: E402
 
 
 class OrchestratorMessagingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(
-            dir="D:/bun/tmp/codex/bugkiller-plugin/orch-04"
-        )
+        self.tempdir = tempfile.TemporaryDirectory(dir=task_scratch("orchestrator-messaging"))
         self.database = Path(self.tempdir.name) / "orchestrator.sqlite"
         self.store = SQLiteStore(self.database)
         self.addCleanup(self.tempdir.cleanup)

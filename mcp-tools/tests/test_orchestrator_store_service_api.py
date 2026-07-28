@@ -21,14 +21,12 @@ from orchestrator.store import (
     VersionConflictError,
     WorkflowCancelledError,
 )
+from temp_support import task_scratch
 
 
 class SQLiteStoreServiceApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        scratch_root = Path(
-            "D:/bun/tmp/codex/bugkiller-plugin/orchestrator-store-tests"
-        )
-        scratch_root.mkdir(parents=True, exist_ok=True)
+        scratch_root = task_scratch("orchestrator-store")
         self._temporary_directory = tempfile.TemporaryDirectory(dir=scratch_root)
         self._database = Path(self._temporary_directory.name) / "orchestrator.sqlite"
         self.store = SQLiteStore(self._database)

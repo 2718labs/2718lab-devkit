@@ -14,6 +14,7 @@ from orchestrator.models import Task, Workflow, WorkflowKind
 from orchestrator.service import OrchestratorService, ServiceError
 from orchestrator.store import SQLiteStore
 from project_index import IndexError, IndexSnapshot, IndexState
+from temp_support import task_scratch
 
 
 class _IndexStub:
@@ -51,8 +52,7 @@ class _IndexStub:
 
 class StrictProjectIndexWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
-        scratch = Path("D:/bun/tmp/codex/bugkiller-plugin/strict-workflow-tests")
-        scratch.mkdir(parents=True, exist_ok=True)
+        scratch = task_scratch("strict-project-index")
         self.directory = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
