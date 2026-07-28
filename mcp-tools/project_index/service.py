@@ -423,6 +423,15 @@ class ProjectIndexService:
         snapshot_id: str,
         required_paths: Sequence[str | Path] | None = None,
     ) -> IndexSnapshot:
+        if required_paths is None:
+            root = self._canonical_workspace(workspace)
+            snapshot = self._require_snapshot(root, snapshot_id)
+            captured_files = self._collect_files(
+                root,
+                self._store.include_paths(snapshot.snapshot_id),
+                error_code="INDEX_STALE",
+            )
+            return self._assert_current_with_files(root, snapshot_id, captured_files)
         current = self.status(workspace, snapshot_id, required_paths)
         if current.state is IndexState.INDEX_UNAVAILABLE:
             raise IndexError("NOT_FOUND", "project index snapshot was not found")
@@ -615,7 +624,7 @@ class ProjectIndexService:
                 ):
                     continue
                 try:
-                    data = _capture_regular_file(full_path)
+                    data = _capture_regular_file(root, full_path)
                 except IndexError as exc:
                     if exc.code == error_code:
                         raise
@@ -756,6 +765,8 @@ def _unsafe_path(path: Path) -> bool:
 
 
 def _verified_workspace_file(root: Path, relative_path: str) -> Path:
+    if _unsafe_path(root):
+        raise IndexError("INDEX_STALE", "project index workspace is no longer safe")
     candidate = root
     for part in PurePosixPath(relative_path).parts:
         candidate /= part
@@ -772,8 +783,10 @@ def _verified_workspace_file(root: Path, relative_path: str) -> Path:
     return candidate
 
 
-def _capture_regular_file(candidate: Path) -> bytes:
+def _capture_regular_file(root: Path, candidate: Path) -> bytes:
     try:
+        relative_path = candidate.relative_to(root).as_posix()
+        candidate = _verified_workspace_file(root, relative_path)
         before = candidate.lstat()
         if _unsafe_stat_result(before) or not stat.S_ISREG(before.st_mode):
             raise IndexError("INDEX_STALE", "project index source path is not regular")
@@ -790,6 +803,7 @@ def _capture_regular_file(candidate: Path) -> bytes:
                     "INDEX_STALE", "project index source path is not regular"
                 )
             body = stream.read()
+        candidate = _verified_workspace_file(root, relative_path)
         after = candidate.lstat()
     except IndexError:
         raise

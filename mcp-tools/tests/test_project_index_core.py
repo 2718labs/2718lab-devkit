@@ -771,9 +771,9 @@ def test_snapshot_file_reader_captures_each_target_once(
     observed: list[str] = []
     original = service_module._capture_regular_file
 
-    def counted(path: Path) -> bytes:
+    def counted(root: Path, path: Path) -> bytes:
         observed.append(path.name)
-        return original(path)
+        return original(root, path)
 
     monkeypatch.setattr(service_module, "_capture_regular_file", counted)
     files = service.read_snapshot_files(
