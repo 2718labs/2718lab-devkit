@@ -1010,6 +1010,7 @@ def test_checkpoint_file_reader_does_not_mutate_storage_or_store_marker(
         _ownership(repository.worktree),
         index_service.sync(repository.worktree).snapshot_id,
     )
+    workspace_before = _workspace_state(repository.worktree)
     database_before = service.database_path.read_bytes()
     cas_before = tuple(
         sorted(
@@ -1046,3 +1047,45 @@ def test_checkpoint_file_reader_does_not_mutate_storage_or_store_marker(
         )
         == cas_before
     )
+    assert _workspace_state(repository.worktree) == workspace_before
+
+
+def test_checkpoint_file_reader_rejects_cas_reparse_parent(
+    repository: _Repository,
+    tmp_path: Path,
+    index_service: _FilesystemIndex,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "module.py").write_bytes(b"safe")
+    database = tmp_path / "reader-cas-link.sqlite3"
+    cas_root = tmp_path / "reader-cas-link"
+    service = CheckpointService(database, cas_root, index_service)
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    sha_root = cas_root / "sha256"
+    external = tmp_path / "external"
+    external.mkdir()
+    try:
+        for child in sha_root.iterdir():
+            child.unlink()
+        sha_root.rmdir()
+        _make_directory_link(sha_root, external)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        service.close()
+        pytest.skip(f"CAS reparse capability unavailable: {exc}")
+    try:
+        with pytest.raises(IndexError) as captured:
+            service.read_files_for_task(
+                checkpoint.checkpoint_id,
+                workflow_id=checkpoint.workflow_id,
+                task_id=checkpoint.task_id,
+                paths=("scope/module.py",),
+                byte_budget=1024,
+            )
+        assert captured.value.code in {"UNSAFE_PATH_TYPE", "INDEX_CORRUPT"}
+        assert list(external.iterdir()) == []
+    finally:
+        service.close()
