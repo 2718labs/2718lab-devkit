@@ -816,3 +816,81 @@ def test_checkpoint_file_reader_verifies_all_cas_payloads(
             byte_budget=4096,
         ),
     )
+
+
+@pytest.mark.parametrize("byte_budget", (0, -1, True, 1.5, 1))
+def test_checkpoint_file_reader_rejects_invalid_or_small_budget(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+    byte_budget: int | float,
+) -> None:
+    source = repository.worktree / "scope" / "module.py"
+    source.parent.mkdir()
+    source.write_bytes(b"xx")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    with pytest.raises(IndexError):
+        service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id=checkpoint.task_id,
+            paths=("scope/module.py",),
+            byte_budget=byte_budget,
+        )
+
+
+def test_checkpoint_file_reader_scope_order_ownership_and_missing_cas(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "a.py").write_bytes(b"aa")
+    (scope / "b.py").write_bytes(b"bb")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    files = service.read_files_for_task(
+        checkpoint.checkpoint_id,
+        workflow_id=checkpoint.workflow_id,
+        task_id=checkpoint.task_id,
+        paths=("scope/a.py", "scope/b.py"),
+        byte_budget=4,
+    )
+    assert tuple(file.path for file in files) == ("scope/a.py", "scope/b.py")
+    for workflow_id, task_id, paths in (
+        ("other", checkpoint.task_id, ("scope/a.py",)),
+        (checkpoint.workflow_id, "other", ("scope/a.py",)),
+        (checkpoint.workflow_id, checkpoint.task_id, ("other.py",)),
+        (checkpoint.workflow_id, checkpoint.task_id, ("scope/b.py", "scope/a.py")),
+    ):
+        with pytest.raises(IndexError):
+            service.read_files_for_task(
+                checkpoint.checkpoint_id,
+                workflow_id=workflow_id,
+                task_id=task_id,
+                paths=paths,
+                byte_budget=4,
+            )
+    entry = next(
+        entry
+        for entry in service._load_entries(checkpoint.checkpoint_id)
+        if entry.path == "scope/a.py"
+    )
+    assert entry.blob_hash is not None
+    service._blob_path(entry.blob_hash).unlink()
+    _assert_error(
+        "INDEX_CORRUPT",
+        lambda: service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id=checkpoint.task_id,
+            paths=("scope/a.py",),
+            byte_budget=4,
+        ),
+    )

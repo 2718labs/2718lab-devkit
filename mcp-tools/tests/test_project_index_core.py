@@ -782,3 +782,95 @@ def test_snapshot_file_reader_captures_each_target_once(
     assert files[0].body == b"VALUE = 1\n"
     assert observed.count("module.py") == 1
     service.close()
+
+
+def test_snapshot_file_reader_orders_and_bounds_without_partial_output(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "a.py").write_bytes(b"aa")
+    (workspace / "b.py").write_bytes(b"bb")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    assert tuple(
+        item.path
+        for item in service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("a.py", "b.py"), byte_budget=4
+        )
+    ) == ("a.py", "b.py")
+    for budget in (1, 3):
+        with pytest.raises(IndexError):
+            service.read_snapshot_files(
+                workspace,
+                snapshot.snapshot_id,
+                ("a.py", "b.py"),
+                byte_budget=budget,
+            )
+    service.close()
+
+
+@pytest.mark.parametrize(
+    "path", ("/etc/passwd", "C:\\temp\\x.py", "\\\\server\\share\\x.py")
+)
+def test_snapshot_file_reader_rejects_absolute_drive_and_unc_paths(
+    tmp_path: Path, path: str
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "a.py").write_bytes(b"x")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    with pytest.raises(IndexError):
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, (path,), byte_budget=8
+        )
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, "sha256:" + "0" * 64, ("a.py",), byte_budget=8
+        )
+    assert captured.value.code == "NOT_FOUND"
+    service.close()
+
+
+def test_snapshot_file_reader_rejects_directory_link_and_preserves_inputs(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = workspace / "a.py"
+    source.write_bytes(b"marker")
+    (workspace / "folder").mkdir()
+    database = tmp_path / "index.sqlite3"
+    service = ProjectIndexService(database)
+    snapshot = service.sync(workspace)
+    workspace_before = tuple(
+        sorted(
+            (path.relative_to(workspace).as_posix(), path.read_bytes())
+            for path in workspace.rglob("*")
+            if path.is_file()
+        )
+    )
+    database_before = database.read_bytes()
+    with pytest.raises(IndexError):
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("folder",), byte_budget=64
+        )
+    link = workspace / "link.py"
+    try:
+        link.symlink_to(source)
+    except OSError as exc:
+        pytest.skip(f"link capability unavailable: {exc}")
+    with pytest.raises(IndexError):
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("link.py",), byte_budget=64
+        )
+    assert database.read_bytes() == database_before
+    assert tuple(
+        sorted(
+            (path.relative_to(workspace).as_posix(), path.read_bytes())
+            for path in workspace.rglob("*")
+            if path.is_file()
+        )
+    ) == workspace_before + (("link.py", b"marker"),)
+    service.close()
