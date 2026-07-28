@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -22,6 +23,23 @@ from code_atlas.store import AtlasStore
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSETS = ROOT / "skills" / "code-atlas" / "assets"
+LOCKED_SEEDS = {
+    "python-fastmcp-read-tool.json": (
+        "python.fastmcp.read-only-tool",
+        "sha256:090d5bb247d1fa88d5ae65f39451ca4f0bf176a50716ef6c647752d10a1a029b",
+        "sha256:c0bd2bd01da25b333bac5dcb06f953242ecaa80c772d84bc48025e70a58e6950",
+    ),
+    "python-pytest-regression.json": (
+        "python.pytest-regression",
+        "sha256:29572bd77a897bbb035fbf6cb79a21ff1a2298144b8c60dcd0d6a12231b45f4c",
+        "sha256:d07c7a977b330d26fe6486ab5e07f02855117f092ad19b0b08b2aafb136aef6c",
+    ),
+    "python-validation-guard.json": (
+        "python.validation-guard",
+        "sha256:c6f2adacb33c5a5037da8559b1b4b550b1cf25dbcfd834d377aaacb6f51ed59a",
+        "sha256:47820213e5b67e968dff12d9509b8990d7aa1a6465a85b631599628589f8d8de",
+    ),
+}
 
 
 def test_three_seed_recipes_load_with_verified_blobs() -> None:
@@ -42,6 +60,15 @@ def test_three_seed_recipes_load_with_verified_blobs() -> None:
                 "sha256:" + hashlib.sha256(blob.read_bytes()).hexdigest()
                 == operation.template_hash
             )
+    by_intent = {recipe.intent_id: recipe for recipe in recipes}
+    for filename, (intent_id, manifest_hash, template_hash) in LOCKED_SEEDS.items():
+        raw = (ASSETS / "recipes" / filename).read_bytes()
+        assert "sha256:" + hashlib.sha256(raw[:-1]).hexdigest() == manifest_hash
+        recipe = by_intent[intent_id]
+        assert recipe.manifest_hash == manifest_hash
+        assert tuple(item.template_hash for item in recipe.operations) == (
+            template_hash,
+        )
 
 
 def test_pattern_card_is_a_deterministic_view() -> None:
@@ -327,6 +354,126 @@ def test_loader_rejects_unsupported_bundled_constraints(
     with pytest.raises(AtlasError) as captured:
         BundledRecipeLoader(root).load()
     assert captured.value.code == code
+
+
+@pytest.mark.parametrize(
+    "mutation", ["extra_blob", "missing_blob", "swapped_manifests"]
+)
+def test_loader_locks_complete_seed_inventory(tmp_path: Path, mutation: str) -> None:
+    root = copied_assets(tmp_path)
+    if mutation == "extra_blob":
+        (root / "templates" / "sha256" / ("f" * 64)).write_bytes(b"extra\n")
+    elif mutation == "missing_blob":
+        (
+            root
+            / "templates"
+            / "sha256"
+            / LOCKED_SEEDS["python-pytest-regression.json"][2][7:]
+        ).unlink()
+    else:
+        first = root / "recipes" / "python-fastmcp-read-tool.json"
+        second = root / "recipes" / "python-pytest-regression.json"
+        first_bytes, second_bytes = first.read_bytes(), second.read_bytes()
+        first.write_bytes(second_bytes)
+        second.write_bytes(first_bytes)
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == "bundled_asset_mismatch"
+
+
+def test_loader_rejects_self_consistent_replacement_seed(tmp_path: Path) -> None:
+    root = copied_assets(tmp_path)
+    body = b"def ${test_name}() -> None:\n    ${test_body}\n    # replacement\n"
+    digest = hashlib.sha256(body).hexdigest()
+    (root / "templates" / "sha256" / digest).write_bytes(body)
+    locked = (
+        root
+        / "templates"
+        / "sha256"
+        / LOCKED_SEEDS["python-pytest-regression.json"][2][7:]
+    )
+    locked.unlink()
+    rewrite_manifest(
+        root,
+        "python-pytest-regression.json",
+        lambda item: item["operations"][0].__setitem__(
+            "template_hash", "sha256:" + digest
+        ),
+    )
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == "bundled_asset_mismatch"
+
+
+def test_safe_read_rejects_atomic_manifest_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = copied_assets(tmp_path)
+    target = root / "recipes" / "python-fastmcp-read-tool.json"
+    replacement = target.with_suffix(".replacement")
+    replacement.write_bytes(target.read_bytes())
+    original_open = os.open
+    replaced = False
+
+    def replacing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        if Path(path) == target and not replaced:
+            replaced = True
+            replacement.replace(target)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replacing_open)
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == "unsafe_asset_reference"
+
+
+def test_safe_read_rejects_symlink_swap_after_safe_child(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = copied_assets(tmp_path)
+    target = root / "recipes" / "python-fastmcp-read-tool.json"
+    backup = target.with_suffix(".backup")
+    original_open = os.open
+    replaced = False
+
+    def replacing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        if Path(path) == target and not replaced:
+            replaced = True
+            target.replace(backup)
+            try:
+                target.symlink_to(backup)
+            except OSError as exc:
+                backup.replace(target)
+                pytest.skip(f"symlink creation unavailable: {exc}")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replacing_open)
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == "unsafe_asset_reference"
+
+
+def test_validator_main_returns_one_without_success_noise(monkeypatch, capsys) -> None:
+    script = ROOT / "skills" / "code-atlas" / "scripts" / "validate_recipes.py"
+    spec = importlib.util.spec_from_file_location(
+        "validate_recipes_failure_test", script
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FailingLoader:
+        def __init__(self, asset_root) -> None:
+            pass
+
+        def load(self):
+            raise AtlasError("bundled_asset_mismatch")
+
+    monkeypatch.setattr(module, "BundledRecipeLoader", FailingLoader)
+    assert module.main() == 1
+    assert capsys.readouterr() == ("", "")
 
 
 def test_loader_rejects_junction_or_reparse_asset_components(

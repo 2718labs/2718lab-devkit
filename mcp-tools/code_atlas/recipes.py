@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -74,11 +75,24 @@ _SLOT_TYPES = frozenset(
         "single_line_text",
     }
 )
-_EXPECTED_RECIPES = {
-    "python-fastmcp-read-tool.json": "python.fastmcp.read-only-tool",
-    "python-pytest-regression.json": "python.pytest-regression",
-    "python-validation-guard.json": "python.validation-guard",
+_LOCKED_SEEDS = {
+    "python-fastmcp-read-tool.json": (
+        "python.fastmcp.read-only-tool",
+        "sha256:090d5bb247d1fa88d5ae65f39451ca4f0bf176a50716ef6c647752d10a1a029b",
+        "sha256:c0bd2bd01da25b333bac5dcb06f953242ecaa80c772d84bc48025e70a58e6950",
+    ),
+    "python-pytest-regression.json": (
+        "python.pytest-regression",
+        "sha256:29572bd77a897bbb035fbf6cb79a21ff1a2298144b8c60dcd0d6a12231b45f4c",
+        "sha256:d07c7a977b330d26fe6486ab5e07f02855117f092ad19b0b08b2aafb136aef6c",
+    ),
+    "python-validation-guard.json": (
+        "python.validation-guard",
+        "sha256:c6f2adacb33c5a5037da8559b1b4b550b1cf25dbcfd834d377aaacb6f51ed59a",
+        "sha256:47820213e5b67e968dff12d9509b8990d7aa1a6465a85b631599628589f8d8de",
+    ),
 }
+_LOCKED_TEMPLATE_HASHES = frozenset(seed[2] for seed in _LOCKED_SEEDS.values())
 
 
 def _error(code: str = "invalid_recipe") -> None:
@@ -156,6 +170,16 @@ class BundledRecipeLoader:
         except OSError as exc:
             raise AtlasError("unsafe_asset_reference") from exc
 
+    @staticmethod
+    def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+
     def _safe_child(self, relative: str, *, allow_missing_final: bool = False) -> Path:
         try:
             self._assert_safe_component(self._root)
@@ -179,19 +203,72 @@ class BundledRecipeLoader:
             self._assert_safe_component(cursor)
         return candidate
 
+    def _safe_read(self, relative: str, *, max_bytes: int, missing_code: str) -> bytes:
+        path = self._safe_child(relative, allow_missing_final=True)
+        try:
+            pre = path.lstat()
+        except FileNotFoundError:
+            _error(missing_code)
+        except OSError as exc:
+            raise AtlasError("unsafe_asset_reference") from exc
+        self._assert_safe_component(path)
+        if not stat.S_ISREG(pre.st_mode):
+            _error("unsafe_asset_reference")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or self._identity(
+                opened
+            ) != self._identity(pre):
+                _error("unsafe_asset_reference")
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                chunk = os.read(descriptor, min(65_536, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            after = os.fstat(descriptor)
+            if self._identity(after) != self._identity(opened):
+                _error("unsafe_asset_reference")
+        except AtlasError:
+            raise
+        except OSError as exc:
+            raise AtlasError("unsafe_asset_reference") from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    raise AtlasError("unsafe_asset_reference") from exc
+        try:
+            post = path.lstat()
+            self._safe_child(relative)
+        except AtlasError:
+            raise
+        except OSError as exc:
+            raise AtlasError("unsafe_asset_reference") from exc
+        if self._identity(post) != self._identity(pre):
+            _error("unsafe_asset_reference")
+        return b"".join(chunks)
+
     def _blob(self, template_hash: str) -> bytes:
         match = _HASH.fullmatch(template_hash)
         if match is None:
             _error("invalid_template_hash")
-        blob_path = self._safe_child(
-            f"templates/sha256/{match.group(1)}", allow_missing_final=True
+        missing_code = (
+            "bundled_asset_mismatch"
+            if template_hash in _LOCKED_TEMPLATE_HASHES
+            else "missing_template_blob"
         )
-        if not blob_path.is_file():
-            _error("missing_template_blob")
-        try:
-            body = blob_path.read_bytes()
-        except OSError as exc:
-            raise AtlasError("invalid_template_blob") from exc
+        body = self._safe_read(
+            f"templates/sha256/{match.group(1)}",
+            max_bytes=MAX_TEMPLATE_BYTES,
+            missing_code=missing_code,
+        )
         if len(body) > MAX_TEMPLATE_BYTES or hashlib.sha256(
             body
         ).hexdigest() != match.group(1):
@@ -208,9 +285,13 @@ class BundledRecipeLoader:
             raise AtlasError("invalid_template_blob") from exc
         return body
 
-    def _parse(self, path: Path) -> RecipeManifest:
+    def _parse(self, filename: str) -> RecipeManifest:
         try:
-            raw = path.read_bytes()
+            raw = self._safe_read(
+                f"recipes/{filename}",
+                max_bytes=MAX_RECIPE_BYTES,
+                missing_code="missing_recipe_assets",
+            )
             if len(raw) > MAX_RECIPE_BYTES:
                 _error()
             data = json.loads(raw.decode("utf-8"))
@@ -450,15 +531,27 @@ class BundledRecipeLoader:
         if not recipes_dir.is_dir():
             _error("missing_recipe_assets")
         paths = sorted(recipes_dir.glob("*.json"), key=lambda value: value.name)
-        if {path.name for path in paths} != set(_EXPECTED_RECIPES):
+        if {path.name for path in paths} != set(_LOCKED_SEEDS):
             _error("invalid_recipe_assets")
-        for path in paths:
-            self._safe_child(f"recipes/{path.name}")
-        recipes = tuple(self._parse(path) for path in paths)
-        if {recipe.intent_id for recipe in recipes} != set(_EXPECTED_RECIPES.values()):
-            _error("invalid_recipe_assets")
+        recipes = tuple(self._parse(path.name) for path in paths)
         if len({recipe.intent_id for recipe in recipes}) != len(recipes):
             _error("duplicate_recipe")
+        for path, recipe in zip(paths, recipes, strict=True):
+            intent_id, manifest_hash, template_hash = _LOCKED_SEEDS[path.name]
+            if (
+                recipe.intent_id != intent_id
+                or recipe.manifest_hash != manifest_hash
+                or tuple(item.template_hash for item in recipe.operations)
+                != (template_hash,)
+            ):
+                _error("bundled_asset_mismatch")
+        templates_dir = self._safe_child("templates/sha256")
+        try:
+            template_names = {path.name for path in templates_dir.iterdir()}
+        except OSError as exc:
+            raise AtlasError("unsafe_asset_reference") from exc
+        if template_names != {value[7:] for value in _LOCKED_TEMPLATE_HASHES}:
+            _error("bundled_asset_mismatch")
         return tuple(
             sorted(recipes, key=lambda recipe: (recipe.intent_id, recipe.recipe_id))
         )
