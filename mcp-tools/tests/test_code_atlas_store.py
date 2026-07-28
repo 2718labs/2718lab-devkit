@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from code_atlas.models import (
     AtlasEdge, AtlasNode, AtlasStatus, EdgeRelation, ImplementationPacket,
     IngestionReceipt, NodeKind, RecipeManifest, TemplateOperation, SlotSpec,
-    ConstraintSpec, DependencySpec, TestSpec,
+    ConstraintSpec, DependencySpec, TestSpec as AtlasTestSpec,
 )
 from code_atlas.store import AtlasStore, StoreConflictError
 from code_atlas.security import MAX_PACKET_BYTES
@@ -33,8 +33,11 @@ def test_schema_wal_foreign_keys_and_reopen(tmp_path: Path) -> None:
     store.close()
     reopened = store_at(tmp_path)
     assert reopened.schema_version() == 1
-    tables = {row[0] for row in sqlite3.connect(tmp_path / "atlas.sqlite").execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    connection = sqlite3.connect(tmp_path / "atlas.sqlite")
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"atlas_metadata", "atlas_nodes", "atlas_edges", "atlas_recipes", "atlas_recipe_nodes", "atlas_recipe_edges", "atlas_blobs", "atlas_packet_receipts", "atlas_ingestion_receipts"} <= tables
+    indexes = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert {"atlas_edges_source", "atlas_edges_target", "atlas_recipe_match"} <= indexes
     reopened.close()
 
 
@@ -65,6 +68,7 @@ def test_all_relations_edges_reopen_and_foreign_endpoints_rejected(tmp_path: Pat
         store.put_nodes((source, target))
         edges.append(AtlasEdge.create(relation, source, target))
     assert store.put_edges(tuple(edges)) == tuple(edges)
+    assert store.put_edges((replace(edges[0], created_at="later"),)) == (replace(edges[0], created_at="later"),)
     with pytest.raises(StoreConflictError, match="(identity|endpoint)"):
         store.put_edges((replace(edges[0], source_id="sha256:" + "a" * 64),))
     store.close()
@@ -82,7 +86,11 @@ def test_verified_cas_and_receipts_are_idempotent_or_conflicting(tmp_path: Path)
     valid = "sha256:" + hashlib.sha256(b"verified template").hexdigest()
     assert store.put_blob(valid, b"verified template") == valid
     assert store.read_blob(valid) == b"verified template"
-    packet = ImplementationPacket("packet", "trace", "workspace", "snap", "recipe", ("node",), ("edge",), ({"path": "x"},), ("eh",), (TemplateOperation("replace", "path", "th"),), (SlotSpec("name", "single_line_text"),), (ConstraintSpec("kind", "subject", {"a": 1}),), (DependencySpec("pytest", "python", ">=8"),), (TestSpec(("python", "-m", "pytest")),), ("gap",), ("source",), ("template",), ("receipt",), "next")
+    blob_path = tmp_path / "cas" / "sha256" / valid[7:9] / valid[9:]
+    blob_path.unlink()
+    with pytest.raises(StoreConflictError):
+        store.read_blob(valid)
+    packet = ImplementationPacket("packet", "trace", "workspace", "snap", "recipe", ("node",), ("edge",), ({"path": "x"},), ("eh",), (TemplateOperation("replace", "path", "th"),), (SlotSpec("name", "single_line_text"),), (ConstraintSpec("kind", "subject", {"a": 1}),), (DependencySpec("pytest", "python", ">=8"),), (AtlasTestSpec(("python", "-m", "pytest")),), ("gap",), ("source",), ("template",), ("receipt",), "next")
     store.put_packet(packet)
     store.put_packet(packet)
     with pytest.raises(StoreConflictError):
@@ -126,4 +134,39 @@ def test_recipe_rejects_wrong_kind_and_missing_links(tmp_path: Path) -> None:
     manifest = RecipeManifest(wrong.node_id, "key", 1, wrong.node_id, "python", "1", "repo", "local", "hash")
     with pytest.raises(StoreConflictError):
         store.put_recipe(manifest)
+    recipe = AtlasNode.create(NodeKind.RECIPE, {"id": "recipe"})
+    store.put_nodes((recipe,))
+    valid_manifest = RecipeManifest(recipe.node_id, "key", 1, wrong.node_id, "python", "1", "repo", "local", "hash")
+    with pytest.raises(StoreConflictError):
+        store.put_recipe(valid_manifest, node_ids=("missing",))
     store.close()
+
+
+def test_depth_boundary_marks_omitted_edge_between_chosen_nodes(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    recipe = AtlasNode.create(NodeKind.RECIPE, {"id": "r"})
+    test = AtlasNode.create(NodeKind.TEST_SPEC, {"id": "t"})
+    evidence = AtlasNode.create(NodeKind.SOURCE_EVIDENCE, {"id": "e"})
+    store.put_nodes((recipe, test, evidence))
+    store.put_edges((
+        AtlasEdge.create(EdgeRelation.VERIFIED_BY, recipe, test),
+        AtlasEdge.create(EdgeRelation.DERIVED_FROM, recipe, evidence),
+        AtlasEdge.create(EdgeRelation.TESTS, test, evidence),
+    ))
+    result = store.graph_query(root_node_ids=(recipe.node_id,), max_nodes=3, max_edges=3, max_depth=1, byte_budget=MAX_PACKET_BYTES)
+    assert len(result.edges) == 2
+    assert result.truncated is True
+
+
+def test_byte_trim_keeps_root_before_non_root(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    root = AtlasNode.create(NodeKind.RECIPE, {"id": "root"})
+    neighbor = AtlasNode.create(NodeKind.INTENT, {"id": "neighbor"})
+    store.put_nodes((root, neighbor))
+    store.put_edges((AtlasEdge.create(EdgeRelation.SOLVES, root, neighbor),))
+    full = store.graph_query(root_node_ids=(root.node_id,), max_nodes=2, max_edges=1, max_depth=1, byte_budget=MAX_PACKET_BYTES)
+    root_only = len(__import__("code_atlas.canonical", fromlist=["canonical_json"]).canonical_json({"nodes": [root.to_dict()], "edges": [], "truncated": True}).encode())
+    assert root_only < len(__import__("code_atlas.canonical", fromlist=["canonical_json"]).canonical_json(full.to_dict()).encode())
+    result = store.graph_query(root_node_ids=(root.node_id,), max_nodes=2, max_edges=1, max_depth=1, byte_budget=root_only)
+    assert tuple(node.node_id for node in result.nodes) == (root.node_id,)
+    assert result.edges == () and result.truncated is True

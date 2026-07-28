@@ -293,13 +293,14 @@ class AtlasStore:
                 (node_id, node_id),
             ):
                 other = target if source == node_id else source
-                if other in chosen or (allowed_relations is not None and relation not in allowed_relations):
+                if (allowed_relations is not None and relation not in allowed_relations):
                     continue
                 if allowed_kinds is not None:
                     kind = self._conn.execute("SELECT kind FROM atlas_nodes WHERE node_id=?", (other,)).fetchone()[0]
                     if kind not in allowed_kinds:
                         continue
-                truncated = True
+                if _edge_id not in selected_edges or other not in chosen:
+                    truncated = True
         nodes = tuple(self._node(item) for item in sorted(chosen))
         edges = tuple(edge for edge in (self._edge(item) for item in sorted(selected_edges))
                       if edge.source_id in chosen and edge.target_id in chosen)
@@ -307,7 +308,16 @@ class AtlasStore:
             result = GraphQueryResult(nodes, edges, truncated)
             if len(canonical_json(result.to_dict()).encode("utf-8")) <= byte_budget: return result
             truncated = True
-            if edges: edges = edges[:-1]
-            elif len(nodes) > len(set(roots) & {node.node_id for node in nodes}): nodes = nodes[:-1]
-            else: return GraphQueryResult((), (), True)
+            if edges:
+                edges = edges[:-1]
+            else:
+                root_ids = set(roots)
+                removable = [node for node in nodes if node.node_id not in root_ids]
+                if removable:
+                    remove_id = removable[-1].node_id
+                    nodes = tuple(node for node in nodes if node.node_id != remove_id)
+                    present = {node.node_id for node in nodes}
+                    edges = tuple(edge for edge in edges if edge.source_id in present and edge.target_id in present)
+                else:
+                    return GraphQueryResult((), (), True)
         return GraphQueryResult((), (), truncated)
