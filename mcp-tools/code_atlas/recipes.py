@@ -530,9 +530,21 @@ class BundledRecipeLoader:
         recipes_dir = self._safe_child("recipes")
         if not recipes_dir.is_dir():
             _error("missing_recipe_assets")
-        paths = sorted(recipes_dir.glob("*.json"), key=lambda value: value.name)
+        try:
+            paths = sorted(recipes_dir.iterdir(), key=lambda value: value.name)
+        except OSError as exc:
+            raise AtlasError("unsafe_asset_reference") from exc
         if {path.name for path in paths} != set(_LOCKED_SEEDS):
-            _error("invalid_recipe_assets")
+            _error("bundled_asset_mismatch")
+        for path in paths:
+            self._assert_safe_component(path)
+            try:
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    _error("unsafe_asset_reference")
+            except AtlasError:
+                raise
+            except OSError as exc:
+                raise AtlasError("unsafe_asset_reference") from exc
         recipes = tuple(self._parse(path.name) for path in paths)
         if len({recipe.intent_id for recipe in recipes}) != len(recipes):
             _error("duplicate_recipe")

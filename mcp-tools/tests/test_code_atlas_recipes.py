@@ -381,6 +381,21 @@ def test_loader_locks_complete_seed_inventory(tmp_path: Path, mutation: str) -> 
     assert captured.value.code == "bundled_asset_mismatch"
 
 
+@pytest.mark.parametrize("extra_kind", ["file", "directory"])
+def test_loader_rejects_every_extra_recipe_directory_entry(
+    tmp_path: Path, extra_kind: str
+) -> None:
+    root = copied_assets(tmp_path)
+    extra = root / "recipes" / ("extra.txt" if extra_kind == "file" else "extra")
+    if extra_kind == "file":
+        extra.write_text("extra\n", encoding="utf-8")
+    else:
+        extra.mkdir()
+    with pytest.raises(AtlasError) as captured:
+        BundledRecipeLoader(root).load()
+    assert captured.value.code == "bundled_asset_mismatch"
+
+
 def test_loader_rejects_self_consistent_replacement_seed(tmp_path: Path) -> None:
     root = copied_assets(tmp_path)
     body = b"def ${test_name}() -> None:\n    ${test_body}\n    # replacement\n"
@@ -410,7 +425,7 @@ def test_safe_read_rejects_atomic_manifest_replacement(
 ) -> None:
     root = copied_assets(tmp_path)
     target = root / "recipes" / "python-fastmcp-read-tool.json"
-    replacement = target.with_suffix(".replacement")
+    replacement = root / "replacement-manifest"
     replacement.write_bytes(target.read_bytes())
     original_open = os.open
     replaced = False
