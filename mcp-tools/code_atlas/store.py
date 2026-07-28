@@ -285,6 +285,21 @@ class AtlasStore:
                     if edge_id not in selected_edges and len(selected_edges) >= max_edges: truncated = True; continue
                     chosen.add(other); selected_edges.add(edge_id); next_frontier.add(other)
             frontier = sorted(next_frontier)
+        # The final frontier is present at the permitted depth; report omitted
+        # descendants instead of making a depth-limited result look complete.
+        for node_id in frontier:
+            for _edge_id, source, target, relation in self._conn.execute(
+                "SELECT edge_id,source_id,target_id,relation FROM atlas_edges WHERE source_id=? OR target_id=? ORDER BY edge_id",
+                (node_id, node_id),
+            ):
+                other = target if source == node_id else source
+                if other in chosen or (allowed_relations is not None and relation not in allowed_relations):
+                    continue
+                if allowed_kinds is not None:
+                    kind = self._conn.execute("SELECT kind FROM atlas_nodes WHERE node_id=?", (other,)).fetchone()[0]
+                    if kind not in allowed_kinds:
+                        continue
+                truncated = True
         nodes = tuple(self._node(item) for item in sorted(chosen))
         edges = tuple(edge for edge in (self._edge(item) for item in sorted(selected_edges))
                       if edge.source_id in chosen and edge.target_id in chosen)
