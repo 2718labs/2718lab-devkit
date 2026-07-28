@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -404,3 +406,38 @@ def test_cas_rejects_file_only_db_only_and_same_size_tamper(tmp_path: Path) -> N
         tamper_store.put_blob(blob_hash, content)
     with pytest.raises(StoreConflictError):
         tamper_store.read_blob(blob_hash)
+
+
+@pytest.mark.parametrize("stress_run", range(10))
+def test_concurrent_first_blob_put_is_idempotent_across_connections(
+    tmp_path: Path,
+    stress_run: int,
+) -> None:
+    content = b"concurrent verified blob"
+    blob_hash = "sha256:" + hashlib.sha256(content).hexdigest()
+    database_path = tmp_path / f"atlas-{stress_run}.sqlite"
+    cas_root = tmp_path / f"cas-{stress_run}"
+    seed = AtlasStore(database_path, cas_root)
+    seed.close()
+    barrier = threading.Barrier(2)
+
+    def put_from_independent_connection() -> str:
+        store = AtlasStore(database_path, cas_root)
+        try:
+            barrier.wait(timeout=10)
+            return store.put_blob(blob_hash, content)
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(lambda _: put_from_independent_connection(), range(2))
+        )
+
+    assert results == (blob_hash, blob_hash)
+    reopened = AtlasStore(database_path, cas_root)
+    assert reopened.read_blob(blob_hash) == content
+    assert reopened._conn.execute(
+        "SELECT count(*) FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)
+    ).fetchone() == (1,)
+    reopened.close()

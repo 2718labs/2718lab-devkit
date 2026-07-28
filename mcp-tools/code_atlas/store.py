@@ -76,7 +76,7 @@ class AtlasStore:
         )
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._cas_root.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._database_path)
+        self._conn = sqlite3.connect(self._database_path, timeout=30.0)
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._migrate()
@@ -313,50 +313,66 @@ class AtlasStore:
         if blob_hash != actual:
             raise StoreConflictError("blob hash conflict")
         path = self._blob_path(blob_hash)
+        created_path = False
         try:
+            self._conn.execute("BEGIN IMMEDIATE")
             path.parent.mkdir(parents=True, exist_ok=True)
             path_exists = path.exists()
             path_is_file = path.is_file() if path_exists else False
-        except OSError as exc:
-            raise StoreConflictError("blob path conflict") from exc
-        row = self._conn.execute(
-            "SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)
-        ).fetchone()
-        if (row is None) == path_exists:
-            raise StoreConflictError("blob consistency conflict")
-        if path_exists and not path_is_file:
-            raise StoreConflictError("blob path conflict")
-        if row is not None and tuple(row) != (len(content), media_type):
-            raise StoreConflictError("blob metadata conflict")
-        if path_exists:
-            if self._read_blob_file(path) != content:
-                raise StoreConflictError("blob filesystem conflict")
-        else:
-            temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-            try:
-                with open(temp, "xb") as handle:
-                    handle.write(content)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp, path)
-            except OSError as exc:
-                raise StoreConflictError("blob write conflict") from exc
-            finally:
-                try:
-                    if temp.exists():
-                        temp.unlink()
-                except OSError as exc:
-                    raise StoreConflictError("blob write conflict") from exc
-            if self._read_blob_file(path) != content:
-                raise StoreConflictError("blob verification conflict")
-        with self._conn:
+            row = self._conn.execute(
+                "SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?",
+                (blob_hash,),
+            ).fetchone()
+            if (row is None) == path_exists:
+                raise StoreConflictError("blob consistency conflict")
+            if path_exists and not path_is_file:
+                raise StoreConflictError("blob path conflict")
             values = (len(content), media_type)
             if row is not None and tuple(row) != values:
                 raise StoreConflictError("blob metadata conflict")
+            if path_exists:
+                if self._read_blob_file(path) != content:
+                    raise StoreConflictError("blob filesystem conflict")
+            else:
+                temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+                try:
+                    with open(temp, "xb") as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temp, path)
+                    created_path = True
+                except OSError as exc:
+                    raise StoreConflictError("blob write conflict") from exc
+                finally:
+                    try:
+                        if temp.exists():
+                            temp.unlink()
+                    except OSError as exc:
+                        raise StoreConflictError("blob write conflict") from exc
+                if self._read_blob_file(path) != content:
+                    raise StoreConflictError("blob verification conflict")
             if row is None:
                 self._conn.execute(
                     "INSERT INTO atlas_blobs VALUES (?,?,?)", (blob_hash, *values)
                 )
+            self._conn.commit()
+        except OSError as exc:
+            self._conn.rollback()
+            if created_path:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise StoreConflictError("blob path conflict") from exc
+        except Exception:
+            self._conn.rollback()
+            if created_path:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
         return blob_hash
 
     def read_blob(self, blob_hash: str) -> bytes:
