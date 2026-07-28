@@ -966,26 +966,25 @@ def _read_open_workspace_file(
         digest = hashlib.sha256()
         chunks: list[bytes] | None = [] if retain else None
         retained = 0
-        if chunks is None:
-            while chunk := opened_file.stream.read(_READ_CHUNK_SIZE):
-                digest.update(chunk)
-        else:
-            while retained < size:
-                read_size = min(
-                    _READ_CHUNK_SIZE,
-                    size - retained,
-                    remaining_budget - retained,
+        remaining = size
+        while remaining:
+            read_size = min(_READ_CHUNK_SIZE, remaining)
+            chunk = opened_file.stream.read(read_size)
+            if not chunk or len(chunk) > read_size:
+                raise IndexError(
+                    "INDEX_STALE", "project index source file changed while reading"
                 )
-                if read_size <= 0:
+            digest.update(chunk)
+            remaining -= len(chunk)
+            if chunks is not None:
+                if retained + len(chunk) > remaining_budget:
                     raise IndexError("INVALID_QUERY", "byte_budget exceeded")
-                chunk = opened_file.stream.read(read_size)
-                if not chunk or len(chunk) > read_size:
-                    raise IndexError(
-                        "INDEX_STALE", "project index source file changed while reading"
-                    )
-                digest.update(chunk)
                 retained += len(chunk)
                 chunks.append(chunk)
+        if opened_file.stream.read(1):
+            raise IndexError(
+                "INDEX_STALE", "project index source file changed while reading"
+            )
         _assert_opened_workspace_file_current(root, opened_file)
     except IndexError:
         raise

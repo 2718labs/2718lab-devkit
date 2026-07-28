@@ -1181,7 +1181,8 @@ def test_snapshot_file_reader_streams_large_unrequested_file_without_body_retent
     assert files[0].body == b"requested\n"
     assert ("large.bin", False, None, 8 * 1024 * 1024) in observed
     assert large_read_sizes
-    assert all(size == service_module._READ_CHUNK_SIZE for size in large_read_sizes)
+    assert all(0 < size <= service_module._READ_CHUNK_SIZE for size in large_read_sizes)
+    assert large_read_sizes[-1] == 1
 
     unrequested.write_bytes(b"y" * (8 * 1024 * 1024))
     with pytest.raises(IndexError) as captured:
@@ -1219,7 +1220,8 @@ def test_stream_workspace_file_uses_positive_bounded_reads_and_closes_successful
     assert body is None
     assert size == source_size
     assert read_sizes
-    assert all(size == service_module._READ_CHUNK_SIZE for size in read_sizes)
+    assert all(0 < size <= service_module._READ_CHUNK_SIZE for size in read_sizes)
+    assert read_sizes[-1] == 1
     assert all(reader.closed for reader in readers)
 
 
@@ -1256,6 +1258,64 @@ def test_stream_workspace_file_closes_descriptor_after_read_error(
     assert captured.value.code == "INDEX_STALE"
     assert fstat_descriptors
     assert readers and all(reader.closed for reader in readers)
+
+
+def test_snapshot_file_reader_stops_unrequested_growth_after_size_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    unrequested = workspace / "a-unrequested.bin"
+    unrequested.write_bytes(b"x")
+    requested = workspace / "z-requested.py"
+    requested.write_bytes(b"requested\n")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    original_open = service_module.os.open
+    original_fdopen = service_module.os.fdopen
+    descriptors: dict[int, Path] = {}
+    read_sizes: list[int] = []
+    read_bytes = 0
+    grew = False
+
+    def tracked_open(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        descriptor = original_open(path, flags, *args)
+        descriptors[descriptor] = Path(path)
+        return descriptor
+
+    def tracked_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _TrackedReader:
+        stream = original_fdopen(descriptor, mode, *args, **kwargs)
+        path = descriptors.get(descriptor)
+
+        class GrowingReadTracker(_TrackedReader):
+            def read(self, size: int = -1) -> bytes:
+                nonlocal grew, read_bytes
+                if path == unrequested:
+                    read_sizes.append(size)
+                    if not grew:
+                        grew = True
+                        with unrequested.open("ab") as growth:
+                            growth.write(b"y" * (8 * 1024 * 1024))
+                body = self._stream.read(size)  # type: ignore[attr-defined]
+                if path == unrequested:
+                    read_bytes += len(body)
+                return body
+
+        return GrowingReadTracker(stream, [])
+
+    monkeypatch.setattr(service_module.os, "open", tracked_open)
+    monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("z-requested.py",), byte_budget=1024
+        )
+    assert captured.value.code == "INDEX_STALE"
+    assert read_sizes
+    assert all(0 < size <= service_module._READ_CHUNK_SIZE for size in read_sizes)
+    assert read_bytes <= 2
+    service.close()
 
 
 def test_stream_workspace_file_closes_raw_descriptor_when_fdopen_fails(
