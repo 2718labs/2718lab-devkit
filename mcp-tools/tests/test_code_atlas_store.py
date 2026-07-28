@@ -31,11 +31,155 @@ from code_atlas.models import (
 )
 from code_atlas.canonical import canonical_json
 from code_atlas.store import AtlasStore, StoreConflictError
-from code_atlas.security import MAX_PACKET_BYTES
+from code_atlas.security import MAX_GRAPH_NODES, MAX_PACKET_BYTES
 
 
 def store_at(tmp_path: Path) -> AtlasStore:
     return AtlasStore(tmp_path / "atlas.sqlite", tmp_path / "cas")
+
+
+def _store_discovery_recipe(
+    store: AtlasStore,
+    *,
+    index: int,
+    intent_id: str,
+    language: str = "python",
+    framework: str | None = None,
+    state: str | None = None,
+) -> str:
+    recipe = AtlasNode.create(
+        NodeKind.RECIPE,
+        {
+            "discovery_index": index,
+            "framework": framework or "",
+            "intent_id": intent_id,
+            "language": language,
+            "state": state or "ready",
+        },
+    )
+    store.put_nodes((recipe,))
+    return store.put_recipe(
+        RecipeManifest(
+            recipe.node_id,
+            f"discovery-{index}",
+            1,
+            intent_id,
+            language,
+            "1",
+            "repository",
+            "local",
+            f"manifest-{index}",
+            framework,
+            quarantine_state=state,
+        )
+    )
+
+
+def test_recipe_discovery_is_ordered_and_limited(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    intent_id = "python.discovery-order"
+    identifiers = tuple(
+        _store_discovery_recipe(store, index=index, intent_id=intent_id)
+        for index in (5, 1, 4, 2, 3)
+    )
+
+    assert (
+        store.recipes_for_intent(intent_id, limit=3) == tuple(sorted(identifiers))[:3]
+    )
+    store.close()
+
+
+def test_recipe_discovery_exact_boundary_and_default_sentinel(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    exact_intent = "python.discovery-exact-boundary"
+    overflow_intent = "python.discovery-overflow"
+    exact_identifiers = tuple(
+        _store_discovery_recipe(store, index=index, intent_id=exact_intent)
+        for index in range(MAX_GRAPH_NODES)
+    )
+    overflow_identifiers = tuple(
+        _store_discovery_recipe(
+            store,
+            index=index,
+            intent_id=overflow_intent,
+        )
+        for index in range(MAX_GRAPH_NODES + 2)
+    )
+
+    assert store.recipes_for_intent(exact_intent) == tuple(sorted(exact_identifiers))
+    assert (
+        store.recipes_for_intent(overflow_intent)
+        == tuple(sorted(overflow_identifiers))[: MAX_GRAPH_NODES + 1]
+    )
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "limit",
+    (True, False, 0, -1, 1.5, "1", MAX_GRAPH_NODES + 2),
+)
+def test_recipe_discovery_rejects_invalid_limits(tmp_path: Path, limit: object) -> None:
+    store = store_at(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid recipe discovery limit"):
+        store.recipes_for_intent("python.discovery-invalid-limit", limit=limit)
+    store.close()
+
+
+def test_recipe_discovery_combines_filters_with_limit_and_reopens(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    intent_id = "python.discovery-filtered"
+    matching = tuple(
+        _store_discovery_recipe(
+            store,
+            index=index,
+            intent_id=intent_id,
+            language="python",
+            framework="pytest",
+            state="ready",
+        )
+        for index in (2, 1, 3)
+    )
+    _store_discovery_recipe(
+        store,
+        index=4,
+        intent_id=intent_id,
+        language="python",
+        framework="pytest",
+        state="quarantined",
+    )
+    _store_discovery_recipe(
+        store,
+        index=5,
+        intent_id=intent_id,
+        language="python",
+        framework="other",
+        state="ready",
+    )
+    _store_discovery_recipe(
+        store,
+        index=6,
+        intent_id=intent_id,
+        language="ruby",
+        framework="pytest",
+        state="ready",
+    )
+    store.close()
+
+    reopened = store_at(tmp_path)
+    assert (
+        reopened.recipes_for_intent(
+            intent_id,
+            language="python",
+            framework="pytest",
+            state="ready",
+            limit=2,
+        )
+        == tuple(sorted(matching))[:2]
+    )
+    reopened.close()
 
 
 def test_schema_wal_foreign_keys_and_reopen(tmp_path: Path) -> None:

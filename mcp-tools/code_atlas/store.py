@@ -485,8 +485,16 @@ class AtlasStore:
         language: str | None = None,
         framework: str | None = None,
         state: str | None = None,
+        limit: int = MAX_GRAPH_NODES + 1,
     ) -> tuple[str, ...]:
-        clauses, args = ["intent_id=?"], [intent_id]
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 0 < limit <= MAX_GRAPH_NODES + 1
+        ):
+            raise ValueError("invalid recipe discovery limit")
+        clauses: list[str] = ["intent_id=?"]
+        args: list[object] = [intent_id]
         for column, value in (
             ("language", language),
             ("framework", framework),
@@ -495,12 +503,13 @@ class AtlasStore:
             if value is not None:
                 clauses.append(column + "=?")
                 args.append(value)
+        args.append(limit)
         return tuple(
             row[0]
             for row in self._conn.execute(
                 "SELECT recipe_id FROM atlas_recipes WHERE "
                 + " AND ".join(clauses)
-                + " ORDER BY recipe_id",
+                + " ORDER BY recipe_id LIMIT ?",
                 args,
             )
         )
