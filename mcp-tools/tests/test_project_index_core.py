@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import subprocess
+import os
 from pathlib import Path
 
 import pytest
@@ -886,4 +887,76 @@ def test_snapshot_file_reader_rejects_symlink_probe(tmp_path: Path) -> None:
         service.read_snapshot_files(
             workspace, snapshot.snapshot_id, ("link.py",), byte_budget=64
         )
+    service.close()
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_snapshot_file_reader_rejects_same_size_atomic_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    target = workspace / "module.py"
+    target.write_bytes(b"safe")
+    replacement = workspace / "replacement.py"
+    replacement.write_bytes(b"evil")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace, include_paths=("module.py",))
+    original_open = service_module.os.open
+    replaced = False
+
+    def replace_before_open(
+        path: str | os.PathLike[str], flags: int, *args: int
+    ) -> int:
+        nonlocal replaced
+        if Path(path) == target and not replaced:
+            replaced = True
+            os.replace(replacement, target)
+        return original_open(path, flags, *args)
+
+    monkeypatch.setattr(service_module.os, "open", replace_before_open)
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=64
+        )
+    assert captured.value.code == "INDEX_STALE"
+    assert target.read_bytes() == b"evil"
+    service.close()
+
+
+def test_snapshot_file_reader_rejects_directory_junction_parent(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    parent = workspace / "src"
+    parent.mkdir()
+    (parent / "module.py").write_bytes(b"safe")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "module.py").write_bytes(b"outside")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    (parent / "module.py").unlink()
+    parent.rmdir()
+    try:
+        _make_directory_link(parent, external)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        pytest.skip(f"junction capability unavailable: {exc}")
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("src/module.py",), byte_budget=64
+        )
+    assert captured.value.code == "INDEX_STALE"
+    assert external.joinpath("module.py").read_bytes() == b"outside"
     service.close()
