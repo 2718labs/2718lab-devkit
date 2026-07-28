@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import sys
-import subprocess
 import os
+import subprocess
+import sys
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -770,13 +771,15 @@ def test_snapshot_file_reader_captures_each_target_once(
     service = ProjectIndexService(tmp_path / "index.sqlite3")
     snapshot = service.sync(workspace)
     observed: list[str] = []
-    original = service_module._capture_regular_file
+    original = service_module._stream_workspace_file
 
-    def counted(root: Path, path: Path) -> bytes:
+    def counted(
+        root: Path, path: Path, retain: bool, remaining_budget: int
+    ) -> tuple[str, bytes | None, int]:
         observed.append(path.name)
-        return original(root, path)
+        return original(root, path, retain, remaining_budget)
 
-    monkeypatch.setattr(service_module, "_capture_regular_file", counted)
+    monkeypatch.setattr(service_module, "_stream_workspace_file", counted)
     files = service.read_snapshot_files(
         workspace, snapshot.snapshot_id, ("module.py",), byte_budget=1024
     )
@@ -967,3 +970,402 @@ def test_snapshot_file_reader_rejects_directory_junction_parent(
             parent.rmdir()
         else:
             parent.unlink()
+
+
+class _TrackedReader:
+    """Expose a real file object while recording bounded read and close behavior."""
+
+    def __init__(
+        self,
+        stream: object,
+        read_sizes: list[int],
+        *,
+        before_read: Callable[[], None] | None = None,
+    ) -> None:
+        self._stream = stream
+        self._read_sizes = read_sizes
+        self._before_read = before_read
+        self.closed = False
+
+    def __enter__(self) -> _TrackedReader:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.closed = True
+        self._stream.close()  # type: ignore[attr-defined]
+
+    def fileno(self) -> int:
+        return self._stream.fileno()  # type: ignore[attr-defined]
+
+    def read(self, size: int = -1) -> bytes:
+        self._read_sizes.append(size)
+        if self._before_read is not None:
+            self._before_read()
+        return self._stream.read(size)  # type: ignore[attr-defined]
+
+
+def test_snapshot_file_reader_prevalidates_aggregate_before_requested_body_reads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "a.py").write_bytes(b"aaa")
+    (workspace / "b.py").write_bytes(b"bbb")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    original_open = service_module.os.open
+    original_fdopen = service_module.os.fdopen
+    descriptors: dict[int, Path] = {}
+    opened_paths: list[Path] = []
+    requested_reads: list[tuple[Path, int]] = []
+    readers: list[_TrackedReader] = []
+
+    def tracked_open(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        descriptor = original_open(path, flags, *args)
+        candidate = Path(path)
+        descriptors[descriptor] = candidate
+        opened_paths.append(candidate)
+        return descriptor
+
+    def tracked_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _TrackedReader:
+        stream = original_fdopen(descriptor, mode, *args, **kwargs)
+        path = descriptors.get(descriptor)
+
+        class RequestedReadTracker(_TrackedReader):
+            def read(self, size: int = -1) -> bytes:
+                if path is not None and path.name in {"a.py", "b.py"}:
+                    requested_reads.append((path, size))
+                return super().read(size)
+
+        reader = RequestedReadTracker(stream, [])
+        readers.append(reader)
+        return reader
+
+    monkeypatch.setattr(service_module.os, "open", tracked_open)
+    monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("a.py", "b.py"), byte_budget=5
+        )
+    assert captured.value.code == "INVALID_QUERY"
+    assert [path.name for path in opened_paths] == ["a.py", "b.py"]
+    assert requested_reads == []
+    assert readers and all(reader.closed for reader in readers)
+    service.close()
+
+
+def test_snapshot_file_reader_rejects_duplicate_requests_before_any_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "module.py").write_bytes(b"VALUE = 1\n")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+
+    def fail_preflight(*args: object, **kwargs: object) -> None:
+        pytest.fail("duplicate paths must fail before file-size preflight")
+
+    def fail_scan(*args: object, **kwargs: object) -> None:
+        pytest.fail("duplicate paths must fail before workspace scan")
+
+    monkeypatch.setattr(
+        service_module, "_prevalidate_requested_file_sizes", fail_preflight
+    )
+    monkeypatch.setattr(service, "_scan_snapshot_files", fail_scan)
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace,
+            snapshot.snapshot_id,
+            ("module.py", "module.py"),
+            byte_budget=64,
+        )
+    assert captured.value.code == "SCOPE_ESCAPE"
+    service.close()
+
+
+def test_snapshot_file_reader_caps_retained_reads_when_file_grows_after_fstat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = workspace / "module.py"
+    source.write_bytes(b"x")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    original_fdopen = service_module.os.fdopen
+    read_sizes: list[int] = []
+    grew = False
+
+    def grow_after_fstat() -> None:
+        nonlocal grew
+        if not grew:
+            grew = True
+            with source.open("ab") as stream:
+                stream.write(b"y" * (1024 * 1024))
+
+    def tracked_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _TrackedReader:
+        return _TrackedReader(
+            original_fdopen(descriptor, mode, *args, **kwargs),
+            read_sizes,
+            before_read=grow_after_fstat,
+        )
+
+    monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=2
+        )
+    assert captured.value.code == "INDEX_STALE"
+    assert read_sizes
+    assert all(0 < size <= 2 for size in read_sizes)
+    service.close()
+
+
+def test_snapshot_file_reader_streams_large_unrequested_file_without_body_retention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "requested.py").write_bytes(b"requested\n")
+    unrequested = workspace / "large.bin"
+    unrequested.write_bytes(b"x" * (8 * 1024 * 1024))
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    original = service_module._stream_workspace_file
+    original_open = service_module.os.open
+    original_fdopen = service_module.os.fdopen
+    descriptors: dict[int, Path] = {}
+    large_read_sizes: list[int] = []
+    observed: list[tuple[str, bool, bytes | None, int]] = []
+
+    def tracked_open(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        descriptor = original_open(path, flags, *args)
+        descriptors[descriptor] = Path(path)
+        return descriptor
+
+    def tracked_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _TrackedReader:
+        stream = original_fdopen(descriptor, mode, *args, **kwargs)
+        path = descriptors.get(descriptor)
+
+        class LargeReadTracker(_TrackedReader):
+            def read(self, size: int = -1) -> bytes:
+                if path == unrequested:
+                    large_read_sizes.append(size)
+                return super().read(size)
+
+        return LargeReadTracker(stream, [])
+
+    def recorded(
+        root: Path, path: Path, retain: bool, remaining_budget: int
+    ) -> tuple[str, bytes | None, int]:
+        result = original(root, path, retain, remaining_budget)
+        observed.append((path.name, retain, result[1], result[2]))
+        return result
+
+    monkeypatch.setattr(service_module.os, "open", tracked_open)
+    monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(service_module, "_stream_workspace_file", recorded)
+    files = service.read_snapshot_files(
+        workspace, snapshot.snapshot_id, ("requested.py",), byte_budget=1024
+    )
+    assert files[0].body == b"requested\n"
+    assert ("large.bin", False, None, 8 * 1024 * 1024) in observed
+    assert large_read_sizes
+    assert all(size == service_module._READ_CHUNK_SIZE for size in large_read_sizes)
+
+    unrequested.write_bytes(b"y" * (8 * 1024 * 1024))
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("requested.py",), byte_budget=1024
+        )
+    assert captured.value.code == "INDEX_STALE"
+    service.close()
+
+
+def test_stream_workspace_file_uses_positive_bounded_reads_and_closes_successfully(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.bin"
+    source_size = 8 * 1024 * 1024 + 1
+    source.write_bytes(b"x" * source_size)
+    original_fdopen = service_module.os.fdopen
+    read_sizes: list[int] = []
+    readers: list[_TrackedReader] = []
+
+    def tracked_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _TrackedReader:
+        reader = _TrackedReader(
+            original_fdopen(descriptor, mode, *args, **kwargs), read_sizes
+        )
+        readers.append(reader)
+        return reader
+
+    monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
+    digest, body, size = service_module._stream_workspace_file(
+        tmp_path, source, False, 1
+    )
+    assert digest.startswith("sha256:")
+    assert body is None
+    assert size == source_size
+    assert read_sizes
+    assert all(size == service_module._READ_CHUNK_SIZE for size in read_sizes)
+    assert all(reader.closed for reader in readers)
+
+
+def test_stream_workspace_file_closes_descriptor_after_read_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x")
+    original_fdopen = service_module.os.fdopen
+    original_fstat = service_module.os.fstat
+    fstat_descriptors: list[int] = []
+    readers: list[_TrackedReader] = []
+
+    class FailingReader(_TrackedReader):
+        def read(self, size: int = -1) -> bytes:
+            self._read_sizes.append(size)
+            raise OSError("injected read failure")
+
+    def failing_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _TrackedReader:
+        reader = FailingReader(original_fdopen(descriptor, mode, *args, **kwargs), [])
+        readers.append(reader)
+        return reader
+
+    def tracked_fstat(descriptor: int) -> os.stat_result:
+        fstat_descriptors.append(descriptor)
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(service_module.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(service_module.os, "fstat", tracked_fstat)
+    with pytest.raises(IndexError) as captured:
+        service_module._stream_workspace_file(tmp_path, source, False, 1)
+    assert captured.value.code == "INDEX_STALE"
+    assert fstat_descriptors
+    assert readers and all(reader.closed for reader in readers)
+
+
+def test_stream_workspace_file_closes_raw_descriptor_when_fdopen_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x")
+    original_open = service_module.os.open
+    original_close = service_module.os.close
+    opened_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+
+    def tracked_open(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        descriptor = original_open(path, flags, *args)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def failing_fdopen(*args: object, **kwargs: object) -> _TrackedReader:
+        raise OSError("injected fdopen failure")
+
+    def tracked_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(service_module.os, "open", tracked_open)
+    monkeypatch.setattr(service_module.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(service_module.os, "close", tracked_close)
+    with pytest.raises(IndexError) as captured:
+        service_module._stream_workspace_file(tmp_path, source, False, 1)
+    assert captured.value.code == "INDEX_STALE"
+    assert opened_descriptors == closed_descriptors
+
+
+def test_snapshot_file_reader_ignores_its_custom_database_inside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "module.py").write_bytes(b"VALUE = 1\n")
+    database = workspace / "custom-reader-cache.sqlite3"
+    service = ProjectIndexService(database)
+    snapshot = service.sync(workspace)
+    assert tuple(
+        path
+        for path, _ in service.snapshot_facts(
+            workspace, snapshot.snapshot_id
+        ).file_hashes
+    ) == ("module.py",)
+    assert (
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=64
+        )[0].body
+        == b"VALUE = 1\n"
+    )
+    service.close()
+
+
+def test_snapshot_file_size_preflight_rejects_same_size_replacement_before_body_reads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    target = workspace / "module.py"
+    target.write_bytes(b"safe")
+    replacement = workspace / "replacement.py"
+    replacement.write_bytes(b"evil")
+    original_open = service_module.os.open
+    replaced = False
+
+    def replace_before_open(
+        path: str | os.PathLike[str], flags: int, *args: int
+    ) -> int:
+        nonlocal replaced
+        if Path(path) == target and not replaced:
+            replaced = True
+            os.replace(replacement, target)
+        return original_open(path, flags, *args)
+
+    monkeypatch.setattr(service_module.os, "open", replace_before_open)
+    with pytest.raises(IndexError) as captured:
+        service_module._prevalidate_requested_file_sizes(workspace, ("module.py",), 64)
+    assert captured.value.code == "INDEX_STALE"
+
+
+def test_snapshot_file_size_preflight_rejects_symlink_replacement_race(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    target = workspace / "module.py"
+    target.write_bytes(b"safe")
+    external = tmp_path / "external.py"
+    external.write_bytes(b"evil")
+    original_open = service_module.os.open
+    replaced = False
+
+    def replace_with_link(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        nonlocal replaced
+        if Path(path) == target and not replaced:
+            replaced = True
+            target.unlink()
+            target.symlink_to(external)
+        return original_open(path, flags, *args)
+
+    monkeypatch.setattr(service_module.os, "open", replace_with_link)
+    try:
+        with pytest.raises(IndexError) as captured:
+            service_module._prevalidate_requested_file_sizes(
+                workspace, ("module.py",), 64
+            )
+    except OSError as exc:
+        pytest.skip(f"link capability unavailable: {exc}")
+    assert captured.value.code == "INDEX_STALE"
