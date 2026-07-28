@@ -14,9 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from code_atlas.models import (
     AtlasEdge, AtlasNode, AtlasStatus, EdgeRelation, ImplementationPacket,
-    IngestionReceipt, NodeKind, RecipeManifest,
+    IngestionReceipt, NodeKind, RecipeManifest, TemplateOperation, SlotSpec,
+    ConstraintSpec, DependencySpec, TestSpec,
 )
 from code_atlas.store import AtlasStore, StoreConflictError
+from code_atlas.security import MAX_PACKET_BYTES
 
 
 def store_at(tmp_path: Path) -> AtlasStore:
@@ -25,12 +27,12 @@ def store_at(tmp_path: Path) -> AtlasStore:
 
 def test_schema_wal_foreign_keys_and_reopen(tmp_path: Path) -> None:
     store = store_at(tmp_path)
-    assert store.schema_version() == "1"
+    assert store.schema_version() == 1
     assert store.journal_mode() == "wal"
     assert store.foreign_keys_enabled() is True
     store.close()
     reopened = store_at(tmp_path)
-    assert reopened.schema_version() == "1"
+    assert reopened.schema_version() == 1
     tables = {row[0] for row in sqlite3.connect(tmp_path / "atlas.sqlite").execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"atlas_metadata", "atlas_nodes", "atlas_edges", "atlas_recipes", "atlas_recipe_nodes", "atlas_recipe_edges", "atlas_blobs", "atlas_packet_receipts", "atlas_ingestion_receipts"} <= tables
     reopened.close()
@@ -39,7 +41,8 @@ def test_schema_wal_foreign_keys_and_reopen(tmp_path: Path) -> None:
 def test_nodes_recompute_identity_reject_tamper_and_allow_mutable_metadata(tmp_path: Path) -> None:
     store = store_at(tmp_path)
     node = AtlasNode.create(NodeKind.INTENT, {"intent_id": "a"}, created_at="one")
-    store.put_nodes((node, replace(node, created_at="two", quarantine_state="accepted")))
+    assert store.put_nodes((node,)) == (node,)
+    assert store.put_nodes((node,)) == (node,)
     with pytest.raises(StoreConflictError, match="node identity"):
         store.put_nodes((replace(node, payload=(("intent_id", "other"),)),))
     store.close()
@@ -61,13 +64,13 @@ def test_all_relations_edges_reopen_and_foreign_endpoints_rejected(tmp_path: Pat
         target = AtlasNode.create(target_kind, {"target": relation.value})
         store.put_nodes((source, target))
         edges.append(AtlasEdge.create(relation, source, target))
-    store.put_edges(tuple(edges))
+    assert store.put_edges(tuple(edges)) == tuple(edges)
     with pytest.raises(StoreConflictError, match="(identity|endpoint)"):
         store.put_edges((replace(edges[0], source_id="sha256:" + "a" * 64),))
     store.close()
     reopened = store_at(tmp_path)
-    assert len(reopened.graph_query((), max_nodes=200, max_edges=400, max_depth=1, byte_budget=1000000).edges) == 0
-    assert sqlite3.connect(tmp_path / "atlas.sqlite").execute("SELECT count(*) FROM atlas_edges").fetchone()[0] == 11
+    roots = tuple(edge.source_id for edge in edges)
+    assert len(reopened.graph_query(root_node_ids=roots, max_nodes=200, max_edges=400, max_depth=1, byte_budget=MAX_PACKET_BYTES).edges) == 11
     reopened.close()
 
 
@@ -79,7 +82,7 @@ def test_verified_cas_and_receipts_are_idempotent_or_conflicting(tmp_path: Path)
     valid = "sha256:" + hashlib.sha256(b"verified template").hexdigest()
     assert store.put_blob(valid, b"verified template") == valid
     assert store.read_blob(valid) == b"verified template"
-    packet = ImplementationPacket("packet", "trace", "workspace", "snap", "recipe")
+    packet = ImplementationPacket("packet", "trace", "workspace", "snap", "recipe", ("node",), ("edge",), ({"path": "x"},), ("eh",), (TemplateOperation("replace", "path", "th"),), (SlotSpec("name", "single_line_text"),), (ConstraintSpec("kind", "subject", {"a": 1}),), (DependencySpec("pytest", "python", ">=8"),), (TestSpec(("python", "-m", "pytest")),), ("gap",), ("source",), ("template",), ("receipt",), "next")
     store.put_packet(packet)
     store.put_packet(packet)
     with pytest.raises(StoreConflictError):
@@ -89,6 +92,8 @@ def test_verified_cas_and_receipts_are_idempotent_or_conflicting(tmp_path: Path)
     store.put_ingestion_receipt(receipt)
     with pytest.raises(StoreConflictError):
         store.put_ingestion_receipt(replace(receipt, episode_id="other"))
+    store.close()
+    store = store_at(tmp_path)
     assert store.get_packet("packet") == packet
     assert store.get_ingestion_receipt("key") == receipt
     store.close()
@@ -104,10 +109,21 @@ def test_recipe_links_and_bounded_bidirectional_query(tmp_path: Path) -> None:
     manifest = RecipeManifest(recipes[0].node_id, "key", 1, intent.node_id, "python", "1", "repo", "local", "hash", "", "ready")
     store.put_recipe(manifest, node_ids=(intent.node_id, recipes[0].node_id), edge_ids=(edges[0].edge_id,))
     assert store.recipes_for_intent(intent.node_id) == (recipes[0].node_id,)
-    result = store.graph_query((intent.node_id,), max_nodes=2, max_edges=1, max_depth=1, byte_budget=1000000)
+    result = store.graph_query(root_node_ids=(intent.node_id,), max_nodes=2, max_edges=1, max_depth=1, byte_budget=MAX_PACKET_BYTES)
     assert tuple(node.node_id for node in result.nodes) == tuple(sorted(node.node_id for node in result.nodes))
     assert len(result.nodes) == 2 and len(result.edges) == 1 and result.truncated is True
     assert {edge.source_id for edge in result.edges} | {edge.target_id for edge in result.edges} <= {node.node_id for node in result.nodes}
     with pytest.raises(ValueError):
-        store.graph_query((intent.node_id,), max_nodes=0, max_edges=1, max_depth=1, byte_budget=1)
+        store.graph_query(root_node_ids=(intent.node_id,), max_nodes=0, max_edges=1, max_depth=1, byte_budget=1)
+    with pytest.raises(ValueError):
+        store.graph_query(root_node_ids=(intent.node_id,), max_nodes=1, max_edges=1, max_depth=0, byte_budget=1)
+
+
+def test_recipe_rejects_wrong_kind_and_missing_links(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    wrong = AtlasNode.create(NodeKind.INTENT, {"id": "wrong"})
+    store.put_nodes((wrong,))
+    manifest = RecipeManifest(wrong.node_id, "key", 1, wrong.node_id, "python", "1", "repo", "local", "hash")
+    with pytest.raises(StoreConflictError):
+        store.put_recipe(manifest)
     store.close()

@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
 import uuid
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
 from .canonical import canonical_hash, canonical_id, canonical_json, thaw_json
-from .models import (AtlasEdge, AtlasNode, AtlasStatus, EdgeRelation, GraphQueryResult,
-                     ImplementationPacket, IngestionReceipt, NodeKind, RecipeManifest)
-from .security import MAX_GRAPH_DEPTH, MAX_GRAPH_EDGES, MAX_GRAPH_NODES
+from .models import (AtlasEdge, AtlasNode, AtlasStatus, ConstraintSpec, DependencySpec, EdgeRelation,
+                     GraphQueryResult, ImplementationPacket, IngestionReceipt, NodeKind, RecipeManifest,
+                     SlotSpec, TemplateOperation, TestSpec)
+from .security import MAX_GRAPH_DEPTH, MAX_GRAPH_EDGES, MAX_GRAPH_NODES, MAX_PACKET_BYTES
 
 
 _HASH = re.compile(r"^sha256:([0-9a-f]{64})$")
@@ -77,8 +78,8 @@ class AtlasStore:
     def close(self) -> None:
         self._conn.close()
 
-    def schema_version(self) -> str:
-        return str(self._conn.execute("SELECT value FROM atlas_metadata WHERE key='schema_version'").fetchone()[0])
+    def schema_version(self) -> int:
+        return int(self._conn.execute("SELECT value FROM atlas_metadata WHERE key='schema_version'").fetchone()[0])
 
     def journal_mode(self) -> str:
         return str(self._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
@@ -98,7 +99,7 @@ class AtlasStore:
                                "target_id": edge.target_id, "schema_version": edge.schema_version,
                                "provenance": edge.provenance, "payload": edge.payload})
 
-    def put_nodes(self, nodes: Iterable[AtlasNode]) -> tuple[str, ...]:
+    def put_nodes(self, nodes: Iterable[AtlasNode]) -> tuple[AtlasNode, ...]:
         items = tuple(nodes)
         for node in items:
             if self._node_identity(node) != node.node_id:
@@ -113,9 +114,9 @@ class AtlasStore:
                 if row is None:
                     self._conn.execute("INSERT INTO atlas_nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)", (node.node_id, *immutable,
                         node.created_at or "", node.superseded_at, node.quarantine_state or ""))
-        return tuple(node.node_id for node in items)
+        return items
 
-    def put_edges(self, edges: Iterable[AtlasEdge]) -> tuple[str, ...]:
+    def put_edges(self, edges: Iterable[AtlasEdge]) -> tuple[AtlasEdge, ...]:
         items = tuple(edges)
         for edge in items:
             if self._edge_identity(edge) != edge.edge_id:
@@ -131,21 +132,31 @@ class AtlasStore:
                     raise StoreConflictError("edge immutable payload conflict")
                 if row is None:
                     self._conn.execute("INSERT INTO atlas_edges VALUES (?,?,?,?,?,?,?,?)", (edge.edge_id, *immutable, edge.created_at or ""))
-        return tuple(edge.edge_id for edge in items)
+        return items
 
     def put_recipe(self, manifest: RecipeManifest, *, node_ids: Iterable[str] = (), edge_ids: Iterable[str] = ()) -> str:
+        linked_nodes = tuple(node_ids)
+        linked_edges = tuple(edge_ids)
         immutable = (manifest.intent_id, manifest.language_name, manifest.framework_name or "", manifest.layer,
                      manifest.version, manifest.manifest_hash, manifest.repository_signature,
                      manifest.quarantine_state or "ready", manifest.superseded_ids[0] if manifest.superseded_ids else None)
         with self._conn:
+            recipe_row = self._conn.execute("SELECT kind FROM atlas_nodes WHERE node_id=?", (manifest.recipe_id,)).fetchone()
+            if recipe_row is None or recipe_row[0] != NodeKind.RECIPE.value:
+                raise StoreConflictError("recipe node conflict")
             row = self._conn.execute("SELECT intent_id,language,framework,layer,version,manifest_hash,repository_signature,state,supersedes_recipe_id FROM atlas_recipes WHERE recipe_id=?", (manifest.recipe_id,)).fetchone()
             if row is not None and tuple(row) != immutable:
                 raise StoreConflictError("recipe conflict")
             if row is None:
                 self._conn.execute("INSERT INTO atlas_recipes VALUES (?,?,?,?,?,?,?,?,?,?)", (manifest.recipe_id, *immutable))
-            for node_id in node_ids:
+            for node_id in linked_nodes:
+                if self._conn.execute("SELECT 1 FROM atlas_nodes WHERE node_id=?", (node_id,)).fetchone() is None:
+                    raise StoreConflictError("recipe node link conflict")
                 self._conn.execute("INSERT OR IGNORE INTO atlas_recipe_nodes VALUES (?,?)", (manifest.recipe_id, node_id))
-            for edge_id in edge_ids:
+            for edge_id in linked_edges:
+                row_edge = self._conn.execute("SELECT source_id,target_id FROM atlas_edges WHERE edge_id=?", (edge_id,)).fetchone()
+                if row_edge is None or row_edge[0] not in linked_nodes or row_edge[1] not in linked_nodes:
+                    raise StoreConflictError("recipe edge link conflict")
                 self._conn.execute("INSERT OR IGNORE INTO atlas_recipe_edges VALUES (?,?)", (manifest.recipe_id, edge_id))
         return manifest.recipe_id
 
@@ -164,6 +175,11 @@ class AtlasStore:
             raise StoreConflictError("blob hash conflict")
         path = self._blob_path(blob_hash)
         path.parent.mkdir(parents=True, exist_ok=True)
+        row = self._conn.execute("SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)).fetchone()
+        if (row is None) == path.exists():
+            raise StoreConflictError("blob consistency conflict")
+        if row is not None and tuple(row) != (len(content), media_type):
+            raise StoreConflictError("blob metadata conflict")
         if path.exists():
             if path.read_bytes() != content:
                 raise StoreConflictError("blob filesystem conflict")
@@ -178,7 +194,6 @@ class AtlasStore:
             if path.read_bytes() != content:
                 raise StoreConflictError("blob verification conflict")
         with self._conn:
-            row = self._conn.execute("SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)).fetchone()
             values = (len(content), media_type)
             if row is not None and tuple(row) != values:
                 raise StoreConflictError("blob metadata conflict")
@@ -188,8 +203,12 @@ class AtlasStore:
 
     def read_blob(self, blob_hash: str) -> bytes:
         path = self._blob_path(blob_hash)
-        if not path.is_file(): raise KeyError(blob_hash)
+        row = self._conn.execute("SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)).fetchone()
+        if row is None or not path.is_file():
+            raise StoreConflictError("blob consistency conflict")
         content = path.read_bytes()
+        if row[0] != len(content):
+            raise StoreConflictError("blob size conflict")
         if "sha256:" + hashlib.sha256(content).hexdigest() != blob_hash:
             raise StoreConflictError("blob hash conflict")
         return content
@@ -205,7 +224,15 @@ class AtlasStore:
 
     def get_packet(self, packet_id: str) -> ImplementationPacket | None:
         row = self._conn.execute("SELECT packet_json FROM atlas_packet_receipts WHERE packet_id=?", (packet_id,)).fetchone()
-        return None if row is None else ImplementationPacket(**__import__('json').loads(row[0]))
+        if row is None: return None
+        value = json.loads(row[0])
+        value["evidence_windows"] = tuple(value["evidence_windows"])
+        value["operations"] = tuple(TemplateOperation(**item) for item in value["operations"])
+        value["slots"] = tuple(SlotSpec(**item) for item in value["slots"])
+        value["constraints"] = tuple(ConstraintSpec(**item) for item in value["constraints"])
+        value["dependencies"] = tuple(DependencySpec(**item) for item in value["dependencies"])
+        value["tests"] = tuple(TestSpec(tuple(item["argv"]), item["expected_exit_code"]) for item in value["tests"])
+        return ImplementationPacket(**value)
 
     def put_ingestion_receipt(self, receipt: IngestionReceipt) -> str:
         values = (receipt.payload_hash, receipt.status.value, receipt.episode_id, receipt.recipe_id or "", canonical_json(receipt.reasons), receipt.created_at)
@@ -217,7 +244,7 @@ class AtlasStore:
 
     def get_ingestion_receipt(self, ingestion_key: str) -> IngestionReceipt | None:
         row = self._conn.execute("SELECT payload_hash,status,episode_id,recipe_id,reasons_json,created_at FROM atlas_ingestion_receipts WHERE ingestion_key=?", (ingestion_key,)).fetchone()
-        return None if row is None else IngestionReceipt(ingestion_key, row[0], AtlasStatus(row[1]), row[2], row[3] or None, tuple(__import__('json').loads(row[4])), row[5])
+        return None if row is None else IngestionReceipt(ingestion_key, row[0], AtlasStatus(row[1]), row[2], row[3] or None, tuple(json.loads(row[4])), row[5])
 
     def recipes_for_intent(self, intent_id: str, *, language: str | None = None, framework: str | None = None, state: str | None = None) -> tuple[str, ...]:
         clauses, args = ["intent_id=?"], [intent_id]
@@ -227,16 +254,17 @@ class AtlasStore:
 
     def _node(self, node_id: str) -> AtlasNode:
         row = self._conn.execute("SELECT node_id,kind,payload_json,schema_version,extractor_id,extractor_version,provenance,source_hashes_json,created_at,superseded_at,quarantine_state FROM atlas_nodes WHERE node_id=?", (node_id,)).fetchone()
-        return AtlasNode(row[0], NodeKind(row[1]), __import__('json').loads(row[2]), row[3], row[4], row[5], row[6], tuple(__import__('json').loads(row[7])), row[8] or None, row[9], row[10] or None)
+        return AtlasNode(row[0], NodeKind(row[1]), json.loads(row[2]), row[3], row[4], row[5], row[6], tuple(json.loads(row[7])), row[8] or None, row[9], row[10] or None)
 
     def _edge(self, edge_id: str) -> AtlasEdge:
         row = self._conn.execute("SELECT e.edge_id,e.relation,e.source_id,e.target_id,s.kind,t.kind,e.payload_json,e.schema_version,e.provenance,e.created_at FROM atlas_edges e JOIN atlas_nodes s ON s.node_id=e.source_id JOIN atlas_nodes t ON t.node_id=e.target_id WHERE e.edge_id=?", (edge_id,)).fetchone()
-        return AtlasEdge(row[0], EdgeRelation(row[1]), row[2], row[3], NodeKind(row[4]), NodeKind(row[5]), __import__('json').loads(row[6]), row[7], row[8], row[9] or None)
+        return AtlasEdge(row[0], EdgeRelation(row[1]), row[2], row[3], NodeKind(row[4]), NodeKind(row[5]), json.loads(row[6]), row[7], row[8], row[9] or None)
 
-    def graph_query(self, roots: Iterable[str], *, max_nodes: int = MAX_GRAPH_NODES, max_edges: int = MAX_GRAPH_EDGES, max_depth: int = MAX_GRAPH_DEPTH, byte_budget: int = 524_288, node_kinds: Iterable[NodeKind] | None = None, relations: Iterable[EdgeRelation] | None = None) -> GraphQueryResult:
-        if not (0 < max_nodes <= MAX_GRAPH_NODES and 0 < max_edges <= MAX_GRAPH_EDGES and 0 <= max_depth <= MAX_GRAPH_DEPTH and byte_budget > 0): raise ValueError("invalid graph budget")
+    def graph_query(self, root_node_ids: Iterable[str], *, max_nodes: int = MAX_GRAPH_NODES, max_edges: int = MAX_GRAPH_EDGES, max_depth: int = MAX_GRAPH_DEPTH, byte_budget: int = MAX_PACKET_BYTES, node_kinds: Iterable[NodeKind] | None = None, relations: Iterable[EdgeRelation] | None = None) -> GraphQueryResult:
+        if not (0 < max_nodes <= MAX_GRAPH_NODES and 0 < max_edges <= MAX_GRAPH_EDGES and 0 < max_depth <= MAX_GRAPH_DEPTH and 0 < byte_budget <= MAX_PACKET_BYTES): raise ValueError("invalid graph budget")
         allowed_kinds = None if node_kinds is None else {item.value if isinstance(item, NodeKind) else str(item) for item in node_kinds}
         allowed_relations = None if relations is None else {item.value if isinstance(item, EdgeRelation) else str(item) for item in relations}
+        roots = tuple(root_node_ids)
         chosen = set(); frontier = sorted(set(roots)); truncated = False
         for root in frontier:
             if self._conn.execute("SELECT 1 FROM atlas_nodes WHERE node_id=?", (root,)).fetchone() is not None:
