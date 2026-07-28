@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, fields, replace
-from pathlib import PurePosixPath
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable
 
 from project_index.models import IndexError, SnapshotFacts
 from project_index.service import ProjectIndexService
@@ -31,11 +31,13 @@ from .models import (
     NodeKind,
     PreparationResult,
     RecipeManifest,
+    RenderResult,
     SlotSpec,
     TemplateOperation,
     TestSpec,
 )
 from .recipes import BundledRecipeLoader
+from .rendering import render_patch, validate_bindings
 from .security import (
     MAX_CHANGED_FILES,
     MAX_COMMAND_SPEC_BYTES,
@@ -44,6 +46,9 @@ from .security import (
     MAX_GRAPH_NODES,
     MAX_PACKET_BYTES,
     MAX_SLOT_COUNT,
+    MAX_TEMPLATE_BYTES,
+    path_collision_key,
+    validate_absent_workspace_path,
     validate_candidate_path,
     validate_fragment,
     validate_slot_value,
@@ -82,6 +87,44 @@ _BODY_KEYS = frozenset(
         "source_text",
         "template_body",
         "template_text",
+    }
+)
+_RENDER_REASON_CODES = frozenset(
+    {
+        "request_invalid",
+        "packet_not_found",
+        "packet_integrity_mismatch",
+        "packet_workspace_mismatch",
+        "packet_snapshot_mismatch",
+        "packet_recipe_mismatch",
+        "packet_template_mismatch",
+        "recipe_unavailable",
+        "recipe_quarantined",
+        "constraint_unmet",
+        "index_stale",
+        "binding_schema_invalid",
+        "binding_missing",
+        "binding_unknown",
+        "binding_invalid",
+        "template_blob_missing",
+        "template_blob_integrity",
+        "template_blob_unsafe",
+        "template_placeholder_invalid",
+        "template_slot_mismatch",
+        "secret_detected",
+        "source_path_unsafe",
+        "source_path_raced",
+        "source_hash_mismatch",
+        "source_encoding_invalid",
+        "source_newline_invalid",
+        "path_case_collision",
+        "operation_unsupported",
+        "operation_path_collision",
+        "target_symbol_ambiguous",
+        "target_layout_unsupported",
+        "rendered_parse_invalid",
+        "test_spec_invalid",
+        "render_budget_exceeded",
     }
 )
 
@@ -336,6 +379,12 @@ def _sorted_records(records: Sequence[Any]) -> tuple[Any, ...]:
     return tuple(sorted(records, key=lambda item: canonical_json(item.to_dict())))
 
 
+def hydrate_local_manifest(root: AtlasNode) -> RecipeManifest:
+    """Strictly hydrate one observed local recipe root without a second codec."""
+
+    return CodeAtlasService._hydrate_manifest(root)
+
+
 class CodeAtlasService:
     """Join immutable bundled records and bounded local Atlas graph records."""
 
@@ -347,7 +396,11 @@ class CodeAtlasService:
     ) -> None:
         self._store = store
         self._project_index = project_index
+        self._bundled_loader = bundled_loader
         self._bundled_manifests = tuple(bundled_loader.load())
+        self._bundled_by_id = {
+            manifest.recipe_id: manifest for manifest in self._bundled_manifests
+        }
         bundled_graph = bundled_loader.materialize()
         self._bundled_nodes = {
             node.node_id: node for node in bundled_graph.nodes if self._safe_node(node)
@@ -787,7 +840,7 @@ class CodeAtlasService:
                 malformed = True
                 continue
             try:
-                manifests.append(self._hydrate_manifest(result.nodes[0]))
+                manifests.append(hydrate_local_manifest(result.nodes[0]))
             except AtlasError:
                 malformed = True
         return (
@@ -1113,3 +1166,292 @@ class CodeAtlasService:
             candidate_recipe_ids=candidate_ids,
             reasons=reasons,
         )
+
+    @staticmethod
+    def _render_invalid(packet_id: object, *codes: str) -> RenderResult:
+        safe_packet_id = packet_id if _is_hash(packet_id) else ""
+        normalized = {
+            code if code in _RENDER_REASON_CODES else "packet_recipe_mismatch"
+            for code in codes
+            if code
+        }
+        return RenderResult(
+            AtlasStatus.RENDER_INVALID,
+            safe_packet_id,
+            reasons=tuple(sorted(normalized)),
+        )
+
+    def _reload_render_manifest(self, recipe_id: str) -> RecipeManifest:
+        bundled = self._bundled_by_id.get(recipe_id)
+        if bundled is not None:
+            return bundled
+        graph = self._store.graph_query(
+            (recipe_id,),
+            max_nodes=1,
+            max_edges=MAX_GRAPH_EDGES,
+            max_depth=MAX_GRAPH_DEPTH,
+            byte_budget=MAX_PACKET_BYTES,
+            node_kinds=None,
+            relations=(),
+        )
+        if (
+            graph.truncated
+            or len(graph.nodes) != 1
+            or graph.nodes[0].node_id != recipe_id
+            or graph.nodes[0].kind is not NodeKind.RECIPE
+        ):
+            raise AtlasError("recipe_unavailable")
+        try:
+            manifest = hydrate_local_manifest(graph.nodes[0])
+        except AtlasError as exc:
+            raise AtlasError("recipe_unavailable") from exc
+        if manifest.quarantine_state not in (None, "", "ready", "READY"):
+            raise AtlasError("recipe_quarantined")
+        return manifest
+
+    def _verify_render_packet_recipe(
+        self, packet: ImplementationPacket, manifest: RecipeManifest
+    ) -> None:
+        expected_templates = tuple(
+            sorted({operation.template_hash for operation in manifest.operations})
+        )
+        graph = self.graph_query(
+            roots=(manifest.recipe_id,),
+            max_nodes=MAX_GRAPH_NODES,
+            max_edges=MAX_GRAPH_EDGES,
+            max_depth=MAX_GRAPH_DEPTH,
+            byte_budget=MAX_PACKET_BYTES,
+        )
+        if packet.template_hashes != expected_templates or any(
+            not _is_hash(item) for item in packet.template_hashes
+        ):
+            raise AtlasError("packet_template_mismatch")
+        if (
+            graph.truncated
+            or packet.recipe_id != manifest.recipe_id
+            or manifest.manifest_hash not in packet.evidence_hashes
+            or packet.operations != _sorted_records(manifest.operations)
+            or packet.slots != tuple(sorted(manifest.slots, key=lambda item: item.name))
+            or packet.constraints != _sorted_records(manifest.constraints)
+            or packet.dependencies != _sorted_records(manifest.dependencies)
+            or packet.tests != _sorted_records(manifest.tests)
+            or packet.node_ids != tuple(node.node_id for node in graph.nodes)
+            or packet.edge_ids != tuple(edge.edge_id for edge in graph.edges)
+        ):
+            raise AtlasError("packet_recipe_mismatch")
+
+    @staticmethod
+    def _render_evidence(packet: ImplementationPacket) -> dict[str, str]:
+        evidence: dict[str, str] = {}
+        for item in packet.evidence_windows:
+            value = thaw_json(item)
+            if (
+                type(value) is not dict
+                or not {"path", "content_hash"} <= set(value)
+                or set(value) - {"path", "content_hash", "start_line", "end_line"}
+                or not isinstance(value["path"], str)
+                or not _is_hash(value["content_hash"])
+            ):
+                raise AtlasError("source_hash_mismatch")
+            try:
+                path = validate_candidate_path(value["path"])
+            except AtlasError as exc:
+                raise AtlasError("source_path_unsafe") from exc
+            current = evidence.get(path)
+            if current is not None and current != value["content_hash"]:
+                raise AtlasError("source_hash_mismatch")
+            evidence[path] = value["content_hash"]
+        return evidence
+
+    @staticmethod
+    def _render_fact_paths(facts: SnapshotFacts) -> dict[str, tuple[str, str]]:
+        values: dict[str, tuple[str, str]] = {}
+        for raw_path, content_hash in facts.file_hashes:
+            if not isinstance(raw_path, str) or not _is_hash(content_hash):
+                raise AtlasError("source_hash_mismatch")
+            try:
+                path = validate_candidate_path(raw_path)
+            except AtlasError as exc:
+                raise AtlasError("source_path_unsafe") from exc
+            key = path_collision_key(path)
+            if key in values and values[key][0] != path:
+                raise AtlasError("path_case_collision")
+            values[key] = (path, content_hash)
+        return values
+
+    def _render_template_reader(
+        self, manifest: RecipeManifest
+    ) -> Callable[[str], bytes]:
+        def read(template_hash: str) -> bytes:
+            try:
+                if manifest.layer == "bundled":
+                    return self._bundled_loader.read_template(template_hash)
+                return self._store.read_blob_verified(
+                    template_hash, max_bytes=MAX_TEMPLATE_BYTES
+                )
+            except AtlasError as error:
+                if error.code in {"unsafe_asset_reference"}:
+                    raise AtlasError("template_blob_unsafe") from error
+                if error.code in {"missing_template_blob"}:
+                    raise AtlasError("template_blob_missing") from error
+                raise AtlasError("template_blob_integrity") from error
+            except StoreConflictError as error:
+                raise AtlasError("template_blob_integrity") from error
+
+        return read
+
+    def render(
+        self,
+        workspace: str,
+        snapshot_id: str,
+        packet_id: str,
+        bindings: Mapping[str, str],
+    ) -> RenderResult:
+        """Return one deterministic patch candidate and inert test specifications."""
+
+        if (
+            type(workspace) is not str
+            or not workspace
+            or type(snapshot_id) is not str
+            or not _is_hash(snapshot_id)
+            or type(packet_id) is not str
+            or not _is_hash(packet_id)
+            or type(bindings) is not dict
+            or len(bindings) > MAX_SLOT_COUNT
+        ):
+            return self._render_invalid(packet_id, "request_invalid")
+        try:
+            request_workspace = Path(workspace).resolve().as_posix()
+        except OSError:
+            return self._render_invalid(packet_id, "request_invalid")
+        try:
+            packet = self._store.get_packet_verified(packet_id)
+        except StoreConflictError:
+            return self._render_invalid(packet_id, "packet_integrity_mismatch")
+        if packet is None:
+            return self._render_invalid(packet_id, "packet_not_found")
+        if packet.workspace != request_workspace:
+            return self._render_invalid(packet_id, "packet_workspace_mismatch")
+        if packet.snapshot_id != snapshot_id:
+            return self._render_invalid(packet_id, "packet_snapshot_mismatch")
+        if packet.next_action != "code_atlas_render":
+            return self._render_invalid(packet_id, "packet_recipe_mismatch")
+        if len(canonical_json(packet.to_dict()).encode("utf-8")) > MAX_PACKET_BYTES:
+            return self._render_invalid(packet_id, "packet_integrity_mismatch")
+        try:
+            manifest = self._reload_render_manifest(packet.recipe_id)
+            self._verify_render_packet_recipe(packet, manifest)
+        except StoreConflictError:
+            return self._render_invalid(packet_id, "packet_recipe_mismatch")
+        except AtlasError as error:
+            return self._render_invalid(packet_id, error.code)
+        try:
+            self._project_index.assert_current(request_workspace, snapshot_id)
+            facts = self._project_index.snapshot_facts(request_workspace, snapshot_id)
+            repository_signature = structural_repository_signature(
+                facts,
+                language=manifest.language_name,
+                framework=manifest.framework_name,
+            )
+            rematch = select_recipe(
+                (manifest,),
+                intent_id=manifest.intent_id,
+                language=manifest.language_name,
+                framework=manifest.framework_name,
+                repository_signature=repository_signature,
+                snapshot_facts=facts,
+                max_candidates=1,
+            )
+            if rematch.status is not AtlasStatus.READY:
+                raise AtlasError("constraint_unmet")
+            validated = validate_bindings(manifest, bindings)
+            evidence = self._render_evidence(packet)
+            if packet.evidence_hashes != tuple(
+                sorted({manifest.manifest_hash, *evidence.values()})
+            ):
+                raise AtlasError("packet_recipe_mismatch")
+            fact_paths = self._render_fact_paths(facts)
+            source_paths: set[str] = set()
+            for operation in manifest.operations:
+                path = validated.get(operation.path_slot)
+                if path is None:
+                    raise AtlasError("binding_schema_invalid")
+                try:
+                    path = validate_candidate_path(path, request_workspace)
+                except AtlasError as exc:
+                    raise AtlasError("source_path_unsafe") from exc
+                key = path_collision_key(path)
+                existing = fact_paths.get(key)
+                if existing is not None and existing[0] != path:
+                    raise AtlasError("path_case_collision")
+                if operation.kind == "create_python_file":
+                    if existing is not None:
+                        raise AtlasError("operation_path_collision")
+                    try:
+                        validate_absent_workspace_path(request_workspace, path)
+                    except AtlasError as exc:
+                        raise AtlasError("source_path_unsafe") from exc
+                    continue
+                if existing is None or path not in evidence:
+                    raise AtlasError("source_hash_mismatch")
+                if evidence[path] != existing[1]:
+                    raise AtlasError("source_hash_mismatch")
+                if evidence[path] not in packet.source_hashes:
+                    raise AtlasError("source_hash_mismatch")
+                source_paths.add(path)
+            if (
+                tuple(sorted(packet.source_hashes)) != packet.source_hashes
+                or any(not _is_hash(value) for value in packet.source_hashes)
+                or len(set(packet.source_hashes)) != len(packet.source_hashes)
+            ):
+                raise AtlasError("source_hash_mismatch")
+            files = (
+                self._project_index.read_snapshot_files(
+                    request_workspace,
+                    snapshot_id,
+                    tuple(sorted(source_paths, key=path_collision_key)),
+                    byte_budget=MAX_PACKET_BYTES,
+                )
+                if source_paths
+                else ()
+            )
+            source_files = {item.path: item.body for item in files}
+            if set(source_files) != source_paths:
+                raise AtlasError("source_hash_mismatch")
+            for item in files:
+                expected = evidence.get(item.path)
+                current = next(
+                    (
+                        content_hash
+                        for path, content_hash in facts.file_hashes
+                        if path == item.path
+                    ),
+                    None,
+                )
+                if expected != item.content_hash or current != item.content_hash:
+                    raise AtlasError("source_hash_mismatch")
+            rendered = render_patch(
+                manifest,
+                validated,
+                source_files=source_files,
+                snapshot_paths=tuple(path for path, _hash in facts.file_hashes),
+                template_reader=self._render_template_reader(manifest),
+            )
+            self._project_index.assert_current(request_workspace, snapshot_id)
+            result = RenderResult(
+                AtlasStatus.READY,
+                packet_id,
+                patch_candidate=rendered.patch_candidate,
+                patch_hash=rendered.patch_hash,
+                bindings_hash=rendered.bindings_hash,
+                test_specs=rendered.test_specs,
+            )
+            if len(canonical_json(result.to_dict()).encode("utf-8")) > MAX_PACKET_BYTES:
+                raise AtlasError("render_budget_exceeded")
+            return result
+        except IndexError:
+            return self._render_invalid(packet_id, "index_stale")
+        except AtlasError as error:
+            return self._render_invalid(packet_id, error.code)
+        except (OSError, TypeError, UnicodeError, ValueError):
+            return self._render_invalid(packet_id, "request_invalid")

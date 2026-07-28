@@ -6,6 +6,7 @@ import ast
 import keyword
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 from .models import AtlasError
@@ -19,22 +20,40 @@ MAX_GRAPH_NODES = 200
 MAX_GRAPH_EDGES = 400
 MAX_GRAPH_DEPTH = 4
 MAX_COMMAND_SPEC_BYTES = 4_096
-GENERATED_COMPONENTS = frozenset({
-    ".git", ".venv", "venv", "node_modules", "vendor",
-    "dist", "build", "__pycache__",
-})
+GENERATED_COMPONENTS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "vendor",
+        "dist",
+        "build",
+        "__pycache__",
+    }
+)
 
 _DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 _ASSIGNMENT = re.compile(
     r"(?ix)(?<![a-z0-9_])(?:export\s+)?['\"]?([a-z][a-z0-9_]*)['\"]?\s*(?:=|:)\s*['\"]?([^\s,}\]]+)"
 )
-_RAW_TOKEN = re.compile(r"(?i)(?<![a-z0-9])(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]{8,})(?![a-z0-9])")
+_RAW_TOKEN = re.compile(
+    r"(?i)(?<![a-z0-9])(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]{8,})(?![a-z0-9])"
+)
 _BEARER_OR_PRIVATE_KEY = re.compile(
     r"(?ix)(?:\bauthorization\s*:\s*bearer\s+\S+|-----begin\s+[a-z\s]*private\s+key-----)"
 )
 _SENSITIVE_KEY_SUFFIXES = (
-    "API_KEY", "ACCESS_TOKEN", "TOKEN", "PASSWORD", "PASSWD", "SECRET_ACCESS_KEY",
-    "CLIENT_SECRET", "SECRET", "PRIVATE_KEY", "AUTHORIZATION",
+    "API_KEY",
+    "ACCESS_TOKEN",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "SECRET_ACCESS_KEY",
+    "CLIENT_SECRET",
+    "SECRET",
+    "PRIVATE_KEY",
+    "AUTHORIZATION",
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
 _QUALIFIED_NAME = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
@@ -46,15 +65,25 @@ def _contains_credential(text: str) -> bool:
         return True
     for match in _ASSIGNMENT.finditer(text):
         key = match.group(1).upper()
-        if any(key == suffix or key.endswith(f"_{suffix}") for suffix in _SENSITIVE_KEY_SUFFIXES):
+        if any(
+            key == suffix or key.endswith(f"_{suffix}")
+            for suffix in _SENSITIVE_KEY_SUFFIXES
+        ):
             return True
     return False
 
 
-def validate_candidate_path(path: str | os.PathLike[str], workspace: str | os.PathLike[str] | None = None) -> str:
+def validate_candidate_path(
+    path: str | os.PathLike[str], workspace: str | os.PathLike[str] | None = None
+) -> str:
     """Validate and return a normalized, non-generated relative candidate path."""
     raw = os.fspath(path)
-    if not raw or raw.strip() != raw or raw.startswith(("/", "\\")) or _DRIVE_PATH.match(raw):
+    if (
+        not raw
+        or raw.strip() != raw
+        or raw.startswith(("/", "\\"))
+        or _DRIVE_PATH.match(raw)
+    ):
         raise AtlasError("unsafe_path")
     normalized = raw.replace("\\", "/")
     parts = normalized.split("/")
@@ -90,7 +119,34 @@ def validate_candidate_path(path: str | os.PathLike[str], workspace: str | os.Pa
     return "/".join(parts)
 
 
-def validate_fragment(fragment: str | bytes, *, max_bytes: int = MAX_TEMPLATE_BYTES) -> str:
+def path_collision_key(path: str) -> str:
+    """Return the NFC/casefold collision key used for safe relative paths."""
+
+    if not isinstance(path, str):
+        raise AtlasError("unsafe_path")
+    return unicodedata.normalize("NFC", path.replace("\\", "/")).casefold()
+
+
+def validate_absent_workspace_path(
+    workspace: str | os.PathLike[str], path: str | os.PathLike[str]
+) -> str:
+    """Validate a safe candidate path and prove its final component is absent."""
+
+    normalized = validate_candidate_path(path, workspace)
+    root = Path(workspace).resolve()
+    candidate = root.joinpath(*normalized.split("/"))
+    try:
+        candidate.lstat()
+    except FileNotFoundError:
+        return normalized
+    except OSError as exc:
+        raise AtlasError("unsafe_path") from exc
+    raise AtlasError("existing_path")
+
+
+def validate_fragment(
+    fragment: str | bytes, *, max_bytes: int = MAX_TEMPLATE_BYTES
+) -> str:
     """Return safe UTF-8 text, rejecting binary, oversize, or secret-bearing input."""
     if isinstance(fragment, bytes):
         if len(fragment) > max_bytes or b"\0" in fragment:
@@ -126,7 +182,9 @@ def validate_slot_value(slot_type: str, value: str) -> str:
             raise AtlasError("invalid_slot_value")
         return value
     if slot_type == "python_qualified_name":
-        if not _QUALIFIED_NAME.fullmatch(value) or any(keyword.iskeyword(part) for part in value.split(".")):
+        if not _QUALIFIED_NAME.fullmatch(value) or any(
+            keyword.iskeyword(part) for part in value.split(".")
+        ):
             raise AtlasError("invalid_slot_value")
         return value
     if slot_type == "python_expression":

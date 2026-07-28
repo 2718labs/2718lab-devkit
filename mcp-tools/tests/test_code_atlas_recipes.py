@@ -71,6 +71,16 @@ def test_three_seed_recipes_load_with_verified_blobs() -> None:
         )
 
 
+def test_public_template_read_reuses_the_locked_asset_boundary() -> None:
+    loader = BundledRecipeLoader(ASSETS)
+    template_hash = LOCKED_SEEDS["python-pytest-regression.json"][2]
+    expected = (
+        ASSETS / "templates" / "sha256" / template_hash.removeprefix("sha256:")
+    ).read_bytes()
+
+    assert loader.read_template(template_hash) == expected
+
+
 def test_pattern_card_is_a_deterministic_view() -> None:
     recipe = BundledRecipeLoader(ASSETS).load()[0]
     first = render_pattern_card(recipe)

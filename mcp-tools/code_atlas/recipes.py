@@ -285,6 +285,11 @@ class BundledRecipeLoader:
             raise AtlasError("invalid_template_blob") from exc
         return body
 
+    def read_template(self, template_hash: str) -> bytes:
+        """Return one locked bundled template through the shared safe reader."""
+
+        return self._blob(template_hash)
+
     def _parse(self, filename: str) -> RecipeManifest:
         try:
             raw = self._safe_read(
@@ -487,7 +492,7 @@ class BundledRecipeLoader:
                 != "python_qualified_name"
             ):
                 _error("invalid_operation")
-            body = self._blob(_text(operation["template_hash"]))
+            body = self.read_template(_text(operation["template_hash"]))
             placeholders = _placeholder_names(
                 body.decode("utf-8"), code="invalid_template_placeholder"
             )

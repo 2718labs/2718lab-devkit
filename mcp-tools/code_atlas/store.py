@@ -7,7 +7,9 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import uuid
+from dataclasses import fields
 from pathlib import Path
 from typing import Iterable
 
@@ -33,10 +35,96 @@ from .security import (
     MAX_GRAPH_EDGES,
     MAX_GRAPH_NODES,
     MAX_PACKET_BYTES,
+    MAX_RECIPE_BYTES,
+    MAX_TEMPLATE_BYTES,
+    validate_fragment,
 )
 
 
 _HASH = re.compile(r"^sha256:([0-9a-f]{64})$")
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Return the attributes that identify a regular file across a read."""
+
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+
+
+def _unsafe_file_status(path: Path, value: os.stat_result) -> bool:
+    is_junction = getattr(os.path, "isjunction", None)
+    return bool(
+        stat.S_ISLNK(value.st_mode)
+        or getattr(value, "st_file_attributes", 0) & 0x400
+        or (callable(is_junction) and is_junction(path))
+    )
+
+
+def _assert_safe_existing_path(path: Path, *, require_regular: bool = False) -> None:
+    """Reject any linked/reparse component without resolving through it."""
+
+    absolute = path.absolute()
+    parts = absolute.parts
+    if not parts:
+        raise StoreConflictError()
+    cursor = Path(parts[0])
+    try:
+        for part in parts[1:]:
+            cursor /= part
+            item = cursor.lstat()
+            if _unsafe_file_status(cursor, item):
+                raise StoreConflictError()
+        final = absolute.lstat()
+    except StoreConflictError:
+        raise
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    if require_regular and not stat.S_ISREG(final.st_mode):
+        raise StoreConflictError()
+
+
+def _remove_owned_ephemera(
+    items: tuple[tuple[Path, tuple[int, int, int, int, int]], ...],
+) -> None:
+    """Remove only a SQLite sidecar this reader proved it created."""
+
+    for path, identity in items:
+        try:
+            _assert_safe_existing_path(path, require_regular=True)
+            # SQLite updates sidecar size/timestamps while a read-only WAL
+            # connection is live.  Keep the stable file-object identity check
+            # so a replacement is never removed, while allowing its own
+            # transient WAL/SHM metadata changes to be cleaned up on close.
+            if _file_identity(path.lstat())[:3] == identity[:3]:
+                path.unlink()
+        except (OSError, StoreConflictError):
+            continue
+
+
+def _capture_owned_sidecars(
+    sidecars: tuple[Path, ...], absent_before: set[Path]
+) -> tuple[tuple[Path, tuple[int, int, int, int, int]], ...]:
+    """Capture safe SQLite sidecars that were absent before this open."""
+
+    created: list[tuple[Path, tuple[int, int, int, int, int]]] = []
+    for sidecar in sidecars:
+        if sidecar not in absent_before:
+            continue
+        try:
+            sidecar_status = sidecar.lstat()
+        except FileNotFoundError:
+            continue
+        if _unsafe_file_status(sidecar, sidecar_status) or not stat.S_ISREG(
+            sidecar_status.st_mode
+        ):
+            raise StoreConflictError()
+        created.append((sidecar, _file_identity(sidecar_status)))
+    return tuple(created)
 
 
 class StoreConflictError(ValueError):
@@ -81,6 +169,73 @@ class AtlasStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._migrate()
 
+    @classmethod
+    def open_readonly(
+        cls, database_path: str | Path, cas_root: str | Path
+    ) -> "AtlasStore":
+        """Open an existing Atlas database without creating or mutating it.
+
+        SQLite's ``mode=ro`` deliberately remains WAL-aware; using
+        ``immutable=1`` here would hide a valid, uncheckpointed WAL file.
+        """
+
+        database = Path(database_path)
+        cas = Path(cas_root)
+        connection: sqlite3.Connection | None = None
+        created_sidecars: tuple[tuple[Path, tuple[int, int, int, int, int]], ...] = ()
+        sidecars: tuple[Path, ...] = ()
+        absent_before: set[Path] = set()
+        try:
+            _assert_safe_existing_path(database, require_regular=True)
+            _assert_safe_existing_path(cas)
+            if not stat.S_ISDIR(cas.lstat().st_mode):
+                raise StoreConflictError()
+            sidecars = (Path(str(database) + "-wal"), Path(str(database) + "-shm"))
+            for sidecar in sidecars:
+                try:
+                    value = sidecar.lstat()
+                except FileNotFoundError:
+                    absent_before.add(sidecar)
+                else:
+                    if _unsafe_file_status(sidecar, value) or not stat.S_ISREG(
+                        value.st_mode
+                    ):
+                        raise StoreConflictError()
+            uri = database.absolute().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=30.0)
+            connection.execute("PRAGMA query_only=ON")
+            created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
+            row = connection.execute(
+                "SELECT value FROM atlas_metadata WHERE key='schema_version'"
+            ).fetchone()
+            created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
+            if row is None or row[0] != "1":
+                raise StoreConflictError()
+            instance = cls.__new__(cls)
+            instance._database_path = database
+            instance._cas_root = cas
+            instance._conn = connection
+            instance._readonly_ephemera = created_sidecars
+            return instance
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            if connection is not None:
+                try:
+                    created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
+                except StoreConflictError:
+                    pass
+                connection.close()
+            _remove_owned_ephemera(created_sidecars)
+            raise StoreConflictError() from exc
+        except Exception:
+            if connection is not None:
+                try:
+                    created_sidecars = _capture_owned_sidecars(sidecars, absent_before)
+                except StoreConflictError:
+                    pass
+                connection.close()
+            _remove_owned_ephemera(created_sidecars)
+            raise
+
     def _migrate(self) -> None:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -107,6 +262,7 @@ class AtlasStore:
 
     def close(self) -> None:
         self._conn.close()
+        _remove_owned_ephemera(getattr(self, "_readonly_ephemera", ()))
 
     def schema_version(self) -> int:
         return int(
@@ -375,23 +531,85 @@ class AtlasStore:
             raise
         return blob_hash
 
-    def read_blob(self, blob_hash: str) -> bytes:
+    def read_blob_verified(self, blob_hash: str, *, max_bytes: int) -> bytes:
+        """Read a bounded text blob through the CAS no-follow integrity boundary."""
+
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or not 0 < max_bytes <= MAX_RECIPE_BYTES
+            or _HASH.fullmatch(blob_hash) is None
+        ):
+            raise StoreConflictError()
         path = self._blob_path(blob_hash)
         row = self._conn.execute(
-            "SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)
+            "SELECT size FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)
         ).fetchone()
+        if row is None or type(row[0]) is not int or row[0] < 0 or row[0] > max_bytes:
+            raise StoreConflictError()
+        descriptor: int | None = None
         try:
-            path_is_file = path.is_file()
+            _assert_safe_existing_path(self._cas_root)
+            _assert_safe_existing_path(path, require_regular=True)
+            before = path.lstat()
+            flags = (
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            )
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or _file_identity(
+                before
+            ) != _file_identity(opened):
+                raise StoreConflictError()
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                chunk = os.read(descriptor, min(65_536, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            after_open = os.fstat(descriptor)
+            if _file_identity(opened) != _file_identity(after_open):
+                raise StoreConflictError()
+            if total > max_bytes:
+                raise StoreConflictError()
+        except StoreConflictError:
+            raise
         except OSError as exc:
-            raise StoreConflictError("blob path conflict") from exc
-        if row is None or not path_is_file:
-            raise StoreConflictError("blob consistency conflict")
-        content = self._read_blob_file(path)
-        if row[0] != len(content):
-            raise StoreConflictError("blob size conflict")
-        if "sha256:" + hashlib.sha256(content).hexdigest() != blob_hash:
-            raise StoreConflictError("blob hash conflict")
+            raise StoreConflictError() from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    raise StoreConflictError() from exc
+        try:
+            _assert_safe_existing_path(path, require_regular=True)
+            post = path.lstat()
+        except StoreConflictError:
+            raise
+        if _file_identity(before) != _file_identity(post):
+            raise StoreConflictError()
+        content = b"".join(chunks)
+        if (
+            len(content) != row[0]
+            or "sha256:" + hashlib.sha256(content).hexdigest() != blob_hash
+        ):
+            raise StoreConflictError()
+        try:
+            validate_fragment(content, max_bytes=max_bytes)
+        except Exception as exc:
+            raise StoreConflictError() from exc
         return content
+
+    def read_blob(self, blob_hash: str) -> bytes:
+        """Compatibility alias for the verified bounded template/blob reader."""
+
+        try:
+            return self.read_blob_verified(blob_hash, max_bytes=MAX_TEMPLATE_BYTES)
+        except StoreConflictError as exc:
+            raise StoreConflictError("blob conflict") from exc
 
     def put_packet(self, packet: ImplementationPacket, *, created_at: str = "") -> str:
         payload = canonical_json(packet.to_dict())
@@ -411,30 +629,180 @@ class AtlasStore:
                 )
         return packet.packet_id
 
+    @staticmethod
+    def _hydrate_packet(value: object) -> ImplementationPacket:
+        """Hydrate one canonical packet with no permissive fallback codec."""
+
+        expected = {item.name for item in fields(ImplementationPacket)}
+        if type(value) is not dict or set(value) != expected:
+            raise StoreConflictError()
+        text_fields = {
+            "packet_id",
+            "trace_id",
+            "workspace",
+            "snapshot_id",
+            "recipe_id",
+            "next_action",
+        }
+        if any(not isinstance(value[name], str) for name in text_fields):
+            raise StoreConflictError()
+        sequence_fields = {
+            "node_ids",
+            "edge_ids",
+            "evidence_windows",
+            "evidence_hashes",
+            "operations",
+            "slots",
+            "constraints",
+            "dependencies",
+            "tests",
+            "gaps",
+            "source_hashes",
+            "template_hashes",
+            "receipt_hashes",
+        }
+        if any(type(value[name]) is not list for name in sequence_fields):
+            raise StoreConflictError()
+        string_sequences = {
+            "node_ids",
+            "edge_ids",
+            "evidence_hashes",
+            "gaps",
+            "source_hashes",
+            "template_hashes",
+            "receipt_hashes",
+        }
+        if any(
+            any(not isinstance(item, str) for item in value[name])
+            for name in string_sequences
+        ):
+            raise StoreConflictError()
+
+        def record_items(
+            raw: object, record_type: type[object]
+        ) -> tuple[dict[str, object], ...]:
+            names = {item.name for item in fields(record_type)}
+            if type(raw) is not list or any(
+                type(item) is not dict or set(item) != names for item in raw
+            ):
+                raise StoreConflictError()
+            return tuple(raw)
+
+        operations = record_items(value["operations"], TemplateOperation)
+        if any(
+            any(not isinstance(item[name], str) for name in item) for item in operations
+        ):
+            raise StoreConflictError()
+        slots = record_items(value["slots"], SlotSpec)
+        if any(
+            not isinstance(item["name"], str)
+            or not isinstance(item["type"], str)
+            or type(item["required"]) is not bool
+            for item in slots
+        ):
+            raise StoreConflictError()
+        constraints = record_items(value["constraints"], ConstraintSpec)
+        if any(
+            not isinstance(item["kind"], str) or not isinstance(item["subject"], str)
+            for item in constraints
+        ):
+            raise StoreConflictError()
+        dependencies = record_items(value["dependencies"], DependencySpec)
+        if any(
+            any(not isinstance(item[name], str) for name in item)
+            for item in dependencies
+        ):
+            raise StoreConflictError()
+        tests = record_items(value["tests"], TestSpec)
+        if any(
+            type(item["argv"]) is not list
+            or any(not isinstance(argument, str) for argument in item["argv"])
+            or type(item["expected_exit_code"]) is not int
+            for item in tests
+        ):
+            raise StoreConflictError()
+        if any(type(item) is not dict for item in value["evidence_windows"]):
+            raise StoreConflictError()
+        try:
+            return ImplementationPacket(
+                packet_id=value["packet_id"],
+                trace_id=value["trace_id"],
+                workspace=value["workspace"],
+                snapshot_id=value["snapshot_id"],
+                recipe_id=value["recipe_id"],
+                node_ids=tuple(value["node_ids"]),
+                edge_ids=tuple(value["edge_ids"]),
+                evidence_windows=tuple(value["evidence_windows"]),
+                evidence_hashes=tuple(value["evidence_hashes"]),
+                operations=tuple(TemplateOperation(**item) for item in operations),
+                slots=tuple(SlotSpec(**item) for item in slots),
+                constraints=tuple(ConstraintSpec(**item) for item in constraints),
+                dependencies=tuple(DependencySpec(**item) for item in dependencies),
+                tests=tuple(
+                    TestSpec(tuple(item["argv"]), item["expected_exit_code"])
+                    for item in tests
+                ),
+                gaps=tuple(value["gaps"]),
+                source_hashes=tuple(value["source_hashes"]),
+                template_hashes=tuple(value["template_hashes"]),
+                receipt_hashes=tuple(value["receipt_hashes"]),
+                next_action=value["next_action"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise StoreConflictError() from exc
+
     def get_packet(self, packet_id: str) -> ImplementationPacket | None:
+        """Return a structurally strict packet for backwards-compatible readers."""
+
         row = self._conn.execute(
             "SELECT packet_json FROM atlas_packet_receipts WHERE packet_id=?",
             (packet_id,),
         ).fetchone()
         if row is None:
             return None
-        value = json.loads(row[0])
-        value["evidence_windows"] = tuple(value["evidence_windows"])
-        value["operations"] = tuple(
-            TemplateOperation(**item) for item in value["operations"]
-        )
-        value["slots"] = tuple(SlotSpec(**item) for item in value["slots"])
-        value["constraints"] = tuple(
-            ConstraintSpec(**item) for item in value["constraints"]
-        )
-        value["dependencies"] = tuple(
-            DependencySpec(**item) for item in value["dependencies"]
-        )
-        value["tests"] = tuple(
-            TestSpec(tuple(item["argv"]), item["expected_exit_code"])
-            for item in value["tests"]
-        )
-        return ImplementationPacket(**value)
+        try:
+            return self._hydrate_packet(json.loads(row[0]))
+        except (json.JSONDecodeError, TypeError, StoreConflictError) as exc:
+            raise StoreConflictError() from exc
+
+    def get_packet_verified(self, packet_id: str) -> ImplementationPacket | None:
+        """Read one packet row and prove its canonical integrity before use."""
+
+        if not isinstance(packet_id, str) or _HASH.fullmatch(packet_id) is None:
+            raise StoreConflictError()
+        row = self._conn.execute(
+            "SELECT snapshot_id,packet_json,packet_hash FROM atlas_packet_receipts "
+            "WHERE packet_id=?",
+            (packet_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        row_snapshot, raw, stored_hash = row
+        try:
+            if (
+                not isinstance(row_snapshot, str)
+                or not isinstance(raw, str)
+                or not isinstance(stored_hash, str)
+                or len(raw.encode("utf-8")) > MAX_PACKET_BYTES
+                or _HASH.fullmatch(stored_hash) is None
+            ):
+                raise StoreConflictError()
+            decoded = json.loads(raw)
+            if canonical_json(decoded) != raw:
+                raise StoreConflictError()
+            packet = self._hydrate_packet(decoded)
+            payload = packet.to_dict()
+            packet_value = payload.pop("packet_id")
+            if (
+                packet_value != packet_id
+                or packet.snapshot_id != row_snapshot
+                or canonical_hash(packet.to_dict()) != stored_hash
+                or canonical_hash(payload) != packet_id
+            ):
+                raise StoreConflictError()
+            return packet
+        except (json.JSONDecodeError, TypeError, UnicodeError, ValueError) as exc:
+            raise StoreConflictError() from exc
 
     def put_ingestion_receipt(self, receipt: IngestionReceipt) -> str:
         values = (
@@ -513,6 +881,33 @@ class AtlasStore:
                 args,
             )
         )
+
+    def recipe_metadata(self, recipe_id: str) -> dict[str, object] | None:
+        """Return immutable recipe-table metadata without exposing SQLite internals."""
+
+        if not isinstance(recipe_id, str) or _HASH.fullmatch(recipe_id) is None:
+            raise StoreConflictError()
+        row = self._conn.execute(
+            "SELECT recipe_id,intent_id,language,framework,layer,version,manifest_hash,"
+            "repository_signature,state,supersedes_recipe_id FROM atlas_recipes "
+            "WHERE recipe_id=?",
+            (recipe_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = (
+            "recipe_id",
+            "intent_id",
+            "language",
+            "framework",
+            "layer",
+            "version",
+            "manifest_hash",
+            "repository_signature",
+            "state",
+            "supersedes_recipe_id",
+        )
+        return dict(zip(keys, row, strict=True))
 
     def _node(self, node_id: str) -> AtlasNode:
         row = self._conn.execute(

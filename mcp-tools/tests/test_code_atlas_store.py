@@ -29,9 +29,9 @@ from code_atlas.models import (
     DependencySpec,
     TestSpec as AtlasTestSpec,
 )
-from code_atlas.canonical import canonical_json
+from code_atlas.canonical import canonical_hash, canonical_json
 from code_atlas.store import AtlasStore, StoreConflictError
-from code_atlas.security import MAX_GRAPH_NODES, MAX_PACKET_BYTES
+from code_atlas.security import MAX_GRAPH_NODES, MAX_PACKET_BYTES, MAX_TEMPLATE_BYTES
 
 
 def store_at(tmp_path: Path) -> AtlasStore:
@@ -585,3 +585,96 @@ def test_concurrent_first_blob_put_is_idempotent_across_connections(
         "SELECT count(*) FROM atlas_blobs WHERE blob_hash=?", (blob_hash,)
     ).fetchone() == (1,)
     reopened.close()
+
+
+def _verified_packet() -> ImplementationPacket:
+    """Build a packet whose public content id is independently reproducible."""
+    digest = "sha256:" + "a" * 64
+    provisional = ImplementationPacket(
+        packet_id="",
+        trace_id=digest,
+        workspace="workspace",
+        snapshot_id=digest,
+        recipe_id=digest,
+        node_ids=(digest,),
+        edge_ids=(digest,),
+        evidence_windows=({"content_hash": digest, "path": "src/example.py"},),
+        evidence_hashes=(digest,),
+        operations=(TemplateOperation("append_python_nodes", "path_000", digest),),
+        slots=(SlotSpec("path_000", "relative_python_path"),),
+        constraints=(),
+        dependencies=(),
+        tests=(AtlasTestSpec(("python", "-m", "pytest")),),
+        gaps=(),
+        source_hashes=(digest,),
+        template_hashes=(digest,),
+        receipt_hashes=(digest,),
+        next_action="code_atlas_render",
+    )
+    payload = provisional.to_dict()
+    del payload["packet_id"]
+    return replace(provisional, packet_id=canonical_hash(payload))
+
+
+def test_verified_packet_and_bounded_cas_reads_use_public_boundaries(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    blob = b"def rendered() -> None:\n    pass\n"
+    blob_hash = "sha256:" + hashlib.sha256(blob).hexdigest()
+    store.put_blob(blob_hash, blob, media_type="text/x-python")
+    packet = _verified_packet()
+    store.put_packet(packet)
+
+    assert store.read_blob_verified(blob_hash, max_bytes=MAX_TEMPLATE_BYTES) == blob
+    assert store.get_packet_verified(packet.packet_id) == packet
+    store.close()
+
+
+def test_open_readonly_store_does_not_create_or_mutate_runtime_files(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "code-atlas.sqlite3"
+    cas_root = tmp_path / "code-atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    readonly = AtlasStore.open_readonly(database, cas_root)
+    try:
+        assert readonly.schema_version() == 1
+    finally:
+        readonly.close()
+
+    after = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:
+    database = tmp_path / "code-atlas.sqlite3"
+    cas_root = tmp_path / "code-atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    node = AtlasNode.create(NodeKind.INTENT, {"intent_id": "python.wal"})
+    writable.put_nodes((node,))
+
+    readonly = AtlasStore.open_readonly(database, cas_root)
+    try:
+        graph = readonly.graph_query(
+            (node.node_id,),
+            max_nodes=1,
+            max_edges=1,
+            max_depth=1,
+            byte_budget=MAX_PACKET_BYTES,
+        )
+        assert graph.nodes == (node,)
+    finally:
+        readonly.close()
+        writable.close()

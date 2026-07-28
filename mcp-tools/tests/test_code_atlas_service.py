@@ -31,6 +31,7 @@ from code_atlas.models import (
     TestSpec as AtlasTestSpec,
 )
 from code_atlas.recipes import BundledRecipeLoader
+from code_atlas.rendering import render_patch, validate_bindings
 from code_atlas.security import (
     MAX_CHANGED_FILES,
     MAX_COMMAND_SPEC_BYTES,
@@ -1934,3 +1935,183 @@ def test_prepare_packet_budget_query_truncation_and_secret_redaction(
     )
     for forbidden in ("codegraph", "openai", "embedding", "vector"):
         assert forbidden not in service_source
+
+
+def test_render_is_deterministic_and_never_writes_the_workspace(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    (atlas_environment.root / "tests" / "test_feature.py").write_bytes(
+        b"import json\n\n\ndef test_feature() -> None:\n    assert json.loads('1') == 1\n"
+    )
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    prepared = _prepare_pytest(
+        atlas_environment,
+        snapshot_id=snapshot.snapshot_id,
+    )
+    assert prepared.status is AtlasStatus.READY
+    assert prepared.packet is not None
+    before = {
+        path.relative_to(atlas_environment.root).as_posix(): path.read_bytes()
+        for path in atlas_environment.root.rglob("*")
+        if path.is_file()
+    }
+    bindings = {
+        "test_path": "tests/test_feature.py",
+        "test_name": "test_rendered_feature",
+        "test_body": "assert True",
+    }
+
+    first = atlas_environment.service.render(
+        str(atlas_environment.root),
+        snapshot.snapshot_id,
+        prepared.packet.packet_id,
+        bindings,
+    )
+    second = atlas_environment.service.render(
+        str(atlas_environment.root),
+        snapshot.snapshot_id,
+        prepared.packet.packet_id,
+        bindings,
+    )
+
+    assert first.status is AtlasStatus.READY
+    assert first == second
+    assert first.patch_candidate.startswith("--- a/tests/test_feature.py\n")
+    assert first.patch_hash.startswith("sha256:")
+    assert before == {
+        path.relative_to(atlas_environment.root).as_posix(): path.read_bytes()
+        for path in atlas_environment.root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_render_rejects_two_path_bindings_that_collide() -> None:
+    manifest = RecipeManifest(
+        recipe_id="sha256:" + "a" * 64,
+        recipe_key="python.binding-collision",
+        version=1,
+        intent_id="python.binding-collision",
+        language_name="python",
+        language_extractor_version="1",
+        repository_signature="",
+        layer="local",
+        manifest_hash="sha256:" + "b" * 64,
+        slots=(
+            SlotSpec("path_000", "relative_python_path"),
+            SlotSpec("path_001", "relative_python_path"),
+        ),
+        provenance_kind="observed",
+        provenance_source="accepted_task",
+    )
+
+    with pytest.raises(AtlasError) as captured:
+        validate_bindings(
+            manifest,
+            {"path_000": "src/new.py", "path_001": "src/new.py"},
+        )
+
+    assert captured.value.code == "path_case_collision"
+
+
+def test_render_invalid_request_never_echoes_a_secret_like_packet_id(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    result = atlas_environment.service.render(
+        str(atlas_environment.root),
+        "not-a-snapshot",
+        "sk-atlas-secret-token",
+        {},
+    )
+
+    assert result.status is AtlasStatus.RENDER_INVALID
+    assert result.packet_id == ""
+    assert "sk-" not in canonical_json(result.to_dict())
+
+
+def test_prepend_places_rendered_body_immediately_after_a_docstring() -> None:
+    manifest = RecipeManifest(
+        recipe_id="sha256:" + "a" * 64,
+        recipe_key="python.docstring-prepend",
+        version=1,
+        intent_id="python.docstring-prepend",
+        language_name="python",
+        language_extractor_version="1",
+        repository_signature="",
+        layer="bundled",
+        manifest_hash="sha256:" + "b" * 64,
+        slots=(
+            SlotSpec("source_path", "relative_python_path"),
+            SlotSpec("target_symbol", "python_qualified_name"),
+            SlotSpec("predicate", "python_expression"),
+            SlotSpec("exception", "python_expression"),
+        ),
+        operations=(
+            TemplateOperation(
+                "prepend_function_body",
+                "source_path",
+                "sha256:" + "c" * 64,
+                target_symbol_slot="target_symbol",
+            ),
+        ),
+        provenance_kind="bundled",
+        provenance_source="fixture",
+    )
+    source = 'def guard(value: int) -> int:\n    """A guard."""\n\n    return value\n'
+
+    rendered = render_patch(
+        manifest,
+        {
+            "source_path": "src/guard.py",
+            "target_symbol": "guard",
+            "predicate": "value > 0",
+            "exception": "ValueError('bad')",
+        },
+        source_files={"src/guard.py": source.encode("utf-8")},
+        snapshot_paths=("src/guard.py",),
+        template_reader=lambda _hash: (
+            b"if not (${predicate}):\n    raise ${exception}\n"
+        ),
+    )
+
+    assert "@@ -2,0 +3,2 @@" in rendered.patch_candidate
+
+
+def test_render_supports_a_bundled_prepend_with_docstring_target(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    (atlas_environment.root / "src" / "guards.py").write_bytes(
+        b"def guarded(value: int) -> int:\n"
+        b'    """Return an accepted value."""\n'
+        b"    return value\n"
+    )
+    (atlas_environment.root / "tests" / "test_feature.py").write_bytes(
+        b"def test_feature() -> None:\n    assert True\n"
+    )
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    prepared = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.validation-guard",
+        language="python",
+        target_paths=("src/guards.py", "tests/test_feature.py"),
+        target_symbols=("guarded",),
+    )
+    assert prepared.status is AtlasStatus.READY
+    assert prepared.packet is not None
+
+    result = atlas_environment.service.render(
+        str(atlas_environment.root),
+        snapshot.snapshot_id,
+        prepared.packet.packet_id,
+        {
+            "source_path": "src/guards.py",
+            "target_symbol": "guarded",
+            "predicate_expression": "value > 0",
+            "exception_expression": "ValueError('bad')",
+            "test_path": "tests/test_feature.py",
+        },
+    )
+
+    assert result.status is AtlasStatus.READY
+    assert result.patch_candidate.startswith("--- a/src/guards.py\n")
+    assert "@@ -2,0 +3,2 @@" in result.patch_candidate
