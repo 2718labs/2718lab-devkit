@@ -28,10 +28,12 @@ from code_atlas.models import (
     RecipeManifest,
     SlotSpec,
     TemplateOperation,
+    TestSpec as AtlasTestSpec,
 )
 from code_atlas.recipes import BundledRecipeLoader
 from code_atlas.security import (
     MAX_CHANGED_FILES,
+    MAX_COMMAND_SPEC_BYTES,
     MAX_GRAPH_EDGES,
     MAX_GRAPH_NODES,
     MAX_PACKET_BYTES,
@@ -106,9 +108,13 @@ def _manifest(
     layer: str = "local",
     constraints: tuple[ConstraintSpec, ...] = (),
     slots: tuple[SlotSpec, ...] = (),
+    tests: tuple[AtlasTestSpec, ...] = (),
     operations: tuple[TemplateOperation, ...] = (),
     superseded_ids: tuple[str, ...] = (),
     quarantine_state: str | None = None,
+    language_extractor_version: str = "1",
+    provenance_kind: str = "observed",
+    provenance_source: str = "fixture",
 ) -> RecipeManifest:
     manifest_data = {
         "intent_id": intent_id,
@@ -120,9 +126,13 @@ def _manifest(
         "layer": layer,
         "constraints": [item.to_dict() for item in constraints],
         "slots": [item.to_dict() for item in slots],
+        "tests": [item.to_dict() for item in tests],
         "operations": [item.to_dict() for item in operations],
         "superseded_ids": list(superseded_ids),
         "quarantine_state": quarantine_state,
+        "language_extractor_version": language_extractor_version,
+        "provenance_kind": provenance_kind,
+        "provenance_source": provenance_source,
     }
     return RecipeManifest(
         recipe_id=recipe_id,
@@ -130,7 +140,7 @@ def _manifest(
         version=version,
         intent_id=intent_id,
         language_name=language,
-        language_extractor_version="1",
+        language_extractor_version=language_extractor_version,
         repository_signature=repository_signature,
         layer=layer,
         manifest_hash=canonical_hash(manifest_data),
@@ -138,12 +148,76 @@ def _manifest(
         framework_specifier=framework_specifier,
         slots=slots,
         constraints=constraints,
+        tests=tests,
         operations=operations,
-        provenance_kind="observed",
-        provenance_source="fixture",
+        provenance_kind=provenance_kind,
+        provenance_source=provenance_source,
         superseded_ids=superseded_ids,
         quarantine_state=quarantine_state,
     )
+
+
+def _observed_schema_payload(manifest: RecipeManifest) -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "recipe_key": manifest.recipe_key,
+        "version": manifest.version,
+        "intent_id": manifest.intent_id,
+        "language": {
+            "name": manifest.language_name,
+            "extractor_version": manifest.language_extractor_version,
+        },
+        "framework": None,
+        "repository_signature": manifest.repository_signature,
+        "layer": manifest.layer,
+        "slots": [slot.to_dict() for slot in manifest.slots],
+        "constraints": [constraint.to_dict() for constraint in manifest.constraints],
+        "dependencies": [dependency.to_dict() for dependency in manifest.dependencies],
+        "tests": [test.to_dict() for test in manifest.tests],
+        "operations": [operation.to_dict() for operation in manifest.operations],
+        "provenance": {
+            "kind": manifest.provenance_kind,
+            "source": manifest.provenance_source,
+        },
+    }
+
+
+def _with_observed_manifest_hash(manifest: RecipeManifest) -> RecipeManifest:
+    return replace(
+        manifest, manifest_hash=canonical_hash(_observed_schema_payload(manifest))
+    )
+
+
+def _observed_manifest(
+    *,
+    recipe_id: str,
+    intent_id: str,
+    repository_signature: str,
+) -> RecipeManifest:
+    slots = (SlotSpec("path_000", "relative_python_path"),)
+    manifest = _manifest(
+        recipe_id=recipe_id,
+        intent_id=intent_id,
+        version=1,
+        language="python",
+        framework=None,
+        framework_specifier=None,
+        repository_signature=repository_signature,
+        layer="local",
+        slots=slots,
+        constraints=(ConstraintSpec("path_suffix", "path_000", ".py"),),
+        tests=(),
+        operations=(
+            TemplateOperation(
+                "create_python_file",
+                "path_000",
+                canonical_hash({"template": intent_id}),
+            ),
+        ),
+        provenance_kind="observed",
+        provenance_source="accepted_task",
+    )
+    return _with_observed_manifest_hash(manifest)
 
 
 def _recipe_payload(manifest: RecipeManifest) -> dict[str, object]:
@@ -160,7 +234,7 @@ def _put_local_recipe(
     recipe_node = AtlasNode.create(
         NodeKind.RECIPE,
         _recipe_payload(manifest),
-        extractor_id="fixture",
+        extractor_id="python-ast",
         extractor_version="1",
         provenance="observed",
         source_hashes=(manifest.manifest_hash,),
@@ -168,7 +242,14 @@ def _put_local_recipe(
     )
     registered = replace(manifest, recipe_id=recipe_node.node_id)
     children = tuple(
-        AtlasNode.create(kind, payload, provenance="observed")
+        AtlasNode.create(
+            kind,
+            payload,
+            extractor_id="python-ast",
+            extractor_version="1",
+            provenance="observed",
+            source_hashes=(manifest.manifest_hash,),
+        )
         for kind, payload, _relation in graph
     )
     edges = tuple(
@@ -361,6 +442,31 @@ def test_matching_supersession_is_explicit_and_quarantine_is_not_ready() -> None
     assert suppressed.winner is None
 
 
+def test_matching_uses_best_active_class_after_supersession() -> None:
+    facts = _facts()
+    repository_signature = "sha256:" + "a" * 64
+    quarantined_exact = _manifest(
+        recipe_id="quarantined-exact",
+        repository_signature=repository_signature,
+        quarantine_state="quarantined",
+    )
+    active_generic = _manifest(recipe_id="active-generic")
+
+    selected = select_recipe(
+        (quarantined_exact, active_generic),
+        intent_id="python.fixture",
+        language="python",
+        framework="",
+        repository_signature=repository_signature,
+        snapshot_facts=facts,
+    )
+
+    assert selected.status is AtlasStatus.READY
+    assert selected.winner is not None
+    assert selected.winner.manifest.recipe_id == "active-generic"
+    assert selected.winner.match_class is MatchClass.LANGUAGE_GENERIC
+
+
 def test_matching_framework_and_constraint_matrix_is_strict() -> None:
     facts = _facts(
         file_hashes=(("src/guard.py", "sha256:1"),),
@@ -415,6 +521,7 @@ def test_matching_framework_and_constraint_matrix_is_strict() -> None:
         ).status
         is AtlasStatus.NO_VERIFIED_RECIPE
     )
+
     with pytest.raises(AtlasError):
         select_recipe(
             (constrained,),
@@ -454,6 +561,69 @@ def test_matching_framework_and_constraint_matrix_is_strict() -> None:
             framework="pytest",
             repository_signature="",
             snapshot_facts=blocked,
+        ).status
+        is AtlasStatus.NO_VERIFIED_RECIPE
+    )
+
+
+def test_matching_framework_versions_are_bounded_and_fail_closed() -> None:
+    facts = _facts()
+    candidate = _manifest(
+        recipe_id="candidate",
+        framework="pytest",
+        framework_specifier=">=7,<9",
+    )
+    oversized_component = "9" * 5_000
+    with pytest.raises(AtlasError) as request_error:
+        select_recipe(
+            (candidate,),
+            intent_id="python.fixture",
+            language="python",
+            framework=f"pytest@{oversized_component}",
+            repository_signature="",
+            snapshot_facts=facts,
+        )
+    assert request_error.value.code == "invalid_framework"
+
+    with pytest.raises(AtlasError) as component_error:
+        select_recipe(
+            (candidate,),
+            intent_id="python.fixture",
+            language="python",
+            framework="pytest@1.2.3.4.5.6.7.8.9",
+            repository_signature="",
+            snapshot_facts=facts,
+        )
+    assert component_error.value.code == "invalid_framework"
+
+    excessive_clauses = replace(
+        candidate,
+        framework_specifier=",".join(">=7" for _ in range(17)),
+    )
+    assert (
+        select_recipe(
+            (excessive_clauses,),
+            intent_id="python.fixture",
+            language="python",
+            framework="pytest@7",
+            repository_signature="",
+            snapshot_facts=facts,
+        ).status
+        is AtlasStatus.NO_VERIFIED_RECIPE
+    )
+
+    malicious_candidate = replace(
+        candidate,
+        framework_specifier=f">={oversized_component}",
+    )
+    assert (
+        select_recipe(
+            (malicious_candidate,),
+            intent_id="python.fixture",
+            language="python",
+            framework="pytest@7",
+            repository_signature="",
+            snapshot_facts=facts,
         ).status
         is AtlasStatus.NO_VERIFIED_RECIPE
     )
@@ -551,6 +721,28 @@ def _packet_receipt_count(database: Path) -> int:
         connection.close()
 
 
+def test_prepare_normalizes_equivalent_numeric_framework_versions(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    common = {
+        "workspace": str(atlas_environment.root),
+        "snapshot_id": snapshot.snapshot_id,
+        "intent_id": "python.pytest-regression",
+        "language": "python",
+        "target_paths": ("tests/test_feature.py",),
+    }
+    first = atlas_environment.service.prepare(framework="pytest@7", **common)
+    second = atlas_environment.service.prepare(framework="pytest@7.0", **common)
+
+    assert first.status is AtlasStatus.READY
+    assert second.status is AtlasStatus.READY
+    assert first.packet is not None
+    assert second.packet is not None
+    assert first.packet.trace_id == second.packet.trace_id
+    assert first.packet.packet_id == second.packet.packet_id
+
+
 def test_prepare_builds_idempotent_safe_packet_and_reopens(
     atlas_environment: AtlasEnvironment,
     monkeypatch: pytest.MonkeyPatch,
@@ -627,6 +819,17 @@ def test_prepare_statuses_validate_inputs_evidence_and_staleness(
     )
     assert unsupported.status is AtlasStatus.UNSUPPORTED_LANGUAGE
     assert unsupported.packet is None
+
+    with pytest.raises(AtlasError) as invalid_framework:
+        atlas_environment.service.prepare(
+            workspace=str(atlas_environment.root),
+            snapshot_id=snapshot.snapshot_id,
+            intent_id="python.pytest-regression",
+            language="python",
+            framework="pytest@" + "9" * 5_000,
+            target_paths=("tests/test_feature.py",),
+        )
+    assert invalid_framework.value.code == "invalid_framework"
 
     for paths in (
         ("../escape.py",),
@@ -725,35 +928,48 @@ def test_prepare_uses_local_repository_priority_and_preserves_ties(
         atlas_environment.root, snapshot.snapshot_id
     )
     signature = structural_repository_signature(
-        facts, language="python", framework="pytest"
+        facts, language="python", framework=None
     )
     local = _put_local_recipe(
         atlas_environment.store,
-        _manifest(
+        _observed_manifest(
             recipe_id="",
-            intent_id="python.pytest-regression",
-            version=2,
-            framework="pytest",
-            framework_specifier=">=7,<9",
+            intent_id="python.validation-guard",
             repository_signature=signature,
         ),
     )
-    preferred = _prepare_pytest(atlas_environment, snapshot_id=snapshot.snapshot_id)
+    request = {
+        "workspace": str(atlas_environment.root),
+        "snapshot_id": snapshot.snapshot_id,
+        "intent_id": "python.validation-guard",
+        "language": "python",
+        "target_paths": ("tests/test_feature.py",),
+    }
+    preferred = atlas_environment.service.prepare(**request)
     assert preferred.status is AtlasStatus.READY
     assert preferred.packet is not None
     assert preferred.packet.recipe_id == local.recipe_id
 
     second = _put_local_recipe(
         atlas_environment.store,
-        _manifest(
-            recipe_id="",
-            intent_id="python.pytest-regression",
-            framework="pytest",
-            framework_specifier=">=7,<9",
-            repository_signature=signature,
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.validation-guard",
+                    repository_signature=signature,
+                ),
+                operations=(
+                    TemplateOperation(
+                        "append_python_nodes",
+                        "path_000",
+                        canonical_hash({"template": "second-local-recipe"}),
+                    ),
+                ),
+            )
         ),
     )
-    tied = _prepare_pytest(atlas_environment, snapshot_id=snapshot.snapshot_id)
+    tied = atlas_environment.service.prepare(**request)
     assert tied.status is AtlasStatus.AMBIGUOUS_MATCH
     assert tied.packet is None
     assert tied.candidate_recipe_ids == tuple(
@@ -761,10 +977,264 @@ def test_prepare_uses_local_repository_priority_and_preserves_ties(
     )
 
 
+def test_local_hydration_rejects_loader_invalid_semantics(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
+    template_hash = canonical_hash({"template": "fixture"})
+    invalid_manifests = (
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.invalid-operation",
+                    repository_signature=repository_signature,
+                ),
+                operations=(
+                    TemplateOperation("execute_command", "path_000", template_hash),
+                ),
+            )
+        ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.invalid-slot",
+                    repository_signature=repository_signature,
+                ),
+                slots=(SlotSpec("path_000", "execute_command"),),
+            )
+        ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.invalid-slot-order",
+                    repository_signature=repository_signature,
+                ),
+                slots=(
+                    SlotSpec("symbol_000", "python_identifier"),
+                    SlotSpec("path_000", "relative_python_path"),
+                ),
+                constraints=(
+                    ConstraintSpec("required_symbol", "symbol_000", "observed_symbol"),
+                    ConstraintSpec("path_suffix", "path_000", ".py"),
+                ),
+            )
+        ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.invalid-constraint",
+                    repository_signature=repository_signature,
+                ),
+                constraints=(ConstraintSpec("path_suffix", "missing_slot", ".py"),),
+            )
+        ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.invalid-test-placeholder",
+                    repository_signature=repository_signature,
+                ),
+                tests=(AtlasTestSpec(("pytest", "${missing_slot}")),),
+            )
+        ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.oversized-test-command",
+                    repository_signature=repository_signature,
+                ),
+                tests=(AtlasTestSpec(("pytest", "x" * MAX_COMMAND_SPEC_BYTES)),),
+            )
+        ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.invalid-append-separator",
+                    repository_signature=repository_signature,
+                ),
+                operations=(
+                    TemplateOperation(
+                        "append_python_nodes", "path_000", template_hash, "\n\n"
+                    ),
+                ),
+            )
+        ),
+    )
+    for manifest in invalid_manifests:
+        _put_local_recipe(atlas_environment.store, manifest)
+        result = atlas_environment.service.prepare(
+            workspace=str(atlas_environment.root),
+            snapshot_id=snapshot.snapshot_id,
+            intent_id=manifest.intent_id,
+            language="python",
+            target_paths=("tests/test_feature.py",),
+        )
+        assert result.status is AtlasStatus.NO_VERIFIED_RECIPE
+        assert result.packet is None
+        assert "malformed_local_recipe" in result.reasons
+
+
+def test_local_observed_manifest_requires_extractor_shape_and_source_hash(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
+    valid = _put_local_recipe(
+        atlas_environment.store,
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.observed-local",
+            repository_signature=repository_signature,
+        ),
+    )
+    ready = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.observed-local",
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+    assert ready.status is AtlasStatus.READY
+    assert ready.packet is not None
+    assert ready.packet.recipe_id == valid.recipe_id
+
+    tampered = replace(
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.tampered-local-hash",
+            repository_signature=repository_signature,
+        ),
+        manifest_hash="sha256:" + "f" * 64,
+    )
+    _put_local_recipe(atlas_environment.store, tampered)
+    rejected = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.tampered-local-hash",
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+    assert rejected.status is AtlasStatus.NO_VERIFIED_RECIPE
+    assert rejected.packet is None
+    assert "malformed_local_recipe" in rejected.reasons
+
+    metadata_tampered = _observed_manifest(
+        recipe_id="",
+        intent_id="python.tampered-local-metadata",
+        repository_signature=repository_signature,
+    )
+    metadata_root = AtlasNode.create(
+        NodeKind.RECIPE,
+        _recipe_payload(metadata_tampered),
+        extractor_id="fixture",
+        extractor_version="1",
+        provenance="observed",
+        source_hashes=(metadata_tampered.manifest_hash,),
+    )
+    atlas_environment.store.put_nodes((metadata_root,))
+    atlas_environment.store.put_recipe(
+        replace(metadata_tampered, recipe_id=metadata_root.node_id)
+    )
+    metadata_rejected = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.tampered-local-metadata",
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+    assert metadata_rejected.status is AtlasStatus.NO_VERIFIED_RECIPE
+    assert metadata_rejected.packet is None
+    assert "malformed_local_recipe" in metadata_rejected.reasons
+
+    created_at_tampered = _observed_manifest(
+        recipe_id="",
+        intent_id="python.tampered-local-created-at",
+        repository_signature=repository_signature,
+    )
+    created_at_root = AtlasNode.create(
+        NodeKind.RECIPE,
+        _recipe_payload(created_at_tampered),
+        extractor_id="python-ast",
+        extractor_version="1",
+        provenance="observed",
+        source_hashes=(created_at_tampered.manifest_hash,),
+        created_at="2026-07-29T00:00:00Z",
+    )
+    atlas_environment.store.put_nodes((created_at_root,))
+    atlas_environment.store.put_recipe(
+        replace(created_at_tampered, recipe_id=created_at_root.node_id)
+    )
+    created_at_rejected = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.tampered-local-created-at",
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+    assert created_at_rejected.status is AtlasStatus.NO_VERIFIED_RECIPE
+    assert created_at_rejected.packet is None
+    assert "malformed_local_recipe" in created_at_rejected.reasons
+
+
+def test_prepare_stops_before_hydrating_unbounded_local_discovery(
+    atlas_environment: AtlasEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    identifiers = tuple(f"sha256:{index:064x}" for index in range(MAX_GRAPH_NODES + 1))
+
+    monkeypatch.setattr(
+        atlas_environment.store,
+        "recipes_for_intent",
+        lambda _intent_id: identifiers,
+    )
+
+    def fail_if_hydrated(*_args, **_kwargs):
+        raise AssertionError("local recipes must not be hydrated beyond the bound")
+
+    monkeypatch.setattr(atlas_environment.store, "graph_query", fail_if_hydrated)
+    result = atlas_environment.service.prepare(
+        workspace=str(atlas_environment.root),
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.discovery-limit",
+        language="python",
+        target_paths=("tests/test_feature.py",),
+    )
+
+    assert result.status is AtlasStatus.AMBIGUOUS_MATCH
+    assert result.packet is None
+    assert result.candidate_recipe_ids == ()
+    assert result.reasons == ("candidate_limit_exceeded",)
+
+
 def test_local_payload_and_template_body_are_fail_closed(
     atlas_environment: AtlasEnvironment,
 ) -> None:
     snapshot = atlas_environment.index.sync(atlas_environment.root)
+    facts = atlas_environment.index.snapshot_facts(
+        atlas_environment.root, snapshot.snapshot_id
+    )
+    repository_signature = structural_repository_signature(
+        facts, language="python", framework=None
+    )
     malformed = _manifest(recipe_id="", intent_id="python.malformed")
     payload = _recipe_payload(malformed)
     payload["slots"] = "not-a-list"
@@ -842,13 +1312,17 @@ def test_local_payload_and_template_body_are_fail_closed(
     template_hash = canonical_hash({"template": "safe-reference"})
     local = _put_local_recipe(
         atlas_environment.store,
-        _manifest(
-            recipe_id="",
-            intent_id="python.unsafe-template",
-            slots=(SlotSpec("test_path", "relative_python_path"),),
-            operations=(
-                TemplateOperation("append_python_nodes", "test_path", template_hash),
-            ),
+        _with_observed_manifest_hash(
+            replace(
+                _observed_manifest(
+                    recipe_id="",
+                    intent_id="python.unsafe-template",
+                    repository_signature=repository_signature,
+                ),
+                operations=(
+                    TemplateOperation("append_python_nodes", "path_000", template_hash),
+                ),
+            )
         ),
         graph=(
             (
@@ -884,7 +1358,11 @@ def test_local_payload_and_template_body_are_fail_closed(
     evidence_marker = "ATLAS07_SOURCE_EVIDENCE_BODY"
     unsafe_evidence = _put_local_recipe(
         atlas_environment.store,
-        _manifest(recipe_id="", intent_id="python.unsafe-evidence"),
+        _observed_manifest(
+            recipe_id="",
+            intent_id="python.unsafe-evidence",
+            repository_signature=repository_signature,
+        ),
         graph=(
             (
                 NodeKind.SOURCE_EVIDENCE,

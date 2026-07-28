@@ -18,6 +18,17 @@ _FRAMEWORK_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 _NUMERIC_VERSION = re.compile(r"^\d+(?:\.\d+)*$")
 _SPECIFIER_CLAUSE = re.compile(r"^(>=|<=|==|!=|>|<)(\d+(?:\.\d+)*)$")
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_FRAMEWORK_LENGTH = 256
+_MAX_FRAMEWORK_NAME_LENGTH = 128
+_MAX_VERSION_COMPONENTS = 8
+_MAX_VERSION_COMPONENT_DIGITS = 9
+_MAX_NUMERIC_VERSION_LENGTH = (
+    _MAX_VERSION_COMPONENTS * _MAX_VERSION_COMPONENT_DIGITS
+    + _MAX_VERSION_COMPONENTS
+    - 1
+)
+_MAX_SPECIFIER_CLAUSES = 16
+_MAX_SPECIFIER_LENGTH = 512
 _SUPPORTED_CONSTRAINTS = frozenset(
     {
         "required_node_kind",
@@ -92,10 +103,24 @@ def _normalise_text(value: str, *, code: str) -> str:
 
 
 def _numeric_version(value: str) -> tuple[int, ...] | None:
-    if not isinstance(value, str) or _NUMERIC_VERSION.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_NUMERIC_VERSION_LENGTH
+        or _NUMERIC_VERSION.fullmatch(value) is None
+    ):
         return None
-    parsed = tuple(int(part) for part in value.split("."))
-    return parsed[:-1] if len(parsed) > 1 and parsed[-1] == 0 else parsed
+    parts = value.split(".")
+    if len(parts) > _MAX_VERSION_COMPONENTS or any(
+        len(part) > _MAX_VERSION_COMPONENT_DIGITS for part in parts
+    ):
+        return None
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except ValueError:
+        return None
+    while len(parsed) > 1 and parsed[-1] == 0:
+        parsed = parsed[:-1]
+    return parsed
 
 
 def _compare_versions(left: tuple[int, ...], right: tuple[int, ...]) -> int:
@@ -106,10 +131,13 @@ def _compare_versions(left: tuple[int, ...], right: tuple[int, ...]) -> int:
 
 
 def _parse_specifier(value: object) -> tuple[tuple[str, tuple[int, ...]], ...] | None:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value or len(value) > _MAX_SPECIFIER_LENGTH:
+        return None
+    raw_clauses = value.split(",")
+    if len(raw_clauses) > _MAX_SPECIFIER_CLAUSES:
         return None
     clauses: list[tuple[str, tuple[int, ...]]] = []
-    for raw_clause in value.split(","):
+    for raw_clause in raw_clauses:
         clause = raw_clause.strip()
         match = _SPECIFIER_CLAUSE.fullmatch(clause)
         if match is None:
@@ -143,13 +171,18 @@ def _parse_framework(value: object) -> tuple[str, tuple[int, ...] | None] | None
         return None
     if not isinstance(value, str):
         raise AtlasError("invalid_framework")
+    if len(value) > _MAX_FRAMEWORK_LENGTH:
+        raise AtlasError("invalid_framework")
     raw = value.strip().casefold()
     if not raw:
         return None
     if raw.count("@") > 1:
         raise AtlasError("invalid_framework")
     name, separator, version_text = raw.partition("@")
-    if _FRAMEWORK_NAME.fullmatch(name) is None:
+    if (
+        len(name) > _MAX_FRAMEWORK_NAME_LENGTH
+        or _FRAMEWORK_NAME.fullmatch(name) is None
+    ):
         raise AtlasError("invalid_framework")
     if not separator:
         return name, None
@@ -157,6 +190,18 @@ def _parse_framework(value: object) -> tuple[str, tuple[int, ...] | None] | None
     if version is None:
         raise AtlasError("invalid_framework")
     return name, version
+
+
+def normalize_framework(value: str | None) -> str | None:
+    """Return the deterministic framework request representation."""
+
+    parsed = _parse_framework(value)
+    if parsed is None:
+        return None
+    name, version = parsed
+    if version is None:
+        return name
+    return f"{name}@{'.'.join(str(component) for component in version)}"
 
 
 def _is_relative_fact_path(value: object) -> bool:
@@ -281,6 +326,8 @@ def _classify(
     else:
         if not isinstance(manifest.framework_name, str):
             return None
+        if len(manifest.framework_name) > _MAX_FRAMEWORK_NAME_LENGTH:
+            return None
         candidate_name = manifest.framework_name.strip().casefold()
         if _FRAMEWORK_NAME.fullmatch(candidate_name) is None:
             return None
@@ -390,6 +437,12 @@ def select_recipe(
         )
 
     active = [candidate for candidate in compatible if _is_active(candidate.manifest)]
+    if not active:
+        return MatchResult(
+            AtlasStatus.RECIPE_QUARANTINED,
+            candidates=tuple(compatible),
+            reason_codes=("best_recipe_quarantined",),
+        )
     if len(active) > max_candidates:
         return MatchResult(
             AtlasStatus.AMBIGUOUS_MATCH,
@@ -399,17 +452,10 @@ def select_recipe(
             reason_codes=("candidate_limit_exceeded",),
         )
 
-    best_class = min(candidate.match_class for candidate in compatible)
-    best = [
-        candidate for candidate in compatible if candidate.match_class == best_class
+    best_class = min(candidate.match_class for candidate in active)
+    active_best = [
+        candidate for candidate in active if candidate.match_class == best_class
     ]
-    active_best = [candidate for candidate in best if _is_active(candidate.manifest)]
-    if not active_best:
-        return MatchResult(
-            AtlasStatus.RECIPE_QUARANTINED,
-            candidates=tuple(best),
-            reason_codes=("best_recipe_quarantined",),
-        )
     if len(active_best) != 1:
         return MatchResult(
             AtlasStatus.AMBIGUOUS_MATCH,

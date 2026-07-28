@@ -12,7 +12,12 @@ from project_index.models import IndexError, SnapshotFacts
 from project_index.service import ProjectIndexService
 
 from .canonical import canonical_hash, canonical_json, normalize_intent_id, thaw_json
-from .matching import MatchCandidate, structural_repository_signature, select_recipe
+from .matching import (
+    MatchCandidate,
+    normalize_framework,
+    structural_repository_signature,
+    select_recipe,
+)
 from .models import (
     AtlasEdge,
     AtlasError,
@@ -33,6 +38,7 @@ from .models import (
 from .recipes import BundledRecipeLoader
 from .security import (
     MAX_CHANGED_FILES,
+    MAX_COMMAND_SPEC_BYTES,
     MAX_GRAPH_DEPTH,
     MAX_GRAPH_EDGES,
     MAX_GRAPH_NODES,
@@ -55,6 +61,13 @@ _DEPENDENCY_FIELDS = frozenset(field.name for field in fields(DependencySpec))
 _TEST_FIELDS = frozenset(field.name for field in fields(TestSpec))
 _OPERATION_FIELDS = frozenset(field.name for field in fields(TemplateOperation))
 _GAP_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_PLACEHOLDER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PATH_SLOT_NAME = re.compile(r"^path_(\d{3})$")
+_SYMBOL_SLOT_NAME = re.compile(r"^symbol_(\d{3})$")
+_LOCAL_SLOT_TYPES = frozenset({"relative_python_path", "python_identifier"})
+_LOCAL_CONSTRAINT_KINDS = frozenset({"path_suffix", "required_symbol"})
+_LOCAL_OPERATION_KINDS = frozenset({"create_python_file", "append_python_nodes"})
+_LOCAL_DISCOVERY_LIMIT = MAX_GRAPH_NODES + 1
 _BODY_KEYS = frozenset(
     {
         "body",
@@ -117,37 +130,87 @@ def _safe_payload(value: object) -> bool:
     return True
 
 
+def _placeholder_names(value: str) -> frozenset[str]:
+    """Parse complete non-nested ``${python_identifier}`` placeholders."""
+
+    names: set[str] = set()
+    cursor = 0
+    while (start := value.find("${", cursor)) != -1:
+        end = value.find("}", start + 2)
+        if end == -1:
+            raise AtlasError("malformed_local_recipe")
+        name = value[start + 2 : end]
+        if "${" in name or _PLACEHOLDER_NAME.fullmatch(name) is None:
+            raise AtlasError("malformed_local_recipe")
+        names.add(name)
+        cursor = end + 1
+    return frozenset(names)
+
+
 def _strict_slots(value: object) -> tuple[SlotSpec, ...]:
-    if not isinstance(value, list) or len(value) > MAX_SLOT_COUNT:
+    if not isinstance(value, list) or not value or len(value) > MAX_SLOT_COUNT:
         raise AtlasError("malformed_local_recipe")
     slots: list[SlotSpec] = []
+    expected_path_index = 0
+    expected_symbol_index = 0
     for item in value:
         data = _require_object(item, _SLOT_FIELDS)
         if (
             not isinstance(data["name"], str)
             or not data["name"]
             or not isinstance(data["type"], str)
-            or type(data["required"]) is not bool
+            or data["type"] not in _LOCAL_SLOT_TYPES
+            or data["required"] is not True
         ):
             raise AtlasError("malformed_local_recipe")
+        match = (
+            _PATH_SLOT_NAME.fullmatch(data["name"])
+            if data["type"] == "relative_python_path"
+            else _SYMBOL_SLOT_NAME.fullmatch(data["name"])
+        )
+        if match is None:
+            raise AtlasError("malformed_local_recipe")
+        if data["type"] == "relative_python_path":
+            if int(match.group(1)) != expected_path_index:
+                raise AtlasError("malformed_local_recipe")
+            expected_path_index += 1
+        else:
+            if expected_path_index == 0 or int(match.group(1)) != expected_symbol_index:
+                raise AtlasError("malformed_local_recipe")
+            expected_symbol_index += 1
         slots.append(SlotSpec(data["name"], data["type"], data["required"]))
-    if len({item.name for item in slots}) != len(slots):
+    if len({item.name for item in slots}) != len(slots) or not expected_path_index:
         raise AtlasError("malformed_local_recipe")
     return tuple(slots)
 
 
-def _strict_constraints(value: object) -> tuple[ConstraintSpec, ...]:
-    if not isinstance(value, list):
+def _strict_constraints(
+    value: object, slots: tuple[SlotSpec, ...]
+) -> tuple[ConstraintSpec, ...]:
+    if not isinstance(value, list) or len(value) != len(slots):
         raise AtlasError("malformed_local_recipe")
     constraints: list[ConstraintSpec] = []
-    for item in value:
+    for slot, item in zip(slots, value, strict=True):
         data = _require_object(item, _CONSTRAINT_FIELDS)
-        if not isinstance(data["kind"], str) or not isinstance(data["subject"], str):
+        if (
+            not isinstance(data["kind"], str)
+            or data["kind"] not in _LOCAL_CONSTRAINT_KINDS
+            or not isinstance(data["subject"], str)
+            or data["subject"] != slot.name
+            or not isinstance(data["value"], str)
+            or not data["value"]
+        ):
             raise AtlasError("malformed_local_recipe")
-        try:
-            canonical_json(data["value"])
-        except (TypeError, ValueError) as exc:
-            raise AtlasError("malformed_local_recipe") from exc
+        if slot.type == "relative_python_path":
+            if data["kind"] != "path_suffix" or data["value"] != ".py":
+                raise AtlasError("malformed_local_recipe")
+        else:
+            if data["kind"] != "required_symbol":
+                raise AtlasError("malformed_local_recipe")
+            try:
+                validate_slot_value("python_identifier", data["value"])
+            except AtlasError as exc:
+                raise AtlasError("malformed_local_recipe") from exc
         constraints.append(ConstraintSpec(data["kind"], data["subject"], data["value"]))
     return tuple(constraints)
 
@@ -158,7 +221,11 @@ def _strict_dependencies(value: object) -> tuple[DependencySpec, ...]:
     dependencies: list[DependencySpec] = []
     for item in value:
         data = _require_object(item, _DEPENDENCY_FIELDS)
-        if not all(isinstance(data[key], str) for key in _DEPENDENCY_FIELDS):
+        if (
+            not all(isinstance(data[key], str) for key in _DEPENDENCY_FIELDS)
+            or not data["name"]
+            or not data["kind"]
+        ):
             raise AtlasError("malformed_local_recipe")
         dependencies.append(
             DependencySpec(data["name"], data["kind"], data["specifier"])
@@ -166,7 +233,7 @@ def _strict_dependencies(value: object) -> tuple[DependencySpec, ...]:
     return tuple(dependencies)
 
 
-def _strict_tests(value: object) -> tuple[TestSpec, ...]:
+def _strict_tests(value: object, slot_names: frozenset[str]) -> tuple[TestSpec, ...]:
     if not isinstance(value, list):
         raise AtlasError("malformed_local_recipe")
     tests: list[TestSpec] = []
@@ -175,23 +242,56 @@ def _strict_tests(value: object) -> tuple[TestSpec, ...]:
         if (
             not isinstance(data["argv"], list)
             or not data["argv"]
-            or any(not isinstance(argument, str) for argument in data["argv"])
+            or any(
+                not isinstance(argument, str) or not argument
+                for argument in data["argv"]
+            )
             or type(data["expected_exit_code"]) is not int
+        ):
+            raise AtlasError("malformed_local_recipe")
+        try:
+            command_size = sum(
+                len(argument.encode("utf-8")) for argument in data["argv"]
+            )
+        except UnicodeEncodeError as exc:
+            raise AtlasError("malformed_local_recipe") from exc
+        if command_size > MAX_COMMAND_SPEC_BYTES:
+            raise AtlasError("malformed_local_recipe")
+        if any(
+            not _placeholder_names(argument) <= slot_names for argument in data["argv"]
         ):
             raise AtlasError("malformed_local_recipe")
         tests.append(TestSpec(tuple(data["argv"]), data["expected_exit_code"]))
     return tuple(tests)
 
 
-def _strict_operations(value: object) -> tuple[TemplateOperation, ...]:
-    if not isinstance(value, list):
+def _strict_operations(
+    value: object, slots_by_name: dict[str, SlotSpec]
+) -> tuple[TemplateOperation, ...]:
+    path_slots = tuple(
+        slot.name
+        for slot in slots_by_name.values()
+        if slot.type == "relative_python_path"
+    )
+    if not isinstance(value, list) or len(value) != len(path_slots):
         raise AtlasError("malformed_local_recipe")
     operations: list[TemplateOperation] = []
-    for item in value:
+    for expected_path_slot, item in zip(path_slots, value, strict=True):
         data = _require_object(item, _OPERATION_FIELDS)
         if not all(isinstance(data[key], str) for key in _OPERATION_FIELDS):
             raise AtlasError("malformed_local_recipe")
         if not _is_hash(data["template_hash"]):
+            raise AtlasError("malformed_local_recipe")
+        kind = data["kind"]
+        path_slot = data["path_slot"]
+        if (
+            kind not in _LOCAL_OPERATION_KINDS
+            or path_slot != expected_path_slot
+            or path_slot not in slots_by_name
+            or slots_by_name[path_slot].type != "relative_python_path"
+        ):
+            raise AtlasError("malformed_local_recipe")
+        if data["separator"] or data["target_symbol_slot"]:
             raise AtlasError("malformed_local_recipe")
         operations.append(
             TemplateOperation(
@@ -203,6 +303,31 @@ def _strict_operations(value: object) -> tuple[TemplateOperation, ...]:
             )
         )
     return tuple(operations)
+
+
+def _observed_manifest_payload(manifest: RecipeManifest) -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "recipe_key": manifest.recipe_key,
+        "version": manifest.version,
+        "intent_id": manifest.intent_id,
+        "language": {
+            "name": manifest.language_name,
+            "extractor_version": manifest.language_extractor_version,
+        },
+        "framework": None,
+        "repository_signature": manifest.repository_signature,
+        "layer": manifest.layer,
+        "slots": [slot.to_dict() for slot in manifest.slots],
+        "constraints": [constraint.to_dict() for constraint in manifest.constraints],
+        "dependencies": [dependency.to_dict() for dependency in manifest.dependencies],
+        "tests": [test.to_dict() for test in manifest.tests],
+        "operations": [operation.to_dict() for operation in manifest.operations],
+        "provenance": {
+            "kind": manifest.provenance_kind,
+            "source": manifest.provenance_source,
+        },
+    }
 
 
 def _sorted_records(records: Sequence[Any]) -> tuple[Any, ...]:
@@ -546,7 +671,16 @@ class CodeAtlasService:
 
     @staticmethod
     def _hydrate_manifest(root: AtlasNode) -> RecipeManifest:
-        if root.kind is not NodeKind.RECIPE:
+        if (
+            root.kind is not NodeKind.RECIPE
+            or root.schema_version != "1"
+            or root.extractor_id != "python-ast"
+            or root.extractor_version != "1"
+            or root.provenance != "observed"
+            or root.created_at is not None
+            or root.superseded_at is not None
+            or root.quarantine_state is not None
+        ):
             raise AtlasError("malformed_local_recipe")
         payload = thaw_json(root.payload)
         if not _safe_payload(payload):
@@ -554,42 +688,33 @@ class CodeAtlasService:
         data = _require_object(payload, _MANIFEST_FIELDS)
         if (
             type(data["version"]) is not int
-            or data["version"] <= 0
+            or data["version"] != 1
             or not isinstance(data["recipe_key"], str)
             or not isinstance(data["intent_id"], str)
             or normalize_intent_id(data["intent_id"]) != data["intent_id"]
             or data["recipe_key"] != data["intent_id"]
-            or not isinstance(data["language_name"], str)
-            or not isinstance(data["language_extractor_version"], str)
-            or not isinstance(data["repository_signature"], str)
+            or data["language_name"] != "python"
+            or data["language_extractor_version"] != "1"
+            or not _is_hash(data["repository_signature"])
             or data["layer"] != "local"
             or not _is_hash(data["manifest_hash"])
-            or not isinstance(data["provenance_kind"], str)
-            or not isinstance(data["provenance_source"], str)
+            or data["framework_name"] is not None
+            or data["framework_specifier"] is not None
+            or data["provenance_kind"] != "observed"
+            or data["provenance_source"] != "accepted_task"
             or data["schema_version"] != "1"
+            or data["quarantine_state"] is not None
+            or data["superseded_ids"] != []
         ):
             raise AtlasError("malformed_local_recipe")
-        if data["repository_signature"] and not _is_hash(data["repository_signature"]):
-            raise AtlasError("malformed_local_recipe")
-        if data["framework_name"] is not None and not isinstance(
-            data["framework_name"], str
-        ):
-            raise AtlasError("malformed_local_recipe")
-        if data["framework_specifier"] is not None and not isinstance(
-            data["framework_specifier"], str
-        ):
-            raise AtlasError("malformed_local_recipe")
-        if data["framework_name"] is None and data["framework_specifier"] is not None:
-            raise AtlasError("malformed_local_recipe")
-        if data["quarantine_state"] is not None and not isinstance(
-            data["quarantine_state"], str
-        ):
-            raise AtlasError("malformed_local_recipe")
-        if (
-            not isinstance(data["superseded_ids"], list)
-            or any(not _is_hash(value) for value in data["superseded_ids"])
-            or len(set(data["superseded_ids"])) != len(data["superseded_ids"])
-        ):
+        slots = _strict_slots(data["slots"])
+        slots_by_name = {slot.name: slot for slot in slots}
+        slot_names = frozenset(slots_by_name)
+        constraints = _strict_constraints(data["constraints"], slots)
+        dependencies = _strict_dependencies(data["dependencies"])
+        tests = _strict_tests(data["tests"], slot_names)
+        operations = _strict_operations(data["operations"], slots_by_name)
+        if dependencies or tests:
             raise AtlasError("malformed_local_recipe")
         manifest = RecipeManifest(
             recipe_id=root.node_id,
@@ -603,11 +728,11 @@ class CodeAtlasService:
             manifest_hash=data["manifest_hash"],
             framework_name=data["framework_name"],
             framework_specifier=data["framework_specifier"],
-            slots=_strict_slots(data["slots"]),
-            constraints=_strict_constraints(data["constraints"]),
-            dependencies=_strict_dependencies(data["dependencies"]),
-            tests=_strict_tests(data["tests"]),
-            operations=_strict_operations(data["operations"]),
+            slots=slots,
+            constraints=constraints,
+            dependencies=dependencies,
+            tests=tests,
+            operations=operations,
             provenance_kind=data["provenance_kind"],
             provenance_source=data["provenance_source"],
             schema_version=data["schema_version"],
@@ -618,18 +743,22 @@ class CodeAtlasService:
         del rebuilt["recipe_id"]
         if (
             canonical_json(payload) != canonical_json(rebuilt)
+            or canonical_hash(_observed_manifest_payload(manifest))
+            != manifest.manifest_hash
             or root.source_hashes != (manifest.manifest_hash,)
-            or root.quarantine_state != manifest.quarantine_state
         ):
             raise AtlasError("malformed_local_recipe")
         return manifest
 
     def _local_manifests(
         self, intent_id: str
-    ) -> tuple[tuple[RecipeManifest, ...], bool]:
+    ) -> tuple[tuple[RecipeManifest, ...], bool, bool]:
         manifests: list[RecipeManifest] = []
         malformed = False
-        for recipe_id in self._store.recipes_for_intent(intent_id):
+        recipe_ids = self._store.recipes_for_intent(intent_id)
+        if len(recipe_ids) >= _LOCAL_DISCOVERY_LIMIT:
+            return (), False, True
+        for recipe_id in recipe_ids:
             result = self._store.graph_query(
                 (recipe_id,),
                 max_nodes=1,
@@ -651,7 +780,11 @@ class CodeAtlasService:
                 manifests.append(self._hydrate_manifest(result.nodes[0]))
             except AtlasError:
                 malformed = True
-        return tuple(sorted(manifests, key=lambda item: item.recipe_id)), malformed
+        return (
+            tuple(sorted(manifests, key=lambda item: item.recipe_id)),
+            malformed,
+            False,
+        )
 
     @staticmethod
     def _prepare_paths(
@@ -777,6 +910,7 @@ class CodeAtlasService:
         if not isinstance(language, str):
             raise AtlasError("invalid_language")
         normalized_language = language.strip().casefold()
+        normalized_framework = normalize_framework(framework)
         target_paths = self._prepare_paths(target_paths, workspace)
         target_symbols = self._prepare_symbols(target_symbols)
         if normalized_language != "python":
@@ -805,14 +939,21 @@ class CodeAtlasService:
                 reasons=("missing_target_symbol",),
             )
         repository_signature = structural_repository_signature(
-            facts, language=normalized_language, framework=framework
+            facts, language=normalized_language, framework=normalized_framework
         )
-        local, malformed_local = self._local_manifests(normalized_intent)
+        local, malformed_local, discovery_limited = self._local_manifests(
+            normalized_intent
+        )
+        if discovery_limited:
+            return PreparationResult(
+                AtlasStatus.AMBIGUOUS_MATCH,
+                reasons=("candidate_limit_exceeded",),
+            )
         matching = select_recipe(
             (*self._bundled_manifests, *local),
             intent_id=normalized_intent,
             language=normalized_language,
-            framework=framework,
+            framework=normalized_framework,
             repository_signature=repository_signature,
             snapshot_facts=facts,
             max_candidates=max_candidates,
@@ -890,7 +1031,9 @@ class CodeAtlasService:
             {
                 "intent_id": normalized_intent,
                 "language": normalized_language,
-                "framework": "" if framework is None else framework.strip().casefold(),
+                "framework": ""
+                if normalized_framework is None
+                else normalized_framework,
                 "target_paths": target_paths,
                 "target_symbols": target_symbols,
                 "snapshot_id": snapshot_id,
