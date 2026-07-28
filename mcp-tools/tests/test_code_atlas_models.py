@@ -72,6 +72,33 @@ def test_edge_rejects_invalid_endpoint_kinds() -> None:
 
 
 @pytest.mark.parametrize(
+    ("relation", "source_kind", "target_kind"),
+    [
+        (EdgeRelation.SOLVES, NodeKind.RECIPE, NodeKind.INTENT),
+        (EdgeRelation.DERIVED_FROM, NodeKind.RECIPE, NodeKind.SOURCE_EVIDENCE),
+        (EdgeRelation.HAS_IMPLEMENTATION, NodeKind.RECIPE, NodeKind.CODE_TEMPLATE),
+        (EdgeRelation.HAS_SLOT, NodeKind.RECIPE, NodeKind.ADAPTATION_SLOT),
+        (EdgeRelation.CONSTRAINED_BY, NodeKind.RECIPE, NodeKind.CONSTRAINT),
+        (EdgeRelation.REQUIRES, NodeKind.RECIPE, NodeKind.DEPENDENCY),
+        (EdgeRelation.VERIFIED_BY, NodeKind.RECIPE, NodeKind.TEST_SPEC),
+        (EdgeRelation.CHANGES, NodeKind.TASK_EPISODE, NodeKind.SOURCE_EVIDENCE),
+        (EdgeRelation.TESTS, NodeKind.TEST_SPEC, NodeKind.SOURCE_EVIDENCE),
+        (EdgeRelation.SUPERSEDES, NodeKind.RECIPE, NodeKind.RECIPE),
+        (EdgeRelation.BUNDLED_AS, NodeKind.RECIPE, NodeKind.SOURCE_EVIDENCE),
+    ],
+)
+def test_edge_creation_succeeds_for_every_locked_relation(
+    relation: EdgeRelation, source_kind: NodeKind, target_kind: NodeKind,
+) -> None:
+    source = AtlasNode.create(source_kind, {"role": "source"})
+    target = AtlasNode.create(target_kind, {"role": "target"})
+    edge = AtlasEdge.create(relation, source, target, created_at="2026-01-01T00:00:00Z")
+    replaced = replace(edge, created_at="2026-02-01T00:00:00Z")
+    assert edge.edge_id.startswith("sha256:")
+    assert replaced.edge_id == edge.edge_id
+
+
+@pytest.mark.parametrize(
     ("raw", "expected"),
     [
         (" Python.Validation Guard ", "python.validation-guard"),
@@ -133,3 +160,7 @@ def test_slot_and_path_edge_cases() -> None:
     with pytest.raises(ValueError):
         validate_slot_value("python_statement_block", "return 1")
     assert validate_slot_value("python_statement_block", "value = 1") == "value = 1"
+    with pytest.raises(ValueError):
+        validate_slot_value("python_identifier", "class")
+    with pytest.raises(ValueError):
+        validate_slot_value("python_qualified_name", "package.class")

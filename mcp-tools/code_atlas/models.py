@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from typing import Any
 
-from .canonical import canonical_id, freeze_json, thaw_json
+from .canonical import canonical_hash, canonical_id, freeze_json, thaw_json
 
 
 class AtlasError(ValueError):
@@ -179,7 +179,7 @@ class AtlasEdge(_Record):
             "payload": {} if payload is None else payload,
         }
         return cls(
-            edge_id=canonical_id(identity), relation=relation, source_id=source.node_id,
+            edge_id=canonical_hash(identity), relation=relation, source_id=source.node_id,
             target_id=target.node_id, source_kind=source.kind, target_kind=target.kind,
             payload={} if payload is None else payload, schema_version=schema_version,
             provenance=provenance, created_at=created_at,

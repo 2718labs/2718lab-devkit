@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import keyword
 import os
 import re
 from pathlib import Path
@@ -94,11 +95,11 @@ def validate_slot_value(slot_type: str, value: str) -> str:
             raise AtlasError("invalid_slot_value")
         return result
     if slot_type == "python_identifier":
-        if not _IDENTIFIER.fullmatch(value):
+        if not _IDENTIFIER.fullmatch(value) or keyword.iskeyword(value):
             raise AtlasError("invalid_slot_value")
         return value
     if slot_type == "python_qualified_name":
-        if not _QUALIFIED_NAME.fullmatch(value):
+        if not _QUALIFIED_NAME.fullmatch(value) or any(keyword.iskeyword(part) for part in value.split(".")):
             raise AtlasError("invalid_slot_value")
         return value
     if slot_type == "python_expression":
