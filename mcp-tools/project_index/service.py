@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 from collections import deque
 from dataclasses import asdict
@@ -26,6 +27,8 @@ from .models import (
     QueryReceipt,
     QueryResult,
     SnapshotDiff,
+    SnapshotFacts,
+    SnapshotFile,
     SourceWindow,
 )
 from .store import ProjectIndexStore, StoreError
@@ -430,6 +433,62 @@ class ProjectIndexService:
         root = self._canonical_workspace(workspace)
         return self._require_snapshot(root, snapshot_id)
 
+    def snapshot_facts(self, workspace: str | Path, snapshot_id: str) -> SnapshotFacts:
+        root = self._canonical_workspace(workspace)
+        snapshot = self._require_snapshot(root, snapshot_id)
+        return SnapshotFacts(
+            snapshot=snapshot,
+            file_hashes=tuple(sorted(self._store.file_hashes(snapshot_id).items())),
+            nodes=tuple(
+                sorted(
+                    self._store.nodes(snapshot_id),
+                    key=lambda node: (node.path, node.node_id),
+                )
+            ),
+            edges=tuple(
+                sorted(self._store.edges(snapshot_id), key=lambda edge: edge.edge_id)
+            ),
+            gaps=tuple(
+                sorted(
+                    self._store.gaps(snapshot_id),
+                    key=lambda gap: (gap.path, gap.code, gap.message),
+                )
+            ),
+        )
+
+    def read_snapshot_files(
+        self,
+        workspace: str | Path,
+        snapshot_id: str,
+        paths: Sequence[str | Path],
+        *,
+        byte_budget: int,
+    ) -> tuple[SnapshotFile, ...]:
+        if type(byte_budget) is not int or byte_budget <= 0:
+            raise IndexError("INVALID_QUERY", "byte_budget must be a positive integer")
+        normalized_paths = self._normalize_read_paths(paths)
+        root = self._canonical_workspace(workspace)
+        self.assert_current(root, snapshot_id)
+        expected_hashes = self._store.file_hashes(snapshot_id)
+        files: list[SnapshotFile] = []
+        used_bytes = 0
+        for relative_path in normalized_paths:
+            expected_hash = expected_hashes.get(relative_path)
+            if expected_hash is None:
+                raise IndexError(
+                    "NOT_FOUND", "project index source file was not snapshotted"
+                )
+            body = _read_verified_workspace_file(root, relative_path)
+            if _content_hash(body) != expected_hash:
+                raise IndexError(
+                    "INDEX_STALE", "project index source hash no longer matches"
+                )
+            used_bytes += len(body)
+            if used_bytes > byte_budget:
+                raise IndexError("INVALID_QUERY", "byte_budget exceeded")
+            files.append(SnapshotFile(relative_path, expected_hash, body))
+        return tuple(files)
+
     def _require_snapshot(self, root: Path, snapshot_id: str) -> IndexSnapshot:
         snapshot = self._store.get_snapshot(snapshot_id)
         if snapshot is None or snapshot.workspace != _workspace_key(root):
@@ -470,6 +529,29 @@ class ProjectIndexService:
                 return ()
             normalized.add(clean)
         return tuple(sorted(normalized))
+
+    def _normalize_read_paths(self, paths: Sequence[str | Path]) -> tuple[str, ...]:
+        if isinstance(paths, (str, bytes)):
+            raise IndexError("SCOPE_ESCAPE", "index paths must be a sequence")
+        try:
+            supplied = tuple(paths)
+        except TypeError as exc:
+            raise IndexError("SCOPE_ESCAPE", "index paths must be a sequence") from exc
+        if not supplied:
+            raise IndexError("SCOPE_ESCAPE", "index paths must not be empty")
+        normalized = self._normalize_paths(supplied)
+        if len(normalized) != len(supplied) or tuple(normalized) != tuple(
+            str(value).replace("\\", "/") for value in supplied
+        ):
+            raise IndexError("SCOPE_ESCAPE", "index paths must be unique and ordered")
+        for path in normalized:
+            parts = tuple(part.casefold() for part in PurePosixPath(path).parts)
+            if (
+                any(part in _IGNORED_DIRECTORIES or ":" in part for part in parts)
+                or parts[-1] in _INDEX_DATABASE_NAMES
+            ):
+                raise IndexError("SCOPE_ESCAPE", "index path is generated or internal")
+        return normalized
 
     def _collect_files(
         self, root: Path, include_paths: Sequence[str]
@@ -657,6 +739,51 @@ def _verified_workspace_file(root: Path, relative_path: str) -> Path:
             "INDEX_STALE", "project index source path left the workspace"
         ) from exc
     return candidate
+
+
+def _read_verified_workspace_file(root: Path, relative_path: str) -> bytes:
+    candidate = _verified_workspace_file(root, relative_path)
+    try:
+        before = candidate.lstat()
+        if _unsafe_stat_result(before) or not stat.S_ISREG(before.st_mode):
+            raise IndexError("INDEX_STALE", "project index source path is not regular")
+        descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if _unsafe_stat_result(opened) or not stat.S_ISREG(opened.st_mode):
+                raise IndexError(
+                    "INDEX_STALE", "project index source path is not regular"
+                )
+            body = stream.read()
+        after = candidate.lstat()
+    except IndexError:
+        raise
+    except OSError as exc:
+        raise IndexError(
+            "INDEX_STALE", "project index source file is unavailable"
+        ) from exc
+    if _file_identity(before) != _file_identity(opened) or _file_identity(
+        opened
+    ) != _file_identity(after):
+        raise IndexError(
+            "INDEX_STALE", "project index source file changed while reading"
+        )
+    if _unsafe_stat_result(after) or not stat.S_ISREG(after.st_mode):
+        raise IndexError("INDEX_STALE", "project index source path is not regular")
+    return body
+
+
+def _file_identity(path_stat: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+    )
+
+
+def _unsafe_stat_result(path_stat: os.stat_result) -> bool:
+    return bool(getattr(path_stat, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def _ignored_database(path: Path, exact_names: set[str]) -> bool:

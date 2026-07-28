@@ -88,6 +88,13 @@ class RestoreResult:
 
 
 @dataclass(frozen=True)
+class CheckpointFile:
+    path: str
+    content_hash: str
+    body: bytes
+
+
+@dataclass(frozen=True)
 class _ManifestEntry:
     path: str
     kind: str
@@ -130,6 +137,39 @@ class CheckpointService:
     def status(self, checkpoint_id: str) -> Checkpoint:
         checkpoint, _ = self._load_verified_checkpoint(checkpoint_id)
         return checkpoint
+
+    def read_files_for_task(
+        self,
+        checkpoint_id: str,
+        *,
+        workflow_id: str,
+        task_id: str,
+        paths: Sequence[str],
+        byte_budget: int,
+    ) -> tuple[CheckpointFile, ...]:
+        if type(byte_budget) is not int or byte_budget <= 0:
+            raise _error("SCOPE_ESCAPE")
+        if not isinstance(workflow_id, str) or not isinstance(task_id, str):
+            raise _error("WORKTREE_UNOWNED")
+        requested = _normalize_requested_paths(paths)
+        checkpoint, entries = self._load_verified_checkpoint(checkpoint_id)
+        if checkpoint.workflow_id != workflow_id or checkpoint.task_id != task_id:
+            raise _error("WORKTREE_UNOWNED")
+        by_path = {entry.path: entry for entry in entries}
+        output: list[CheckpointFile] = []
+        used_bytes = 0
+        for path in requested:
+            if not _covered_by_scope(path, checkpoint.write_scope):
+                raise _error("SCOPE_ESCAPE")
+            entry = by_path.get(path)
+            if entry is None or entry.kind != "file" or entry.blob_hash is None:
+                raise _error("SCOPE_ESCAPE")
+            body = self._load_and_verify_blobs((entry,))[entry.blob_hash]
+            used_bytes += len(body)
+            if used_bytes > byte_budget:
+                raise _error("SCOPE_ESCAPE")
+            output.append(CheckpointFile(path, entry.blob_hash, body))
+        return tuple(output)
 
     def _load_verified_checkpoint(
         self, checkpoint_id: str
@@ -944,6 +984,23 @@ def _normalize_scope(write_scope: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(normalized))
 
 
+def _normalize_requested_paths(paths: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(paths, (str, bytes)):
+        raise _error("SCOPE_ESCAPE")
+    try:
+        supplied = tuple(paths)
+    except TypeError:
+        raise _error("SCOPE_ESCAPE") from None
+    if not supplied or any(not isinstance(path, str) for path in supplied):
+        raise _error("SCOPE_ESCAPE")
+    normalized = _normalize_scope(supplied)
+    if len(normalized) != len(supplied) or normalized != supplied:
+        raise _error("SCOPE_ESCAPE")
+    if any(":" in part for path in normalized for part in PurePosixPath(path).parts):
+        raise _error("SCOPE_ESCAPE")
+    return normalized
+
+
 def _normalize_relative(value: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise _error("SCOPE_ESCAPE")
@@ -1176,6 +1233,7 @@ def _error(code: str) -> IndexError:
 
 __all__ = [
     "Checkpoint",
+    "CheckpointFile",
     "CheckpointService",
     "RestoreResult",
     "WorktreeOwnership",

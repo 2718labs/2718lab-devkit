@@ -101,6 +101,22 @@ class IndexSnapshot:
 
 
 @dataclass(frozen=True)
+class SnapshotFacts:
+    snapshot: IndexSnapshot
+    file_hashes: tuple[tuple[str, str], ...]
+    nodes: tuple[IndexNode, ...]
+    edges: tuple[IndexEdge, ...]
+    gaps: tuple[CoverageGap, ...]
+
+
+@dataclass(frozen=True)
+class SnapshotFile:
+    path: str
+    content_hash: str
+    body: bytes
+
+
+@dataclass(frozen=True)
 class IndexStatus:
     workspace: str
     snapshot_id: str | None

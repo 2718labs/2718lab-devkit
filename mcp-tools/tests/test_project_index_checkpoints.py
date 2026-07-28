@@ -722,3 +722,65 @@ def test_idempotent_create_does_not_repair_tampered_checkpoint(
 
 def test_status_unknown_checkpoint_is_not_found(service: CheckpointService) -> None:
     _assert_error("NOT_FOUND", lambda: service.status("sha256:" + "0" * 64))
+
+
+def test_checkpoint_files_require_task_ownership(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    source = repository.worktree / "scope" / "module.py"
+    source.parent.mkdir()
+    source.write_bytes(b"VALUE = 1\n")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    files = service.read_files_for_task(
+        checkpoint.checkpoint_id,
+        workflow_id=checkpoint.workflow_id,
+        task_id=checkpoint.task_id,
+        paths=("scope/module.py",),
+        byte_budget=4096,
+    )
+    assert files[0].body == b"VALUE = 1\n"
+    with pytest.raises(IndexError) as captured:
+        service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id="other-task",
+            paths=("scope/module.py",),
+            byte_budget=4096,
+        )
+    assert captured.value.code == "WORKTREE_UNOWNED"
+
+
+def test_checkpoint_file_reader_rejects_tampered_cas_body(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    source = repository.worktree / "scope" / "module.py"
+    source.parent.mkdir()
+    source.write_bytes(b"VALUE = 1\n")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    entry = next(
+        entry
+        for entry in service._load_entries(checkpoint.checkpoint_id)
+        if entry.path == "scope/module.py"
+    )
+    assert entry.blob_hash is not None
+    service._blob_path(entry.blob_hash).write_bytes(b"VALUE = 2\n")
+    _assert_error(
+        "INDEX_CORRUPT",
+        lambda: service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id=checkpoint.task_id,
+            paths=("scope/module.py",),
+            byte_budget=4096,
+        ),
+    )

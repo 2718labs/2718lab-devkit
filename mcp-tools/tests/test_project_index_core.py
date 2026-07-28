@@ -653,3 +653,47 @@ def test_snapshot_exposes_deterministic_manifest_parser_set_and_git_head(
     assert first.parser_set_hash.startswith("sha256:")
     assert first.head == expected_head
     service.close()
+
+
+def test_snapshot_facts_and_files_are_hash_verified(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = workspace / "module.py"
+    source.write_bytes(b"VALUE = 1\n")
+    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    snapshot = service.sync(workspace)
+    facts = service.snapshot_facts(workspace, snapshot.snapshot_id)
+    files = service.read_snapshot_files(
+        workspace,
+        snapshot.snapshot_id,
+        ("module.py",),
+        byte_budget=1024,
+    )
+    assert facts.snapshot == snapshot
+    assert facts.file_hashes == (("module.py", files[0].content_hash),)
+    assert files[0].body == b"VALUE = 1\n"
+    source.write_bytes(b"VALUE = 2\n")
+    with pytest.raises(IndexError) as captured:
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=1024
+        )
+    assert captured.value.code == "INDEX_STALE"
+    service.close()
+
+
+def test_snapshot_file_body_is_not_stored_in_the_index_database(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    marker = b"ATLAS05_SOURCE_MARKER_7fddb342\n"
+    (workspace / "marker.txt").write_bytes(marker)
+    database = tmp_path / "index.sqlite3"
+    service = ProjectIndexService(database)
+    snapshot = service.sync(workspace)
+    assert (
+        service.read_snapshot_files(
+            workspace, snapshot.snapshot_id, ("marker.txt",), byte_budget=1024
+        )[0].body
+        == marker
+    )
+    service.close()
+    assert marker not in database.read_bytes()
