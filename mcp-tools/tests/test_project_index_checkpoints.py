@@ -952,3 +952,97 @@ def test_checkpoint_file_reader_is_independent_of_expired_lease(
         )[0].body
         == b"lease-independent"
     )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "UPDATE checkpoint_records SET manifest_hash = 'sha256:' || printf('%064d', 0)",
+        "UPDATE checkpoint_records SET cas_root_hash = 'sha256:' || printf('%064d', 0)",
+    ),
+)
+def test_checkpoint_file_reader_rejects_tampered_record_metadata(
+    repository: _Repository,
+    tmp_path: Path,
+    index_service: _FilesystemIndex,
+    statement: str,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "module.py").write_bytes(b"record-marker")
+    database = tmp_path / "reader-record.sqlite3"
+    cas_root = tmp_path / "reader-record-cas"
+    service = CheckpointService(database, cas_root, index_service)
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    service.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute(statement)
+    reopened = CheckpointService(database, cas_root, index_service)
+    try:
+        _assert_error(
+            "INDEX_CORRUPT",
+            lambda: reopened.read_files_for_task(
+                checkpoint.checkpoint_id,
+                workflow_id=checkpoint.workflow_id,
+                task_id=checkpoint.task_id,
+                paths=("scope/module.py",),
+                byte_budget=1024,
+            ),
+        )
+    finally:
+        reopened.close()
+
+
+def test_checkpoint_file_reader_does_not_mutate_storage_or_store_marker(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    marker = b"ATLAS05_CHECKPOINT_READER_MARKER_b9c0"
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "a.py").write_bytes(marker)
+    (scope / "b.py").write_bytes(b"late")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    database_before = service.database_path.read_bytes()
+    cas_before = tuple(
+        sorted(
+            (path.relative_to(service.cas_root).as_posix(), path.read_bytes())
+            for path in service.cas_root.rglob("*")
+            if path.is_file()
+        )
+    )
+    files = service.read_files_for_task(
+        checkpoint.checkpoint_id,
+        workflow_id=checkpoint.workflow_id,
+        task_id=checkpoint.task_id,
+        paths=("scope/a.py", "scope/b.py"),
+        byte_budget=1024,
+    )
+    assert files[0].body == marker
+    with pytest.raises(IndexError):
+        service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id=checkpoint.task_id,
+            paths=("scope/a.py", "scope/b.py"),
+            byte_budget=len(marker),
+        )
+    assert marker not in service.database_path.read_bytes()
+    assert service.database_path.read_bytes() == database_before
+    assert (
+        tuple(
+            sorted(
+                (path.relative_to(service.cas_root).as_posix(), path.read_bytes())
+                for path in service.cas_root.rglob("*")
+                if path.is_file()
+            )
+        )
+        == cas_before
+    )
