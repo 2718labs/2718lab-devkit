@@ -17,6 +17,7 @@ from .models import IndexError
 
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_READ_CHUNK_SIZE = 64 * 1024
 _IGNORED_DIRECTORIES = frozenset(
     {
         ".git",
@@ -155,21 +156,35 @@ class CheckpointService:
         checkpoint, entries = self._load_verified_checkpoint(checkpoint_id)
         if checkpoint.workflow_id != workflow_id or checkpoint.task_id != task_id:
             raise _error("WORKTREE_UNOWNED")
-        verified_blobs = self._load_and_verify_blobs(entries)
         by_path = {entry.path: entry for entry in entries}
-        output: list[CheckpointFile] = []
-        used_bytes = 0
+        requested_entries: list[_ManifestEntry] = []
+        requested_size = 0
         for path in requested:
             if not _covered_by_scope(path, checkpoint.write_scope):
                 raise _error("SCOPE_ESCAPE")
             entry = by_path.get(path)
             if entry is None or entry.kind != "file" or entry.blob_hash is None:
                 raise _error("SCOPE_ESCAPE")
-            body = verified_blobs[entry.blob_hash]
-            used_bytes += len(body)
-            if used_bytes > byte_budget:
-                raise _error("SCOPE_ESCAPE")
-            output.append(CheckpointFile(path, entry.blob_hash, body))
+            requested_entries.append(entry)
+            requested_size += entry.size
+        requested_hashes = (
+            frozenset()
+            if requested_size > byte_budget
+            else frozenset(
+                str(entry.blob_hash) for entry in requested_entries if entry.blob_hash
+            )
+        )
+        verified_blobs = self._load_and_verify_blobs(entries, requested_hashes)
+        if requested_size > byte_budget:
+            raise _error("SCOPE_ESCAPE")
+        output: list[CheckpointFile] = []
+        for entry in requested_entries:
+            if entry.blob_hash is None:
+                raise _error("INDEX_CORRUPT")
+            body = verified_blobs.get(entry.blob_hash)
+            if body is None:
+                raise _error("INDEX_CORRUPT")
+            output.append(CheckpointFile(entry.path, entry.blob_hash, body))
         return tuple(output)
 
     def _load_verified_checkpoint(
@@ -660,13 +675,21 @@ class CheckpointService:
                 raise _error("ROLLBACK_DRIFT")
 
     def _load_and_verify_blobs(
-        self, entries: Sequence[_ManifestEntry]
+        self,
+        entries: Sequence[_ManifestEntry],
+        retain_hashes: frozenset[str] | None = None,
     ) -> dict[str, bytes]:
-        blobs: dict[str, bytes] = {}
+        expected_sizes: dict[str, int] = {}
         for entry in entries:
-            if entry.blob_hash is None or entry.blob_hash in blobs:
+            if entry.blob_hash is None:
                 continue
-            path = self._blob_path(entry.blob_hash)
+            blob_hash = entry.blob_hash
+            previous_size = expected_sizes.setdefault(blob_hash, entry.size)
+            if previous_size != entry.size:
+                raise _error("INDEX_CORRUPT")
+        blobs: dict[str, bytes] = {}
+        for blob_hash, expected_size in sorted(expected_sizes.items()):
+            path = self._blob_path(blob_hash)
             _safe_storage_directory(self.cas_root, path.parent, create=False)
             try:
                 path_stat = path.lstat()
@@ -674,10 +697,14 @@ class CheckpointService:
                 raise _error("INDEX_CORRUPT") from None
             if _unsafe_stat(path_stat) or not stat.S_ISREG(path_stat.st_mode):
                 raise _error("UNSAFE_PATH_TYPE")
-            body = _read_regular_file(path, path_stat)
-            if len(body) != entry.size or _hash_bytes(body) != entry.blob_hash:
-                raise _error("INDEX_CORRUPT")
-            blobs[entry.blob_hash] = body
+            retain = retain_hashes is None or blob_hash in retain_hashes
+            body = _stream_cas_blob(
+                self.cas_root, path, path_stat, blob_hash, expected_size, retain
+            )
+            if retain:
+                if body is None:
+                    raise _error("INDEX_CORRUPT")
+                blobs[blob_hash] = body
         return blobs
 
     def _apply_manifest(
@@ -1112,6 +1139,78 @@ def _read_regular_file(path: Path, before: os.stat_result) -> bytes:
     if identity_before != identity_opened or identity_opened != identity_after:
         raise _error("INDEX_STALE")
     return body
+
+
+def _stream_cas_blob(
+    cas_root: Path,
+    path: Path,
+    before: os.stat_result,
+    expected_hash: str,
+    expected_size: int,
+    retain: bool,
+) -> bytes | None:
+    """Hash one immutable CAS object without retaining an unrequested payload."""
+
+    try:
+        _safe_storage_directory(cas_root, path.parent, create=False)
+        descriptor = os.open(path, _read_only_open_flags())
+        try:
+            stream = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
+            opened = os.fstat(stream.fileno())
+            if _unsafe_stat(opened) or not stat.S_ISREG(opened.st_mode):
+                raise _error("UNSAFE_PATH_TYPE")
+            if _file_identity(before) != _file_identity(opened):
+                raise _error("INDEX_CORRUPT")
+            if opened.st_size != expected_size:
+                raise _error("INDEX_CORRUPT")
+            digest = hashlib.sha256()
+            chunks: list[bytes] | None = [] if retain else None
+            retained = 0
+            remaining = opened.st_size
+            while remaining:
+                chunk = stream.read(_READ_CHUNK_SIZE)
+                if not chunk or len(chunk) > remaining:
+                    raise _error("INDEX_CORRUPT")
+                digest.update(chunk)
+                remaining -= len(chunk)
+                if chunks is not None:
+                    if retained + len(chunk) > expected_size:
+                        raise _error("INDEX_CORRUPT")
+                    retained += len(chunk)
+                    chunks.append(chunk)
+            if stream.read(_READ_CHUNK_SIZE):
+                raise _error("INDEX_CORRUPT")
+        _safe_storage_directory(cas_root, path.parent, create=False)
+        after = path.lstat()
+    except IndexError:
+        raise
+    except (OSError, ValueError):
+        raise _error("INDEX_CORRUPT") from None
+    if _unsafe_stat(after) or not stat.S_ISREG(after.st_mode):
+        raise _error("UNSAFE_PATH_TYPE")
+    if _file_identity(opened) != _file_identity(after):
+        raise _error("INDEX_CORRUPT")
+    actual_hash = f"sha256:{digest.hexdigest()}"
+    if actual_hash != expected_hash:
+        raise _error("INDEX_CORRUPT")
+    return None if chunks is None else b"".join(chunks)
+
+
+def _file_identity(path_stat: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+    )
+
+
+def _read_only_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
 def _prepare_storage_file(path: str | Path) -> Path:

@@ -1094,3 +1094,219 @@ def test_checkpoint_file_reader_rejects_cas_reparse_parent(
         else:
             sha_root.unlink()
         backup.rename(sha_root)
+
+
+class _CASReadTracker:
+    """Delegate to a real file object while recording every requested read size."""
+
+    def __init__(
+        self, stream: object, path: Path, reads: dict[Path, list[int]]
+    ) -> None:
+        self._stream = stream
+        self._path = path
+        self._reads = reads
+
+    def __enter__(self) -> _CASReadTracker:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._stream.close()  # type: ignore[attr-defined]
+
+    def fileno(self) -> int:
+        return self._stream.fileno()  # type: ignore[attr-defined]
+
+    def read(self, size: int = -1) -> bytes:
+        self._reads.setdefault(self._path, []).append(size)
+        return self._stream.read(size)  # type: ignore[attr-defined]
+
+
+def test_checkpoint_file_reader_streams_every_cas_blob_and_retains_requested_only(
+    monkeypatch: pytest.MonkeyPatch,
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    requested = scope / "requested.py"
+    requested.write_bytes(b"requested\n")
+    unrequested = scope / "unrequested.bin"
+    unrequested.write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    entries = service._load_entries(checkpoint.checkpoint_id)
+    requested_entry = next(
+        entry for entry in entries if entry.path == "scope/requested.py"
+    )
+    assert requested_entry.blob_hash is not None
+    expected_paths = {
+        service._blob_path(str(entry.blob_hash))
+        for entry in entries
+        if entry.blob_hash is not None
+    }
+    original_open = checkpoints_module.os.open
+    original_fdopen = checkpoints_module.os.fdopen
+    original_stream = checkpoints_module._stream_cas_blob
+    descriptors: dict[int, Path] = {}
+    read_sizes: dict[Path, list[int]] = {}
+    observed: list[tuple[Path, bool, bytes | None]] = []
+
+    def tracked_open(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        descriptor = original_open(path, flags, *args)
+        descriptors[descriptor] = Path(path)
+        return descriptor
+
+    def tracked_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _CASReadTracker:
+        return _CASReadTracker(
+            original_fdopen(descriptor, mode, *args, **kwargs),
+            descriptors[descriptor],
+            read_sizes,
+        )
+
+    def recorded_stream(
+        cas_root: Path,
+        path: Path,
+        before: os.stat_result,
+        expected_hash: str,
+        expected_size: int,
+        retain: bool,
+    ) -> bytes | None:
+        body = original_stream(
+            cas_root, path, before, expected_hash, expected_size, retain
+        )
+        observed.append((path, retain, body))
+        return body
+
+    monkeypatch.setattr(checkpoints_module.os, "open", tracked_open)
+    monkeypatch.setattr(checkpoints_module.os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(checkpoints_module, "_stream_cas_blob", recorded_stream)
+    files = service.read_files_for_task(
+        checkpoint.checkpoint_id,
+        workflow_id=checkpoint.workflow_id,
+        task_id=checkpoint.task_id,
+        paths=("scope/requested.py",),
+        byte_budget=1024,
+    )
+    assert files[0].body == b"requested\n"
+    assert {path for path, _, _ in observed} == expected_paths
+    assert {path for path, retain, _ in observed if retain} == {
+        service._blob_path(requested_entry.blob_hash)
+    }
+    assert all(body is None for _, retain, body in observed if not retain)
+    assert set(read_sizes) == expected_paths
+    assert all(
+        all(size == checkpoints_module._READ_CHUNK_SIZE for size in sizes)
+        for sizes in read_sizes.values()
+    )
+
+
+def test_checkpoint_file_reader_checks_every_blob_when_requested_total_exceeds_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "a.py").write_bytes(b"aaa")
+    (scope / "b.py").write_bytes(b"bbb")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+    entries = service._load_entries(checkpoint.checkpoint_id)
+    expected_paths = {
+        service._blob_path(str(entry.blob_hash))
+        for entry in entries
+        if entry.blob_hash is not None
+    }
+    original_open = checkpoints_module.os.open
+    original_fdopen = checkpoints_module.os.fdopen
+    original_stream = checkpoints_module._stream_cas_blob
+    descriptors: dict[int, Path] = {}
+    read_sizes: dict[Path, list[int]] = {}
+    observed: list[tuple[Path, bool, bytes | None]] = []
+
+    def tracked_open(path: str | os.PathLike[str], flags: int, *args: int) -> int:
+        descriptor = original_open(path, flags, *args)
+        descriptors[descriptor] = Path(path)
+        return descriptor
+
+    def tracked_fdopen(
+        descriptor: int, mode: str, *args: object, **kwargs: object
+    ) -> _CASReadTracker:
+        return _CASReadTracker(
+            original_fdopen(descriptor, mode, *args, **kwargs),
+            descriptors[descriptor],
+            read_sizes,
+        )
+
+    def recorded_stream(
+        cas_root: Path,
+        path: Path,
+        before: os.stat_result,
+        expected_hash: str,
+        expected_size: int,
+        retain: bool,
+    ) -> bytes | None:
+        body = original_stream(
+            cas_root, path, before, expected_hash, expected_size, retain
+        )
+        observed.append((path, retain, body))
+        return body
+
+    monkeypatch.setattr(checkpoints_module.os, "open", tracked_open)
+    monkeypatch.setattr(checkpoints_module.os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(checkpoints_module, "_stream_cas_blob", recorded_stream)
+    with pytest.raises(IndexError) as captured:
+        service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id=checkpoint.task_id,
+            paths=("scope/a.py", "scope/b.py"),
+            byte_budget=5,
+        )
+    assert captured.value.code == "SCOPE_ESCAPE"
+    assert {path for path, _, _ in observed} == expected_paths
+    assert all(not retain and body is None for _, retain, body in observed)
+    assert set(read_sizes) == expected_paths
+    assert all(
+        all(size == checkpoints_module._READ_CHUNK_SIZE for size in sizes)
+        for sizes in read_sizes.values()
+    )
+
+
+def test_checkpoint_file_reader_rejects_duplicate_paths_before_loading_cas(
+    monkeypatch: pytest.MonkeyPatch,
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    scope = repository.worktree / "scope"
+    scope.mkdir()
+    (scope / "module.py").write_bytes(b"VALUE = 1\n")
+    checkpoint = service.create(
+        _ownership(repository.worktree),
+        index_service.sync(repository.worktree).snapshot_id,
+    )
+
+    def fail_blob_load(*args: object, **kwargs: object) -> dict[str, bytes]:
+        pytest.fail("duplicate requested paths must fail before loading CAS blobs")
+
+    monkeypatch.setattr(service, "_load_and_verify_blobs", fail_blob_load)
+    with pytest.raises(IndexError) as captured:
+        service.read_files_for_task(
+            checkpoint.checkpoint_id,
+            workflow_id=checkpoint.workflow_id,
+            task_id=checkpoint.task_id,
+            paths=("scope/module.py", "scope/module.py"),
+            byte_budget=1024,
+        )
+    assert captured.value.code == "SCOPE_ESCAPE"
