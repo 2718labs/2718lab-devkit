@@ -23,9 +23,12 @@ from code_atlas import (
     RecipeManifest,
     canonical_id,
     canonical_json,
+    freeze_json,
     normalize_intent_id,
     validate_candidate_path,
+    validate_fragment,
     validate_slot_value,
+    thaw_json,
 )
 
 
@@ -127,6 +130,48 @@ def test_tuple_payload_is_immutable_and_serializes_as_json_containers() -> None:
     assert node.to_dict()["payload"] == {"intent_id": ["python", "guard"]}
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [[]],
+        [["a", 1]],
+        {"pairs": [["a", 1]]},
+        {"items": [{"name": "x"}, [1, {"nested": True}]]},
+    ],
+)
+def test_frozen_json_round_trips_arrays_and_objects_unambiguously(payload: object) -> None:
+    frozen = freeze_json(payload)
+    node = AtlasNode.create(NodeKind.RECIPE, payload)
+    assert thaw_json(frozen) == payload
+    assert node.to_dict()["payload"] == payload
+    assert canonical_json(node.payload) == canonical_json(payload)
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "GITHUB_TOKEN=ghp_exampleSecret123",
+        "AWS_SECRET_ACCESS_KEY=exampleSecret123456",
+        "token = exampleSecret123",
+        "Authorization: Bearer abcdefghijklmnop",
+        "-----BEGIN PRIVATE KEY-----",
+    ],
+)
+def test_fragment_rejects_credentials_without_returning_them(fragment: str) -> None:
+    with pytest.raises(ValueError):
+        validate_fragment(fragment)
+
+
+@pytest.mark.parametrize("fragment", ["bad\x01text", b"bad\x1ftext"])
+def test_fragment_rejects_control_characters(fragment: str | bytes) -> None:
+    with pytest.raises(ValueError):
+        validate_fragment(fragment)
+
+
+def test_fragment_allows_standard_text_whitespace() -> None:
+    assert validate_fragment("one\ttwo\nthree\rfour") == "one\ttwo\nthree\rfour"
+
+
 def test_provenance_must_be_locked_value() -> None:
     with pytest.raises(ValueError, match="provenance"):
         AtlasNode.create(NodeKind.RECIPE, {}, provenance="invented")
@@ -164,3 +209,19 @@ def test_slot_and_path_edge_cases() -> None:
         validate_slot_value("python_identifier", "class")
     with pytest.raises(ValueError):
         validate_slot_value("python_qualified_name", "package.class")
+    with pytest.raises(ValueError):
+        validate_candidate_path("src/module.py:secret")
+    with pytest.raises(ValueError):
+        validate_candidate_path("Vendor/X.py")
+
+
+def test_candidate_path_rejects_workspace_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    link = tmp_path / "linked"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    with pytest.raises(ValueError):
+        validate_candidate_path("linked/file.py", workspace=tmp_path)

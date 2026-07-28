@@ -26,7 +26,9 @@ GENERATED_COMPONENTS = frozenset({
 
 _DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 _CREDENTIAL = re.compile(
-    r"(?i)(?:api[_-]?key|access[_-]?token|secret|password|authorization)\s*(?:=|:|\s)\s*['\"]?[^\s'\"]+"
+    r"(?ix)(?:\b(?:github[_-]?token|aws[_-]?secret[_-]?access[_-]?key|"
+    r"api[_-]?key|access[_-]?token|token|secret|password)\b\s*(?:=|:)\s*['\"]?\S+|"
+    r"\bauthorization\s*:\s*bearer\s+\S+|-----begin\s+[a-z\s]*private\s+key-----)"
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
 _QUALIFIED_NAME = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
@@ -39,7 +41,7 @@ def validate_candidate_path(path: str | os.PathLike[str], workspace: str | os.Pa
         raise AtlasError("unsafe_path")
     normalized = raw.replace("\\", "/")
     parts = normalized.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
+    if any(part in {"", ".", ".."} or ":" in part for part in parts):
         raise AtlasError("unsafe_path")
     if any(part.casefold() in GENERATED_COMPONENTS for part in parts):
         raise AtlasError("generated_path")
@@ -57,9 +59,16 @@ def validate_candidate_path(path: str | os.PathLike[str], workspace: str | os.Pa
         cursor = root
         for part in parts:
             cursor = cursor / part
-            if cursor.exists() and cursor.is_symlink():
+            if cursor.is_symlink():
                 raise AtlasError("symlink_path")
-            if cursor.exists() and getattr(cursor.stat(), "st_file_attributes", 0) & 0x400:
+            try:
+                stat_result = cursor.lstat()
+            except OSError:
+                continue
+            if getattr(stat_result, "st_file_attributes", 0) & 0x400:
+                raise AtlasError("reparse_path")
+            is_junction = getattr(os.path, "isjunction", None)
+            if callable(is_junction) and is_junction(cursor):
                 raise AtlasError("reparse_path")
     return "/".join(parts)
 
@@ -79,6 +88,8 @@ def validate_fragment(fragment: str | bytes, *, max_bytes: int = MAX_TEMPLATE_BY
         text = fragment
     else:
         raise AtlasError("invalid_fragment")
+    if any(ord(char) < 32 and char not in "\t\n\r" for char in text):
+        raise AtlasError("unsafe_fragment")
     redacted = _CREDENTIAL.sub("[REDACTED]", text)
     if redacted != text:
         raise AtlasError("credential_detected")

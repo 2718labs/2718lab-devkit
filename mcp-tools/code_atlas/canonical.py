@@ -12,12 +12,26 @@ from typing import Any
 FrozenJson = Any
 
 
+class FrozenObject(tuple[tuple[str, FrozenJson], ...]):
+    """Tuple-backed immutable JSON object, distinct from JSON arrays."""
+
+
+class FrozenArray(tuple[FrozenJson, ...]):
+    """Tuple-backed immutable JSON array, distinct from JSON objects."""
+
+
+def _pairs_are_object(value: tuple[Any, ...]) -> bool:
+    return all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value)
+
+
 def freeze_json(value: Any) -> FrozenJson:
     """Recursively make a JSON-like value immutable."""
     if isinstance(value, Mapping):
-        return tuple(sorted(((str(key), freeze_json(item)) for key, item in value.items()), key=lambda item: item[0]))
+        return FrozenObject(sorted(((str(key), freeze_json(item)) for key, item in value.items()), key=lambda item: item[0]))
+    if isinstance(value, tuple) and _pairs_are_object(value):
+        return FrozenObject(sorted(((key, freeze_json(item)) for key, item in value), key=lambda item: item[0]))
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return tuple(freeze_json(item) for item in value)
+        return FrozenArray(freeze_json(item) for item in value)
     return value
 
 
@@ -25,9 +39,11 @@ def thaw_json(value: FrozenJson) -> Any:
     """Return plain JSON containers at an explicit serialization boundary."""
     if isinstance(value, Mapping):
         return {str(key): thaw_json(item) for key, item in value.items()}
+    if isinstance(value, FrozenObject):
+        return {key: thaw_json(item) for key, item in value}
+    if isinstance(value, FrozenArray):
+        return [thaw_json(item) for item in value]
     if isinstance(value, tuple):
-        if all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value):
-            return {key: thaw_json(item) for key, item in value}
         return [thaw_json(item) for item in value]
     return value
 
