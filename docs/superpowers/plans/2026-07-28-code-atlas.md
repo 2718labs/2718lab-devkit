@@ -29,12 +29,17 @@ The implementation must preserve these decisions:
 - Every accepted code task creates one `TaskEpisode`; recipe creation is gated
   separately and may result in an episode-only receipt.
 - Codex routing is Sol coordinator/final acceptor, Luna with `max` reasoning for
-  code/test/debug execution, and Terra for bounded medium-complexity work.
+  code/test/debug execution, and Terra for bounded medium-complexity work. A
+  coding dispatch requests Luna Max first; only a model-unavailable,
+  reasoning-unavailable, or multi-agent-protocol-incompatible spawn may retry
+  once as Terra with `medium` reasoning.
 - Claude routing is Opus coordinator/final acceptor, Sonnet default executor,
   Haiku lightweight worker, and Fable explicit expensive escalation with an
   automatic budget of zero.
-- Requested model unavailability returns `MODEL_UNAVAILABLE`; no role may be
-  silently impersonated by another model.
+- Every permitted Terra fallback records and discloses requested/effective
+  model and reasoning plus the fallback reason; Terra is never represented as
+  Luna. If Terra medium is unavailable too, return `MODEL_UNAVAILABLE` with
+  both failed attempts. No other model fallback is allowed.
 
 ### Canonical identity rules
 
@@ -2164,7 +2169,7 @@ git commit -m "feat: expose Code Atlas through 2718lab tools"
 `test_code_atlas_routing.py` must assert:
 
 ```python
-def test_codex_roles_require_exact_models_and_luna_max(profile) -> None:
+def test_codex_coding_requests_luna_max_then_allows_only_disclosed_terra_medium(profile) -> None:
     assert profile["codex"]["coordinator"] == {
         "model": "gpt-5.6-sol",
         "responsibilities": ["design", "dispatch", "review", "final_acceptance"],
@@ -2175,7 +2180,23 @@ def test_codex_roles_require_exact_models_and_luna_max(profile) -> None:
         "responsibilities": ["coding", "testing", "debugging", "heavy_execution"],
     }
     assert profile["codex"]["medium_worker"]["model"] == "gpt-5.6-terra"
-    assert profile["codex"]["fallback"] == "fail_closed"
+    assert profile["codex"]["code_worker_fallback"] == {
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "medium",
+        "allowed_reasons": [
+            "MODEL_UNAVAILABLE",
+            "REASONING_UNAVAILABLE",
+            "MULTI_AGENT_PROTOCOL_INCOMPATIBLE",
+        ],
+        "max_attempts": 1,
+        "disclosure_fields": [
+            "requested_model",
+            "requested_reasoning_effort",
+            "effective_model",
+            "effective_reasoning_effort",
+            "fallback_reason",
+        ],
+    }
 
 
 def test_claude_fable_is_explicit_and_zero_budget(profile) -> None:
@@ -2187,7 +2208,7 @@ def test_claude_fable_is_explicit_and_zero_budget(profile) -> None:
     assert profile["claude"]["resolve_full_id_from_capabilities"] is True
 
 
-def test_missing_requested_model_fails_closed(profile) -> None:
+def test_luna_unavailable_uses_disclosed_terra_medium_fallback(profile) -> None:
     result = resolve_role(
         profile,
         host="codex",
@@ -2195,13 +2216,81 @@ def test_missing_requested_model_fails_closed(profile) -> None:
         available_models=("gpt-5.6-sol", "gpt-5.6-terra"),
         requested_reasoning_effort="max",
     )
+    assert result.status.value == "READY"
+    assert result.requested_model == "gpt-5.6-luna"
+    assert result.requested_reasoning_effort == "max"
+    assert result.effective_model == "gpt-5.6-terra"
+    assert result.effective_reasoning_effort == "medium"
+    assert result.fallback_reason == "MODEL_UNAVAILABLE"
+    assert result.disclosure_required is True
+
+
+def test_luna_protocol_incompatibility_uses_only_terra_medium(profile) -> None:
+    result = resolve_role(
+        profile,
+        host="codex",
+        role="code_worker",
+        available_models=("gpt-5.6-sol", "gpt-5.6-terra"),
+        requested_reasoning_effort="max",
+        spawn_failure="MULTI_AGENT_PROTOCOL_INCOMPATIBLE",
+    )
+    assert result.status.value == "READY"
+    assert result.effective_model == "gpt-5.6-terra"
+    assert result.effective_reasoning_effort == "medium"
+    assert result.fallback_reason == "MULTI_AGENT_PROTOCOL_INCOMPATIBLE"
+
+
+def test_luna_reasoning_unavailable_uses_only_terra_medium(profile) -> None:
+    result = resolve_role(
+        profile,
+        host="codex",
+        role="code_worker",
+        available_models=("gpt-5.6-luna", "gpt-5.6-terra"),
+        requested_reasoning_effort="max",
+        spawn_failure="REASONING_UNAVAILABLE",
+    )
+    assert result.status.value == "READY"
+    assert result.effective_model == "gpt-5.6-terra"
+    assert result.effective_reasoning_effort == "medium"
+    assert result.fallback_reason == "REASONING_UNAVAILABLE"
+
+
+def test_non_capability_spawn_failure_does_not_fallback(profile) -> None:
+    result = resolve_role(
+        profile,
+        host="codex",
+        role="code_worker",
+        available_models=("gpt-5.6-luna", "gpt-5.6-terra"),
+        requested_reasoning_effort="max",
+        spawn_failure="TASK_SCOPE_REJECTED",
+    )
+    assert result.status.value == "TASK_SCOPE_REJECTED"
+    assert result.effective_model == ""
+    assert result.attempts == [
+        {"model": "gpt-5.6-luna", "reasoning_effort": "max", "reason": "TASK_SCOPE_REJECTED"}
+    ]
+
+
+def test_missing_luna_and_terra_returns_model_unavailable(profile) -> None:
+    result = resolve_role(
+        profile,
+        host="codex",
+        role="code_worker",
+        available_models=("gpt-5.6-sol",),
+        requested_reasoning_effort="max",
+    )
     assert result.status.value == "MODEL_UNAVAILABLE"
-    assert result.selected_model == ""
-    assert result.required_model == "gpt-5.6-luna"
+    assert result.requested_model == "gpt-5.6-luna"
+    assert result.effective_model == ""
+    assert result.attempts == [
+        {"model": "gpt-5.6-luna", "reasoning_effort": "max", "reason": "MODEL_UNAVAILABLE"},
+        {"model": "gpt-5.6-terra", "reasoning_effort": "medium", "reason": "MODEL_UNAVAILABLE"},
+    ]
 ```
 
-Update legacy tests first so they reject Sol as code writer and accept only the
-new Luna Max code-worker asset.
+Update legacy tests first so they reject Sol as code writer and accept Luna Max
+as the requested code-worker asset or the fully disclosed Terra-medium fallback
+asset only.
 
 - [ ] **Step 2: Run policy tests and verify failure**
 
@@ -2235,11 +2324,27 @@ names. Claude entries do not invent a full model id:
       "reasoning_effort": "max",
       "responsibilities": ["coding", "testing", "debugging", "heavy_execution"]
     },
+    "code_worker_fallback": {
+      "model": "gpt-5.6-terra",
+      "reasoning_effort": "medium",
+      "allowed_reasons": [
+        "MODEL_UNAVAILABLE",
+        "REASONING_UNAVAILABLE",
+        "MULTI_AGENT_PROTOCOL_INCOMPATIBLE"
+      ],
+      "max_attempts": 1,
+      "disclosure_fields": [
+        "requested_model",
+        "requested_reasoning_effort",
+        "effective_model",
+        "effective_reasoning_effort",
+        "fallback_reason"
+      ]
+    },
     "medium_worker": {
       "model": "gpt-5.6-terra",
       "responsibilities": ["bounded_analysis", "documentation", "aux_validation"]
-    },
-    "fallback": "fail_closed"
+    }
   },
   "claude": {
     "coordinator": {"family": "opus"},
@@ -2262,9 +2367,13 @@ names. Claude entries do not invent a full model id:
 ```
 
 `routing.resolve_role` is pure and accepts host-reported available model ids or
-Claude family/id pairs. It never probes a network, invokes a model, or chooses a
-different family. Its error includes the exact required model/family and
-available capability names.
+Claude family/id pairs. It never probes a network or invokes a model. For Codex
+`code_worker`, it returns a Luna Max request first and may select exactly one
+Terra medium fallback only after `MODEL_UNAVAILABLE`, `REASONING_UNAVAILABLE`,
+or `MULTI_AGENT_PROTOCOL_INCOMPATIBLE`; every such result carries the five
+configured disclosure fields. If Terra medium cannot run, it returns
+`MODEL_UNAVAILABLE` and both attempt records. It never chooses another model or
+family.
 
 - [ ] **Step 4: Replace contradictory role assets**
 
@@ -2272,14 +2381,19 @@ available capability names.
 acceptance, and the `workflow_accept_code_task` call. It has no routine code
 write scope.
 
-`bugkiller-luna-code-worker` requires the exact `gpt-5.6-luna` model plus
+`bugkiller-luna-code-worker` requests the exact `gpt-5.6-luna` model plus
 `reasoning_effort=max`, owns coding/tests/debugging in one assigned write scope,
 uses Code/exec batching when available, falls back to equivalent direct host
 calls when Code/exec is absent, and returns verification/receipt ids. It cannot
 accept its own task, change routing, broaden scope, or request Fable.
 
 Terra assets remain bounded medium-complexity roles. A documentation-only Terra
-card may write documentation; Terra does not become the fallback code worker.
+card may write documentation. The sole exception is the recorded, automatic
+`code_worker_fallback`: when Luna Max spawn fails for one configured capability
+reason, Terra with `medium` reasoning may perform that same assigned code scope
+once. Its task card and receipt disclose the requested Luna Max capability, the
+effective Terra medium capability, and the fallback reason; it is never labeled
+as Luna.
 
 Claude docs define Opus/Sonnet/Haiku/Fable responsibilities and require host
 capability resolution. Fable remains unavailable automatically until one listed
@@ -2317,7 +2431,7 @@ acceptance pipeline. External CodeGraph is not a fallback.
 | `RECIPE_QUARANTINED` | Exclude the recipe and continue through normal coding. |
 | `INGEST_PENDING` | Keep acceptance successful and allow deterministic retry. |
 | `ATLAS_UNAVAILABLE` | Use normal coding only when the task card explicitly allows degraded Atlas; never use external CodeGraph. |
-| `MODEL_UNAVAILABLE` | Block the requested role and report the exact missing capability. |
+| `MODEL_UNAVAILABLE` | Report both failed Luna Max and Terra medium attempts; block the code worker. |
 
 The plugin cannot inject a host Code/exec tool. The worker inspects the
 host-exposed tool list: when Code/exec exists it batches freshness, preparation,
@@ -2332,14 +2446,14 @@ Require:
 - the two new Sol/Luna assets and absence of deprecated assets;
 - Luna's exact model/reasoning/write-scope/acceptance prohibitions;
 - Sol's coordinator/final-acceptance responsibility;
-- Terra's bounded role;
+- Terra's bounded role plus its only permitted, disclosed Terra-medium code-worker fallback;
 - Claude families and Fable zero budget;
 - Code Atlas status actions and four MCP names;
 - Code/exec direct-call equivalence;
-- no silent model fallback.
+- Luna-Max-first dispatch, one permitted Terra-medium fallback, its required disclosure, and no other model fallback.
 
-`validate_work_package.py` permits code write scope only when the task card
-contains all three exact markers:
+`validate_work_package.py` permits primary code write scope only when the task
+card contains all three exact markers:
 
 ```text
 Owner: luna-max-code-worker
@@ -2347,7 +2461,18 @@ Model: gpt-5.6-luna
 Reasoning effort: max
 ```
 
-It continues to reject generic Luna, Terra, or Sol code-write claims.
+It permits a fallback code write scope only when the card additionally contains:
+
+```text
+Requested model: gpt-5.6-luna
+Requested reasoning effort: max
+Effective model: gpt-5.6-terra
+Effective reasoning effort: medium
+Fallback reason: MODEL_UNAVAILABLE|REASONING_UNAVAILABLE|MULTI_AGENT_PROTOCOL_INCOMPATIBLE
+```
+
+It continues to reject generic Luna, Terra, or Sol code-write claims and any
+undisclosed fallback.
 
 - [ ] **Step 6: Run routing and asset validation**
 
@@ -2509,7 +2634,7 @@ Sol must inspect:
 - data-root/cache boundaries remain intact;
 - acceptance/outbox atomicity and retry evidence passed;
 - equal-best matching never selects arbitrarily;
-- model routing is exact and fail-closed;
+- model routing is Luna-Max-first, with only the disclosed Terra-medium fallback and terminal `MODEL_UNAVAILABLE`;
 - no unrelated user change is present.
 
 - [ ] **Step 7: Commit the verified delivery**
@@ -2536,7 +2661,7 @@ delivery action after the source repository passes all acceptance gates.
 | Direct/Code-exec receipt equivalence | Task 9 tests |
 | Automatic acceptance/outbox/recovery | Tasks 10-11 tests |
 | Four safe MCP tools | Task 11 contract tests |
-| Sol/Luna Max/Terra routing | Task 12 policy tests |
+| Luna-Max-first/Terra-medium-only fallback routing and disclosure | Task 12 policy tests (model, reasoning, reason, and terminal `MODEL_UNAVAILABLE` assertions) |
 | Opus/Sonnet/Haiku/Fable routing | Task 12 policy tests |
 | First miss, accepted ingestion, second hit | Task 13 E2E |
 | Zero LLM calls and no external CodeGraph | Tasks 11 and 13 |

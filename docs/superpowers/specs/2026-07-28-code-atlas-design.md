@@ -92,8 +92,19 @@ Atlas graph.
   execution.
 - Terra owns bounded medium-complexity analysis, documentation, and auxiliary
   validation.
-- If Luna or the requested reasoning effort is unavailable, execution blocks
-  with the exact capability error. No model may impersonate Luna.
+- Coding dispatch always requests Luna with `max` reasoning first. If that
+  spawn fails specifically because the model is unavailable, the requested
+  reasoning effort is unavailable, or the multi-agent protocol is
+  incompatible, dispatch automatically retries once with Terra at `medium`
+  reasoning. No other fallback is permitted.
+- Every fallback result/receipt must disclose `requested_model`,
+  `requested_reasoning_effort`, `effective_model`,
+  `effective_reasoning_effort`, and one of the recorded reasons
+  `MODEL_UNAVAILABLE`, `REASONING_UNAVAILABLE`, or
+  `MULTI_AGENT_PROTOCOL_INCOMPATIBLE`. Terra must never be presented as Luna.
+- If Terra at `medium` is also unavailable, return `MODEL_UNAVAILABLE` with
+  both attempted capabilities and their failures. Non-capability spawn errors
+  are returned directly and do not trigger a model fallback.
 
 ### Claude
 
@@ -348,7 +359,8 @@ rebuildable knowledge projection is temporarily unavailable.
 - `INGEST_PENDING`: acceptance succeeded; deterministic projection awaits retry.
 - `ATLAS_UNAVAILABLE`: report loss of reuse and ingestion, then follow the
   workflow's explicit degraded-mode policy.
-- `MODEL_UNAVAILABLE`: fail closed for the requested role/model.
+- `MODEL_UNAVAILABLE`: Luna Max and the sole permitted Terra medium fallback
+  are unavailable; report requested/effective capability attempts and reasons.
 
 Code/exec absence degrades to direct host calls. External CodeGraph is never a
 fallback.
@@ -379,8 +391,9 @@ fallback.
 - Stable matching, ambiguity, compatibility, and supersession.
 - Slot validation, rendering, and exact round-trip output hashes.
 - Secret, generated-file, size, and parser-gap quarantine.
-- Codex and Claude routing, fail-closed model availability, and Fable's zero
-  default budget.
+- Codex Luna-Max-first routing, the disclosed Terra-medium-only fallback,
+  terminal `MODEL_UNAVAILABLE`, Claude routing, and Fable's zero default
+  budget.
 
 ### Contract tests
 
