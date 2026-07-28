@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ from .security import (
     MAX_SLOT_COUNT,
     MAX_TEMPLATE_BYTES,
     validate_candidate_path,
+    validate_fragment,
 )
 
 
@@ -61,6 +64,21 @@ _OPERATION = frozenset(
 )
 _PROVENANCE = frozenset({"kind", "source"})
 _OPERATIONS = frozenset({"append_python_nodes", "prepend_function_body"})
+_SLOT_TYPES = frozenset(
+    {
+        "relative_python_path",
+        "python_identifier",
+        "python_qualified_name",
+        "python_expression",
+        "python_statement_block",
+        "single_line_text",
+    }
+)
+_EXPECTED_RECIPES = {
+    "python-fastmcp-read-tool.json": "python.fastmcp.read-only-tool",
+    "python-pytest-regression.json": "python.pytest-regression",
+    "python-validation-guard.json": "python.validation-guard",
+}
 
 
 def _error(code: str = "invalid_recipe") -> None:
@@ -85,32 +103,73 @@ def _text(value: Any) -> str:
     return value
 
 
+def _recipe_payload(recipe: RecipeManifest) -> dict[str, Any]:
+    payload = recipe.to_dict()
+    del payload["recipe_id"]
+    return payload
+
+
+def _recipe_node(recipe: RecipeManifest) -> AtlasNode:
+    return AtlasNode.create(
+        NodeKind.RECIPE,
+        _recipe_payload(recipe),
+        provenance="declared",
+        source_hashes=(recipe.manifest_hash,),
+    )
+
+
 class BundledRecipeLoader:
     """Read only configured bundled assets and project them into Atlas records."""
 
     def __init__(self, asset_root: str | Path) -> None:
-        self._root = Path(asset_root).resolve()
+        self._root = Path(asset_root)
 
-    def _safe_child(self, relative: str) -> Path:
-        normalized = validate_candidate_path(relative)
-        candidate = self._root.joinpath(*normalized.split("/"))
+    @staticmethod
+    def _assert_safe_component(path: Path) -> None:
+        try:
+            stat_result = path.lstat()
+            is_junction = getattr(os.path, "isjunction", None)
+            if (
+                path.is_symlink()
+                or getattr(stat_result, "st_file_attributes", 0) & 0x400
+                or (callable(is_junction) and is_junction(path))
+            ):
+                raise AtlasError("unsafe_asset_reference")
+        except AtlasError:
+            raise
+        except OSError as exc:
+            raise AtlasError("unsafe_asset_reference") from exc
+
+    def _safe_child(self, relative: str, *, allow_missing_final: bool = False) -> Path:
+        try:
+            self._assert_safe_component(self._root)
+            root = self._root.resolve(strict=True)
+            self._assert_safe_component(root)
+            normalized = validate_candidate_path(relative)
+            candidate = root.joinpath(*normalized.split("/"))
+        except (OSError, ValueError) as exc:
+            raise AtlasError("unsafe_asset_reference") from exc
         try:
             resolved = candidate.resolve(strict=False)
-            resolved.relative_to(self._root)
-        except ValueError as exc:
+            resolved.relative_to(root)
+        except (OSError, ValueError) as exc:
             raise AtlasError("unsafe_asset_reference") from exc
-        cursor = self._root
-        for part in normalized.split("/"):
+        cursor = root
+        parts = normalized.split("/")
+        for index, part in enumerate(parts):
             cursor /= part
-            if cursor.is_symlink():
-                raise AtlasError("unsafe_asset_reference")
+            if allow_missing_final and index == len(parts) - 1 and not cursor.exists():
+                continue
+            self._assert_safe_component(cursor)
         return candidate
 
     def _blob(self, template_hash: str) -> bytes:
         match = _HASH.fullmatch(template_hash)
         if match is None:
             _error("invalid_template_hash")
-        blob_path = self._safe_child(f"templates/sha256/{match.group(1)}")
+        blob_path = self._safe_child(
+            f"templates/sha256/{match.group(1)}", allow_missing_final=True
+        )
         if not blob_path.is_file():
             _error("missing_template_blob")
         try:
@@ -127,6 +186,10 @@ class BundledRecipeLoader:
             body.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise AtlasError("invalid_template_blob") from exc
+        try:
+            validate_fragment(body)
+        except AtlasError as exc:
+            raise AtlasError("invalid_template_blob") from exc
         return body
 
     def _parse(self, path: Path) -> RecipeManifest:
@@ -138,12 +201,17 @@ class BundledRecipeLoader:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AtlasError("invalid_recipe") from exc
         item = _object(data, _TOP_LEVEL)
-        if raw != canonical_json(item).encode("utf-8") + b"\n":
+        try:
+            canonical = canonical_json(item).encode("utf-8") + b"\n"
+        except (TypeError, ValueError) as exc:
+            raise AtlasError("invalid_recipe") from exc
+        if raw != canonical:
             _error("noncanonical_manifest")
         if (
             item["schema_version"] != "1"
             or isinstance(item["version"], bool)
             or not isinstance(item["version"], int)
+            or item["version"] <= 0
         ):
             _error()
         intent_id = _text(item["intent_id"])
@@ -154,12 +222,18 @@ class BundledRecipeLoader:
         ):
             _error("invalid_intent_id")
         language = _object(item["language"], _LANGUAGE)
-        if language["name"] != "python" or language["extractor_version"] != "1":
+        if (
+            not all(isinstance(language[key], str) for key in _LANGUAGE)
+            or language["name"] != "python"
+            or language["extractor_version"] != "1"
+        ):
             _error()
         framework = item["framework"]
         if framework is not None:
             framework = _object(framework, _FRAMEWORK)
-            if not framework["name"] or not framework["specifier"]:
+            if not all(
+                isinstance(framework[key], str) and framework[key] for key in _FRAMEWORK
+            ):
                 _error()
         if not isinstance(item["repository_signature"], str):
             _error()
@@ -173,15 +247,32 @@ class BundledRecipeLoader:
             or len(slots_data) > MAX_SLOT_COUNT
         ):
             _error("invalid_slots")
+        if any(
+            not isinstance(slot, dict)
+            or not isinstance(slot.get("name"), str)
+            or not isinstance(slot.get("type"), str)
+            or type(slot.get("required")) is not bool
+            for slot in slots_data
+        ):
+            _error("invalid_slots")
         slots = tuple(SlotSpec(**_object(slot, _SLOT)) for slot in slots_data)
         if any(
-            not slot.name or not slot.type or not isinstance(slot.required, bool)
+            not slot.name
+            or slot.type not in _SLOT_TYPES
+            or not isinstance(slot.required, bool)
             for slot in slots
         ) or len({slot.name for slot in slots}) != len(slots):
             _error("invalid_slots")
         slot_names = {slot.name for slot in slots}
         constraints_data = item["constraints"]
         if not isinstance(constraints_data, list):
+            _error()
+        if any(
+            not isinstance(value, dict)
+            or not isinstance(value.get("kind"), str)
+            or not isinstance(value.get("subject"), str)
+            for value in constraints_data
+        ):
             _error()
         constraints = tuple(
             ConstraintSpec(**_object(value, _CONSTRAINT)) for value in constraints_data
@@ -193,6 +284,12 @@ class BundledRecipeLoader:
         dependencies_data = item["dependencies"]
         if not isinstance(dependencies_data, list):
             _error()
+        if any(
+            not isinstance(value, dict)
+            or not all(isinstance(value.get(key), str) for key in _DEPENDENCY)
+            for value in dependencies_data
+        ):
+            _error()
         dependencies = tuple(
             DependencySpec(**_object(value, _DEPENDENCY)) for value in dependencies_data
         )
@@ -200,6 +297,15 @@ class BundledRecipeLoader:
             _error()
         tests_data = item["tests"]
         if not isinstance(tests_data, list) or not tests_data:
+            _error()
+        if any(
+            not isinstance(value, dict)
+            or not isinstance(value.get("argv"), list)
+            or not value["argv"]
+            or any(not isinstance(arg, str) for arg in value["argv"])
+            or type(value.get("expected_exit_code")) is not int
+            for value in tests_data
+        ):
             _error()
         tests = tuple(TestSpec(**_object(value, _TEST)) for value in tests_data)
         if any(
@@ -220,9 +326,24 @@ class BundledRecipeLoader:
                 frozenset({"kind", "path_slot", "template_hash"}),
                 optional=frozenset({"separator", "target_symbol_slot"}),
             )
+            if not all(
+                isinstance(operation[key], str)
+                for key in ("kind", "path_slot", "template_hash")
+            ):
+                _error("invalid_operation")
+            if "separator" in operation and not isinstance(operation["separator"], str):
+                _error("invalid_operation")
+            if "target_symbol_slot" in operation and not isinstance(
+                operation["target_symbol_slot"], str
+            ):
+                _error("invalid_operation")
             if (
                 operation["kind"] not in _OPERATIONS
                 or operation["path_slot"] not in slot_names
+                or next(
+                    slot for slot in slots if slot.name == operation["path_slot"]
+                ).type
+                != "relative_python_path"
             ):
                 _error("invalid_operation")
             if (
@@ -233,6 +354,16 @@ class BundledRecipeLoader:
             if (
                 operation["kind"] == "prepend_function_body"
                 and operation.get("target_symbol_slot") not in slot_names
+            ):
+                _error("invalid_operation")
+            if (
+                operation["kind"] == "prepend_function_body"
+                and next(
+                    slot
+                    for slot in slots
+                    if slot.name == operation["target_symbol_slot"]
+                ).type
+                != "python_qualified_name"
             ):
                 _error("invalid_operation")
             body = self._blob(_text(operation["template_hash"]))
@@ -249,8 +380,8 @@ class BundledRecipeLoader:
                 )
             )
         manifest_hash = canonical_hash(item)
-        return RecipeManifest(
-            recipe_id=manifest_hash,
+        manifest = RecipeManifest(
+            recipe_id="",
             recipe_key=intent_id,
             version=item["version"],
             intent_id=intent_id,
@@ -270,15 +401,20 @@ class BundledRecipeLoader:
             provenance_source=provenance["source"],
             schema_version=item["schema_version"],
         )
+        return replace(manifest, recipe_id=_recipe_node(manifest).node_id)
 
     def load(self) -> tuple[RecipeManifest, ...]:
         recipes_dir = self._safe_child("recipes")
         if not recipes_dir.is_dir():
             _error("missing_recipe_assets")
         paths = sorted(recipes_dir.glob("*.json"), key=lambda value: value.name)
-        if len(paths) != 3 or any(path.is_symlink() for path in paths):
+        if {path.name for path in paths} != set(_EXPECTED_RECIPES):
             _error("invalid_recipe_assets")
+        for path in paths:
+            self._safe_child(f"recipes/{path.name}")
         recipes = tuple(self._parse(path) for path in paths)
+        if {recipe.intent_id for recipe in recipes} != set(_EXPECTED_RECIPES.values()):
+            _error("invalid_recipe_assets")
         if len({recipe.intent_id for recipe in recipes}) != len(recipes):
             _error("duplicate_recipe")
         return tuple(
@@ -293,14 +429,21 @@ class BundledRecipeLoader:
         nodes: list[AtlasNode] = []
         edges: list[AtlasEdge] = []
         for recipe in self.load():
-            recipe_node = AtlasNode.create(NodeKind.RECIPE, recipe.to_dict())
-            intent = AtlasNode.create(NodeKind.INTENT, {"intent_id": recipe.intent_id})
+            recipe_node = _recipe_node(recipe)
+            node_options = {
+                "provenance": "declared",
+                "source_hashes": (recipe.manifest_hash,),
+            }
+            intent = AtlasNode.create(
+                NodeKind.INTENT, {"intent_id": recipe.intent_id}, **node_options
+            )
             language = AtlasNode.create(
                 NodeKind.LANGUAGE,
                 {
                     "name": recipe.language_name,
                     "extractor_version": recipe.language_extractor_version,
                 },
+                **node_options,
             )
             evidence = AtlasNode.create(
                 NodeKind.SOURCE_EVIDENCE,
@@ -309,6 +452,7 @@ class BundledRecipeLoader:
                     "manifest_hash": recipe.manifest_hash,
                     "source": recipe.provenance_source,
                 },
+                **node_options,
             )
             nodes.extend((recipe_node, intent, language, evidence))
             edges.extend(
@@ -325,6 +469,7 @@ class BundledRecipeLoader:
                         "name": recipe.framework_name,
                         "specifier": recipe.framework_specifier,
                     },
+                    **node_options,
                 )
                 nodes.append(framework)
                 edges.append(
@@ -334,6 +479,7 @@ class BundledRecipeLoader:
                 template = AtlasNode.create(
                     NodeKind.CODE_TEMPLATE,
                     {"template_hash": operation.template_hash, "kind": operation.kind},
+                    **node_options,
                 )
                 nodes.append(template)
                 edges.append(
@@ -342,21 +488,29 @@ class BundledRecipeLoader:
                     )
                 )
             for slot in recipe.slots:
-                node = AtlasNode.create(NodeKind.ADAPTATION_SLOT, slot.to_dict())
+                node = AtlasNode.create(
+                    NodeKind.ADAPTATION_SLOT, slot.to_dict(), **node_options
+                )
                 nodes.append(node)
                 edges.append(AtlasEdge.create(EdgeRelation.HAS_SLOT, recipe_node, node))
             for constraint in recipe.constraints:
-                node = AtlasNode.create(NodeKind.CONSTRAINT, constraint.to_dict())
+                node = AtlasNode.create(
+                    NodeKind.CONSTRAINT, constraint.to_dict(), **node_options
+                )
                 nodes.append(node)
                 edges.append(
                     AtlasEdge.create(EdgeRelation.CONSTRAINED_BY, recipe_node, node)
                 )
             for dependency in recipe.dependencies:
-                node = AtlasNode.create(NodeKind.DEPENDENCY, dependency.to_dict())
+                node = AtlasNode.create(
+                    NodeKind.DEPENDENCY, dependency.to_dict(), **node_options
+                )
                 nodes.append(node)
                 edges.append(AtlasEdge.create(EdgeRelation.REQUIRES, recipe_node, node))
             for test in recipe.tests:
-                node = AtlasNode.create(NodeKind.TEST_SPEC, test.to_dict())
+                node = AtlasNode.create(
+                    NodeKind.TEST_SPEC, test.to_dict(), **node_options
+                )
                 nodes.append(node)
                 edges.append(
                     AtlasEdge.create(EdgeRelation.VERIFIED_BY, recipe_node, node)
@@ -377,6 +531,13 @@ def render_pattern_card(recipe: RecipeManifest) -> str:
         f"- Recipe ID: `{recipe.recipe_id}`",
         f"- Intent ID: `{recipe.intent_id}`",
         f"- Layer: `{recipe.layer}`",
+        f"- Manifest hash: `{recipe.manifest_hash}`",
+        "",
+        "## Applicability",
+        "",
+        f"- Language: `{recipe.language_name}` (extractor `{recipe.language_extractor_version}`)",
+        f"- Framework: `{recipe.framework_name or 'none'}`{f' ({recipe.framework_specifier})' if recipe.framework_name else ''}",
+        f"- Repository signature: `{recipe.repository_signature}`",
         "",
         "## Slots",
         "",
@@ -385,9 +546,32 @@ def render_pattern_card(recipe: RecipeManifest) -> str:
         f"- `{slot.name}`: `{slot.type}` ({'required' if slot.required else 'optional'})"
         for slot in recipe.slots
     )
+    lines.extend(("", "## Constraints", ""))
+    lines.extend(
+        f"- `{constraint.kind}` on `{constraint.subject}`: `{constraint.value}`"
+        for constraint in recipe.constraints
+    )
+    lines.extend(("", "## Dependencies", ""))
+    lines.extend(
+        f"- `{dependency.name}` ({dependency.kind} {dependency.specifier})"
+        for dependency in recipe.dependencies
+    )
+    lines.extend(("", "## Operations", ""))
+    lines.extend(
+        f"- `{operation.kind}` via `{operation.template_hash}` on `{operation.path_slot}`"
+        for operation in recipe.operations
+    )
     lines.extend(("", "## Verification", ""))
     lines.extend(
         f"- `{' '.join(test.argv)}` (exit {test.expected_exit_code})"
         for test in recipe.tests
+    )
+    lines.extend(
+        (
+            "",
+            "## Provenance",
+            "",
+            f"- `{recipe.provenance_kind}` from `{recipe.provenance_source}`",
+        )
     )
     return "\n".join(lines) + "\n"
