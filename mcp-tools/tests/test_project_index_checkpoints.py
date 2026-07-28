@@ -1068,12 +1068,12 @@ def test_checkpoint_file_reader_rejects_cas_reparse_parent(
     sha_root = cas_root / "sha256"
     external = tmp_path / "external"
     external.mkdir()
+    backup = cas_root / "sha256-backup"
+    sha_root.rename(backup)
     try:
-        for child in sha_root.iterdir():
-            child.unlink()
-        sha_root.rmdir()
         _make_directory_link(sha_root, external)
     except (OSError, subprocess.CalledProcessError) as exc:
+        backup.rename(sha_root)
         service.close()
         pytest.skip(f"CAS reparse capability unavailable: {exc}")
     try:
@@ -1089,3 +1089,8 @@ def test_checkpoint_file_reader_rejects_cas_reparse_parent(
         assert list(external.iterdir()) == []
     finally:
         service.close()
+        if os.name == "nt":
+            sha_root.rmdir()
+        else:
+            sha_root.unlink()
+        backup.rename(sha_root)

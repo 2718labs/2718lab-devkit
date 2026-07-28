@@ -952,11 +952,18 @@ def test_snapshot_file_reader_rejects_directory_junction_parent(
     try:
         _make_directory_link(parent, external)
     except (OSError, subprocess.CalledProcessError) as exc:
+        service.close()
         pytest.skip(f"junction capability unavailable: {exc}")
-    with pytest.raises(IndexError) as captured:
-        service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("src/module.py",), byte_budget=64
-        )
-    assert captured.value.code == "INDEX_STALE"
-    assert external.joinpath("module.py").read_bytes() == b"outside"
-    service.close()
+    try:
+        with pytest.raises(IndexError) as captured:
+            service.read_snapshot_files(
+                workspace, snapshot.snapshot_id, ("src/module.py",), byte_budget=64
+            )
+        assert captured.value.code == "INDEX_STALE"
+        assert external.joinpath("module.py").read_bytes() == b"outside"
+    finally:
+        service.close()
+        if os.name == "nt":
+            parent.rmdir()
+        else:
+            parent.unlink()
