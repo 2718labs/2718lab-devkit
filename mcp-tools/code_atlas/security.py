@@ -25,8 +25,10 @@ GENERATED_COMPONENTS = frozenset({
 })
 
 _DRIVE_PATH = re.compile(r"^[A-Za-z]:")
-_ASSIGNMENT = re.compile(r"(?m)^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*([^\s]+)")
-_RAW_TOKEN = re.compile(r"(?i)(?:^|\s)(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]{8,})(?:$|\s)")
+_ASSIGNMENT = re.compile(
+    r"(?ix)(?<![a-z0-9_])(?:export\s+)?['\"]?([a-z][a-z0-9_]*)['\"]?\s*(?:=|:)\s*['\"]?([^\s,}\]]+)"
+)
+_RAW_TOKEN = re.compile(r"(?i)(?<![a-z0-9])(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]{8,})(?![a-z0-9])")
 _BEARER_OR_PRIVATE_KEY = re.compile(
     r"(?ix)(?:\bauthorization\s*:\s*bearer\s+\S+|-----begin\s+[a-z\s]*private\s+key-----)"
 )

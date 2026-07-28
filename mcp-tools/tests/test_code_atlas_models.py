@@ -173,6 +173,11 @@ def test_freeze_json_is_idempotent_for_tagged_containers(payload: object) -> Non
         "CLIENT_SECRET=exampleSecret123",
         "sk-exampleSecret123",
         "ghp_exampleSecret123",
+        "export OPENAI_API_KEY=sk-exampleSecret123",
+        '{"OPENAI_API_KEY":"sk-exampleSecret123"}',
+        'OPENAI_API_KEY: "sk-exampleSecret123"',
+        'value = "ghp_exampleSecret123"',
+        '{"value":"sk-exampleSecret123"}',
     ],
 )
 def test_fragment_rejects_credentials_without_returning_them(fragment: str) -> None:
