@@ -66,8 +66,6 @@ def test_enums_match_locked_contract_values() -> None:
 
 def test_edge_rejects_invalid_endpoint_kinds() -> None:
     recipe = AtlasNode.create(NodeKind.RECIPE, {"name": "recipe"})
-    template = AtlasNode.create(NodeKind.CODE_TEMPLATE, {"name": "template"})
-
     language = AtlasNode.create(NodeKind.LANGUAGE, {"name": "python"})
 
     with pytest.raises(ValueError, match="edge endpoints"):
