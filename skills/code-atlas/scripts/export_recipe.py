@@ -7,6 +7,7 @@ import ctypes
 import errno
 import hashlib
 import os
+import secrets
 import stat
 import sys
 import tempfile
@@ -64,12 +65,18 @@ def _unsafe_status(path: Path, value: os.stat_result) -> bool:
     )
 
 
+def _lexical_absolute(path: str | Path) -> Path:
+    """Normalize ``.``/``..`` without resolving through a possible link."""
+
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def _safe_existing(
     path: Path, *, directory: bool = False, regular: bool = False
 ) -> Path:
     """Return an absolute path only after every existing component is safe."""
 
-    absolute = path.absolute()
+    absolute = _lexical_absolute(path)
     parts = absolute.parts
     if not parts:
         raise PromotionError("promotion_data_root_unsafe")
@@ -94,7 +101,7 @@ def _safe_existing(
 
 def _safe_output_parent(path: Path) -> Path:
     try:
-        absolute = path.absolute()
+        absolute = _lexical_absolute(path)
         parts = absolute.parts
         if not parts:
             raise PromotionError("promotion_output_unsafe")
@@ -114,21 +121,19 @@ def _safe_output_parent(path: Path) -> Path:
 
 
 def _overlaps(left: Path, right: Path) -> bool:
-    left_value = left.absolute()
-    right_value = right.absolute()
+    left_value = _lexical_absolute(left)
+    right_value = _lexical_absolute(right)
     try:
-        left_value.relative_to(right_value)
-        return True
+        left_text = os.path.normcase(os.fspath(left_value))
+        right_text = os.path.normcase(os.fspath(right_value))
+        common = os.path.commonpath((left_text, right_text))
+        return common in {left_text, right_text}
     except ValueError:
-        try:
-            right_value.relative_to(left_value)
-            return True
-        except ValueError:
-            return False
+        return False
 
 
 def _contains_plugin_cache(path: Path) -> bool:
-    components = [part.casefold() for part in path.absolute().parts]
+    components = [part.casefold() for part in _lexical_absolute(path).parts]
     return any(
         first == "plugins" and second == "cache"
         for first, second in zip(components, components[1:], strict=False)
@@ -208,30 +213,360 @@ def _manifest_from_store(store: AtlasStore, recipe_id: str) -> RecipeManifest:
     return manifest
 
 
-def _write_file(path: Path, data: bytes) -> None:
+def _capture_safe_directory_chain(
+    path: Path,
+) -> tuple[tuple[Path, tuple[int, int, int]], ...]:
+    """Capture all existing directory components without link resolution."""
+
+    absolute = _safe_output_parent(path)
+    parts = absolute.parts
+    cursor = Path(parts[0])
+    records: list[tuple[Path, tuple[int, int, int]]] = []
     try:
-        with path.open("xb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        root_status = cursor.lstat()
+        if _unsafe_status(cursor, root_status) or not stat.S_ISDIR(root_status.st_mode):
+            raise PromotionError("promotion_output_unsafe")
+        records.append((cursor, _object_identity(root_status)))
+        for part in parts[1:]:
+            cursor /= part
+            value = cursor.lstat()
+            if _unsafe_status(cursor, value) or not stat.S_ISDIR(value.st_mode):
+                raise PromotionError("promotion_output_unsafe")
+            records.append((cursor, _object_identity(value)))
+    except PromotionError:
+        raise
     except OSError as exc:
-        raise PromotionError("promotion_write_failed") from exc
+        raise PromotionError("promotion_output_unsafe") from exc
+    return tuple(records)
 
 
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_BINARY", 0)
+def _close_descriptor(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _posix_directory_flags() -> int:
+    if (
+        os.name != "posix"
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise PromotionError("promotion_write_failed")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0)
+
+
+def _open_posix_directory(name: str | Path, *, directory_fd: int | None = None) -> int:
+    try:
+        if directory_fd is None:
+            return os.open(name, _posix_directory_flags())
+        return os.open(name, _posix_directory_flags(), dir_fd=directory_fd)
+    except OSError as exc:
+        raise PromotionError("promotion_output_raced") from exc
+
+
+def _win_kernel32() -> ctypes.WinDLL:
+    if os.name != "nt":
+        raise PromotionError("promotion_write_failed")
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+_WIN_GENERIC_READ = 0x80000000
+_WIN_DELETE = 0x00010000
+_WIN_SHARE_READ = 0x00000001
+_WIN_SHARE_WRITE = 0x00000002
+_WIN_CREATE_NEW = 1
+_WIN_OPEN_EXISTING = 3
+_WIN_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WIN_INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+def _win_close_handle(handle: int | None) -> None:
+    if handle is None:
+        return
+    kernel32 = _win_kernel32()
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    close_handle(ctypes.c_void_p(handle))
+
+
+def _win_open_directory(path: Path, *, delete: bool = False) -> int:
+    """Open one directory itself and retain a no-delete-sharing lease."""
+
+    kernel32 = _win_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    desired = _WIN_GENERIC_READ | (_WIN_DELETE if delete else 0)
+    handle = create_file(
+        str(path),
+        desired,
+        _WIN_SHARE_READ | _WIN_SHARE_WRITE,
+        None,
+        _WIN_OPEN_EXISTING,
+        _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == _WIN_INVALID_HANDLE:
+        raise PromotionError("promotion_output_raced")
+    try:
+        value = path.lstat()
+        if _unsafe_status(path, value) or not stat.S_ISDIR(value.st_mode):
+            raise PromotionError("promotion_output_raced")
+        return int(handle)
+    except Exception:
+        _win_close_handle(int(handle))
+        raise
+
+
+class _WinUnicodeString(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_ushort),
+        ("maximum_length", ctypes.c_ushort),
+        ("buffer", ctypes.c_void_p),
+    )
+
+
+class _WinObjectAttributes(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_ulong),
+        ("root_directory", ctypes.c_void_p),
+        ("object_name", ctypes.POINTER(_WinUnicodeString)),
+        ("attributes", ctypes.c_ulong),
+        ("security_descriptor", ctypes.c_void_p),
+        ("security_quality_of_service", ctypes.c_void_p),
+    )
+
+
+class _WinIoStatusUnion(ctypes.Union):
+    _fields_ = (("status", ctypes.c_long), ("pointer", ctypes.c_void_p))
+
+
+class _WinIoStatusBlock(ctypes.Structure):
+    _fields_ = (("status", _WinIoStatusUnion), ("information", ctypes.c_size_t))
+
+
+_WIN_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
+_WIN_FILE_OPEN = 1
+_WIN_FILE_CREATE = 2
+_WIN_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_WIN_FILE_DIRECTORY_FILE = 0x00000001
+_WIN_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_WIN_FILE_OPEN_REPARSE_POINT = 0x00200000
+_WIN_OBJ_CASE_INSENSITIVE = 0x00000040
+_WIN_OBJ_DONT_REPARSE = 0x00001000
+_WIN_DIRECTORY_ACCESS = 0x00120089
+
+
+def _win_open_relative_directory(
+    parent_handle: int, name: str, *, create: bool
+) -> int | None:
+    """Open/create one basename below a retained Windows directory handle."""
+
+    if not name or "\\" in name or "/" in name:
+        raise PromotionError("promotion_write_failed")
+    buffer = ctypes.create_unicode_buffer(name)
+    unicode_name = _WinUnicodeString(
+        len(name) * ctypes.sizeof(ctypes.c_wchar),
+        (len(name) + 1) * ctypes.sizeof(ctypes.c_wchar),
+        ctypes.cast(buffer, ctypes.c_void_p),
+    )
+    attributes = _WinObjectAttributes(
+        ctypes.sizeof(_WinObjectAttributes),
+        ctypes.c_void_p(parent_handle),
+        ctypes.pointer(unicode_name),
+        _WIN_OBJ_CASE_INSENSITIVE | _WIN_OBJ_DONT_REPARSE,
+        None,
+        None,
+    )
+    status_block = _WinIoStatusBlock()
+    output = ctypes.c_void_p()
+    ntdll = ctypes.WinDLL("ntdll")
+    create_file = ntdll.NtCreateFile
+    create_file.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_ulong,
+        ctypes.POINTER(_WinObjectAttributes),
+        ctypes.POINTER(_WinIoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    )
+    create_file.restype = ctypes.c_long
+    status = create_file(
+        ctypes.byref(output),
+        _WIN_DIRECTORY_ACCESS,
+        ctypes.byref(attributes),
+        ctypes.byref(status_block),
+        None,
+        _WIN_FILE_ATTRIBUTE_NORMAL,
+        _WIN_SHARE_READ | _WIN_SHARE_WRITE,
+        _WIN_FILE_CREATE if create else _WIN_FILE_OPEN,
+        _WIN_FILE_DIRECTORY_FILE
+        | _WIN_FILE_SYNCHRONOUS_IO_NONALERT
+        | _WIN_FILE_OPEN_REPARSE_POINT,
+        None,
+        0,
+    )
+    if status != 0:
+        if create and (status & 0xFFFFFFFF) == _WIN_STATUS_OBJECT_NAME_COLLISION:
+            return None
+        raise PromotionError("promotion_output_raced")
+    return int(output.value)
+
+
+class _WinRenameInfo(ctypes.Structure):
+    _fields_ = (
+        ("replace_if_exists", ctypes.c_byte),
+        ("padding", ctypes.c_byte * 7),
+        ("root_directory", ctypes.c_void_p),
+        ("file_name_length", ctypes.c_uint32),
+        ("file_name", ctypes.c_wchar * 1),
+    )
+
+
+def _win_rename_noreplace(stage_handle: int, destination: Path) -> None:
+    """Rename the retained stage handle without following a mutable source path."""
+
+    target = str(destination)
+    encoded = target.encode("utf-16-le") + b"\x00\x00"
+    size = _WinRenameInfo.file_name.offset + len(encoded)
+    buffer = ctypes.create_string_buffer(size)
+    info = ctypes.cast(buffer, ctypes.POINTER(_WinRenameInfo)).contents
+    info.replace_if_exists = 0
+    info.root_directory = None
+    # SetFileInformationByHandle consumes this field as a UTF-16 character
+    # count on supported Windows runtimes, despite the header's byte wording.
+    info.file_name_length = len(target)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + _WinRenameInfo.file_name.offset,
+        encoded,
+        len(encoded),
+    )
+    kernel32 = _win_kernel32()
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    set_information.restype = ctypes.c_int
+    if set_information(ctypes.c_void_p(stage_handle), 3, buffer, size):
+        return
+    error = ctypes.get_last_error()
+    if error in {80, 183}:
+        raise FileExistsError(error, "destination exists", str(destination))
+    raise OSError(error, "SetFileInformationByHandle failed", str(destination))
+
+
+def _win_write_regular(path: Path, data: bytes) -> None:
+    """Create one new regular file while its verified parents remain leased."""
+
+    kernel32 = _win_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        0x40000000,
+        _WIN_SHARE_READ | _WIN_SHARE_WRITE,
+        None,
+        _WIN_CREATE_NEW,
+        _WIN_FILE_ATTRIBUTE_NORMAL | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == _WIN_INVALID_HANDLE:
+        raise PromotionError("promotion_write_failed")
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags)
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_WRONLY)
+        handle = None
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise PromotionError("promotion_write_failed")
+            offset += written
         os.fsync(descriptor)
-    except OSError:
-        return
+    except PromotionError:
+        raise
+    except OSError as exc:
+        raise PromotionError("promotion_write_failed") from exc
     finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        _close_descriptor(descriptor)
+        if handle is not None:
+            _win_close_handle(int(handle))
+
+
+def _write_file(
+    path: Path,
+    data: bytes,
+    *,
+    directory_fd: int | None = None,
+    filename: str | None = None,
+    windows_locks: tuple[int, ...] = (),
+) -> None:
+    descriptor: int | None = None
+    try:
+        if directory_fd is None:
+            if not windows_locks:
+                raise PromotionError("promotion_write_failed")
+            _win_write_regular(path, data)
+            return
+        if not filename:
+            raise PromotionError("promotion_write_failed")
+        descriptor = os.open(
+            filename,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise PromotionError("promotion_write_failed")
+            offset += written
+        os.fsync(descriptor)
+    except PromotionError:
+        raise
+    except OSError as exc:
+        raise PromotionError("promotion_write_failed") from exc
+    finally:
+        _close_descriptor(descriptor)
 
 
 def _capture_output_parent(parent: Path) -> tuple[int, int, int]:
@@ -247,137 +582,492 @@ def _capture_output_parent(parent: Path) -> tuple[int, int, int]:
     return _object_identity(value)
 
 
-def _assert_current_stage(
-    parent: Path,
-    parent_identity: tuple[int, int, int],
-    stage: Path,
-    stage_identity: tuple[int, int, int],
-) -> None:
-    """Fail closed before a write if parent/stage lookup was redirected."""
-
+def _win_open_regular(path: Path) -> int:
+    kernel32 = _win_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        _WIN_GENERIC_READ,
+        _WIN_SHARE_READ | _WIN_SHARE_WRITE,
+        None,
+        _WIN_OPEN_EXISTING,
+        _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == _WIN_INVALID_HANDLE:
+        raise PromotionError("promotion_write_failed")
     try:
-        if _capture_output_parent(parent) != parent_identity:
-            raise PromotionError("promotion_output_raced")
-        value = stage.lstat()
-    except PromotionError:
+        value = path.lstat()
+        if _unsafe_status(path, value) or not stat.S_ISREG(value.st_mode):
+            raise PromotionError("promotion_write_failed")
+        return int(handle)
+    except Exception:
+        _win_close_handle(int(handle))
         raise
-    except OSError as exc:
-        raise PromotionError("promotion_output_raced") from exc
-    if (
-        _unsafe_status(stage, value)
-        or not stat.S_ISDIR(value.st_mode)
-        or _object_identity(value) != stage_identity
-        or stage.parent != parent
-    ):
-        raise PromotionError("promotion_output_raced")
 
 
-def _make_stage_parent(
-    stage: Path,
-    relative: str,
-    directories: dict[Path, tuple[int, int, int]],
-) -> Path:
-    """Create exactly the known stage directories; reject a substituted path."""
+class _StageLease:
+    """Retain verified directory capabilities for all staging operations."""
 
-    current = stage
-    for component in relative.split("/")[:-1]:
-        current = current / component
-        known = directories.get(current)
-        try:
-            value = current.lstat()
-        except FileNotFoundError:
+    def __init__(
+        self,
+        parent: Path,
+        expected_parent_identity: tuple[int, int, int] | None,
+    ) -> None:
+        self.parent = _lexical_absolute(parent)
+        self.parent_identity = _capture_output_parent(self.parent)
+        if (
+            expected_parent_identity is not None
+            and self.parent_identity != expected_parent_identity
+        ):
+            raise PromotionError("promotion_output_raced")
+        self.stage: Path | None = None
+        self.stage_identity: tuple[int, int, int] | None = None
+        self._parent_fd: int | None = None
+        self._stage_fd: int | None = None
+        self._parent_handles: list[int] = []
+        self._stage_handle: int | None = None
+        if os.name == "posix":
+            self._parent_fd = _open_posix_directory(self.parent)
+            if _object_identity(os.fstat(self._parent_fd)) != self.parent_identity:
+                self.close()
+                raise PromotionError("promotion_output_raced")
+        elif os.name == "nt":
             try:
-                current.mkdir()
-                value = current.lstat()
-            except OSError as exc:
-                raise PromotionError("promotion_write_failed") from exc
-            if _unsafe_status(current, value) or not stat.S_ISDIR(value.st_mode):
-                raise PromotionError("promotion_write_failed")
-            directories[current] = _object_identity(value)
-            continue
+                records = _capture_safe_directory_chain(self.parent)
+                if records[-1][1] != self.parent_identity:
+                    raise PromotionError("promotion_output_raced")
+                for path, identity in records:
+                    handle = _win_open_directory(path)
+                    if _object_identity(path.lstat()) != identity:
+                        _win_close_handle(handle)
+                        raise PromotionError("promotion_output_raced")
+                    self._parent_handles.append(handle)
+            except Exception:
+                self.close()
+                raise
+        else:
+            raise PromotionError("promotion_write_failed")
+
+    def close(self) -> None:
+        _close_descriptor(self._stage_fd)
+        self._stage_fd = None
+        _close_descriptor(self._parent_fd)
+        self._parent_fd = None
+        _win_close_handle(self._stage_handle)
+        self._stage_handle = None
+        while self._parent_handles:
+            _win_close_handle(self._parent_handles.pop())
+
+    def _assert_parent(self) -> None:
+        try:
+            if os.name == "posix":
+                if (
+                    self._parent_fd is None
+                    or _object_identity(os.fstat(self._parent_fd))
+                    != self.parent_identity
+                ):
+                    raise PromotionError("promotion_output_raced")
+            if _capture_output_parent(self.parent) != self.parent_identity:
+                raise PromotionError("promotion_output_raced")
+        except PromotionError:
+            raise
+        except OSError as exc:
+            raise PromotionError("promotion_output_raced") from exc
+
+    def _assert_stage(self) -> None:
+        if (
+            self.stage is None
+            or self.stage_identity is None
+            or self.stage.parent != self.parent
+        ):
+            raise PromotionError("promotion_output_raced")
+        self._assert_parent()
+        try:
+            if os.name == "posix":
+                if self._parent_fd is None or self._stage_fd is None:
+                    raise PromotionError("promotion_output_raced")
+                status = os.stat(
+                    self.stage.name,
+                    dir_fd=self._parent_fd,
+                    follow_symlinks=False,
+                )
+                opened = os.fstat(self._stage_fd)
+                if _object_identity(opened) != self.stage_identity:
+                    raise PromotionError("promotion_output_raced")
+            else:
+                if self._stage_handle is None:
+                    raise PromotionError("promotion_output_raced")
+                status = self.stage.lstat()
+            if (
+                _unsafe_status(self.stage, status)
+                or not stat.S_ISDIR(status.st_mode)
+                or _object_identity(status) != self.stage_identity
+            ):
+                raise PromotionError("promotion_output_raced")
+        except PromotionError:
+            raise
+        except OSError as exc:
+            raise PromotionError("promotion_output_raced") from exc
+
+    def create_stage(self) -> Path:
+        self._assert_parent()
+        if os.name == "posix":
+            if self._parent_fd is None:
+                raise PromotionError("promotion_output_raced")
+            for _attempt in range(64):
+                name = _STAGE_PREFIX + secrets.token_hex(16)
+                try:
+                    os.mkdir(name, 0o700, dir_fd=self._parent_fd)
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    raise PromotionError("promotion_write_failed") from exc
+                stage_fd = _open_posix_directory(name, directory_fd=self._parent_fd)
+                status = os.fstat(stage_fd)
+                if not stat.S_ISDIR(status.st_mode):
+                    _close_descriptor(stage_fd)
+                    raise PromotionError("promotion_output_raced")
+                self._stage_fd = stage_fd
+                self.stage = self.parent / name
+                self.stage_identity = _object_identity(status)
+                return self.stage
+            raise PromotionError("promotion_write_failed")
+        try:
+            stage = Path(tempfile.mkdtemp(prefix=_STAGE_PREFIX, dir=self.parent))
+            initial = stage.lstat()
+            if _unsafe_status(stage, initial) or not stat.S_ISDIR(initial.st_mode):
+                raise PromotionError("promotion_output_raced")
+            handle = _win_open_directory(stage, delete=True)
+            if _object_identity(stage.lstat()) != _object_identity(initial):
+                _win_close_handle(handle)
+                raise PromotionError("promotion_output_raced")
+            self.stage = stage
+            self.stage_identity = _object_identity(initial)
+            self._stage_handle = handle
+            return stage
+        except PromotionError:
+            raise
         except OSError as exc:
             raise PromotionError("promotion_write_failed") from exc
+
+    @staticmethod
+    def _relative_parts(relative: str) -> tuple[tuple[str, ...], str]:
+        pieces = tuple(relative.split("/"))
         if (
-            known is None
-            or _unsafe_status(current, value)
-            or not stat.S_ISDIR(value.st_mode)
-            or _object_identity(value) != known
+            not pieces
+            or any(not piece or piece in {".", ".."} for piece in pieces)
+            or any("\\" in piece for piece in pieces)
         ):
             raise PromotionError("promotion_write_failed")
-    return current
+        return pieces[:-1], pieces[-1]
+
+    def _posix_leaf_directory(
+        self,
+        relative: str,
+        directories: dict[Path, tuple[int, int, int]],
+        *,
+        create: bool,
+    ) -> tuple[int, str]:
+        if self.stage is None or self._stage_fd is None:
+            raise PromotionError("promotion_output_raced")
+        components, filename = self._relative_parts(relative)
+        descriptor = os.dup(self._stage_fd)
+        current = self.stage
+        try:
+            for component in components:
+                candidate = current / component
+                known = directories.get(candidate)
+                created = False
+                if create and known is None:
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=descriptor)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    except OSError as exc:
+                        raise PromotionError("promotion_write_failed") from exc
+                try:
+                    value = os.stat(
+                        component,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise PromotionError("promotion_write_failed") from exc
+                if _unsafe_status(candidate, value) or not stat.S_ISDIR(value.st_mode):
+                    raise PromotionError("promotion_write_failed")
+                identity = _object_identity(value)
+                if known is None:
+                    if not created:
+                        raise PromotionError("promotion_write_failed")
+                    directories[candidate] = identity
+                elif identity != known:
+                    raise PromotionError("promotion_write_failed")
+                next_descriptor = _open_posix_directory(
+                    component, directory_fd=descriptor
+                )
+                if _object_identity(os.fstat(next_descriptor)) != identity:
+                    _close_descriptor(next_descriptor)
+                    raise PromotionError("promotion_write_failed")
+                _close_descriptor(descriptor)
+                descriptor = next_descriptor
+                current = candidate
+            return descriptor, filename
+        except Exception:
+            _close_descriptor(descriptor)
+            raise
+
+    def _win_leaf_directory(
+        self,
+        relative: str,
+        directories: dict[Path, tuple[int, int, int]],
+        *,
+        create: bool,
+    ) -> tuple[tuple[int, ...], str]:
+        if self.stage is None or self._stage_handle is None:
+            raise PromotionError("promotion_output_raced")
+        components, filename = self._relative_parts(relative)
+        handles: list[int] = []
+        current = self.stage
+        parent_handle = self._stage_handle
+        try:
+            for component in components:
+                candidate = current / component
+                known = directories.get(candidate)
+                handle = _win_open_relative_directory(
+                    parent_handle, component, create=create and known is None
+                )
+                if handle is None:
+                    raise PromotionError("promotion_write_failed")
+                value = candidate.lstat()
+                if _unsafe_status(candidate, value) or not stat.S_ISDIR(value.st_mode):
+                    _win_close_handle(handle)
+                    raise PromotionError("promotion_write_failed")
+                identity = _object_identity(value)
+                if known is None:
+                    if not create:
+                        _win_close_handle(handle)
+                        raise PromotionError("promotion_write_failed")
+                    directories[candidate] = identity
+                elif identity != known:
+                    _win_close_handle(handle)
+                    raise PromotionError("promotion_write_failed")
+                handles.append(handle)
+                parent_handle = handle
+                current = candidate
+            return tuple(handles), filename
+        except Exception:
+            while handles:
+                _win_close_handle(handles.pop())
+            raise
+
+    def write(
+        self,
+        relative: str,
+        data: bytes,
+        directories: dict[Path, tuple[int, int, int]],
+    ) -> tuple[Path, tuple[int, int, int]]:
+        self._assert_stage()
+        if self.stage is None:
+            raise PromotionError("promotion_output_raced")
+        target = self.stage.joinpath(*relative.split("/"))
+        if os.name == "posix":
+            descriptor, filename = self._posix_leaf_directory(
+                relative, directories, create=True
+            )
+            try:
+                _write_file(target, data, directory_fd=descriptor, filename=filename)
+                value = os.stat(filename, dir_fd=descriptor, follow_symlinks=False)
+            finally:
+                _close_descriptor(descriptor)
+        else:
+            handles, _filename = self._win_leaf_directory(
+                relative, directories, create=True
+            )
+            try:
+                if self._stage_handle is None:
+                    raise PromotionError("promotion_output_raced")
+                _write_file(
+                    target,
+                    data,
+                    windows_locks=(self._stage_handle, *handles),
+                )
+                value = target.lstat()
+            finally:
+                for handle in reversed(handles):
+                    _win_close_handle(handle)
+        if _unsafe_status(target, value) or not stat.S_ISREG(value.st_mode):
+            raise PromotionError("promotion_write_failed")
+        return target, _object_identity(value)
+
+    def verify(
+        self,
+        relative: str,
+        expected: bytes,
+        identity: tuple[int, int, int],
+        directories: dict[Path, tuple[int, int, int]],
+    ) -> None:
+        self._assert_stage()
+        if self.stage is None:
+            raise PromotionError("promotion_output_raced")
+        target = self.stage.joinpath(*relative.split("/"))
+        if os.name == "posix":
+            descriptor, filename = self._posix_leaf_directory(
+                relative, directories, create=False
+            )
+            file_descriptor: int | None = None
+            try:
+                before = os.stat(filename, dir_fd=descriptor, follow_symlinks=False)
+                if (
+                    _unsafe_status(target, before)
+                    or not stat.S_ISREG(before.st_mode)
+                    or _object_identity(before) != identity
+                ):
+                    raise PromotionError("promotion_write_failed")
+                file_descriptor = os.open(
+                    filename,
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
+                    dir_fd=descriptor,
+                )
+                if _object_identity(os.fstat(file_descriptor)) != identity:
+                    raise PromotionError("promotion_write_failed")
+                chunks: list[bytes] = []
+                total = 0
+                while total <= len(expected):
+                    chunk = os.read(file_descriptor, len(expected) + 1 - total)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                after = os.stat(filename, dir_fd=descriptor, follow_symlinks=False)
+            except OSError as exc:
+                raise PromotionError("promotion_write_failed") from exc
+            finally:
+                _close_descriptor(file_descriptor)
+                _close_descriptor(descriptor)
+        else:
+            handles, _filename = self._win_leaf_directory(
+                relative, directories, create=False
+            )
+            handle: int | None = None
+            descriptor: int | None = None
+            try:
+                before = target.lstat()
+                if (
+                    _unsafe_status(target, before)
+                    or not stat.S_ISREG(before.st_mode)
+                    or _object_identity(before) != identity
+                ):
+                    raise PromotionError("promotion_write_failed")
+                handle = _win_open_regular(target)
+                after_open = target.lstat()
+                if _object_identity(after_open) != identity:
+                    raise PromotionError("promotion_write_failed")
+                import msvcrt
+
+                descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+                handle = None
+                chunks = []
+                total = 0
+                while total <= len(expected):
+                    chunk = os.read(descriptor, len(expected) + 1 - total)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                after = target.lstat()
+            except OSError as exc:
+                raise PromotionError("promotion_write_failed") from exc
+            finally:
+                _close_descriptor(descriptor)
+                _win_close_handle(handle)
+                for directory_handle in reversed(handles):
+                    _win_close_handle(directory_handle)
+        actual = b"".join(chunks)
+        if (
+            _object_identity(after) != identity
+            or actual != expected
+            or _digest(actual) != _digest(expected)
+        ):
+            raise PromotionError("promotion_write_failed")
+
+    def publish(self, output: Path) -> None:
+        self._assert_stage()
+        if self.stage is None or output.parent != self.parent or not output.name:
+            raise PromotionError("promotion_output_raced")
+        if os.name == "posix":
+            if self._parent_fd is None:
+                raise PromotionError("promotion_output_raced")
+            _renameat2_noreplace(
+                self._parent_fd, self.stage.name, self._parent_fd, output.name
+            )
+            return
+        if self._stage_handle is None:
+            raise PromotionError("promotion_output_raced")
+        _win_rename_noreplace(self._stage_handle, output)
 
 
-def _verify_stage_file(
-    path: Path,
-    expected: bytes,
-    identity: tuple[int, int, int],
+def _renameat2_noreplace(
+    old_directory_fd: int,
+    old_name: str,
+    new_directory_fd: int,
+    new_name: str,
 ) -> None:
-    """Verify one file without accepting replacement between verification steps."""
+    """Publish basename-only entries through retained POSIX directory FDs."""
 
-    try:
-        before = path.lstat()
-        if (
-            _unsafe_status(path, before)
-            or not stat.S_ISREG(before.st_mode)
-            or _object_identity(before) != identity
-        ):
-            raise PromotionError("promotion_write_failed")
-        actual = path.read_bytes()
-        after = path.lstat()
-    except PromotionError:
-        raise
-    except OSError as exc:
-        raise PromotionError("promotion_write_failed") from exc
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
     if (
-        _object_identity(after) != identity
-        or actual != expected
-        or _digest(actual) != _digest(expected)
+        renameat2(
+            old_directory_fd,
+            os.fsencode(old_name),
+            new_directory_fd,
+            os.fsencode(new_name),
+            1,
+        )
+        == 0
     ):
-        raise PromotionError("promotion_write_failed")
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, "destination exists", new_name)
+    raise OSError(error, "renameat2 failed", new_name)
 
 
-def _atomic_noreplace_directory(stage: Path, destination: Path) -> None:
+def _atomic_noreplace_directory(
+    stage: Path,
+    destination: Path,
+    *,
+    capability: _StageLease | None = None,
+) -> None:
     """Atomically publish a directory only if the destination is absent."""
 
-    if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        move_file = kernel32.MoveFileExW
-        move_file.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
-        move_file.restype = ctypes.c_int
-        if move_file(str(stage), str(destination), 0):
-            return
-        error = ctypes.get_last_error()
-        if error in {80, 183}:
-            raise FileExistsError(error, "destination exists", str(destination))
-        raise OSError(error, "MoveFileExW failed", str(destination))
-    if os.name == "posix":
-        libc = ctypes.CDLL(None, use_errno=True)
-        renameat2 = getattr(libc, "renameat2", None)
-        if renameat2 is None:
-            raise OSError(errno.ENOSYS, "renameat2 is unavailable")
-        renameat2.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        renameat2.restype = ctypes.c_int
-        if (
-            renameat2(
-                -100,
-                os.fsencode(stage),
-                -100,
-                os.fsencode(destination),
-                1,
-            )
-            == 0
-        ):
-            return
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(error, "destination exists", str(destination))
-        raise OSError(error, "renameat2 failed", str(destination))
+    if capability is not None:
+        capability.publish(destination)
+        return
+    if os.name in {"nt", "posix"}:
+        raise OSError(errno.ENOSYS, "retained directory capability is required")
     raise OSError(errno.ENOSYS, "atomic no-replace promotion is unavailable")
 
 
@@ -442,26 +1132,6 @@ def _remove_stage(
         return
 
 
-def _prepare_readonly_scratch(
-    parent: Path, parent_identity: tuple[int, int, int]
-) -> Path:
-    """Create a verified sibling scratch root without entering durable data."""
-
-    scratch = parent / ".code-atlas-export-scratch"
-    try:
-        scratch.mkdir(exist_ok=True)
-        value = scratch.lstat()
-    except OSError as exc:
-        raise PromotionError("promotion_output_unsafe") from exc
-    if (
-        _unsafe_status(scratch, value)
-        or not stat.S_ISDIR(value.st_mode)
-        or _capture_output_parent(parent) != parent_identity
-    ):
-        raise PromotionError("promotion_output_raced")
-    return scratch
-
-
 def _build_files(store: AtlasStore, manifest: RecipeManifest) -> dict[str, bytes]:
     templates: dict[str, bytes] = {}
     total = 0
@@ -507,58 +1177,43 @@ def _write_bundle(
     stage_identity: tuple[int, int, int] | None = None
     owned_files: dict[Path, tuple[int, int, int]] = {}
     owned_directories: dict[Path, tuple[int, int, int]] = {}
+    lease: _StageLease | None = None
     try:
-        parent_identity = _capture_output_parent(parent)
-        if (
-            expected_parent_identity is not None
-            and parent_identity != expected_parent_identity
-        ):
+        parent = _lexical_absolute(parent)
+        output = _lexical_absolute(output)
+        if output.parent != parent or not output.name:
+            raise PromotionError("promotion_output_unsafe")
+        lease = _StageLease(parent, expected_parent_identity)
+        parent_identity = lease.parent_identity
+        stage = lease.create_stage()
+        stage_identity = lease.stage_identity
+        if stage_identity is None:
             raise PromotionError("promotion_output_raced")
-        stage = Path(tempfile.mkdtemp(prefix=_STAGE_PREFIX, dir=parent))
-        value = stage.lstat()
-        if _unsafe_status(stage, value) or not stat.S_ISDIR(value.st_mode):
-            raise PromotionError("promotion_output_raced")
-        stage_identity = _object_identity(value)
-        _assert_current_stage(parent, parent_identity, stage, stage_identity)
         for relative, body in sorted(files.items()):
-            _assert_current_stage(parent, parent_identity, stage, stage_identity)
-            target = stage.joinpath(*relative.split("/"))
-            _make_stage_parent(stage, relative, owned_directories)
-            _assert_current_stage(parent, parent_identity, stage, stage_identity)
-            _write_file(target, body)
-            try:
-                target_status = target.lstat()
-            except OSError as exc:
-                _assert_current_stage(parent, parent_identity, stage, stage_identity)
-                raise PromotionError("promotion_write_failed") from exc
-            if _unsafe_status(target, target_status) or not stat.S_ISREG(
-                target_status.st_mode
-            ):
-                raise PromotionError("promotion_write_failed")
-            owned_files[target] = _object_identity(target_status)
-            _assert_current_stage(parent, parent_identity, stage, stage_identity)
-            _fsync_directory(target.parent)
+            target, identity = lease.write(relative, body, owned_directories)
+            owned_files[target] = identity
         for relative, expected in files.items():
             target = stage.joinpath(*relative.split("/"))
-            _assert_current_stage(parent, parent_identity, stage, stage_identity)
             identity = owned_files.get(target)
             if identity is None:
                 raise PromotionError("promotion_write_failed")
-            _verify_stage_file(target, expected, identity)
-        _fsync_directory(stage)
-        _assert_current_stage(parent, parent_identity, stage, stage_identity)
+            lease.verify(relative, expected, identity, owned_directories)
+        lease._assert_stage()
+        if os.name == "posix" and lease._stage_fd is not None:
+            os.fsync(lease._stage_fd)
         try:
-            _atomic_noreplace_directory(stage, output)
+            _atomic_noreplace_directory(stage, output, capability=lease)
         except FileExistsError as exc:
             raise PromotionError("promotion_output_raced") from exc
         except OSError as exc:
             raise PromotionError("promotion_write_failed") from exc
+        stage = None
         try:
             if _capture_output_parent(parent) != parent_identity:
                 raise PromotionError("promotion_output_raced")
             output_status = output.lstat()
-        except PromotionError:
-            raise
+        except PromotionError as exc:
+            raise PromotionError("promotion_output_raced") from exc
         except OSError as exc:
             raise PromotionError("promotion_output_raced") from exc
         if (
@@ -567,9 +1222,11 @@ def _write_bundle(
             or _object_identity(output_status) != stage_identity
         ):
             raise PromotionError("promotion_output_raced")
-        stage = None
-        _fsync_directory(parent)
+        if os.name == "posix" and lease._parent_fd is not None:
+            os.fsync(lease._parent_fd)
     finally:
+        if lease is not None:
+            lease.close()
         _remove_stage(
             stage,
             parent,
@@ -592,7 +1249,7 @@ def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
         raise PromotionError("promotion_recipe_invalid")
     parent = _safe_output_parent(output.parent)
     initial_parent_identity = _capture_output_parent(parent)
-    final = output.absolute()
+    final = _lexical_absolute(output)
     if not final.name or _contains_plugin_cache(final):
         raise PromotionError("promotion_output_unsafe")
     if _overlaps(final, durable_root) or _overlaps(final, ROOT):
@@ -607,12 +1264,10 @@ def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
         if _unsafe_status(final, existing):
             raise PromotionError("promotion_output_unsafe")
         raise PromotionError("promotion_output_exists")
-    scratch = _prepare_readonly_scratch(parent, initial_parent_identity)
     try:
         store = AtlasStore.open_readonly(
             durable_root / "code-atlas.sqlite3",
             durable_root / "code-atlas-cas",
-            scratch_root=scratch,
         )
     except StoreConflictError as exc:
         raise PromotionError("promotion_db_open_failed") from exc

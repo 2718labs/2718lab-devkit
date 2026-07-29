@@ -633,6 +633,51 @@ def test_verified_packet_and_bounded_cas_reads_use_public_boundaries(
     store.close()
 
 
+@pytest.mark.parametrize("replace_component", ("cas", "sha256"))
+def test_verified_blob_read_rejects_an_equivalent_replaced_cas_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_component: str,
+) -> None:
+    store = store_at(tmp_path)
+    content = b"def verified() -> None:\n    pass\n"
+    blob_hash = "sha256:" + hashlib.sha256(content).hexdigest()
+    store.put_blob(blob_hash, content, media_type="text/x-python")
+    cas_root = tmp_path / "cas"
+    digest = blob_hash.removeprefix("sha256:")
+    replacement = tmp_path / f"replacement-{replace_component}"
+    replacement_blob = (
+        replacement / "sha256" / digest[:2] / digest[2:]
+        if replace_component == "cas"
+        else replacement / digest[:2] / digest[2:]
+    )
+    replacement_blob.parent.mkdir(parents=True)
+    replacement_blob.write_bytes(content)
+    original_assert = store_module._assert_safe_existing_path
+    swapped = False
+
+    def swap_after_cas_validation(path: Path, *, require_regular: bool = False) -> None:
+        nonlocal swapped
+        original_assert(path, require_regular=require_regular)
+        if swapped or Path(path).absolute() != cas_root.absolute():
+            return
+        swapped = True
+        target = cas_root if replace_component == "cas" else cas_root / "sha256"
+        parked = tmp_path / f"parked-{replace_component}"
+        os.replace(target, parked)
+        os.replace(replacement, target)
+
+    monkeypatch.setattr(
+        store_module, "_assert_safe_existing_path", swap_after_cas_validation
+    )
+
+    try:
+        with pytest.raises(StoreConflictError):
+            store.read_blob_verified(blob_hash, max_bytes=MAX_TEMPLATE_BYTES)
+    finally:
+        store.close()
+
+
 def _durable_file_state(
     root: Path,
 ) -> dict[str, tuple[bytes, tuple[int, int, int, int, int]]]:
@@ -675,6 +720,28 @@ def test_open_readonly_store_uses_a_scratch_snapshot_without_touching_durable_fi
     after = _durable_file_state(durable)
     assert after == before
     assert not tuple(scratch.iterdir())
+
+
+def test_open_readonly_supports_the_two_path_public_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    task_temp = tmp_path / "task-temp"
+    task_temp.mkdir()
+    monkeypatch.setenv("CODEX_TASK_TEMP", str(task_temp))
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+
+    readonly = AtlasStore.open_readonly(database, cas_root)
+    try:
+        assert readonly.schema_version() == 1
+    finally:
+        readonly.close()
+    assert not tuple(task_temp.iterdir())
 
 
 def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:

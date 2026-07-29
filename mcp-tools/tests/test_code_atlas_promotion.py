@@ -273,7 +273,7 @@ def test_bundle_publish_rejects_a_destination_created_at_atomic_promotion(
     parent.mkdir()
     output = parent / "bundle"
 
-    def contender(_stage: Path, destination: Path) -> None:
+    def contender(_stage: Path, destination: Path, **_kwargs: object) -> None:
         destination.mkdir()
         (destination / "attacker.txt").write_bytes(b"keep")
         raise FileExistsError(destination)
@@ -298,25 +298,38 @@ def test_bundle_publish_fails_closed_when_the_output_parent_is_replaced(
     original_write = exporter._write_file
     replaced = False
 
-    def replace_parent_after_first_write(path: Path, body: bytes) -> None:
+    def replace_parent_after_first_write(
+        path: Path, body: bytes, **kwargs: object
+    ) -> None:
         nonlocal replaced
-        original_write(path, body)
+        original_write(path, body, **kwargs)
         if not replaced:
             replaced = True
-            os.replace(parent, outside)
+            try:
+                os.replace(parent, outside)
+            except PermissionError:
+                # A retained Windows directory lease blocks the replacement.
+                return
             parent.mkdir()
 
     monkeypatch.setattr(exporter, "_write_file", replace_parent_after_first_write)
 
-    with pytest.raises(exporter.PromotionError, match="promotion_output_raced"):
+    try:
         exporter._write_bundle(
             parent,
             output,
             {"a.txt": b"first\n", "b.txt": b"second\n"},
         )
-
-    assert not output.exists()
-    assert not tuple(outside.rglob("b.txt"))
+    except exporter.PromotionError as error:
+        assert error.code == "promotion_output_raced"
+        assert not output.exists()
+        assert not tuple(outside.rglob("b.txt"))
+    else:
+        # On Windows, an open no-delete parent handle rejects the attack before
+        # it can replace the parent, so the verified promotion can complete.
+        assert (output / "a.txt").read_bytes() == b"first\n"
+        assert (output / "b.txt").read_bytes() == b"second\n"
+        assert not outside.exists()
 
 
 def test_export_refuses_parent_replacement_between_validation_and_staging(
@@ -466,3 +479,144 @@ def test_export_rejects_existing_overlap_and_linked_output_paths(
         == 1
     )
     assert not (real_parent / "bundle").exists()
+
+
+@pytest.mark.parametrize("relative", ("escape", "code-atlas-cas/escape"))
+def test_export_rejects_dotdot_alias_into_durable_before_creating_transients(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    relative: str,
+) -> None:
+    exporter = _export_module()
+    data_root = tmp_path / "durable"
+    recipe_id = _stored_local_recipe(data_root)
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    aliased_output = outer / ".." / "durable" / relative
+
+    assert (
+        exporter.main(
+            [
+                "--data-root",
+                str(data_root),
+                "--recipe-id",
+                recipe_id,
+                "--output",
+                str(aliased_output),
+            ]
+        )
+        == 1
+    )
+    assert capsys.readouterr().err.strip() == "promotion_output_unsafe"
+    assert not (data_root / relative).exists()
+    assert not tuple(
+        path
+        for path in data_root.rglob("*")
+        if path.name == ".code-atlas-export-scratch"
+        or path.name.startswith(".code-atlas-stage-")
+    )
+
+
+def test_publish_does_not_follow_a_parent_symlink_swapped_at_atomic_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    moved_parent = tmp_path / "moved-parent"
+    attacker = tmp_path / "attacker"
+    parent.mkdir()
+    attacker.mkdir()
+    output = parent / "bundle"
+    original_publish = exporter._atomic_noreplace_directory
+    swapped = False
+    blocked = False
+
+    def swap_parent_before_publish(
+        stage: Path, destination: Path, **kwargs: object
+    ) -> None:
+        nonlocal blocked, swapped
+        if not swapped:
+            swapped = True
+            try:
+                os.replace(parent, moved_parent)
+            except PermissionError:
+                blocked = True
+                return original_publish(stage, destination, **kwargs)
+            attacker_stage = attacker / stage.name
+            attacker_stage.mkdir()
+            (attacker_stage / "attacker.txt").write_bytes(b"do-not-move")
+            try:
+                os.symlink(attacker, parent, target_is_directory=True)
+            except OSError:
+                pytest.skip("directory symlinks are unavailable for this test account")
+        original_publish(stage, destination, **kwargs)
+
+    monkeypatch.setattr(
+        exporter, "_atomic_noreplace_directory", swap_parent_before_publish
+    )
+
+    try:
+        exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
+    except exporter.PromotionError as error:
+        assert error.code == "promotion_output_raced"
+    else:
+        assert blocked is True
+        assert (output / "receipt.txt").read_bytes() == b"verified\n"
+
+    assert not (attacker / "bundle").exists()
+    if not blocked:
+        assert (
+            attacker / next(attacker.iterdir()).name / "attacker.txt"
+        ).read_bytes() == b"do-not-move"
+
+
+def test_stage_writer_never_follows_a_nested_component_replaced_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    outside = tmp_path / "outside"
+    parent.mkdir()
+    outside.mkdir()
+    output = parent / "bundle"
+    original_write = exporter._write_file
+    replaced = False
+    blocked = False
+
+    def replace_component_then_write(path: Path, body: bytes, **kwargs: object) -> None:
+        nonlocal blocked, replaced
+        if not replaced:
+            replaced = True
+            templates = path.parents[1]
+            moved_templates = tmp_path / "moved-templates"
+            try:
+                os.replace(templates, moved_templates)
+            except PermissionError:
+                blocked = True
+                return original_write(path, body, **kwargs)
+            (outside / "sha256").mkdir()
+            try:
+                os.symlink(outside, templates, target_is_directory=True)
+            except OSError:
+                pytest.skip("directory symlinks are unavailable for this test account")
+        original_write(path, body, **kwargs)
+
+    monkeypatch.setattr(exporter, "_write_file", replace_component_then_write)
+
+    try:
+        exporter._write_bundle(
+            parent,
+            output,
+            {"templates/sha256/template.py": b"def verified() -> None:\n    pass\n"},
+        )
+    except exporter.PromotionError:
+        pass
+    else:
+        assert blocked is True
+        assert (output / "templates" / "sha256" / "template.py").read_bytes() == (
+            b"def verified() -> None:\n    pass\n"
+        )
+
+    assert not (outside / "sha256" / "template.py").exists()

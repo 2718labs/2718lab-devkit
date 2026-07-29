@@ -45,6 +45,12 @@ from .security import (
 _HASH = re.compile(r"^sha256:([0-9a-f]{64})$")
 
 
+def _lexical_absolute(path: str | Path) -> Path:
+    """Normalize ``.``/``..`` without resolving through a possible link."""
+
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     """Return the attributes that identify a regular file across a read."""
 
@@ -66,20 +72,24 @@ def _unsafe_file_status(path: Path, value: os.stat_result) -> bool:
     )
 
 
-def _assert_safe_existing_path(path: Path, *, require_regular: bool = False) -> None:
-    """Reject any linked/reparse component without resolving through it."""
+def _capture_safe_path_chain(
+    path: Path, *, require_regular: bool = False
+) -> tuple[tuple[Path, tuple[int, int, int, int, int]], ...]:
+    """Capture every safe component without resolving through a link."""
 
-    absolute = path.absolute()
+    absolute = _lexical_absolute(path)
     parts = absolute.parts
     if not parts:
         raise StoreConflictError()
     cursor = Path(parts[0])
+    records: list[tuple[Path, tuple[int, int, int, int, int]]] = []
     try:
         for part in parts[1:]:
             cursor /= part
             item = cursor.lstat()
             if _unsafe_file_status(cursor, item):
                 raise StoreConflictError()
+            records.append((cursor, _file_identity(item)))
         final = absolute.lstat()
     except StoreConflictError:
         raise
@@ -87,6 +97,95 @@ def _assert_safe_existing_path(path: Path, *, require_regular: bool = False) -> 
         raise StoreConflictError() from exc
     if require_regular and not stat.S_ISREG(final.st_mode):
         raise StoreConflictError()
+    if records and _file_identity(final) != records[-1][1]:
+        raise StoreConflictError()
+    return tuple(records)
+
+
+def _assert_safe_existing_path(path: Path, *, require_regular: bool = False) -> None:
+    """Reject any linked/reparse component without resolving through it."""
+
+    _capture_safe_path_chain(path, require_regular=require_regular)
+
+
+def _assert_path_chain_unchanged(
+    records: tuple[tuple[Path, tuple[int, int, int, int, int]], ...],
+) -> None:
+    """Fail closed if a checked component was replaced or modified."""
+
+    for path, identity in records:
+        try:
+            value = path.lstat()
+        except OSError as exc:
+            raise StoreConflictError() from exc
+        if _unsafe_file_status(path, value) or _file_identity(value) != identity:
+            raise StoreConflictError()
+
+
+def _capture_cas_directory_identities(
+    cas_root: Path,
+) -> tuple[tuple[Path, tuple[int, int, int]], ...]:
+    """Pin every existing CAS directory and its lexical parent chain."""
+
+    root_chain = _capture_safe_path_chain(cas_root)
+    try:
+        root_status = cas_root.lstat()
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    if _unsafe_file_status(cas_root, root_status) or not stat.S_ISDIR(
+        root_status.st_mode
+    ):
+        raise StoreConflictError()
+    records = [
+        (path, _object_identity_from_identity(identity))
+        for path, identity in root_chain
+    ]
+    stack = [cas_root]
+    seen = {cas_root}
+    records.append((cas_root, _object_identity(root_status)))
+    try:
+        while stack:
+            current = stack.pop()
+            for child in sorted(current.iterdir(), key=lambda item: item.name):
+                value = child.lstat()
+                if _unsafe_file_status(child, value):
+                    raise StoreConflictError()
+                if not stat.S_ISDIR(value.st_mode):
+                    continue
+                if child in seen:
+                    raise StoreConflictError()
+                seen.add(child)
+                records.append((child, _object_identity(value)))
+                stack.append(child)
+    except StoreConflictError:
+        raise
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    return tuple(records)
+
+
+def _object_identity_from_identity(
+    identity: tuple[int, int, int, int, int],
+) -> tuple[int, int, int]:
+    return identity[:3]
+
+
+def _assert_cas_directory_identities(
+    records: tuple[tuple[Path, tuple[int, int, int]], ...],
+) -> None:
+    """Require all components pinned for this store instance to remain intact."""
+
+    for path, identity in records:
+        try:
+            value = path.lstat()
+        except OSError as exc:
+            raise StoreConflictError() from exc
+        if (
+            _unsafe_file_status(path, value)
+            or not stat.S_ISDIR(value.st_mode)
+            or _object_identity(value) != identity
+        ):
+            raise StoreConflictError()
 
 
 def _object_identity(value: os.stat_result) -> tuple[int, int, int]:
@@ -261,18 +360,39 @@ def _cleanup_readonly_snapshot(
         return
 
 
+def _cleanup_owned_scratch(
+    scratch: Path, scratch_identity: tuple[int, int, int] | None
+) -> None:
+    """Remove only the empty private scratch root created for this reader."""
+
+    if scratch_identity is None:
+        return
+    try:
+        _assert_safe_existing_path(scratch)
+        value = scratch.lstat()
+        if (
+            _unsafe_file_status(scratch, value)
+            or not stat.S_ISDIR(value.st_mode)
+            or _object_identity(value) != scratch_identity
+        ):
+            return
+        scratch.rmdir()
+    except (OSError, StoreConflictError):
+        return
+
+
 def _paths_overlap(left: Path, right: Path) -> bool:
     """Check lexical containment without resolving through a possible link."""
 
+    left = _lexical_absolute(left)
+    right = _lexical_absolute(right)
     try:
-        left.relative_to(right)
-        return True
+        left_value = os.path.normcase(os.fspath(left))
+        right_value = os.path.normcase(os.fspath(right))
+        common = os.path.commonpath((left_value, right_value))
+        return common in {left_value, right_value}
     except ValueError:
-        try:
-            right.relative_to(left)
-            return True
-        except ValueError:
-            return False
+        return False
 
 
 class StoreConflictError(ValueError):
@@ -304,9 +424,9 @@ class AtlasStore:
     def __init__(
         self, database_path: str | Path, cas_root: str | Path | None = None
     ) -> None:
-        self._database_path = Path(database_path)
+        self._database_path = _lexical_absolute(database_path)
         self._cas_root = (
-            Path(cas_root)
+            _lexical_absolute(cas_root)
             if cas_root is not None
             else self._database_path.parent / "cas"
         )
@@ -316,6 +436,9 @@ class AtlasStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._migrate()
+        self._cas_directory_identities = _capture_cas_directory_identities(
+            self._cas_root
+        )
 
     @classmethod
     def open_readonly(
@@ -323,26 +446,44 @@ class AtlasStore:
         database_path: str | Path,
         cas_root: str | Path,
         *,
-        scratch_root: str | Path,
+        scratch_root: str | Path | None = None,
     ) -> "AtlasStore":
         """Open a stable durable DB/WAL copy without touching the durable root.
 
         SQLite's WAL-aware ``mode=ro`` can create ``-shm`` state beside the
-        database.  The reader therefore operates exclusively on a verified
-        caller-owned scratch snapshot, preserving a live durable WAL while
-        never creating, deleting, or writing a durable sidecar.
+        database. The reader therefore operates exclusively on a verified
+        scratch snapshot, preserving a live durable WAL while never creating,
+        deleting, or writing a durable sidecar. When ``scratch_root`` is
+        omitted, the snapshot gets a private root beneath ``CODEX_TASK_TEMP``
+        (or the process temp directory) and removes that empty root on close.
         """
 
-        database = Path(database_path).absolute()
-        cas = Path(cas_root).absolute()
-        scratch = Path(scratch_root).absolute()
+        database = _lexical_absolute(database_path)
+        cas = _lexical_absolute(cas_root)
+        owned_scratch: Path | None = None
+        if scratch_root is None:
+            configured_temp = os.environ.get("CODEX_TASK_TEMP")
+            scratch_parent = (
+                _lexical_absolute(configured_temp)
+                if configured_temp
+                else Path(tempfile.gettempdir())
+            )
+            scratch_parent.mkdir(parents=True, exist_ok=True)
+            owned_scratch = Path(
+                tempfile.mkdtemp(
+                    prefix=".code-atlas-readonly-root-", dir=scratch_parent
+                )
+            )
+            scratch = _lexical_absolute(owned_scratch)
+        else:
+            scratch = _lexical_absolute(scratch_root)
         connection: sqlite3.Connection | None = None
         stage: Path | None = None
         scratch_identity: tuple[int, int, int] | None = None
         stage_identity: tuple[int, int, int] | None = None
         snapshot_files: tuple[tuple[Path, tuple[int, int, int]], ...] = ()
         try:
-            _assert_safe_existing_path(database, require_regular=True)
+            database_chain = _capture_safe_path_chain(database, require_regular=True)
             _assert_safe_existing_path(cas)
             _assert_safe_existing_path(scratch)
             if not stat.S_ISDIR(cas.lstat().st_mode) or not stat.S_ISDIR(
@@ -355,6 +496,7 @@ class AtlasStore:
             if _unsafe_file_status(scratch, scratch_status):
                 raise StoreConflictError()
             scratch_identity = _object_identity(scratch_status)
+            cas_directory_identities = _capture_cas_directory_identities(cas)
             source_state = _snapshot_source_state(database)
             stage = Path(tempfile.mkdtemp(prefix=".code-atlas-readonly-", dir=scratch))
             stage_status = stage.lstat()
@@ -377,7 +519,7 @@ class AtlasStore:
             _assert_safe_existing_path(stage)
             if _object_identity(stage.lstat()) != stage_identity:
                 raise StoreConflictError()
-            uri = snapshot_database.absolute().as_uri() + "?mode=ro"
+            uri = _lexical_absolute(snapshot_database).as_uri() + "?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=30.0)
             connection.execute("PRAGMA query_only=ON")
             row = connection.execute(
@@ -387,10 +529,13 @@ class AtlasStore:
                 raise StoreConflictError()
             if _snapshot_source_state(database) != source_state:
                 raise StoreConflictError()
+            _assert_path_chain_unchanged(database_chain)
+            _assert_cas_directory_identities(cas_directory_identities)
             snapshot_files = _capture_snapshot_files(stage)
             instance = cls.__new__(cls)
             instance._database_path = snapshot_database
             instance._cas_root = cas
+            instance._cas_directory_identities = cas_directory_identities
             instance._conn = connection
             instance._readonly_snapshot = (
                 stage,
@@ -399,6 +544,7 @@ class AtlasStore:
                 stage_identity,
                 snapshot_files,
             )
+            instance._readonly_owned_scratch = owned_scratch
             return instance
         except Exception as exc:
             if connection is not None:
@@ -418,6 +564,8 @@ class AtlasStore:
                 stage_identity,
                 snapshot_files,
             )
+            if owned_scratch is not None:
+                _cleanup_owned_scratch(owned_scratch, scratch_identity)
             if isinstance(exc, StoreConflictError):
                 raise
             raise StoreConflictError() from exc
@@ -453,6 +601,9 @@ class AtlasStore:
             snapshot = getattr(self, "_readonly_snapshot", None)
             if snapshot is not None:
                 _cleanup_readonly_snapshot(*snapshot)
+            owned_scratch = getattr(self, "_readonly_owned_scratch", None)
+            if owned_scratch is not None:
+                _cleanup_owned_scratch(owned_scratch, snapshot[2])
 
     def schema_version(self) -> int:
         return int(
@@ -658,6 +809,7 @@ class AtlasStore:
         actual = "sha256:" + hashlib.sha256(content).hexdigest()
         if blob_hash != actual:
             raise StoreConflictError("blob hash conflict")
+        _assert_cas_directory_identities(self._cas_directory_identities)
         path = self._blob_path(blob_hash)
         created_path = False
         try:
@@ -719,6 +871,9 @@ class AtlasStore:
                 except OSError:
                     pass
             raise
+        self._cas_directory_identities = _capture_cas_directory_identities(
+            self._cas_root
+        )
         return blob_hash
 
     def read_blob_verified(self, blob_hash: str, *, max_bytes: int) -> bytes:
@@ -740,8 +895,11 @@ class AtlasStore:
         descriptor: int | None = None
         try:
             _assert_safe_existing_path(self._cas_root)
-            _assert_safe_existing_path(path, require_regular=True)
+            _assert_cas_directory_identities(self._cas_directory_identities)
+            path_chain = _capture_safe_path_chain(path, require_regular=True)
             before = path.lstat()
+            if not path_chain or _file_identity(before) != path_chain[-1][1]:
+                raise StoreConflictError()
             flags = (
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
             )
@@ -775,7 +933,8 @@ class AtlasStore:
                 except OSError as exc:
                     raise StoreConflictError() from exc
         try:
-            _assert_safe_existing_path(path, require_regular=True)
+            _assert_cas_directory_identities(self._cas_directory_identities)
+            _assert_path_chain_unchanged(path_chain)
             post = path.lstat()
         except StoreConflictError:
             raise
