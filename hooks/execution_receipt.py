@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Fail-open PostToolUse capture of bounded Code Atlas execution receipts."""
+"""Fail-open PostToolUse capture of bounded Code Atlas execution receipts.
+
+The installed PostToolUse adapter is the trust boundary.  It constructs an
+in-process capture context from explicit host envelope fields and local time;
+payload ``trusted`` flags, serialized contexts, and evidence keys are ignored.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,9 +24,9 @@ _MAX_STDIN_BYTES = 1_048_576
 def _load_receipts() -> tuple[Any, Any]:
     if str(_MCP_TOOLS) not in sys.path:
         sys.path.insert(0, str(_MCP_TOOLS))
-    from code_atlas.receipts import ReceiptRepository, normalize_post_tool_use
+    from code_atlas.receipts import HostCaptureContext, ReceiptRepository
 
-    return ReceiptRepository, normalize_post_tool_use
+    return HostCaptureContext, ReceiptRepository
 
 
 def _resolve_data_root(environ: Mapping[str, str] | None = None) -> Path | None:
@@ -61,6 +67,54 @@ def _read_payload() -> Mapping[str, Any] | None:
     return payload if isinstance(payload, Mapping) else None
 
 
+def _capture_context(payload: Mapping[str, Any], context_type: Any) -> Any | None:
+    raw_host = payload.get("host")
+    if not isinstance(raw_host, str):
+        return None
+    normalized_host = "".join(
+        character for character in raw_host.casefold() if character.isalnum()
+    )
+    host = {
+        "claude": "claude",
+        "claudecode": "claude",
+        "codex": "codex",
+        "openaicodex": "codex",
+    }.get(normalized_host)
+    if host is None:
+        return None
+    nested = payload.get("context")
+    sources = (payload, nested) if isinstance(nested, Mapping) else (payload,)
+    session_id = _first_string(sources, ("session_id", "sessionId"))
+    turn_id = _first_string(sources, ("turn_id", "turnId"))
+    workspace = _first_string(
+        sources,
+        ("workspace", "cwd", "working_directory", "workingDirectory"),
+    )
+    if session_id is None or turn_id is None or workspace is None:
+        return None
+    observed_at = (
+        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    return context_type(
+        host=host,
+        session_id=session_id,
+        turn_id=turn_id,
+        workspace=workspace,
+        observed_at=observed_at,
+    )
+
+
+def _first_string(
+    sources: tuple[Mapping[str, Any], ...], keys: tuple[str, ...]
+) -> str | None:
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value and "\x00" not in value:
+                return value
+    return None
+
+
 def main() -> int:
     """Capture trusted input when possible; every failure remains silent and zero."""
 
@@ -69,10 +123,11 @@ def main() -> int:
         root = _resolve_data_root()
         if payload is None or root is None:
             return 0
-        ReceiptRepository, normalize_post_tool_use = _load_receipts()
-        if not normalize_post_tool_use(payload):
+        HostCaptureContext, ReceiptRepository = _load_receipts()
+        capture_context = _capture_context(payload, HostCaptureContext)
+        if capture_context is None:
             return 0
-        ReceiptRepository(root).capture(payload)
+        ReceiptRepository(root).capture(payload, capture_context=capture_context)
     except BaseException:
         return 0
     return 0

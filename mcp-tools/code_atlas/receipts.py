@@ -6,12 +6,17 @@ command, applies a patch, or reads from a target workspace.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import re
+import secrets
 import shlex
+import stat
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +30,8 @@ MAX_IDENTIFIER_BYTES = 256
 MAX_OBSERVED_AT_BYTES = 64
 MAX_NESTED_RECEIPT_DEPTH = 4
 MAX_RECEIPTS_PER_PAYLOAD = 32
+EVIDENCE_KEY_BYTES = 32
+EVIDENCE_KEY_FILENAME = "code-atlas-evidence.key"
 
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOOL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -75,7 +82,38 @@ _SENSITIVE_KEY_VALUE = re.compile(
     \s*[:=]\s*
     """
 )
-_WINDOWS_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z]:[\\/][^\s'\";&|]*")
+_WINDOWS_QUOTED_PRIVATE_PATH = re.compile(
+    r"""(?ix)
+    (?:
+        "(?:
+            [A-Z]:[\\/]|\\\\|
+            (?:~|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$HOME|\$env:(?:USERPROFILE|HOME))[\\/]
+        )[^\"]*"
+        |
+        '(?:
+            [A-Z]:[\\/]|\\\\|
+            (?:~|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$HOME|\$env:(?:USERPROFILE|HOME))[\\/]
+        )[^']*'
+    )
+    """
+)
+_WINDOWS_PRIVATE_PATH = re.compile(
+    r"""(?ix)
+    (?<![A-Za-z0-9_.%$~-])
+    (?:
+        [A-Z]:[\\/]|\\\\|
+        (?:~|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$HOME|\$env:(?:USERPROFILE|HOME))[\\/]
+    )
+    [^\s'\";&|]*
+    """
+)
+_WINDOWS_COMMAND_HINT = re.compile(
+    r"""(?ix)(?:
+        [A-Z]:[\\/]|\\|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|
+        \$HOME|\$env:(?:USERPROFILE|HOME)|~\\
+    )"""
+)
+_POSIX_QUOTED_PATH = re.compile(r"""(?x)(?:"/(?!/)[^\"]*"|'/(?!/)[^']*')""")
 _POSIX_ABSOLUTE_PATH = re.compile(
     r"(?<![:/A-Za-z0-9_.-])/(?:[^\s'\";&|]+(?:/[^\s'\";&|]+)*)?"
 )
@@ -119,6 +157,23 @@ class ReceiptIntegrityError(ReceiptError):
 
 class ReceiptConflictError(ReceiptError):
     """The same receipt id names non-equivalent receipt content."""
+
+
+@dataclass(frozen=True, slots=True)
+class HostCaptureContext:
+    """Out-of-band facts supplied only by an authenticated host-hook adapter.
+
+    This object must never be deserialized from tool payload data.  Payload
+    ``trusted`` booleans carry no authority.  Python cannot prove caller
+    identity in-process, so the durable per-install evidence key remains the
+    cryptographic boundary enforced by :class:`ReceiptRepository`.
+    """
+
+    host: str
+    session_id: str
+    turn_id: str
+    workspace: str
+    observed_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,19 +271,23 @@ class RawExecutionReceipt(Mapping[str, Any]):
             "workspace_hash": self.workspace_hash,
         }
 
-    def expected_receipt_id(self) -> str:
-        """Return the content address, deliberately excluding ``observed_at``."""
+    def expected_receipt_id(self, evidence_key: bytes) -> str:
+        """Return the keyed content address, excluding ``observed_at``."""
 
-        return canonical_hash(
+        return _keyed_hash(
+            evidence_key,
+            "receipt-id",
             {
                 "kind": "raw_execution_receipt",
                 "schema_version": self.schema_version,
                 "receipt": self.identity_projection(),
-            }
+            },
         )
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> RawExecutionReceipt:
+    def from_dict(
+        cls, value: Mapping[str, Any], *, evidence_key: bytes
+    ) -> RawExecutionReceipt:
         """Decode one exact persisted record and verify its content address."""
 
         if set(value) != set(_RECEIPT_FIELDS):
@@ -254,37 +313,47 @@ class RawExecutionReceipt(Mapping[str, Any]):
             workspace_hash=value["workspace_hash"],
             observed_at=value["observed_at"],
         )
-        _validate_receipt(receipt)
+        _validate_receipt(receipt, evidence_key=evidence_key)
         return receipt
 
 
 def normalize_post_tool_use(
     payload: Mapping[str, Any] | object,
+    *,
+    capture_context: HostCaptureContext | None = None,
+    evidence_key: bytes | None = None,
 ) -> tuple[RawExecutionReceipt, ...]:
-    """Normalize one trusted direct or nested PostToolUse payload.
+    """Normalize one host-authenticated direct or nested PostToolUse payload.
 
-    Invalid, untrusted, unsupported, or over-depth payloads deliberately return
-    no evidence.  This preserves a fail-open hook while never manufacturing a
-    successful execution fact.
+    Trust is out-of-band: callers must supply a ``HostCaptureContext`` and the
+    installation evidence key.  Payload trust flags are ignored.  Invalid,
+    unsupported, or over-depth payloads deliberately return no evidence.
     """
 
-    if not isinstance(payload, Mapping) or not _is_trusted(payload):
+    if (
+        not isinstance(payload, Mapping)
+        or not _valid_capture_context(capture_context)
+        or not _valid_evidence_key(evidence_key)
+    ):
         return ()
     try:
-        context = _context(payload)
-        if context is None:
-            return ()
-        observed_at = _observed_at(payload)
-        if observed_at is None:
-            return ()
         explicit_host = _host(payload)
-        if _has_host(payload) and explicit_host is None:
+        if (
+            not _has_host(payload)
+            or explicit_host is None
+            or explicit_host != capture_context.host
+        ):
             return ()
         state = _NormalizationState()
         _visit(
             payload,
-            context=context,
-            observed_at=observed_at,
+            context=(
+                capture_context.session_id,
+                capture_context.turn_id,
+                capture_context.workspace,
+            ),
+            observed_at=capture_context.observed_at,
+            evidence_key=evidence_key,
             inherited_host=explicit_host,
             inherited_parent="",
             depth=0,
@@ -305,17 +374,43 @@ class ReceiptRepository:
 
     @property
     def receipt_root(self) -> Path:
-        """Return the sole durable directory used by this repository."""
+        """Return the durable receipt reader tree."""
 
         return self.data_root / "code-atlas-receipts" / "sha256"
 
+    @property
+    def evidence_key_path(self) -> Path:
+        """Return the key location outside the readable receipt tree."""
+
+        return self.data_root / EVIDENCE_KEY_FILENAME
+
+    def normalize(
+        self,
+        payload: Mapping[str, Any] | object,
+        *,
+        capture_context: HostCaptureContext | None,
+    ) -> tuple[RawExecutionReceipt, ...]:
+        """Normalize only an explicitly host-authorized capture with this key."""
+
+        if not _capture_authorized(payload, capture_context):
+            return ()
+        evidence_key = self._load_or_create_evidence_key()
+        return normalize_post_tool_use(
+            payload,
+            capture_context=capture_context,
+            evidence_key=evidence_key,
+        )
+
     def capture(
-        self, payload: Mapping[str, Any] | object
+        self,
+        payload: Mapping[str, Any] | object,
+        *,
+        capture_context: HostCaptureContext | None = None,
     ) -> tuple[RawExecutionReceipt, ...]:
         """Normalize and immutably persist all supported records from one payload."""
 
         try:
-            normalized = normalize_post_tool_use(payload)
+            normalized = self.normalize(payload, capture_context=capture_context)
         except (TypeError, ValueError, UnicodeError):
             return ()
         stored: list[RawExecutionReceipt] = []
@@ -328,19 +423,18 @@ class ReceiptRepository:
 
         if not isinstance(receipt, RawExecutionReceipt):
             raise ReceiptIntegrityError("receipt_type_invalid")
+        evidence_key = self._load_evidence_key()
         path = self._path_for(receipt.receipt_id)
         if path.exists():
             existing = self.read(receipt.receipt_id)
             if existing.identity_projection() == receipt.identity_projection():
                 return existing
             raise ReceiptConflictError("receipt_conflict")
-        _validate_receipt(receipt)
-        body = canonical_json(receipt.to_dict())
+        _validate_receipt(receipt, evidence_key=evidence_key)
+        body = canonical_json(receipt.to_dict()).encode("utf-8")
         self.receipt_root.mkdir(parents=True, exist_ok=True)
-        try:
-            with path.open("x", encoding="utf-8", newline="") as handle:
-                handle.write(body)
-        except FileExistsError:
+        published = _atomic_publish_no_replace(path, body)
+        if not published:
             existing = self.read(receipt.receipt_id)
             if existing.identity_projection() == receipt.identity_projection():
                 return existing
@@ -361,7 +455,9 @@ class ReceiptRepository:
         try:
             if not isinstance(decoded, Mapping) or canonical_json(decoded) != raw:
                 raise ReceiptIntegrityError("receipt_canonical_invalid")
-            receipt = RawExecutionReceipt.from_dict(decoded)
+            receipt = RawExecutionReceipt.from_dict(
+                decoded, evidence_key=self._load_evidence_key()
+            )
             if receipt.receipt_id != receipt_id:
                 raise ReceiptIntegrityError("receipt_id_invalid")
             return receipt
@@ -374,6 +470,31 @@ class ReceiptRepository:
         if not isinstance(receipt_id, str) or not _HASH.fullmatch(receipt_id):
             raise ReceiptIntegrityError("receipt_id_invalid")
         return self.receipt_root / f"{receipt_id[7:]}.json"
+
+    def _load_or_create_evidence_key(self) -> bytes:
+        existing = _read_evidence_key(self.evidence_key_path, missing_ok=True)
+        if existing is not None:
+            return existing
+        if self.receipt_root.is_dir() and any(self.receipt_root.glob("*.json")):
+            raise ReceiptIntegrityError("evidence_key_missing")
+        self.data_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        candidate = secrets.token_bytes(EVIDENCE_KEY_BYTES)
+        published = _atomic_publish_no_replace(self.evidence_key_path, candidate)
+        if published and os.name != "nt":
+            try:
+                os.chmod(self.evidence_key_path, 0o600, follow_symlinks=False)
+            except (NotImplementedError, OSError):
+                pass
+        loaded = _read_evidence_key(self.evidence_key_path, missing_ok=False)
+        if loaded is None:  # pragma: no cover - guarded by missing_ok=False
+            raise ReceiptIntegrityError("evidence_key_missing")
+        return loaded
+
+    def _load_evidence_key(self) -> bytes:
+        loaded = _read_evidence_key(self.evidence_key_path, missing_ok=False)
+        if loaded is None:  # pragma: no cover - guarded by missing_ok=False
+            raise ReceiptIntegrityError("evidence_key_missing")
+        return loaded
 
 
 @dataclass(slots=True)
@@ -391,6 +512,7 @@ def _visit(
     *,
     context: tuple[str, str, str],
     observed_at: str,
+    evidence_key: bytes,
     inherited_host: str | None,
     inherited_parent: str,
     depth: int,
@@ -416,7 +538,10 @@ def _visit(
         ):
             state.invalid = True
             return
-        host = local_host or inherited_host or expected_host
+        host = inherited_host
+        if host is None:
+            state.invalid = True
+            return
         if host != expected_host:
             state.invalid = True
             return
@@ -424,6 +549,7 @@ def _visit(
             node,
             context=context,
             observed_at=observed_at,
+            evidence_key=evidence_key,
             host=host,
             canonical_tool=canonical_tool,
             inherited_parent=inherited_parent,
@@ -452,6 +578,7 @@ def _visit(
             child,
             context=context,
             observed_at=observed_at,
+            evidence_key=evidence_key,
             inherited_host=inherited_host,
             inherited_parent=parent,
             depth=depth + 1,
@@ -464,6 +591,7 @@ def _normalize_direct(
     *,
     context: tuple[str, str, str],
     observed_at: str,
+    evidence_key: bytes,
     host: str,
     canonical_tool: str,
     inherited_parent: str,
@@ -495,22 +623,22 @@ def _normalize_direct(
             receipt_id="",
             schema_version=RAW_RECEIPT_SCHEMA_VERSION,
             host=host,
-            session_id_hash=_context_hash(session_id),
-            turn_id_hash=_context_hash(turn_id),
+            session_id_hash=_keyed_hash(evidence_key, "session-id", session_id),
+            turn_id_hash=_keyed_hash(evidence_key, "turn-id", turn_id),
             tool_use_id=tool_use_id,
             parent_tool_use_id=parent_tool_use_id,
             canonical_tool=canonical_tool,
             command_spec=command_spec,
             command_spec_hash=canonical_hash(command_spec),
-            input_hash=canonical_hash(tool_input),
+            input_hash=_keyed_hash(evidence_key, "tool-input", tool_input),
             exit_code=exit_code,
             success=success,
-            output_hash=canonical_hash(response),
-            workspace_hash=_context_hash(workspace),
+            output_hash=_keyed_hash(evidence_key, "tool-output", response),
+            workspace_hash=_keyed_hash(evidence_key, "workspace", workspace),
             observed_at=observed_at,
         )
         return RawExecutionReceipt(
-            receipt_id=provisional.expected_receipt_id(),
+            receipt_id=provisional.expected_receipt_id(evidence_key),
             schema_version=provisional.schema_version,
             host=provisional.host,
             session_id_hash=provisional.session_id_hash,
@@ -529,46 +657,6 @@ def _normalize_direct(
         )
     except (TypeError, ValueError, UnicodeError):
         return None
-
-
-def _is_trusted(payload: Mapping[str, Any]) -> bool:
-    context = payload.get("context")
-    return (
-        payload.get("plugin_trusted") is True
-        or payload.get("trusted") is True
-        or isinstance(context, Mapping)
-        and context.get("trusted") is True
-    )
-
-
-def _context(payload: Mapping[str, Any]) -> tuple[str, str, str] | None:
-    context = payload.get("context", _MISSING)
-    if context is not _MISSING and not isinstance(context, Mapping):
-        return None
-    sources: tuple[Mapping[str, Any], ...] = (
-        (payload, context) if isinstance(context, Mapping) else (payload,)
-    )
-    session_id = _first_text(sources, ("session_id", "sessionId"), MAX_CONTEXT_BYTES)
-    turn_id = _first_text(sources, ("turn_id", "turnId"), MAX_CONTEXT_BYTES)
-    workspace = _first_text(
-        sources,
-        ("workspace", "cwd", "working_directory", "workingDirectory"),
-        MAX_CONTEXT_BYTES,
-    )
-    if session_id is None or turn_id is None or workspace is None:
-        return None
-    return session_id, turn_id, workspace
-
-
-def _observed_at(payload: Mapping[str, Any]) -> str | None:
-    value = _first_text(
-        (payload,), ("observed_at", "observedAt", "timestamp"), MAX_OBSERVED_AT_BYTES
-    )
-    if value is None:
-        return (
-            datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        )
-    return value if _valid_observed_at(value) else None
 
 
 def _has_host(payload: Mapping[str, Any]) -> bool:
@@ -699,11 +787,14 @@ def _bounded_command_spec(command: str) -> tuple[str, ...]:
         return ("[TRUNCATED COMMAND]",)
     if _contains_sensitive_command(command):
         return ("[REDACTED]",)
+    windows_syntax = bool(_WINDOWS_COMMAND_HINT.search(command))
     redacted = _redact_command(command)
     try:
-        parts = tuple(shlex.split(redacted, posix=True))
+        parts = tuple(shlex.split(redacted, posix=not windows_syntax))
     except ValueError:
         parts = tuple(redacted.split())
+    if windows_syntax:
+        parts = tuple(_strip_matching_quotes(part) for part in parts)
     if not parts:
         return ("[EMPTY COMMAND]",)
     if any(len(part.encode("utf-8")) > MAX_COMMAND_SPEC_BYTES for part in parts):
@@ -718,9 +809,17 @@ def _redact_command(command: str) -> str:
     redacted = _URL_CREDENTIALS.sub(r"\g<prefix>[REDACTED]@", redacted)
     redacted = _BEARER.sub(r"\1[REDACTED]", redacted)
     redacted = _ASSIGNMENT.sub(r"\g<prefix>[REDACTED]", redacted)
-    redacted = _WINDOWS_ABSOLUTE_PATH.sub("[REDACTED_PATH]", redacted)
+    redacted = _WINDOWS_QUOTED_PRIVATE_PATH.sub("[REDACTED_PATH]", redacted)
+    redacted = _WINDOWS_PRIVATE_PATH.sub("[REDACTED_PATH]", redacted)
+    redacted = _POSIX_QUOTED_PATH.sub("[REDACTED_PATH]", redacted)
     redacted = _POSIX_ABSOLUTE_PATH.sub("[REDACTED_PATH]", redacted)
     return _RAW_TOKEN.sub("[REDACTED]", redacted)
+
+
+def _strip_matching_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
 
 
 def _contains_sensitive_command(command: str) -> bool:
@@ -812,11 +911,166 @@ def _valid_tool_id(value: str) -> bool:
     return bool(_TOOL_ID.fullmatch(value)) and not bool(_RAW_TOKEN.search(value))
 
 
-def _context_hash(value: str) -> str:
-    return canonical_hash({"value": value})
+def _capture_authorized(
+    payload: Mapping[str, Any] | object,
+    capture_context: HostCaptureContext | None,
+) -> bool:
+    return bool(
+        isinstance(payload, Mapping)
+        and _valid_capture_context(capture_context)
+        and _has_host(payload)
+        and _host(payload) == capture_context.host
+    )
 
 
-def _validate_receipt(receipt: RawExecutionReceipt) -> None:
+def _valid_capture_context(value: object) -> bool:
+    if not isinstance(value, HostCaptureContext):
+        return False
+    return bool(
+        value.host in {"claude", "codex"}
+        and _bounded_text(value.session_id, MAX_CONTEXT_BYTES) is not None
+        and _bounded_text(value.turn_id, MAX_CONTEXT_BYTES) is not None
+        and _bounded_text(value.workspace, MAX_CONTEXT_BYTES) is not None
+        and _bounded_text(value.observed_at, MAX_OBSERVED_AT_BYTES) is not None
+        and _valid_observed_at(value.observed_at)
+    )
+
+
+def _valid_evidence_key(value: object) -> bool:
+    return isinstance(value, bytes) and len(value) == EVIDENCE_KEY_BYTES
+
+
+def _keyed_hash(evidence_key: bytes, domain: str, value: object) -> str:
+    if not _valid_evidence_key(evidence_key):
+        raise ReceiptIntegrityError("evidence_key_invalid")
+    message = canonical_json(
+        {
+            "domain": f"code-atlas-execution-receipt/{domain}/v1",
+            "value": value,
+        }
+    ).encode("utf-8")
+    digest = hmac.new(evidence_key, message, hashlib.sha256).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _atomic_publish_no_replace(final_path: Path, body: bytes) -> bool:
+    """Fsync a same-directory stage and atomically link it without replacement."""
+
+    directory = final_path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    stage_path = directory / f".{final_path.name}.{secrets.token_hex(16)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(stage_path, flags, 0o600)
+    stage_identity: tuple[int, int] | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        stage_identity = (metadata.st_dev, metadata.st_ino)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(stage_path, final_path)
+        except FileExistsError:
+            return False
+        _fsync_directory(directory)
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        _unlink_owned_stage(stage_path, stage_identity)
+
+
+def _unlink_owned_stage(
+    stage_path: Path, stage_identity: tuple[int, int] | None
+) -> None:
+    """Remove a stage only while its path still names our original file."""
+
+    if stage_identity is None:
+        return
+    try:
+        metadata = stage_path.lstat()
+    except OSError:
+        return
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != stage_identity
+    ):
+        return
+    try:
+        stage_path.unlink()
+    except OSError:
+        pass
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _read_evidence_key(path: Path, *, missing_ok: bool) -> bytes | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ReceiptIntegrityError("evidence_key_missing") from None
+    except OSError as error:
+        raise ReceiptIntegrityError("evidence_key_read_invalid") from error
+    if _unsafe_key_metadata(path, metadata):
+        raise ReceiptIntegrityError("evidence_key_unsafe")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ReceiptIntegrityError("evidence_key_read_invalid") from error
+    try:
+        opened_metadata = os.fstat(descriptor)
+        if (
+            _unsafe_key_metadata(path, opened_metadata, check_path=False)
+            or opened_metadata.st_dev != metadata.st_dev
+            or opened_metadata.st_ino != metadata.st_ino
+        ):
+            raise ReceiptIntegrityError("evidence_key_unsafe")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            key = handle.read(EVIDENCE_KEY_BYTES + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(key) != EVIDENCE_KEY_BYTES:
+        raise ReceiptIntegrityError("evidence_key_size_invalid")
+    return key
+
+
+def _unsafe_key_metadata(
+    path: Path, metadata: os.stat_result, *, check_path: bool = True
+) -> bool:
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return True
+    if getattr(metadata, "st_file_attributes", 0) & 0x400:
+        return True
+    is_junction = getattr(os.path, "isjunction", None)
+    if check_path and callable(is_junction) and is_junction(path):
+        return True
+    return os.name != "nt" and bool(stat.S_IMODE(metadata.st_mode) & 0o077)
+
+
+def _validate_receipt(receipt: RawExecutionReceipt, *, evidence_key: bytes) -> None:
     try:
         valid = (
             receipt.schema_version == RAW_RECEIPT_SCHEMA_VERSION
@@ -851,7 +1105,7 @@ def _validate_receipt(receipt: RawExecutionReceipt) -> None:
             and len(canonical_json(receipt.command_spec).encode("utf-8"))
             <= MAX_COMMAND_SPEC_BYTES
             and canonical_hash(receipt.command_spec) == receipt.command_spec_hash
-            and receipt.expected_receipt_id() == receipt.receipt_id
+            and receipt.expected_receipt_id(evidence_key) == receipt.receipt_id
         )
     except (AttributeError, TypeError, ValueError, UnicodeError):
         valid = False
@@ -860,6 +1114,9 @@ def _validate_receipt(receipt: RawExecutionReceipt) -> None:
 
 
 __all__ = [
+    "EVIDENCE_KEY_BYTES",
+    "EVIDENCE_KEY_FILENAME",
+    "HostCaptureContext",
     "MAX_CONTEXT_BYTES",
     "MAX_NESTED_RECEIPT_DEPTH",
     "MAX_RECEIPTS_PER_PAYLOAD",
