@@ -17,6 +17,7 @@ from code_atlas.canonical import canonical_hash, canonical_json
 from code_atlas.receipts import (
     EVIDENCE_KEY_FILENAME,
     HostCaptureContext,
+    MAX_CONTEXT_BYTES,
     RawExecutionReceipt,
     ReceiptConflictError,
     ReceiptIntegrityError,
@@ -326,6 +327,85 @@ def test_evidence_key_is_outside_receipt_reader_tree(tmp_path: Path) -> None:
     assert repository.evidence_key_path.read_bytes().hex() not in canonical_json(
         receipt
     )
+
+
+def test_workspace_hash_for_matches_captured_receipt_and_binds_workspace(
+    tmp_path: Path,
+) -> None:
+    repository = ReceiptRepository(tmp_path)
+    receipt = _capture(repository, _codex_shell_payload())[0]
+
+    workspace_hash = repository.workspace_hash_for(_WORKSPACE)
+
+    assert workspace_hash == receipt.workspace_hash
+    assert workspace_hash != repository.workspace_hash_for("D:/private/foreign-project")
+    assert workspace_hash.startswith("sha256:")
+    assert _WORKSPACE not in workspace_hash
+    assert repository.evidence_key_path.read_bytes().hex() not in workspace_hash
+
+
+def test_workspace_hash_for_preserves_captured_workspace_aliases(
+    tmp_path: Path,
+) -> None:
+    repository = ReceiptRepository(tmp_path)
+    workspace_alias = f"{_WORKSPACE}/."
+    payload = _codex_shell_payload()
+    payload["workspace"] = workspace_alias
+    receipt = _capture(repository, payload)[0]
+
+    assert repository.workspace_hash_for(workspace_alias) == receipt.workspace_hash
+    assert repository.workspace_hash_for(_WORKSPACE) != receipt.workspace_hash
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    (None, b"not-text", "", "x" * (MAX_CONTEXT_BYTES + 1)),
+)
+def test_workspace_hash_for_rejects_invalid_workspace(
+    tmp_path: Path, workspace: object
+) -> None:
+    repository = ReceiptRepository(tmp_path)
+
+    with pytest.raises(ReceiptIntegrityError) as raised:
+        repository.workspace_hash_for(workspace)
+
+    assert str(raised.value) == "workspace_invalid"
+    assert not repository.evidence_key_path.exists()
+
+
+def test_workspace_hash_for_rejects_missing_evidence_key_without_creating_one(
+    tmp_path: Path,
+) -> None:
+    repository = ReceiptRepository(tmp_path)
+
+    with pytest.raises(ReceiptIntegrityError) as raised:
+        repository.workspace_hash_for(_WORKSPACE)
+
+    assert str(raised.value) == "evidence_key_missing"
+    assert not repository.evidence_key_path.exists()
+
+
+def test_workspace_hash_for_rejects_unsafe_evidence_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = ReceiptRepository(tmp_path)
+    _capture(repository, _codex_shell_payload())
+    real_lstat = Path.lstat
+
+    def unsafe_lstat(path: Path) -> object:
+        if path == repository.evidence_key_path:
+            return SimpleNamespace(
+                st_mode=stat.S_IFLNK | 0o600,
+                st_file_attributes=0,
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", unsafe_lstat)
+
+    with pytest.raises(ReceiptIntegrityError) as raised:
+        repository.workspace_hash_for(_WORKSPACE)
+
+    assert str(raised.value) == "evidence_key_unsafe"
 
 
 @pytest.mark.parametrize(

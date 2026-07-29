@@ -384,6 +384,18 @@ class ReceiptRepository:
 
         return self.data_root / EVIDENCE_KEY_FILENAME
 
+    def workspace_hash_for(self, workspace: object) -> str:
+        """Return the opaque durable binding for one bounded workspace value.
+
+        This lookup never creates an evidence key; callers must only use an
+        existing, safe per-install key.
+        """
+
+        bounded_workspace = _bounded_text(workspace, MAX_CONTEXT_BYTES)
+        if bounded_workspace is None:
+            raise ReceiptIntegrityError("workspace_invalid")
+        return _keyed_hash(self._load_evidence_key(), "workspace", bounded_workspace)
+
     def normalize(
         self,
         payload: Mapping[str, Any] | object,
