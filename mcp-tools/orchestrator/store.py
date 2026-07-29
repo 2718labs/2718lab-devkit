@@ -71,6 +71,12 @@ class AcceptanceConflictError(StoreError):
     code = "ACCEPTANCE_CONFLICT"
 
 
+class AcceptanceAuthorizationError(StoreError):
+    """Raised when durable task/coordinator authority is not satisfied."""
+
+    code = "ACCEPTANCE_FORBIDDEN"
+
+
 class AtlasOutboxTransitionError(StoreError):
     """Raised when an outbox item would leave an immutable terminal state."""
 
@@ -894,6 +900,9 @@ class SQLiteStore:
         workflow_id: str,
         task_id: str,
         task_version: int,
+        coordinator_task_id: str,
+        coordinator_owner: str,
+        coordinator_epoch: int,
         input_snapshot_id: str,
         output_snapshot_id: str,
         indexed_diff_hash: str,
@@ -901,12 +910,13 @@ class SQLiteStore:
         language: str,
         framework: str,
         created_at: str,
+        now: str | None = None,
     ) -> tuple[CodeTaskAcceptance, AtlasOutboxItem]:
-        """Insert one immutable acceptance and its pending outbox item atomically.
+        """Authorize and insert one acceptance with its outbox item atomically.
 
-        This is deliberately a storage primitive only.  It validates canonical,
-        privacy-bounded metadata but does not authorize a task, inspect receipts,
-        or invoke Code Atlas.
+        This persistence boundary enforces durable task, strict-index, and live
+        coordinator gates. Receipt-specific policy and Atlas projection stay in
+        the service layer.
         """
         payload_json = self._canonical_code_task_acceptance_payload(
             workflow_id=workflow_id,
@@ -921,8 +931,25 @@ class SQLiteStore:
         )
         payload_hash = _payload_hash(payload_json)
         accepted_at = _utc_timestamp(created_at)
+        authorization_now = _utc_timestamp(now) if now is not None else _utc_now()
 
         with self._transaction() as cursor:
+            self._require_authorized_code_task_acceptance(
+                cursor,
+                workflow_id=workflow_id,
+                task_id=task_id,
+                task_version=task_version,
+                coordinator_task_id=coordinator_task_id,
+                coordinator_owner=coordinator_owner,
+                coordinator_epoch=coordinator_epoch,
+                input_snapshot_id=input_snapshot_id,
+                output_snapshot_id=output_snapshot_id,
+                indexed_diff_hash=indexed_diff_hash,
+                intent_id=intent_id,
+                language=language,
+                framework=framework,
+                now=authorization_now,
+            )
             existing_row = cursor.execute(
                 "SELECT * FROM code_task_acceptances WHERE code_task_id = ?",
                 (task_id,),
@@ -1880,6 +1907,78 @@ class SQLiteStore:
         ).fetchone()
         return self._atlas_outbox_from_row(row)
 
+    def _require_authorized_code_task_acceptance(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        coordinator_task_id: str,
+        coordinator_owner: str,
+        coordinator_epoch: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        intent_id: str,
+        language: str,
+        framework: str,
+        now: str,
+    ) -> None:
+        coordinator = cursor.execute(
+            "SELECT workflow_id, owner_role, state FROM tasks WHERE id = ?",
+            (coordinator_task_id,),
+        ).fetchone()
+        if (
+            coordinator is None
+            or str(coordinator["workflow_id"]) != workflow_id
+            or str(coordinator["owner_role"]) not in {"sol", "opus"}
+            or str(coordinator["state"]) != TaskState.RUNNING.value
+        ):
+            raise AcceptanceAuthorizationError(
+                "acceptance requires a same-workflow sol or opus coordinator"
+            )
+        self._require_current_lease(
+            cursor,
+            coordinator_task_id,
+            coordinator_owner,
+            coordinator_epoch,
+            now=now,
+        )
+
+        task = cursor.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or str(task["workflow_id"]) != workflow_id
+            or str(task["task_kind"]) != TaskKind.CODE.value
+        ):
+            raise AcceptanceAuthorizationError(
+                "acceptance requires a code task in the coordinator workflow"
+            )
+        if int(task["version"]) != task_version:
+            raise VersionConflictError(f"task version is not current: {task_id!r}")
+        if str(task["state"]) != TaskState.DONE.value:
+            raise InvalidTaskStateError(
+                f"code task must be done before acceptance: {task_id!r}"
+            )
+
+        binding = self._require_index_binding(cursor, task_id)
+        self._require_strict_completion(cursor, task_id)
+        if (
+            str(binding["input_snapshot_id"]) != input_snapshot_id
+            or str(binding["output_snapshot_id"]) != output_snapshot_id
+            or str(binding["indexed_diff_hash"]) != indexed_diff_hash
+            or str(task["intent_id"]) != intent_id
+            or str(task["language"]) != language
+            or str(task["framework"]) != framework
+        ):
+            raise AcceptanceConflictError(
+                f"acceptance metadata is not current for code task: {task_id!r}"
+            )
+
     @classmethod
     def _canonical_code_task_acceptance_payload(
         cls,
@@ -2053,8 +2152,9 @@ class SQLiteStore:
         )
 
     def _create_schema(self) -> None:
-        with self._connection:
-            self._connection.executescript(
+        with self._transaction() as cursor:
+            _execute_schema_statements(
+                cursor,
                 """
                 CREATE TABLE IF NOT EXISTS schema_metadata (
                     key TEXT PRIMARY KEY,
@@ -2243,41 +2343,35 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_recipient_inbox
                     ON messages(workflow_id, recipient_task_id, sequence);
-                """
+                """,
             )
             columns = {
                 str(row["name"])
-                for row in self._connection.execute(
-                    "PRAGMA table_info(leases)"
-                ).fetchall()
+                for row in cursor.execute("PRAGMA table_info(leases)").fetchall()
             }
             if "host_target" not in columns:
-                self._connection.execute(
-                    "ALTER TABLE leases ADD COLUMN host_target TEXT"
-                )
+                cursor.execute("ALTER TABLE leases ADD COLUMN host_target TEXT")
             task_columns = {
                 str(row["name"])
-                for row in self._connection.execute(
-                    "PRAGMA table_info(tasks)"
-                ).fetchall()
+                for row in cursor.execute("PRAGMA table_info(tasks)").fetchall()
             }
             if "task_kind" not in task_columns:
-                self._connection.execute(
+                cursor.execute(
                     "ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'general'"
                 )
             if "intent_id" not in task_columns:
-                self._connection.execute(
+                cursor.execute(
                     "ALTER TABLE tasks ADD COLUMN intent_id TEXT NOT NULL DEFAULT ''"
                 )
             if "language" not in task_columns:
-                self._connection.execute(
+                cursor.execute(
                     "ALTER TABLE tasks ADD COLUMN language TEXT NOT NULL DEFAULT ''"
                 )
             if "framework" not in task_columns:
-                self._connection.execute(
+                cursor.execute(
                     "ALTER TABLE tasks ADD COLUMN framework TEXT NOT NULL DEFAULT ''"
                 )
-            self._connection.execute(
+            cursor.execute(
                 """
                 INSERT INTO schema_metadata (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -2528,6 +2622,19 @@ class SQLiteStore:
                 "host target is not a supported Codex agent target"
             )
         return host_target
+
+
+def _execute_schema_statements(cursor: sqlite3.Cursor, script: str) -> None:
+    """Execute one schema script statement-by-statement in the caller's transaction."""
+    pending_lines: list[str] = []
+    for line in script.splitlines():
+        pending_lines.append(line)
+        statement = "\n".join(pending_lines).strip()
+        if statement and sqlite3.complete_statement(statement):
+            cursor.execute(statement)
+            pending_lines.clear()
+    if any(line.strip() for line in pending_lines):
+        raise StoreError("schema script ended with an incomplete statement")
 
 
 def _utc_now() -> str:
