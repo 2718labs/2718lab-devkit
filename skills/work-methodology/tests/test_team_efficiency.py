@@ -29,6 +29,7 @@ from code_atlas import (  # noqa: E402
     EdgeRelation,
     GraphQueryResult,
     ImplementationPacket,
+    NodeKind,
     SlotSpec,
     TemplateOperation,
     TestSpec as AtlasTestSpec,
@@ -1256,8 +1257,64 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        indexed_path = "mcp-tools/code_atlas/extractors.py"
-        result = PythonRecipeExtractor().extract(_extractor_request(path=indexed_path))
+        indexed_path = "src/atlas_guard.py"
+        request = _extractor_request(path=indexed_path)
+        self.assertEqual(1, len(request.after_files))
+        after_file = request.after_files[0]
+        self.assertEqual(indexed_path, after_file.path)
+        repository_root = self.temp / "atlas-e2e-repository"
+        workspace_root = self.temp / "atlas-e2e-workspace"
+        subprocess.run(
+            ["git", "init", str(repository_root)], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repository_root), "config", "user.name", "e2e test"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository_root),
+                "config",
+                "user.email",
+                "e2e@example.invalid",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository_root),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository_root),
+                "worktree",
+                "add",
+                "--detach",
+                str(workspace_root),
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        workspace_file = workspace_root / indexed_path
+        workspace_file.parent.mkdir(parents=True, exist_ok=True)
+        workspace_file.write_bytes(after_file.body)
+        result = PythonRecipeExtractor().extract(request)
         self.assertTrue(result.eligible)
         self.assertTrue(result.episode_id)
 
@@ -1298,11 +1355,34 @@ class TeamEfficiencyTests(unittest.TestCase):
             _marker_hash("output-primary"),
         ):
             self.assertNotIn(sensitive_identity, registration)
-        workspace_root = ROOT.parents[1]
         index_service = ProjectIndexService(self.temp / "orchestrator-index.sqlite")
         self._index_services.append(index_service)
         snapshot = index_service.sync(workspace_root, include_paths=(indexed_path,))
         self.assertEqual(1, snapshot.file_count)
+        snapshot_facts = index_service.snapshot_facts(
+            workspace_root, snapshot.snapshot_id
+        )
+        (indexed_file,) = index_service.read_snapshot_files(
+            workspace_root,
+            snapshot.snapshot_id,
+            (indexed_path,),
+            byte_budget=64 * 1024,
+        )
+        source_evidence = next(
+            node
+            for node in graph.nodes
+            if node.kind is NodeKind.SOURCE_EVIDENCE
+            and node.to_dict()["payload"].get("path") == indexed_path
+        )
+        source_payload = source_evidence.to_dict()["payload"]
+        self.assertEqual(
+            ((indexed_path, indexed_file.content_hash),), snapshot_facts.file_hashes
+        )
+        self.assertEqual(after_file.body, indexed_file.body)
+        self.assertEqual(after_file.content_hash, indexed_file.content_hash)
+        self.assertEqual(source_payload["after_hash"], after_file.content_hash)
+        self.assertEqual(source_payload["after_hash"], indexed_file.content_hash)
+        self.assertEqual(_content_hash(indexed_file.body), indexed_file.content_hash)
         workflow_id = "extractor-e2e-lifecycle"
         durable_store, service = self.orchestrator(
             "extractor-e2e-lifecycle.sqlite",
