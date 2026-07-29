@@ -21,7 +21,13 @@ from code_atlas.extractors import (
     RecipeExtractor,
     render_operations,
 )
-from code_atlas.models import AtlasError, TemplateOperation
+from code_atlas.models import (
+    AtlasEdge,
+    AtlasError,
+    EdgeRelation,
+    NodeKind,
+    TemplateOperation,
+)
 from code_atlas.security import (
     MAX_GRAPH_EDGES,
     MAX_GRAPH_NODES,
@@ -324,6 +330,38 @@ def test_python_append_shape_round_trips_and_is_repeatable() -> None:
     )
     assert "return value > 0" not in serialized
     assert "from src.guards import VALUE" not in serialized
+
+
+def test_eligible_extractor_marks_only_task_episode_facts_observed() -> None:
+    result = PythonRecipeExtractor().extract(_primary_request())
+
+    assert result.eligible is True
+    observed_edges = [edge for edge in result.edges if edge.provenance == "observed"]
+    assert {(edge.relation, edge.source_kind) for edge in observed_edges} == {
+        (EdgeRelation.SOLVES, NodeKind.TASK_EPISODE),
+        (EdgeRelation.CHANGES, NodeKind.TASK_EPISODE),
+        (EdgeRelation.VERIFIED_BY, NodeKind.TASK_EPISODE),
+        (EdgeRelation.TESTS, NodeKind.TEST_SPEC),
+    }
+    assert EdgeRelation.SUPERSEDES not in {edge.relation for edge in result.edges}
+    assert EdgeRelation.BUNDLED_AS not in {edge.relation for edge in result.edges}
+    assert all(
+        edge.provenance == "declared"
+        for edge in result.edges
+        if edge.source_kind is NodeKind.RECIPE
+    )
+
+    nodes_by_id = {node.node_id: node for node in result.nodes}
+    for edge in result.edges:
+        canonical = AtlasEdge.create(
+            edge.relation,
+            nodes_by_id[edge.source_id],
+            nodes_by_id[edge.target_id],
+            payload=thaw_json(edge.payload),
+            schema_version=edge.schema_version,
+            provenance=edge.provenance,
+        )
+        assert edge.edge_id == canonical.edge_id
 
 
 @pytest.mark.parametrize(

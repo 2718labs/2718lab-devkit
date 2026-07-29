@@ -1029,20 +1029,49 @@ class PythonRecipeExtractor:
             *verification_nodes,
         ]
         edges: list[AtlasEdge] = [
-            AtlasEdge.create(EdgeRelation.SOLVES, episode, intent_node)
+            AtlasEdge.create(
+                EdgeRelation.SOLVES,
+                episode,
+                intent_node,
+                provenance="observed",
+            )
         ]
         for source in source_evidence:
-            edges.append(AtlasEdge.create(EdgeRelation.CHANGES, episode, source))
+            edges.append(
+                AtlasEdge.create(
+                    EdgeRelation.CHANGES,
+                    episode,
+                    source,
+                    provenance="observed",
+                )
+            )
         for receipt_node in receipt_nodes:
             edges.append(
-                AtlasEdge.create(EdgeRelation.VERIFIED_BY, episode, receipt_node)
+                AtlasEdge.create(
+                    EdgeRelation.VERIFIED_BY,
+                    episode,
+                    receipt_node,
+                    provenance="observed",
+                )
             )
         for verification in verification_nodes:
             edges.append(
-                AtlasEdge.create(EdgeRelation.VERIFIED_BY, episode, verification)
+                AtlasEdge.create(
+                    EdgeRelation.VERIFIED_BY,
+                    episode,
+                    verification,
+                    provenance="observed",
+                )
             )
             for source in source_evidence:
-                edges.append(AtlasEdge.create(EdgeRelation.TESTS, verification, source))
+                edges.append(
+                    AtlasEdge.create(
+                        EdgeRelation.TESTS,
+                        verification,
+                        source,
+                        provenance="observed",
+                    )
+                )
         return _EpisodeArtifacts(
             episode=episode,
             intent=intent_node,

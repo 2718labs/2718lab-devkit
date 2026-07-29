@@ -131,14 +131,29 @@ redacted extractor payloads:
   successful command receipts and whose observed `TESTS` edges cover the
   changed evidence.
 
-The current upstream `PythonRecipeExtractor` constructs its edges with the
-model's default `declared` provenance. Its unchanged
-`ExtractionResult -> GraphQueryResult.to_dict()` output therefore fails closed
-with reason `ATLAS_EDGE_UNVERIFIED`. The positive trust-contract fixture is
-only a consumer contract, not an end-to-end or source-authenticity test. Real
-end-to-end planning remains gated on upstream promotion of accepted-task edges
-to observed provenance, and ATLAS-12C completes the trusted-source authenticity
-boundary.
+For an accepted, receipt-verified request, `PythonRecipeExtractor` explicitly
+emits `observed` provenance only for the direct TaskEpisode evidence graph's
+`SOLVES`, `CHANGES`, `VERIFIED_BY`, and `TESTS` edges.
+
+Here `TESTS` is an acceptance-evidence binding: it binds bound verification or
+command-receipt test evidence to changed source evidence. It is not a test
+coverage measurement or an inference that coverage is complete. The extractor
+does not auto-generate or promote `SUPERSEDES`, `BUNDLED_AS`, recipe-facing
+links, matching/alias, coverage, ordering, or other inferred edges. In
+particular, recipe lineage is not TaskEpisode dependency evidence; recipe-link
+promotion or migration is ATLAS-12D work.
+
+The fresh-store end-to-end contract writes the unchanged extractor result to
+`AtlasStore`, obtains an untruncated graph by querying from the `episode_id`,
+and forwards only that `GraphQueryResult.to_dict()` value to the planner. A
+single externally rebuilt `declared` edge must still fail closed with
+`ATLAS_EDGE_UNVERIFIED`.
+
+Provenance is part of canonical edge identity, so promoting a legacy
+`declared` edge to `observed` changes its `edge_id`. This work guarantees the
+fresh-store chain only. Migration of existing durable graphs, repair of recipe
+links, and invalidation or migration of packet links are ATLAS-12D work; this
+contract does not claim those legacy migrations are complete.
 
 The graph execution-contract hash uses only a canonical sorted set of
 participating node ids and edge ids plus the `TaskEpisode` id. Creation times

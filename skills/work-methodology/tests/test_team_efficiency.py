@@ -39,10 +39,12 @@ from code_atlas.extractors import (  # noqa: E402
     ExtractionRequest,
     PythonRecipeExtractor,
 )
+from code_atlas.store import AtlasStore  # noqa: E402
 from orchestrator.models import Task, TaskState, Workflow, WorkflowKind  # noqa: E402
 from orchestrator.service import OrchestratorService  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
 from project_index.models import SnapshotFile  # noqa: E402
+from project_index.service import ProjectIndexService  # noqa: E402
 
 
 def _content_hash(body: bytes) -> str:
@@ -182,8 +184,11 @@ class TeamEfficiencyTests(unittest.TestCase):
             Path(r"D:\bun\tmp\codex\2718-devkit\worktrees") / "atlas12b-team-efficiency"
         )
         self._stores: list[SQLiteStore] = []
+        self._index_services: list[ProjectIndexService] = []
 
     def tearDown(self) -> None:
+        for index_service in reversed(self._index_services):
+            index_service.close()
         for store in reversed(self._stores):
             store.close()
         self._temporary_directory.cleanup()
@@ -192,10 +197,12 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
         database_name: str,
         workflow_id: str,
+        *,
+        index_service: ProjectIndexService | None = None,
     ) -> tuple[SQLiteStore, OrchestratorService]:
         store = SQLiteStore(self.temp / database_name)
         self._stores.append(store)
-        service = OrchestratorService(store)
+        service = OrchestratorService(store, index_service=index_service)
         service.create_workflow(
             Workflow(
                 workflow_id,
@@ -232,12 +239,17 @@ class TeamEfficiencyTests(unittest.TestCase):
         store: SQLiteStore,
         service: OrchestratorService,
         workflow_id: str,
+        workspace_root: Path | None = None,
+        input_snapshot_id: str = "snapshot-lifecycle",
+        index_service: ProjectIndexService | None = None,
     ) -> list[list[str]]:
         lifecycle = plan["registration_plan"]
         base_bindings: dict[str, object] = {
             "workflow_id": workflow_id,
-            "workspace_root": str(self.repo),
-            "input_snapshot_id": "snapshot-lifecycle",
+            "workspace_root": str(
+                self.repo if workspace_root is None else workspace_root
+            ),
+            "input_snapshot_id": input_snapshot_id,
         }
         for descriptor in lifecycle["register_steps"]:
             arguments = self.resolve_host_arguments(descriptor, base_bindings)
@@ -305,6 +317,63 @@ class TeamEfficiencyTests(unittest.TestCase):
                     now=bind["now"],
                 )
                 self.assertEqual(bind["host_target"], bound.host_target)
+                strict_binding = store.get_index_binding(task_id)
+                if strict_binding is not None:
+                    self.assertIsNotNone(index_service)
+                    self.assertIsNotNone(workspace_root)
+                    if running.write_scope:
+                        service.record_checkpoint(
+                            task_id,
+                            owner=lease.owner,
+                            epoch=lease.epoch,
+                            checkpoint_id=canonical_hash(
+                                {"kind": "lifecycle_checkpoint", "task_id": task_id}
+                            ),
+                            now=task_bindings["now"],
+                        )
+                        service.record_output_snapshot(
+                            task_id,
+                            owner=lease.owner,
+                            epoch=lease.epoch,
+                            snapshot_id=strict_binding.input_snapshot_id,
+                            diff_hash=canonical_hash(
+                                {"kind": "lifecycle_diff", "task_id": task_id}
+                            ),
+                            now=task_bindings["now"],
+                        )
+                    query = index_service.query(
+                        workspace_root,
+                        strict_binding.input_snapshot_id,
+                        f"lifecycle {task_id}",
+                        max_nodes=1,
+                        max_depth=0,
+                        source_lines=0,
+                    )
+                    service.record_index_query(
+                        workflow_id,
+                        task_id,
+                        owner=lease.owner,
+                        epoch=lease.epoch,
+                        trace_id=query.trace_id,
+                        snapshot_id=strict_binding.input_snapshot_id,
+                        miss_escape_used=False,
+                        now=task_bindings["now"],
+                    )
+                    service.register_artifact(
+                        workflow_id,
+                        task_id,
+                        owner=lease.owner,
+                        epoch=lease.epoch,
+                        kind="verification",
+                        content_hash=canonical_hash(
+                            {"kind": "lifecycle_verification", "task_id": task_id}
+                        ),
+                        safe_path=f"evidence/{task_id}.json",
+                        size=1,
+                        redaction_version="r1",
+                        snapshot_id=strict_binding.input_snapshot_id,
+                        now=task_bindings["now"],
+                    )
                 done = service.complete_task(
                     task_id,
                     expected_version=running.version,
@@ -511,7 +580,6 @@ class TeamEfficiencyTests(unittest.TestCase):
     def extractor_episode_manifest(
         self,
         *,
-        observed_edges: bool,
         command_success: bool = True,
         command_exit_code: int = 0,
         complete_receipt_hashes: bool = True,
@@ -524,22 +592,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 complete_receipt_hashes=complete_receipt_hashes,
             )
         )
-        nodes_by_id = {node.node_id: node for node in result.nodes}
-        edges = result.edges
-        if observed_edges:
-            edges = tuple(
-                AtlasEdge.create(
-                    edge.relation,
-                    nodes_by_id[edge.source_id],
-                    nodes_by_id[edge.target_id],
-                    payload=edge.to_dict()["payload"],
-                    schema_version=edge.schema_version,
-                    provenance="observed",
-                    created_at=edge.created_at,
-                )
-                for edge in edges
-            )
-        graph = GraphQueryResult(result.nodes, edges, False)
+        graph = GraphQueryResult(result.nodes, result.edges, False)
         return {
             "schema": "team-efficiency/work-package-v1",
             "task_id": "ATLAS-12B",
@@ -550,6 +603,41 @@ class TeamEfficiencyTests(unittest.TestCase):
             "eligible": (
                 result.eligible if eligible_override is None else eligible_override
             ),
+            "graph": graph.to_dict(),
+        }
+
+    def declared_edge_episode_manifest(self) -> dict[str, object]:
+        """Model one external downgrade; the extractor result remains untouched."""
+        result = PythonRecipeExtractor().extract(_extractor_request())
+        nodes_by_id = {node.node_id: node for node in result.nodes}
+        trusted = next(
+            edge for edge in result.edges if edge.relation is EdgeRelation.CHANGES
+        )
+        declared = AtlasEdge.create(
+            trusted.relation,
+            nodes_by_id[trusted.source_id],
+            nodes_by_id[trusted.target_id],
+            payload=trusted.to_dict()["payload"],
+            schema_version=trusted.schema_version,
+            provenance="declared",
+            created_at=trusted.created_at,
+        )
+        graph = GraphQueryResult(
+            result.nodes,
+            tuple(
+                declared if edge.edge_id == trusted.edge_id else edge
+                for edge in result.edges
+            ),
+            False,
+        )
+        return {
+            "schema": "team-efficiency/work-package-v1",
+            "task_id": "ATLAS-12B",
+            "goal": "Reject an externally downgraded extractor edge",
+            "capacity": 2,
+            "decomposition": "atlas_evidence",
+            "source_kind": "task_episode_graph",
+            "eligible": result.eligible,
             "graph": graph.to_dict(),
         }
 
@@ -571,24 +659,11 @@ class TeamEfficiencyTests(unittest.TestCase):
         nodes_by_id = {
             node.node_id: node for result in results for node in result.nodes
         }
-        # This fixture promotes edges to the trust contract required by the helper.
-        # It is not evidence that the current extractor emits observed edges.
-        edges = [
-            AtlasEdge.create(
-                edge.relation,
-                nodes_by_id[edge.source_id],
-                nodes_by_id[edge.target_id],
-                payload=edge.to_dict()["payload"],
-                schema_version=edge.schema_version,
-                provenance="observed",
-                created_at=edge.created_at,
-            )
-            for result in results
-            for edge in result.edges
-        ]
+        edges = [edge for result in results for edge in result.edges]
         if supersedes:
             recipe_build = nodes_by_id[results[0].manifest.recipe_id]
             recipe_docs = nodes_by_id[results[1].manifest.recipe_id]
+            # External lineage-consumer input only: the extractor never emits it.
             edges.append(
                 AtlasEdge.create(
                     EdgeRelation.SUPERSEDES,
@@ -1137,21 +1212,24 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         self.assertEqual("verification", conflict_plan["waves"][-1][0]["unit_kind"])
 
+    def test_external_lineage_supersedes_does_not_create_episode_ordering(self) -> None:
+        helper = load_efficiency()
         dependent = helper.decompose(self.task_episode_manifest(supersedes=True))
+
         self.assertTrue(
             all(
                 not unit["depends_on"]
                 for unit in dependent["units"]
                 if unit["unit_kind"] == "code"
             ),
-            "Recipe SUPERSEDES must not invent TaskEpisode task order",
+            "External Recipe SUPERSEDES evidence must not invent TaskEpisode task order",
         )
 
-    def test_real_extractor_graph_is_parsed_and_unverified_edges_fail_closed(
+    def test_one_declared_extractor_edge_fails_closed(
         self,
     ) -> None:
         helper = load_efficiency()
-        manifest = self.extractor_episode_manifest(observed_edges=False)
+        manifest = self.declared_edge_episode_manifest()
         payload_kinds = {
             node["payload"].get("kind")
             for node in manifest["graph"]["nodes"]
@@ -1174,17 +1252,44 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.decompose(manifest)["reason"],
         )
 
-    def test_observed_edge_trust_contract_fixture_compiles_real_payloads(
+    def test_real_extractor_store_graph_decomposes_and_executes_full_lifecycle(
         self,
     ) -> None:
         helper = load_efficiency()
-        manifest = self.extractor_episode_manifest(observed_edges=True)
+        indexed_path = "mcp-tools/code_atlas/extractors.py"
+        result = PythonRecipeExtractor().extract(_extractor_request(path=indexed_path))
+        self.assertTrue(result.eligible)
+        self.assertTrue(result.episode_id)
+
+        atlas_store = AtlasStore(
+            self.temp / "atlas-e2e.sqlite", self.temp / "atlas-cas"
+        )
+        try:
+            atlas_store.put_nodes(result.nodes)
+            atlas_store.put_edges(result.edges)
+            graph = atlas_store.graph_query((result.episode_id,))
+        finally:
+            atlas_store.close()
+
+        self.assertFalse(graph.truncated)
+        self.assertEqual(result.nodes, graph.nodes)
+        self.assertEqual(result.edges, graph.edges)
+        manifest = {
+            "schema": "team-efficiency/work-package-v1",
+            "task_id": "ATLAS-12B",
+            "goal": "Compile one persisted extractor TaskEpisode",
+            "capacity": 2,
+            "decomposition": "atlas_evidence",
+            "source_kind": "task_episode_graph",
+            "eligible": result.eligible,
+            "graph": graph.to_dict(),
+        }
 
         plan = helper.decompose(manifest)
 
         self.assertEqual("planned", plan["status"])
         code_unit = next(unit for unit in plan["units"] if unit["unit_kind"] == "code")
-        self.assertEqual(["src/atlas_guard.py"], code_unit["write_scope"])
+        self.assertEqual([indexed_path], code_unit["write_scope"])
         self.assertTrue(code_unit["contract_node_ids"])
         registration = json.dumps(plan["registration_plan"], sort_keys=True)
         for sensitive_identity in (
@@ -1193,6 +1298,30 @@ class TeamEfficiencyTests(unittest.TestCase):
             _marker_hash("output-primary"),
         ):
             self.assertNotIn(sensitive_identity, registration)
+        workspace_root = ROOT.parents[1]
+        index_service = ProjectIndexService(self.temp / "orchestrator-index.sqlite")
+        self._index_services.append(index_service)
+        snapshot = index_service.sync(workspace_root, include_paths=(indexed_path,))
+        self.assertEqual(1, snapshot.file_count)
+        workflow_id = "extractor-e2e-lifecycle"
+        durable_store, service = self.orchestrator(
+            "extractor-e2e-lifecycle.sqlite",
+            workflow_id,
+            index_service=index_service,
+        )
+        self.execute_lifecycle(
+            plan=plan,
+            store=durable_store,
+            service=service,
+            workflow_id=workflow_id,
+            workspace_root=workspace_root,
+            input_snapshot_id=snapshot.snapshot_id,
+            index_service=index_service,
+        )
+        self.assertEqual(
+            {TaskState.DONE},
+            {task.state for task in durable_store.list_tasks(workflow_id)},
+        )
 
     def test_graph_trust_failures_return_machine_readable_needs_design(
         self,
@@ -1200,7 +1329,6 @@ class TeamEfficiencyTests(unittest.TestCase):
         helper = load_efficiency()
 
         ineligible = self.extractor_episode_manifest(
-            observed_edges=True,
             command_success=False,
         )
         self.assertEqual(
@@ -1209,7 +1337,6 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
 
         failed_receipt = self.extractor_episode_manifest(
-            observed_edges=True,
             command_success=False,
             eligible_override=True,
         )
@@ -1219,7 +1346,6 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
 
         incomplete_hash = self.extractor_episode_manifest(
-            observed_edges=True,
             complete_receipt_hashes=False,
             eligible_override=True,
         )
@@ -1229,7 +1355,6 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
 
         bad_exit = self.extractor_episode_manifest(
-            observed_edges=True,
             command_exit_code=1,
             eligible_override=True,
         )
@@ -1238,7 +1363,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.decompose(bad_exit)["reason"],
         )
 
-        declared_node = self.extractor_episode_manifest(observed_edges=True)
+        declared_node = self.extractor_episode_manifest()
         episode = next(
             node
             for node in declared_node["graph"]["nodes"]
@@ -1250,7 +1375,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.decompose(declared_node)["reason"],
         )
 
-        declared_source = self.extractor_episode_manifest(observed_edges=True)
+        declared_source = self.extractor_episode_manifest()
         source_node = next(
             node
             for node in declared_source["graph"]["nodes"]
@@ -1262,7 +1387,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.decompose(declared_source)["reason"],
         )
 
-        quarantined = self.extractor_episode_manifest(observed_edges=True)
+        quarantined = self.extractor_episode_manifest()
         episode = next(
             node
             for node in quarantined["graph"]["nodes"]
@@ -1274,7 +1399,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.decompose(quarantined)["reason"],
         )
 
-        superseded = self.extractor_episode_manifest(observed_edges=True)
+        superseded = self.extractor_episode_manifest()
         episode = next(
             node
             for node in superseded["graph"]["nodes"]
@@ -1307,7 +1432,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             ),
         ):
             with self.subTest(node_kind=node_kind, field=field):
-                untrusted = self.extractor_episode_manifest(observed_edges=True)
+                untrusted = self.extractor_episode_manifest()
                 participant = next(
                     node
                     for node in untrusted["graph"]["nodes"]
@@ -1323,7 +1448,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        manifest = self.extractor_episode_manifest(observed_edges=True)
+        manifest = self.extractor_episode_manifest()
         first = helper.decompose(manifest)
         changed_times = copy.deepcopy(manifest)
         for node in changed_times["graph"]["nodes"]:
