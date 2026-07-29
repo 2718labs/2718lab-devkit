@@ -74,7 +74,7 @@ class WorkPackageValidationTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def write_strict_sol_package(self) -> None:
+    def write_strict_terra_package(self) -> None:
         self.write_valid_package()
         (self.root / "index.md").write_text(
             "# Work Index\n\n"
@@ -87,11 +87,11 @@ class WorkPackageValidationTests(unittest.TestCase):
         )
         (self.root / "tasks" / "BK-01.md").write_text(
             "# BK-01 Core\n\n"
-            "Owner: sol-code-writer\n"
+            "Owner: terra-high\n"
             "Depends on: none\n\n"
             "## Goal\nImplement state values.\n\n"
             "## Context\n"
-            "Dispatch the code writer with `gpt-5.6-sol` and `ultra`.\n\n"
+            "Dispatch Terra High with `gpt-5.6-terra` and `high`.\n\n"
             "## Write Scope\n- `src/state.py`\n\n"
             "## Steps\n"
             "1. Call `project_index_query` and persist its `trace_id` receipt.\n"
@@ -107,7 +107,7 @@ class WorkPackageValidationTests(unittest.TestCase):
         )
 
     def write_strict_read_only_package(self) -> None:
-        self.write_strict_sol_package()
+        self.write_strict_terra_package()
         (self.root / "tasks" / "BK-01.md").write_text(
             "# BK-01 Core\n\n"
             "Owner: terra-investigator\n"
@@ -169,8 +169,8 @@ class WorkPackageValidationTests(unittest.TestCase):
 
         self.assertEqual([], errors)
 
-    def test_strict_sol_ultra_package_with_all_index_gates_passes(self) -> None:
-        self.write_strict_sol_package()
+    def test_strict_terra_high_package_with_all_index_gates_passes(self) -> None:
+        self.write_strict_terra_package()
 
         errors = self.validate_strict()
 
@@ -205,7 +205,7 @@ class WorkPackageValidationTests(unittest.TestCase):
                 self.assertTrue(any(marker in error for error in errors), errors)
 
     def test_strict_package_requires_index_first_and_completion_markers(self) -> None:
-        self.write_strict_sol_package()
+        self.write_strict_terra_package()
         index = self.root / "index.md"
         index.write_text(
             index.read_text(encoding="utf-8")
@@ -245,12 +245,12 @@ class WorkPackageValidationTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertTrue(any(marker in error for error in errors), errors)
 
-    def test_strict_package_rejects_luna_or_terra_for_code_scope(self) -> None:
-        self.write_strict_sol_package()
+    def test_strict_package_rejects_luna_for_code_scope(self) -> None:
+        self.write_strict_terra_package()
         card = self.root / "tasks" / "BK-01.md"
         card.write_text(
             card.read_text(encoding="utf-8").replace(
-                "Owner: sol-code-writer", "Owner: terra-doc-writer"
+                "Owner: terra-high", "Owner: luna-unavailable"
             ),
             encoding="utf-8",
         )
@@ -258,19 +258,19 @@ class WorkPackageValidationTests(unittest.TestCase):
         errors = self.validate_strict()
 
         self.assertTrue(
-            any("Luna/Terra" in error and "code" in error for error in errors)
+            any("Luna is unavailable" in error and "code" in error for error in errors)
         )
 
     def test_strict_package_allows_terra_documentation_only_scope(self) -> None:
-        self.write_strict_sol_package()
+        self.write_strict_terra_package()
         card = self.root / "tasks" / "BK-01.md"
         card.write_text(
             card.read_text(encoding="utf-8")
-            .replace("Owner: sol-code-writer", "Owner: terra-doc-writer")
+            .replace("Owner: terra-high", "Owner: terra-doc-writer")
             .replace("`src/state.py`", "`docs/state.md`")
             .replace(
-                "Dispatch the code writer with `gpt-5.6-sol` and `ultra`.",
-                "Dispatch Terra for documentation only; Terra never writes code.",
+                "Dispatch Terra High with `gpt-5.6-terra` and `high`.",
+                "Dispatch Terra High for documentation only.",
             ),
             encoding="utf-8",
         )
@@ -323,6 +323,145 @@ class WorkPackageValidationTests(unittest.TestCase):
 
         self.assertTrue(any("one owner" in error.lower() for error in errors))
         self.assertTrue(any("write scope" in error.lower() for error in errors))
+
+    def test_verification_lanes_block_core_failures_and_bound_deferrals(self) -> None:
+        validator = load_validator()
+        valid_record = {
+            "acceptance_requested": True,
+            "lanes": {
+                "core": {"status": "passed", "evidence_hash": "core-evidence"},
+                "extended": {
+                    "status": "deferred",
+                    "evidence_hash": "extended-evidence",
+                    "owner": "release-owner",
+                    "release_gate": "release-2026-07",
+                    "timebox": "2026-07-30T12:00:00Z",
+                },
+                "platform": {
+                    "status": "skipped",
+                    "reason": "Windows hook lane is not scheduled locally",
+                },
+            },
+        }
+
+        self.assertEqual([], validator.validate_verification_lanes(valid_record))
+
+        core_failed = {
+            **valid_record,
+            "lanes": {
+                **valid_record["lanes"],
+                "core": {"status": "failed", "evidence_hash": "core-evidence"},
+            },
+        }
+        missing_deferred_evidence = {
+            **valid_record,
+            "lanes": {
+                **valid_record["lanes"],
+                "extended": {"status": "deferred"},
+            },
+        }
+        unknown_lane = {
+            **valid_record,
+            "lanes": {**valid_record["lanes"], "legacy": {"status": "passed"}},
+        }
+        claimed_skipped_platform = {
+            **valid_record,
+            "platform_support_claimed": True,
+        }
+
+        core_errors = validator.validate_verification_lanes(core_failed)
+        deferred_errors = validator.validate_verification_lanes(
+            missing_deferred_evidence
+        )
+        lane_errors = validator.validate_verification_lanes(unknown_lane)
+        platform_errors = validator.validate_verification_lanes(
+            claimed_skipped_platform
+        )
+
+        self.assertTrue(
+            any(
+                "core" in error and "blocks acceptance" in error
+                for error in core_errors
+            )
+        )
+        self.assertTrue(
+            any("extended deferred lane missing" in error for error in deferred_errors)
+        )
+        self.assertTrue(any("unknown lane" in error for error in lane_errors))
+        self.assertTrue(
+            any("platform support claim" in error for error in platform_errors)
+        )
+
+    def test_resume_packet_and_interface_handoff_are_bounded_and_ordered(self) -> None:
+        validator = load_validator()
+        packet = {
+            "workflow_id": "atlas-workflow",
+            "task_id": "ATLAS-12A",
+            "lease_epoch": 4,
+            "current_endpoint": "agent-7",
+            "base_commit": "de41eb5",
+            "candidate_commit": "candidate-sha",
+            "branch_or_worktree": "feature/code-atlas-v1-routing",
+            "write_scope_hash": "scope-sha",
+            "latest_red": {"command": "python -m pytest focused", "result": "1 failed"},
+            "latest_green": {
+                "command": "python -m pytest focused",
+                "result": "29 passed",
+            },
+            "contract_hashes": ["contract-sha"],
+            "evidence_hashes": ["evidence-sha"],
+            "next_action": "run core verification lane",
+            "redacted": True,
+            "resume_steps": [
+                "workflow_endpoint_bind",
+                "workflow_inbox",
+                "workflow_artifact_resolve",
+                "workflow_message_ack",
+                "resume_next_action",
+            ],
+        }
+        handoff = {
+            "artifact_kind": "contract",
+            "artifact_hash": "contract-sha",
+            "metadata": {"kind": "contract"},
+            "interface_frozen": True,
+            "steps": [
+                "workflow_artifact_register",
+                "workflow_message_send",
+                "workflow_inbox",
+                "workflow_artifact_resolve",
+                "workflow_message_ack",
+            ],
+        }
+
+        self.assertEqual([], validator.validate_crash_resume_packet(packet))
+        self.assertEqual([], validator.validate_mcp_handoff_record(handoff))
+
+        unsafe_packet = {**packet, "stdout": "unbounded raw output"}
+        unordered_packet = {
+            **packet,
+            "resume_steps": list(reversed(packet["resume_steps"])),
+        }
+        unordered_handoff = {**handoff, "steps": list(reversed(handoff["steps"]))}
+
+        self.assertTrue(
+            any(
+                "forbidden" in error
+                for error in validator.validate_crash_resume_packet(unsafe_packet)
+            )
+        )
+        self.assertTrue(
+            any(
+                "out of order" in error
+                for error in validator.validate_crash_resume_packet(unordered_packet)
+            )
+        )
+        self.assertTrue(
+            any(
+                "out of order" in error
+                for error in validator.validate_mcp_handoff_record(unordered_handoff)
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -1,28 +1,34 @@
 ---
 name: bugkiller
-description: Use when triaging, investigating, patching, or verifying a repository bug through the Bugkiller workflow.
+description: Use when triaging, implementing, validating, or integrating a bounded repository fix through the Bugkiller workflow.
 ---
 
 # Bugkiller
 
-Coordinate a bounded bug fix using the workflow record as the source of truth. Keep role, state, routing, and safety detail in [references](references/).
+Sol owns architecture, dispatch, review, integration, and final acceptance.
+Read the assigned task card and direct contracts, then follow
+[roles and routing](references/roles.md), [workflow and delivery](references/workflow.md),
+and [safety](references/safety.md).
 
 ## Start
 
-1. Read the assigned task card and direct contracts only.
-2. Route executable/code writes to the Sol code writer with dispatch model `gpt-5.6-sol` and reasoning `ultra`; Luna and Terra never write code.
-3. Follow [roles and routing](references/roles.md), then [workflow and delivery](references/workflow.md).
-4. Enforce [safety and degraded operation](references/safety.md) before commands, writes, or escalation.
+1. Route routine/bounded execution to Terra High: `gpt-5.6-terra`, `high`.
+2. Route moderately complex or harder execution to Terra Max:
+   `gpt-5.6-terra`, `max`.
+3. Use Sol High: `gpt-5.6-sol`, `high`, only for an explicitly exceptional
+   bounded execution or deep investigation.
+4. Luna is unavailable. Never attempt a Luna spawn or rename a substitute.
+5. A worker creates scoped evidence and a candidate commit; Sol alone reviews,
+   orders integration, and accepts.
 
 ## Non-negotiables
 
-- Luna/Terra never write code. The Sol code writer performs approved executable writes; `bugkiller-sol-escalation` remains a separate read-only dangerous-review role.
-- Do not automatically request a reviewer or Sol for ordinary, low-risk work.
-- MCP coordinates lease-bound host targets, metadata, and durable mailbox references; it never starts agents, calls host collaboration tools, runs commands, or relays message bodies.
-- Without MCP or host peer messaging, mark `DEGRADED_SKILL_ONLY` and work serially within the task card's scope.
-
-## References
-
-- [roles.md](references/roles.md): roles, model dispatch, risk routing, and Sol budget.
-- [workflow.md](references/workflow.md): task states, artifact-backed peer delivery, inbox, acknowledgement, and TTL.
-- [safety.md](references/safety.md): permission boundaries, tainted input, command discipline, and degraded modes.
+- Do not silently substitute a model or reasoning level.
+- A worker never merges another task, expands its write scope, or accepts its
+  own work.
+- MCP stores lease-bound metadata and durable artifacts; it never starts an
+  agent, calls host collaboration tools, or relays large message bodies.
+- Durable delivery is `workflow_artifact_register -> workflow_message_send ->
+  workflow_inbox -> workflow_artifact_resolve -> workflow_message_ack`.
+- Without MCP, record `DEGRADED_SKILL_ONLY` and use the card's scoped serial
+  fallback. Do not pretend direct chat is durable task context.

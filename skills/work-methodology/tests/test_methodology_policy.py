@@ -4,76 +4,125 @@ import unittest
 from pathlib import Path
 
 
-SKILL = Path(__file__).resolve().parents[1] / "SKILL.md"
-TEAM_PATTERNS = Path(__file__).resolve().parents[1] / "references" / "team-patterns.md"
-WORK_PACKAGES = Path(__file__).resolve().parents[1] / "references" / "work-packages.md"
+ROOT = Path(__file__).resolve().parents[1]
+TEAM_PATTERNS = ROOT / "references" / "team-patterns.md"
+ORCHESTRATION = ROOT / "references" / "orchestration-runtime.md"
+INTEGRATION = ROOT / "references" / "github-parallel-integration.md"
 
 
 class MethodologyPolicyTests(unittest.TestCase):
-    def test_low_risk_work_does_not_require_reviewer(self) -> None:
-        text = SKILL.read_text(encoding="utf-8")
-
-        self.assertIn("低风险任务不自动创建审查代理", text)
-        self.assertNotIn("开 team 时必须有一个专职唱反调成员", text)
-
-    def test_dangerous_work_asks_user_before_review_or_escalation(self) -> None:
-        text = SKILL.read_text(encoding="utf-8")
-
-        self.assertIn("先向用户说明具体风险并询问", text)
-        self.assertIn("用户明确同意后", text)
-
-    def test_minimum_sufficient_engineering_stops_scope_growth(self) -> None:
-        text = SKILL.read_text(encoding="utf-8")
+    def test_current_host_policy_routes_terra_and_sol_without_luna(self) -> None:
+        text = TEAM_PATTERNS.read_text(encoding="utf-8")
 
         for required in (
-            "最小充分工程",
-            "不得重复扫描全仓",
-            "不得扩展当前 scope",
-            "立即停止并交付",
+            "Terra High",
+            "gpt-5.6-terra",
+            "Terra Max",
+            "Sol High",
+            "gpt-5.6-sol",
+            "Luna is unavailable",
+            "Opus",
+            "Sonnet",
+            "Haiku",
+            "Fable",
+            "explicitly reasoned",
         ):
             self.assertIn(required, text)
 
-    def test_team_patterns_separate_dispatch_from_optional_review(self) -> None:
-        text = TEAM_PATTERNS.read_text(encoding="utf-8")
-
-        self.assertIn("审查不是默认 team 成员", text)
-        self.assertIn("危险门禁", text)
-
-    def test_code_dispatch_is_sol_ultra_and_separate_from_dangerous_review(
+    def test_local_integration_contract_protects_disjoint_scopes_and_review(
         self,
     ) -> None:
-        text = TEAM_PATTERNS.read_text(encoding="utf-8")
+        text = INTEGRATION.read_text(encoding="utf-8")
 
         for required in (
-            "bugkiller-sol-code-writer",
-            "gpt-5.6-sol",
-            "ultra",
-            "bugkiller-terra-doc-writer",
-            "Luna/Terra",
-            "永不写代码",
+            "isolated task branch/worktree",
+            "scoped commit + evidence",
+            "Sol review",
+            "ordered integration/rebase",
+            "CI gate",
+            "release gate",
+            "disjoint",
+            "must not overwrite",
+            "must not merge",
+            "remote push",
+            "candidate/source commit",
+            "base revision",
+            "accepted evidence hash",
+            "integration order",
         ):
             self.assertIn(required, text)
-        self.assertIn("危险审查", text)
-        self.assertIn("不自动", text)
 
-    def test_strict_work_package_policy_names_every_index_gate(self) -> None:
+    def test_mcp_handoff_is_durable_and_ordered(self) -> None:
         text = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in (SKILL, TEAM_PATTERNS, WORK_PACKAGES)
+            path.read_text(encoding="utf-8") for path in (INTEGRATION, ORCHESTRATION)
         )
+        cursor = 0
+        for marker in (
+            "workflow_artifact_register",
+            "workflow_message_send",
+            "workflow_inbox",
+            "workflow_artifact_resolve",
+            "workflow_message_ack",
+        ):
+            cursor = text.find(marker, cursor)
+            self.assertGreaterEqual(cursor, 0, marker)
+            cursor += len(marker)
+        self.assertIn("Direct chat", text)
+        self.assertIn("not the source of truth", text)
+
+    def test_runtime_keeps_sol_as_acceptance_owner(self) -> None:
+        text = ORCHESTRATION.read_text(encoding="utf-8")
+
+        self.assertIn("Only Sol may call the acceptance completion gate", text)
+        self.assertIn("Luna is unavailable", text)
+
+    def test_efficiency_amendment_locks_resume_handoff_and_lanes(self) -> None:
+        integration = INTEGRATION.read_text(encoding="utf-8")
+        runtime = ORCHESTRATION.read_text(encoding="utf-8")
+        normalized_integration = " ".join(integration.split())
 
         for required in (
-            "strict_index=true",
-            "project_index_sync",
-            "workflow_register_task",
-            "project_index_query",
-            "trace_id",
-            "worktree_checkpoint_create",
-            'project_index_sync(bind_as="output")',
-            'workflow_artifact_register(kind="verification", snapshot_id=...)',
-            "workflow_complete",
+            "bounded, redacted crash-resume packet",
+            "workflow/task identity",
+            "lease epoch",
+            "current endpoint",
+            "base and candidate commit ids",
+            "branch/worktree identifier",
+            "write-scope hash",
+            "latest RED/GREEN command and result summary",
+            "registered contract/evidence hashes",
+            "one explicit next action",
+            "raw stdout/stderr",
+            "credentials",
+            "source bodies",
+            "environment values",
+            "unbounded chat history",
+            "public task interface freezes",
+            "small redacted contract artifact",
+            "hash plus minimal kind metadata",
+            "before the producer's complete branch is integrated",
+            "core",
+            "extended",
+            "platform",
+            "core failure blocks acceptance",
+            "English-first bilingual documentation",
         ):
-            self.assertIn(required, text)
+            self.assertIn(required, normalized_integration)
+
+        cursor = 0
+        for marker in (
+            "workflow_endpoint_bind",
+            "workflow_inbox",
+            "workflow_artifact_resolve",
+            "workflow_message_ack",
+            "recorded next action",
+        ):
+            cursor = integration.find(marker, cursor)
+            self.assertGreaterEqual(cursor, 0, marker)
+            cursor += len(marker)
+
+        self.assertIn("workflow_artifact_register", runtime)
+        self.assertIn("workflow_message_send", runtime)
 
 
 if __name__ == "__main__":

@@ -39,9 +39,11 @@ SQLite 是 task、dependency、lease、attempt、event、evidence hash 和 budge
 
 ## Strict index write gate
 
-Legacy registrations retain `strict_index=false`. A strict task follows this exact sequence: `project_index_sync` -> `strict_index=true` -> `project_index_query` -> `trace_id` -> `worktree_checkpoint_create` -> `project_index_sync(bind_as="output")` -> `project_index_query` -> `trace_id` -> `workflow_artifact_register(kind="verification", snapshot_id=...)` -> `workflow_complete`. The first query and trace bind the input snapshot, the checkpoint precedes writes, and the output sync/query bind the verification snapshot before completion.
+Legacy registrations retain `strict_index=false`. A strict task follows this exact sequence: `project_index_sync` -> `strict_index=true` -> `project_index_query` -> `trace_id` -> `worktree_checkpoint_create` -> `project_index_sync(bind_as="output")` -> `project_index_query` -> `trace_id` -> `workflow_artifact_register(kind="verification", snapshot_id=...)` -> `workflow_complete`. The first query and trace bind the input snapshot, the checkpoint precedes writes, and the output sync/query bind the verification snapshot before completion. Only Sol may call the acceptance completion gate after review.
 
 ## 点对点通信
+
+Durable handoff order is `workflow_artifact_register -> workflow_message_send -> workflow_inbox -> workflow_artifact_resolve -> workflow_message_ack`. Direct chat may wake a worker after durable delivery but is never task context, evidence, handoff, or acceptance source of truth.
 
 消息仅可在已注册的 dependency edge 两端，或同一 workflow 中显式订阅同一 contract 的任务之间发送；订阅关系由任务注册时固定，不能由消息创建。消息不会扩大接收方的 role、lease、contract access 或 write scope。
 
@@ -55,7 +57,7 @@ Legacy registrations retain `strict_index=false`. A strict task follows this exa
 
 1. 用 content hash 去重 repository map、task card、contract、测试命令和验证输出；相同输入不重复采集。
 2. `workflow_context` 不返回 sibling task cards、完整聊天历史或不相关日志。
-3. Luna 处理分诊、仓库地图和证据整理；Terra 处理定位、实现和验证；Sol 默认预算为零。
+3. Sol owns architecture, dispatch, review, integration, and final acceptance. Terra High handles routine bounded work; Terra Max handles complex work; Sol High is explicit exceptional escalation only. Luna is unavailable and is never spawned or substituted.
 4. 同一 write scope 只允许一个有效租约；只读任务可以并行。
 5. 任务完成只回传结构化摘要、artifact hashes 和阻塞项；长日志保存在证据路径。
 6. 普通低风险流程不创建 reviewer。高风险先问用户，用户允许后再分派危险审查。

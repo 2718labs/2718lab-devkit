@@ -1,4 +1,4 @@
 interface:
   display_name: Bugkiller
-  short_description: Bounded bug triage, patching, and verification workflow.
-  default_prompt: Triage this bug through Bugkiller with the assigned task card and direct contracts.
+  short_description: Sol-coordinated, evidence-backed local bug workflow.
+  default_prompt: Coordinate this bug through the assigned card, local routing policy, scoped worktree, and durable evidence handoff.

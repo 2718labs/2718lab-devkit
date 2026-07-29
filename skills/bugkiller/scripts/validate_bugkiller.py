@@ -1,44 +1,34 @@
-"""Validate the self-contained Bugkiller plugin assets without third-party packages."""
+"""Validate current Bugkiller routing and durable-handoff assets."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[3]
 SKILL = ROOT / "skills" / "bugkiller" / "SKILL.md"
 REFERENCES = ROOT / "skills" / "bugkiller" / "references"
 AGENTS = ROOT / "agents"
+PROFILE = ROOT / "skills" / "code-atlas" / "assets" / "host-profiles.json"
 AGENT_MARKERS = {
-    "bugkiller-luna-triage.md": ("Luna", "read-only", "DEGRADED_TRIAGE"),
-    "bugkiller-terra-investigator.md": ("Terra", "read-only", "investigation"),
-    "bugkiller-terra-doc-writer.md": ("Terra", "documentation"),
-    "bugkiller-terra-verifier.md": ("Terra", "read-only", "verification"),
-    "bugkiller-sol-code-writer.md": ("Sol", "code writer", "gpt-5.6-sol", "ultra"),
-    "bugkiller-sol-escalation.md": ("Sol", "read-only", "budget: 0"),
+    "bugkiller-sol-coordinator.md": ("Sol", "final acceptance", "Terra High"),
+    "bugkiller-terra-investigator.md": ("Terra High", "gpt-5.6-terra", "high"),
+    "bugkiller-terra-doc-writer.md": ("Terra High", "documentation-only"),
+    "bugkiller-terra-verifier.md": ("Terra High", "read-only", "verification"),
+    "bugkiller-sol-escalation.md": ("Sol High", "gpt-5.6-sol", "exceptional"),
 }
-NON_CODE_AGENTS = (
-    "bugkiller-luna-triage.md",
-    "bugkiller-terra-investigator.md",
-    "bugkiller-terra-doc-writer.md",
-    "bugkiller-terra-verifier.md",
+DEPRECATED_AGENTS = (
+    "-".join(("bugkiller", "sol", "code", "writer")) + ".md",
+    "-".join(("bugkiller", "luna", "triage")) + ".md",
 )
-CODE_WRITE_PROHIBITIONS = (
-    "never write code",
-    "must not write code",
-    "do not write code",
-)
-STRICT_WORKFLOW_SEQUENCE = (
-    "project_index_sync",
-    "strict_index=true",
-    "project_index_query",
-    "trace_id",
-    "worktree_checkpoint_create",
-    'project_index_sync(bind_as="output")',
-    "project_index_query",
-    "trace_id",
-    'workflow_artifact_register(kind="verification", snapshot_id=...)',
-    "workflow_complete",
+HANDOFF_SEQUENCE = (
+    "workflow_artifact_register",
+    "workflow_message_send",
+    "workflow_inbox",
+    "workflow_artifact_resolve",
+    "workflow_message_ack",
 )
 
 
@@ -83,97 +73,96 @@ def require_ordered_markers(
         cursor = position + len(marker)
 
 
+def _mapping(value: object) -> dict[str, Any] | None:
+    return value if isinstance(value, dict) else None
+
+
+def validate_profiles(errors: list[str]) -> None:
+    try:
+        payload = json.loads(PROFILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(errors, f"invalid host profile asset: {exc}")
+        return
+    root = _mapping(payload)
+    hosts = _mapping(root.get("hosts") if root else None)
+    codex = _mapping(hosts.get("codex") if hosts else None)
+    claude = _mapping(hosts.get("claude") if hosts else None)
+    codex_roles = _mapping(codex.get("roles") if codex else None)
+    claude_roles = _mapping(claude.get("roles") if claude else None)
+    expected = {
+        "normal": ("gpt-5.6-terra", "high"),
+        "complex": ("gpt-5.6-terra", "max"),
+        "exceptional": ("gpt-5.6-sol", "high"),
+    }
+    code = _mapping(codex_roles.get("code") if codex_roles else None)
+    for route, (model, reasoning) in expected.items():
+        value = _mapping(code.get(route) if code else None)
+        if value is None or value.get("model") != model or value.get("reasoning") != reasoning:
+            fail(errors, f"host profile missing Codex {route} route")
+    luna = _mapping(codex_roles.get("luna") if codex_roles else None)
+    if luna is None or luna.get("status") != "unavailable":
+        fail(errors, "host profile must declare Luna unavailable")
+    for role, model in (("coordinator", "opus"), ("code", "sonnet"), ("light", "haiku")):
+        value = _mapping(claude_roles.get(role) if claude_roles else None)
+        if value is None or value.get("model") != model:
+            fail(errors, f"host profile missing Claude {role} route")
+    fable = _mapping(claude_roles.get("fable") if claude_roles else None)
+    if fable is None or fable.get("requires_escalation_reason") is not True:
+        fail(errors, "host profile must require an explicit Fable escalation reason")
+
+
 def main() -> int:
     errors: list[str] = []
     skill = text(SKILL, errors)
     if skill:
-        if not valid_frontmatter(skill):
-            fail(errors, "SKILL.md needs name and description YAML frontmatter")
-        if not has_markdown_body(skill):
-            fail(errors, "SKILL.md needs a Markdown body")
+        if not valid_frontmatter(skill) or not has_markdown_body(skill):
+            fail(errors, "SKILL.md needs YAML frontmatter and a Markdown body")
         if len(skill.splitlines()) > 120:
             fail(errors, "SKILL.md must remain at or below 120 lines")
-        if "references/" not in skill:
-            fail(errors, "SKILL.md must route detailed guidance to references")
-        for marker in ("gpt-5.6-sol", "ultra"):
-            if marker not in skill:
-                fail(errors, f"SKILL.md missing code-routing marker: {marker}")
-        if not any(
-            marker in skill
-            for marker in (
-                "Luna and Terra never write code",
-                "Luna/Terra never write code",
-            )
+        for marker in (
+            "Terra High",
+            "Terra Max",
+            "Sol High",
+            "Luna is unavailable",
+            "workflow_artifact_register",
+            "workflow_message_ack",
         ):
-            fail(errors, "SKILL.md must state that Luna/Terra never write code")
-        if "Terra writer is the only workspace writer" in skill:
-            fail(errors, "SKILL.md still authorizes the deprecated Terra code writer")
+            if marker not in skill:
+                fail(errors, f"SKILL.md missing routing marker: {marker}")
 
     reference_text = "\n".join(text(path, errors) for path in REFERENCES.glob("*.md"))
-    for marker in (
-        "DEGRADED_SKILL_ONLY",
-        "workflow_artifact_register",
-        "workflow_message_send",
-        "collaboration.send_message",
-        "workflow_inbox",
-        "workflow_message_ack",
-        "TTL",
-        "does not grant",
-    ):
+    for marker in (*HANDOFF_SEQUENCE, "TTL", "does not grant", "candidate commit"):
         if marker not in reference_text:
             fail(errors, f"references missing policy marker: {marker}")
+    workflow = text(REFERENCES / "workflow.md", errors)
+    require_ordered_markers(workflow, HANDOFF_SEQUENCE, errors, "workflow.md")
     roles = text(REFERENCES / "roles.md", errors)
     for marker in (
-        "spawn",
-        "model choices",
-        "explicitly select Luna",
-        "explicitly select Terra",
-        "DEGRADED_TRIAGE",
-        "bugkiller-terra-doc-writer",
-        "bugkiller-sol-code-writer",
-        "gpt-5.6-sol",
-        "ultra",
+        "Sol coordinator",
+        "gpt-5.6-terra",
+        "Terra High",
+        "Terra Max",
+        "Sol High",
+        "Luna",
+        "Opus",
+        "Sonnet",
+        "Haiku",
+        "Fable",
+        "explicit escalation reason",
     ):
         if marker not in roles:
-            fail(errors, f"roles.md missing runtime-routing marker: {marker}")
-    if not any(
-        marker in roles
-        for marker in (
-            "Luna and Terra never write code",
-            "Luna/Terra never write code",
-        )
-    ):
-        fail(errors, "roles.md must state that Luna/Terra never write code")
-    if "only patch writer" in roles:
-        fail(errors, "roles.md still authorizes the deprecated Terra code writer")
-
-    workflow = text(REFERENCES / "workflow.md", errors)
-    require_ordered_markers(
-        workflow,
-        STRICT_WORKFLOW_SEQUENCE,
-        errors,
-        "workflow.md",
-    )
+            fail(errors, f"roles.md missing routing marker: {marker}")
 
     for filename, markers in AGENT_MARKERS.items():
         content = text(AGENTS / filename, errors)
-        if content and not valid_frontmatter(content):
-            fail(errors, f"{filename} needs YAML frontmatter plus Markdown body")
-        if content and not has_markdown_body(content):
-            fail(errors, f"{filename} needs a Markdown body")
+        if content and (not valid_frontmatter(content) or not has_markdown_body(content)):
+            fail(errors, f"{filename} needs YAML frontmatter and a Markdown body")
         for marker in markers:
             if content and marker not in content:
                 fail(errors, f"{filename} missing marker: {marker}")
-
-    deprecated_writer = AGENTS / "bugkiller-terra-writer.md"
-    if deprecated_writer.exists():
-        fail(
-            errors, "deprecated agent asset must be removed: bugkiller-terra-writer.md"
-        )
-    for filename in NON_CODE_AGENTS:
-        content = text(AGENTS / filename, errors).lower()
-        if content and not any(marker in content for marker in CODE_WRITE_PROHIBITIONS):
-            fail(errors, f"{filename} must explicitly prohibit code writes")
+    for filename in DEPRECATED_AGENTS:
+        if (AGENTS / filename).exists():
+            fail(errors, "obsolete routing agent asset must be removed")
 
     ui_metadata = text(AGENTS / "openai.yaml", errors)
     if not ui_metadata.startswith("interface:\n"):
@@ -181,26 +170,10 @@ def main() -> int:
     for marker in ("display_name:", "short_description:", "default_prompt:"):
         if marker not in ui_metadata:
             fail(errors, f"openai.yaml missing interface field: {marker}")
-    if "agents:" in ui_metadata:
-        fail(errors, "openai.yaml must not enumerate plugin agents")
-    if "model:" in ui_metadata or ".toml" in ui_metadata:
-        fail(
-            errors,
-            "openai.yaml must not declare model slugs or global TOML installation",
-        )
+    if "agents:" in ui_metadata or "model:" in ui_metadata or ".toml" in ui_metadata:
+        fail(errors, "openai.yaml must remain UI metadata only")
 
-    writer = text(AGENTS / "bugkiller-sol-code-writer.md", errors)
-    sol = text(AGENTS / "bugkiller-sol-escalation.md", errors)
-    if writer and "dispatch" not in writer:
-        fail(
-            errors,
-            "Sol code writer must identify gpt-5.6-sol and ultra as dispatch parameters",
-        )
-    if writer and "do not automatically request reviewer" not in writer:
-        fail(errors, "Sol code writer must prohibit automatic reviewer escalation")
-    if sol and ("dangerous user approval" not in sol or "one call" not in sol):
-        fail(errors, "dangerous Sol reviewer must require user approval and one call")
-
+    validate_profiles(errors)
     if errors:
         print("Bugkiller asset validation failed:")
         print("\n".join(f"- {error}" for error in errors))
