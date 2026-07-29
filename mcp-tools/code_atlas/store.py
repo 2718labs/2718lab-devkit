@@ -45,6 +45,7 @@ from .security import (
 
 
 _HASH = re.compile(r"^sha256:([0-9a-f]{64})$")
+_BUNDLE_REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 
 def _lexical_absolute(path: str | Path) -> Path:
@@ -2136,6 +2137,799 @@ class AtlasStore:
                     (receipt.ingestion_key, *values),
                 )
         return receipt.ingestion_key
+
+    def put_ingestion_bundle(
+        self,
+        *,
+        nodes: Iterable[AtlasNode],
+        edges: Iterable[AtlasEdge],
+        manifest: RecipeManifest | None,
+        recipe_node_ids: Iterable[str],
+        recipe_edge_ids: Iterable[str],
+        blobs: Iterable[tuple[str, bytes, str]],
+        receipt: IngestionReceipt,
+    ) -> IngestionReceipt:
+        """Persist one accepted Atlas projection with its receipt as visibility marker.
+
+        Unlike the compatibility ``put_*`` methods, this boundary keeps graph,
+        recipe, CAS metadata, and receipt rows inside one SQLite transaction.
+        CAS publication is content-addressed and no-replace; only files created
+        by this invocation are eligible for rollback cleanup.
+        """
+
+        node_items = self._bundle_nodes(nodes)
+        edge_items = self._bundle_edges(edges)
+        linked_nodes = self._bundle_ids(recipe_node_ids, "recipe node", MAX_GRAPH_NODES)
+        linked_edges = self._bundle_ids(recipe_edge_ids, "recipe edge", MAX_GRAPH_EDGES)
+        blob_items = self._bundle_blobs(blobs)
+        receipt_values = self._bundle_receipt_values(receipt)
+        self._bundle_validate_shape(
+            node_items,
+            edge_items,
+            manifest,
+            linked_nodes,
+            linked_edges,
+            blob_items,
+            receipt,
+        )
+
+        created_paths: list[tuple[Path, tuple[int, int, int, int, int]]] = []
+        staged_paths: list[tuple[Path, tuple[int, int, int, int, int]]] = []
+        committed = False
+        try:
+            if self._conn.in_transaction:
+                raise StoreConflictError("bundle transaction conflict")
+            self._conn.execute("BEGIN IMMEDIATE")
+            existing_receipt = self._bundle_existing_receipt(receipt, receipt_values)
+            self._bundle_validate_database(
+                node_items,
+                edge_items,
+                manifest,
+                linked_nodes,
+                linked_edges,
+                blob_items,
+                receipt,
+                require_existing=existing_receipt is not None,
+            )
+            if existing_receipt is not None:
+                self._conn.rollback()
+                return existing_receipt
+
+            _assert_safe_existing_path(self._cas_root)
+            _assert_cas_directory_identities(self._cas_directory_identities)
+            for blob_hash, content, media_type in blob_items:
+                self._bundle_publish_blob(
+                    blob_hash,
+                    content,
+                    media_type,
+                    created_paths,
+                    staged_paths,
+                )
+            self._bundle_insert_blobs(blob_items)
+            self._bundle_insert_nodes(node_items)
+            self._bundle_insert_edges(edge_items)
+            self._bundle_insert_recipe(manifest, linked_nodes, linked_edges)
+            self._bundle_insert_receipt(receipt, receipt_values)
+            for blob_hash, content, _media_type in blob_items:
+                self._bundle_verify_blob_file(
+                    self._blob_path(blob_hash), blob_hash, content
+                )
+            refreshed_identities = _capture_cas_directory_identities(self._cas_root)
+            self._bundle_commit()
+            committed = True
+            self._cas_directory_identities = refreshed_identities
+            return receipt
+        except Exception:
+            if self._conn.in_transaction:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+            self._bundle_cleanup_paths(staged_paths, created_paths)
+            raise
+        finally:
+            if not committed:
+                # Keep a pre-existing root pin usable after a failed attempt;
+                # new empty CAS fan-out directories are intentionally inert.
+                try:
+                    self._cas_directory_identities = _capture_cas_directory_identities(
+                        self._cas_root
+                    )
+                except StoreConflictError:
+                    pass
+
+    @staticmethod
+    def _bundle_nodes(nodes: Iterable[AtlasNode]) -> tuple[AtlasNode, ...]:
+        try:
+            supplied = tuple(nodes)
+        except TypeError as exc:
+            raise StoreConflictError("bundle node conflict") from exc
+        if len(supplied) > MAX_GRAPH_NODES:
+            raise StoreConflictError("bundle node limit")
+        values: dict[str, AtlasNode] = {}
+        for node in supplied:
+            if (
+                type(node) is not AtlasNode
+                or AtlasStore._node_identity(node) != node.node_id
+            ):
+                raise StoreConflictError("bundle node conflict")
+            try:
+                encoded = canonical_json(node.to_dict())
+                validate_fragment(encoded, max_bytes=MAX_PACKET_BYTES)
+            except Exception as exc:
+                raise StoreConflictError("bundle node conflict") from exc
+            prior = values.get(node.node_id)
+            if prior is not None and prior != node:
+                raise StoreConflictError("bundle node conflict")
+            values[node.node_id] = node
+        return tuple(sorted(values.values(), key=lambda item: item.node_id))
+
+    @staticmethod
+    def _bundle_edges(edges: Iterable[AtlasEdge]) -> tuple[AtlasEdge, ...]:
+        try:
+            supplied = tuple(edges)
+        except TypeError as exc:
+            raise StoreConflictError("bundle edge conflict") from exc
+        if len(supplied) > MAX_GRAPH_EDGES:
+            raise StoreConflictError("bundle edge limit")
+        values: dict[str, AtlasEdge] = {}
+        for edge in supplied:
+            if (
+                type(edge) is not AtlasEdge
+                or AtlasStore._edge_identity(edge) != edge.edge_id
+            ):
+                raise StoreConflictError("bundle edge conflict")
+            try:
+                encoded = canonical_json(edge.to_dict())
+                validate_fragment(encoded, max_bytes=MAX_PACKET_BYTES)
+            except Exception as exc:
+                raise StoreConflictError("bundle edge conflict") from exc
+            prior = values.get(edge.edge_id)
+            if prior is not None and prior != edge:
+                raise StoreConflictError("bundle edge conflict")
+            values[edge.edge_id] = edge
+        return tuple(sorted(values.values(), key=lambda item: item.edge_id))
+
+    @staticmethod
+    def _bundle_ids(values: Iterable[str], label: str, maximum: int) -> tuple[str, ...]:
+        if isinstance(values, (str, bytes)):
+            raise StoreConflictError(f"bundle {label} conflict")
+        try:
+            supplied = tuple(values)
+        except TypeError as exc:
+            raise StoreConflictError(f"bundle {label} conflict") from exc
+        if len(supplied) > maximum or any(
+            not isinstance(value, str) or _HASH.fullmatch(value) is None
+            for value in supplied
+        ):
+            raise StoreConflictError(f"bundle {label} conflict")
+        if len(set(supplied)) != len(supplied):
+            raise StoreConflictError(f"bundle {label} conflict")
+        return tuple(sorted(supplied))
+
+    @staticmethod
+    def _bundle_blobs(
+        blobs: Iterable[tuple[str, bytes, str]],
+    ) -> tuple[tuple[str, bytes, str], ...]:
+        if isinstance(blobs, (str, bytes)):
+            raise StoreConflictError("bundle blob conflict")
+        try:
+            supplied = tuple(blobs)
+        except TypeError as exc:
+            raise StoreConflictError("bundle blob conflict") from exc
+        if len(supplied) > MAX_GRAPH_NODES:
+            raise StoreConflictError("bundle blob limit")
+        total = 0
+        values: dict[str, tuple[str, bytes, str]] = {}
+        media_type = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
+        for item in supplied:
+            if type(item) is not tuple or len(item) != 3:
+                raise StoreConflictError("bundle blob conflict")
+            blob_hash, content, kind = item
+            if (
+                not isinstance(blob_hash, str)
+                or _HASH.fullmatch(blob_hash) is None
+                or not isinstance(content, bytes)
+                or not isinstance(kind, str)
+                or media_type.fullmatch(kind) is None
+                or len(kind.encode("utf-8")) > 128
+                or len(content) > MAX_TEMPLATE_BYTES
+                or "sha256:" + hashlib.sha256(content).hexdigest() != blob_hash
+            ):
+                raise StoreConflictError("bundle blob conflict")
+            try:
+                validate_fragment(content, max_bytes=MAX_TEMPLATE_BYTES)
+            except Exception as exc:
+                raise StoreConflictError("bundle blob conflict") from exc
+            if blob_hash in values:
+                raise StoreConflictError("bundle blob duplicate")
+            total += len(content)
+            if total > MAX_RECIPE_BYTES:
+                raise StoreConflictError("bundle blob limit")
+            values[blob_hash] = (blob_hash, content, kind)
+        return tuple(values[key] for key in sorted(values))
+
+    @staticmethod
+    def _bundle_receipt_values(
+        receipt: IngestionReceipt,
+    ) -> tuple[str, str, str, str, str, str]:
+        if type(receipt) is not IngestionReceipt:
+            raise StoreConflictError("bundle ingestion receipt conflict")
+        if (
+            _HASH.fullmatch(receipt.ingestion_key) is None
+            or _HASH.fullmatch(receipt.payload_hash) is None
+            or _HASH.fullmatch(receipt.episode_id) is None
+            or (
+                receipt.recipe_id is not None
+                and _HASH.fullmatch(receipt.recipe_id) is None
+            )
+            or not isinstance(receipt.status, AtlasStatus)
+            or receipt.status
+            in {
+                AtlasStatus.INGEST_PENDING,
+                AtlasStatus.ATLAS_UNAVAILABLE,
+                AtlasStatus.MODEL_UNAVAILABLE,
+            }
+            or receipt.created_at != ""
+            or len(receipt.reasons) > MAX_GRAPH_NODES
+            or any(
+                not isinstance(reason, str) or _BUNDLE_REASON.fullmatch(reason) is None
+                for reason in receipt.reasons
+            )
+            or receipt.reasons != tuple(sorted(set(receipt.reasons)))
+        ):
+            raise StoreConflictError("bundle ingestion receipt conflict")
+        try:
+            reasons = canonical_json(receipt.reasons)
+            validate_fragment(reasons, max_bytes=MAX_PACKET_BYTES)
+        except Exception as exc:
+            raise StoreConflictError("bundle ingestion receipt conflict") from exc
+        return (
+            receipt.payload_hash,
+            receipt.status.value,
+            receipt.episode_id,
+            receipt.recipe_id or "",
+            reasons,
+            receipt.created_at,
+        )
+
+    def _bundle_validate_shape(
+        self,
+        nodes: tuple[AtlasNode, ...],
+        edges: tuple[AtlasEdge, ...],
+        manifest: RecipeManifest | None,
+        linked_nodes: tuple[str, ...],
+        linked_edges: tuple[str, ...],
+        blobs: tuple[tuple[str, bytes, str], ...],
+        receipt: IngestionReceipt,
+    ) -> None:
+        if not nodes or not any(node.node_id == receipt.episode_id for node in nodes):
+            raise StoreConflictError("bundle episode conflict")
+        by_id = {node.node_id: node.kind for node in nodes}
+        if by_id.get(receipt.episode_id) is not NodeKind.TASK_EPISODE:
+            raise StoreConflictError("bundle episode conflict")
+        for edge in edges:
+            source_kind = by_id.get(edge.source_id)
+            target_kind = by_id.get(edge.target_id)
+            if source_kind is not None and source_kind is not edge.source_kind:
+                raise StoreConflictError("bundle edge endpoint conflict")
+            if target_kind is not None and target_kind is not edge.target_kind:
+                raise StoreConflictError("bundle edge endpoint conflict")
+        if manifest is None:
+            if (
+                linked_nodes
+                or linked_edges
+                or blobs
+                or receipt.recipe_id is not None
+                or receipt.status
+                not in {
+                    AtlasStatus.NO_VERIFIED_RECIPE,
+                    AtlasStatus.UNSUPPORTED_LANGUAGE,
+                    AtlasStatus.EVIDENCE_INCOMPLETE,
+                    AtlasStatus.RECIPE_QUARANTINED,
+                }
+                or not receipt.reasons
+            ):
+                raise StoreConflictError("bundle episode-only conflict")
+            return
+        if type(manifest) is not RecipeManifest:
+            raise StoreConflictError("bundle recipe conflict")
+        if (
+            manifest.recipe_id not in linked_nodes
+            or receipt.recipe_id != manifest.recipe_id
+            or by_id.get(manifest.recipe_id) is not NodeKind.RECIPE
+            or receipt.status is not AtlasStatus.READY
+            or receipt.reasons
+        ):
+            raise StoreConflictError("bundle recipe conflict")
+        try:
+            manifest_value = manifest.to_dict()
+            recipe_payload = dict(manifest_value)
+            del recipe_payload["recipe_id"]
+            recipe_node = next(
+                node for node in nodes if node.node_id == manifest.recipe_id
+            )
+            if canonical_json(recipe_node.payload) != canonical_json(recipe_payload):
+                raise StoreConflictError("bundle recipe conflict")
+            validate_fragment(
+                canonical_json(manifest_value), max_bytes=MAX_PACKET_BYTES
+            )
+        except StoreConflictError:
+            raise
+        except Exception as exc:
+            raise StoreConflictError("bundle recipe conflict") from exc
+
+    def _bundle_existing_receipt(
+        self,
+        receipt: IngestionReceipt,
+        values: tuple[str, str, str, str, str, str],
+    ) -> IngestionReceipt | None:
+        row = self._conn.execute(
+            "SELECT payload_hash,status,episode_id,recipe_id,reasons_json,created_at "
+            "FROM atlas_ingestion_receipts WHERE ingestion_key=?",
+            (receipt.ingestion_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if tuple(row) != values:
+            raise StoreConflictError("ingestion receipt conflict")
+        return receipt
+
+    def _bundle_validate_database(
+        self,
+        nodes: tuple[AtlasNode, ...],
+        edges: tuple[AtlasEdge, ...],
+        manifest: RecipeManifest | None,
+        linked_nodes: tuple[str, ...],
+        linked_edges: tuple[str, ...],
+        blobs: tuple[tuple[str, bytes, str], ...],
+        receipt: IngestionReceipt,
+        *,
+        require_existing: bool,
+    ) -> None:
+        kinds: dict[str, str] = {}
+        for node in nodes:
+            immutable = self._bundle_node_values(node)
+            row = self._conn.execute(
+                "SELECT kind,payload_json,schema_version,extractor_id,extractor_version,provenance,source_hashes_json FROM atlas_nodes WHERE node_id=?",
+                (node.node_id,),
+            ).fetchone()
+            if row is not None and tuple(row) != immutable:
+                raise StoreConflictError("node immutable payload conflict")
+            if require_existing and row is None:
+                raise StoreConflictError("ingestion receipt incomplete")
+            kinds[node.node_id] = node.kind.value
+        for edge in edges:
+            immutable = self._bundle_edge_values(edge)
+            row = self._conn.execute(
+                "SELECT source_id,target_id,relation,payload_json,schema_version,provenance FROM atlas_edges WHERE edge_id=?",
+                (edge.edge_id,),
+            ).fetchone()
+            if row is not None and tuple(row) != immutable:
+                raise StoreConflictError("edge immutable payload conflict")
+            if require_existing and row is None:
+                raise StoreConflictError("ingestion receipt incomplete")
+            for node_id, kind in (
+                (edge.source_id, edge.source_kind.value),
+                (edge.target_id, edge.target_kind.value),
+            ):
+                available = kinds.get(node_id)
+                if available is None:
+                    endpoint = self._conn.execute(
+                        "SELECT kind FROM atlas_nodes WHERE node_id=?", (node_id,)
+                    ).fetchone()
+                    available = None if endpoint is None else endpoint[0]
+                if available != kind:
+                    raise StoreConflictError("edge endpoint conflict")
+        episode = kinds.get(receipt.episode_id)
+        if episode is None:
+            row = self._conn.execute(
+                "SELECT kind FROM atlas_nodes WHERE node_id=?", (receipt.episode_id,)
+            ).fetchone()
+            episode = None if row is None else row[0]
+        if episode != NodeKind.TASK_EPISODE.value:
+            raise StoreConflictError("bundle episode conflict")
+        self._bundle_validate_recipe_database(
+            manifest,
+            linked_nodes,
+            linked_edges,
+            edges,
+            kinds,
+            require_existing,
+        )
+        for blob_hash, content, media_type in blobs:
+            row = self._conn.execute(
+                "SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?",
+                (blob_hash,),
+            ).fetchone()
+            path = self._blob_path(blob_hash)
+            if row is not None and tuple(row) != (len(content), media_type):
+                raise StoreConflictError("blob metadata conflict")
+            if require_existing and row is None:
+                raise StoreConflictError("ingestion receipt incomplete")
+            if row is not None or path.exists() or path.is_symlink():
+                self._bundle_verify_blob_file(path, blob_hash, content)
+            elif require_existing:
+                raise StoreConflictError("ingestion receipt incomplete")
+
+        if manifest is not None:
+            referenced = {operation.template_hash for operation in manifest.operations}
+            if any(_HASH.fullmatch(blob_hash) is None for blob_hash in referenced):
+                raise StoreConflictError("bundle blob conflict")
+            supplied = {blob_hash for blob_hash, _content, _media_type in blobs}
+            if supplied - referenced:
+                raise StoreConflictError("bundle blob conflict")
+            for blob_hash in sorted(referenced - supplied):
+                try:
+                    self.read_blob_verified(blob_hash, max_bytes=MAX_TEMPLATE_BYTES)
+                except StoreConflictError as exc:
+                    raise StoreConflictError("bundle blob missing") from exc
+
+    def _bundle_validate_recipe_database(
+        self,
+        manifest: RecipeManifest | None,
+        linked_nodes: tuple[str, ...],
+        linked_edges: tuple[str, ...],
+        edges: tuple[AtlasEdge, ...],
+        local_kinds: dict[str, str],
+        require_existing: bool,
+    ) -> None:
+        if manifest is None:
+            return
+        immutable = self._bundle_recipe_values(manifest)
+        row = self._conn.execute(
+            "SELECT intent_id,language,framework,layer,version,manifest_hash,repository_signature,state,supersedes_recipe_id FROM atlas_recipes WHERE recipe_id=?",
+            (manifest.recipe_id,),
+        ).fetchone()
+        if row is not None and tuple(row) != immutable:
+            raise StoreConflictError("recipe conflict")
+        if require_existing and row is None:
+            raise StoreConflictError("ingestion receipt incomplete")
+        recipe_kind = local_kinds.get(manifest.recipe_id)
+        if recipe_kind is None:
+            recipe_row = self._conn.execute(
+                "SELECT kind FROM atlas_nodes WHERE node_id=?", (manifest.recipe_id,)
+            ).fetchone()
+            recipe_kind = None if recipe_row is None else recipe_row[0]
+        if recipe_kind != NodeKind.RECIPE.value:
+            raise StoreConflictError("recipe node conflict")
+        for node_id in linked_nodes:
+            kind = local_kinds.get(node_id)
+            if kind is None:
+                node_row = self._conn.execute(
+                    "SELECT kind FROM atlas_nodes WHERE node_id=?", (node_id,)
+                ).fetchone()
+                kind = None if node_row is None else node_row[0]
+            if kind is None:
+                raise StoreConflictError("recipe node link conflict")
+        supplied_edges = {edge.edge_id: edge for edge in edges}
+        for edge_id in linked_edges:
+            supplied_edge = supplied_edges.get(edge_id)
+            if supplied_edge is not None:
+                endpoints = (supplied_edge.source_id, supplied_edge.target_id)
+            else:
+                edge_row = self._conn.execute(
+                    "SELECT source_id,target_id FROM atlas_edges WHERE edge_id=?",
+                    (edge_id,),
+                ).fetchone()
+                if edge_row is None:
+                    raise StoreConflictError("recipe edge link conflict")
+                endpoints = (edge_row[0], edge_row[1])
+            if endpoints[0] not in linked_nodes or endpoints[1] not in linked_nodes:
+                raise StoreConflictError("recipe edge link conflict")
+        if row is not None:
+            current_nodes = {
+                item[0]
+                for item in self._conn.execute(
+                    "SELECT node_id FROM atlas_recipe_nodes WHERE recipe_id=?",
+                    (manifest.recipe_id,),
+                )
+            }
+            current_edges = {
+                item[0]
+                for item in self._conn.execute(
+                    "SELECT edge_id FROM atlas_recipe_edges WHERE recipe_id=?",
+                    (manifest.recipe_id,),
+                )
+            }
+            if current_nodes != set(linked_nodes) or current_edges != set(linked_edges):
+                raise StoreConflictError("recipe link conflict")
+
+    @staticmethod
+    def _bundle_node_values(
+        node: AtlasNode,
+    ) -> tuple[str, str, str, str, str, str, str]:
+        return (
+            node.kind.value,
+            canonical_json(node.payload),
+            node.schema_version,
+            node.extractor_id,
+            node.extractor_version,
+            node.provenance,
+            canonical_json(node.source_hashes),
+        )
+
+    @staticmethod
+    def _bundle_edge_values(edge: AtlasEdge) -> tuple[str, str, str, str, str, str]:
+        return (
+            edge.source_id,
+            edge.target_id,
+            edge.relation.value,
+            canonical_json(edge.payload),
+            edge.schema_version,
+            edge.provenance,
+        )
+
+    @staticmethod
+    def _bundle_recipe_values(manifest: RecipeManifest) -> tuple[object, ...]:
+        return (
+            manifest.intent_id,
+            manifest.language_name,
+            manifest.framework_name or "",
+            manifest.layer,
+            manifest.version,
+            manifest.manifest_hash,
+            manifest.repository_signature,
+            manifest.quarantine_state or "ready",
+            manifest.superseded_ids[0] if manifest.superseded_ids else None,
+        )
+
+    def _bundle_publish_blob(
+        self,
+        blob_hash: str,
+        content: bytes,
+        _media_type: str,
+        created_paths: list[tuple[Path, tuple[int, int, int, int, int]]],
+        staged_paths: list[tuple[Path, tuple[int, int, int, int, int]]],
+    ) -> None:
+        path = self._blob_path(blob_hash)
+        existing = _safe_regular_identity(path, optional=True)
+        if existing is not None:
+            self._bundle_verify_blob_file(path, blob_hash, content)
+            return
+        self._bundle_prepare_blob_parent(path.parent)
+        _assert_safe_existing_path(path.parent)
+        temp: Path | None = None
+        temp_identity: tuple[int, int, int, int, int] | None = None
+        for _attempt in range(64):
+            candidate = path.with_name(
+                path.name + ".bundle-" + uuid.uuid4().hex + ".tmp"
+            )
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise StoreConflictError("blob write conflict") from exc
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                raise StoreConflictError("blob write conflict") from exc
+            temp = candidate
+            temp_identity = _safe_regular_identity(temp)
+            if temp_identity is None:
+                raise StoreConflictError("blob write conflict")
+            staged_paths.append((temp, temp_identity))
+            break
+        if temp is None or temp_identity is None:
+            raise StoreConflictError("blob write conflict")
+        try:
+            os.link(temp, path, follow_symlinks=False)
+        except FileExistsError:
+            self._bundle_verify_blob_file(path, blob_hash, content)
+        except OSError as exc:
+            raise StoreConflictError("blob write conflict") from exc
+        else:
+            created_identity = _safe_regular_identity(path)
+            if created_identity is None:
+                raise StoreConflictError("blob write conflict")
+            created_paths.append((path, created_identity))
+            self._bundle_verify_blob_file(path, blob_hash, content)
+        self._bundle_remove_owned_path(temp, temp_identity, strict=True)
+        staged_paths.remove((temp, temp_identity))
+
+    def _bundle_prepare_blob_parent(self, parent: Path) -> None:
+        _assert_safe_existing_path(self._cas_root)
+        try:
+            relative = parent.relative_to(self._cas_root)
+        except ValueError as exc:
+            raise StoreConflictError("blob path conflict") from exc
+        current = self._cas_root
+        for part in relative.parts:
+            current /= part
+            try:
+                current.mkdir(exist_ok=True)
+                value = current.lstat()
+            except OSError as exc:
+                raise StoreConflictError("blob path conflict") from exc
+            if _unsafe_file_status(current, value) or not stat.S_ISDIR(value.st_mode):
+                raise StoreConflictError("blob path conflict")
+        _assert_safe_existing_path(parent)
+
+    def _bundle_verify_blob_file(
+        self, path: Path, blob_hash: str, expected: bytes
+    ) -> None:
+        descriptor: int | None = None
+        try:
+            _assert_safe_existing_path(self._cas_root)
+            chain = _capture_safe_path_chain(path, require_regular=True)
+            before = path.lstat()
+            if not chain or _file_identity(before) != chain[-1][1]:
+                raise StoreConflictError("blob path conflict")
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+            )
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or _file_identity(
+                opened
+            ) != _file_identity(before):
+                raise StoreConflictError("blob path conflict")
+            chunks: list[bytes] = []
+            total = 0
+            while total <= len(expected):
+                chunk = os.read(descriptor, min(65_536, len(expected) + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if os.read(descriptor, 1) or total != len(expected):
+                raise StoreConflictError("blob filesystem conflict")
+            after_open = os.fstat(descriptor)
+            if _file_identity(opened) != _file_identity(after_open):
+                raise StoreConflictError("blob path conflict")
+            body = b"".join(chunks)
+            if (
+                body != expected
+                or "sha256:" + hashlib.sha256(body).hexdigest() != blob_hash
+            ):
+                raise StoreConflictError("blob filesystem conflict")
+            _assert_path_chain_unchanged(chain)
+            after = path.lstat()
+            if _file_identity(before) != _file_identity(after):
+                raise StoreConflictError("blob path conflict")
+        except StoreConflictError as exc:
+            if str(exc).startswith("blob "):
+                raise
+            raise StoreConflictError("blob path conflict") from exc
+        except OSError as exc:
+            raise StoreConflictError("blob path conflict") from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    raise StoreConflictError("blob path conflict") from exc
+
+    def _bundle_insert_blobs(self, blobs: tuple[tuple[str, bytes, str], ...]) -> None:
+        for blob_hash, content, media_type in blobs:
+            row = self._conn.execute(
+                "SELECT size,media_type FROM atlas_blobs WHERE blob_hash=?",
+                (blob_hash,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO atlas_blobs VALUES (?,?,?)",
+                    (blob_hash, len(content), media_type),
+                )
+
+    def _bundle_insert_nodes(self, nodes: tuple[AtlasNode, ...]) -> None:
+        for node in nodes:
+            if (
+                self._conn.execute(
+                    "SELECT 1 FROM atlas_nodes WHERE node_id=?", (node.node_id,)
+                ).fetchone()
+                is None
+            ):
+                self._conn.execute(
+                    "INSERT INTO atlas_nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        node.node_id,
+                        *self._bundle_node_values(node),
+                        node.created_at or "",
+                        node.superseded_at,
+                        node.quarantine_state or "",
+                    ),
+                )
+
+    def _bundle_insert_edges(self, edges: tuple[AtlasEdge, ...]) -> None:
+        for edge in edges:
+            if (
+                self._conn.execute(
+                    "SELECT 1 FROM atlas_edges WHERE edge_id=?", (edge.edge_id,)
+                ).fetchone()
+                is None
+            ):
+                self._conn.execute(
+                    "INSERT INTO atlas_edges VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        edge.edge_id,
+                        *self._bundle_edge_values(edge),
+                        edge.created_at or "",
+                    ),
+                )
+
+    def _bundle_insert_recipe(
+        self,
+        manifest: RecipeManifest | None,
+        linked_nodes: tuple[str, ...],
+        linked_edges: tuple[str, ...],
+    ) -> None:
+        if manifest is None:
+            return
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM atlas_recipes WHERE recipe_id=?", (manifest.recipe_id,)
+            ).fetchone()
+            is None
+        ):
+            self._conn.execute(
+                "INSERT INTO atlas_recipes VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (manifest.recipe_id, *self._bundle_recipe_values(manifest)),
+            )
+        for node_id in linked_nodes:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO atlas_recipe_nodes VALUES (?,?)",
+                (manifest.recipe_id, node_id),
+            )
+        for edge_id in linked_edges:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO atlas_recipe_edges VALUES (?,?)",
+                (manifest.recipe_id, edge_id),
+            )
+
+    def _bundle_insert_receipt(
+        self,
+        receipt: IngestionReceipt,
+        values: tuple[str, str, str, str, str, str],
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO atlas_ingestion_receipts VALUES (?,?,?,?,?,?,?)",
+            (receipt.ingestion_key, *values),
+        )
+
+    def _bundle_commit(self) -> None:
+        self._conn.commit()
+
+    @staticmethod
+    def _bundle_remove_owned_path(
+        path: Path,
+        identity: tuple[int, int, int, int, int],
+        *,
+        strict: bool,
+    ) -> None:
+        try:
+            current = _safe_regular_identity(path, optional=True)
+            if current is None:
+                return
+            if current != identity:
+                if strict:
+                    raise StoreConflictError("blob cleanup conflict")
+                return
+            path.unlink()
+        except StoreConflictError:
+            if strict:
+                raise
+        except OSError:
+            if strict:
+                raise StoreConflictError("blob cleanup conflict") from None
+
+    def _bundle_cleanup_paths(
+        self,
+        staged_paths: list[tuple[Path, tuple[int, int, int, int, int]]],
+        created_paths: list[tuple[Path, tuple[int, int, int, int, int]]],
+    ) -> None:
+        for path, identity in reversed(staged_paths):
+            self._bundle_remove_owned_path(path, identity, strict=False)
+        for path, identity in reversed(created_paths):
+            self._bundle_remove_owned_path(path, identity, strict=False)
 
     def get_ingestion_receipt(self, ingestion_key: str) -> IngestionReceipt | None:
         row = self._conn.execute(

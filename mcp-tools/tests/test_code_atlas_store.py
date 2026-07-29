@@ -34,7 +34,12 @@ from code_atlas.models import (
 from code_atlas.canonical import canonical_hash, canonical_json
 from code_atlas import store as store_module
 from code_atlas.store import AtlasStore, StoreConflictError
-from code_atlas.security import MAX_GRAPH_NODES, MAX_PACKET_BYTES, MAX_TEMPLATE_BYTES
+from code_atlas.security import (
+    MAX_GRAPH_NODES,
+    MAX_PACKET_BYTES,
+    MAX_RECIPE_BYTES,
+    MAX_TEMPLATE_BYTES,
+)
 
 
 def store_at(tmp_path: Path) -> AtlasStore:
@@ -344,6 +349,504 @@ def test_verified_cas_and_receipts_are_idempotent_or_conflicting(
     assert store.get_packet("packet") == packet
     assert store.get_ingestion_receipt("key") == receipt
     store.close()
+
+
+def _ingestion_bundle_fixture() -> tuple[
+    tuple[AtlasNode, ...],
+    tuple[AtlasEdge, ...],
+    RecipeManifest,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[tuple[str, bytes, str], ...],
+    IngestionReceipt,
+]:
+    """Create one complete observed recipe bundle with deterministic identities."""
+
+    template = b"def ${symbol_000}() -> int:\n    return 1\n"
+    template_hash = "sha256:" + hashlib.sha256(template).hexdigest()
+    manifest = RecipeManifest(
+        recipe_id="",
+        recipe_key="python.atomic-bundle",
+        version=1,
+        intent_id="python.atomic-bundle",
+        language_name="python",
+        language_extractor_version="1",
+        repository_signature="sha256:" + "1" * 64,
+        layer="local",
+        manifest_hash="sha256:" + "2" * 64,
+        slots=(
+            SlotSpec("path_000", "relative_python_path"),
+            SlotSpec("symbol_000", "python_identifier"),
+        ),
+        constraints=(
+            ConstraintSpec("path_suffix", "path_000", ".py"),
+            ConstraintSpec("required_symbol", "symbol_000", "created"),
+        ),
+        operations=(
+            TemplateOperation("create_python_file", "path_000", template_hash),
+        ),
+        provenance_kind="observed",
+        provenance_source="accepted_task",
+    )
+    intent = AtlasNode.create(NodeKind.INTENT, {"intent_id": manifest.intent_id})
+    episode = AtlasNode.create(
+        NodeKind.TASK_EPISODE,
+        {"acceptance_id_hash": "sha256:" + "3" * 64, "task_kind": "code"},
+    )
+    recipe_payload = manifest.to_dict()
+    del recipe_payload["recipe_id"]
+    recipe = AtlasNode.create(NodeKind.RECIPE, recipe_payload)
+    manifest = replace(manifest, recipe_id=recipe.node_id)
+    template_node = AtlasNode.create(
+        NodeKind.CODE_TEMPLATE,
+        {"template_hash": template_hash, "kind": "create_python_file"},
+    )
+    nodes = (intent, episode, recipe, template_node)
+    edges = (
+        AtlasEdge.create(EdgeRelation.SOLVES, episode, intent),
+        AtlasEdge.create(EdgeRelation.SOLVES, recipe, intent),
+        AtlasEdge.create(EdgeRelation.DERIVED_FROM, recipe, episode),
+        AtlasEdge.create(EdgeRelation.HAS_IMPLEMENTATION, recipe, template_node),
+    )
+    receipt = IngestionReceipt(
+        ingestion_key="sha256:" + "4" * 64,
+        payload_hash="sha256:" + "5" * 64,
+        status=AtlasStatus.READY,
+        episode_id=episode.node_id,
+        recipe_id=recipe.node_id,
+        reasons=(),
+    )
+    return (
+        nodes,
+        edges,
+        manifest,
+        tuple(node.node_id for node in nodes),
+        tuple(edge.edge_id for edge in edges),
+        ((template_hash, template, "text/x-python"),),
+        receipt,
+    )
+
+
+def _put_ingestion_bundle(
+    store: AtlasStore,
+    fixture: tuple[
+        tuple[AtlasNode, ...],
+        tuple[AtlasEdge, ...],
+        RecipeManifest,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[tuple[str, bytes, str], ...],
+        IngestionReceipt,
+    ],
+) -> IngestionReceipt:
+    nodes, edges, manifest, node_ids, edge_ids, blobs, receipt = fixture
+    return store.put_ingestion_bundle(
+        nodes=nodes,
+        edges=edges,
+        manifest=manifest,
+        recipe_node_ids=node_ids,
+        recipe_edge_ids=edge_ids,
+        blobs=blobs,
+        receipt=receipt,
+    )
+
+
+def _bundle_counts(store: AtlasStore) -> tuple[int, int, int, int, int]:
+    return tuple(
+        int(store._conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+        for table in (
+            "atlas_nodes",
+            "atlas_edges",
+            "atlas_recipes",
+            "atlas_blobs",
+            "atlas_ingestion_receipts",
+        )
+    )
+
+
+def test_ingestion_bundle_persists_one_atomic_recipe_projection(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+    nodes, _edges, manifest, _node_ids, _edge_ids, blobs, receipt = fixture
+
+    assert _put_ingestion_bundle(store, fixture) == receipt
+    assert store.get_ingestion_receipt(receipt.ingestion_key) == receipt
+    assert _bundle_counts(store) == (len(nodes), 4, 1, 1, 1)
+    assert store.read_blob(blobs[0][0]) == blobs[0][1]
+    assert store.recipe_metadata(manifest.recipe_id) is not None
+    store.close()
+
+
+def test_ingestion_bundle_persists_an_episode_only_projection(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    intent = AtlasNode.create(NodeKind.INTENT, {"intent_id": "python.episode-only"})
+    episode = AtlasNode.create(NodeKind.TASK_EPISODE, {"task_kind": "code"})
+    edge = AtlasEdge.create(EdgeRelation.SOLVES, episode, intent)
+    receipt = IngestionReceipt(
+        ingestion_key="sha256:" + "6" * 64,
+        payload_hash="sha256:" + "7" * 64,
+        status=AtlasStatus.EVIDENCE_INCOMPLETE,
+        episode_id=episode.node_id,
+        reasons=("UNSUPPORTED_LANGUAGE",),
+    )
+
+    assert (
+        store.put_ingestion_bundle(
+            nodes=(intent, episode),
+            edges=(edge,),
+            manifest=None,
+            recipe_node_ids=(),
+            recipe_edge_ids=(),
+            blobs=(),
+            receipt=receipt,
+        )
+        == receipt
+    )
+    assert _bundle_counts(store) == (2, 1, 0, 0, 1)
+    store.close()
+
+
+def test_ingestion_bundle_replays_exactly_and_conflicts_before_mutation(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+    _put_ingestion_bundle(store, fixture)
+    before = _bundle_counts(store)
+
+    assert _put_ingestion_bundle(store, fixture) == fixture[-1]
+    assert _bundle_counts(store) == before
+    conflicting = (
+        *fixture[:-1],
+        replace(fixture[-1], payload_hash="sha256:" + "8" * 64),
+    )
+    with pytest.raises(StoreConflictError, match="ingestion receipt"):
+        _put_ingestion_bundle(store, conflicting)
+    assert _bundle_counts(store) == before
+    store.close()
+
+
+def test_ingestion_bundle_requires_complete_and_exact_recipe_templates(
+    tmp_path: Path,
+) -> None:
+    fixture = _ingestion_bundle_fixture()
+    blob_hash, content, media_type = fixture[5][0]
+    extra = b"def unrelated() -> None:\n    pass\n"
+    extra_hash = "sha256:" + hashlib.sha256(extra).hexdigest()
+    invalid_cases = (
+        (*fixture[:5], (), fixture[6]),
+        (*fixture[:5], (fixture[5][0], (extra_hash, extra, media_type)), fixture[6]),
+    )
+    for index, candidate in enumerate(invalid_cases):
+        store = store_at(tmp_path / f"template-invalid-{index}")
+        with pytest.raises(StoreConflictError, match="bundle blob"):
+            _put_ingestion_bundle(store, candidate)
+        assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+        store.close()
+
+    adopted = store_at(tmp_path / "template-adopted")
+    adopted.put_blob(blob_hash, content, media_type)
+    existing_case = (*fixture[:5], (), fixture[6])
+    assert _put_ingestion_bundle(adopted, existing_case) == fixture[6]
+    assert adopted.read_blob(blob_hash) == content
+    adopted.close()
+
+
+def test_ingestion_bundle_rejects_unstable_receipts_and_recipe_status_mismatch(
+    tmp_path: Path,
+) -> None:
+    fixture = _ingestion_bundle_fixture()
+    recipe_receipt = fixture[6]
+    episode_intent = AtlasNode.create(NodeKind.INTENT, {"intent_id": "python.gap"})
+    episode = AtlasNode.create(NodeKind.TASK_EPISODE, {"task_kind": "code"})
+    episode_edge = AtlasEdge.create(EdgeRelation.SOLVES, episode, episode_intent)
+    episode_receipt = IngestionReceipt(
+        ingestion_key="sha256:" + "d" * 64,
+        payload_hash="sha256:" + "e" * 64,
+        status=AtlasStatus.EVIDENCE_INCOMPLETE,
+        episode_id=episode.node_id,
+        reasons=("PARSER_GAP",),
+    )
+    recipe_cases = (
+        replace(recipe_receipt, status=AtlasStatus.EVIDENCE_INCOMPLETE),
+        replace(recipe_receipt, reasons=("UNEXPECTED",)),
+        replace(recipe_receipt, created_at="2026-07-29T00:00:00Z"),
+        replace(recipe_receipt, reasons=("not-stable",)),
+    )
+    for index, receipt in enumerate(recipe_cases):
+        store = store_at(tmp_path / f"recipe-receipt-{index}")
+        candidate = (*fixture[:-1], receipt)
+        with pytest.raises(StoreConflictError, match="bundle"):
+            _put_ingestion_bundle(store, candidate)
+        assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+        store.close()
+
+    for index, receipt in enumerate(
+        (
+            replace(episode_receipt, status=AtlasStatus.READY, reasons=()),
+            replace(episode_receipt, reasons=()),
+            replace(episode_receipt, reasons=("PARSER_GAP", "PARSER_GAP")),
+            replace(episode_receipt, reasons=(1,)),
+        )
+    ):
+        store = store_at(tmp_path / f"episode-receipt-{index}")
+        with pytest.raises(StoreConflictError, match="bundle"):
+            store.put_ingestion_bundle(
+                nodes=(episode_intent, episode),
+                edges=(episode_edge,),
+                manifest=None,
+                recipe_node_ids=(),
+                recipe_edge_ids=(),
+                blobs=(),
+                receipt=receipt,
+            )
+        assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+        store.close()
+
+
+def test_ingestion_bundle_prevalidates_every_recipe_link_endpoint(
+    tmp_path: Path,
+) -> None:
+    fixture = _ingestion_bundle_fixture()
+    missing_edge = "sha256:" + "f" * 64
+    cases = (
+        (*fixture[:4], (missing_edge,), fixture[5], fixture[6]),
+        (
+            *fixture[:3],
+            tuple(
+                node_id for node_id in fixture[3] if node_id != fixture[0][1].node_id
+            ),
+            fixture[4],
+            fixture[5],
+            fixture[6],
+        ),
+    )
+    for index, candidate in enumerate(cases):
+        store = store_at(tmp_path / f"link-invalid-{index}")
+        with pytest.raises(StoreConflictError, match="recipe edge link"):
+            _put_ingestion_bundle(store, candidate)
+        assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+        store.close()
+
+
+def test_ingestion_bundle_requires_recipe_node_to_match_manifest(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+    mismatched_manifest = replace(fixture[2], version=2)
+    candidate = (
+        fixture[0],
+        fixture[1],
+        mismatched_manifest,
+        fixture[3],
+        fixture[4],
+        fixture[5],
+        fixture[6],
+    )
+
+    with pytest.raises(StoreConflictError, match="bundle recipe"):
+        _put_ingestion_bundle(store, candidate)
+    assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        "_bundle_publish_blob",
+        "_bundle_insert_blobs",
+        "_bundle_insert_nodes",
+        "_bundle_insert_edges",
+        "_bundle_insert_recipe",
+        "_bundle_insert_receipt",
+        "_bundle_commit",
+    ),
+)
+def test_ingestion_bundle_rolls_back_every_logical_write_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise StoreConflictError("forced bundle failure")
+
+    monkeypatch.setattr(store, stage, fail)
+    with pytest.raises(StoreConflictError, match="forced bundle failure"):
+        _put_ingestion_bundle(store, fixture)
+    assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+    blob_hash = fixture[5][0][0]
+    blob_path = tmp_path / "cas" / "sha256" / blob_hash[7:9] / blob_hash[9:]
+    assert not blob_path.exists()
+    store.close()
+
+
+def test_ingestion_bundle_preserves_existing_cas_and_adopts_verified_orphans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+    blob_hash, content, media_type = fixture[5][0]
+    store.put_blob(blob_hash, content, media_type)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise StoreConflictError("forced receipt failure")
+
+    monkeypatch.setattr(store, "_bundle_insert_receipt", fail)
+    with pytest.raises(StoreConflictError, match="forced receipt failure"):
+        _put_ingestion_bundle(store, fixture)
+    assert store.read_blob(blob_hash) == content
+    assert _bundle_counts(store) == (0, 0, 0, 1, 0)
+    store.close()
+
+    orphan_store = store_at(tmp_path / "orphan")
+    orphan_path = (
+        tmp_path / "orphan" / "cas" / "sha256" / blob_hash[7:9] / blob_hash[9:]
+    )
+    orphan_path.parent.mkdir(parents=True)
+    orphan_path.write_bytes(content)
+
+    def forbid_plain_path_read(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("bundle orphan verification must use the no-follow reader")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_plain_path_read)
+    assert _put_ingestion_bundle(orphan_store, fixture) == fixture[-1]
+    assert orphan_store.read_blob(blob_hash) == content
+    orphan_store.close()
+
+
+def test_ingestion_bundle_rejects_a_mismatching_orphan_and_reopens(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+    blob_hash, _content, _media_type = fixture[5][0]
+    path = tmp_path / "cas" / "sha256" / blob_hash[7:9] / blob_hash[9:]
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"mismatching orphan")
+
+    with pytest.raises(StoreConflictError, match="blob"):
+        _put_ingestion_bundle(store, fixture)
+    assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+    assert path.read_bytes() == b"mismatching orphan"
+    store.close()
+
+    clean = store_at(tmp_path / "restart")
+    assert _put_ingestion_bundle(clean, fixture) == fixture[-1]
+    clean.close()
+    reopened = store_at(tmp_path / "restart")
+    assert reopened.get_ingestion_receipt(fixture[-1].ingestion_key) == fixture[-1]
+    assert reopened.read_blob(fixture[5][0][0]) == fixture[5][0][1]
+    reopened.close()
+
+
+@pytest.mark.parametrize("kind", ("directory", "symlink"))
+def test_ingestion_bundle_rejects_unsafe_orphan_file_types(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+    blob_hash = fixture[5][0][0]
+    path = tmp_path / "cas" / "sha256" / blob_hash[7:9] / blob_hash[9:]
+    path.parent.mkdir(parents=True)
+    if kind == "directory":
+        path.mkdir()
+    else:
+        target = tmp_path / "untrusted-template"
+        target.write_bytes(fixture[5][0][1])
+        try:
+            os.symlink(target, path)
+        except OSError:
+            pytest.skip("symlinks are unavailable for this test account")
+
+    with pytest.raises(StoreConflictError, match="blob"):
+        _put_ingestion_bundle(store, fixture)
+    assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+    store.close()
+
+
+def test_ingestion_bundle_rechecks_blob_parent_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_at(tmp_path)
+    fixture = _ingestion_bundle_fixture()
+    blob_hash = fixture[5][0][0]
+    parent = tmp_path / "cas" / "sha256" / blob_hash[7:9]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_prepare = store._bundle_prepare_blob_parent
+
+    def swap_parent(candidate: Path) -> None:
+        original_prepare(candidate)
+        try:
+            os.rmdir(parent)
+            os.symlink(outside, parent, target_is_directory=True)
+        except OSError:
+            pytest.skip("parent symlink swaps are unavailable for this test account")
+
+    monkeypatch.setattr(store, "_bundle_prepare_blob_parent", swap_parent)
+    with pytest.raises(StoreConflictError, match="blob"):
+        _put_ingestion_bundle(store, fixture)
+    assert not tuple(outside.iterdir())
+    assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+    store.close()
+
+
+def test_ingestion_bundle_rejects_blob_bounds_metadata_and_duplicates_before_write(
+    tmp_path: Path,
+) -> None:
+    fixture = _ingestion_bundle_fixture()
+    blob_hash, content, media_type = fixture[5][0]
+
+    invalid_cases = (
+        (*fixture[:5], (fixture[5][0], fixture[5][0]), fixture[6]),
+        (*fixture[:5], ((blob_hash, content, "not-a-media-type"),), fixture[6]),
+        (
+            *fixture[:5],
+            tuple(
+                (
+                    "sha256:"
+                    + hashlib.sha256(
+                        b"x" * (MAX_TEMPLATE_BYTES - 1) + str(index).encode("ascii")
+                    ).hexdigest(),
+                    b"x" * (MAX_TEMPLATE_BYTES - 1) + str(index).encode("ascii"),
+                    media_type,
+                )
+                for index in range(5)
+            ),
+            fixture[6],
+        ),
+        (
+            *fixture[:5],
+            tuple(
+                (
+                    "sha256:" + hashlib.sha256(f"blob-{index}".encode()).hexdigest(),
+                    f"blob-{index}".encode(),
+                    media_type,
+                )
+                for index in range(MAX_GRAPH_NODES + 1)
+            ),
+            fixture[6],
+        ),
+    )
+    assert 5 * MAX_TEMPLATE_BYTES > MAX_RECIPE_BYTES
+
+    for index, candidate in enumerate(invalid_cases):
+        store = store_at(tmp_path / f"invalid-{index}")
+        with pytest.raises(StoreConflictError, match="bundle blob"):
+            _put_ingestion_bundle(store, candidate)
+        assert _bundle_counts(store) == (0, 0, 0, 0, 0)
+        store.close()
 
 
 def test_recipe_links_and_bounded_bidirectional_query(tmp_path: Path) -> None:
