@@ -310,6 +310,58 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
         finally:
             migrated.close()
 
+    def test_v4_database_additively_migrates_receipt_trust_tables_and_keeps_data(
+        self,
+    ) -> None:
+        legacy_database = Path(self._temporary_directory.name) / "legacy-v4.sqlite"
+        seeded = SQLiteStore(legacy_database)
+        try:
+            seeded.create_workflow(
+                Workflow(
+                    "legacy-v4-workflow",
+                    WorkflowKind.DAG,
+                    "legacy",
+                    "summary",
+                    WorkflowState.RUNNING,
+                )
+            )
+            seeded.register_task(
+                Task(
+                    "legacy-v4-task",
+                    "legacy-v4-workflow",
+                    "legacy task",
+                    "worker",
+                )
+            )
+        finally:
+            seeded.close()
+
+        connection = sqlite3.connect(legacy_database)
+        try:
+            connection.execute("DROP TABLE IF EXISTS code_task_receipt_owners")
+            connection.execute("DROP TABLE IF EXISTS code_task_receipt_attestations")
+            connection.execute(
+                "UPDATE schema_metadata SET value = '4' WHERE key = 'schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = SQLiteStore(legacy_database)
+        try:
+            self.assertEqual(5, migrated.schema_version())
+            table_names = {
+                str(row["name"])
+                for row in migrated._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            self.assertIn("code_task_receipt_attestations", table_names)
+            self.assertIn("code_task_receipt_owners", table_names)
+            self.assertEqual("legacy task", migrated.get_task("legacy-v4-task").title)
+        finally:
+            migrated.close()
+
     def test_claim_running_task_requires_expired_lease_for_takeover(self) -> None:
         task = self._register_task("running-claim", TaskState.RUNNING)
         original = self.store.acquire_lease(

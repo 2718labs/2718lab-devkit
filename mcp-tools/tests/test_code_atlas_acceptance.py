@@ -22,6 +22,7 @@ from orchestrator.models import (  # noqa: E402
     AtlasOutboxState,
     Task,
     TaskKind,
+    TaskState,
     Workflow,
     WorkflowKind,
     WorkflowState,
@@ -29,6 +30,7 @@ from orchestrator.models import (  # noqa: E402
 from orchestrator.service import OrchestratorService, ServiceError  # noqa: E402
 from orchestrator.store import (  # noqa: E402
     AcceptanceConflictError,
+    AcceptanceEvidenceError,
     SQLiteStore,
     StoreError,
 )
@@ -37,8 +39,9 @@ from project_index.service import ProjectIndexService  # noqa: E402
 from temp_support import task_scratch  # noqa: E402
 
 
-class CodeTaskAcceptanceServiceTests(unittest.TestCase):
+class CodeTaskAcceptanceFixture(unittest.TestCase):
     _NOW = "2026-07-29T01:00:00+00:00"
+    _COMPLETE_IN_SETUP = False
 
     def setUp(self) -> None:
         scratch = task_scratch("code-atlas-acceptance")
@@ -167,9 +170,11 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             expires_at="2099-01-01T00:00:00+00:00",
             now=self._NOW,
         )
-        self._complete_code_task()
+        self._prepare_code_task_completion()
+        if self._COMPLETE_IN_SETUP:
+            self._complete_code_task()
 
-    def _complete_code_task(self) -> None:
+    def _prepare_code_task_completion(self) -> None:
         input_query = self.index.query(
             self.workspace, self.input_snapshot.snapshot_id, "value"
         )
@@ -228,22 +233,23 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         )
 
         self.execution_receipts = self._capture_receipts()
-        receipt_ids = tuple(
+        self.receipt_ids = tuple(
             sorted(receipt.receipt_id for receipt in self.execution_receipts)
         )
         workspace_hashes = {
             receipt.workspace_hash for receipt in self.execution_receipts
         }
         self.assertEqual(1, len(workspace_hashes))
-        expected_completed_version = self.running_task.version + 1
-        self.receipt_attestation = SQLiteStore.build_code_task_receipt_attestation(
-            workflow_id="workflow",
-            code_task_id="code-task",
-            code_task_version=expected_completed_version,
-            input_snapshot_id=self.input_snapshot.snapshot_id,
-            output_snapshot_id=self.output_snapshot.snapshot_id,
-            workspace_hash=next(iter(workspace_hashes)),
-            execution_receipt_ids=receipt_ids,
+        self.expected_receipt_attestation = (
+            SQLiteStore.build_code_task_receipt_attestation(
+                workflow_id="workflow",
+                code_task_id="code-task",
+                code_task_version=self.running_task.version + 1,
+                input_snapshot_id=self.input_snapshot.snapshot_id,
+                output_snapshot_id=self.output_snapshot.snapshot_id,
+                workspace_hash=next(iter(workspace_hashes)),
+                execution_receipt_ids=self.receipt_ids,
+            )
         )
         self.verification_hash = "sha256:" + "a" * 64
         self.service.register_artifact(
@@ -259,28 +265,22 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             snapshot_id=self.output_snapshot.snapshot_id,
             now=self._NOW,
         )
-        self.service.register_artifact(
-            "workflow",
-            "code-task",
-            owner="worker-owner",
-            epoch=self.worker_lease.epoch,
-            kind="verification",
-            content_hash=self.receipt_attestation.attestation_hash,
-            safe_path="evidence/receipt-attestation.json",
-            size=0,
-            redaction_version="r1",
-            snapshot_id=self.output_snapshot.snapshot_id,
-            now=self._NOW,
-        )
+
+    def _complete_code_task(self) -> None:
         self.completed_task = self.service.complete_task(
             "code-task",
             expected_version=self.running_task.version,
             owner="worker-owner",
             epoch=self.worker_lease.epoch,
             result_hash=self.verification_hash,
+            execution_receipt_ids=list(self.receipt_ids),
             now=self._NOW,
         )
-        self.assertEqual(expected_completed_version, self.completed_task.version)
+        self.assertEqual(self.running_task.version + 1, self.completed_task.version)
+        self.receipt_attestation = self.store.code_task_receipt_attestation_for_task(
+            "code-task"
+        )
+        self.assertEqual(self.expected_receipt_attestation, self.receipt_attestation)
 
     def _capture_receipts(
         self,
@@ -377,6 +377,10 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         ).encode("utf-8")
         return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
+
+class CodeTaskAcceptanceServiceTests(CodeTaskAcceptanceFixture):
+    _COMPLETE_IN_SETUP = True
+
     def test_accepts_current_receipt_bound_code_task_once(self) -> None:
         self.assertNotEqual(
             self.execution_receipts[0].output_hash,
@@ -416,6 +420,64 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         self.assertEqual(
             binding, self.store.evidence_binding_for_ingestion(outbox.ingestion_key)
         )
+        self.assertEqual(
+            self.receipt_attestation,
+            self.store.code_task_receipt_attestation_for_acceptance(
+                acceptance.acceptance_id
+            ),
+        )
+        self.assertIsNone(
+            self.store.get_artifact(self.receipt_attestation.attestation_hash)
+        )
+
+    def test_generic_verification_artifact_cannot_replace_typed_attestation(
+        self,
+    ) -> None:
+        with self.store._transaction() as cursor:
+            cursor.execute(
+                "DELETE FROM code_task_receipt_owners WHERE task_id = ?",
+                ("code-task",),
+            )
+            cursor.execute(
+                "DELETE FROM code_task_receipt_attestations WHERE task_id = ?",
+                ("code-task",),
+            )
+            cursor.execute(
+                """
+                INSERT INTO artifacts (
+                    content_hash, kind, safe_path, size, redaction_version, created_at
+                ) VALUES (?, 'verification', ?, 0, 'r1', ?)
+                """,
+                (
+                    self.receipt_attestation.attestation_hash,
+                    "evidence/legacy-receipt-attestation.json",
+                    self._NOW,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO artifact_owners (content_hash, task_id)
+                VALUES (?, ?)
+                """,
+                (self.receipt_attestation.attestation_hash, "code-task"),
+            )
+            cursor.execute(
+                """
+                INSERT INTO task_index_verification_artifacts (
+                    task_id, content_hash, snapshot_id
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    "code-task",
+                    self.receipt_attestation.attestation_hash,
+                    self.output_snapshot.snapshot_id,
+                ),
+            )
+
+        self.assertIsNotNone(
+            self.store.get_artifact(self.receipt_attestation.attestation_hash)
+        )
+        self._assert_acceptance_rejected("EVIDENCE_INCOMPLETE")
 
     def test_receipt_attestation_hash_binds_every_task_evidence_dimension(self) -> None:
         arguments: dict[str, object] = {
@@ -462,6 +524,87 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
                         **changed
                     ).attestation_hash,
                 )
+
+    def test_typed_attestation_recovery_rejects_field_hash_and_set_tampering(
+        self,
+    ) -> None:
+        acceptance, _ = self._accept()
+        row = self.store._connection.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            ("code-task",),
+        ).fetchone()
+        originals = {
+            "workspace_hash": str(row["workspace_hash"]),
+            "attestation_hash": str(row["attestation_hash"]),
+            "execution_receipt_ids": str(row["execution_receipt_ids"]),
+        }
+        mutations = {
+            "workspace_hash": "sha256:" + "d" * 64,
+            "attestation_hash": "sha256:" + "e" * 64,
+            "execution_receipt_ids": json.dumps(
+                [self.receipt_ids[0]], separators=(",", ":")
+            ),
+        }
+
+        self.store._connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            for field_name, value in mutations.items():
+                self.store._connection.execute(
+                    f"""
+                    UPDATE code_task_receipt_attestations
+                    SET {field_name} = ?
+                    WHERE task_id = ?
+                    """,
+                    (value, "code-task"),
+                )
+                with self.subTest(field_name=field_name):
+                    with self.assertRaises(AcceptanceConflictError):
+                        self.store.code_task_receipt_attestation_for_task("code-task")
+                    with self.assertRaises(AcceptanceConflictError):
+                        self.store.code_task_receipt_attestation_for_acceptance(
+                            acceptance.acceptance_id
+                        )
+                self.store._connection.execute(
+                    f"""
+                    UPDATE code_task_receipt_attestations
+                    SET {field_name} = ?
+                    WHERE task_id = ?
+                    """,
+                    (originals[field_name], "code-task"),
+                )
+        finally:
+            for field_name, value in originals.items():
+                self.store._connection.execute(
+                    f"""
+                    UPDATE code_task_receipt_attestations
+                    SET {field_name} = ?
+                    WHERE task_id = ?
+                    """,
+                    (value, "code-task"),
+                )
+            self.store._connection.execute("PRAGMA foreign_keys = ON")
+
+        self.assertEqual(
+            self.receipt_attestation,
+            self.store.code_task_receipt_attestation_for_acceptance(
+                acceptance.acceptance_id
+            ),
+        )
+
+    def test_typed_attestation_recovery_rejects_owner_row_tampering(self) -> None:
+        acceptance, _ = self._accept()
+        removed_receipt_id = self.receipt_ids[0]
+        self.store._connection.execute(
+            "DELETE FROM code_task_receipt_owners WHERE receipt_id = ?",
+            (removed_receipt_id,),
+        )
+
+        with self.assertRaises(AcceptanceConflictError):
+            self.store.code_task_receipt_attestation_for_task("code-task")
+        with self.assertRaises(AcceptanceConflictError):
+            self.store.code_task_receipt_attestation_for_acceptance(
+                acceptance.acceptance_id
+            )
 
     def test_evidence_binding_matches_frozen_golden_vector(self) -> None:
         binding = SQLiteStore.build_code_task_evidence_binding(
@@ -649,6 +792,21 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             ),
         )
 
+        with self.assertRaises(AcceptanceConflictError):
+            self.store.complete_task(
+                "code-task",
+                TaskState.DONE,
+                self.running_task.version,
+                "worker-owner",
+                self.worker_lease.epoch,
+                result_hash=self.verification_hash,
+                receipt_attestation=unrelated_attestation,
+                now=self._NOW,
+            )
+        self.assertEqual(
+            self.receipt_attestation,
+            self.store.code_task_receipt_attestation_for_task("code-task"),
+        )
         with self.assertRaises(ServiceError) as raised:
             self.service.register_artifact(
                 "workflow",
@@ -922,6 +1080,261 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             SQLiteStore.build_code_task_evidence_binding(**arguments)
+
+
+class CodeTaskCompletionAttestationTests(CodeTaskAcceptanceFixture):
+    def _assert_completion_evidence_rejected(
+        self, execution_receipt_ids: list[str]
+    ) -> None:
+        with self.assertRaises(ServiceError) as raised:
+            self.service.complete_task(
+                "code-task",
+                expected_version=self.running_task.version,
+                owner="worker-owner",
+                epoch=self.worker_lease.epoch,
+                result_hash=self.verification_hash,
+                execution_receipt_ids=execution_receipt_ids,
+                now=self._NOW,
+            )
+
+        self.assertEqual("EVIDENCE_INCOMPLETE", raised.exception.code)
+        self.assertEqual(TaskState.RUNNING, self.store.get_task("code-task").state)
+        self.assertIsNone(
+            self.store.code_task_receipt_attestation_for_task("code-task")
+        )
+        owner_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM code_task_receipt_owners WHERE task_id = ?",
+            ("code-task",),
+        ).fetchone()[0]
+        self.assertEqual(0, owner_count)
+
+    def test_service_code_completion_requires_receipt_ids_atomically(self) -> None:
+        with self.assertRaises(ServiceError) as raised:
+            self.service.complete_task(
+                "code-task",
+                expected_version=self.running_task.version,
+                owner="worker-owner",
+                epoch=self.worker_lease.epoch,
+                result_hash=self.verification_hash,
+                now=self._NOW,
+            )
+
+        self.assertEqual("EVIDENCE_INCOMPLETE", raised.exception.code)
+        self.assertEqual(TaskState.RUNNING, self.store.get_task("code-task").state)
+        self.assertIsNone(
+            self.store.code_task_receipt_attestation_for_task("code-task")
+        )
+
+    def test_store_code_completion_requires_typed_attestation_atomically(self) -> None:
+        with self.assertRaises(AcceptanceEvidenceError):
+            self.store.complete_task(
+                "code-task",
+                TaskState.DONE,
+                self.running_task.version,
+                "worker-owner",
+                self.worker_lease.epoch,
+                result_hash=self.verification_hash,
+                now=self._NOW,
+            )
+
+        self.assertEqual(TaskState.RUNNING, self.store.get_task("code-task").state)
+        self.assertIsNone(
+            self.store.code_task_receipt_attestation_for_task("code-task")
+        )
+
+    def test_invalid_raw_receipts_roll_back_code_completion_and_attestation(
+        self,
+    ) -> None:
+        failed = self._capture_receipts(suffix="completion-failed", command_exit_code=1)
+        self._assert_completion_evidence_rejected(
+            [receipt.receipt_id for receipt in failed]
+        )
+
+        other_workspace = self.root / "completion-other-workspace"
+        other_workspace.mkdir()
+        foreign = self._capture_receipts(
+            suffix="completion-foreign", workspace=str(other_workspace)
+        )
+        self._assert_completion_evidence_rejected(
+            [
+                self.execution_receipts[0].receipt_id,
+                foreign[1].receipt_id,
+            ]
+        )
+
+        patch_only = self._capture_receipts(
+            suffix="completion-patch-only", include_command=False
+        )
+        self._assert_completion_evidence_rejected(
+            [receipt.receipt_id for receipt in patch_only]
+        )
+        shell_only = self._capture_receipts(
+            suffix="completion-shell-only", include_patch=False
+        )
+        self._assert_completion_evidence_rejected(
+            [receipt.receipt_id for receipt in shell_only]
+        )
+
+    def test_successful_completion_atomically_persists_typed_attestation(
+        self,
+    ) -> None:
+        self._complete_code_task()
+
+        self.assertEqual(TaskState.DONE, self.completed_task.state)
+        self.assertEqual(self.expected_receipt_attestation, self.receipt_attestation)
+        owner_rows = self.store._connection.execute(
+            """
+            SELECT receipt_id, task_id, code_task_version, attestation_hash
+            FROM code_task_receipt_owners
+            WHERE task_id = ?
+            ORDER BY receipt_id
+            """,
+            ("code-task",),
+        ).fetchall()
+        self.assertEqual(
+            self.receipt_ids, tuple(row["receipt_id"] for row in owner_rows)
+        )
+        self.assertTrue(
+            all(
+                row["task_id"] == "code-task"
+                and row["code_task_version"] == self.completed_task.version
+                and row["attestation_hash"] == self.receipt_attestation.attestation_hash
+                for row in owner_rows
+            )
+        )
+        attestation_row = self.store._connection.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            ("code-task",),
+        ).fetchone()
+        rendered_trust_rows = json.dumps(
+            {
+                "attestation": dict(attestation_row),
+                "owners": [dict(row) for row in owner_rows],
+            },
+            sort_keys=True,
+        )
+        self.assertNotIn(str(self.workspace), rendered_trust_rows)
+        self.assertNotIn("*** Begin Patch", rendered_trust_rows)
+        self.assertNotIn("python -m pytest -q", rendered_trust_rows)
+        self.assertNotIn("patch-applied", rendered_trust_rows)
+        self.assertNotIn("2 passed", rendered_trust_rows)
+        for receipt in self.execution_receipts:
+            self.assertNotIn(receipt.input_hash, rendered_trust_rows)
+            self.assertNotIn(receipt.output_hash, rendered_trust_rows)
+
+    def test_same_completion_retry_is_idempotent_but_wrong_owner_is_rejected(
+        self,
+    ) -> None:
+        self._complete_code_task()
+
+        repeated = self.service.complete_task(
+            "code-task",
+            expected_version=self.running_task.version,
+            owner="worker-owner",
+            epoch=self.worker_lease.epoch,
+            result_hash=self.verification_hash,
+            execution_receipt_ids=list(reversed(self.receipt_ids)),
+            now=self._NOW,
+        )
+        self.assertEqual(self.completed_task, repeated)
+        with self.assertRaises(ServiceError) as raised:
+            self.service.complete_task(
+                "code-task",
+                expected_version=self.running_task.version,
+                owner="not-worker-owner",
+                epoch=self.worker_lease.epoch,
+                result_hash=self.verification_hash,
+                execution_receipt_ids=list(self.receipt_ids),
+                now=self._NOW,
+            )
+        self.assertEqual("STALE_LEASE", raised.exception.code)
+
+    def test_same_receipts_cannot_complete_a_second_code_task(self) -> None:
+        self._complete_code_task()
+        second = self.store.register_task(
+            Task(
+                "code-task-2",
+                "workflow",
+                "second code task",
+                "worker",
+                state=TaskState.RUNNING,
+                write_scope=("src/second.py",),
+                task_kind=TaskKind.CODE,
+                intent_id="intent-2",
+                language="python",
+                framework="pytest",
+            ),
+            strict_index=True,
+            workspace_root=str(self.workspace),
+            input_snapshot_id=self.input_snapshot.snapshot_id,
+            task_node_ids=("sha256:second-task-node",),
+            contract_node_ids=("sha256:second-contract-node",),
+        )
+        second_lease = self.store.acquire_lease(
+            second.id,
+            "second-worker",
+            "2099-01-01T00:00:00+00:00",
+            now=self._NOW,
+        )
+        self.store.record_checkpoint(
+            second.id,
+            "second-worker",
+            second_lease.epoch,
+            "sha256:second-checkpoint",
+            now=self._NOW,
+        )
+        self.store.record_output_snapshot(
+            second.id,
+            "second-worker",
+            second_lease.epoch,
+            snapshot_id=self.output_snapshot.snapshot_id,
+            diff_hash="sha256:second-diff",
+            now=self._NOW,
+        )
+        self.store.record_index_query(
+            second.id,
+            "second-worker",
+            second_lease.epoch,
+            trace_id="sha256:second-output-query",
+            snapshot_id=self.output_snapshot.snapshot_id,
+            miss_escape_used=False,
+            now=self._NOW,
+        )
+        self.store.register_task_artifact(
+            second.id,
+            "second-worker",
+            second_lease.epoch,
+            kind="verification",
+            content_hash="sha256:" + "b" * 64,
+            safe_path="evidence/second-verification.json",
+            size=10,
+            redaction_version="r1",
+            snapshot_id=self.output_snapshot.snapshot_id,
+            now=self._NOW,
+        )
+        second_attestation = SQLiteStore.build_code_task_receipt_attestation(
+            workflow_id="workflow",
+            code_task_id=second.id,
+            code_task_version=second.version + 1,
+            input_snapshot_id=self.input_snapshot.snapshot_id,
+            output_snapshot_id=self.output_snapshot.snapshot_id,
+            workspace_hash=self.receipt_attestation.workspace_hash,
+            execution_receipt_ids=self.receipt_ids,
+        )
+
+        with self.assertRaises(AcceptanceConflictError):
+            self.store.complete_task(
+                second.id,
+                TaskState.DONE,
+                second.version,
+                "second-worker",
+                second_lease.epoch,
+                receipt_attestation=second_attestation,
+                now=self._NOW,
+            )
+
+        self.assertEqual(TaskState.RUNNING, self.store.get_task(second.id).state)
+        self.assertIsNone(self.store.code_task_receipt_attestation_for_task(second.id))
 
 
 if __name__ == "__main__":

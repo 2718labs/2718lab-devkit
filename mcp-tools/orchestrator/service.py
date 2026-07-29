@@ -172,14 +172,44 @@ class OrchestratorService:
         owner: str,
         epoch: int,
         result_hash: str = "",
+        execution_receipt_ids: list[str] | tuple[str, ...] | None = None,
         now: str | None = None,
     ) -> Task:
+        task = self._call(self._store.get_task, task_id)
         binding = self._call(self._store.get_index_binding, task_id)
         if binding is not None:
-            task = self._call(self._store.get_task, task_id)
             snapshot_id = binding.output_snapshot_id or binding.input_snapshot_id
             self._assert_index_current(
                 Path(binding.workspace_root), snapshot_id, task.write_scope
+            )
+        receipt_attestation = None
+        if task.task_kind is TaskKind.CODE:
+            if execution_receipt_ids is None:
+                raise ServiceError(
+                    "EVIDENCE_INCOMPLETE",
+                    "code task execution receipt identifiers are required",
+                )
+            if (
+                isinstance(expected_version, bool)
+                or not isinstance(expected_version, int)
+                or not 0 <= expected_version < 2**63 - 1
+            ):
+                raise ServiceError("INVALID_REQUEST", "task version is invalid")
+            if binding is None:
+                raise ServiceError(
+                    "INDEX_UNAVAILABLE", "code task has no strict index binding"
+                )
+            receipt_ids = self._validate_execution_receipt_ids(execution_receipt_ids)
+            workspace_hash = self._validate_receipt_evidence(receipt_ids)
+            receipt_attestation = self._call(
+                self._store.build_code_task_receipt_attestation,
+                workflow_id=task.workflow_id,
+                code_task_id=task.id,
+                code_task_version=expected_version + 1,
+                input_snapshot_id=binding.input_snapshot_id,
+                output_snapshot_id=binding.output_snapshot_id,
+                workspace_hash=workspace_hash,
+                execution_receipt_ids=receipt_ids,
             )
         return self._call(
             self._store.complete_task,
@@ -189,6 +219,7 @@ class OrchestratorService:
             owner,
             epoch,
             result_hash=result_hash or None,
+            receipt_attestation=receipt_attestation,
             now=now,
         )
 
@@ -340,6 +371,18 @@ class OrchestratorService:
         self._validate_output_query_evidence(
             task_evidence.output_query_trace_id, binding.output_snapshot_id
         )
+        persisted_attestation = self._call(
+            self._store.code_task_receipt_attestation_for_task, code_task_id
+        )
+        if persisted_attestation is None:
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE", "code task receipt attestation is unavailable"
+            )
+        if persisted_attestation.execution_receipt_ids != receipt_ids:
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE",
+                "execution receipts do not match code task completion",
+            )
         workspace_hash = self._validate_receipt_evidence(receipt_ids)
         receipt_attestation = self._call(
             self._store.build_code_task_receipt_attestation,
@@ -351,6 +394,10 @@ class OrchestratorService:
             workspace_hash=workspace_hash,
             execution_receipt_ids=receipt_ids,
         )
+        if receipt_attestation != persisted_attestation:
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE", "execution receipt attestation does not verify"
+            )
         self._validate_verification_artifacts(
             task,
             task_evidence.verification_artifact_hashes,
@@ -970,6 +1017,11 @@ class OrchestratorService:
                 "EVIDENCE_INCOMPLETE", "execution receipt attestation is unavailable"
             )
         for artifact_hash in artifact_hashes:
+            if (
+                artifact_hash == receipt_attestation_hash
+                and artifact_hash != task.result_hash
+            ):
+                continue
             artifact = self._call(self._store.get_artifact, artifact_hash)
             if artifact is None or artifact.kind != "verification":
                 raise ServiceError(
@@ -1056,14 +1108,22 @@ class OrchestratorService:
             or coordinator_epoch < 1
         ):
             raise ServiceError("INVALID_REQUEST", "coordinator epoch is invalid")
+        return self._validate_execution_receipt_ids(execution_receipt_ids)
+
+    def _validate_execution_receipt_ids(
+        self, execution_receipt_ids: list[str] | tuple[str, ...]
+    ) -> tuple[str, ...]:
         if not isinstance(execution_receipt_ids, (list, tuple)):
             raise ServiceError("INVALID_REQUEST", "receipt identifiers must be a list")
         receipt_ids = tuple(execution_receipt_ids)
         if not 1 <= len(receipt_ids) <= self._MAX_ACCEPTANCE_RECEIPTS:
             raise ServiceError("EVIDENCE_INCOMPLETE", "receipt count is invalid")
-        if len(set(receipt_ids)) != len(receipt_ids) or any(
-            not isinstance(receipt_id, str)
-            or self._SAFE_RECEIPT_IDENTIFIER.fullmatch(receipt_id) is None
+        if any(not isinstance(receipt_id, str) for receipt_id in receipt_ids) or len(
+            set(receipt_ids)
+        ) != len(receipt_ids):
+            raise ServiceError("EVIDENCE_INCOMPLETE", "receipt identifiers are invalid")
+        if any(
+            self._SAFE_RECEIPT_IDENTIFIER.fullmatch(receipt_id) is None
             for receipt_id in receipt_ids
         ):
             raise ServiceError("EVIDENCE_INCOMPLETE", "receipt identifiers are invalid")

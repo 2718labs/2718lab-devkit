@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import sqlite3
@@ -82,7 +83,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             store = SQLiteStore(database)
             try:
-                self.assertEqual(4, store.schema_version())
+                self.assertEqual(5, store.schema_version())
                 self.assertEqual(
                     {"task_kind", "intent_id", "language", "framework"},
                     {
@@ -113,7 +114,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             restarted = SQLiteStore(database)
             try:
-                self.assertEqual(4, restarted.schema_version())
+                self.assertEqual(5, restarted.schema_version())
                 self.assertEqual(
                     Task(
                         "code-task",
@@ -212,7 +213,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             reopened = SQLiteStore(database)
             try:
-                self.assertEqual(4, reopened.schema_version())
+                self.assertEqual(5, reopened.schema_version())
                 self.assertEqual(
                     Task("legacy-task", "workflow-1", "legacy", "owner", version=2),
                     reopened.get_task("legacy-task"),
@@ -345,12 +346,32 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
         )
         if not complete:
             return task
+        receipt_ids = tuple(
+            sorted(
+                (
+                    "sha256:"
+                    + hashlib.sha256(f"{task_id}:patch".encode("utf-8")).hexdigest(),
+                    "sha256:"
+                    + hashlib.sha256(f"{task_id}:shell".encode("utf-8")).hexdigest(),
+                )
+            )
+        )
+        receipt_attestation = self.store.build_code_task_receipt_attestation(
+            workflow_id=accepted_workflow_id,
+            code_task_id=task.id,
+            code_task_version=task.version + 1,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            workspace_hash="sha256:" + "a" * 64,
+            execution_receipt_ids=receipt_ids,
+        )
         return self.store.complete_task(
             task.id,
             TaskState.DONE,
             task.version,
             owner,
             lease.epoch,
+            receipt_attestation=receipt_attestation,
             now="2026-07-29T00:09:00+00:00",
         )
 
@@ -401,6 +422,17 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
             stored_diff if indexed_diff_hash is None else indexed_diff_hash
         )
         accepted_intent_id = accepted_task.intent_id if intent_id is None else intent_id
+        receipt_attestation = self.store.code_task_receipt_attestation_for_task(
+            accepted_task.id
+        )
+        receipt_ids = (
+            ("sha256:" + "e" * 64, "sha256:" + "f" * 64)
+            if receipt_attestation is None
+            else receipt_attestation.execution_receipt_ids
+        )
+        verification_hashes = {"sha256:" + "d" * 64}
+        if receipt_attestation is not None:
+            verification_hashes.add(receipt_attestation.attestation_hash)
         evidence_binding = self.store.build_code_task_evidence_binding(
             workflow_id=accepted_workflow_id,
             task_id=accepted_task.id,
@@ -411,11 +443,8 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
             checkpoint_id=f"checkpoint-{accepted_task.id}",
             checkpoint_hash="sha256:" + "c" * 64,
             output_query_trace_id=f"trace-{accepted_task.id}",
-            verification_artifact_hashes=("sha256:" + "d" * 64,),
-            execution_receipt_ids=(
-                "sha256:" + "e" * 64,
-                "sha256:" + "f" * 64,
-            ),
+            verification_artifact_hashes=tuple(sorted(verification_hashes)),
+            execution_receipt_ids=receipt_ids,
         )
         return self.store.insert_code_task_acceptance(
             workflow_id=accepted_workflow_id,

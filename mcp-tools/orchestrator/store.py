@@ -269,7 +269,7 @@ class CodeTaskReceiptAttestation:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
@@ -1016,6 +1016,33 @@ class SQLiteStore:
                 framework=framework,
                 now=authorization_now,
             )
+            receipt_attestation_row = cursor.execute(
+                """
+                SELECT * FROM code_task_receipt_attestations
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if receipt_attestation_row is None:
+                raise AcceptanceEvidenceError(
+                    "code task receipt attestation is required"
+                )
+            receipt_attestation = self._code_task_receipt_attestation_from_row(
+                receipt_attestation_row
+            )
+            if (
+                receipt_attestation.workflow_id != workflow_id
+                or receipt_attestation.code_task_version != task_version
+                or receipt_attestation.input_snapshot_id != input_snapshot_id
+                or receipt_attestation.output_snapshot_id != output_snapshot_id
+                or receipt_attestation.execution_receipt_ids
+                != evidence_binding.execution_receipt_ids
+                or receipt_attestation.attestation_hash
+                not in evidence_binding.verification_artifact_hashes
+            ):
+                raise AcceptanceConflictError(
+                    "receipt attestation does not match acceptance evidence"
+                )
             existing_row = cursor.execute(
                 "SELECT * FROM code_task_acceptances WHERE code_task_id = ?",
                 (task_id,),
@@ -1147,12 +1174,81 @@ class SQLiteStore:
             """,
             (task_id, output_snapshot_id, self._MAX_CODE_TASK_EVIDENCE_ITEMS + 1),
         ).fetchall()
-        if not artifact_rows or len(artifact_rows) > self._MAX_CODE_TASK_EVIDENCE_ITEMS:
+        attestation_row = self._connection.execute(
+            """
+            SELECT attestation_hash FROM code_task_receipt_attestations
+            WHERE task_id = ? AND output_snapshot_id = ?
+            """,
+            (task_id, output_snapshot_id),
+        ).fetchone()
+        verification_hashes = tuple(
+            sorted(
+                {
+                    *(str(row["content_hash"]) for row in artifact_rows),
+                    *(
+                        ()
+                        if attestation_row is None
+                        else (str(attestation_row["attestation_hash"]),)
+                    ),
+                }
+            )
+        )
+        if (
+            not verification_hashes
+            or len(verification_hashes) > self._MAX_CODE_TASK_EVIDENCE_ITEMS
+        ):
             raise StrictIndexError("VERIFICATION_EVIDENCE_REQUIRED")
         return TaskAcceptanceEvidence(
             str(query_rows[0]["trace_id"]),
-            tuple(str(row["content_hash"]) for row in artifact_rows),
+            verification_hashes,
         )
+
+    def code_task_receipt_attestation_for_task(
+        self, task_id: str
+    ) -> CodeTaskReceiptAttestation | None:
+        """Recover and integrity-check one completion-gated receipt attestation."""
+
+        self._safe_acceptance_identifier("task_id", task_id)
+        row = self._connection.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._code_task_receipt_attestation_from_row(row)
+
+    def code_task_receipt_attestation_for_acceptance(
+        self, acceptance_id: str
+    ) -> CodeTaskReceiptAttestation | None:
+        """Recover a typed receipt attestation through immutable acceptance identity."""
+
+        self._safe_acceptance_identifier("acceptance_id", acceptance_id)
+        acceptance = self._connection.execute(
+            "SELECT * FROM code_task_acceptances WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()
+        if acceptance is None:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            (str(acceptance["code_task_id"]),),
+        ).fetchone()
+        if row is None:
+            raise AcceptanceConflictError(
+                "accepted code task has no receipt attestation"
+            )
+        attestation = self._code_task_receipt_attestation_from_row(row)
+        if (
+            attestation.workflow_id != str(acceptance["workflow_id"])
+            or attestation.code_task_id != str(acceptance["code_task_id"])
+            or attestation.code_task_version != int(acceptance["code_task_version"])
+            or attestation.input_snapshot_id != str(acceptance["input_snapshot_id"])
+            or attestation.output_snapshot_id != str(acceptance["output_snapshot_id"])
+        ):
+            raise AcceptanceConflictError(
+                "receipt attestation does not match acceptance"
+            )
+        return attestation
 
     def evidence_binding_for_acceptance(
         self, acceptance_id: str
@@ -1387,13 +1483,18 @@ class SQLiteStore:
         epoch: int,
         *,
         result_hash: str | None = None,
+        receipt_attestation: CodeTaskReceiptAttestation | None = None,
         now: str | None = None,
     ) -> Task:
         """Complete a task only when the caller still owns the supplied epoch."""
         now_utc = _utc_timestamp(now) if now is not None else _utc_now()
         with self._transaction() as cursor:
             self._require_current_lease(cursor, task_id, owner, epoch, now=now_utc)
-            self._require_strict_completion(cursor, task_id)
+            task_row = cursor.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"task not found: {task_id!r}")
             workflow = cursor.execute(
                 """
                 SELECT workflows.state
@@ -1409,20 +1510,200 @@ class SQLiteStore:
                 raise WorkflowCancelledError(
                     f"workflow is cancelled for task {task_id!r}"
                 )
-            cursor.execute(
-                """
-                UPDATE tasks
-                SET state = ?, result_hash = COALESCE(?, result_hash), version = version + 1
-                WHERE id = ? AND version = ?
-                """,
-                (state.value, result_hash, task_id, expected_version),
+            is_code_completion = (
+                state is TaskState.DONE
+                and str(task_row["task_kind"]) == TaskKind.CODE.value
             )
+            final_version = expected_version
+            if is_code_completion:
+                if (
+                    isinstance(expected_version, bool)
+                    or not isinstance(expected_version, int)
+                    or not 0 <= expected_version < 2**63 - 1
+                ):
+                    raise VersionConflictError(
+                        f"task version is not current: {task_id!r}"
+                    )
+                final_version += 1
+
+            if (
+                is_code_completion
+                and str(task_row["state"]) == TaskState.DONE.value
+                and int(task_row["version"]) == final_version
+            ):
+                if receipt_attestation is None:
+                    raise AcceptanceEvidenceError(
+                        "code task receipt attestation is required"
+                    )
+                binding = self._require_index_binding(cursor, task_id)
+                self._validate_completion_receipt_attestation(
+                    receipt_attestation,
+                    task_row=task_row,
+                    binding=binding,
+                    final_version=final_version,
+                )
+                if (
+                    result_hash is not None
+                    and str(task_row["result_hash"]) != result_hash
+                ):
+                    raise AcceptanceConflictError(
+                        "completed task result hash does not match retry"
+                    )
+                persisted_row = cursor.execute(
+                    """
+                    SELECT * FROM code_task_receipt_attestations
+                    WHERE task_id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if persisted_row is None:
+                    raise AcceptanceConflictError(
+                        "completed code task has no receipt attestation"
+                    )
+                persisted = self._code_task_receipt_attestation_from_row(persisted_row)
+                if persisted != receipt_attestation:
+                    raise AcceptanceConflictError(
+                        "completed task receipt attestation does not match retry"
+                    )
+                return self._task_from_row(task_row)
+
+            if is_code_completion and str(task_row["state"]) != TaskState.RUNNING.value:
+                raise InvalidTaskStateError(
+                    f"task must be running before completion: {task_id!r}"
+                )
+            if int(task_row["version"]) != expected_version:
+                raise VersionConflictError(f"task version is not current: {task_id!r}")
+            self._require_strict_completion(cursor, task_id)
+
+            if is_code_completion:
+                if receipt_attestation is None:
+                    raise AcceptanceEvidenceError(
+                        "code task receipt attestation is required"
+                    )
+                binding = self._require_index_binding(cursor, task_id)
+                self._validate_completion_receipt_attestation(
+                    receipt_attestation,
+                    task_row=task_row,
+                    binding=binding,
+                    final_version=final_version,
+                )
+
+            if is_code_completion:
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, result_hash = COALESCE(?, result_hash),
+                        version = version + 1
+                    WHERE id = ? AND state = ? AND version = ?
+                    """,
+                    (
+                        state.value,
+                        result_hash,
+                        task_id,
+                        TaskState.RUNNING.value,
+                        expected_version,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, result_hash = COALESCE(?, result_hash),
+                        version = version + 1
+                    WHERE id = ? AND version = ?
+                    """,
+                    (state.value, result_hash, task_id, expected_version),
+                )
             if cursor.rowcount != 1:
                 raise VersionConflictError(f"task version is not current: {task_id!r}")
+            if is_code_completion:
+                self._insert_code_task_receipt_attestation(
+                    cursor, receipt_attestation, created_at=now_utc
+                )
             row = cursor.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
         return self._task_from_row(row)
+
+    def _validate_completion_receipt_attestation(
+        self,
+        receipt_attestation: CodeTaskReceiptAttestation,
+        *,
+        task_row: sqlite3.Row,
+        binding: sqlite3.Row,
+        final_version: int,
+    ) -> None:
+        try:
+            self._validate_code_task_receipt_attestation(
+                receipt_attestation,
+                workflow_id=str(task_row["workflow_id"]),
+                task_id=str(task_row["id"]),
+                task_version=final_version,
+                input_snapshot_id=str(binding["input_snapshot_id"]),
+                output_snapshot_id=str(binding["output_snapshot_id"]),
+            )
+        except ValueError as error:
+            raise AcceptanceEvidenceError(
+                "code task receipt attestation is invalid"
+            ) from error
+
+    def _insert_code_task_receipt_attestation(
+        self,
+        cursor: sqlite3.Cursor,
+        receipt_attestation: CodeTaskReceiptAttestation,
+        *,
+        created_at: str,
+    ) -> None:
+        existing = cursor.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            (receipt_attestation.code_task_id,),
+        ).fetchone()
+        if existing is not None:
+            persisted = self._code_task_receipt_attestation_from_row(existing)
+            if persisted != receipt_attestation:
+                raise AcceptanceConflictError(
+                    "code task already has a different receipt attestation"
+                )
+            return
+        try:
+            cursor.execute(
+                """
+                INSERT INTO code_task_receipt_attestations (
+                    task_id, workflow_id, code_task_version, input_snapshot_id,
+                    output_snapshot_id, workspace_hash, execution_receipt_ids,
+                    attestation_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt_attestation.code_task_id,
+                    receipt_attestation.workflow_id,
+                    receipt_attestation.code_task_version,
+                    receipt_attestation.input_snapshot_id,
+                    receipt_attestation.output_snapshot_id,
+                    receipt_attestation.workspace_hash,
+                    _encode_strings(receipt_attestation.execution_receipt_ids),
+                    receipt_attestation.attestation_hash,
+                    created_at,
+                ),
+            )
+            for receipt_id in receipt_attestation.execution_receipt_ids:
+                cursor.execute(
+                    """
+                    INSERT INTO code_task_receipt_owners (
+                        receipt_id, task_id, code_task_version, attestation_hash
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        receipt_id,
+                        receipt_attestation.code_task_id,
+                        receipt_attestation.code_task_version,
+                        receipt_attestation.attestation_hash,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise AcceptanceConflictError(
+                "execution receipt is already owned by another code task"
+            ) from error
 
     def cancel_workflow(
         self, workflow_id: str, *, expected_version: int | None = None
@@ -2175,6 +2456,119 @@ class SQLiteStore:
             _payload_hash(payload_json),
         )
 
+    @classmethod
+    def _validate_code_task_receipt_attestation(
+        cls,
+        receipt_attestation: CodeTaskReceiptAttestation,
+        *,
+        workflow_id: str | None = None,
+        task_id: str | None = None,
+        task_version: int | None = None,
+        input_snapshot_id: str | None = None,
+        output_snapshot_id: str | None = None,
+    ) -> None:
+        if not isinstance(receipt_attestation, CodeTaskReceiptAttestation):
+            raise ValueError("receipt_attestation must be a CodeTaskReceiptAttestation")
+        expected = cls.build_code_task_receipt_attestation(
+            workflow_id=receipt_attestation.workflow_id,
+            code_task_id=receipt_attestation.code_task_id,
+            code_task_version=receipt_attestation.code_task_version,
+            input_snapshot_id=receipt_attestation.input_snapshot_id,
+            output_snapshot_id=receipt_attestation.output_snapshot_id,
+            workspace_hash=receipt_attestation.workspace_hash,
+            execution_receipt_ids=receipt_attestation.execution_receipt_ids,
+        )
+        if expected != receipt_attestation:
+            raise ValueError("receipt attestation is not canonical")
+        if (
+            (workflow_id is not None and receipt_attestation.workflow_id != workflow_id)
+            or (task_id is not None and receipt_attestation.code_task_id != task_id)
+            or (
+                task_version is not None
+                and receipt_attestation.code_task_version != task_version
+            )
+            or (
+                input_snapshot_id is not None
+                and receipt_attestation.input_snapshot_id != input_snapshot_id
+            )
+            or (
+                output_snapshot_id is not None
+                and receipt_attestation.output_snapshot_id != output_snapshot_id
+            )
+        ):
+            raise AcceptanceConflictError(
+                "receipt attestation does not match code task completion"
+            )
+
+    def _code_task_receipt_attestation_from_row(
+        self, row: sqlite3.Row
+    ) -> CodeTaskReceiptAttestation:
+        try:
+            encoded_receipt_ids = str(row["execution_receipt_ids"])
+            receipt_ids = _decode_strings(encoded_receipt_ids)
+            attestation = self.build_code_task_receipt_attestation(
+                workflow_id=str(row["workflow_id"]),
+                code_task_id=str(row["task_id"]),
+                code_task_version=int(row["code_task_version"]),
+                input_snapshot_id=str(row["input_snapshot_id"]),
+                output_snapshot_id=str(row["output_snapshot_id"]),
+                workspace_hash=str(row["workspace_hash"]),
+                execution_receipt_ids=receipt_ids,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise AcceptanceConflictError(
+                "code task receipt attestation is corrupt"
+            ) from error
+        if (
+            encoded_receipt_ids != _encode_strings(attestation.execution_receipt_ids)
+            or str(row["attestation_hash"]) != attestation.attestation_hash
+        ):
+            raise AcceptanceConflictError(
+                "code task receipt attestation hash is corrupt"
+            )
+
+        task = self._connection.execute(
+            "SELECT workflow_id, state, version, task_kind FROM tasks WHERE id = ?",
+            (attestation.code_task_id,),
+        ).fetchone()
+        binding = self._connection.execute(
+            """
+            SELECT input_snapshot_id, output_snapshot_id
+            FROM task_index_bindings WHERE task_id = ?
+            """,
+            (attestation.code_task_id,),
+        ).fetchone()
+        owner_rows = self._connection.execute(
+            """
+            SELECT receipt_id, code_task_version, attestation_hash
+            FROM code_task_receipt_owners
+            WHERE task_id = ?
+            ORDER BY receipt_id
+            """,
+            (attestation.code_task_id,),
+        ).fetchall()
+        if (
+            task is None
+            or str(task["workflow_id"]) != attestation.workflow_id
+            or str(task["state"]) != TaskState.DONE.value
+            or int(task["version"]) != attestation.code_task_version
+            or str(task["task_kind"]) != TaskKind.CODE.value
+            or binding is None
+            or str(binding["input_snapshot_id"]) != attestation.input_snapshot_id
+            or str(binding["output_snapshot_id"]) != attestation.output_snapshot_id
+            or tuple(str(owner["receipt_id"]) for owner in owner_rows)
+            != attestation.execution_receipt_ids
+            or any(
+                int(owner["code_task_version"]) != attestation.code_task_version
+                or str(owner["attestation_hash"]) != attestation.attestation_hash
+                for owner in owner_rows
+            )
+        ):
+            raise AcceptanceConflictError(
+                "code task receipt attestation ownership is corrupt"
+            )
+        return attestation
+
     def _insert_code_task_evidence_binding(
         self,
         cursor: sqlite3.Cursor,
@@ -2821,6 +3215,36 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_code_task_acceptances_workflow
                     ON code_task_acceptances(workflow_id, created_at, acceptance_id);
+                CREATE TABLE IF NOT EXISTS code_task_receipt_attestations (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                    code_task_version INTEGER NOT NULL,
+                    input_snapshot_id TEXT NOT NULL,
+                    output_snapshot_id TEXT NOT NULL,
+                    workspace_hash TEXT NOT NULL,
+                    execution_receipt_ids TEXT NOT NULL,
+                    attestation_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (task_id, code_task_version, attestation_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_code_task_receipt_attestations_workflow
+                    ON code_task_receipt_attestations(
+                        workflow_id, code_task_version, task_id
+                    );
+                CREATE TABLE IF NOT EXISTS code_task_receipt_owners (
+                    receipt_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    code_task_version INTEGER NOT NULL,
+                    attestation_hash TEXT NOT NULL,
+                    FOREIGN KEY (task_id, code_task_version, attestation_hash)
+                        REFERENCES code_task_receipt_attestations(
+                            task_id, code_task_version, attestation_hash
+                        )
+                );
+                CREATE INDEX IF NOT EXISTS idx_code_task_receipt_owners_task
+                    ON code_task_receipt_owners(
+                        task_id, code_task_version, attestation_hash, receipt_id
+                    );
                 CREATE TABLE IF NOT EXISTS atlas_ingestion_outbox (
                     ingestion_key TEXT PRIMARY KEY,
                     acceptance_id TEXT NOT NULL UNIQUE
