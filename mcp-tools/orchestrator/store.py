@@ -18,7 +18,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Mapping
 
-from .models import Task, TaskState, Workflow, WorkflowKind, WorkflowState
+from .models import (
+    AtlasOutboxItem,
+    AtlasOutboxState,
+    CodeTaskAcceptance,
+    Task,
+    TaskKind,
+    TaskState,
+    Workflow,
+    WorkflowKind,
+    WorkflowState,
+)
 
 
 class StoreError(RuntimeError):
@@ -53,6 +63,24 @@ class ArtifactConflictError(StoreError):
     """Raised when an artifact hash is reused with different metadata."""
 
     code = "ARTIFACT_CONFLICT"
+
+
+class AcceptanceConflictError(StoreError):
+    """Raised when one code task is reused with different accepted content."""
+
+    code = "ACCEPTANCE_CONFLICT"
+
+
+class AtlasOutboxTransitionError(StoreError):
+    """Raised when an outbox item would leave an immutable terminal state."""
+
+    code = "OUTBOX_TERMINAL"
+
+
+class AtlasOutboxAttemptLimitError(StoreError):
+    """Raised when a pending outbox item reaches its bounded retry limit."""
+
+    code = "OUTBOX_ATTEMPTS_EXHAUSTED"
 
 
 class InvalidTaskStateError(StoreError):
@@ -187,11 +215,18 @@ class IndexBinding:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 3
+    _SCHEMA_VERSION = 4
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
+    _MAX_ATLAS_OUTBOX_ATTEMPTS = 16
+    _MAX_ATLAS_OUTBOX_LIMIT = 100
+    _MAX_SAFE_ACCEPTANCE_IDENTIFIER_LENGTH = 256
+    _MAX_SAFE_OUTBOX_CODE_LENGTH = 64
+    _MAX_SAFE_OUTBOX_REASON_COUNT = 8
     _HOST_TARGET_PATTERN = re.compile(r"/root(?:/[a-z0-9_]+)*\Z")
+    _SAFE_ACCEPTANCE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+    _SAFE_OUTBOX_CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 
     def __init__(self, database: str | Path) -> None:
         self._connection = sqlite3.connect(str(database), isolation_level=None)
@@ -274,8 +309,9 @@ class SQLiteStore:
             cursor.execute(
                 """
                 INSERT INTO tasks
-                    (id, workflow_id, title, owner_role, state, write_scope, card_hash, result_hash, version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, workflow_id, title, owner_role, state, write_scope, card_hash, result_hash,
+                     version, task_kind, intent_id, language, framework)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -287,6 +323,10 @@ class SQLiteStore:
                     task.card_hash,
                     task.result_hash,
                     task.version,
+                    task.task_kind.value,
+                    task.intent_id,
+                    task.language,
+                    task.framework,
                 ),
             )
             if card_body is not None:
@@ -846,6 +886,269 @@ class SQLiteStore:
         ).fetchall()
         return tuple(
             self._task_from_row(row, self.dependencies_for(row["id"])) for row in rows
+        )
+
+    def insert_code_task_acceptance(
+        self,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        intent_id: str,
+        language: str,
+        framework: str,
+        created_at: str,
+    ) -> tuple[CodeTaskAcceptance, AtlasOutboxItem]:
+        """Insert one immutable acceptance and its pending outbox item atomically.
+
+        This is deliberately a storage primitive only.  It validates canonical,
+        privacy-bounded metadata but does not authorize a task, inspect receipts,
+        or invoke Code Atlas.
+        """
+        payload_json = self._canonical_code_task_acceptance_payload(
+            workflow_id=workflow_id,
+            task_id=task_id,
+            task_version=task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+            intent_id=intent_id,
+            language=language,
+            framework=framework,
+        )
+        payload_hash = _payload_hash(payload_json)
+        accepted_at = _utc_timestamp(created_at)
+
+        with self._transaction() as cursor:
+            existing_row = cursor.execute(
+                "SELECT * FROM code_task_acceptances WHERE code_task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._acceptance_from_row(existing_row)
+                if (
+                    existing.payload_hash != payload_hash
+                    or str(existing_row["payload_json"]) != payload_json
+                ):
+                    raise AcceptanceConflictError(
+                        f"code task already has different acceptance content: {task_id!r}"
+                    )
+                outbox_row = cursor.execute(
+                    "SELECT * FROM atlas_ingestion_outbox WHERE acceptance_id = ?",
+                    (existing.acceptance_id,),
+                ).fetchone()
+                if outbox_row is None:
+                    raise StoreError(
+                        f"acceptance is missing its durable outbox item: {task_id!r}"
+                    )
+                return existing, self._atlas_outbox_from_row(outbox_row)
+
+            cursor.execute(
+                """
+                INSERT INTO code_task_acceptances (
+                    acceptance_id, workflow_id, code_task_id, code_task_version,
+                    input_snapshot_id, output_snapshot_id, indexed_diff_hash,
+                    intent_id, language, framework, payload_json, payload_hash,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload_hash,
+                    workflow_id,
+                    task_id,
+                    task_version,
+                    input_snapshot_id,
+                    output_snapshot_id,
+                    indexed_diff_hash,
+                    intent_id,
+                    language,
+                    framework,
+                    payload_json,
+                    payload_hash,
+                    accepted_at,
+                ),
+            )
+            acceptance_row = cursor.execute(
+                "SELECT * FROM code_task_acceptances WHERE acceptance_id = ?",
+                (payload_hash,),
+            ).fetchone()
+            acceptance = self._acceptance_from_row(acceptance_row)
+            outbox = self._insert_atlas_outbox(
+                cursor,
+                acceptance,
+                payload_json=payload_json,
+                created_at=accepted_at,
+            )
+        return acceptance, outbox
+
+    def acceptance_for_task(self, task_id: str) -> CodeTaskAcceptance | None:
+        """Return an accepted code task's immutable metadata, if it exists."""
+        row = self._connection.execute(
+            "SELECT * FROM code_task_acceptances WHERE code_task_id = ?", (task_id,)
+        ).fetchone()
+        return None if row is None else self._acceptance_from_row(row)
+
+    def pending_atlas_outbox(self, *, limit: int) -> tuple[AtlasOutboxItem, ...]:
+        """Return pending ingestion work in deterministic creation/key order."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= self._MAX_ATLAS_OUTBOX_LIMIT
+        ):
+            raise ValueError(
+                "outbox limit must be an integer between 1 and "
+                f"{self._MAX_ATLAS_OUTBOX_LIMIT}"
+            )
+        rows = self._connection.execute(
+            """
+            SELECT * FROM atlas_ingestion_outbox
+            WHERE state = ?
+            ORDER BY created_at, ingestion_key
+            LIMIT ?
+            """,
+            (AtlasOutboxState.PENDING.value, limit),
+        ).fetchall()
+        return tuple(self._atlas_outbox_from_row(row) for row in rows)
+
+    def pending_ingestions(self, *, limit: int) -> tuple[AtlasOutboxItem, ...]:
+        """Compatibility name for the durable, pending Atlas ingestion queue."""
+        return self.pending_atlas_outbox(limit=limit)
+
+    def mark_atlas_outbox_state(
+        self,
+        ingestion_key: str,
+        state: AtlasOutboxState,
+        *,
+        error_code: str = "",
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Advance one pending outbox item or record a bounded pending retry."""
+        if not isinstance(state, AtlasOutboxState):
+            raise ValueError("outbox state must be an AtlasOutboxState")
+        self._safe_acceptance_identifier("ingestion_key", ingestion_key)
+        safe_error_code = self._safe_outbox_code(
+            "error_code", error_code, allow_empty=True
+        )
+        safe_reason_codes = self._safe_outbox_reason_codes(reason_codes)
+        if state is AtlasOutboxState.PENDING and not safe_error_code:
+            raise ValueError("pending retry requires a stable error code")
+        if state is AtlasOutboxState.PROJECTED and safe_error_code:
+            raise ValueError("projected outbox state cannot retain an error code")
+        if state is AtlasOutboxState.QUARANTINED and not safe_error_code:
+            raise ValueError("quarantined outbox state requires a stable error code")
+        updated_at = _utc_timestamp(now) if now is not None else _utc_now()
+
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+                (ingestion_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"atlas outbox item not found: {ingestion_key!r}")
+            current = AtlasOutboxState(str(row["state"]))
+            if current is not AtlasOutboxState.PENDING:
+                if current is state:
+                    return self._atlas_outbox_from_row(row)
+                raise AtlasOutboxTransitionError(
+                    f"terminal outbox item cannot change state: {ingestion_key!r}"
+                )
+
+            if state is AtlasOutboxState.PENDING:
+                if int(row["attempt_count"]) >= self._MAX_ATLAS_OUTBOX_ATTEMPTS:
+                    raise AtlasOutboxAttemptLimitError(
+                        f"outbox retry limit reached: {ingestion_key!r}"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE atlas_ingestion_outbox
+                    SET attempt_count = attempt_count + 1,
+                        last_error_code = ?,
+                        reason_codes_json = ?,
+                        updated_at = ?
+                    WHERE ingestion_key = ?
+                    """,
+                    (
+                        safe_error_code,
+                        _encode_outbox_reason_codes(safe_reason_codes),
+                        updated_at,
+                        ingestion_key,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE atlas_ingestion_outbox
+                    SET state = ?,
+                        last_error_code = ?,
+                        reason_codes_json = ?,
+                        updated_at = ?
+                    WHERE ingestion_key = ?
+                    """,
+                    (
+                        state.value,
+                        safe_error_code,
+                        _encode_outbox_reason_codes(safe_reason_codes),
+                        updated_at,
+                        ingestion_key,
+                    ),
+                )
+            updated_row = cursor.execute(
+                "SELECT * FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+                (ingestion_key,),
+            ).fetchone()
+        return self._atlas_outbox_from_row(updated_row)
+
+    def mark_atlas_outbox_projected(
+        self,
+        ingestion_key: str,
+        *,
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Mark a pending outbox item permanently projected."""
+        return self.mark_atlas_outbox_state(
+            ingestion_key,
+            AtlasOutboxState.PROJECTED,
+            reason_codes=reason_codes,
+            now=now,
+        )
+
+    def mark_atlas_outbox_quarantined(
+        self,
+        ingestion_key: str,
+        *,
+        error_code: str,
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Mark a pending outbox item permanently quarantined."""
+        return self.mark_atlas_outbox_state(
+            ingestion_key,
+            AtlasOutboxState.QUARANTINED,
+            error_code=error_code,
+            reason_codes=reason_codes,
+            now=now,
+        )
+
+    def mark_atlas_outbox_retry(
+        self,
+        ingestion_key: str,
+        *,
+        error_code: str,
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Record one bounded retry while leaving the item pending."""
+        return self.mark_atlas_outbox_state(
+            ingestion_key,
+            AtlasOutboxState.PENDING,
+            error_code=error_code,
+            reason_codes=reason_codes,
+            now=now,
         )
 
     def dependencies_for(self, task_id: str) -> tuple[str, ...]:
@@ -1542,6 +1845,132 @@ class SQLiteStore:
             ),
         )
 
+    def _insert_atlas_outbox(
+        self,
+        cursor: sqlite3.Cursor,
+        acceptance: CodeTaskAcceptance,
+        *,
+        payload_json: str,
+        created_at: str,
+    ) -> AtlasOutboxItem:
+        """Insert the single pending ingestion row owned by an acceptance."""
+        cursor.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                acceptance.payload_hash,
+                acceptance.acceptance_id,
+                payload_json,
+                acceptance.payload_hash,
+                AtlasOutboxState.PENDING.value,
+                0,
+                "",
+                "[]",
+                created_at,
+                created_at,
+            ),
+        )
+        row = cursor.execute(
+            "SELECT * FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+            (acceptance.payload_hash,),
+        ).fetchone()
+        return self._atlas_outbox_from_row(row)
+
+    @classmethod
+    def _canonical_code_task_acceptance_payload(
+        cls,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        intent_id: str,
+        language: str,
+        framework: str,
+    ) -> str:
+        if (
+            isinstance(task_version, bool)
+            or not isinstance(task_version, int)
+            or not 0 <= task_version <= 2**63 - 1
+        ):
+            raise ValueError("task_version must be a non-negative SQLite integer")
+        payload = {
+            "framework": cls._safe_acceptance_identifier(
+                "framework", framework, allow_empty=True
+            ),
+            "indexed_diff_hash": cls._safe_acceptance_identifier(
+                "indexed_diff_hash", indexed_diff_hash
+            ),
+            "input_snapshot_id": cls._safe_acceptance_identifier(
+                "input_snapshot_id", input_snapshot_id
+            ),
+            "intent_id": cls._safe_acceptance_identifier("intent_id", intent_id),
+            "language": cls._safe_acceptance_identifier("language", language),
+            "output_snapshot_id": cls._safe_acceptance_identifier(
+                "output_snapshot_id", output_snapshot_id
+            ),
+            "task_id": cls._safe_acceptance_identifier("task_id", task_id),
+            "task_kind": TaskKind.CODE.value,
+            "task_version": task_version,
+            "workflow_id": cls._safe_acceptance_identifier("workflow_id", workflow_id),
+        }
+        return _canonical_payload_json(payload)
+
+    @classmethod
+    def _safe_acceptance_identifier(
+        cls, field_name: str, value: str, *, allow_empty: bool = False
+    ) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        if not value and allow_empty:
+            return ""
+        if (
+            not value
+            or len(value) > cls._MAX_SAFE_ACCEPTANCE_IDENTIFIER_LENGTH
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(value) is None
+        ):
+            raise ValueError(f"{field_name} must be a bounded opaque identifier")
+        return value
+
+    @classmethod
+    def _safe_outbox_code(
+        cls, field_name: str, value: str, *, allow_empty: bool = False
+    ) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        if not value and allow_empty:
+            return ""
+        if (
+            not value
+            or len(value) > cls._MAX_SAFE_OUTBOX_CODE_LENGTH
+            or cls._SAFE_OUTBOX_CODE_PATTERN.fullmatch(value) is None
+        ):
+            raise ValueError(f"{field_name} must be a stable safe code")
+        return value
+
+    @classmethod
+    def _safe_outbox_reason_codes(
+        cls, reason_codes: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        if not isinstance(reason_codes, tuple):
+            raise ValueError("reason_codes must be a tuple of stable safe codes")
+        if len(reason_codes) > cls._MAX_SAFE_OUTBOX_REASON_COUNT:
+            raise ValueError("too many outbox reason codes")
+        return tuple(
+            sorted(
+                {
+                    cls._safe_outbox_code("reason_code", reason_code)
+                    for reason_code in reason_codes
+                }
+            )
+        )
+
     @staticmethod
     def _require_index_binding(cursor: sqlite3.Cursor, task_id: str) -> sqlite3.Row:
         row = cursor.execute(
@@ -1651,9 +2080,49 @@ class SQLiteStore:
                     write_scope TEXT NOT NULL,
                     card_hash TEXT NOT NULL,
                     result_hash TEXT NOT NULL,
-                    version INTEGER NOT NULL
+                    version INTEGER NOT NULL,
+                    task_kind TEXT NOT NULL DEFAULT 'general',
+                    intent_id TEXT NOT NULL DEFAULT '',
+                    language TEXT NOT NULL DEFAULT '',
+                    framework TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_workflow_state ON tasks(workflow_id, state);
+                CREATE TABLE IF NOT EXISTS code_task_acceptances (
+                    acceptance_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                    code_task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+                    code_task_version INTEGER NOT NULL,
+                    input_snapshot_id TEXT NOT NULL,
+                    output_snapshot_id TEXT NOT NULL,
+                    indexed_diff_hash TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    framework TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    CHECK (acceptance_id = payload_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_code_task_acceptances_workflow
+                    ON code_task_acceptances(workflow_id, created_at, acceptance_id);
+                CREATE TABLE IF NOT EXISTS atlas_ingestion_outbox (
+                    ingestion_key TEXT PRIMARY KEY,
+                    acceptance_id TEXT NOT NULL UNIQUE
+                        REFERENCES code_task_acceptances(acceptance_id),
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('pending', 'projected', 'quarantined')),
+                    attempt_count INTEGER NOT NULL
+                        CHECK (attempt_count BETWEEN 0 AND 16),
+                    last_error_code TEXT NOT NULL,
+                    reason_codes_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (ingestion_key = payload_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_atlas_outbox_pending
+                    ON atlas_ingestion_outbox(state, created_at, ingestion_key);
                 CREATE TABLE IF NOT EXISTS task_dependencies (
                     task_id TEXT NOT NULL REFERENCES tasks(id),
                     dependency_id TEXT NOT NULL REFERENCES tasks(id),
@@ -1786,6 +2255,28 @@ class SQLiteStore:
                 self._connection.execute(
                     "ALTER TABLE leases ADD COLUMN host_target TEXT"
                 )
+            task_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(tasks)"
+                ).fetchall()
+            }
+            if "task_kind" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'general'"
+                )
+            if "intent_id" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN intent_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "language" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN language TEXT NOT NULL DEFAULT ''"
+                )
+            if "framework" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN framework TEXT NOT NULL DEFAULT ''"
+                )
             self._connection.execute(
                 """
                 INSERT INTO schema_metadata (key, value) VALUES (?, ?)
@@ -1833,6 +2324,41 @@ class SQLiteStore:
             row["card_hash"],
             row["result_hash"],
             int(row["version"]),
+            TaskKind(row["task_kind"]),
+            row["intent_id"],
+            row["language"],
+            row["framework"],
+        )
+
+    @staticmethod
+    def _acceptance_from_row(row: sqlite3.Row) -> CodeTaskAcceptance:
+        return CodeTaskAcceptance(
+            str(row["acceptance_id"]),
+            str(row["workflow_id"]),
+            str(row["code_task_id"]),
+            int(row["code_task_version"]),
+            str(row["input_snapshot_id"]),
+            str(row["output_snapshot_id"]),
+            str(row["indexed_diff_hash"]),
+            str(row["intent_id"]),
+            str(row["language"]),
+            str(row["framework"]),
+            str(row["payload_hash"]),
+            str(row["created_at"]),
+        )
+
+    @staticmethod
+    def _atlas_outbox_from_row(row: sqlite3.Row) -> AtlasOutboxItem:
+        return AtlasOutboxItem(
+            str(row["ingestion_key"]),
+            str(row["acceptance_id"]),
+            str(row["payload_hash"]),
+            AtlasOutboxState(str(row["state"])),
+            int(row["attempt_count"]),
+            str(row["last_error_code"]),
+            _decode_outbox_reason_codes(str(row["reason_codes_json"])),
+            str(row["created_at"]),
+            str(row["updated_at"]),
         )
 
     @staticmethod
@@ -2013,6 +2539,16 @@ def _card_hash(card_body: str) -> str:
     return f"sha256:{digest}"
 
 
+def _canonical_payload_json(payload: Mapping[str, object]) -> str:
+    """Encode a fixed, safe metadata map in content-addressed form."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _payload_hash(payload_json: str) -> str:
+    digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
 def _utc_timestamp(value: str) -> str:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -2042,3 +2578,16 @@ def _encode_metadata(metadata: Mapping[str, str]) -> str:
 def _decode_metadata(value: str) -> tuple[tuple[str, str], ...]:
     decoded = json.loads(value)
     return tuple(sorted((str(key), str(item)) for key, item in decoded.items()))
+
+
+def _encode_outbox_reason_codes(reason_codes: tuple[str, ...]) -> str:
+    return json.dumps(reason_codes, separators=(",", ":"))
+
+
+def _decode_outbox_reason_codes(value: str) -> tuple[str, ...]:
+    decoded = json.loads(value)
+    if not isinstance(decoded, list) or any(
+        not isinstance(reason_code, str) for reason_code in decoded
+    ):
+        raise StoreError("stored outbox reasons are invalid")
+    return tuple(decoded)
