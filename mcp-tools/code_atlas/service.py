@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from project_index.models import IndexError, SnapshotFacts
 from project_index.service import ProjectIndexService
 
 from .canonical import canonical_hash, canonical_json, normalize_intent_id, thaw_json
+from .extractors import BoundExecutionReceipt, ExtractionRequest, PythonRecipeExtractor
 from .matching import (
     MatchCandidate,
     normalize_framework,
@@ -23,11 +25,13 @@ from .models import (
     AtlasError,
     AtlasNode,
     AtlasStatus,
+    AcceptanceProjection,
     ConstraintSpec,
     DependencySpec,
     EdgeRelation,
     GraphQueryResult,
     ImplementationPacket,
+    IngestionReceipt,
     NodeKind,
     PreparationResult,
     RecipeManifest,
@@ -127,10 +131,243 @@ _RENDER_REASON_CODES = frozenset(
         "render_budget_exceeded",
     }
 )
+_ACCEPTANCE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_EVIDENCE_BINDING_SCHEMA = "acceptance-evidence-binding/v1"
+_MAX_ACCEPTANCE_EVIDENCE_IDS = 32
+_RECIPE_ONLY_KINDS = frozenset(
+    {
+        NodeKind.RECIPE,
+        NodeKind.CODE_TEMPLATE,
+        NodeKind.ADAPTATION_SLOT,
+        NodeKind.CONSTRAINT,
+        NodeKind.LANGUAGE,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedCodeProjectionRequest:
+    """Opaque, already-accepted identifiers needed for one Atlas projection.
+
+    This is deliberately a data-only boundary: source bodies, raw receipts,
+    commands, workspace paths, retry state, and timestamps belong behind the
+    constructor-injected evidence reader rather than this public request.
+    """
+
+    ingestion_key: str
+    payload_hash: str
+    acceptance_id: str
+    workflow_id: str
+    code_task_id: str
+    code_task_version: int
+    input_snapshot_id: str
+    output_snapshot_id: str
+    indexed_diff_hash: str
+    intent_id: str
+    language: str
+    framework: str
+    checkpoint_id: str
+    checkpoint_hash: str
+    output_query_trace_id: str
+    verification_artifact_hashes: tuple[str, ...]
+    execution_receipt_ids: tuple[str, ...]
+    evidence_binding_hash: str
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        workflow_id: str,
+        code_task_id: str,
+        code_task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        intent_id: str,
+        language: str,
+        framework: str,
+        checkpoint_id: str,
+        checkpoint_hash: str,
+        output_query_trace_id: str,
+        verification_artifact_hashes: tuple[str, ...],
+        execution_receipt_ids: tuple[str, ...],
+    ) -> "AcceptedCodeProjectionRequest":
+        """Build the canonical core and evidence-binding identifiers."""
+
+        payload = _acceptance_projection_core_payload(
+            workflow_id=workflow_id,
+            code_task_id=code_task_id,
+            code_task_version=code_task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+            intent_id=intent_id,
+            language=language,
+            framework=framework,
+        )
+        payload_hash = canonical_hash(payload)
+        binding = _acceptance_evidence_binding_payload(
+            workflow_id=workflow_id,
+            code_task_id=code_task_id,
+            code_task_version=code_task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+            checkpoint_id=checkpoint_id,
+            checkpoint_hash=checkpoint_hash,
+            output_query_trace_id=output_query_trace_id,
+            verification_artifact_hashes=verification_artifact_hashes,
+            execution_receipt_ids=execution_receipt_ids,
+        )
+        return cls(
+            ingestion_key=payload_hash,
+            payload_hash=payload_hash,
+            acceptance_id=payload_hash,
+            workflow_id=workflow_id,
+            code_task_id=code_task_id,
+            code_task_version=code_task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+            intent_id=intent_id,
+            language=language,
+            framework=framework,
+            checkpoint_id=checkpoint_id,
+            checkpoint_hash=checkpoint_hash,
+            output_query_trace_id=output_query_trace_id,
+            verification_artifact_hashes=verification_artifact_hashes,
+            execution_receipt_ids=execution_receipt_ids,
+            evidence_binding_hash=canonical_hash(binding),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedCodeProjectionEvidence:
+    """Trusted reader output kept separate from the public projection request."""
+
+    code_task_version: int
+    language: str
+    framework: str
+    checkpoint_hash: str
+    indexed_diff_hash: str
+    output_query_trace_id: str
+    verification_artifact_hashes: tuple[str, ...]
+    extraction_request: ExtractionRequest
+
+
+class AcceptanceEvidenceReader(Protocol):
+    """Read verified checkpoint/index/receipt evidence for one accepted task."""
+
+    def read(
+        self, request: AcceptedCodeProjectionRequest
+    ) -> AcceptedCodeProjectionEvidence:
+        """Return the typed evidence named by ``request`` without caller data."""
 
 
 def _is_hash(value: object) -> bool:
     return isinstance(value, str) and _HASH.fullmatch(value) is not None
+
+
+def _acceptance_identifier(value: object, *, allow_empty: bool = False) -> str:
+    if isinstance(value, str) and not value and allow_empty:
+        return value
+    if not isinstance(value, str) or _ACCEPTANCE_IDENTIFIER.fullmatch(value) is None:
+        raise AtlasError("invalid_acceptance_projection")
+    return value
+
+
+def _bounded_identifier_hashes(value: object, *, required: bool) -> tuple[str, ...]:
+    if type(value) is not tuple or len(value) > _MAX_ACCEPTANCE_EVIDENCE_IDS:
+        raise AtlasError("invalid_acceptance_projection")
+    if required and not value:
+        raise AtlasError("invalid_acceptance_projection")
+    if (
+        any(not _is_hash(item) for item in value)
+        or tuple(sorted(value)) != value
+        or len(set(value)) != len(value)
+    ):
+        raise AtlasError("invalid_acceptance_projection")
+    return value
+
+
+def _acceptance_projection_core_payload(
+    *,
+    workflow_id: str,
+    code_task_id: str,
+    code_task_version: int,
+    input_snapshot_id: str,
+    output_snapshot_id: str,
+    indexed_diff_hash: str,
+    intent_id: str,
+    language: str,
+    framework: str,
+) -> dict[str, object]:
+    """Match the ATLAS-10A core acceptance hash exactly."""
+
+    if (
+        isinstance(code_task_version, bool)
+        or not isinstance(code_task_version, int)
+        or not 0 <= code_task_version <= 2**63 - 1
+    ):
+        raise AtlasError("invalid_acceptance_projection")
+    if not _is_hash(indexed_diff_hash):
+        raise AtlasError("invalid_acceptance_projection")
+    return {
+        "framework": _acceptance_identifier(framework, allow_empty=True),
+        "indexed_diff_hash": indexed_diff_hash,
+        "input_snapshot_id": _acceptance_identifier(input_snapshot_id),
+        "intent_id": _acceptance_identifier(intent_id),
+        "language": _acceptance_identifier(language),
+        "output_snapshot_id": _acceptance_identifier(output_snapshot_id),
+        "task_id": _acceptance_identifier(code_task_id),
+        "task_kind": "code",
+        "task_version": code_task_version,
+        "workflow_id": _acceptance_identifier(workflow_id),
+    }
+
+
+def _acceptance_evidence_binding_payload(
+    *,
+    workflow_id: str,
+    code_task_id: str,
+    code_task_version: int,
+    input_snapshot_id: str,
+    output_snapshot_id: str,
+    indexed_diff_hash: str,
+    checkpoint_id: str,
+    checkpoint_hash: str,
+    output_query_trace_id: str,
+    verification_artifact_hashes: tuple[str, ...],
+    execution_receipt_ids: tuple[str, ...],
+) -> dict[str, object]:
+    """Return the frozen acceptance-evidence-binding/v1 canonical payload."""
+
+    if (
+        isinstance(code_task_version, bool)
+        or not isinstance(code_task_version, int)
+        or not 0 <= code_task_version <= 2**63 - 1
+        or not _is_hash(indexed_diff_hash)
+        or not _is_hash(checkpoint_hash)
+    ):
+        raise AtlasError("invalid_acceptance_projection")
+    return {
+        "schema_version": _EVIDENCE_BINDING_SCHEMA,
+        "workflow_id": _acceptance_identifier(workflow_id),
+        "code_task_id": _acceptance_identifier(code_task_id),
+        "code_task_version": code_task_version,
+        "input_snapshot_id": _acceptance_identifier(input_snapshot_id),
+        "output_snapshot_id": _acceptance_identifier(output_snapshot_id),
+        "indexed_diff_hash": indexed_diff_hash,
+        "checkpoint_id": _acceptance_identifier(checkpoint_id),
+        "checkpoint_hash": checkpoint_hash,
+        "output_query_trace_id": _acceptance_identifier(output_query_trace_id),
+        "verification_artifact_hashes": list(
+            _bounded_identifier_hashes(verification_artifact_hashes, required=True)
+        ),
+        "execution_receipt_ids": list(
+            _bounded_identifier_hashes(execution_receipt_ids, required=True)
+        ),
+    }
 
 
 def _require_object(value: object, expected: frozenset[str]) -> dict[str, Any]:
@@ -395,9 +632,13 @@ class CodeAtlasService:
         store: AtlasStore,
         bundled_loader: BundledRecipeLoader,
         project_index: ProjectIndexService,
+        *,
+        acceptance_evidence_reader: AcceptanceEvidenceReader | None = None,
     ) -> None:
         self._store = store
         self._project_index = project_index
+        self._acceptance_evidence_reader = acceptance_evidence_reader
+        self._projection_extractor = PythonRecipeExtractor()
         self._bundled_loader = bundled_loader
         self._bundled_manifests = tuple(bundled_loader.load())
         self._bundled_by_id = {
@@ -418,6 +659,442 @@ class CodeAtlasService:
     def store(self) -> AtlasStore:
         """Expose the durable store as a read-only service property."""
         return self._store
+
+    @staticmethod
+    def _validate_accepted_projection_request(
+        request: object,
+    ) -> AcceptedCodeProjectionRequest:
+        if type(request) is not AcceptedCodeProjectionRequest:
+            raise AtlasError("invalid_acceptance_projection")
+        payload = _acceptance_projection_core_payload(
+            workflow_id=request.workflow_id,
+            code_task_id=request.code_task_id,
+            code_task_version=request.code_task_version,
+            input_snapshot_id=request.input_snapshot_id,
+            output_snapshot_id=request.output_snapshot_id,
+            indexed_diff_hash=request.indexed_diff_hash,
+            intent_id=request.intent_id,
+            language=request.language,
+            framework=request.framework,
+        )
+        binding = _acceptance_evidence_binding_payload(
+            workflow_id=request.workflow_id,
+            code_task_id=request.code_task_id,
+            code_task_version=request.code_task_version,
+            input_snapshot_id=request.input_snapshot_id,
+            output_snapshot_id=request.output_snapshot_id,
+            indexed_diff_hash=request.indexed_diff_hash,
+            checkpoint_id=request.checkpoint_id,
+            checkpoint_hash=request.checkpoint_hash,
+            output_query_trace_id=request.output_query_trace_id,
+            verification_artifact_hashes=request.verification_artifact_hashes,
+            execution_receipt_ids=request.execution_receipt_ids,
+        )
+        expected_payload_hash = canonical_hash(payload)
+        if (
+            not _is_hash(request.ingestion_key)
+            or request.payload_hash != expected_payload_hash
+            or request.acceptance_id != expected_payload_hash
+            or request.evidence_binding_hash != canonical_hash(binding)
+        ):
+            raise AtlasError("invalid_acceptance_projection")
+        return request
+
+    @staticmethod
+    def _require_canonical_core_key(request: AcceptedCodeProjectionRequest) -> None:
+        if request.ingestion_key != request.payload_hash:
+            raise AtlasError("invalid_acceptance_projection")
+
+    @staticmethod
+    def _binding_provenance_node(
+        request: AcceptedCodeProjectionRequest,
+    ) -> AtlasNode:
+        return AtlasNode.create(
+            NodeKind.SOURCE_EVIDENCE,
+            {
+                "kind": "acceptance_evidence_binding",
+                "schema_version": _EVIDENCE_BINDING_SCHEMA,
+                "evidence_binding_hash": request.evidence_binding_hash,
+            },
+            extractor_id="acceptance-projection",
+            extractor_version="1",
+            provenance="observed",
+            source_hashes=(request.evidence_binding_hash,),
+        )
+
+    @staticmethod
+    def _projection_from_receipt(
+        request: AcceptedCodeProjectionRequest,
+        receipt: IngestionReceipt,
+    ) -> AcceptanceProjection:
+        return AcceptanceProjection(
+            acceptance_id=request.acceptance_id,
+            code_task_id=request.code_task_id,
+            output_snapshot_id=request.output_snapshot_id,
+            atlas_ingest_state=receipt.status,
+            episode_id=receipt.episode_id,
+            recipe_id=receipt.recipe_id,
+            reasons=receipt.reasons,
+        )
+
+    def _existing_receipt_has_binding(
+        self,
+        request: AcceptedCodeProjectionRequest,
+        receipt: IngestionReceipt,
+    ) -> bool:
+        binding = self._binding_provenance_node(request)
+        graph = self._store.graph_query(
+            (receipt.episode_id,),
+            max_nodes=MAX_GRAPH_NODES,
+            max_edges=MAX_GRAPH_EDGES,
+            max_depth=1,
+            byte_budget=MAX_PACKET_BYTES,
+            node_kinds=None,
+            relations=None,
+        )
+        nodes = {node.node_id: node for node in graph.nodes}
+        episode = nodes.get(receipt.episode_id)
+        if episode is None or episode.kind is not NodeKind.TASK_EPISODE:
+            return False
+        if nodes.get(binding.node_id) != binding:
+            return False
+        edge = AtlasEdge.create(EdgeRelation.CHANGES, episode, binding)
+        return any(item.edge_id == edge.edge_id for item in graph.edges)
+
+    @staticmethod
+    def _binding_scope(value: object) -> tuple[str, ...]:
+        if type(value) is not tuple or not value or len(value) > MAX_CHANGED_FILES:
+            raise AtlasError("acceptance_evidence_conflict")
+        values: list[str] = []
+        for item in value:
+            try:
+                values.append(validate_candidate_path(item))
+            except AtlasError as exc:
+                raise AtlasError("acceptance_evidence_conflict") from exc
+        if tuple(sorted(values)) != tuple(values) or len(set(values)) != len(values):
+            raise AtlasError("acceptance_evidence_conflict")
+        if len({path_collision_key(item) for item in values}) != len(values):
+            raise AtlasError("acceptance_evidence_conflict")
+        return tuple(values)
+
+    @classmethod
+    def _validate_reader_evidence(
+        cls,
+        request: AcceptedCodeProjectionRequest,
+        evidence: object,
+    ) -> ExtractionRequest:
+        if type(evidence) is not AcceptedCodeProjectionEvidence:
+            raise AtlasError("acceptance_evidence_conflict")
+        extraction = evidence.extraction_request
+        if type(extraction) is not ExtractionRequest:
+            raise AtlasError("acceptance_evidence_conflict")
+        try:
+            artifact_hashes = _bounded_identifier_hashes(
+                evidence.verification_artifact_hashes, required=True
+            )
+            if (
+                extraction.workflow_id != request.workflow_id
+                or extraction.task_id != request.code_task_id
+                or extraction.acceptance_id != request.acceptance_id
+                or extraction.task_kind != "code"
+                or extraction.intent_id != request.intent_id
+                or evidence.code_task_version != request.code_task_version
+                or evidence.language != request.language
+                or evidence.framework != request.framework
+                or not _is_hash(extraction.workspace_hash)
+                or extraction.checkpoint_id != request.checkpoint_id
+                or extraction.input_snapshot_id != request.input_snapshot_id
+                or extraction.output_snapshot_id != request.output_snapshot_id
+                or evidence.indexed_diff_hash != request.indexed_diff_hash
+                or evidence.checkpoint_hash != request.checkpoint_hash
+                or evidence.output_query_trace_id != request.output_query_trace_id
+                or artifact_hashes != request.verification_artifact_hashes
+            ):
+                raise AtlasError("acceptance_evidence_conflict")
+            cls._binding_scope(extraction.write_scope)
+            if type(extraction.execution_receipts) is not tuple:
+                raise AtlasError("acceptance_evidence_conflict")
+            if any(
+                type(item) is not BoundExecutionReceipt
+                for item in extraction.execution_receipts
+            ):
+                raise AtlasError("acceptance_evidence_conflict")
+            receipt_ids = tuple(
+                item.receipt_id for item in extraction.execution_receipts
+            )
+            if receipt_ids != request.execution_receipt_ids:
+                raise AtlasError("acceptance_evidence_conflict")
+            for receipt in extraction.execution_receipts:
+                if (
+                    receipt.workflow_id != request.workflow_id
+                    or receipt.task_id != request.code_task_id
+                    or receipt.acceptance_id != request.acceptance_id
+                    or receipt.workspace_hash != extraction.workspace_hash
+                    or receipt.output_snapshot_id != request.output_snapshot_id
+                ):
+                    raise AtlasError("acceptance_evidence_conflict")
+            actual_core = _acceptance_projection_core_payload(
+                workflow_id=extraction.workflow_id,
+                code_task_id=extraction.task_id,
+                code_task_version=evidence.code_task_version,
+                input_snapshot_id=extraction.input_snapshot_id,
+                output_snapshot_id=extraction.output_snapshot_id,
+                indexed_diff_hash=evidence.indexed_diff_hash,
+                intent_id=extraction.intent_id,
+                language=evidence.language,
+                framework=evidence.framework,
+            )
+            if canonical_hash(actual_core) != request.payload_hash:
+                raise AtlasError("acceptance_evidence_conflict")
+            actual_binding = _acceptance_evidence_binding_payload(
+                workflow_id=extraction.workflow_id,
+                code_task_id=extraction.task_id,
+                code_task_version=evidence.code_task_version,
+                input_snapshot_id=extraction.input_snapshot_id,
+                output_snapshot_id=extraction.output_snapshot_id,
+                indexed_diff_hash=evidence.indexed_diff_hash,
+                checkpoint_id=extraction.checkpoint_id,
+                checkpoint_hash=evidence.checkpoint_hash,
+                output_query_trace_id=evidence.output_query_trace_id,
+                verification_artifact_hashes=artifact_hashes,
+                execution_receipt_ids=receipt_ids,
+            )
+            if canonical_hash(actual_binding) != request.evidence_binding_hash:
+                raise AtlasError("acceptance_evidence_conflict")
+        except AtlasError as exc:
+            if str(exc) == "acceptance_evidence_conflict":
+                raise
+            raise AtlasError("acceptance_evidence_conflict") from exc
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise AtlasError("acceptance_evidence_conflict") from exc
+        return extraction
+
+    def _read_accepted_evidence(
+        self, request: AcceptedCodeProjectionRequest
+    ) -> ExtractionRequest:
+        reader = self._acceptance_evidence_reader
+        if reader is None:
+            raise AtlasError("acceptance_evidence_unavailable")
+        try:
+            evidence = reader.read(request)
+        except (AtlasError, StoreConflictError):
+            raise
+        except Exception as exc:
+            raise AtlasError("acceptance_evidence_unavailable") from exc
+        return self._validate_reader_evidence(request, evidence)
+
+    @staticmethod
+    def _episode_records(
+        nodes: tuple[AtlasNode, ...], edges: tuple[AtlasEdge, ...]
+    ) -> tuple[tuple[AtlasNode, ...], tuple[AtlasEdge, ...]]:
+        episode_nodes = tuple(
+            node for node in nodes if node.kind not in _RECIPE_ONLY_KINDS
+        )
+        ids = {node.node_id for node in episode_nodes}
+        return (
+            episode_nodes,
+            tuple(
+                edge
+                for edge in edges
+                if edge.source_id in ids and edge.target_id in ids
+            ),
+        )
+
+    @staticmethod
+    def _recipe_link_ids(
+        nodes: tuple[AtlasNode, ...], edges: tuple[AtlasEdge, ...]
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Link only reusable recipe topology, not acceptance-specific evidence."""
+
+        node_ids = tuple(
+            sorted(node.node_id for node in nodes if node.kind in _RECIPE_ONLY_KINDS)
+        )
+        linked = set(node_ids)
+        edge_ids = tuple(
+            sorted(
+                edge.edge_id
+                for edge in edges
+                if edge.source_id in linked and edge.target_id in linked
+            )
+        )
+        return node_ids, edge_ids
+
+    def _with_binding_provenance(
+        self,
+        request: AcceptedCodeProjectionRequest,
+        *,
+        episode_id: str,
+        recipe_id: str | None,
+        nodes: tuple[AtlasNode, ...],
+        edges: tuple[AtlasEdge, ...],
+    ) -> tuple[tuple[AtlasNode, ...], tuple[AtlasEdge, ...]]:
+        by_id = {node.node_id: node for node in nodes}
+        episode = by_id.get(episode_id)
+        if episode is None or episode.kind is not NodeKind.TASK_EPISODE:
+            raise AtlasError("projection_extraction_invalid")
+        binding = self._binding_provenance_node(request)
+        by_id[binding.node_id] = binding
+        by_edge = {edge.edge_id: edge for edge in edges}
+        binding_edge = AtlasEdge.create(EdgeRelation.CHANGES, episode, binding)
+        by_edge[binding_edge.edge_id] = binding_edge
+        if recipe_id is not None:
+            recipe = by_id.get(recipe_id)
+            if recipe is None or recipe.kind is not NodeKind.RECIPE:
+                raise AtlasError("projection_extraction_invalid")
+            provenance_edge = AtlasEdge.create(
+                EdgeRelation.DERIVED_FROM, recipe, binding
+            )
+            by_edge[provenance_edge.edge_id] = provenance_edge
+        return (
+            tuple(sorted(by_id.values(), key=lambda node: node.node_id)),
+            tuple(sorted(by_edge.values(), key=lambda edge: edge.edge_id)),
+        )
+
+    @staticmethod
+    def _recipe_blobs(
+        manifest: RecipeManifest,
+        bindings: object,
+        declared_hashes: object,
+    ) -> tuple[tuple[str, bytes, str], ...]:
+        try:
+            value = thaw_json(bindings)
+            if (
+                type(value) is not dict
+                or set(value) != {"slot_values", "template_text_by_hash"}
+                or type(value["template_text_by_hash"]) is not dict
+                or type(declared_hashes) is not tuple
+            ):
+                raise AtlasError("projection_extraction_invalid")
+            templates = value["template_text_by_hash"]
+            expected = tuple(
+                sorted({operation.template_hash for operation in manifest.operations})
+            )
+            if (
+                not expected
+                or tuple(sorted(declared_hashes)) != expected
+                or set(templates) != set(expected)
+            ):
+                raise AtlasError("projection_extraction_invalid")
+            blobs: list[tuple[str, bytes, str]] = []
+            for blob_hash in expected:
+                text = templates[blob_hash]
+                if not isinstance(text, str) or not _is_hash(blob_hash):
+                    raise AtlasError("projection_extraction_invalid")
+                content = text.encode("utf-8")
+                validate_fragment(content, max_bytes=MAX_TEMPLATE_BYTES)
+                if "sha256:" + hashlib.sha256(content).hexdigest() != blob_hash:
+                    raise AtlasError("projection_extraction_invalid")
+                blobs.append((blob_hash, content, "text/x-python"))
+            return tuple(blobs)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise AtlasError("projection_extraction_invalid") from exc
+
+    @staticmethod
+    def _episode_status_and_reasons(
+        *,
+        language: str,
+        gaps: object,
+    ) -> tuple[AtlasStatus, tuple[str, ...]]:
+        if language != "python":
+            return AtlasStatus.UNSUPPORTED_LANGUAGE, ("UNSUPPORTED_LANGUAGE",)
+        try:
+            codes = tuple(
+                sorted(
+                    {
+                        gap.code
+                        for gap in gaps
+                        if isinstance(getattr(gap, "code", None), str)
+                        and _GAP_CODE.fullmatch(gap.code) is not None
+                    }
+                )
+            )
+        except TypeError as exc:
+            raise AtlasError("projection_extraction_invalid") from exc
+        if not codes:
+            return AtlasStatus.NO_VERIFIED_RECIPE, ("NO_VERIFIED_RECIPE",)
+        if codes == ("UNSUPPORTED_LANGUAGE",):
+            return AtlasStatus.UNSUPPORTED_LANGUAGE, codes
+        return AtlasStatus.EVIDENCE_INCOMPLETE, codes
+
+    def project_acceptance(
+        self, request: AcceptedCodeProjectionRequest
+    ) -> AcceptanceProjection:
+        """Project one accepted code task through verified reader evidence only."""
+
+        request = self._validate_accepted_projection_request(request)
+        existing = self._store.get_ingestion_receipt(request.ingestion_key)
+        if existing is not None:
+            if existing.payload_hash != request.payload_hash:
+                raise StoreConflictError("ingestion receipt conflict")
+        self._require_canonical_core_key(request)
+        extraction_request = self._read_accepted_evidence(request)
+        if existing is not None:
+            if not self._existing_receipt_has_binding(request, existing):
+                raise StoreConflictError("ingestion evidence binding conflict")
+            return self._projection_from_receipt(request, existing)
+        result = self._projection_extractor.extract(extraction_request)
+        if result.eligible and request.language == "python":
+            manifest = result.manifest
+            if type(manifest) is not RecipeManifest:
+                raise AtlasError("projection_extraction_invalid")
+            nodes, edges = self._with_binding_provenance(
+                request,
+                episode_id=result.episode_id,
+                recipe_id=manifest.recipe_id,
+                nodes=tuple(result.nodes),
+                edges=tuple(result.edges),
+            )
+            blobs = self._recipe_blobs(manifest, result.original_bindings, result.blobs)
+            recipe_node_ids, recipe_edge_ids = self._recipe_link_ids(nodes, edges)
+            receipt = IngestionReceipt(
+                request.ingestion_key,
+                request.payload_hash,
+                AtlasStatus.READY,
+                result.episode_id,
+                manifest.recipe_id,
+            )
+            self._store.put_ingestion_bundle(
+                nodes=nodes,
+                edges=edges,
+                manifest=manifest,
+                recipe_node_ids=recipe_node_ids,
+                recipe_edge_ids=recipe_edge_ids,
+                blobs=blobs,
+                receipt=receipt,
+            )
+            return self._projection_from_receipt(request, receipt)
+
+        episode_nodes, episode_edges = self._episode_records(
+            tuple(result.nodes), tuple(result.edges)
+        )
+        nodes, edges = self._with_binding_provenance(
+            request,
+            episode_id=result.episode_id,
+            recipe_id=None,
+            nodes=episode_nodes,
+            edges=episode_edges,
+        )
+        status, reasons = self._episode_status_and_reasons(
+            language=request.language,
+            gaps=result.gaps,
+        )
+        receipt = IngestionReceipt(
+            request.ingestion_key,
+            request.payload_hash,
+            status,
+            result.episode_id,
+            reasons=reasons,
+        )
+        self._store.put_ingestion_bundle(
+            nodes=nodes,
+            edges=edges,
+            manifest=None,
+            recipe_node_ids=(),
+            recipe_edge_ids=(),
+            blobs=(),
+            receipt=receipt,
+        )
+        return self._projection_from_receipt(request, receipt)
 
     @staticmethod
     def _safe_node(node: AtlasNode) -> bool:
