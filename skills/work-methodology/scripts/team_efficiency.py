@@ -17,13 +17,15 @@ from typing import Any
 
 MAX_PACKET_BYTES = 16 * 1024
 MAX_STATUS_BYTES = 32 * 1024
-MAX_MANIFEST_BYTES = 32 * 1024
+MAX_MANIFEST_BYTES = 128 * 1024
+MAX_MANIFEST_INPUT_BYTES = 4 * MAX_MANIFEST_BYTES
 MAX_WRITE_SCOPES = 32
 MAX_STATUS_TASKS = 64
 MAX_MANIFEST_UNITS = 16
 MAX_LIST_ITEMS = 32
 MAX_GRAPH_NODES = 64
 MAX_GRAPH_EDGES = 128
+MAX_REGISTRATION_CARD_BYTES = 4 * 1024
 
 _TASK_ID = re.compile(r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -209,6 +211,14 @@ _ATLAS_EDGE_ENDPOINTS = {
 
 class ContractMismatchError(ValueError):
     """Raised when a producer and consumer contract cannot safely join."""
+
+
+class AtlasEvidenceError(ValueError):
+    """A machine-readable, fail-closed Atlas evidence decision."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 def _canonical_json(value: object) -> str:
@@ -890,7 +900,7 @@ def _artifact(value: object) -> dict[str, Any]:
                 "depends_on",
                 "required_evidence",
                 "complexity",
-                "handoff_contracts",
+                "execution_contracts",
             }
         ),
         "artifact boundary",
@@ -915,13 +925,15 @@ def _artifact(value: object) -> dict[str, Any]:
             required=True,
         ),
         "recommended_route": _ROUTES[complexity],
-        "handoff_contracts": _normalised_list(
-            source["handoff_contracts"],
-            "handoff_contracts",
+        "execution_contracts": _normalised_list(
+            source["execution_contracts"],
+            "execution_contracts",
             _label,
             required=True,
         ),
         "direct_contract_hashes": [],
+        "task_node_ids": [],
+        "contract_node_ids": [],
     }
 
 
@@ -955,7 +967,9 @@ def _atlas_text(
     return value
 
 
-def _atlas_optional_text(value: object, field: str, *, maximum: int = 256) -> str | None:
+def _atlas_optional_text(
+    value: object, field: str, *, maximum: int = 256
+) -> str | None:
     if value is None:
         return None
     return _atlas_text(value, field, maximum=maximum, allow_empty=True)
@@ -1095,10 +1109,7 @@ def _atlas_test(value: object, field: str) -> dict[str, Any]:
     if type(expected_exit_code) is not int:
         raise ValueError(f"{field} expected_exit_code must be an integer")
     return {
-        "argv": [
-            _atlas_text(item, f"{field} argv item", maximum=256)
-            for item in argv
-        ],
+        "argv": [_atlas_text(item, f"{field} argv item", maximum=256) for item in argv],
         "expected_exit_code": expected_exit_code,
     }
 
@@ -1120,7 +1131,9 @@ def _atlas_evidence_window(value: object) -> dict[str, Any]:
     end_line = source.get("end_line")
     if start_line is not None:
         if type(start_line) is not int or start_line < 1:
-            raise ValueError("ImplementationPacket evidence window start_line is invalid")
+            raise ValueError(
+                "ImplementationPacket evidence window start_line is invalid"
+            )
         result["start_line"] = start_line
     if end_line is not None:
         if type(end_line) is not int or end_line < result.get("start_line", 1):
@@ -1195,9 +1208,7 @@ def _atlas_packet(value: object) -> dict[str, Any]:
         "workspace": _atlas_text(
             source["workspace"], "ImplementationPacket workspace", maximum=512
         ),
-        "snapshot_id": _hash(
-            source["snapshot_id"], "ImplementationPacket snapshot_id"
-        ),
+        "snapshot_id": _hash(source["snapshot_id"], "ImplementationPacket snapshot_id"),
         "recipe_id": _hash(source["recipe_id"], "ImplementationPacket recipe_id"),
         "node_ids": _atlas_hashes(
             source["node_ids"], "ImplementationPacket node_ids", maximum=MAX_GRAPH_NODES
@@ -1237,15 +1248,14 @@ def _packet_path_bindings(
     source = _mapping(value, "path_bindings")
     if len(source) > MAX_LIST_ITEMS:
         raise ValueError("path_bindings is out of bounds")
-    normalized_slots = {
-        _label(slot, "path binding slot") for slot in source
-    }
+    normalized_slots = {_label(slot, "path binding slot") for slot in source}
     if normalized_slots != path_slots:
-        return None, "ImplementationPacket path bindings do not cover its operation slots."
-    bindings = {
-        _label(slot, "path binding slot"): _relative_scope(
-            path, "path binding value"
+        return (
+            None,
+            "ImplementationPacket path bindings do not cover its operation slots.",
         )
+    bindings = {
+        _label(slot, "path binding slot"): _relative_scope(path, "path binding value")
         for slot, path in source.items()
     }
     if len(bindings) != len(source):
@@ -1271,7 +1281,9 @@ def _packet_units(
         or not packet["receipt_hashes"]
     ):
         return None, "ImplementationPacket does not contain complete verified evidence."
-    operation_hashes = {operation["template_hash"] for operation in packet["operations"]}
+    operation_hashes = {
+        operation["template_hash"] for operation in packet["operations"]
+    }
     if operation_hashes != set(packet["template_hashes"]):
         return None, "ImplementationPacket template evidence does not match operations."
 
@@ -1290,9 +1302,11 @@ def _packet_units(
         if constraint["kind"] != "path_suffix" or constraint["subject"] not in bindings:
             continue
         suffix = constraint["value"]
-        if not isinstance(suffix, str) or not suffix or not bindings[
-            constraint["subject"]
-        ].endswith(suffix):
+        if (
+            not isinstance(suffix, str)
+            or not suffix
+            or not bindings[constraint["subject"]].endswith(suffix)
+        ):
             return None, "ImplementationPacket path constraints do not prove bindings."
 
     operations_by_path: dict[str, list[dict[str, str]]] = {}
@@ -1323,13 +1337,13 @@ def _packet_units(
     direct_contract_hashes = [
         _sha256_json(
             {
-                "kind": "code_atlas_handoff",
+                "kind": "code_atlas_packet_execution_contract_v1",
                 "packet_id": packet["packet_id"],
                 "recipe_id": packet["recipe_id"],
             }
         )
     ]
-    handoff_contracts = sorted(
+    execution_contracts = sorted(
         {
             _hash_label("packet", packet["packet_id"]),
             *(_hash_label("contract", item) for item in direct_contract_hashes),
@@ -1350,7 +1364,7 @@ def _packet_units(
                 "depends_on": [],
                 "required_evidence": sorted(evidence),
                 "recommended_route": _ROUTES["routine"],
-                "handoff_contracts": handoff_contracts,
+                "execution_contracts": execution_contracts,
                 "direct_contract_hashes": direct_contract_hashes,
                 "operation_count": len(operations_by_path[path]),
                 "acceptance_constraints": acceptance_constraints,
@@ -1373,7 +1387,7 @@ def _packet_units(
             "depends_on": sorted(task_by_path.values()),
             "required_evidence": sorted(evidence),
             "recommended_route": _ROUTES["moderate"],
-            "handoff_contracts": handoff_contracts,
+            "execution_contracts": execution_contracts,
             "direct_contract_hashes": direct_contract_hashes,
             "operation_count": 0,
             "acceptance_constraints": acceptance_constraints,
@@ -1396,6 +1410,20 @@ def _atlas_node(value: object) -> dict[str, Any]:
     )
     if provenance not in {"observed", "resolved", "declared"}:
         raise ValueError("GraphQueryResult node provenance is invalid")
+    if kind in {
+        "TaskEpisode",
+        "SourceEvidence",
+        "TestSpec",
+        "ExecutionReceipt",
+    }:
+        if provenance != "observed":
+            raise AtlasEvidenceError("ATLAS_NODE_UNVERIFIED")
+        if source["quarantine_state"] is not None:
+            raise AtlasEvidenceError("ATLAS_NODE_QUARANTINED")
+        if source["superseded_at"] is not None:
+            raise AtlasEvidenceError("ATLAS_NODE_SUPERSEDED")
+        if not source["source_hashes"]:
+            raise AtlasEvidenceError("ATLAS_SOURCE_HASH_INCOMPLETE")
     payload = _atlas_json(source["payload"], "GraphQueryResult node payload")
     node_id = _hash(source["node_id"], "GraphQueryResult node_id")
     identity = {
@@ -1470,6 +1498,12 @@ def _atlas_edge(value: object) -> dict[str, Any]:
     )
     if provenance not in {"observed", "resolved", "declared"}:
         raise ValueError("GraphQueryResult edge provenance is invalid")
+    trust_edge = (
+        source_kind == "TaskEpisode"
+        and relation in {"CHANGES", "VERIFIED_BY", "SOLVES"}
+    ) or relation in {"TESTS", "SUPERSEDES"}
+    if trust_edge and provenance != "observed":
+        raise AtlasEvidenceError("ATLAS_EDGE_UNVERIFIED")
     payload = _atlas_json(source["payload"], "GraphQueryResult edge payload")
     edge_id = _hash(source["edge_id"], "GraphQueryResult edge_id")
     identity = {
@@ -1510,14 +1544,16 @@ def _atlas_graph(value: object) -> dict[str, Any]:
     nodes = [
         _atlas_node(item)
         for item in _bounded_records(
-            source["nodes"], "GraphQueryResult nodes",
+            source["nodes"],
+            "GraphQueryResult nodes",
             maximum=MAX_GRAPH_NODES,
         )
     ]
     edges = [
         _atlas_edge(item)
         for item in _bounded_records(
-            source["edges"], "GraphQueryResult edges",
+            source["edges"],
+            "GraphQueryResult edges",
             maximum=MAX_GRAPH_EDGES,
         )
     ]
@@ -1543,13 +1579,265 @@ def _atlas_graph(value: object) -> dict[str, Any]:
     }
 
 
+def _require_observed_node(node: Mapping[str, Any]) -> None:
+    if node["provenance"] != "observed":
+        raise AtlasEvidenceError("ATLAS_NODE_UNVERIFIED")
+    if node["quarantine_state"] is not None:
+        raise AtlasEvidenceError("ATLAS_NODE_QUARANTINED")
+    if node["superseded_at"] is not None:
+        raise AtlasEvidenceError("ATLAS_NODE_SUPERSEDED")
+    if not node["source_hashes"]:
+        raise AtlasEvidenceError("ATLAS_SOURCE_HASH_INCOMPLETE")
+
+
+def _require_observed_edge(edge: Mapping[str, Any]) -> None:
+    if edge["provenance"] != "observed":
+        raise AtlasEvidenceError("ATLAS_EDGE_UNVERIFIED")
+
+
+def _payload_mapping(
+    value: object,
+    expected: frozenset[str],
+    code: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise AtlasEvidenceError(code)
+    return value
+
+
+def _proof_hash(value: object, code: str, *, allow_empty: bool = False) -> str:
+    if allow_empty and value == "":
+        return ""
+    try:
+        return _hash(value, code)
+    except ValueError:
+        raise AtlasEvidenceError(code) from None
+
+
+def _task_episode_payload(node: Mapping[str, Any]) -> None:
+    payload = _payload_mapping(
+        node["payload"],
+        frozenset(
+            {
+                "workflow_id_hash",
+                "task_id_hash",
+                "acceptance_id_hash",
+                "workspace_hash",
+                "checkpoint_id_hash",
+                "input_snapshot_id_hash",
+                "output_snapshot_id_hash",
+                "task_kind",
+            }
+        ),
+        "ATLAS_TASK_EPISODE_INVALID",
+    )
+    if payload["task_kind"] != "code":
+        raise AtlasEvidenceError("ATLAS_TASK_EPISODE_INVALID")
+    for field in (
+        "workflow_id_hash",
+        "task_id_hash",
+        "acceptance_id_hash",
+        "workspace_hash",
+        "checkpoint_id_hash",
+        "input_snapshot_id_hash",
+        "output_snapshot_id_hash",
+    ):
+        _proof_hash(payload[field], "ATLAS_TASK_EPISODE_INVALID")
+
+
+def _source_evidence_path(node: Mapping[str, Any]) -> str | None:
+    _require_observed_node(node)
+    payload = node["payload"]
+    if not isinstance(payload, Mapping):
+        raise AtlasEvidenceError("ATLAS_SOURCE_EVIDENCE_INVALID")
+    kind = payload.get("kind")
+    if kind == "task_change_set":
+        summary = _payload_mapping(
+            payload,
+            frozenset(
+                {
+                    "kind",
+                    "path_count",
+                    "input_snapshot_id_hash",
+                    "output_snapshot_id_hash",
+                }
+            ),
+            "ATLAS_SOURCE_EVIDENCE_INVALID",
+        )
+        if type(summary["path_count"]) is not int or summary["path_count"] < 1:
+            raise AtlasEvidenceError("ATLAS_SOURCE_EVIDENCE_INVALID")
+        _proof_hash(
+            summary["input_snapshot_id_hash"],
+            "ATLAS_SOURCE_EVIDENCE_INVALID",
+        )
+        _proof_hash(
+            summary["output_snapshot_id_hash"],
+            "ATLAS_SOURCE_EVIDENCE_INVALID",
+        )
+        return None
+    if kind == "index_node":
+        indexed = _payload_mapping(
+            payload,
+            frozenset(
+                {
+                    "kind",
+                    "path",
+                    "node_id_hash",
+                    "content_hash",
+                    "start_byte",
+                    "end_byte",
+                    "name_hash",
+                }
+            ),
+            "ATLAS_SOURCE_EVIDENCE_INVALID",
+        )
+        for field in ("node_id_hash", "content_hash", "name_hash"):
+            _proof_hash(indexed[field], "ATLAS_SOURCE_EVIDENCE_INVALID")
+        if (
+            type(indexed["start_byte"]) is not int
+            or type(indexed["end_byte"]) is not int
+            or indexed["start_byte"] < 0
+            or indexed["end_byte"] < indexed["start_byte"]
+        ):
+            raise AtlasEvidenceError("ATLAS_SOURCE_EVIDENCE_INVALID")
+        try:
+            return _relative_scope(indexed["path"], "SourceEvidence path")
+        except ValueError:
+            raise AtlasEvidenceError("ATLAS_SOURCE_EVIDENCE_INVALID") from None
+
+    changed = _payload_mapping(
+        payload,
+        frozenset(
+            {
+                "path",
+                "before_hash",
+                "after_hash",
+                "before_bytes",
+                "after_bytes",
+            }
+        ),
+        "ATLAS_SOURCE_EVIDENCE_INVALID",
+    )
+    before_hash = _proof_hash(
+        changed["before_hash"],
+        "ATLAS_SOURCE_EVIDENCE_INVALID",
+        allow_empty=True,
+    )
+    after_hash = _proof_hash(
+        changed["after_hash"],
+        "ATLAS_SOURCE_EVIDENCE_INVALID",
+        allow_empty=True,
+    )
+    if not before_hash and not after_hash:
+        raise AtlasEvidenceError("ATLAS_SOURCE_EVIDENCE_INVALID")
+    if (
+        type(changed["before_bytes"]) is not int
+        or type(changed["after_bytes"]) is not int
+        or changed["before_bytes"] < 0
+        or changed["after_bytes"] < 0
+    ):
+        raise AtlasEvidenceError("ATLAS_SOURCE_EVIDENCE_INVALID")
+    try:
+        return _relative_scope(changed["path"], "SourceEvidence path")
+    except ValueError:
+        raise AtlasEvidenceError("ATLAS_SOURCE_EVIDENCE_INVALID") from None
+
+
+def _test_spec_proof(node: Mapping[str, Any]) -> tuple[str, str]:
+    _require_observed_node(node)
+    payload = node["payload"]
+    if not isinstance(payload, Mapping):
+        raise AtlasEvidenceError("ATLAS_VERIFICATION_UNVERIFIED")
+    if payload.get("kind") == "bound_verification":
+        bound = _payload_mapping(
+            payload,
+            frozenset({"kind", "expected_exit_code"}),
+            "ATLAS_VERIFICATION_UNVERIFIED",
+        )
+        if (
+            type(bound["expected_exit_code"]) is not int
+            or bound["expected_exit_code"] != 0
+        ):
+            raise AtlasEvidenceError("ATLAS_VERIFICATION_UNVERIFIED")
+        return "bound_verification", ""
+    if payload.get("kind") == "command_receipt":
+        command = _payload_mapping(
+            payload,
+            frozenset({"kind", "command_spec_hash", "expected_exit_code"}),
+            "ATLAS_VERIFICATION_UNVERIFIED",
+        )
+        if (
+            type(command["expected_exit_code"]) is not int
+            or command["expected_exit_code"] != 0
+        ):
+            raise AtlasEvidenceError("ATLAS_VERIFICATION_UNVERIFIED")
+        return (
+            "command_receipt",
+            _proof_hash(
+                command["command_spec_hash"],
+                "ATLAS_VERIFICATION_UNVERIFIED",
+            ),
+        )
+    raise AtlasEvidenceError("ATLAS_VERIFICATION_UNVERIFIED")
+
+
+def _receipt_proof(node: Mapping[str, Any]) -> tuple[str, str | int]:
+    _require_observed_node(node)
+    payload = node["payload"]
+    if not isinstance(payload, Mapping):
+        raise AtlasEvidenceError("ATLAS_RECEIPT_UNVERIFIED")
+    if payload.get("kind") == "bound_receipt_summary":
+        summary = _payload_mapping(
+            payload,
+            frozenset({"kind", "receipt_count"}),
+            "ATLAS_RECEIPT_UNVERIFIED",
+        )
+        count = summary["receipt_count"]
+        if type(count) is not int or count < 2:
+            raise AtlasEvidenceError("ATLAS_RECEIPT_UNVERIFIED")
+        return "bound_receipt_summary", count
+
+    receipt = _payload_mapping(
+        payload,
+        frozenset(
+            {
+                "receipt_id_hash",
+                "kind",
+                "command_spec_hash",
+                "input_hash",
+                "output_hash",
+                "exit_code",
+                "success",
+            }
+        ),
+        "ATLAS_RECEIPT_UNVERIFIED",
+    )
+    kind = receipt["kind"]
+    if kind not in {"command", "write"}:
+        raise AtlasEvidenceError("ATLAS_RECEIPT_UNVERIFIED")
+    for field in (
+        "receipt_id_hash",
+        "command_spec_hash",
+        "input_hash",
+        "output_hash",
+    ):
+        _proof_hash(receipt[field], "ATLAS_RECEIPT_UNVERIFIED")
+    if (
+        receipt["success"] is not True
+        or type(receipt["exit_code"]) is not int
+        or receipt["exit_code"] != 0
+    ):
+        raise AtlasEvidenceError("ATLAS_RECEIPT_UNVERIFIED")
+    return kind, str(receipt["command_spec_hash"])
+
+
 def _episode_units(
     graph_value: object,
     parent_task_id: str,
 ) -> tuple[list[dict[str, Any]] | None, str]:
     graph = _atlas_graph(graph_value)
     if graph["truncated"]:
-        return None, "GraphQueryResult is truncated."
+        raise AtlasEvidenceError("ATLAS_GRAPH_TRUNCATED")
     nodes_by_id = {node["node_id"]: node for node in graph["nodes"]}
     episode_ids = [
         node_id
@@ -1557,9 +1845,9 @@ def _episode_units(
         if node["kind"] == "TaskEpisode"
     ]
     if not episode_ids:
-        return None, "GraphQueryResult contains no TaskEpisode evidence."
-    if len(episode_ids) > MAX_MANIFEST_UNITS:
-        raise ValueError("GraphQueryResult derives too many work units")
+        raise AtlasEvidenceError("ATLAS_TASK_EPISODE_MISSING")
+    if len(episode_ids) >= MAX_MANIFEST_UNITS:
+        raise AtlasEvidenceError("ATLAS_UNIT_BUDGET_EXCEEDED")
 
     change_edges: dict[str, list[dict[str, Any]]] = {
         node_id: [] for node_id in episode_ids
@@ -1567,124 +1855,150 @@ def _episode_units(
     verification_edges: dict[str, list[dict[str, Any]]] = {
         node_id: [] for node_id in episode_ids
     }
-    recipes_by_episode: dict[str, set[str]] = {
-        node_id: set() for node_id in episode_ids
-    }
+    test_edges: dict[str, list[dict[str, Any]]] = {}
     for edge in graph["edges"]:
-        if edge["relation"] == "CHANGES" and edge["source_id"] in change_edges:
-            change_edges[edge["source_id"]].append(edge)
-        elif edge["relation"] == "VERIFIED_BY" and edge["source_id"] in verification_edges:
-            verification_edges[edge["source_id"]].append(edge)
-        elif edge["relation"] == "DERIVED_FROM" and edge["target_id"] in recipes_by_episode:
-            recipes_by_episode[edge["target_id"]].add(edge["source_id"])
+        relation = edge["relation"]
+        source_id = edge["source_id"]
+        if relation == "SUPERSEDES":
+            _require_observed_edge(edge)
+        if relation == "CHANGES" and source_id in change_edges:
+            _require_observed_edge(edge)
+            change_edges[source_id].append(edge)
+        elif relation == "VERIFIED_BY" and source_id in verification_edges:
+            _require_observed_edge(edge)
+            verification_edges[source_id].append(edge)
+        elif relation == "SOLVES" and source_id in change_edges:
+            _require_observed_edge(edge)
+        elif relation == "TESTS":
+            test_edges.setdefault(source_id, []).append(edge)
 
     scopes_by_episode: dict[str, set[str]] = {}
     evidence_by_episode: dict[str, set[str]] = {}
     acceptance_by_episode: dict[str, set[str]] = {}
+    contract_nodes_by_episode: dict[str, list[str]] = {}
+    contracts_by_episode: dict[str, list[str]] = {}
     for episode_id in episode_ids:
         episode = nodes_by_id[episode_id]
-        payload = _mapping(episode["payload"], "TaskEpisode payload")
-        if payload.get("task_kind") != "code":
-            return None, "TaskEpisode is not a verified code task."
+        _require_observed_node(episode)
+        _task_episode_payload(episode)
         scopes: set[str] = set()
-        evidence = set(episode["source_hashes"])
+        evidence = {episode_id}
+        participating_node_ids = {episode_id}
+        participating_edge_ids: set[str] = set()
+        changed_source_ids: set[str] = set()
         for edge in change_edges[episode_id]:
             source = nodes_by_id[edge["target_id"]]
-            payload = _mapping(source["payload"], "SourceEvidence payload")
-            path = payload.get("path")
-            if path is None:
-                continue
-            scopes.add(_relative_scope(path, "SourceEvidence path"))
-            if not source["source_hashes"]:
-                return None, "SourceEvidence lacks source hashes."
+            path = _source_evidence_path(source)
+            if path is not None:
+                scopes.add(path)
+            changed_source_ids.add(source["node_id"])
+            participating_node_ids.add(source["node_id"])
+            participating_edge_ids.add(edge["edge_id"])
             evidence.add(source["node_id"])
-            evidence.update(source["source_hashes"])
+            evidence.add(edge["edge_id"])
         if not scopes:
-            return None, "TaskEpisode lacks concrete changed-path evidence."
+            raise AtlasEvidenceError("ATLAS_CHANGED_PATH_UNPROVEN")
 
         acceptance: set[str] = set()
+        verification_node_ids: set[str] = set()
+        command_receipt_hashes: set[str] = set()
+        command_test_hashes: set[str] = set()
+        receipt_kinds: list[str] = []
+        receipt_summaries: list[int] = []
+        bound_verification = False
+        test_node_ids: set[str] = set()
         for edge in verification_edges[episode_id]:
             verification = nodes_by_id[edge["target_id"]]
             if verification["kind"] == "TestSpec":
-                _atlas_test(verification["payload"], "TestSpec payload")
-            if not verification["source_hashes"]:
-                return None, "TaskEpisode verification lacks source hashes."
+                proof_kind, proof_hash = _test_spec_proof(verification)
+                test_node_ids.add(verification["node_id"])
+                if proof_kind == "bound_verification":
+                    bound_verification = True
+                else:
+                    command_test_hashes.add(proof_hash)
+            elif verification["kind"] == "ExecutionReceipt":
+                proof_kind, proof_value = _receipt_proof(verification)
+                if proof_kind == "bound_receipt_summary":
+                    receipt_summaries.append(int(proof_value))
+                else:
+                    receipt_kinds.append(proof_kind)
+                    if proof_kind == "command":
+                        command_receipt_hashes.add(str(proof_value))
+            else:
+                raise AtlasEvidenceError("ATLAS_VERIFICATION_UNVERIFIED")
+            verification_node_ids.add(verification["node_id"])
+            participating_node_ids.add(verification["node_id"])
+            participating_edge_ids.add(edge["edge_id"])
             acceptance.add(verification["node_id"])
             evidence.add(verification["node_id"])
-            evidence.update(verification["source_hashes"])
-        if not acceptance:
-            return None, "TaskEpisode lacks VERIFIED_BY evidence."
-        if not evidence:
-            return None, "TaskEpisode lacks source evidence."
+            evidence.add(edge["edge_id"])
+        if (
+            not acceptance
+            or not bound_verification
+            or len(receipt_summaries) != 1
+            or receipt_summaries[0] != len(receipt_kinds)
+            or "command" not in receipt_kinds
+            or "write" not in receipt_kinds
+            or command_test_hashes != command_receipt_hashes
+        ):
+            raise AtlasEvidenceError("ATLAS_RECEIPT_UNVERIFIED")
+
+        for test_node_id in test_node_ids:
+            covered = set()
+            for edge in test_edges.get(test_node_id, []):
+                if edge["target_id"] not in changed_source_ids:
+                    continue
+                _require_observed_edge(edge)
+                covered.add(edge["target_id"])
+                participating_edge_ids.add(edge["edge_id"])
+                evidence.add(edge["edge_id"])
+            if covered != changed_source_ids:
+                raise AtlasEvidenceError("ATLAS_VERIFICATION_UNVERIFIED")
+
+        contract_hash = _sha256_json(
+            {
+                "kind": "code_atlas_task_episode_execution_contract_v1",
+                "task_episode_node_id": episode_id,
+                "node_ids": sorted(participating_node_ids),
+                "edge_ids": sorted(participating_edge_ids),
+            }
+        )
         scopes_by_episode[episode_id] = scopes
         evidence_by_episode[episode_id] = evidence
         acceptance_by_episode[episode_id] = acceptance
+        contract_nodes_by_episode[episode_id] = sorted(verification_node_ids)
+        contracts_by_episode[episode_id] = [contract_hash]
 
-    episodes_by_recipe: dict[str, set[str]] = {}
-    for episode_id, recipe_ids in recipes_by_episode.items():
-        for recipe_id in recipe_ids:
-            episodes_by_recipe.setdefault(recipe_id, set()).add(episode_id)
-    dependencies_by_episode: dict[str, set[str]] = {
-        node_id: set() for node_id in episode_ids
-    }
-    for edge in graph["edges"]:
-        if edge["relation"] != "SUPERSEDES":
-            continue
-        for current_episode in episodes_by_recipe.get(edge["source_id"], set()):
-            dependencies_by_episode[current_episode].update(
-                episodes_by_recipe.get(edge["target_id"], set()) - {current_episode}
-            )
-
-    graph_fingerprint = _sha256_json(
-        {
-            "nodes": graph["nodes"],
-            "edges": graph["edges"],
-            "truncated": False,
-        }
-    )
-    contracts_by_episode = {
-        node_id: [
-            _sha256_json(
-                {
-                    "kind": "code_atlas_task_episode_handoff",
-                    "graph_fingerprint": graph_fingerprint,
-                    "task_episode_node_id": node_id,
-                }
-            )
-        ]
-        for node_id in episode_ids
-    }
-    contract_nodes_by_episode = {node_id: [] for node_id in episode_ids}
     task_by_episode = {
         node_id: _derived_task_id(
             parent_task_id,
             "E",
-            {"graph_fingerprint": graph_fingerprint, "node_id": node_id},
+            {
+                "execution_contract_hash": contracts_by_episode[node_id][0],
+                "task_episode_node_id": node_id,
+            },
         )
         for node_id in episode_ids
     }
     units = []
     for node_id in episode_ids:
-        handoff_contracts = {
+        execution_contracts = {
             _hash_label("episode", node_id),
+            *(
+                _hash_label("contract", contract_hash)
+                for contract_hash in contracts_by_episode[node_id]
+            ),
         }
-        handoff_contracts.update(
-            _hash_label("contract", contract_hash)
-            for contract_hash in contracts_by_episode[node_id]
-        )
         units.append(
             {
                 "task_id": task_by_episode[node_id],
                 "goal": f"Execute verified TaskEpisode {node_id[:24]}",
                 "output_boundary": f"TaskEpisode {node_id}",
                 "write_scope": sorted(scopes_by_episode[node_id]),
-                "depends_on": sorted(
-                    task_by_episode[dependency_id]
-                    for dependency_id in dependencies_by_episode[node_id]
-                ),
+                "depends_on": [],
                 "required_evidence": sorted(evidence_by_episode[node_id]),
                 "recommended_route": _ROUTES["routine"],
-                "handoff_contracts": sorted(handoff_contracts),
+                "execution_contracts": sorted(execution_contracts),
                 "direct_contract_hashes": sorted(contracts_by_episode[node_id]),
                 "task_node_ids": [node_id],
                 "contract_node_ids": contract_nodes_by_episode[node_id],
@@ -1706,23 +2020,30 @@ def _episode_units(
             for contract in contracts_by_episode[episode_id]
         }
     )
+    verification_identity = _sha256_json(
+        {
+            "kind": "code_atlas_graph_verification_execution_contract_v1",
+            "direct_contract_hashes": all_contracts,
+            "task_episode_node_ids": episode_ids,
+        }
+    )
     verification_id = _derived_task_id(
         parent_task_id,
         "V",
-        {"graph_fingerprint": graph_fingerprint, "kind": "verification"},
+        {"execution_contract_hash": verification_identity},
     )
     units.append(
         {
             "task_id": verification_id,
             "goal": "Run TaskEpisode graph verification constraints",
-            "output_boundary": f"verification {graph_fingerprint}",
+            "output_boundary": f"verification {verification_identity}",
             "write_scope": [],
             "depends_on": sorted(task_by_episode.values()),
             "required_evidence": all_evidence,
             "recommended_route": _ROUTES["moderate"],
-            "handoff_contracts": sorted(
+            "execution_contracts": sorted(
                 {
-                    _hash_label("graph", graph_fingerprint),
+                    _hash_label("graph", verification_identity),
                     *(_hash_label("contract", item) for item in all_contracts),
                 }
             ),
@@ -1815,6 +2136,127 @@ def _maximal_ready_wave(
     return list(best)
 
 
+_HOST_BINDING_DESCRIPTIONS = {
+    "workflow_id": "Existing workflow identifier selected by the orchestration host.",
+    "owner": "Claim owner identity selected by the orchestration host.",
+    "expires_at": "Lease expiry timestamp selected by the orchestration host.",
+    "lease_epoch": "Lease epoch returned by workflow_claim.",
+    "host_target": "Canonical collaboration target selected by the orchestration host.",
+    "now": "Optional host clock value; omit to use the orchestration service clock.",
+    "workspace_root": "Canonical workspace root resolved by the orchestration host.",
+    "input_snapshot_id": "Current input snapshot identifier resolved by the host.",
+}
+
+
+def _host_binding(reference: str) -> dict[str, str]:
+    return {
+        "source": "host",
+        "ref": reference,
+        "description": _HOST_BINDING_DESCRIPTIONS[reference],
+    }
+
+
+def _registration_plan(
+    units: Sequence[Mapping[str, Any]],
+    *,
+    strict_index: bool,
+) -> dict[str, Any]:
+    calls = []
+    for unit in sorted(units, key=lambda item: item["task_id"]):
+        input_hash = _sha256_json(
+            {
+                "kind": "team_efficiency_task_input_v1",
+                "task_id": unit["task_id"],
+                "dependencies": unit["depends_on"],
+                "write_scope": unit["write_scope"],
+                "direct_contract_hashes": unit["direct_contract_hashes"],
+                "task_node_ids": unit["task_node_ids"],
+                "contract_node_ids": unit["contract_node_ids"],
+                "required_evidence": unit["required_evidence"],
+            }
+        )
+        card = _canonical_json(
+            {
+                "schema": "team-efficiency/task-card-v1",
+                "task_id": unit["task_id"],
+                "goal": unit["goal"],
+                "output_boundary": unit["output_boundary"],
+                "unit_kind": unit.get("unit_kind", "artifact"),
+                "execution_contracts": unit["execution_contracts"],
+            }
+        )
+        if len(card.encode("utf-8")) > MAX_REGISTRATION_CARD_BYTES:
+            raise ValueError("registration card exceeds its byte budget")
+        calls.append(
+            {
+                "task_id": unit["task_id"],
+                "workflow_register_task": {
+                    "tool": "workflow_register_task",
+                    "arguments": {
+                        "workflow_id": _host_binding("workflow_id"),
+                        "task_id": unit["task_id"],
+                        "title": unit["goal"],
+                        "owner_role": unit["recommended_route"],
+                        "card": card,
+                        "dependencies": list(unit["depends_on"]),
+                        "write_scope": list(unit["write_scope"]),
+                        "direct_contract_hashes": list(unit["direct_contract_hashes"]),
+                        "required_evidence": list(unit["required_evidence"]),
+                        "input_hash": input_hash,
+                        "strict_index": strict_index,
+                        "workspace_root": _host_binding("workspace_root"),
+                        "input_snapshot_id": _host_binding("input_snapshot_id"),
+                        "task_node_ids": list(unit["task_node_ids"]),
+                        "contract_node_ids": list(unit["contract_node_ids"]),
+                    },
+                    "host_bound_fields": [
+                        "input_snapshot_id",
+                        "workflow_id",
+                        "workspace_root",
+                    ],
+                },
+                "workflow_claim": {
+                    "tool": "workflow_claim",
+                    "arguments": {
+                        "task_id": unit["task_id"],
+                        "owner": _host_binding("owner"),
+                        "expires_at": _host_binding("expires_at"),
+                        "host_target": _host_binding("host_target"),
+                        "now": _host_binding("now"),
+                    },
+                    "host_bound_fields": [
+                        "expires_at",
+                        "host_target",
+                        "now",
+                        "owner",
+                    ],
+                },
+                "workflow_endpoint_bind": {
+                    "tool": "workflow_endpoint_bind",
+                    "arguments": {
+                        "workflow_id": _host_binding("workflow_id"),
+                        "task_id": unit["task_id"],
+                        "owner": _host_binding("owner"),
+                        "lease_epoch": _host_binding("lease_epoch"),
+                        "host_target": _host_binding("host_target"),
+                        "now": _host_binding("now"),
+                    },
+                    "host_bound_fields": [
+                        "host_target",
+                        "lease_epoch",
+                        "now",
+                        "owner",
+                        "workflow_id",
+                    ],
+                },
+            }
+        )
+    return {
+        "schema": "team-efficiency/workflow-registration-plan-v1",
+        "units": calls,
+    }
+
+
 def _needs_design_plan(
     *,
     task_id: str,
@@ -1834,6 +2276,7 @@ def _needs_design_plan(
         "units": [],
         "conflict_graph": {},
         "waves": [],
+        "registration_plan": _registration_plan((), strict_index=False),
     }
 
 
@@ -1889,14 +2332,16 @@ def _scheduled_plan(
         "units": units,
         "conflict_graph": graph,
         "waves": waves,
+        "registration_plan": _registration_plan(
+            units,
+            strict_index=source_kind in _ATLAS_SOURCE_KINDS,
+        ),
     }
 
 
 def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Compile manual boundaries or verified Code Atlas evidence into safe waves."""
 
-    if len(_json_bytes(manifest)) > MAX_MANIFEST_BYTES:
-        raise ValueError("work-package manifest exceeds its byte budget")
     source = _mapping(manifest, "work-package manifest")
     common = frozenset({"schema", "task_id", "goal", "capacity", "decomposition"})
     if source.get("schema") != "team-efficiency/work-package-v1":
@@ -1907,6 +2352,32 @@ def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
     if type(capacity) is not int or not 1 <= capacity <= MAX_MANIFEST_UNITS:
         raise ValueError("capacity is out of bounds")
     decomposition = _text(source.get("decomposition"), "decomposition", maximum=32)
+    try:
+        manifest_size = len(_json_bytes(manifest))
+    except ValueError:
+        if source.get("source_kind") == "task_episode_graph":
+            return _needs_design_plan(
+                task_id=task_id,
+                goal=goal,
+                capacity=capacity,
+                source_kind="task_episode_graph",
+                reason="ATLAS_GRAPH_INVALID",
+            )
+        raise
+    if manifest_size > MAX_MANIFEST_BYTES:
+        source_kind = source.get("source_kind")
+        if (
+            not isinstance(source_kind, str)
+            or source_kind not in _ATLAS_SOURCE_KINDS | _ARTIFACT_SOURCE_KINDS
+        ):
+            source_kind = "none"
+        return _needs_design_plan(
+            task_id=task_id,
+            goal=goal,
+            capacity=capacity,
+            source_kind=source_kind,
+            reason="ATLAS_INPUT_BUDGET_EXCEEDED",
+        )
 
     if decomposition in {"semantic", "needs_design"}:
         source_kind = _manifest_source_kind(
@@ -1964,12 +2435,20 @@ def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
             task_id,
         )
     else:
-        _exact_keys(
-            source,
-            common | {"source_kind", "graph"},
-            "work-package manifest",
-        )
-        units, reason = _episode_units(source["graph"], task_id)
+        try:
+            expected = common | {"source_kind", "eligible", "graph"}
+            if "eligible" not in source:
+                raise AtlasEvidenceError("ATLAS_ELIGIBILITY_UNPROVEN")
+            _exact_keys(source, expected, "work-package manifest")
+            if source["eligible"] is not True:
+                if source["eligible"] is False:
+                    raise AtlasEvidenceError("ATLAS_EXTRACTION_INELIGIBLE")
+                raise AtlasEvidenceError("ATLAS_ELIGIBILITY_UNPROVEN")
+            units, reason = _episode_units(source["graph"], task_id)
+        except AtlasEvidenceError as error:
+            units, reason = None, error.code
+        except (KeyError, TypeError, ValueError):
+            units, reason = None, "ATLAS_GRAPH_INVALID"
     if units is None:
         return _needs_design_plan(
             task_id=task_id,
@@ -2062,7 +2541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inputs = _read_json(args.input, maximum=MAX_PACKET_BYTES)
             _print_json(make_cache_metadata(inputs))
         else:
-            manifest = _read_json(args.input, maximum=MAX_MANIFEST_BYTES)
+            manifest = _read_json(args.input, maximum=MAX_MANIFEST_INPUT_BYTES)
             _print_json(decompose(manifest))
     except (ContractMismatchError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

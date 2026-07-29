@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -27,13 +29,128 @@ from code_atlas import (  # noqa: E402
     EdgeRelation,
     GraphQueryResult,
     ImplementationPacket,
-    NodeKind,
-    RecipeManifest,
     SlotSpec,
     TemplateOperation,
     TestSpec as AtlasTestSpec,
     canonical_hash,
 )
+from code_atlas.extractors import (  # noqa: E402
+    BoundExecutionReceipt,
+    ExtractionRequest,
+    PythonRecipeExtractor,
+)
+from project_index.models import SnapshotFile  # noqa: E402
+
+
+def _content_hash(body: bytes) -> str:
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _marker_hash(marker: str) -> str:
+    return _content_hash(marker.encode("utf-8"))
+
+
+def _receipt_binding_hash(
+    *,
+    kind: str,
+    request: ExtractionRequest,
+    snapshot_id: str,
+    files: tuple[SnapshotFile, ...],
+) -> str:
+    return canonical_hash(
+        {
+            "kind": kind,
+            "workflow_id": request.workflow_id,
+            "task_id": request.task_id,
+            "acceptance_id": request.acceptance_id,
+            "workspace_hash": request.workspace_hash,
+            "checkpoint_id": request.checkpoint_id,
+            "snapshot_id": snapshot_id,
+            "write_scope": sorted(request.write_scope),
+            "files": sorted([[item.path, item.content_hash] for item in files]),
+        }
+    )
+
+
+def _extractor_request(
+    *,
+    path: str = "src/atlas_guard.py",
+    marker: str = "primary",
+    command_success: bool = True,
+    command_exit_code: int = 0,
+    complete_receipt_hashes: bool = True,
+) -> ExtractionRequest:
+    body = b"def atlas_guard(value: int) -> bool:\n    return value > 0\n"
+    after_files = (SnapshotFile(path, _content_hash(body), body),)
+    request = ExtractionRequest(
+        workflow_id=f"workflow-{marker}",
+        task_id=f"task-{marker}",
+        acceptance_id=f"acceptance-{marker}",
+        task_kind="code",
+        intent_id=f"python.atlas-guard-{marker}",
+        workspace_hash=_marker_hash(f"workspace-{marker}"),
+        checkpoint_id=f"checkpoint-{marker}",
+        input_snapshot_id=_marker_hash(f"input-{marker}"),
+        output_snapshot_id=_marker_hash(f"output-{marker}"),
+        write_scope=(path,),
+        before_files=(),
+        after_files=after_files,
+        changed_nodes=(),
+        coverage_gaps=(),
+        execution_receipts=(),
+    )
+    input_hash = _receipt_binding_hash(
+        kind="atlas-extraction-input-v1",
+        request=request,
+        snapshot_id=request.input_snapshot_id,
+        files=(),
+    )
+    output_hash = _receipt_binding_hash(
+        kind="atlas-extraction-output-v1",
+        request=request,
+        snapshot_id=request.output_snapshot_id,
+        files=after_files,
+    )
+    if not complete_receipt_hashes:
+        output_hash = ""
+
+    def receipt(
+        receipt_id: str,
+        kind: str,
+        command_spec: tuple[str, ...],
+        *,
+        success: bool = True,
+        exit_code: int = 0,
+    ) -> BoundExecutionReceipt:
+        return BoundExecutionReceipt(
+            receipt_id=receipt_id,
+            kind=kind,
+            workflow_id=request.workflow_id,
+            task_id=request.task_id,
+            acceptance_id=request.acceptance_id,
+            workspace_hash=request.workspace_hash,
+            output_snapshot_id=request.output_snapshot_id,
+            command_spec=command_spec,
+            command_spec_hash=canonical_hash(command_spec),
+            input_hash=input_hash,
+            output_hash=output_hash,
+            exit_code=exit_code,
+            success=success,
+        )
+
+    return replace(
+        request,
+        execution_receipts=(
+            receipt(f"write-{marker}", "write", ()),
+            receipt(
+                f"command-{marker}",
+                "command",
+                ("python", "-m", "pytest"),
+                success=command_success,
+                exit_code=command_exit_code,
+            ),
+        ),
+    )
 
 
 def load_efficiency():
@@ -55,9 +172,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.temp = Path(self._temporary_directory.name)
         self.safe_root = task_temp
         codex_temp_root = Path(r"D:\bun\tmp\codex").resolve(strict=False)
-        self.project = self.safe_root.resolve(strict=False).relative_to(
-            codex_temp_root
-        ).as_posix()
+        self.project = (
+            self.safe_root.resolve(strict=False).relative_to(codex_temp_root).as_posix()
+        )
         self.repo = (
             Path(r"D:\bun\tmp\codex\2718-devkit\worktrees") / "atlas12b-team-efficiency"
         )
@@ -132,7 +249,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                     "depends_on": [],
                     "required_evidence": ["focused-helper-tests"],
                     "complexity": "routine",
-                    "handoff_contracts": ["contracts/helper-api"],
+                    "execution_contracts": ["contracts/helper-api"],
                 },
                 {
                     "task_id": "ATLAS-12B-B",
@@ -144,7 +261,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                     "depends_on": [],
                     "required_evidence": ["reference-review"],
                     "complexity": "moderate",
-                    "handoff_contracts": ["contracts/helper-api"],
+                    "execution_contracts": ["contracts/helper-api"],
                 },
                 {
                     "task_id": "ATLAS-12B-C",
@@ -156,13 +273,15 @@ class TeamEfficiencyTests(unittest.TestCase):
                     "depends_on": ["ATLAS-12B-A"],
                     "required_evidence": ["focused-team-efficiency"],
                     "complexity": "moderate",
-                    "handoff_contracts": ["contracts/helper-api"],
+                    "execution_contracts": ["contracts/helper-api"],
                 },
             ],
         }
 
     def code_atlas_manifest(self) -> dict[str, object]:
-        digest = lambda marker: f"sha256:{marker * 64}"
+        def digest(marker: str) -> str:
+            return f"sha256:{marker * 64}"
+
         operations = (
             TemplateOperation("create_python_file", "service_primary", digest("4")),
             TemplateOperation("append_python_nodes", "service_secondary", digest("5")),
@@ -235,198 +354,87 @@ class TeamEfficiencyTests(unittest.TestCase):
             },
         }
 
+    def extractor_episode_manifest(
+        self,
+        *,
+        observed_edges: bool,
+        command_success: bool = True,
+        command_exit_code: int = 0,
+        complete_receipt_hashes: bool = True,
+        eligible_override: bool | None = None,
+    ) -> dict[str, object]:
+        result = PythonRecipeExtractor().extract(
+            _extractor_request(
+                command_success=command_success,
+                command_exit_code=command_exit_code,
+                complete_receipt_hashes=complete_receipt_hashes,
+            )
+        )
+        nodes_by_id = {node.node_id: node for node in result.nodes}
+        edges = result.edges
+        if observed_edges:
+            edges = tuple(
+                AtlasEdge.create(
+                    edge.relation,
+                    nodes_by_id[edge.source_id],
+                    nodes_by_id[edge.target_id],
+                    payload=edge.to_dict()["payload"],
+                    schema_version=edge.schema_version,
+                    provenance="observed",
+                    created_at=edge.created_at,
+                )
+                for edge in edges
+            )
+        graph = GraphQueryResult(result.nodes, edges, False)
+        return {
+            "schema": "team-efficiency/work-package-v1",
+            "task_id": "ATLAS-12B",
+            "goal": "Compile one real extractor TaskEpisode",
+            "capacity": 2,
+            "decomposition": "atlas_evidence",
+            "source_kind": "task_episode_graph",
+            "eligible": (
+                result.eligible if eligible_override is None else eligible_override
+            ),
+            "graph": graph.to_dict(),
+        }
+
     def task_episode_manifest(
         self,
         *,
-        docs_path: str = "docs/core.md",
+        docs_path: str = "docs/core.py",
         supersedes: bool = False,
     ) -> dict[str, object]:
-        digest = lambda marker: f"sha256:{marker * 64}"
-        build_slot = SlotSpec("build_path", "relative_python_path")
-        docs_slot = SlotSpec("docs_path", "relative_python_path")
-        verification = AtlasTestSpec(("python", "-m", "pytest"), 0)
-        dependency = DependencySpec("pytest", "python", ">=8")
-
-        def episode_payload(marker: str) -> dict[str, str]:
-            return {
-                "workflow_id_hash": digest(marker),
-                "task_id_hash": digest("1"),
-                "acceptance_id_hash": digest("2"),
-                "workspace_hash": digest("3"),
-                "checkpoint_id_hash": digest("4"),
-                "input_snapshot_id_hash": digest("5"),
-                "output_snapshot_id_hash": digest("6"),
-                "task_kind": "code",
-            }
-
-        episode_build = AtlasNode.create(
-            NodeKind.TASK_EPISODE,
-            episode_payload("7"),
-            provenance="observed",
-            source_hashes=(digest("7"),),
+        results = (
+            PythonRecipeExtractor().extract(
+                _extractor_request(path="src/core.py", marker="build")
+            ),
+            PythonRecipeExtractor().extract(
+                _extractor_request(path=docs_path, marker="docs")
+            ),
         )
-        episode_docs = AtlasNode.create(
-            NodeKind.TASK_EPISODE,
-            episode_payload("8"),
-            provenance="observed",
-            source_hashes=(digest("8"),),
-        )
-        source_build = AtlasNode.create(
-            NodeKind.SOURCE_EVIDENCE,
-            {
-                "path": "src/core.py",
-                "before_hash": digest("9"),
-                "after_hash": digest("a"),
-                "before_bytes": 1,
-                "after_bytes": 2,
-            },
-            provenance="observed",
-            source_hashes=(digest("9"), digest("a")),
-        )
-        source_docs = AtlasNode.create(
-            NodeKind.SOURCE_EVIDENCE,
-            {
-                "path": docs_path,
-                "before_hash": digest("b"),
-                "after_hash": digest("c"),
-                "before_bytes": 1,
-                "after_bytes": 2,
-            },
-            provenance="observed",
-            source_hashes=(digest("b"), digest("c")),
-        )
-        test_node = AtlasNode.create(
-            NodeKind.TEST_SPEC,
-            verification.to_dict(),
-            provenance="observed",
-            source_hashes=(digest("d"),),
-        )
-        dependency_node = AtlasNode.create(
-            NodeKind.DEPENDENCY,
-            dependency.to_dict(),
-            provenance="observed",
-            source_hashes=(digest("e"),),
-        )
-        build_slot_node = AtlasNode.create(
-            NodeKind.ADAPTATION_SLOT,
-            build_slot.to_dict(),
-            provenance="observed",
-            source_hashes=(digest("0"),),
-        )
-        docs_slot_node = AtlasNode.create(
-            NodeKind.ADAPTATION_SLOT,
-            docs_slot.to_dict(),
-            provenance="observed",
-            source_hashes=(digest("1"),),
-        )
-
-        def recipe_node(
-            key: str,
-            manifest_hash: str,
-            slot: SlotSpec,
-        ) -> AtlasNode:
-            manifest = RecipeManifest(
-                recipe_id="",
-                recipe_key=key,
-                version=1,
-                intent_id=key,
-                language_name="python",
-                language_extractor_version="1",
-                repository_signature=digest("2"),
-                layer="local",
-                manifest_hash=manifest_hash,
-                slots=(slot,),
-                constraints=(),
-                dependencies=(dependency,),
-                tests=(verification,),
-                operations=(),
-                provenance_kind="observed",
-                provenance_source="accepted_task",
-            )
-            return AtlasNode.create(
-                NodeKind.RECIPE,
-                manifest.to_dict(),
-                provenance="observed",
-                source_hashes=(manifest_hash,),
-            )
-
-        recipe_build = recipe_node("build-core", digest("3"), build_slot)
-        recipe_docs = recipe_node("document-core", digest("4"), docs_slot)
-        nodes = (
-            episode_build,
-            episode_docs,
-            source_build,
-            source_docs,
-            test_node,
-            dependency_node,
-            build_slot_node,
-            docs_slot_node,
-            recipe_build,
-            recipe_docs,
-        )
+        self.assertTrue(all(result.eligible for result in results))
+        nodes_by_id = {
+            node.node_id: node for result in results for node in result.nodes
+        }
+        # This fixture promotes edges to the trust contract required by the helper.
+        # It is not evidence that the current extractor emits observed edges.
         edges = [
             AtlasEdge.create(
-                EdgeRelation.CHANGES,
-                episode_build,
-                source_build,
+                edge.relation,
+                nodes_by_id[edge.source_id],
+                nodes_by_id[edge.target_id],
+                payload=edge.to_dict()["payload"],
+                schema_version=edge.schema_version,
                 provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.CHANGES,
-                episode_docs,
-                source_docs,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.VERIFIED_BY,
-                episode_build,
-                test_node,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.VERIFIED_BY,
-                episode_docs,
-                test_node,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.DERIVED_FROM,
-                recipe_build,
-                episode_build,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.DERIVED_FROM,
-                recipe_docs,
-                episode_docs,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.HAS_SLOT,
-                recipe_build,
-                build_slot_node,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.HAS_SLOT,
-                recipe_docs,
-                docs_slot_node,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.REQUIRES,
-                recipe_build,
-                dependency_node,
-                provenance="observed",
-            ),
-            AtlasEdge.create(
-                EdgeRelation.REQUIRES,
-                recipe_docs,
-                dependency_node,
-                provenance="observed",
-            ),
+                created_at=edge.created_at,
+            )
+            for result in results
+            for edge in result.edges
         ]
         if supersedes:
+            recipe_build = nodes_by_id[results[0].manifest.recipe_id]
+            recipe_docs = nodes_by_id[results[1].manifest.recipe_id]
             edges.append(
                 AtlasEdge.create(
                     EdgeRelation.SUPERSEDES,
@@ -436,7 +444,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 )
             )
         graph = GraphQueryResult(
-            tuple(sorted(nodes, key=lambda node: node.node_id)),
+            tuple(sorted(nodes_by_id.values(), key=lambda node: node.node_id)),
             tuple(sorted(edges, key=lambda edge: edge.edge_id)),
             False,
         )
@@ -447,6 +455,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "capacity": 2,
             "decomposition": "atlas_evidence",
             "source_kind": "task_episode_graph",
+            "eligible": True,
             "graph": graph.to_dict(),
         }
 
@@ -753,9 +762,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         plan = helper.decompose(manifest)
         reordered = copy.deepcopy(manifest)
         reordered["packet"] = dict(reversed(reordered["packet"].items()))
-        reordered["path_bindings"] = dict(
-            reversed(reordered["path_bindings"].items())
-        )
+        reordered["path_bindings"] = dict(reversed(reordered["path_bindings"].items()))
 
         self.assertEqual(plan, helper.plan_waves(reordered))
         self.assertEqual(
@@ -805,7 +812,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(1, len(verification["acceptance_constraints"]))
         expected_contract = canonical_hash(
             {
-                "kind": "code_atlas_handoff",
+                "kind": "code_atlas_packet_execution_contract_v1",
                 "packet_id": manifest["packet"]["packet_id"],
                 "recipe_id": manifest["packet"]["recipe_id"],
             }
@@ -840,7 +847,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             len({unit["output_boundary"] for unit in plan["units"]}),
         )
         for unit in plan["units"]:
-            self.assertTrue(unit["handoff_contracts"])
+            self.assertTrue(unit["execution_contracts"])
             self.assertTrue(
                 unit["task_id"].startswith(("ATLAS-12B-P-", "ATLAS-12B-V-"))
             )
@@ -870,7 +877,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.decompose(raw_source)
 
         invented_contracts = self.code_atlas_manifest()
-        invented_contracts["packet"]["handoff_contract_hashes"] = [
+        invented_contracts["packet"]["execution_contract_hashes"] = [
             f"sha256:{'a' * 64}"
         ]
         with self.assertRaises(ValueError):
@@ -922,7 +929,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual("task_episode_graph", plan["source_kind"])
         self.assertNotIn("artifacts", manifest)
         self.assertEqual(
-            {"docs/core.md", "src/core.py"},
+            {"docs/core.py", "src/core.py"},
             {unit["write_scope"][0] for unit in plan["waves"][0]},
         )
         self.assertEqual(
@@ -938,37 +945,16 @@ class TeamEfficiencyTests(unittest.TestCase):
             unit for unit in plan["units"] if unit["unit_kind"] == "verification"
         )
         self.assertEqual(
-            {by_scope["src/core.py"]["task_id"], by_scope["docs/core.md"]["task_id"]},
+            {by_scope["src/core.py"]["task_id"], by_scope["docs/core.py"]["task_id"]},
             set(verification["depends_on"]),
         )
         self.assertEqual("Terra Max", verification["recommended_route"])
         core_contracts = by_scope["src/core.py"]["direct_contract_hashes"]
-        docs_contracts = by_scope["docs/core.md"]["direct_contract_hashes"]
-        graph_fingerprint = canonical_hash(
-            {
-                "nodes": manifest["graph"]["nodes"],
-                "edges": manifest["graph"]["edges"],
-                "truncated": False,
-            }
-        )
+        docs_contracts = by_scope["docs/core.py"]["direct_contract_hashes"]
         self.assertEqual(1, len(core_contracts))
         self.assertEqual(1, len(docs_contracts))
-        self.assertEqual(
-            [
-                canonical_hash(
-                    {
-                        "kind": "code_atlas_task_episode_handoff",
-                        "graph_fingerprint": graph_fingerprint,
-                        "task_episode_node_id": by_scope["src/core.py"][
-                            "task_node_ids"
-                        ][0],
-                    }
-                )
-            ],
-            core_contracts,
-        )
         self.assertEqual([], by_scope["src/core.py"]["depends_on"])
-        self.assertEqual([], by_scope["docs/core.md"]["depends_on"])
+        self.assertEqual([], by_scope["docs/core.py"]["depends_on"])
         self.assertNotEqual(core_contracts, docs_contracts)
         self.assertEqual(
             sorted(core_contracts + docs_contracts),
@@ -979,37 +965,442 @@ class TeamEfficiencyTests(unittest.TestCase):
                 unit["task_id"].startswith(("ATLAS-12B-E-", "ATLAS-12B-V-"))
             )
             self.assertTrue(unit["required_evidence"])
-            self.assertTrue(unit["handoff_contracts"])
+            self.assertTrue(unit["execution_contracts"])
 
-        conflict = self.task_episode_manifest(docs_path="src")
+        conflict = self.task_episode_manifest(docs_path="src/core.py")
         conflict_plan = helper.decompose(conflict)
-        conflict_by_scope = {
-            unit["write_scope"][0]: unit
-            for unit in conflict_plan["units"]
-            if unit["write_scope"]
-        }
-        build_id = conflict_by_scope["src/core.py"]["task_id"]
-        docs_id = conflict_by_scope["src"]["task_id"]
+        conflict_units = [
+            unit for unit in conflict_plan["units"] if unit["unit_kind"] == "code"
+        ]
+        self.assertEqual(2, len(conflict_units))
+        build_id, docs_id = sorted(unit["task_id"] for unit in conflict_units)
         self.assertIn(build_id, conflict_plan["conflict_graph"][docs_id])
         self.assertFalse(
             any(
-                {build_id, docs_id}
-                <= {unit["task_id"] for unit in wave}
+                {build_id, docs_id} <= {unit["task_id"] for unit in wave}
                 for wave in conflict_plan["waves"]
             )
         )
         self.assertEqual("verification", conflict_plan["waves"][-1][0]["unit_kind"])
 
         dependent = helper.decompose(self.task_episode_manifest(supersedes=True))
-        dependent_by_scope = {
-            unit["write_scope"][0]: unit
-            for unit in dependent["units"]
-            if unit["write_scope"]
-        }
-        self.assertIn(
-            dependent_by_scope["src/core.py"]["task_id"],
-            dependent_by_scope["docs/core.md"]["depends_on"],
+        self.assertTrue(
+            all(
+                not unit["depends_on"]
+                for unit in dependent["units"]
+                if unit["unit_kind"] == "code"
+            ),
+            "Recipe SUPERSEDES must not invent TaskEpisode task order",
         )
+
+    def test_real_extractor_graph_is_parsed_and_unverified_edges_fail_closed(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        manifest = self.extractor_episode_manifest(observed_edges=False)
+        payload_kinds = {
+            node["payload"].get("kind")
+            for node in manifest["graph"]["nodes"]
+            if isinstance(node["payload"], dict)
+        }
+
+        self.assertTrue(manifest["eligible"])
+        self.assertTrue(
+            {
+                "bound_verification",
+                "command_receipt",
+                "bound_receipt_summary",
+                "command",
+                "write",
+            }
+            <= payload_kinds
+        )
+        self.assertEqual(
+            "ATLAS_EDGE_UNVERIFIED",
+            helper.decompose(manifest)["reason"],
+        )
+
+    def test_observed_edge_trust_contract_fixture_compiles_real_payloads(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        manifest = self.extractor_episode_manifest(observed_edges=True)
+
+        plan = helper.decompose(manifest)
+
+        self.assertEqual("planned", plan["status"])
+        code_unit = next(unit for unit in plan["units"] if unit["unit_kind"] == "code")
+        self.assertEqual(["src/atlas_guard.py"], code_unit["write_scope"])
+        self.assertTrue(code_unit["contract_node_ids"])
+        registration = json.dumps(plan["registration_plan"], sort_keys=True)
+        for sensitive_identity in (
+            _marker_hash("workspace-primary"),
+            _marker_hash("input-primary"),
+            _marker_hash("output-primary"),
+        ):
+            self.assertNotIn(sensitive_identity, registration)
+
+    def test_graph_trust_failures_return_machine_readable_needs_design(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+
+        ineligible = self.extractor_episode_manifest(
+            observed_edges=True,
+            command_success=False,
+        )
+        self.assertEqual(
+            "ATLAS_EXTRACTION_INELIGIBLE",
+            helper.decompose(ineligible)["reason"],
+        )
+
+        failed_receipt = self.extractor_episode_manifest(
+            observed_edges=True,
+            command_success=False,
+            eligible_override=True,
+        )
+        self.assertEqual(
+            "ATLAS_RECEIPT_UNVERIFIED",
+            helper.decompose(failed_receipt)["reason"],
+        )
+
+        incomplete_hash = self.extractor_episode_manifest(
+            observed_edges=True,
+            complete_receipt_hashes=False,
+            eligible_override=True,
+        )
+        self.assertEqual(
+            "ATLAS_RECEIPT_UNVERIFIED",
+            helper.decompose(incomplete_hash)["reason"],
+        )
+
+        bad_exit = self.extractor_episode_manifest(
+            observed_edges=True,
+            command_exit_code=1,
+            eligible_override=True,
+        )
+        self.assertEqual(
+            "ATLAS_RECEIPT_UNVERIFIED",
+            helper.decompose(bad_exit)["reason"],
+        )
+
+        declared_node = self.extractor_episode_manifest(observed_edges=True)
+        episode = next(
+            node
+            for node in declared_node["graph"]["nodes"]
+            if node["kind"] == "TaskEpisode"
+        )
+        episode["provenance"] = "declared"
+        self.assertEqual(
+            "ATLAS_NODE_UNVERIFIED",
+            helper.decompose(declared_node)["reason"],
+        )
+
+        declared_source = self.extractor_episode_manifest(observed_edges=True)
+        source_node = next(
+            node
+            for node in declared_source["graph"]["nodes"]
+            if node["kind"] == "SourceEvidence"
+        )
+        source_node["provenance"] = "declared"
+        self.assertEqual(
+            "ATLAS_NODE_UNVERIFIED",
+            helper.decompose(declared_source)["reason"],
+        )
+
+        quarantined = self.extractor_episode_manifest(observed_edges=True)
+        episode = next(
+            node
+            for node in quarantined["graph"]["nodes"]
+            if node["kind"] == "TaskEpisode"
+        )
+        episode["quarantine_state"] = "review"
+        self.assertEqual(
+            "ATLAS_NODE_QUARANTINED",
+            helper.decompose(quarantined)["reason"],
+        )
+
+        superseded = self.extractor_episode_manifest(observed_edges=True)
+        episode = next(
+            node
+            for node in superseded["graph"]["nodes"]
+            if node["kind"] == "TaskEpisode"
+        )
+        episode["superseded_at"] = "2026-07-29T00:00:00Z"
+        self.assertEqual(
+            "ATLAS_NODE_SUPERSEDED",
+            helper.decompose(superseded)["reason"],
+        )
+
+        for node_kind, field, value, reason in (
+            (
+                "SourceEvidence",
+                "quarantine_state",
+                "review",
+                "ATLAS_NODE_QUARANTINED",
+            ),
+            (
+                "TestSpec",
+                "superseded_at",
+                "2026-07-29T00:00:00Z",
+                "ATLAS_NODE_SUPERSEDED",
+            ),
+            (
+                "ExecutionReceipt",
+                "quarantine_state",
+                "review",
+                "ATLAS_NODE_QUARANTINED",
+            ),
+        ):
+            with self.subTest(node_kind=node_kind, field=field):
+                untrusted = self.extractor_episode_manifest(observed_edges=True)
+                participant = next(
+                    node
+                    for node in untrusted["graph"]["nodes"]
+                    if node["kind"] == node_kind
+                )
+                participant[field] = value
+                self.assertEqual(
+                    reason,
+                    helper.decompose(untrusted)["reason"],
+                )
+
+    def test_graph_execution_contract_hash_ignores_time_metadata_only(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        manifest = self.extractor_episode_manifest(observed_edges=True)
+        first = helper.decompose(manifest)
+        changed_times = copy.deepcopy(manifest)
+        for node in changed_times["graph"]["nodes"]:
+            node["created_at"] = "2026-07-29T01:02:03Z"
+        for edge in changed_times["graph"]["edges"]:
+            edge["created_at"] = "2026-07-29T04:05:06Z"
+
+        second = helper.decompose(changed_times)
+
+        first_contracts = sorted(
+            unit["direct_contract_hashes"] for unit in first["units"]
+        )
+        second_contracts = sorted(
+            unit["direct_contract_hashes"] for unit in second["units"]
+        )
+        self.assertEqual(first_contracts, second_contracts)
+
+    def test_graph_input_budget_accepts_default_query_size_and_fails_closed(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        manifest = self.task_episode_manifest()
+
+        self.assertGreaterEqual(helper.MAX_MANIFEST_BYTES, 65_536)
+        self.assertGreater(
+            len(json.dumps(manifest).encode("utf-8")),
+            34_291,
+        )
+        self.assertLessEqual(
+            len(json.dumps(manifest).encode("utf-8")),
+            helper.MAX_MANIFEST_BYTES,
+        )
+        self.assertEqual("planned", helper.decompose(manifest)["status"])
+
+        oversized = copy.deepcopy(manifest)
+        oversized["padding"] = "x" * helper.MAX_MANIFEST_BYTES
+        plan = helper.decompose(oversized)
+        self.assertEqual("needs_design", plan["status"])
+        self.assertEqual("ATLAS_INPUT_BUDGET_EXCEEDED", plan["reason"])
+        oversized_path = self.temp / "oversized-graph.json"
+        oversized_path.write_text(json.dumps(oversized), encoding="utf-8")
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            exit_code = helper.main(["decompose", "--input", str(oversized_path)])
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors.getvalue())
+        self.assertEqual(
+            "ATLAS_INPUT_BUDGET_EXCEEDED",
+            json.loads(output.getvalue())["reason"],
+        )
+
+    def test_planned_units_emit_versioned_executable_registration_calls(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+
+        manifest = self.code_atlas_manifest()
+        plan = helper.decompose(manifest)
+
+        registration = plan["registration_plan"]
+        self.assertEqual(
+            "team-efficiency/workflow-registration-plan-v1",
+            registration["schema"],
+        )
+        self.assertEqual(len(plan["units"]), len(registration["units"]))
+        first = registration["units"][0]
+        self.assertEqual(
+            {"tool", "arguments", "host_bound_fields"},
+            set(first["workflow_register_task"]),
+        )
+        self.assertEqual(
+            "workflow_register_task",
+            first["workflow_register_task"]["tool"],
+        )
+        self.assertEqual(
+            {
+                "workflow_id",
+                "task_id",
+                "title",
+                "owner_role",
+                "card",
+                "dependencies",
+                "write_scope",
+                "direct_contract_hashes",
+                "required_evidence",
+                "input_hash",
+                "strict_index",
+                "workspace_root",
+                "input_snapshot_id",
+                "task_node_ids",
+                "contract_node_ids",
+            },
+            set(first["workflow_register_task"]["arguments"]),
+        )
+        self.assertIsInstance(
+            first["workflow_register_task"]["arguments"]["card"],
+            str,
+        )
+        self.assertEqual(
+            {"task_id", "owner", "expires_at", "host_target", "now"},
+            set(first["workflow_claim"]["arguments"]),
+        )
+        self.assertEqual(
+            {
+                "workflow_id",
+                "task_id",
+                "owner",
+                "lease_epoch",
+                "host_target",
+                "now",
+            },
+            set(first["workflow_endpoint_bind"]["arguments"]),
+        )
+        server_tree = ast.parse(
+            (ROOT.parents[1] / "mcp-tools" / "server.py").read_text(encoding="utf-8")
+        )
+        signatures = {}
+        required = {}
+        for node in server_tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name not in {
+                "workflow_register_task",
+                "workflow_claim",
+                "workflow_endpoint_bind",
+            }:
+                continue
+            names = [argument.arg for argument in node.args.args]
+            signatures[node.name] = set(names)
+            required_count = len(names) - len(node.args.defaults)
+            required[node.name] = set(names[:required_count])
+        self.assertEqual(
+            {
+                "workflow_id",
+                "task_id",
+                "title",
+                "owner_role",
+                "card",
+            },
+            required["workflow_register_task"],
+        )
+        self.assertEqual(
+            {"task_id", "owner", "expires_at"},
+            required["workflow_claim"],
+        )
+        self.assertEqual(
+            {"workflow_id", "task_id", "owner", "lease_epoch", "host_target"},
+            required["workflow_endpoint_bind"],
+        )
+        unit_by_id = {unit["task_id"]: unit for unit in plan["units"]}
+        for call in registration["units"]:
+            unit = unit_by_id[call["task_id"]]
+            for operation_name in (
+                "workflow_register_task",
+                "workflow_claim",
+                "workflow_endpoint_bind",
+            ):
+                operation = call[operation_name]
+                self.assertEqual(operation_name, operation["tool"])
+                self.assertEqual(
+                    signatures[operation_name],
+                    set(operation["arguments"]),
+                )
+                self.assertEqual(
+                    sorted(operation["host_bound_fields"]),
+                    operation["host_bound_fields"],
+                )
+            register = call["workflow_register_task"]
+            arguments = register["arguments"]
+            self.assertEqual(unit["depends_on"], arguments["dependencies"])
+            self.assertEqual(unit["write_scope"], arguments["write_scope"])
+            self.assertEqual(
+                unit["direct_contract_hashes"],
+                arguments["direct_contract_hashes"],
+            )
+            self.assertEqual(unit["task_node_ids"], arguments["task_node_ids"])
+            self.assertEqual(
+                unit["contract_node_ids"],
+                arguments["contract_node_ids"],
+            )
+            self.assertEqual(
+                unit["required_evidence"],
+                arguments["required_evidence"],
+            )
+            self.assertTrue(arguments["strict_index"])
+            self.assertRegex(arguments["input_hash"], r"^sha256:[0-9a-f]{64}$")
+            card = json.loads(arguments["card"])
+            self.assertEqual(
+                {
+                    "schema",
+                    "task_id",
+                    "goal",
+                    "output_boundary",
+                    "unit_kind",
+                    "execution_contracts",
+                },
+                set(card),
+            )
+            self.assertLessEqual(
+                len(arguments["card"].encode("utf-8")),
+                helper.MAX_REGISTRATION_CARD_BYTES,
+            )
+            for field in ("workspace_root", "input_snapshot_id"):
+                self.assertIn(field, register["host_bound_fields"])
+                self.assertEqual("host", arguments[field]["source"])
+                self.assertEqual(field, arguments[field]["ref"])
+                self.assertTrue(arguments[field]["description"])
+            for operation_descriptor, fields in (
+                (
+                    call["workflow_claim"],
+                    ("owner", "expires_at", "host_target", "now"),
+                ),
+                (
+                    call["workflow_endpoint_bind"],
+                    ("owner", "lease_epoch", "host_target", "now"),
+                ),
+            ):
+                operation = operation_descriptor["arguments"]
+                for field in fields:
+                    self.assertIn(field, operation_descriptor["host_bound_fields"])
+                    self.assertEqual("host", operation[field]["source"])
+                    self.assertEqual(field, operation[field]["ref"])
+                    self.assertTrue(operation[field]["description"])
+
+        rendered = json.dumps(registration, sort_keys=True)
+        self.assertNotIn(manifest["packet"]["trace_id"], rendered)
+        self.assertNotIn(manifest["packet"]["snapshot_id"], rendered)
+        self.assertNotIn(manifest["packet"]["workspace"], rendered)
+        self.assertNotIn(str(self.repo), rendered)
 
     def test_task_episode_mode_needs_design_or_fails_closed_without_graph_proof(
         self,
@@ -1030,17 +1421,20 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         unknown_relation = self.task_episode_manifest()
         unknown_relation["graph"]["edges"][0]["relation"] = "MAYBE_RELATED"
-        with self.assertRaises(ValueError):
-            helper.decompose(unknown_relation)
+        self.assertEqual("needs_design", helper.decompose(unknown_relation)["status"])
 
-        unsafe_scope = self.task_episode_manifest(docs_path="../outside.py")
-        with self.assertRaises(ValueError):
-            helper.decompose(unsafe_scope)
+        unsafe_scope = self.task_episode_manifest()
+        path_source = next(
+            node
+            for node in unsafe_scope["graph"]["nodes"]
+            if node["kind"] == "SourceEvidence" and node["payload"].get("path")
+        )
+        path_source["payload"]["path"] = "../outside.py"
+        self.assertEqual("needs_design", helper.decompose(unsafe_scope)["status"])
 
         invented_scope = self.task_episode_manifest()
         invented_scope["path_bindings"] = {"docs_path": "docs/core.md"}
-        with self.assertRaises(ValueError):
-            helper.decompose(invented_scope)
+        self.assertEqual("needs_design", helper.decompose(invented_scope)["status"])
 
         command_output = self.task_episode_manifest()
         test_node = next(
@@ -1049,8 +1443,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             if node["kind"] == "TestSpec"
         )
         test_node["payload"]["command_output"] = "1 passed"
-        with self.assertRaises(ValueError):
-            helper.decompose(command_output)
+        self.assertEqual("needs_design", helper.decompose(command_output)["status"])
 
     def test_decompose_serializes_overlapping_scopes_without_losing_parallelism(
         self,
@@ -1137,7 +1530,9 @@ class TeamEfficiencyTests(unittest.TestCase):
                     )
 
                 self.assertEqual(0, exit_code)
-                self.assertEqual(helper.decompose(manifest), json.loads(output.getvalue()))
+                self.assertEqual(
+                    helper.decompose(manifest), json.loads(output.getvalue())
+                )
 
 
 if __name__ == "__main__":

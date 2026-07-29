@@ -12,7 +12,7 @@ description: Use when a 2718lab engineering task spans multiple files or agents,
 - 多代理或需要持久计划：读 `references/work-packages.md`。
 - 需要创建、领取或恢复任务：读 `references/orchestration-runtime.md`。
 - 需要选择 team 形状或写 dispatch：读 `references/team-patterns.md`。
-- 需要生成安全的本地启动计划、恢复包、Todo 状态、契约/缓存检查、手工工件 wave，或基于 `ImplementationPacket.to_dict()` / `GraphQueryResult.to_dict()` 的 Atlas 证据 wave：读 `references/efficiency-automation.md`。
+- 需要生成安全的本地启动计划、恢复包、Todo 状态、契约/缓存检查、手工工件 wave，或基于 `ImplementationPacket.to_dict()` / observed `GraphQueryResult.to_dict()` 的 Atlas 证据 wave 与工作流注册计划：读 `references/efficiency-automation.md`。
 - 不确定框架/API：读 `references/grounding-discipline.md`。
 - 准备交付：读 `references/verification-checklist.md`。
 
