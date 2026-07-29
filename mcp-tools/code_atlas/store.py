@@ -11,7 +11,6 @@ import re
 import secrets
 import sqlite3
 import stat
-import tempfile
 import uuid
 from dataclasses import fields
 from pathlib import Path
@@ -1367,6 +1366,19 @@ def _paths_overlap(left: Path, right: Path) -> bool:
         return False
 
 
+def _default_readonly_scratch_parent() -> Path:
+    """Choose an already-configured scratch parent without probing it."""
+
+    configured_task_temp = os.environ.get("CODEX_TASK_TEMP")
+    if configured_task_temp:
+        return _lexical_absolute(configured_task_temp)
+    for variable in ("TMPDIR", "TEMP", "TMP"):
+        configured_temp = os.environ.get(variable)
+        if configured_temp:
+            return _lexical_absolute(configured_temp)
+    raise StoreConflictError()
+
+
 class StoreConflictError(ValueError):
     """A safe, stable error raised when durable content conflicts."""
 
@@ -1426,8 +1438,9 @@ class AtlasStore:
         database. The reader therefore operates exclusively on a verified
         scratch snapshot, preserving a live durable WAL while never creating,
         deleting, or writing a durable sidecar. When ``scratch_root`` is
-        omitted, the snapshot gets a private root beneath ``CODEX_TASK_TEMP``
-        (or the process temp directory) and removes that empty root on close.
+        omitted, the snapshot gets a private root beneath a pre-existing
+        ``CODEX_TASK_TEMP`` (or a configured ``TMPDIR``/``TEMP``/``TMP``)
+        directory and removes that empty root on close.
         """
 
         database = _lexical_absolute(database_path)
@@ -1441,12 +1454,7 @@ class AtlasStore:
                 raise StoreConflictError()
             cas_directory_identities = _capture_cas_directory_identities(cas)
             if scratch_root is None:
-                configured_temp = os.environ.get("CODEX_TASK_TEMP")
-                scratch_parent = (
-                    _lexical_absolute(configured_temp)
-                    if configured_temp
-                    else _lexical_absolute(tempfile.gettempdir())
-                )
+                scratch_parent = _default_readonly_scratch_parent()
                 owns_scratch = True
             else:
                 scratch_parent = _lexical_absolute(scratch_root)
@@ -1454,6 +1462,9 @@ class AtlasStore:
             if _paths_overlap(scratch_parent, database.parent) or _paths_overlap(
                 scratch_parent, cas
             ):
+                raise StoreConflictError()
+            _assert_safe_existing_path(scratch_parent)
+            if not stat.S_ISDIR(scratch_parent.lstat().st_mode):
                 raise StoreConflictError()
             _assert_path_chain_unchanged(database_chain)
             _assert_cas_directory_identities(cas_directory_identities)

@@ -857,6 +857,49 @@ def test_open_readonly_two_path_api_rejects_unsafe_or_missing_default_scratch_pa
     assert unsafe_temp != "missing" or not configured_temp.exists()
 
 
+def test_open_readonly_default_scratch_never_probes_temp_before_overlap_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold tempfile cache must not create a probe in durable storage."""
+
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    before_files = _durable_file_state(durable)
+    before_entries = tuple(
+        sorted(path.relative_to(durable).as_posix() for path in durable.rglob("*"))
+    )
+    original_probe = tempfile._get_default_tempdir
+    probes = 0
+
+    def count_temp_probe() -> str:
+        nonlocal probes
+        probes += 1
+        return original_probe()
+
+    monkeypatch.delenv("CODEX_TASK_TEMP", raising=False)
+    for variable in ("TEMP", "TMP", "TMPDIR"):
+        monkeypatch.setenv(variable, str(durable))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    monkeypatch.setattr(tempfile, "_get_default_tempdir", count_temp_probe)
+
+    with pytest.raises(StoreConflictError):
+        AtlasStore.open_readonly(database, cas_root)
+
+    assert probes == 0
+    assert _durable_file_state(durable) == before_files
+    assert (
+        tuple(
+            sorted(path.relative_to(durable).as_posix() for path in durable.rglob("*"))
+        )
+        == before_entries
+    )
+
+
 @pytest.mark.parametrize("use_default_scratch", (True, False))
 def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_create(
     tmp_path: Path,
@@ -919,7 +962,7 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
         assert original_create is not None
         return original_create(*args, **kwargs)
 
-    monkeypatch.setattr(store_module.tempfile, "mkdtemp", swap_then_mkdtemp)
+    monkeypatch.setattr(tempfile, "mkdtemp", swap_then_mkdtemp)
     monkeypatch.setattr(
         store_module,
         "_create_readonly_directory",
