@@ -723,6 +723,81 @@ def test_open_readonly_store_uses_a_scratch_snapshot_without_touching_durable_fi
     assert not tuple(scratch.iterdir())
 
 
+@pytest.mark.skipif(os.name == "posix", reason="POSIX uses its real quarantine path")
+def test_readonly_scratch_lease_dispatches_cleanup_to_the_posix_quarantine_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the POSIX cleanup dispatch covered while this suite runs on Windows."""
+
+    calls: list[str] = []
+
+    class ProbeLease:
+        _stage_descriptor = 1
+        _owns_scratch = False
+
+        def _cleanup_stage_posix_quarantined(self) -> bool:
+            calls.append("stage")
+            return True
+
+    monkeypatch.setattr(store_module.os, "name", "posix")
+
+    assert store_module._ReadonlyScratchLease.cleanup(ProbeLease()) is None
+    assert calls == ["stage"]
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX atomic quarantine is platform-specific"
+)
+def test_open_readonly_posix_cleanup_never_deletes_a_snapshot_replaced_before_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot-file swap is retained in quarantine instead of being deleted."""
+
+    durable = tmp_path / "durable"
+    scratch = tmp_path / "readonly-scratch"
+    durable.mkdir()
+    scratch.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    expected_snapshot = database.read_bytes()
+    parked = tmp_path / "parked-snapshot.sqlite3"
+    attacker = b"attacker-owned\n"
+    original_rename = store_module._posix_rename_noreplace
+    raced = False
+
+    def replace_before_quarantine(
+        old_directory_fd: int,
+        old_name: str,
+        new_directory_fd: int,
+        new_name: str,
+    ) -> None:
+        nonlocal raced
+        if not raced and old_name.startswith(".code-atlas-readonly-"):
+            raced = True
+            snapshot = next(scratch.glob(".code-atlas-readonly-*")) / (
+                "code-atlas.sqlite3"
+            )
+            os.replace(snapshot, parked)
+            snapshot.write_bytes(attacker)
+        original_rename(old_directory_fd, old_name, new_directory_fd, new_name)
+
+    monkeypatch.setattr(
+        store_module, "_posix_rename_noreplace", replace_before_quarantine
+    )
+
+    readonly = AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
+    readonly.close()
+
+    assert raced is True
+    assert parked.read_bytes() == expected_snapshot
+    quarantined = tuple(scratch.rglob("code-atlas.sqlite3"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == attacker
+
+
 def test_open_readonly_supports_the_two_path_public_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

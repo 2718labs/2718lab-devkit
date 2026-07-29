@@ -710,7 +710,7 @@ def test_failed_bundle_cleanup_never_deletes_a_file_replaced_before_handle_open(
 
 
 @pytest.mark.skipif(os.name == "posix", reason="POSIX uses its real capability path")
-def test_stage_lease_dispatches_failure_cleanup_to_the_posix_dirfd_path(
+def test_stage_lease_dispatches_failure_cleanup_to_the_posix_quarantine_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep the POSIX cleanup branch covered while this suite runs on Windows."""
@@ -721,7 +721,7 @@ def test_stage_lease_dispatches_failure_cleanup_to_the_posix_dirfd_path(
     ] = []
 
     class ProbeLease:
-        def _cleanup_posix(
+        def _cleanup_posix_quarantined(
             self,
             files: dict[Path, tuple[int, int, int]],
             directories: dict[Path, tuple[int, int, int]],
@@ -735,6 +735,77 @@ def test_stage_lease_dispatches_failure_cleanup_to_the_posix_dirfd_path(
 
     assert exporter._StageLease.cleanup(ProbeLease(), files, directories) is True
     assert calls == [(files, directories)]
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX atomic quarantine is platform-specific"
+)
+def test_failed_bundle_posix_cleanup_never_deletes_a_file_replaced_before_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source-child swap must become a safe quarantine leak, never a delete."""
+
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "bundle"
+    parked = tmp_path / "parked-receipt.txt"
+    attacker = b"attacker-owned\n"
+    original_rename = exporter._posix_rename_noreplace
+    raced = False
+
+    def fail_publish(*_args: object, **_kwargs: object) -> None:
+        raise OSError("forced publish failure")
+
+    def replace_before_quarantine(
+        old_directory_fd: int,
+        old_name: str,
+        new_directory_fd: int,
+        new_name: str,
+    ) -> None:
+        nonlocal raced
+        if not raced and old_name.startswith(".code-atlas-stage-"):
+            raced = True
+            receipt = next(parent.glob(".code-atlas-stage-*")) / "receipt.txt"
+            os.replace(receipt, parked)
+            receipt.write_bytes(attacker)
+        original_rename(old_directory_fd, old_name, new_directory_fd, new_name)
+
+    monkeypatch.setattr(exporter, "_atomic_noreplace_directory", fail_publish)
+    monkeypatch.setattr(exporter, "_posix_rename_noreplace", replace_before_quarantine)
+
+    with pytest.raises(exporter.PromotionError, match="promotion_write_failed"):
+        exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
+
+    assert raced is True
+    assert parked.read_bytes() == b"verified\n"
+    quarantined = tuple(parent.rglob("receipt.txt"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == attacker
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX atomic quarantine is platform-specific"
+)
+def test_failed_bundle_posix_cleanup_removes_a_normal_owned_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "bundle"
+
+    def fail_publish(*_args: object, **_kwargs: object) -> None:
+        raise OSError("forced publish failure")
+
+    monkeypatch.setattr(exporter, "_atomic_noreplace_directory", fail_publish)
+
+    with pytest.raises(exporter.PromotionError, match="promotion_write_failed"):
+        exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
+
+    assert not tuple(parent.iterdir())
 
 
 def test_export_cli_unknown_argument_is_a_stable_secret_free_failure(

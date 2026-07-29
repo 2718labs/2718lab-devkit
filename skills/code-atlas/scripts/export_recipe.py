@@ -30,6 +30,7 @@ from code_atlas.store import AtlasStore, StoreConflictError  # noqa: E402
 
 _HASH_PREFIX = "sha256:"
 _STAGE_PREFIX = ".code-atlas-stage-"
+_QUARANTINE_PREFIX = ".code-atlas-quarantine-"
 
 
 class PromotionError(ValueError):
@@ -750,6 +751,12 @@ class _StageLease:
             if _object_identity(os.fstat(self._parent_fd)) != self.parent_identity:
                 self.close()
                 raise PromotionError("promotion_output_raced")
+            try:
+                _assert_posix_quarantine_parent(self._parent_fd)
+                _require_posix_rename_noreplace()
+            except PromotionError:
+                self.close()
+                raise
         elif os.name == "nt":
             try:
                 records = _capture_safe_directory_chain(self.parent)
@@ -1110,20 +1117,52 @@ class _StageLease:
         ):
             raise PromotionError("promotion_write_failed")
 
-    def _posix_cleanup_parent(
+    def _create_posix_quarantine(self) -> tuple[str, int] | None:
+        """Create a 0700 directory used only after an atomic stage move."""
+
+        if self._parent_fd is None:
+            return None
+        try:
+            _assert_posix_quarantine_parent(self._parent_fd)
+        except PromotionError:
+            return None
+        for _attempt in range(64):
+            name = _QUARANTINE_PREFIX + secrets.token_hex(16)
+            descriptor: int | None = None
+            try:
+                os.mkdir(name, 0o700, dir_fd=self._parent_fd)
+            except FileExistsError:
+                continue
+            except OSError:
+                return None
+            try:
+                descriptor = _open_posix_directory(name, directory_fd=self._parent_fd)
+                if not _posix_private_directory(os.fstat(descriptor)):
+                    _close_descriptor(descriptor)
+                    return None
+                result = descriptor
+                descriptor = None
+                return name, result
+            except (OSError, PromotionError):
+                _close_descriptor(descriptor)
+                return None
+        return None
+
+    def _posix_quarantined_parent(
         self,
+        stage_descriptor: int,
         path: Path,
         directories: dict[Path, tuple[int, int, int]],
     ) -> tuple[int, str] | None:
-        """Open the retained parent directory of one owned stage child."""
+        """Open a verified parent after the stage entered private quarantine."""
 
-        if self.stage is None or self._stage_fd is None:
+        if self.stage is None:
             return None
         descriptor: int | None = None
         try:
             relative = path.relative_to(self.stage).as_posix()
             components, leaf = self._relative_parts(relative)
-            descriptor = os.dup(self._stage_fd)
+            descriptor = os.dup(stage_descriptor)
             current = self.stage
             for component in components:
                 candidate = current / component
@@ -1131,18 +1170,14 @@ class _StageLease:
                 if expected is None:
                     _close_descriptor(descriptor)
                     return None
-                value = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
-                if (
-                    _unsafe_status(candidate, value)
-                    or not stat.S_ISDIR(value.st_mode)
-                    or _object_identity(value) != expected
-                ):
-                    _close_descriptor(descriptor)
-                    return None
                 next_descriptor = _open_posix_directory(
                     component, directory_fd=descriptor
                 )
-                if _object_identity(os.fstat(next_descriptor)) != expected:
+                value = os.fstat(next_descriptor)
+                if (
+                    not stat.S_ISDIR(value.st_mode)
+                    or _object_identity(value) != expected
+                ):
                     _close_descriptor(next_descriptor)
                     _close_descriptor(descriptor)
                     return None
@@ -1154,12 +1189,36 @@ class _StageLease:
             _close_descriptor(descriptor)
             return None
 
-    def _cleanup_posix(
+    @staticmethod
+    def _open_posix_quarantined_regular(
+        parent_descriptor: int,
+        name: str,
+        expected: tuple[int, int, int],
+    ) -> int | None:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
+                dir_fd=parent_descriptor,
+            )
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode) or _object_identity(value) != expected:
+                _close_descriptor(descriptor)
+                return None
+            result = descriptor
+            descriptor = None
+            return result
+        except OSError:
+            _close_descriptor(descriptor)
+            return None
+
+    def _cleanup_posix_quarantined(
         self,
         files: dict[Path, tuple[int, int, int]],
         directories: dict[Path, tuple[int, int, int]],
     ) -> bool:
-        """Best-effort cleanup through retained POSIX directory descriptors."""
+        """Move a stage atomically into private space before any cleanup."""
 
         if (
             self.stage is None
@@ -1168,61 +1227,98 @@ class _StageLease:
             or self._parent_fd is None
         ):
             return False
+        quarantine_descriptor: int | None = None
+        moved_stage_descriptor: int | None = None
         try:
             if (
                 _object_identity(os.fstat(self._stage_fd)) != self.stage_identity
                 or _object_identity(os.fstat(self._parent_fd)) != self.parent_identity
             ):
                 return False
+            quarantine = self._create_posix_quarantine()
+            if quarantine is None:
+                return False
+            quarantine_name, quarantine_descriptor = quarantine
+            moved_name = "stage-" + secrets.token_hex(16)
+            _posix_rename_noreplace(
+                self._parent_fd,
+                self.stage.name,
+                quarantine_descriptor,
+                moved_name,
+            )
+            moved_stage_descriptor = _open_posix_directory(
+                moved_name, directory_fd=quarantine_descriptor
+            )
+            if (
+                _object_identity(os.fstat(moved_stage_descriptor))
+                != self.stage_identity
+                or _object_identity(os.fstat(self._stage_fd)) != self.stage_identity
+            ):
+                return False
             for path, identity in sorted(files.items(), key=lambda item: str(item[0])):
-                parent = self._posix_cleanup_parent(path, directories)
+                parent = self._posix_quarantined_parent(
+                    moved_stage_descriptor, path, directories
+                )
                 if parent is None:
                     return False
                 descriptor, name = parent
+                file_descriptor: int | None = None
                 try:
-                    value = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                    if (
-                        _unsafe_status(path, value)
-                        or not stat.S_ISREG(value.st_mode)
-                        or _object_identity(value) != identity
-                    ):
+                    file_descriptor = self._open_posix_quarantined_regular(
+                        descriptor, name, identity
+                    )
+                    if file_descriptor is None:
                         return False
+                    # The source entry was atomically moved beneath a 0700
+                    # lease-owned directory and authenticated by descriptor.
+                    # Any uncertainty before that boundary returns False and
+                    # leaves the moved objects intact.
                     os.unlink(name, dir_fd=descriptor)
                 finally:
+                    _close_descriptor(file_descriptor)
                     _close_descriptor(descriptor)
             for path, identity in sorted(
                 directories.items(),
                 key=lambda item: (len(item[0].parts), str(item[0])),
                 reverse=True,
             ):
-                parent = self._posix_cleanup_parent(path, directories)
+                parent = self._posix_quarantined_parent(
+                    moved_stage_descriptor, path, directories
+                )
                 if parent is None:
                     return False
                 descriptor, name = parent
+                directory_descriptor: int | None = None
                 try:
-                    value = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    directory_descriptor = _open_posix_directory(
+                        name, directory_fd=descriptor
+                    )
+                    value = os.fstat(directory_descriptor)
                     if (
-                        _unsafe_status(path, value)
-                        or not stat.S_ISDIR(value.st_mode)
+                        not stat.S_ISDIR(value.st_mode)
                         or _object_identity(value) != identity
                     ):
                         return False
                     os.rmdir(name, dir_fd=descriptor)
                 finally:
+                    _close_descriptor(directory_descriptor)
                     _close_descriptor(descriptor)
-            named_stage = os.stat(
-                self.stage.name, dir_fd=self._parent_fd, follow_symlinks=False
-            )
-            if (
-                _unsafe_status(self.stage, named_stage)
-                or not stat.S_ISDIR(named_stage.st_mode)
-                or _object_identity(named_stage) != self.stage_identity
-            ):
-                return False
-            os.rmdir(self.stage.name, dir_fd=self._parent_fd)
+            os.rmdir(moved_name, dir_fd=quarantine_descriptor)
+            _close_descriptor(moved_stage_descriptor)
+            moved_stage_descriptor = None
+            os.rmdir(quarantine_name, dir_fd=self._parent_fd)
+            _close_descriptor(quarantine_descriptor)
+            quarantine_descriptor = None
+            _close_descriptor(self._stage_fd)
+            self._stage_fd = None
+            self.stage = None
+            self.stage_identity = None
             return True
         except (OSError, PromotionError):
             return False
+        finally:
+            _close_descriptor(moved_stage_descriptor)
+            _close_descriptor(quarantine_descriptor)
 
     def cleanup(
         self,
@@ -1232,7 +1328,7 @@ class _StageLease:
         """Remove only this lease's verified staging objects before release."""
 
         if os.name == "posix":
-            return self._cleanup_posix(files, directories)
+            return self._cleanup_posix_quarantined(files, directories)
         if os.name != "nt":
             return False
         try:
@@ -1281,7 +1377,7 @@ class _StageLease:
         if os.name == "posix":
             if self._parent_fd is None:
                 raise PromotionError("promotion_output_raced")
-            _renameat2_noreplace(
+            _posix_rename_noreplace(
                 self._parent_fd, self.stage.name, self._parent_fd, output.name
             )
             return
@@ -1290,7 +1386,7 @@ class _StageLease:
         _win_rename_noreplace(self._stage_handle, output)
 
 
-def _renameat2_noreplace(
+def _posix_rename_noreplace(
     old_directory_fd: int,
     old_name: str,
     new_directory_fd: int,
@@ -1325,6 +1421,40 @@ def _renameat2_noreplace(
     if error == errno.EEXIST:
         raise FileExistsError(error, "destination exists", new_name)
     raise OSError(error, "renameat2 failed", new_name)
+
+
+def _require_posix_rename_noreplace() -> None:
+    """Fail before staging when the atomic POSIX cleanup primitive is absent."""
+
+    try:
+        _posix_rename_noreplace(-1, "", -1, "")
+    except OSError as exc:
+        if exc.errno in {errno.EBADF, errno.ENOENT, errno.EINVAL}:
+            return
+    raise PromotionError("promotion_write_failed")
+
+
+def _posix_private_directory(value: os.stat_result) -> bool:
+    mode = stat.S_IMODE(value.st_mode)
+    return bool(
+        stat.S_ISDIR(value.st_mode)
+        and mode & 0o077 == 0
+        and value.st_uid == os.geteuid()
+    )
+
+
+def _assert_posix_quarantine_parent(descriptor: int) -> None:
+    """Require a parent where the lease-owned quarantine name is protected."""
+
+    try:
+        value = os.fstat(descriptor)
+    except OSError as exc:
+        raise PromotionError("promotion_write_failed") from exc
+    if not stat.S_ISDIR(value.st_mode):
+        raise PromotionError("promotion_write_failed")
+    mode = stat.S_IMODE(value.st_mode)
+    if mode & 0o022 and not value.st_mode & stat.S_ISVTX:
+        raise PromotionError("promotion_write_failed")
 
 
 def _atomic_noreplace_directory(

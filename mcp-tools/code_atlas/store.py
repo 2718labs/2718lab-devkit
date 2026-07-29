@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -236,6 +237,7 @@ def _snapshot_source_state(
 
 _READONLY_ROOT_PREFIX = ".code-atlas-readonly-root-"
 _READONLY_STAGE_PREFIX = ".code-atlas-readonly-"
+_READONLY_QUARANTINE_PREFIX = ".code-atlas-readonly-quarantine-"
 _SQLITE_SNAPSHOT_FILENAMES = (
     "code-atlas.sqlite3",
     "code-atlas.sqlite3-journal",
@@ -335,6 +337,77 @@ def _open_posix_directory_chain(
         while descriptors:
             _close_descriptor(descriptors.pop())
         raise
+
+
+def _posix_rename_noreplace(
+    old_directory_fd: int,
+    old_name: str,
+    new_directory_fd: int,
+    new_name: str,
+) -> None:
+    """Atomically relocate one basename without replacing a destination."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            old_directory_fd,
+            os.fsencode(old_name),
+            new_directory_fd,
+            os.fsencode(new_name),
+            1,
+        )
+        == 0
+    ):
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, "destination exists", new_name)
+    raise OSError(error, "renameat2 failed", new_name)
+
+
+def _require_posix_rename_noreplace() -> None:
+    """Reject a POSIX scratch lifecycle before writes without atomic rename."""
+
+    try:
+        _posix_rename_noreplace(-1, "", -1, "")
+    except OSError as exc:
+        if exc.errno in {errno.EBADF, errno.ENOENT, errno.EINVAL}:
+            return
+    raise StoreConflictError()
+
+
+def _posix_private_directory(value: os.stat_result) -> bool:
+    mode = stat.S_IMODE(value.st_mode)
+    return bool(
+        stat.S_ISDIR(value.st_mode)
+        and mode & 0o077 == 0
+        and value.st_uid == os.geteuid()
+    )
+
+
+def _assert_posix_quarantine_parent(descriptor: int) -> None:
+    """Require a parent that protects a lease-owned quarantine entry."""
+
+    try:
+        value = os.fstat(descriptor)
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    if not stat.S_ISDIR(value.st_mode):
+        raise StoreConflictError()
+    mode = stat.S_IMODE(value.st_mode)
+    if mode & 0o022 and not value.st_mode & stat.S_ISVTX:
+        raise StoreConflictError()
 
 
 _WIN_GENERIC_READ = 0x80000000
@@ -631,6 +704,9 @@ class _ReadonlyScratchLease:
             else:
                 raise StoreConflictError()
             self._anchor_descriptor = self._chain_descriptors[-1]
+            if os.name == "posix":
+                _assert_posix_quarantine_parent(self._anchor_descriptor)
+                _require_posix_rename_noreplace()
             if not owns_scratch:
                 self.scratch = self.anchor
                 self.scratch_identity = self.anchor_identity
@@ -735,9 +811,12 @@ class _ReadonlyScratchLease:
                     )
                     if descriptor is None:
                         continue
-                identity = self._descriptor_identity(descriptor)
-                if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                status = os.fstat(descriptor)
+                if not stat.S_ISDIR(status.st_mode) or (
+                    os.name == "posix" and not _posix_private_directory(status)
+                ):
                     raise StoreConflictError()
+                identity = _object_identity(status)
                 created = parent / name
                 if owned_scratch:
                     self.scratch = created
@@ -900,7 +979,118 @@ class _ReadonlyScratchLease:
             if expected is None or self._descriptor_identity(descriptor) != expected:
                 raise StoreConflictError()
 
-    def _cleanup_stage_posix(self) -> bool:
+    def _create_posix_quarantine(
+        self, parent_descriptor: int
+    ) -> tuple[str, int] | None:
+        """Create a private directory used only after an atomic move."""
+
+        try:
+            _assert_posix_quarantine_parent(parent_descriptor)
+        except StoreConflictError:
+            return None
+        for _attempt in range(64):
+            name = _READONLY_QUARANTINE_PREFIX + secrets.token_hex(16)
+            descriptor: int | None = None
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            except OSError:
+                return None
+            try:
+                descriptor = _open_posix_directory(name, directory_fd=parent_descriptor)
+                if not _posix_private_directory(os.fstat(descriptor)):
+                    _close_descriptor(descriptor)
+                    return None
+                result = descriptor
+                descriptor = None
+                return name, result
+            except (OSError, StoreConflictError):
+                _close_descriptor(descriptor)
+                return None
+        return None
+
+    def _move_posix_directory_to_quarantine(
+        self,
+        parent_descriptor: int,
+        source_name: str,
+        source_descriptor: int,
+        expected_identity: tuple[int, int, int],
+    ) -> tuple[str, int, str, int] | None:
+        """Move one named directory before authenticating it by retained fd."""
+
+        quarantine = self._create_posix_quarantine(parent_descriptor)
+        if quarantine is None:
+            return None
+        quarantine_name, quarantine_descriptor = quarantine
+        for _attempt in range(64):
+            moved_name = "entry-" + secrets.token_hex(16)
+            moved_descriptor: int | None = None
+            try:
+                _posix_rename_noreplace(
+                    parent_descriptor,
+                    source_name,
+                    quarantine_descriptor,
+                    moved_name,
+                )
+                moved_descriptor = _open_posix_directory(
+                    moved_name, directory_fd=quarantine_descriptor
+                )
+                if (
+                    self._descriptor_identity(moved_descriptor) != expected_identity
+                    or self._descriptor_identity(source_descriptor) != expected_identity
+                ):
+                    _close_descriptor(moved_descriptor)
+                    _close_descriptor(quarantine_descriptor)
+                    return None
+                result = (
+                    quarantine_name,
+                    quarantine_descriptor,
+                    moved_name,
+                    moved_descriptor,
+                )
+                quarantine_descriptor = None
+                moved_descriptor = None
+                return result
+            except FileExistsError:
+                continue
+            except (OSError, StoreConflictError):
+                _close_descriptor(moved_descriptor)
+                _close_descriptor(quarantine_descriptor)
+                return None
+        _close_descriptor(quarantine_descriptor)
+        return None
+
+    @staticmethod
+    def _open_posix_quarantined_regular(
+        parent_descriptor: int,
+        name: str,
+        expected_identity: tuple[int, int, int],
+    ) -> int | None:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
+                dir_fd=parent_descriptor,
+            )
+            value = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(value.st_mode)
+                or _object_identity(value) != expected_identity
+            ):
+                _close_descriptor(descriptor)
+                return None
+            result = descriptor
+            descriptor = None
+            return result
+        except OSError:
+            _close_descriptor(descriptor)
+            return None
+
+    def _cleanup_stage_posix_quarantined(self) -> bool:
+        """Authenticate a moved stage before deleting only private entries."""
+
         if (
             self._stage_descriptor is None
             or self._scratch_descriptor is None
@@ -908,32 +1098,49 @@ class _ReadonlyScratchLease:
             or self.stage_identity is None
         ):
             return False
+        quarantine_descriptor: int | None = None
+        moved_descriptor: int | None = None
         try:
             if self._descriptor_identity(self._stage_descriptor) != self.stage_identity:
                 return False
-            for name, identity in self._files.items():
-                value = os.stat(
-                    name, dir_fd=self._stage_descriptor, follow_symlinks=False
-                )
-                if (
-                    not stat.S_ISREG(value.st_mode)
-                    or _object_identity(value) != identity
-                ):
-                    return False
-                os.unlink(name, dir_fd=self._stage_descriptor)
-            named_stage = os.stat(
+            moved = self._move_posix_directory_to_quarantine(
+                self._scratch_descriptor,
                 self._stage_name,
-                dir_fd=self._scratch_descriptor,
-                follow_symlinks=False,
+                self._stage_descriptor,
+                self.stage_identity,
             )
-            if (
-                not stat.S_ISDIR(named_stage.st_mode)
-                or _object_identity(named_stage) != self.stage_identity
-            ):
+            if moved is None:
                 return False
-            os.rmdir(self._stage_name, dir_fd=self._scratch_descriptor)
-        except OSError:
+            (
+                quarantine_name,
+                quarantine_descriptor,
+                moved_name,
+                moved_descriptor,
+            ) = moved
+            for name, identity in self._files.items():
+                file_descriptor = self._open_posix_quarantined_regular(
+                    moved_descriptor, name, identity
+                )
+                if file_descriptor is None:
+                    return False
+                try:
+                    # The source name no longer resolves in scratch.  This
+                    # deletion is scoped below the 0700 quarantine boundary
+                    # after descriptor identity authentication.
+                    os.unlink(name, dir_fd=moved_descriptor)
+                finally:
+                    _close_descriptor(file_descriptor)
+            os.rmdir(moved_name, dir_fd=quarantine_descriptor)
+            _close_descriptor(moved_descriptor)
+            moved_descriptor = None
+            os.rmdir(quarantine_name, dir_fd=self._scratch_descriptor)
+            _close_descriptor(quarantine_descriptor)
+            quarantine_descriptor = None
+        except (OSError, StoreConflictError):
             return False
+        finally:
+            _close_descriptor(moved_descriptor)
+            _close_descriptor(quarantine_descriptor)
         _close_descriptor(self._stage_descriptor)
         self._stage_descriptor = None
         self.stage = None
@@ -977,7 +1184,9 @@ class _ReadonlyScratchLease:
         self._stage_name = None
         return True
 
-    def _cleanup_owned_scratch_posix(self) -> bool:
+    def _cleanup_owned_scratch_posix_quarantined(self) -> bool:
+        """Remove an empty owned scratch root only after an atomic move."""
+
         if (
             self._scratch_descriptor is None
             or self._anchor_descriptor is None
@@ -985,25 +1194,39 @@ class _ReadonlyScratchLease:
             or self.scratch_identity is None
         ):
             return False
+        quarantine_descriptor: int | None = None
+        moved_descriptor: int | None = None
         try:
             if (
                 self._descriptor_identity(self._scratch_descriptor)
                 != self.scratch_identity
             ):
                 return False
-            named_scratch = os.stat(
+            moved = self._move_posix_directory_to_quarantine(
+                self._anchor_descriptor,
                 self._scratch_name,
-                dir_fd=self._anchor_descriptor,
-                follow_symlinks=False,
+                self._scratch_descriptor,
+                self.scratch_identity,
             )
-            if (
-                not stat.S_ISDIR(named_scratch.st_mode)
-                or _object_identity(named_scratch) != self.scratch_identity
-            ):
+            if moved is None:
                 return False
-            os.rmdir(self._scratch_name, dir_fd=self._anchor_descriptor)
-        except OSError:
+            (
+                quarantine_name,
+                quarantine_descriptor,
+                moved_name,
+                moved_descriptor,
+            ) = moved
+            os.rmdir(moved_name, dir_fd=quarantine_descriptor)
+            _close_descriptor(moved_descriptor)
+            moved_descriptor = None
+            os.rmdir(quarantine_name, dir_fd=self._anchor_descriptor)
+            _close_descriptor(quarantine_descriptor)
+            quarantine_descriptor = None
+        except (OSError, StoreConflictError):
             return False
+        finally:
+            _close_descriptor(moved_descriptor)
+            _close_descriptor(quarantine_descriptor)
         _close_descriptor(self._scratch_descriptor)
         self._scratch_descriptor = None
         self.scratch = None
@@ -1035,7 +1258,7 @@ class _ReadonlyScratchLease:
 
         if self._stage_descriptor is not None:
             if os.name == "posix":
-                if not self._cleanup_stage_posix():
+                if not self._cleanup_stage_posix_quarantined():
                     return
             elif os.name == "nt":
                 if not self._cleanup_stage_windows():
@@ -1044,7 +1267,7 @@ class _ReadonlyScratchLease:
                 return
         if self._owns_scratch and self._scratch_descriptor is not None:
             if os.name == "posix":
-                self._cleanup_owned_scratch_posix()
+                self._cleanup_owned_scratch_posix_quarantined()
             elif os.name == "nt":
                 self._cleanup_owned_scratch_windows()
 
