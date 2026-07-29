@@ -39,8 +39,19 @@ class BugkillerMetadataTests(unittest.TestCase):
     def test_codex_hook_uses_supported_manifest_and_output_schema(self) -> None:
         hook = load_json("hooks/hooks.json")
         self.assertEqual({"hooks"}, set(hook))
-        post_tool = hook["hooks"]["PostToolUse"][0]
+        post_tools = hook["hooks"]["PostToolUse"]
+        self.assertEqual(2, len(post_tools))
+        post_tool = post_tools[0]
         self.assertEqual("Edit|Write", post_tool["matcher"])
+        receipt_hook = post_tools[1]
+        self.assertEqual(
+            "Bash|Edit|Write|shell_command|apply_patch|Code|exec",
+            receipt_hook["matcher"],
+        )
+        self.assertEqual(
+            'python "${CLAUDE_PLUGIN_ROOT}/hooks/execution_receipt.py"',
+            receipt_hook["hooks"][0]["command"],
+        )
 
         with tempfile.TemporaryDirectory() as temporary:
             metadata = Path(temporary) / "metadata.yaml"
