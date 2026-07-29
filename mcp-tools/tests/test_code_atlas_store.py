@@ -744,6 +744,43 @@ def test_open_readonly_supports_the_two_path_public_api(
     assert not tuple(task_temp.iterdir())
 
 
+@pytest.mark.parametrize("unsafe_temp", ("durable", "cas", "missing"))
+def test_open_readonly_two_path_api_rejects_unsafe_or_missing_default_scratch_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_temp: str,
+) -> None:
+    durable = tmp_path / "durable"
+    durable.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    before_files = _durable_file_state(durable)
+    before_entries = tuple(
+        sorted(path.relative_to(durable).as_posix() for path in durable.rglob("*"))
+    )
+    configured_temp = {
+        "durable": durable,
+        "cas": cas_root,
+        "missing": tmp_path / "missing-task-temp",
+    }[unsafe_temp]
+    monkeypatch.setenv("CODEX_TASK_TEMP", str(configured_temp))
+
+    with pytest.raises(StoreConflictError):
+        AtlasStore.open_readonly(database, cas_root)
+
+    assert _durable_file_state(durable) == before_files
+    assert (
+        tuple(
+            sorted(path.relative_to(durable).as_posix() for path in durable.rglob("*"))
+        )
+        == before_entries
+    )
+    assert not tuple(durable.rglob(".code-atlas-readonly-root-*"))
+    assert unsafe_temp != "missing" or not configured_temp.exists()
+
+
 def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()

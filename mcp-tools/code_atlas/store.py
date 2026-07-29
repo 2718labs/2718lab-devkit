@@ -461,22 +461,7 @@ class AtlasStore:
         database = _lexical_absolute(database_path)
         cas = _lexical_absolute(cas_root)
         owned_scratch: Path | None = None
-        if scratch_root is None:
-            configured_temp = os.environ.get("CODEX_TASK_TEMP")
-            scratch_parent = (
-                _lexical_absolute(configured_temp)
-                if configured_temp
-                else Path(tempfile.gettempdir())
-            )
-            scratch_parent.mkdir(parents=True, exist_ok=True)
-            owned_scratch = Path(
-                tempfile.mkdtemp(
-                    prefix=".code-atlas-readonly-root-", dir=scratch_parent
-                )
-            )
-            scratch = _lexical_absolute(owned_scratch)
-        else:
-            scratch = _lexical_absolute(scratch_root)
+        scratch: Path | None = None
         connection: sqlite3.Connection | None = None
         stage: Path | None = None
         scratch_identity: tuple[int, int, int] | None = None
@@ -485,10 +470,42 @@ class AtlasStore:
         try:
             database_chain = _capture_safe_path_chain(database, require_regular=True)
             _assert_safe_existing_path(cas)
+            if not stat.S_ISDIR(cas.lstat().st_mode):
+                raise StoreConflictError()
+            cas_directory_identities = _capture_cas_directory_identities(cas)
+            if scratch_root is None:
+                configured_temp = os.environ.get("CODEX_TASK_TEMP")
+                scratch_parent = (
+                    _lexical_absolute(configured_temp)
+                    if configured_temp
+                    else _lexical_absolute(tempfile.gettempdir())
+                )
+                scratch_parent_chain = _capture_safe_path_chain(scratch_parent)
+                scratch_parent_status = scratch_parent.lstat()
+                if (
+                    _unsafe_file_status(scratch_parent, scratch_parent_status)
+                    or not stat.S_ISDIR(scratch_parent_status.st_mode)
+                    or _paths_overlap(scratch_parent, database.parent)
+                    or _paths_overlap(scratch_parent, cas)
+                ):
+                    raise StoreConflictError()
+                _assert_path_chain_unchanged(database_chain)
+                _assert_cas_directory_identities(cas_directory_identities)
+                _assert_path_chain_unchanged(scratch_parent_chain)
+                owned_scratch = _lexical_absolute(
+                    Path(
+                        tempfile.mkdtemp(
+                            prefix=".code-atlas-readonly-root-", dir=scratch_parent
+                        )
+                    )
+                )
+                scratch = owned_scratch
+            else:
+                scratch = _lexical_absolute(scratch_root)
+            if scratch is None:
+                raise StoreConflictError()
             _assert_safe_existing_path(scratch)
-            if not stat.S_ISDIR(cas.lstat().st_mode) or not stat.S_ISDIR(
-                scratch.lstat().st_mode
-            ):
+            if not stat.S_ISDIR(scratch.lstat().st_mode):
                 raise StoreConflictError()
             if _paths_overlap(scratch, database.parent) or _paths_overlap(scratch, cas):
                 raise StoreConflictError()
@@ -496,7 +513,6 @@ class AtlasStore:
             if _unsafe_file_status(scratch, scratch_status):
                 raise StoreConflictError()
             scratch_identity = _object_identity(scratch_status)
-            cas_directory_identities = _capture_cas_directory_identities(cas)
             source_state = _snapshot_source_state(database)
             stage = Path(tempfile.mkdtemp(prefix=".code-atlas-readonly-", dir=scratch))
             stage_status = stage.lstat()

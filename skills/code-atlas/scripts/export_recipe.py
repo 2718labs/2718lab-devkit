@@ -40,6 +40,13 @@ class PromotionError(ValueError):
         super().__init__(code)
 
 
+class _PromotionArgumentParser(argparse.ArgumentParser):
+    """Map parser failures to the same secret-free CLI error boundary."""
+
+    def error(self, _message: str) -> None:
+        raise PromotionError("promotion_recipe_invalid")
+
+
 def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         value.st_dev,
@@ -1071,67 +1078,6 @@ def _atomic_noreplace_directory(
     raise OSError(errno.ENOSYS, "atomic no-replace promotion is unavailable")
 
 
-def _remove_stage(
-    stage: Path | None,
-    parent: Path,
-    parent_identity: tuple[int, int, int] | None,
-    stage_identity: tuple[int, int, int] | None,
-    files: dict[Path, tuple[int, int, int]],
-    directories: dict[Path, tuple[int, int, int]],
-) -> None:
-    """Remove only the still-owned stage entries; never recurse through a race."""
-
-    if (
-        stage is None
-        or parent_identity is None
-        or stage_identity is None
-        or stage.parent != parent
-        or not stage.name.startswith(_STAGE_PREFIX)
-    ):
-        return
-    try:
-        if _capture_output_parent(parent) != parent_identity:
-            return
-        stage_status = stage.lstat()
-        if (
-            _unsafe_status(stage, stage_status)
-            or not stat.S_ISDIR(stage_status.st_mode)
-            or _object_identity(stage_status) != stage_identity
-        ):
-            return
-        for path, identity in sorted(
-            files.items(), key=lambda item: len(item[0].parts), reverse=True
-        ):
-            try:
-                value = path.lstat()
-            except FileNotFoundError:
-                continue
-            if (
-                _unsafe_status(path, value)
-                or not stat.S_ISREG(value.st_mode)
-                or _object_identity(value) != identity
-            ):
-                continue
-            path.unlink()
-        for path, identity in sorted(
-            directories.items(), key=lambda item: len(item[0].parts), reverse=True
-        ):
-            try:
-                value = path.lstat()
-            except FileNotFoundError:
-                continue
-            if (
-                _unsafe_status(path, value)
-                or not stat.S_ISDIR(value.st_mode)
-                or _object_identity(value) != identity
-            ):
-                continue
-            path.rmdir()
-        stage.rmdir()
-    except (OSError, PromotionError):
-        return
-
-
 def _build_files(store: AtlasStore, manifest: RecipeManifest) -> dict[str, bytes]:
     templates: dict[str, bytes] = {}
     total = 0
@@ -1227,14 +1173,10 @@ def _write_bundle(
     finally:
         if lease is not None:
             lease.close()
-        _remove_stage(
-            stage,
-            parent,
-            parent_identity,
-            stage_identity,
-            owned_files,
-            owned_directories,
-        )
+        # A failed stage is intentionally retained. Once publication fails,
+        # portable pathname cleanup cannot prove that a later lookup still
+        # denotes an owned object, so deletion would be less safe than a
+        # harmless prefixed staging directory.
 
 
 def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
@@ -1292,7 +1234,7 @@ def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="export_recipe.py")
+    parser = _PromotionArgumentParser(prog="export_recipe.py")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--recipe-id", required=True)
     parser.add_argument("--output", required=True)

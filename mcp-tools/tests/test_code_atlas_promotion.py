@@ -35,6 +35,17 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "skills" / "code-atlas" / "scripts" / "export_recipe.py"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_default_readonly_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Give two-path readonly export a pre-existing non-overlapping parent."""
+
+    scratch_parent = tmp_path / "readonly-task-temp"
+    scratch_parent.mkdir()
+    monkeypatch.setenv("CODEX_TASK_TEMP", str(scratch_parent))
+
+
 def test_export_recipe_script_exposes_a_public_main_entrypoint() -> None:
     specification = importlib.util.spec_from_file_location("export_recipe", SCRIPT)
     assert specification is not None
@@ -620,3 +631,58 @@ def test_stage_writer_never_follows_a_nested_component_replaced_before_open(
         )
 
     assert not (outside / "sha256" / "template.py").exists()
+
+
+def test_failed_bundle_never_uses_unleased_pathname_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "bundle"
+
+    def fail_publish(*_args: object, **_kwargs: object) -> None:
+        raise OSError("forced publish failure")
+
+    def forbid_path_delete(self: Path, *_args: object, **_kwargs: object) -> None:
+        raise AssertionError(f"unsafe pathname cleanup attempted for {self.name}")
+
+    monkeypatch.setattr(exporter, "_atomic_noreplace_directory", fail_publish)
+    monkeypatch.setattr(Path, "unlink", forbid_path_delete)
+    monkeypatch.setattr(Path, "rmdir", forbid_path_delete)
+
+    with pytest.raises(exporter.PromotionError, match="promotion_write_failed"):
+        exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
+
+    stages = tuple(parent.glob(".code-atlas-stage-*"))
+    assert len(stages) == 1
+    assert (stages[0] / "receipt.txt").read_bytes() == b"verified\n"
+
+
+def test_export_cli_unknown_argument_is_a_stable_secret_free_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exporter = _export_module()
+    secret = "ghp_9b3d9a0b5b0c4e8a9f14e2d1c0b6a7d8"
+
+    assert (
+        exporter.main(
+            [
+                "--data-root",
+                "safe-data-root",
+                "--recipe-id",
+                "sha256:" + "0" * 64,
+                "--output",
+                "safe-output",
+                "--unexpected",
+                secret,
+            ]
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "promotion_recipe_invalid"
+    assert secret not in captured.out
+    assert secret not in captured.err
