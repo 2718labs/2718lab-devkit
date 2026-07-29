@@ -77,6 +77,12 @@ class AcceptanceAuthorizationError(StoreError):
     code = "ACCEPTANCE_FORBIDDEN"
 
 
+class AcceptanceEvidenceError(StoreError):
+    """Raised when an acceptance has no immutable evidence binding."""
+
+    code = "EVIDENCE_INCOMPLETE"
+
+
 class AtlasOutboxTransitionError(StoreError):
     """Raised when an outbox item would leave an immutable terminal state."""
 
@@ -218,6 +224,33 @@ class IndexBinding:
     fallback_count: int
 
 
+@dataclass(frozen=True)
+class TaskAcceptanceEvidence:
+    """Bound output evidence identifiers selected from one strict task."""
+
+    output_query_trace_id: str
+    verification_artifact_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodeTaskEvidenceBinding:
+    """Canonical, privacy-bounded evidence retained with one acceptance."""
+
+    schema_version: str
+    workflow_id: str
+    code_task_id: str
+    code_task_version: int
+    input_snapshot_id: str
+    output_snapshot_id: str
+    indexed_diff_hash: str
+    checkpoint_id: str
+    checkpoint_hash: str
+    output_query_trace_id: str
+    verification_artifact_hashes: tuple[str, ...]
+    execution_receipt_ids: tuple[str, ...]
+    evidence_binding_hash: str
+
+
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
@@ -230,6 +263,10 @@ class SQLiteStore:
     _MAX_SAFE_ACCEPTANCE_IDENTIFIER_LENGTH = 256
     _MAX_SAFE_OUTBOX_CODE_LENGTH = 64
     _MAX_SAFE_OUTBOX_REASON_COUNT = 8
+    _MAX_CODE_TASK_EVIDENCE_ITEMS = 32
+    _MAX_CODE_TASK_ACCEPTANCE_LIST = 100
+    _EVIDENCE_BINDING_SCHEMA_VERSION = "acceptance-evidence-binding/v1"
+    _EVIDENCE_BINDING_EVENT_TYPE = "code_task_evidence_binding"
     _HOST_TARGET_PATTERN = re.compile(r"/root(?:/[a-z0-9_]+)*\Z")
     _SAFE_ACCEPTANCE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
     _SAFE_OUTBOX_CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]*\Z")
@@ -909,6 +946,7 @@ class SQLiteStore:
         intent_id: str,
         language: str,
         framework: str,
+        evidence_binding: CodeTaskEvidenceBinding | None = None,
         created_at: str,
         now: str | None = None,
     ) -> tuple[CodeTaskAcceptance, AtlasOutboxItem]:
@@ -932,6 +970,17 @@ class SQLiteStore:
         payload_hash = _payload_hash(payload_json)
         accepted_at = _utc_timestamp(created_at)
         authorization_now = _utc_timestamp(now) if now is not None else _utc_now()
+        if evidence_binding is None:
+            raise AcceptanceEvidenceError("acceptance evidence binding is required")
+        self._validate_code_task_evidence_binding(
+            evidence_binding,
+            workflow_id=workflow_id,
+            task_id=task_id,
+            task_version=task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+        )
 
         with self._transaction() as cursor:
             self._require_authorized_code_task_acceptance(
@@ -971,6 +1020,9 @@ class SQLiteStore:
                     raise StoreError(
                         f"acceptance is missing its durable outbox item: {task_id!r}"
                     )
+                self._require_existing_code_task_evidence_binding(
+                    cursor, existing, evidence_binding
+                )
                 return existing, self._atlas_outbox_from_row(outbox_row)
 
             cursor.execute(
@@ -1003,6 +1055,12 @@ class SQLiteStore:
                 (payload_hash,),
             ).fetchone()
             acceptance = self._acceptance_from_row(acceptance_row)
+            self._insert_code_task_evidence_binding(
+                cursor,
+                acceptance,
+                evidence_binding,
+                created_at=accepted_at,
+            )
             outbox = self._insert_atlas_outbox(
                 cursor,
                 acceptance,
@@ -1017,6 +1075,108 @@ class SQLiteStore:
             "SELECT * FROM code_task_acceptances WHERE code_task_id = ?", (task_id,)
         ).fetchone()
         return None if row is None else self._acceptance_from_row(row)
+
+    def list_code_task_acceptances(
+        self, workflow_id: str, *, limit: int
+    ) -> tuple[CodeTaskAcceptance, ...]:
+        """Return a bounded deterministic acceptance projection for one workflow."""
+
+        self._validate_code_task_acceptance_list_limit(limit)
+        rows = self._connection.execute(
+            """
+            SELECT * FROM code_task_acceptances
+            WHERE workflow_id = ?
+            ORDER BY created_at, acceptance_id
+            LIMIT ?
+            """,
+            (workflow_id, limit),
+        ).fetchall()
+        return tuple(self._acceptance_from_row(row) for row in rows)
+
+    def atlas_outbox_for_acceptance(self, acceptance_id: str) -> AtlasOutboxItem | None:
+        """Return the one outbox row owned by an immutable acceptance, if present."""
+
+        self._safe_acceptance_identifier("acceptance_id", acceptance_id)
+        row = self._connection.execute(
+            "SELECT * FROM atlas_ingestion_outbox WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()
+        return None if row is None else self._atlas_outbox_from_row(row)
+
+    def task_acceptance_evidence(
+        self, task_id: str, output_snapshot_id: str
+    ) -> TaskAcceptanceEvidence:
+        """Return only deterministic output evidence identifiers for one task."""
+
+        self._safe_acceptance_identifier("task_id", task_id)
+        self._safe_acceptance_identifier("output_snapshot_id", output_snapshot_id)
+        query_rows = self._connection.execute(
+            """
+            SELECT trace_id FROM task_index_query_receipts
+            WHERE task_id = ? AND snapshot_id = ?
+            ORDER BY trace_id
+            LIMIT 2
+            """,
+            (task_id, output_snapshot_id),
+        ).fetchall()
+        if len(query_rows) != 1:
+            raise StrictIndexError("QUERY_RECEIPT_REQUIRED")
+        artifact_rows = self._connection.execute(
+            """
+            SELECT content_hash FROM task_index_verification_artifacts
+            WHERE task_id = ? AND snapshot_id = ?
+            ORDER BY content_hash
+            LIMIT ?
+            """,
+            (task_id, output_snapshot_id, self._MAX_CODE_TASK_EVIDENCE_ITEMS + 1),
+        ).fetchall()
+        if (
+            not artifact_rows
+            or len(artifact_rows) > self._MAX_CODE_TASK_EVIDENCE_ITEMS
+        ):
+            raise StrictIndexError("VERIFICATION_EVIDENCE_REQUIRED")
+        return TaskAcceptanceEvidence(
+            str(query_rows[0]["trace_id"]),
+            tuple(str(row["content_hash"]) for row in artifact_rows),
+        )
+
+    def evidence_binding_for_acceptance(
+        self, acceptance_id: str
+    ) -> CodeTaskEvidenceBinding | None:
+        """Read one typed recovery binding by immutable acceptance identity."""
+
+        self._safe_acceptance_identifier("acceptance_id", acceptance_id)
+        row = self._connection.execute(
+            "SELECT * FROM code_task_acceptances WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._code_task_evidence_binding_for_acceptance(
+            self._acceptance_from_row(row)
+        )
+
+    def evidence_binding_for_ingestion(
+        self, ingestion_key: str
+    ) -> CodeTaskEvidenceBinding | None:
+        """Read one typed recovery binding by immutable ingestion identity."""
+
+        self._safe_acceptance_identifier("ingestion_key", ingestion_key)
+        row = self._connection.execute(
+            """
+            SELECT acceptances.*
+            FROM atlas_ingestion_outbox AS outbox
+            JOIN code_task_acceptances AS acceptances
+                ON acceptances.acceptance_id = outbox.acceptance_id
+            WHERE outbox.ingestion_key = ?
+            """,
+            (ingestion_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._code_task_evidence_binding_for_acceptance(
+            self._acceptance_from_row(row)
+        )
 
     def pending_atlas_outbox(self, *, limit: int) -> tuple[AtlasOutboxItem, ...]:
         """Return pending ingestion work in deterministic creation/key order."""
@@ -1907,6 +2067,338 @@ class SQLiteStore:
         ).fetchone()
         return self._atlas_outbox_from_row(row)
 
+    @classmethod
+    def build_code_task_evidence_binding(
+        cls,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        checkpoint_id: str,
+        checkpoint_hash: str,
+        output_query_trace_id: str,
+        verification_artifact_hashes: tuple[str, ...],
+        execution_receipt_ids: tuple[str, ...],
+    ) -> CodeTaskEvidenceBinding:
+        """Construct one canonical typed evidence binding without persistence."""
+
+        payload = cls._code_task_evidence_binding_payload(
+            workflow_id=workflow_id,
+            task_id=task_id,
+            task_version=task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+            checkpoint_id=checkpoint_id,
+            checkpoint_hash=checkpoint_hash,
+            output_query_trace_id=output_query_trace_id,
+            verification_artifact_hashes=verification_artifact_hashes,
+            execution_receipt_ids=execution_receipt_ids,
+        )
+        payload_json = _canonical_evidence_binding_json(payload)
+        return CodeTaskEvidenceBinding(
+            str(payload["schema_version"]),
+            str(payload["workflow_id"]),
+            str(payload["code_task_id"]),
+            int(payload["code_task_version"]),
+            str(payload["input_snapshot_id"]),
+            str(payload["output_snapshot_id"]),
+            str(payload["indexed_diff_hash"]),
+            str(payload["checkpoint_id"]),
+            str(payload["checkpoint_hash"]),
+            str(payload["output_query_trace_id"]),
+            tuple(payload["verification_artifact_hashes"]),
+            tuple(payload["execution_receipt_ids"]),
+            _payload_hash(payload_json),
+        )
+
+    def _insert_code_task_evidence_binding(
+        self,
+        cursor: sqlite3.Cursor,
+        acceptance: CodeTaskAcceptance,
+        evidence_binding: CodeTaskEvidenceBinding,
+        *,
+        created_at: str,
+    ) -> None:
+        payload_json = self._code_task_evidence_binding_json(evidence_binding)
+        cursor.execute(
+            """
+            INSERT INTO events
+                (workflow_id, task_id, event_type, redacted_payload, payload_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                acceptance.workflow_id,
+                acceptance.code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+                payload_json,
+                evidence_binding.evidence_binding_hash,
+                created_at,
+            ),
+        )
+
+    def _require_existing_code_task_evidence_binding(
+        self,
+        cursor: sqlite3.Cursor,
+        acceptance: CodeTaskAcceptance,
+        evidence_binding: CodeTaskEvidenceBinding,
+    ) -> None:
+        rows = cursor.execute(
+            """
+            SELECT redacted_payload, payload_hash FROM events
+            WHERE workflow_id = ? AND task_id = ? AND event_type = ?
+            ORDER BY sequence
+            """,
+            (
+                acceptance.workflow_id,
+                acceptance.code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+            ),
+        ).fetchall()
+        if len(rows) != 1:
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence is not durable: {acceptance.code_task_id!r}"
+            )
+        payload_json = self._code_task_evidence_binding_json(evidence_binding)
+        row = rows[0]
+        if (
+            str(row["redacted_payload"]) != payload_json
+            or str(row["payload_hash"]) != evidence_binding.evidence_binding_hash
+        ):
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence changed: {acceptance.code_task_id!r}"
+            )
+
+    def _code_task_evidence_binding_for_acceptance(
+        self, acceptance: CodeTaskAcceptance
+    ) -> CodeTaskEvidenceBinding:
+        rows = self._connection.execute(
+            """
+            SELECT redacted_payload, payload_hash FROM events
+            WHERE workflow_id = ? AND task_id = ? AND event_type = ?
+            ORDER BY sequence
+            """,
+            (
+                acceptance.workflow_id,
+                acceptance.code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+            ),
+        ).fetchall()
+        if len(rows) != 1:
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence is not durable: {acceptance.code_task_id!r}"
+            )
+        binding = self._code_task_evidence_binding_from_event(rows[0])
+        if (
+            binding.workflow_id != acceptance.workflow_id
+            or binding.code_task_id != acceptance.code_task_id
+            or binding.code_task_version != acceptance.code_task_version
+            or binding.input_snapshot_id != acceptance.input_snapshot_id
+            or binding.output_snapshot_id != acceptance.output_snapshot_id
+            or binding.indexed_diff_hash != acceptance.indexed_diff_hash
+        ):
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence is inconsistent: {acceptance.code_task_id!r}"
+            )
+        return binding
+
+    @classmethod
+    def _code_task_evidence_binding_from_event(
+        cls, row: sqlite3.Row
+    ) -> CodeTaskEvidenceBinding:
+        try:
+            payload_json = str(row["redacted_payload"])
+            payload = json.loads(payload_json)
+            if (
+                not isinstance(payload, dict)
+                or set(payload)
+                != {
+                    "checkpoint_hash",
+                    "checkpoint_id",
+                    "code_task_id",
+                    "code_task_version",
+                    "execution_receipt_ids",
+                    "indexed_diff_hash",
+                    "input_snapshot_id",
+                    "output_query_trace_id",
+                    "output_snapshot_id",
+                    "schema_version",
+                    "verification_artifact_hashes",
+                    "workflow_id",
+                }
+                or _canonical_evidence_binding_json(payload) != payload_json
+                or not isinstance(payload["verification_artifact_hashes"], list)
+                or not isinstance(payload["execution_receipt_ids"], list)
+                or payload["schema_version"] != cls._EVIDENCE_BINDING_SCHEMA_VERSION
+            ):
+                raise ValueError("evidence binding payload is invalid")
+            binding = cls.build_code_task_evidence_binding(
+                workflow_id=payload["workflow_id"],
+                task_id=payload["code_task_id"],
+                task_version=payload["code_task_version"],
+                input_snapshot_id=payload["input_snapshot_id"],
+                output_snapshot_id=payload["output_snapshot_id"],
+                indexed_diff_hash=payload["indexed_diff_hash"],
+                checkpoint_id=payload["checkpoint_id"],
+                checkpoint_hash=payload["checkpoint_hash"],
+                output_query_trace_id=payload["output_query_trace_id"],
+                verification_artifact_hashes=tuple(
+                    payload["verification_artifact_hashes"]
+                ),
+                execution_receipt_ids=tuple(payload["execution_receipt_ids"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise AcceptanceConflictError("code task evidence binding is corrupt") from error
+        if str(row["payload_hash"]) != binding.evidence_binding_hash:
+            raise AcceptanceConflictError("code task evidence binding hash is corrupt")
+        return binding
+
+    @classmethod
+    def _code_task_evidence_binding_json(
+        cls, evidence_binding: CodeTaskEvidenceBinding
+    ) -> str:
+        cls._validate_code_task_evidence_binding(evidence_binding)
+        payload = cls._code_task_evidence_binding_payload(
+            workflow_id=evidence_binding.workflow_id,
+            task_id=evidence_binding.code_task_id,
+            task_version=evidence_binding.code_task_version,
+            input_snapshot_id=evidence_binding.input_snapshot_id,
+            output_snapshot_id=evidence_binding.output_snapshot_id,
+            indexed_diff_hash=evidence_binding.indexed_diff_hash,
+            checkpoint_id=evidence_binding.checkpoint_id,
+            checkpoint_hash=evidence_binding.checkpoint_hash,
+            output_query_trace_id=evidence_binding.output_query_trace_id,
+            verification_artifact_hashes=evidence_binding.verification_artifact_hashes,
+            execution_receipt_ids=evidence_binding.execution_receipt_ids,
+        )
+        return _canonical_evidence_binding_json(payload)
+
+    @classmethod
+    def _validate_code_task_evidence_binding(
+        cls,
+        evidence_binding: CodeTaskEvidenceBinding,
+        *,
+        workflow_id: str | None = None,
+        task_id: str | None = None,
+        task_version: int | None = None,
+        input_snapshot_id: str | None = None,
+        output_snapshot_id: str | None = None,
+        indexed_diff_hash: str | None = None,
+    ) -> None:
+        if not isinstance(evidence_binding, CodeTaskEvidenceBinding):
+            raise ValueError("evidence_binding must be a CodeTaskEvidenceBinding")
+        expected = cls.build_code_task_evidence_binding(
+            workflow_id=evidence_binding.workflow_id,
+            task_id=evidence_binding.code_task_id,
+            task_version=evidence_binding.code_task_version,
+            input_snapshot_id=evidence_binding.input_snapshot_id,
+            output_snapshot_id=evidence_binding.output_snapshot_id,
+            indexed_diff_hash=evidence_binding.indexed_diff_hash,
+            checkpoint_id=evidence_binding.checkpoint_id,
+            checkpoint_hash=evidence_binding.checkpoint_hash,
+            output_query_trace_id=evidence_binding.output_query_trace_id,
+            verification_artifact_hashes=evidence_binding.verification_artifact_hashes,
+            execution_receipt_ids=evidence_binding.execution_receipt_ids,
+        )
+        if expected != evidence_binding:
+            raise ValueError("evidence binding is not canonical")
+        if (
+            (workflow_id is not None and evidence_binding.workflow_id != workflow_id)
+            or (task_id is not None and evidence_binding.code_task_id != task_id)
+            or (
+                task_version is not None
+                and evidence_binding.code_task_version != task_version
+            )
+            or (
+                input_snapshot_id is not None
+                and evidence_binding.input_snapshot_id != input_snapshot_id
+            )
+            or (
+                output_snapshot_id is not None
+                and evidence_binding.output_snapshot_id != output_snapshot_id
+            )
+            or (
+                indexed_diff_hash is not None
+                and evidence_binding.indexed_diff_hash != indexed_diff_hash
+            )
+        ):
+            raise AcceptanceConflictError("evidence binding does not match acceptance")
+
+    @classmethod
+    def _code_task_evidence_binding_payload(
+        cls,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        checkpoint_id: str,
+        checkpoint_hash: str,
+        output_query_trace_id: str,
+        verification_artifact_hashes: tuple[str, ...],
+        execution_receipt_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        if (
+            isinstance(task_version, bool)
+            or not isinstance(task_version, int)
+            or not 0 <= task_version <= 2**63 - 1
+        ):
+            raise ValueError("task_version must be a non-negative SQLite integer")
+        return {
+            "schema_version": cls._EVIDENCE_BINDING_SCHEMA_VERSION,
+            "workflow_id": cls._safe_acceptance_identifier("workflow_id", workflow_id),
+            "code_task_id": cls._safe_acceptance_identifier("code_task_id", task_id),
+            "code_task_version": task_version,
+            "input_snapshot_id": cls._safe_acceptance_identifier(
+                "input_snapshot_id", input_snapshot_id
+            ),
+            "output_snapshot_id": cls._safe_acceptance_identifier(
+                "output_snapshot_id", output_snapshot_id
+            ),
+            "indexed_diff_hash": cls._safe_acceptance_identifier(
+                "indexed_diff_hash", indexed_diff_hash
+            ),
+            "checkpoint_id": cls._safe_acceptance_identifier(
+                "checkpoint_id", checkpoint_id
+            ),
+            "checkpoint_hash": cls._safe_acceptance_identifier(
+                "checkpoint_hash", checkpoint_hash
+            ),
+            "output_query_trace_id": cls._safe_acceptance_identifier(
+                "output_query_trace_id", output_query_trace_id
+            ),
+            "verification_artifact_hashes": list(
+                cls._safe_evidence_identifier_list(
+                    "verification_artifact_hashes", verification_artifact_hashes
+                )
+            ),
+            "execution_receipt_ids": list(
+                cls._safe_evidence_identifier_list(
+                    "execution_receipt_ids", execution_receipt_ids
+                )
+            ),
+        }
+
+    @classmethod
+    def _safe_evidence_identifier_list(
+        cls, field_name: str, values: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        if (
+            not isinstance(values, tuple)
+            or not values
+            or len(values) > cls._MAX_CODE_TASK_EVIDENCE_ITEMS
+            or tuple(sorted(set(values))) != values
+        ):
+            raise ValueError(f"{field_name} must be a sorted unique bounded tuple")
+        return tuple(
+            cls._safe_acceptance_identifier(field_name, value) for value in values
+        )
+
     def _require_authorized_code_task_acceptance(
         self,
         cursor: sqlite3.Cursor,
@@ -2036,6 +2528,18 @@ class SQLiteStore:
         ):
             raise ValueError(f"{field_name} must be a bounded opaque identifier")
         return value
+
+    @classmethod
+    def _validate_code_task_acceptance_list_limit(cls, limit: int) -> None:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= cls._MAX_CODE_TASK_ACCEPTANCE_LIST
+        ):
+            raise ValueError(
+                "acceptance list limit must be an integer between 1 and "
+                f"{cls._MAX_CODE_TASK_ACCEPTANCE_LIST}"
+            )
 
     @classmethod
     def _safe_outbox_code(
@@ -2649,6 +3153,11 @@ def _card_hash(card_body: str) -> str:
 def _canonical_payload_json(payload: Mapping[str, object]) -> str:
     """Encode a fixed, safe metadata map in content-addressed form."""
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _canonical_evidence_binding_json(payload: Mapping[str, object]) -> str:
+    """Encode the ATLAS-10D binding with its independently frozen contract."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _payload_hash(payload_json: str) -> str:

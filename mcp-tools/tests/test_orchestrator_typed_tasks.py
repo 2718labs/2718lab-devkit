@@ -377,37 +377,64 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
         stored_input, stored_output, stored_diff = self._acceptance_inputs[
             accepted_task.id
         ]
-        return self.store.insert_code_task_acceptance(
-            workflow_id=(
-                accepted_task.workflow_id if workflow_id is None else workflow_id
-            ),
+        accepted_workflow_id = (
+            accepted_task.workflow_id if workflow_id is None else workflow_id
+        )
+        accepted_task_version = (
+            accepted_task.version if task_version is None else task_version
+        )
+        accepted_coordinator_owner = (
+            self.coordinator_owner
+            if coordinator_owner is None
+            else coordinator_owner
+        )
+        accepted_coordinator_epoch = (
+            self.coordinator_lease.epoch
+            if coordinator_epoch is None
+            else coordinator_epoch
+        )
+        accepted_input_snapshot_id = (
+            stored_input if input_snapshot_id is None else input_snapshot_id
+        )
+        accepted_output_snapshot_id = (
+            stored_output if output_snapshot_id is None else output_snapshot_id
+        )
+        accepted_indexed_diff_hash = (
+            stored_diff if indexed_diff_hash is None else indexed_diff_hash
+        )
+        accepted_intent_id = (
+            accepted_task.intent_id if intent_id is None else intent_id
+        )
+        evidence_binding = self.store.build_code_task_evidence_binding(
+            workflow_id=accepted_workflow_id,
             task_id=accepted_task.id,
-            task_version=(
-                accepted_task.version if task_version is None else task_version
+            task_version=accepted_task_version,
+            input_snapshot_id=accepted_input_snapshot_id,
+            output_snapshot_id=accepted_output_snapshot_id,
+            indexed_diff_hash=accepted_indexed_diff_hash,
+            checkpoint_id=f"checkpoint-{accepted_task.id}",
+            checkpoint_hash="sha256:" + "c" * 64,
+            output_query_trace_id=f"trace-{accepted_task.id}",
+            verification_artifact_hashes=("sha256:" + "d" * 64,),
+            execution_receipt_ids=(
+                "sha256:" + "e" * 64,
+                "sha256:" + "f" * 64,
             ),
+        )
+        return self.store.insert_code_task_acceptance(
+            workflow_id=accepted_workflow_id,
+            task_id=accepted_task.id,
+            task_version=accepted_task_version,
             coordinator_task_id=authorized_coordinator.id,
-            coordinator_owner=(
-                self.coordinator_owner
-                if coordinator_owner is None
-                else coordinator_owner
-            ),
-            coordinator_epoch=(
-                self.coordinator_lease.epoch
-                if coordinator_epoch is None
-                else coordinator_epoch
-            ),
-            input_snapshot_id=(
-                stored_input if input_snapshot_id is None else input_snapshot_id
-            ),
-            output_snapshot_id=(
-                stored_output if output_snapshot_id is None else output_snapshot_id
-            ),
-            indexed_diff_hash=(
-                stored_diff if indexed_diff_hash is None else indexed_diff_hash
-            ),
-            intent_id=accepted_task.intent_id if intent_id is None else intent_id,
+            coordinator_owner=accepted_coordinator_owner,
+            coordinator_epoch=accepted_coordinator_epoch,
+            input_snapshot_id=accepted_input_snapshot_id,
+            output_snapshot_id=accepted_output_snapshot_id,
+            indexed_diff_hash=accepted_indexed_diff_hash,
+            intent_id=accepted_intent_id,
             language=accepted_task.language,
             framework=accepted_task.framework,
+            evidence_binding=evidence_binding,
             created_at=created_at,
             now=now,
         )

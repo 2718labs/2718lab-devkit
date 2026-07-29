@@ -8,12 +8,14 @@ boundary.
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+import re
+from dataclasses import asdict, is_dataclass, replace
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
-from .models import Task, TaskState, Workflow
+from .models import Task, TaskKind, TaskState, Workflow
 from .store import Artifact, Lease, SQLiteStore, StoreError
 
 
@@ -32,12 +34,18 @@ class OrchestratorService:
     _MAX_METADATA_KEY_LENGTH = 32
     _MAX_METADATA_VALUE_LENGTH = 128
     _MAX_METADATA_BYTES = 512
+    _MAX_ACCEPTANCE_RECEIPTS = 32
+    _MAX_STATUS_CODE_ACCEPTANCES = 100
+    _SAFE_ACCEPTANCE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+    _SAFE_RECEIPT_IDENTIFIER = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
     def __init__(
         self,
         store: SQLiteStore,
         *,
         index_service: Any | None = None,
+        checkpoint_service: Any | None = None,
+        receipt_repository: Any | None = None,
         evidence_root: str = "evidence",
         mailbox_count_limit: int = 100,
         mailbox_byte_limit: int = 1_048_576,
@@ -45,6 +53,8 @@ class OrchestratorService:
     ) -> None:
         self._store = store
         self._index_service = index_service
+        self._checkpoint_service = checkpoint_service
+        self._receipt_repository = receipt_repository
         self._evidence_root = PurePosixPath(evidence_root.replace("\\", "/"))
         self._mailbox_count_limit = mailbox_count_limit
         self._mailbox_byte_limit = mailbox_byte_limit
@@ -228,10 +238,143 @@ class OrchestratorService:
 
     def status(self, workflow_id: str) -> dict[str, Any]:
         workflow = self._call(self._store.get_workflow, workflow_id)
+        code_acceptances = self._call(
+            self._store.list_code_task_acceptances,
+            workflow_id,
+            limit=self._MAX_STATUS_CODE_ACCEPTANCES,
+        )
+        acceptance_status: list[dict[str, Any]] = []
+        for acceptance in code_acceptances:
+            outbox = self._call(
+                self._store.atlas_outbox_for_acceptance, acceptance.acceptance_id
+            )
+            if outbox is None:
+                acceptance_status.append(
+                    {
+                        "acceptance_id": acceptance.acceptance_id,
+                        "code_task_id": acceptance.code_task_id,
+                        "output_snapshot_id": acceptance.output_snapshot_id,
+                        "outbox_state": "missing",
+                        "last_error_code": "OUTBOX_MISSING",
+                        "reason_codes": [],
+                    }
+                )
+                continue
+            acceptance_status.append(
+                {
+                    "acceptance_id": acceptance.acceptance_id,
+                    "code_task_id": acceptance.code_task_id,
+                    "output_snapshot_id": acceptance.output_snapshot_id,
+                    "outbox_state": outbox.state.value,
+                    "last_error_code": outbox.last_error_code,
+                    "reason_codes": list(outbox.reason_codes),
+                }
+            )
         return {
             "workflow": workflow,
             "tasks": self._call(self._store.list_tasks, workflow_id),
+            "code_acceptances": acceptance_status,
         }
+
+    def accept_code_task(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        *,
+        expected_code_task_version: int,
+        expected_output_snapshot_id: str,
+        coordinator_task_id: str,
+        coordinator_owner: str,
+        coordinator_epoch: int,
+        execution_receipt_ids: list[str] | tuple[str, ...],
+        now: str | None = None,
+    ) -> tuple[Any, Any]:
+        """Validate immutable code-task evidence before one atomic acceptance write."""
+
+        accepted_at = self._acceptance_timestamp(now)
+        receipt_ids = self._validate_acceptance_request(
+            workflow_id=workflow_id,
+            code_task_id=code_task_id,
+            expected_code_task_version=expected_code_task_version,
+            expected_output_snapshot_id=expected_output_snapshot_id,
+            coordinator_task_id=coordinator_task_id,
+            coordinator_owner=coordinator_owner,
+            coordinator_epoch=coordinator_epoch,
+            execution_receipt_ids=execution_receipt_ids,
+        )
+        self._call(self._store.get_workflow, workflow_id)
+        coordinator = self._call(self._store.get_task, coordinator_task_id)
+        self._require_current_coordinator(
+            coordinator,
+            workflow_id=workflow_id,
+            coordinator_owner=coordinator_owner,
+            coordinator_epoch=coordinator_epoch,
+            now=accepted_at,
+        )
+        task = self._call(self._store.get_task, code_task_id)
+        self._require_current_code_task(
+            task,
+            workflow_id=workflow_id,
+            expected_version=expected_code_task_version,
+        )
+        binding = self._call(self._store.get_index_binding, code_task_id)
+        if binding is None:
+            raise ServiceError("INDEX_UNAVAILABLE", "code task has no strict index binding")
+        if binding.output_snapshot_id != expected_output_snapshot_id:
+            raise ServiceError(
+                "ACCEPTANCE_CONFLICT", "code task output snapshot is not current"
+            )
+        self._validate_current_index_evidence(task, binding)
+        checkpoint = self._validate_checkpoint_evidence(
+            workflow_id=workflow_id,
+            task=task,
+            binding=binding,
+        )
+        task_evidence = self._call(
+            self._store.task_acceptance_evidence,
+            code_task_id,
+            binding.output_snapshot_id,
+        )
+        self._validate_output_query_evidence(
+            task_evidence.output_query_trace_id, binding.output_snapshot_id
+        )
+        self._validate_verification_artifacts(
+            task, task_evidence.verification_artifact_hashes
+        )
+        self._validate_receipt_evidence(receipt_ids)
+        evidence_binding = self._call(
+            self._store.build_code_task_evidence_binding,
+            workflow_id=workflow_id,
+            task_id=code_task_id,
+            task_version=task.version,
+            input_snapshot_id=binding.input_snapshot_id,
+            output_snapshot_id=binding.output_snapshot_id,
+            indexed_diff_hash=binding.indexed_diff_hash,
+            checkpoint_id=checkpoint.checkpoint_id,
+            checkpoint_hash=checkpoint.manifest_hash,
+            output_query_trace_id=task_evidence.output_query_trace_id,
+            verification_artifact_hashes=task_evidence.verification_artifact_hashes,
+            execution_receipt_ids=receipt_ids,
+        )
+
+        return self._call(
+            self._store.insert_code_task_acceptance,
+            workflow_id=workflow_id,
+            task_id=code_task_id,
+            task_version=task.version,
+            coordinator_task_id=coordinator_task_id,
+            coordinator_owner=coordinator_owner,
+            coordinator_epoch=coordinator_epoch,
+            input_snapshot_id=binding.input_snapshot_id,
+            output_snapshot_id=binding.output_snapshot_id,
+            indexed_diff_hash=binding.indexed_diff_hash,
+            intent_id=task.intent_id,
+            language=task.language,
+            framework=task.framework,
+            evidence_binding=evidence_binding,
+            created_at=accepted_at,
+            now=accepted_at,
+        )
 
     def write_scope_conflicts(
         self, workflow_id: str
@@ -679,6 +822,241 @@ class OrchestratorService:
             epoch,
             now=now,
         )
+
+    def _require_current_coordinator(
+        self,
+        coordinator: Task,
+        *,
+        workflow_id: str,
+        coordinator_owner: str,
+        coordinator_epoch: int,
+        now: str,
+    ) -> None:
+        if (
+            coordinator.workflow_id != workflow_id
+            or coordinator.owner_role not in {"sol", "opus"}
+            or coordinator.state is not TaskState.RUNNING
+        ):
+            raise ServiceError(
+                "ACCEPTANCE_FORBIDDEN", "coordinator is not authorized for acceptance"
+            )
+        lease = self._call(self._store.get_lease, coordinator.id)
+        if (
+            lease is None
+            or lease.owner != coordinator_owner
+            or lease.epoch != coordinator_epoch
+            or lease.expires_at <= now
+        ):
+            raise ServiceError("STALE_LEASE", "coordinator lease is not current")
+
+    @staticmethod
+    def _require_current_code_task(
+        task: Task,
+        *,
+        workflow_id: str,
+        expected_version: int,
+    ) -> None:
+        if task.workflow_id != workflow_id or task.task_kind is not TaskKind.CODE:
+            raise ServiceError("ACCEPTANCE_FORBIDDEN", "task is not an accepted code task")
+        if task.version != expected_version:
+            raise ServiceError("VERSION_CONFLICT", "code task version is not current")
+        if task.state is not TaskState.DONE:
+            raise ServiceError("INVALID_STATE", "code task is not complete")
+        if not task.write_scope or not task.intent_id or not task.language:
+            raise ServiceError("ACCEPTANCE_FORBIDDEN", "code task metadata is incomplete")
+
+    def _validate_current_index_evidence(self, task: Task, binding: Any) -> None:
+        if (
+            not binding.input_snapshot_id
+            or not binding.output_snapshot_id
+            or not binding.indexed_diff_hash
+        ):
+            raise ServiceError("INDEXED_DIFF_REQUIRED", "strict output evidence is missing")
+        self._assert_index_current(
+            Path(binding.workspace_root), binding.output_snapshot_id, task.write_scope
+        )
+        if self._index_service is None:
+            raise ServiceError("INDEX_UNAVAILABLE", "project index service is unavailable")
+        try:
+            indexed_diff = self._index_service.diff(
+                binding.input_snapshot_id, binding.output_snapshot_id
+            )
+            computed_hash = self._index_diff_hash(indexed_diff)
+        except ServiceError:
+            raise
+        except Exception as error:
+            self._raise_index_error(error)
+        if computed_hash != binding.indexed_diff_hash:
+            raise ServiceError("SNAPSHOT_MISMATCH", "indexed diff is not current")
+
+    def _validate_checkpoint_evidence(
+        self,
+        *,
+        workflow_id: str,
+        task: Task,
+        binding: Any,
+    ) -> Any:
+        if not binding.checkpoint_id:
+            raise ServiceError("CHECKPOINT_REQUIRED", "code task checkpoint is missing")
+        if self._checkpoint_service is None:
+            raise ServiceError("INDEX_UNAVAILABLE", "checkpoint service is unavailable")
+        try:
+            checkpoint = self._checkpoint_service.status(binding.checkpoint_id)
+        except Exception as error:
+            self._raise_index_error(error)
+        if (
+            checkpoint.checkpoint_id != binding.checkpoint_id
+            or checkpoint.kind != "checkpoint"
+            or checkpoint.workflow_id != workflow_id
+            or checkpoint.task_id != task.id
+            or checkpoint.workspace_root != binding.workspace_root
+            or checkpoint.snapshot_id != binding.input_snapshot_id
+            or tuple(checkpoint.write_scope) != task.write_scope
+        ):
+            raise ServiceError("SNAPSHOT_MISMATCH", "checkpoint binding is not current")
+        return checkpoint
+
+    def _validate_output_query_evidence(
+        self, trace_id: str, output_snapshot_id: str
+    ) -> None:
+        if self._index_service is None:
+            raise ServiceError("INDEX_UNAVAILABLE", "project index service is unavailable")
+        try:
+            receipt = self._index_service.get_query_receipt(trace_id)
+        except Exception as error:
+            self._raise_index_error(error)
+        if receipt.snapshot_id != output_snapshot_id:
+            raise ServiceError("SNAPSHOT_MISMATCH", "output query is not current")
+
+    def _validate_verification_artifacts(
+        self, task: Task, artifact_hashes: tuple[str, ...]
+    ) -> None:
+        if not task.result_hash:
+            raise ServiceError("EVIDENCE_INCOMPLETE", "task output evidence is missing")
+        if task.result_hash not in artifact_hashes:
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE", "task output evidence is not verified"
+            )
+        for artifact_hash in artifact_hashes:
+            artifact = self._call(self._store.get_artifact, artifact_hash)
+            if artifact is None or artifact.kind != "verification":
+                raise ServiceError(
+                    "EVIDENCE_INCOMPLETE", "verification evidence is unavailable"
+                )
+
+    def _validate_receipt_evidence(self, receipt_ids: tuple[str, ...]) -> None:
+        if self._receipt_repository is None:
+            raise ServiceError("EVIDENCE_INCOMPLETE", "receipt repository is unavailable")
+        receipts: list[Any] = []
+        unreadable = False
+        for receipt_id in receipt_ids:
+            try:
+                receipts.append(self._receipt_repository.read(receipt_id))
+            except Exception:
+                unreadable = True
+        if unreadable or len(receipts) != len(receipt_ids):
+            raise ServiceError("EVIDENCE_INCOMPLETE", "execution receipt is unavailable")
+        workspace_hashes: set[str] = set()
+        for receipt in receipts:
+            workspace_hash = getattr(receipt, "workspace_hash", None)
+            if not isinstance(workspace_hash, str) or not workspace_hash:
+                raise ServiceError(
+                    "EVIDENCE_INCOMPLETE", "execution workspace is unavailable"
+                )
+            workspace_hashes.add(workspace_hash)
+        if (
+            len(workspace_hashes) != 1
+            or any(
+                getattr(receipt, "success", None) is not True
+                or getattr(receipt, "exit_code", None) != 0
+                for receipt in receipts
+            )
+            or not any(getattr(receipt, "canonical_tool", None) == "patch" for receipt in receipts)
+            or not any(getattr(receipt, "canonical_tool", None) == "shell" for receipt in receipts)
+        ):
+            raise ServiceError("EVIDENCE_INCOMPLETE", "execution evidence is incomplete")
+
+    def _validate_acceptance_request(
+        self,
+        *,
+        workflow_id: str,
+        code_task_id: str,
+        expected_code_task_version: int,
+        expected_output_snapshot_id: str,
+        coordinator_task_id: str,
+        coordinator_owner: str,
+        coordinator_epoch: int,
+        execution_receipt_ids: list[str] | tuple[str, ...],
+    ) -> tuple[str, ...]:
+        for field_name, value in (
+            ("workflow_id", workflow_id),
+            ("code_task_id", code_task_id),
+            ("expected_output_snapshot_id", expected_output_snapshot_id),
+            ("coordinator_task_id", coordinator_task_id),
+            ("coordinator_owner", coordinator_owner),
+        ):
+            self._require_acceptance_identifier(field_name, value)
+        if (
+            isinstance(expected_code_task_version, bool)
+            or not isinstance(expected_code_task_version, int)
+            or expected_code_task_version < 0
+        ):
+            raise ServiceError("INVALID_REQUEST", "code task version is invalid")
+        if (
+            isinstance(coordinator_epoch, bool)
+            or not isinstance(coordinator_epoch, int)
+            or coordinator_epoch < 1
+        ):
+            raise ServiceError("INVALID_REQUEST", "coordinator epoch is invalid")
+        if not isinstance(execution_receipt_ids, (list, tuple)):
+            raise ServiceError("INVALID_REQUEST", "receipt identifiers must be a list")
+        receipt_ids = tuple(execution_receipt_ids)
+        if not 1 <= len(receipt_ids) <= self._MAX_ACCEPTANCE_RECEIPTS:
+            raise ServiceError("EVIDENCE_INCOMPLETE", "receipt count is invalid")
+        if len(set(receipt_ids)) != len(receipt_ids) or any(
+            not isinstance(receipt_id, str)
+            or self._SAFE_RECEIPT_IDENTIFIER.fullmatch(receipt_id) is None
+            for receipt_id in receipt_ids
+        ):
+            raise ServiceError("EVIDENCE_INCOMPLETE", "receipt identifiers are invalid")
+        return tuple(sorted(receipt_ids))
+
+    @classmethod
+    def _require_acceptance_identifier(cls, field_name: str, value: str) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 256
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER.fullmatch(value) is None
+        ):
+            raise ServiceError("INVALID_REQUEST", f"{field_name} is invalid")
+
+    @staticmethod
+    def _acceptance_timestamp(now: str | None) -> str:
+        if now is None:
+            return datetime.now(UTC).isoformat()
+        if not isinstance(now, str):
+            raise ServiceError("INVALID_REQUEST", "acceptance time is invalid")
+        try:
+            parsed = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ServiceError("INVALID_REQUEST", "acceptance time is invalid") from error
+        if parsed.tzinfo is None:
+            raise ServiceError("INVALID_REQUEST", "acceptance time is invalid")
+        return parsed.astimezone(UTC).isoformat()
+
+    @staticmethod
+    def _index_diff_hash(indexed_diff: Any) -> str:
+        if not is_dataclass(indexed_diff) or isinstance(indexed_diff, type):
+            raise ServiceError("INDEX_CORRUPT", "indexed diff is invalid")
+        try:
+            payload = asdict(indexed_diff)
+            encoded = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ServiceError("INDEX_CORRUPT", "indexed diff is invalid") from error
+        return f"sha256:{sha256(encoded).hexdigest()}"
 
     @staticmethod
     def _canonical_workspace(workspace_root: str) -> Path:

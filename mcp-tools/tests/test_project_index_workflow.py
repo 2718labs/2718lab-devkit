@@ -93,8 +93,8 @@ class StrictProjectIndexWorkflowTests(unittest.TestCase):
             expires_at="2099-01-01T00:00:00+00:00",
         )
 
-    def test_schema_v3_and_legacy_tasks_remain_unbound(self) -> None:
-        self.assertEqual(3, self.store.schema_version())
+    def test_schema_v4_and_legacy_tasks_remain_unbound(self) -> None:
+        self.assertEqual(4, self.store.schema_version())
         legacy = self.service.register_task(
             Task("legacy", "wf", "legacy", "writer"), card="legacy"
         )
