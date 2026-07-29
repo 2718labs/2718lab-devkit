@@ -623,6 +623,107 @@ def _win_open_regular(path: Path) -> int:
         raise
 
 
+class _WinDispositionInfo(ctypes.Structure):
+    _fields_ = (("delete_file", ctypes.c_byte),)
+
+
+def _win_open_owned_cleanup_handle(
+    path: Path,
+    expected: tuple[int, int, int],
+    *,
+    directory: bool,
+) -> int | None:
+    """Open an owned object for deletion and authenticate the opened handle.
+
+    ``CreateFileW`` excludes delete sharing once it succeeds.  The identity
+    check is deliberately performed through that handle, rather than through
+    a later pathname lookup, so an object swapped immediately before opening
+    is left in place instead of being deleted.
+    """
+
+    kernel32 = _win_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    flags = _WIN_FILE_FLAG_OPEN_REPARSE_POINT
+    if directory:
+        flags |= _WIN_FILE_FLAG_BACKUP_SEMANTICS
+    handle = create_file(
+        str(path),
+        _WIN_GENERIC_READ | _WIN_DELETE,
+        _WIN_SHARE_READ | _WIN_SHARE_WRITE,
+        None,
+        _WIN_OPEN_EXISTING,
+        flags,
+        None,
+    )
+    if handle == _WIN_INVALID_HANDLE:
+        return None
+    descriptor: int | None = None
+    try:
+        import msvcrt
+
+        # ``open_osfhandle`` transfers ownership to the CRT descriptor.  It
+        # also gives us a handle-authenticated ``fstat`` with Python's exact
+        # device/inode representation, rather than attempting to reconstruct
+        # that representation from FILE_ID_INFO by hand.
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+        handle = None
+        value = os.fstat(descriptor)
+        if (
+            _object_identity(value) != expected
+            or (directory and not stat.S_ISDIR(value.st_mode))
+            or (not directory and not stat.S_ISREG(value.st_mode))
+        ):
+            _close_descriptor(descriptor)
+            return None
+        return descriptor
+    except OSError:
+        _close_descriptor(descriptor)
+        return None
+    finally:
+        if handle is not None:
+            _win_close_handle(int(handle))
+
+
+def _win_mark_handle_for_delete(handle: int) -> None:
+    """Mark an already-authenticated Windows handle for delete-on-close."""
+
+    kernel32 = _win_kernel32()
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    set_information.restype = ctypes.c_int
+    disposition = _WinDispositionInfo(1)
+    if set_information(
+        ctypes.c_void_p(handle),
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        return
+    error = ctypes.get_last_error()
+    raise OSError(error, "SetFileInformationByHandle disposition failed")
+
+
+def _win_mark_descriptor_for_delete(descriptor: int) -> None:
+    import msvcrt
+
+    _win_mark_handle_for_delete(msvcrt.get_osfhandle(descriptor))
+
+
 class _StageLease:
     """Retain verified directory capabilities for all staging operations."""
 
@@ -1009,6 +1110,170 @@ class _StageLease:
         ):
             raise PromotionError("promotion_write_failed")
 
+    def _posix_cleanup_parent(
+        self,
+        path: Path,
+        directories: dict[Path, tuple[int, int, int]],
+    ) -> tuple[int, str] | None:
+        """Open the retained parent directory of one owned stage child."""
+
+        if self.stage is None or self._stage_fd is None:
+            return None
+        descriptor: int | None = None
+        try:
+            relative = path.relative_to(self.stage).as_posix()
+            components, leaf = self._relative_parts(relative)
+            descriptor = os.dup(self._stage_fd)
+            current = self.stage
+            for component in components:
+                candidate = current / component
+                expected = directories.get(candidate)
+                if expected is None:
+                    _close_descriptor(descriptor)
+                    return None
+                value = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+                if (
+                    _unsafe_status(candidate, value)
+                    or not stat.S_ISDIR(value.st_mode)
+                    or _object_identity(value) != expected
+                ):
+                    _close_descriptor(descriptor)
+                    return None
+                next_descriptor = _open_posix_directory(
+                    component, directory_fd=descriptor
+                )
+                if _object_identity(os.fstat(next_descriptor)) != expected:
+                    _close_descriptor(next_descriptor)
+                    _close_descriptor(descriptor)
+                    return None
+                _close_descriptor(descriptor)
+                descriptor = next_descriptor
+                current = candidate
+            return descriptor, leaf
+        except (OSError, PromotionError):
+            _close_descriptor(descriptor)
+            return None
+
+    def _cleanup_posix(
+        self,
+        files: dict[Path, tuple[int, int, int]],
+        directories: dict[Path, tuple[int, int, int]],
+    ) -> bool:
+        """Best-effort cleanup through retained POSIX directory descriptors."""
+
+        if (
+            self.stage is None
+            or self.stage_identity is None
+            or self._stage_fd is None
+            or self._parent_fd is None
+        ):
+            return False
+        try:
+            if (
+                _object_identity(os.fstat(self._stage_fd)) != self.stage_identity
+                or _object_identity(os.fstat(self._parent_fd)) != self.parent_identity
+            ):
+                return False
+            for path, identity in sorted(files.items(), key=lambda item: str(item[0])):
+                parent = self._posix_cleanup_parent(path, directories)
+                if parent is None:
+                    return False
+                descriptor, name = parent
+                try:
+                    value = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    if (
+                        _unsafe_status(path, value)
+                        or not stat.S_ISREG(value.st_mode)
+                        or _object_identity(value) != identity
+                    ):
+                        return False
+                    os.unlink(name, dir_fd=descriptor)
+                finally:
+                    _close_descriptor(descriptor)
+            for path, identity in sorted(
+                directories.items(),
+                key=lambda item: (len(item[0].parts), str(item[0])),
+                reverse=True,
+            ):
+                parent = self._posix_cleanup_parent(path, directories)
+                if parent is None:
+                    return False
+                descriptor, name = parent
+                try:
+                    value = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    if (
+                        _unsafe_status(path, value)
+                        or not stat.S_ISDIR(value.st_mode)
+                        or _object_identity(value) != identity
+                    ):
+                        return False
+                    os.rmdir(name, dir_fd=descriptor)
+                finally:
+                    _close_descriptor(descriptor)
+            named_stage = os.stat(
+                self.stage.name, dir_fd=self._parent_fd, follow_symlinks=False
+            )
+            if (
+                _unsafe_status(self.stage, named_stage)
+                or not stat.S_ISDIR(named_stage.st_mode)
+                or _object_identity(named_stage) != self.stage_identity
+            ):
+                return False
+            os.rmdir(self.stage.name, dir_fd=self._parent_fd)
+            return True
+        except (OSError, PromotionError):
+            return False
+
+    def cleanup(
+        self,
+        files: dict[Path, tuple[int, int, int]],
+        directories: dict[Path, tuple[int, int, int]],
+    ) -> bool:
+        """Remove only this lease's verified staging objects before release."""
+
+        if os.name == "posix":
+            return self._cleanup_posix(files, directories)
+        if os.name != "nt":
+            return False
+        try:
+            self._assert_stage()
+            if self._stage_handle is None:
+                return False
+            for path, identity in sorted(files.items(), key=lambda item: str(item[0])):
+                descriptor = _win_open_owned_cleanup_handle(
+                    path, identity, directory=False
+                )
+                if descriptor is None:
+                    return False
+                try:
+                    _win_mark_descriptor_for_delete(descriptor)
+                finally:
+                    _close_descriptor(descriptor)
+            # A directory must be empty before its delete disposition can be
+            # committed, so dispose of deepest descendants first.
+            for path, identity in sorted(
+                directories.items(),
+                key=lambda item: (len(item[0].parts), str(item[0])),
+                reverse=True,
+            ):
+                descriptor = _win_open_owned_cleanup_handle(
+                    path, identity, directory=True
+                )
+                if descriptor is None:
+                    return False
+                try:
+                    _win_mark_descriptor_for_delete(descriptor)
+                finally:
+                    _close_descriptor(descriptor)
+            # The stage's original DELETE-capable handle was opened during
+            # creation and remains leased, so it is itself the capability for
+            # the final deletion.  ``close`` below makes that disposition take
+            # effect before it releases the enclosing parent leases.
+            _win_mark_handle_for_delete(self._stage_handle)
+            return True
+        except (OSError, PromotionError):
+            return False
+
     def publish(self, output: Path) -> None:
         self._assert_stage()
         if self.stage is None or output.parent != self.parent or not output.name:
@@ -1172,11 +1437,9 @@ def _write_bundle(
             os.fsync(lease._parent_fd)
     finally:
         if lease is not None:
+            if stage is not None:
+                lease.cleanup(owned_files, owned_directories)
             lease.close()
-        # A failed stage is intentionally retained. Once publication fails,
-        # portable pathname cleanup cannot prove that a later lookup still
-        # denotes an owned object, so deletion would be less safe than a
-        # harmless prefixed staging directory.
 
 
 def export_recipe(data_root: Path, recipe_id: str, output: Path) -> None:

@@ -633,7 +633,10 @@ def test_stage_writer_never_follows_a_nested_component_replaced_before_open(
     assert not (outside / "sha256" / "template.py").exists()
 
 
-def test_failed_bundle_never_uses_unleased_pathname_cleanup(
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows handle cleanup is platform-specific"
+)
+def test_failed_bundle_capability_cleanup_removes_the_owned_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -655,9 +658,83 @@ def test_failed_bundle_never_uses_unleased_pathname_cleanup(
     with pytest.raises(exporter.PromotionError, match="promotion_write_failed"):
         exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
 
+    assert not tuple(parent.glob(".code-atlas-stage-*"))
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows handle cleanup is platform-specific"
+)
+def test_failed_bundle_cleanup_never_deletes_a_file_replaced_before_handle_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _export_module()
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "bundle"
+    parked = tmp_path / "parked-receipt.txt"
+    attacker = b"attacker-owned\n"
+    original_open = getattr(exporter, "_win_open_owned_cleanup_handle", None)
+    raced = False
+
+    def fail_publish(*_args: object, **_kwargs: object) -> None:
+        raise OSError("forced publish failure")
+
+    def replace_before_open(
+        path: Path,
+        expected: tuple[int, int, int],
+        *,
+        directory: bool,
+    ) -> int | None:
+        nonlocal raced
+        if not raced and not directory and path.name == "receipt.txt":
+            raced = True
+            os.replace(path, parked)
+            path.write_bytes(attacker)
+        assert original_open is not None
+        return original_open(path, expected, directory=directory)
+
+    monkeypatch.setattr(exporter, "_atomic_noreplace_directory", fail_publish)
+    monkeypatch.setattr(
+        exporter, "_win_open_owned_cleanup_handle", replace_before_open, raising=False
+    )
+
+    with pytest.raises(exporter.PromotionError, match="promotion_write_failed"):
+        exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
+
+    assert raced is True
     stages = tuple(parent.glob(".code-atlas-stage-*"))
     assert len(stages) == 1
-    assert (stages[0] / "receipt.txt").read_bytes() == b"verified\n"
+    assert (stages[0] / "receipt.txt").read_bytes() == attacker
+    assert parked.read_bytes() == b"verified\n"
+
+
+@pytest.mark.skipif(os.name == "posix", reason="POSIX uses its real capability path")
+def test_stage_lease_dispatches_failure_cleanup_to_the_posix_dirfd_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the POSIX cleanup branch covered while this suite runs on Windows."""
+
+    exporter = _export_module()
+    calls: list[
+        tuple[dict[Path, tuple[int, int, int]], dict[Path, tuple[int, int, int]]]
+    ] = []
+
+    class ProbeLease:
+        def _cleanup_posix(
+            self,
+            files: dict[Path, tuple[int, int, int]],
+            directories: dict[Path, tuple[int, int, int]],
+        ) -> bool:
+            calls.append((files, directories))
+            return True
+
+    files = {Path("stage") / "receipt.txt": (1, 2, 3)}
+    directories = {Path("stage") / "templates": (4, 5, 6)}
+    monkeypatch.setattr(exporter.os, "name", "posix")
+
+    assert exporter._StageLease.cleanup(ProbeLease(), files, directories) is True
+    assert calls == [(files, directories)]
 
 
 def test_export_cli_unknown_argument_is_a_stable_secret_free_failure(

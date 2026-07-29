@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import tempfile
@@ -232,16 +234,860 @@ def _snapshot_source_state(
     )
 
 
+_READONLY_ROOT_PREFIX = ".code-atlas-readonly-root-"
+_READONLY_STAGE_PREFIX = ".code-atlas-readonly-"
+_SQLITE_SNAPSHOT_FILENAMES = (
+    "code-atlas.sqlite3",
+    "code-atlas.sqlite3-journal",
+    "code-atlas.sqlite3-shm",
+    "code-atlas.sqlite3-wal",
+)
+
+
+def _close_descriptor(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _capture_safe_directory_chain(
+    path: Path,
+) -> tuple[tuple[Path, tuple[int, int, int]], ...]:
+    """Capture every directory component needed to reach one scratch anchor."""
+
+    absolute = _lexical_absolute(path)
+    parts = absolute.parts
+    if not parts:
+        raise StoreConflictError()
+    cursor = Path(parts[0])
+    records: list[tuple[Path, tuple[int, int, int]]] = []
+    try:
+        for part in (None, *parts[1:]):
+            if part is not None:
+                cursor /= part
+            value = cursor.lstat()
+            if _unsafe_file_status(cursor, value) or not stat.S_ISDIR(value.st_mode):
+                raise StoreConflictError()
+            records.append((cursor, _object_identity(value)))
+    except StoreConflictError:
+        raise
+    except OSError as exc:
+        raise StoreConflictError() from exc
+    return tuple(records)
+
+
+def _assert_safe_directory_chain(
+    records: tuple[tuple[Path, tuple[int, int, int]], ...],
+) -> None:
+    for path, identity in records:
+        try:
+            value = path.lstat()
+        except OSError as exc:
+            raise StoreConflictError() from exc
+        if (
+            _unsafe_file_status(path, value)
+            or not stat.S_ISDIR(value.st_mode)
+            or _object_identity(value) != identity
+        ):
+            raise StoreConflictError()
+
+
+def _posix_directory_flags() -> int:
+    if (
+        os.name != "posix"
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise StoreConflictError()
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0)
+
+
+def _open_posix_directory(name: str | Path, *, directory_fd: int | None = None) -> int:
+    try:
+        if directory_fd is None:
+            return os.open(name, _posix_directory_flags())
+        return os.open(name, _posix_directory_flags(), dir_fd=directory_fd)
+    except OSError as exc:
+        raise StoreConflictError() from exc
+
+
+def _open_posix_directory_chain(
+    records: tuple[tuple[Path, tuple[int, int, int]], ...],
+) -> list[int]:
+    descriptors: list[int] = []
+    try:
+        for path, identity in records:
+            descriptor = (
+                _open_posix_directory(path)
+                if not descriptors
+                else _open_posix_directory(path.name, directory_fd=descriptors[-1])
+            )
+            value = os.fstat(descriptor)
+            if not stat.S_ISDIR(value.st_mode) or _object_identity(value) != identity:
+                _close_descriptor(descriptor)
+                raise StoreConflictError()
+            descriptors.append(descriptor)
+        return descriptors
+    except Exception:
+        while descriptors:
+            _close_descriptor(descriptors.pop())
+        raise
+
+
+_WIN_GENERIC_READ = 0x80000000
+_WIN_DELETE = 0x00010000
+_WIN_SHARE_READ = 0x00000001
+_WIN_SHARE_WRITE = 0x00000002
+_WIN_OPEN_EXISTING = 3
+_WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WIN_INVALID_HANDLE = ctypes.c_void_p(-1).value
+_WIN_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
+_WIN_STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+_WIN_STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A
+_WIN_FILE_OPEN = 1
+_WIN_FILE_CREATE = 2
+_WIN_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_WIN_FILE_DIRECTORY_FILE = 0x00000001
+_WIN_FILE_NON_DIRECTORY_FILE = 0x00000040
+_WIN_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_WIN_FILE_OPEN_REPARSE_POINT = 0x00200000
+_WIN_OBJ_CASE_INSENSITIVE = 0x00000040
+_WIN_OBJ_DONT_REPARSE = 0x00001000
+_WIN_DIRECTORY_ACCESS = 0x00120089
+_WIN_FILE_GENERIC_READ = 0x00120089
+_WIN_FILE_GENERIC_WRITE = 0x00120116
+
+
+def _win_kernel32() -> object:
+    if os.name != "nt":
+        raise StoreConflictError()
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _win_close_handle(handle: int | None) -> None:
+    if handle is None:
+        return
+    kernel32 = _win_kernel32()
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    close_handle(ctypes.c_void_p(handle))
+
+
+def _win_descriptor_handle(descriptor: int) -> int:
+    import msvcrt
+
+    return int(msvcrt.get_osfhandle(descriptor))
+
+
+def _win_open_verified_directory(path: Path, expected: tuple[int, int, int]) -> int:
+    """Open a path component and pin it with no delete sharing."""
+
+    kernel32 = _win_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        _WIN_GENERIC_READ,
+        _WIN_SHARE_READ | _WIN_SHARE_WRITE,
+        None,
+        _WIN_OPEN_EXISTING,
+        _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle in {None, _WIN_INVALID_HANDLE}:
+        raise StoreConflictError()
+    descriptor: int | None = None
+    try:
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+        handle = None
+        opened = os.fstat(descriptor)
+        status = path.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _object_identity(opened) != expected
+            or _unsafe_file_status(path, status)
+            or not stat.S_ISDIR(status.st_mode)
+            or _object_identity(status) != expected
+        ):
+            raise StoreConflictError()
+        return descriptor
+    except StoreConflictError:
+        _close_descriptor(descriptor)
+        raise
+    except OSError as exc:
+        _close_descriptor(descriptor)
+        raise StoreConflictError() from exc
+    finally:
+        if handle is not None:
+            _win_close_handle(int(handle))
+
+
+def _open_windows_directory_chain(
+    records: tuple[tuple[Path, tuple[int, int, int]], ...],
+) -> list[int]:
+    descriptors: list[int] = []
+    try:
+        for path, identity in records:
+            descriptors.append(_win_open_verified_directory(path, identity))
+        return descriptors
+    except Exception:
+        while descriptors:
+            _close_descriptor(descriptors.pop())
+        raise
+
+
+class _WinUnicodeString(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_ushort),
+        ("maximum_length", ctypes.c_ushort),
+        ("buffer", ctypes.c_void_p),
+    )
+
+
+class _WinObjectAttributes(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_ulong),
+        ("root_directory", ctypes.c_void_p),
+        ("object_name", ctypes.POINTER(_WinUnicodeString)),
+        ("attributes", ctypes.c_ulong),
+        ("security_descriptor", ctypes.c_void_p),
+        ("security_quality_of_service", ctypes.c_void_p),
+    )
+
+
+class _WinIoStatusUnion(ctypes.Union):
+    _fields_ = (("status", ctypes.c_long), ("pointer", ctypes.c_void_p))
+
+
+class _WinIoStatusBlock(ctypes.Structure):
+    _fields_ = (("status", _WinIoStatusUnion), ("information", ctypes.c_size_t))
+
+
+class _WinDispositionInfo(ctypes.Structure):
+    _fields_ = (("delete_file", ctypes.c_byte),)
+
+
+def _win_open_relative(
+    parent_descriptor: int,
+    name: str,
+    *,
+    create: bool,
+    directory: bool,
+    delete: bool = False,
+    write: bool = False,
+    optional: bool = False,
+) -> int | None:
+    """Open/create one basename below a retained Windows directory handle."""
+
+    if not name or "\\" in name or "/" in name:
+        raise StoreConflictError()
+    buffer = ctypes.create_unicode_buffer(name)
+    unicode_name = _WinUnicodeString(
+        len(name) * ctypes.sizeof(ctypes.c_wchar),
+        (len(name) + 1) * ctypes.sizeof(ctypes.c_wchar),
+        ctypes.cast(buffer, ctypes.c_void_p),
+    )
+    attributes = _WinObjectAttributes(
+        ctypes.sizeof(_WinObjectAttributes),
+        ctypes.c_void_p(_win_descriptor_handle(parent_descriptor)),
+        ctypes.pointer(unicode_name),
+        _WIN_OBJ_CASE_INSENSITIVE | _WIN_OBJ_DONT_REPARSE,
+        None,
+        None,
+    )
+    status_block = _WinIoStatusBlock()
+    output = ctypes.c_void_p()
+    ntdll = ctypes.WinDLL("ntdll")
+    create_file = ntdll.NtCreateFile
+    create_file.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_ulong,
+        ctypes.POINTER(_WinObjectAttributes),
+        ctypes.POINTER(_WinIoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    )
+    create_file.restype = ctypes.c_long
+    access = (
+        (_WIN_DIRECTORY_ACCESS if directory else _WIN_FILE_GENERIC_READ)
+        | (_WIN_FILE_GENERIC_WRITE if write else 0)
+        | (_WIN_DELETE if delete else 0)
+    )
+    status = create_file(
+        ctypes.byref(output),
+        access,
+        ctypes.byref(attributes),
+        ctypes.byref(status_block),
+        None,
+        _WIN_FILE_ATTRIBUTE_NORMAL,
+        _WIN_SHARE_READ | _WIN_SHARE_WRITE,
+        _WIN_FILE_CREATE if create else _WIN_FILE_OPEN,
+        (_WIN_FILE_DIRECTORY_FILE if directory else _WIN_FILE_NON_DIRECTORY_FILE)
+        | _WIN_FILE_SYNCHRONOUS_IO_NONALERT
+        | _WIN_FILE_OPEN_REPARSE_POINT,
+        None,
+        0,
+    )
+    if status != 0:
+        if create and (status & 0xFFFFFFFF) == _WIN_STATUS_OBJECT_NAME_COLLISION:
+            return None
+        if (
+            not create
+            and optional
+            and (status & 0xFFFFFFFF)
+            in {_WIN_STATUS_OBJECT_NAME_NOT_FOUND, _WIN_STATUS_OBJECT_PATH_NOT_FOUND}
+        ):
+            return None
+        raise StoreConflictError()
+    descriptor: int | None = None
+    try:
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(
+            int(output.value), os.O_WRONLY if write else os.O_RDONLY
+        )
+        output = ctypes.c_void_p()
+        return descriptor
+    except OSError as exc:
+        _close_descriptor(descriptor)
+        raise StoreConflictError() from exc
+    finally:
+        if output.value is not None:
+            _win_close_handle(int(output.value))
+
+
+def _win_mark_descriptor_for_delete(descriptor: int) -> None:
+    kernel32 = _win_kernel32()
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    set_information.restype = ctypes.c_int
+    disposition = _WinDispositionInfo(1)
+    if set_information(
+        ctypes.c_void_p(_win_descriptor_handle(descriptor)),
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        return
+    raise StoreConflictError()
+
+
+class _ReadonlyScratchLease:
+    """Capability lease for the complete private SQLite snapshot lifecycle."""
+
+    def __init__(self, scratch_parent: Path, *, owns_scratch: bool) -> None:
+        self.anchor = _lexical_absolute(scratch_parent)
+        self._directory_chain = _capture_safe_directory_chain(self.anchor)
+        self.anchor_identity = self._directory_chain[-1][1]
+        self._chain_descriptors: list[int] = []
+        self._anchor_descriptor: int | None = None
+        self._scratch_descriptor: int | None = None
+        self._stage_descriptor: int | None = None
+        self._owns_scratch = owns_scratch
+        self._scratch_is_anchor = False
+        self._scratch_name: str | None = None
+        self._stage_name: str | None = None
+        self.scratch: Path | None = None
+        self.scratch_identity: tuple[int, int, int] | None = None
+        self.stage: Path | None = None
+        self.stage_identity: tuple[int, int, int] | None = None
+        self._files: dict[str, tuple[int, int, int]] = {}
+        self._snapshot_file_descriptors: dict[str, int] = {}
+        try:
+            if os.name == "posix":
+                self._chain_descriptors = _open_posix_directory_chain(
+                    self._directory_chain
+                )
+            elif os.name == "nt":
+                self._chain_descriptors = _open_windows_directory_chain(
+                    self._directory_chain
+                )
+            else:
+                raise StoreConflictError()
+            self._anchor_descriptor = self._chain_descriptors[-1]
+            if not owns_scratch:
+                self.scratch = self.anchor
+                self.scratch_identity = self.anchor_identity
+                self._scratch_descriptor = self._anchor_descriptor
+                self._scratch_is_anchor = True
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def _new_name(prefix: str) -> str:
+        return prefix + secrets.token_hex(16)
+
+    @staticmethod
+    def _descriptor_identity(descriptor: int | None) -> tuple[int, int, int]:
+        if descriptor is None:
+            raise StoreConflictError()
+        try:
+            return _object_identity(os.fstat(descriptor))
+        except OSError as exc:
+            raise StoreConflictError() from exc
+
+    def _assert_anchor(self) -> None:
+        if self._descriptor_identity(self._anchor_descriptor) != self.anchor_identity:
+            raise StoreConflictError()
+        _assert_safe_directory_chain(self._directory_chain)
+
+    def _assert_scratch(self) -> None:
+        if self.scratch is None or self.scratch_identity is None:
+            raise StoreConflictError()
+        self._assert_anchor()
+        if self._descriptor_identity(self._scratch_descriptor) != self.scratch_identity:
+            raise StoreConflictError()
+        try:
+            status = self.scratch.lstat()
+        except OSError as exc:
+            raise StoreConflictError() from exc
+        if (
+            _unsafe_file_status(self.scratch, status)
+            or not stat.S_ISDIR(status.st_mode)
+            or _object_identity(status) != self.scratch_identity
+        ):
+            raise StoreConflictError()
+
+    def _assert_stage(self) -> None:
+        if (
+            self.stage is None
+            or self.stage_identity is None
+            or self._stage_name is None
+            or self.scratch is None
+            or self.stage.parent != self.scratch
+        ):
+            raise StoreConflictError()
+        self._assert_scratch()
+        if self._descriptor_identity(self._stage_descriptor) != self.stage_identity:
+            raise StoreConflictError()
+        try:
+            status = self.stage.lstat()
+        except OSError as exc:
+            raise StoreConflictError() from exc
+        if (
+            _unsafe_file_status(self.stage, status)
+            or not stat.S_ISDIR(status.st_mode)
+            or _object_identity(status) != self.stage_identity
+        ):
+            raise StoreConflictError()
+
+    def create_directory(self, prefix: str, *, owned_scratch: bool) -> Path:
+        if owned_scratch:
+            if self.scratch is not None:
+                raise StoreConflictError()
+            self._assert_anchor()
+            parent = self.anchor
+            parent_descriptor = self._anchor_descriptor
+        else:
+            if self.stage is not None:
+                raise StoreConflictError()
+            self._assert_scratch()
+            parent = self.scratch
+            parent_descriptor = self._scratch_descriptor
+        if parent is None or parent_descriptor is None:
+            raise StoreConflictError()
+        for _attempt in range(64):
+            name = self._new_name(prefix)
+            descriptor: int | None = None
+            try:
+                if os.name == "posix":
+                    try:
+                        os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+                    except FileExistsError:
+                        continue
+                    descriptor = _open_posix_directory(
+                        name, directory_fd=parent_descriptor
+                    )
+                else:
+                    descriptor = _win_open_relative(
+                        parent_descriptor,
+                        name,
+                        create=True,
+                        directory=True,
+                        delete=True,
+                    )
+                    if descriptor is None:
+                        continue
+                identity = self._descriptor_identity(descriptor)
+                if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise StoreConflictError()
+                created = parent / name
+                if owned_scratch:
+                    self.scratch = created
+                    self.scratch_identity = identity
+                    self._scratch_descriptor = descriptor
+                    self._scratch_name = name
+                else:
+                    self.stage = created
+                    self.stage_identity = identity
+                    self._stage_descriptor = descriptor
+                    self._stage_name = name
+                return created
+            except StoreConflictError:
+                _close_descriptor(descriptor)
+                raise
+            except OSError as exc:
+                _close_descriptor(descriptor)
+                raise StoreConflictError() from exc
+        raise StoreConflictError()
+
+    def create_file(self, name: str) -> int:
+        if not name or "/" in name or "\\" in name:
+            raise StoreConflictError()
+        self._assert_stage()
+        if self._stage_descriptor is None:
+            raise StoreConflictError()
+        try:
+            if os.name == "posix":
+                return os.open(
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_BINARY", 0),
+                    0o600,
+                    dir_fd=self._stage_descriptor,
+                )
+            descriptor = _win_open_relative(
+                self._stage_descriptor,
+                name,
+                create=True,
+                directory=False,
+                write=True,
+            )
+            if descriptor is None:
+                raise StoreConflictError()
+            return descriptor
+        except StoreConflictError:
+            raise
+        except OSError as exc:
+            raise StoreConflictError() from exc
+
+    def record_file(self, name: str, identity: tuple[int, int, int]) -> None:
+        self._assert_stage()
+        if name in self._files:
+            raise StoreConflictError()
+        self._files[name] = identity
+
+    def retain_snapshot_file(self, name: str, identity: tuple[int, int, int]) -> None:
+        """Keep the pathname SQLite will open from being replaced on Windows."""
+
+        if name in self._snapshot_file_descriptors:
+            raise StoreConflictError()
+        self._assert_stage()
+        if self._stage_descriptor is None:
+            raise StoreConflictError()
+        descriptor: int | None = None
+        try:
+            if os.name == "posix":
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
+                    dir_fd=self._stage_descriptor,
+                )
+            else:
+                descriptor = _win_open_relative(
+                    self._stage_descriptor,
+                    name,
+                    create=False,
+                    directory=False,
+                )
+                if descriptor is None:
+                    raise StoreConflictError()
+            status = os.fstat(descriptor)
+            if not stat.S_ISREG(status.st_mode) or _object_identity(status) != identity:
+                raise StoreConflictError()
+            self._snapshot_file_descriptors[name] = descriptor
+            descriptor = None
+        except StoreConflictError:
+            raise
+        except OSError as exc:
+            raise StoreConflictError() from exc
+        finally:
+            _close_descriptor(descriptor)
+
+    def release_snapshot_file_locks(self) -> None:
+        while self._snapshot_file_descriptors:
+            _close_descriptor(self._snapshot_file_descriptors.popitem()[1])
+
+    def _capture_regular_file(
+        self, name: str, *, optional: bool
+    ) -> tuple[int, int, int] | None:
+        if not name or "/" in name or "\\" in name:
+            raise StoreConflictError()
+        self._assert_stage()
+        if self._stage_descriptor is None:
+            raise StoreConflictError()
+        descriptor: int | None = None
+        try:
+            if os.name == "posix":
+                try:
+                    status = os.stat(
+                        name,
+                        dir_fd=self._stage_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    if optional:
+                        return None
+                    raise StoreConflictError() from None
+                if not stat.S_ISREG(status.st_mode):
+                    raise StoreConflictError()
+                identity = _object_identity(status)
+            else:
+                descriptor = _win_open_relative(
+                    self._stage_descriptor,
+                    name,
+                    create=False,
+                    directory=False,
+                    optional=optional,
+                )
+                if descriptor is None:
+                    return None
+                status = os.fstat(descriptor)
+                if not stat.S_ISREG(status.st_mode):
+                    raise StoreConflictError()
+                identity = _object_identity(status)
+            self._files[name] = identity
+            return identity
+        except StoreConflictError:
+            raise
+        except OSError as exc:
+            raise StoreConflictError() from exc
+        finally:
+            _close_descriptor(descriptor)
+
+    def capture_sqlite_snapshot_files(self) -> None:
+        """Record only the fixed SQLite sidecars that this snapshot may create."""
+
+        for name in _SQLITE_SNAPSHOT_FILENAMES:
+            self._capture_regular_file(name, optional=True)
+
+    def assert_ready_for_sqlite(self) -> None:
+        """Reassert pathname and retained-capability identities before SQLite opens."""
+
+        self._assert_stage()
+        for name, descriptor in self._snapshot_file_descriptors.items():
+            expected = self._files.get(name)
+            if expected is None or self._descriptor_identity(descriptor) != expected:
+                raise StoreConflictError()
+
+    def _cleanup_stage_posix(self) -> bool:
+        if (
+            self._stage_descriptor is None
+            or self._scratch_descriptor is None
+            or self._stage_name is None
+            or self.stage_identity is None
+        ):
+            return False
+        try:
+            if self._descriptor_identity(self._stage_descriptor) != self.stage_identity:
+                return False
+            for name, identity in self._files.items():
+                value = os.stat(
+                    name, dir_fd=self._stage_descriptor, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(value.st_mode)
+                    or _object_identity(value) != identity
+                ):
+                    return False
+                os.unlink(name, dir_fd=self._stage_descriptor)
+            named_stage = os.stat(
+                self._stage_name,
+                dir_fd=self._scratch_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(named_stage.st_mode)
+                or _object_identity(named_stage) != self.stage_identity
+            ):
+                return False
+            os.rmdir(self._stage_name, dir_fd=self._scratch_descriptor)
+        except OSError:
+            return False
+        _close_descriptor(self._stage_descriptor)
+        self._stage_descriptor = None
+        self.stage = None
+        self.stage_identity = None
+        self._stage_name = None
+        return True
+
+    def _cleanup_stage_windows(self) -> bool:
+        if self._stage_descriptor is None or self.stage_identity is None:
+            return False
+        try:
+            if self._descriptor_identity(self._stage_descriptor) != self.stage_identity:
+                return False
+            for name, identity in self._files.items():
+                descriptor = _win_open_relative(
+                    self._stage_descriptor,
+                    name,
+                    create=False,
+                    directory=False,
+                    delete=True,
+                )
+                if descriptor is None:
+                    return False
+                try:
+                    status = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(status.st_mode)
+                        or _object_identity(status) != identity
+                    ):
+                        return False
+                    _win_mark_descriptor_for_delete(descriptor)
+                finally:
+                    _close_descriptor(descriptor)
+            _win_mark_descriptor_for_delete(self._stage_descriptor)
+        except (OSError, StoreConflictError):
+            return False
+        _close_descriptor(self._stage_descriptor)
+        self._stage_descriptor = None
+        self.stage = None
+        self.stage_identity = None
+        self._stage_name = None
+        return True
+
+    def _cleanup_owned_scratch_posix(self) -> bool:
+        if (
+            self._scratch_descriptor is None
+            or self._anchor_descriptor is None
+            or self._scratch_name is None
+            or self.scratch_identity is None
+        ):
+            return False
+        try:
+            if (
+                self._descriptor_identity(self._scratch_descriptor)
+                != self.scratch_identity
+            ):
+                return False
+            named_scratch = os.stat(
+                self._scratch_name,
+                dir_fd=self._anchor_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(named_scratch.st_mode)
+                or _object_identity(named_scratch) != self.scratch_identity
+            ):
+                return False
+            os.rmdir(self._scratch_name, dir_fd=self._anchor_descriptor)
+        except OSError:
+            return False
+        _close_descriptor(self._scratch_descriptor)
+        self._scratch_descriptor = None
+        self.scratch = None
+        self.scratch_identity = None
+        self._scratch_name = None
+        return True
+
+    def _cleanup_owned_scratch_windows(self) -> bool:
+        if self._scratch_descriptor is None or self.scratch_identity is None:
+            return False
+        try:
+            if (
+                self._descriptor_identity(self._scratch_descriptor)
+                != self.scratch_identity
+            ):
+                return False
+            _win_mark_descriptor_for_delete(self._scratch_descriptor)
+        except (OSError, StoreConflictError):
+            return False
+        _close_descriptor(self._scratch_descriptor)
+        self._scratch_descriptor = None
+        self.scratch = None
+        self.scratch_identity = None
+        self._scratch_name = None
+        return True
+
+    def cleanup(self) -> None:
+        """Clean normal owned objects through retained directory capabilities only."""
+
+        if self._stage_descriptor is not None:
+            if os.name == "posix":
+                if not self._cleanup_stage_posix():
+                    return
+            elif os.name == "nt":
+                if not self._cleanup_stage_windows():
+                    return
+            else:
+                return
+        if self._owns_scratch and self._scratch_descriptor is not None:
+            if os.name == "posix":
+                self._cleanup_owned_scratch_posix()
+            elif os.name == "nt":
+                self._cleanup_owned_scratch_windows()
+
+    def close(self) -> None:
+        self.release_snapshot_file_locks()
+        _close_descriptor(self._stage_descriptor)
+        self._stage_descriptor = None
+        if self._owns_scratch and not self._scratch_is_anchor:
+            _close_descriptor(self._scratch_descriptor)
+        self._scratch_descriptor = None
+        while self._chain_descriptors:
+            _close_descriptor(self._chain_descriptors.pop())
+        self._anchor_descriptor = None
+
+
+def _create_readonly_directory(
+    lease: _ReadonlyScratchLease,
+    prefix: str,
+    *,
+    owned_scratch: bool,
+) -> Path:
+    """Create one random private scratch directory beneath a retained lease."""
+
+    return lease.create_directory(prefix, owned_scratch=owned_scratch)
+
+
+class _SnapshotDestination:
+    def __init__(self, lease: _ReadonlyScratchLease, name: str) -> None:
+        self.lease = lease
+        self.name = name
+
+
 def _copy_snapshot_file(
-    source: Path, destination: Path
+    source: Path, destination: _SnapshotDestination
 ) -> tuple[int, int, int, int, int]:
-    """Copy one stable no-follow source file into an exclusive scratch path."""
+    """Copy a stable source into a capability-relative exclusive scratch file."""
 
     before = _safe_regular_identity(source)
     if before is None:
         raise StoreConflictError()
     source_descriptor: int | None = None
     destination_descriptor: int | None = None
+    destination_identity: tuple[int, int, int] | None = None
     try:
         source_descriptor = os.open(
             source,
@@ -250,11 +1096,7 @@ def _copy_snapshot_file(
         opened = os.fstat(source_descriptor)
         if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != before:
             raise StoreConflictError()
-        destination_descriptor = os.open(
-            destination,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-            0o600,
-        )
+        destination_descriptor = destination.lease.create_file(destination.name)
         while True:
             chunk = os.read(source_descriptor, 65_536)
             if not chunk:
@@ -267,118 +1109,25 @@ def _copy_snapshot_file(
                 offset += written
         if _file_identity(os.fstat(source_descriptor)) != before:
             raise StoreConflictError()
+        destination_status = os.fstat(destination_descriptor)
+        if not stat.S_ISREG(destination_status.st_mode):
+            raise StoreConflictError()
+        destination_identity = _object_identity(destination_status)
         os.fsync(destination_descriptor)
     except StoreConflictError:
         raise
     except OSError as exc:
         raise StoreConflictError() from exc
     finally:
-        if destination_descriptor is not None:
-            try:
-                os.close(destination_descriptor)
-            except OSError:
-                pass
-        if source_descriptor is not None:
-            try:
-                os.close(source_descriptor)
-            except OSError:
-                pass
+        _close_descriptor(destination_descriptor)
+        _close_descriptor(source_descriptor)
+    if destination_identity is None:
+        raise StoreConflictError()
+    destination.lease.record_file(destination.name, destination_identity)
+    destination.lease.retain_snapshot_file(destination.name, destination_identity)
     if _safe_regular_identity(source) != before:
         raise StoreConflictError()
     return before
-
-
-def _capture_snapshot_files(
-    stage: Path,
-) -> tuple[tuple[Path, tuple[int, int, int]], ...]:
-    """Capture only the direct regular files that SQLite may later clean up."""
-
-    _assert_safe_existing_path(stage)
-    try:
-        stage_status = stage.lstat()
-        if _unsafe_file_status(stage, stage_status) or not stat.S_ISDIR(
-            stage_status.st_mode
-        ):
-            raise StoreConflictError()
-        records: list[tuple[Path, tuple[int, int, int]]] = []
-        for child in stage.iterdir():
-            value = child.lstat()
-            if _unsafe_file_status(child, value) or not stat.S_ISREG(value.st_mode):
-                raise StoreConflictError()
-            records.append((child, _object_identity(value)))
-        return tuple(records)
-    except StoreConflictError:
-        raise
-    except OSError as exc:
-        raise StoreConflictError() from exc
-
-
-def _cleanup_readonly_snapshot(
-    stage: Path | None,
-    scratch: Path | None,
-    scratch_identity: tuple[int, int, int] | None,
-    stage_identity: tuple[int, int, int] | None,
-    files: tuple[tuple[Path, tuple[int, int, int]], ...],
-) -> None:
-    """Remove only a still-proven private snapshot; never recurse blindly."""
-
-    if (
-        stage is None
-        or scratch is None
-        or scratch_identity is None
-        or stage_identity is None
-        or stage.parent != scratch
-    ):
-        return
-    try:
-        _assert_safe_existing_path(scratch)
-        scratch_status = scratch.lstat()
-        stage_status = stage.lstat()
-        if (
-            _unsafe_file_status(scratch, scratch_status)
-            or _unsafe_file_status(stage, stage_status)
-            or not stat.S_ISDIR(scratch_status.st_mode)
-            or not stat.S_ISDIR(stage_status.st_mode)
-            or _object_identity(scratch_status) != scratch_identity
-            or _object_identity(stage_status) != stage_identity
-        ):
-            return
-        for path, identity in files:
-            try:
-                value = path.lstat()
-            except FileNotFoundError:
-                continue
-            if (
-                _unsafe_file_status(path, value)
-                or not stat.S_ISREG(value.st_mode)
-                or _object_identity(value) != identity
-            ):
-                continue
-            path.unlink()
-        stage.rmdir()
-    except (OSError, StoreConflictError):
-        return
-
-
-def _cleanup_owned_scratch(
-    scratch: Path, scratch_identity: tuple[int, int, int] | None
-) -> None:
-    """Remove only the empty private scratch root created for this reader."""
-
-    if scratch_identity is None:
-        return
-    try:
-        _assert_safe_existing_path(scratch)
-        value = scratch.lstat()
-        if (
-            _unsafe_file_status(scratch, value)
-            or not stat.S_ISDIR(value.st_mode)
-            or _object_identity(value) != scratch_identity
-        ):
-            return
-        scratch.rmdir()
-    except (OSError, StoreConflictError):
-        return
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -460,13 +1209,8 @@ class AtlasStore:
 
         database = _lexical_absolute(database_path)
         cas = _lexical_absolute(cas_root)
-        owned_scratch: Path | None = None
-        scratch: Path | None = None
         connection: sqlite3.Connection | None = None
-        stage: Path | None = None
-        scratch_identity: tuple[int, int, int] | None = None
-        stage_identity: tuple[int, int, int] | None = None
-        snapshot_files: tuple[tuple[Path, tuple[int, int, int]], ...] = ()
+        lease: _ReadonlyScratchLease | None = None
         try:
             database_chain = _capture_safe_path_chain(database, require_regular=True)
             _assert_safe_existing_path(cas)
@@ -480,61 +1224,41 @@ class AtlasStore:
                     if configured_temp
                     else _lexical_absolute(tempfile.gettempdir())
                 )
-                scratch_parent_chain = _capture_safe_path_chain(scratch_parent)
-                scratch_parent_status = scratch_parent.lstat()
-                if (
-                    _unsafe_file_status(scratch_parent, scratch_parent_status)
-                    or not stat.S_ISDIR(scratch_parent_status.st_mode)
-                    or _paths_overlap(scratch_parent, database.parent)
-                    or _paths_overlap(scratch_parent, cas)
-                ):
-                    raise StoreConflictError()
-                _assert_path_chain_unchanged(database_chain)
-                _assert_cas_directory_identities(cas_directory_identities)
-                _assert_path_chain_unchanged(scratch_parent_chain)
-                owned_scratch = _lexical_absolute(
-                    Path(
-                        tempfile.mkdtemp(
-                            prefix=".code-atlas-readonly-root-", dir=scratch_parent
-                        )
-                    )
-                )
-                scratch = owned_scratch
+                owns_scratch = True
             else:
-                scratch = _lexical_absolute(scratch_root)
-            if scratch is None:
-                raise StoreConflictError()
-            _assert_safe_existing_path(scratch)
-            if not stat.S_ISDIR(scratch.lstat().st_mode):
-                raise StoreConflictError()
-            if _paths_overlap(scratch, database.parent) or _paths_overlap(scratch, cas):
-                raise StoreConflictError()
-            scratch_status = scratch.lstat()
-            if _unsafe_file_status(scratch, scratch_status):
-                raise StoreConflictError()
-            scratch_identity = _object_identity(scratch_status)
-            source_state = _snapshot_source_state(database)
-            stage = Path(tempfile.mkdtemp(prefix=".code-atlas-readonly-", dir=scratch))
-            stage_status = stage.lstat()
-            if _unsafe_file_status(stage, stage_status) or not stat.S_ISDIR(
-                stage_status.st_mode
+                scratch_parent = _lexical_absolute(scratch_root)
+                owns_scratch = False
+            if _paths_overlap(scratch_parent, database.parent) or _paths_overlap(
+                scratch_parent, cas
             ):
                 raise StoreConflictError()
-            stage_identity = _object_identity(stage_status)
-            if _object_identity(scratch.lstat()) != scratch_identity:
+            _assert_path_chain_unchanged(database_chain)
+            _assert_cas_directory_identities(cas_directory_identities)
+            lease = _ReadonlyScratchLease(scratch_parent, owns_scratch=owns_scratch)
+            if owns_scratch:
+                scratch = _create_readonly_directory(
+                    lease, _READONLY_ROOT_PREFIX, owned_scratch=True
+                )
+            else:
+                scratch = lease.scratch
+            if scratch is None:
                 raise StoreConflictError()
+            source_state = _snapshot_source_state(database)
+            stage = _create_readonly_directory(
+                lease, _READONLY_STAGE_PREFIX, owned_scratch=False
+            )
             snapshot_database = stage / "code-atlas.sqlite3"
-            _copy_snapshot_file(database, snapshot_database)
+            _copy_snapshot_file(
+                database, _SnapshotDestination(lease, "code-atlas.sqlite3")
+            )
             if source_state[1] is not None:
                 _copy_snapshot_file(
                     Path(str(database) + "-wal"),
-                    Path(str(snapshot_database) + "-wal"),
+                    _SnapshotDestination(lease, "code-atlas.sqlite3-wal"),
                 )
             if _snapshot_source_state(database) != source_state:
                 raise StoreConflictError()
-            _assert_safe_existing_path(stage)
-            if _object_identity(stage.lstat()) != stage_identity:
-                raise StoreConflictError()
+            lease.assert_ready_for_sqlite()
             uri = _lexical_absolute(snapshot_database).as_uri() + "?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=30.0)
             connection.execute("PRAGMA query_only=ON")
@@ -547,20 +1271,15 @@ class AtlasStore:
                 raise StoreConflictError()
             _assert_path_chain_unchanged(database_chain)
             _assert_cas_directory_identities(cas_directory_identities)
-            snapshot_files = _capture_snapshot_files(stage)
+            lease.capture_sqlite_snapshot_files()
+            lease.assert_ready_for_sqlite()
             instance = cls.__new__(cls)
             instance._database_path = snapshot_database
             instance._cas_root = cas
             instance._cas_directory_identities = cas_directory_identities
             instance._conn = connection
-            instance._readonly_snapshot = (
-                stage,
-                scratch,
-                scratch_identity,
-                stage_identity,
-                snapshot_files,
-            )
-            instance._readonly_owned_scratch = owned_scratch
+            instance._readonly_scratch_lease = lease
+            lease = None
             return instance
         except Exception as exc:
             if connection is not None:
@@ -568,20 +1287,10 @@ class AtlasStore:
                     connection.close()
                 except sqlite3.Error:
                     pass
-            if stage is not None:
-                try:
-                    snapshot_files = _capture_snapshot_files(stage)
-                except StoreConflictError:
-                    pass
-            _cleanup_readonly_snapshot(
-                stage,
-                scratch,
-                scratch_identity,
-                stage_identity,
-                snapshot_files,
-            )
-            if owned_scratch is not None:
-                _cleanup_owned_scratch(owned_scratch, scratch_identity)
+            if lease is not None:
+                lease.release_snapshot_file_locks()
+                lease.cleanup()
+                lease.close()
             if isinstance(exc, StoreConflictError):
                 raise
             raise StoreConflictError() from exc
@@ -614,12 +1323,14 @@ class AtlasStore:
         try:
             self._conn.close()
         finally:
-            snapshot = getattr(self, "_readonly_snapshot", None)
-            if snapshot is not None:
-                _cleanup_readonly_snapshot(*snapshot)
-            owned_scratch = getattr(self, "_readonly_owned_scratch", None)
-            if owned_scratch is not None:
-                _cleanup_owned_scratch(owned_scratch, snapshot[2])
+            lease = getattr(self, "_readonly_scratch_lease", None)
+            if lease is not None:
+                try:
+                    lease.release_snapshot_file_locks()
+                    lease.cleanup()
+                finally:
+                    lease.close()
+                self._readonly_scratch_lease = None
 
     def schema_version(self) -> int:
         return int(

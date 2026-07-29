@@ -6,6 +6,7 @@ import hashlib
 import os
 import sqlite3
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -779,6 +780,111 @@ def test_open_readonly_two_path_api_rejects_unsafe_or_missing_default_scratch_pa
     )
     assert not tuple(durable.rglob(".code-atlas-readonly-root-*"))
     assert unsafe_temp != "missing" or not configured_temp.exists()
+
+
+@pytest.mark.parametrize("use_default_scratch", (True, False))
+def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_default_scratch: bool,
+) -> None:
+    """A scratch parent swap must not redirect even the first private write."""
+
+    durable = tmp_path / "durable"
+    scratch_parent = tmp_path / "scratch-parent"
+    parked = tmp_path / "parked-scratch-parent"
+    durable.mkdir()
+    scratch_parent.mkdir()
+    database = durable / "code-atlas.sqlite3"
+    cas_root = durable / "code-atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    before_files = _durable_file_state(durable)
+    before_entries = tuple(
+        sorted(path.relative_to(durable).as_posix() for path in durable.rglob("*"))
+    )
+    state = {
+        "attempted": False,
+        "blocked": False,
+        "capability_create_called": False,
+        "swapped": False,
+        "unsafe_mkdtemp": False,
+    }
+
+    def swap_parent_once() -> None:
+        if state["attempted"]:
+            return
+        state["attempted"] = True
+        moved_parent = False
+        try:
+            os.replace(scratch_parent, parked)
+            moved_parent = True
+            os.replace(durable, scratch_parent)
+            state["swapped"] = True
+        except OSError:
+            state["blocked"] = True
+            if moved_parent and parked.exists() and not scratch_parent.exists():
+                os.replace(parked, scratch_parent)
+
+    original_mkdtemp = tempfile.mkdtemp
+
+    def swap_then_mkdtemp(*args: object, **kwargs: object) -> str:
+        directory = kwargs.get("dir")
+        if directory is not None and Path(os.fspath(directory)) == scratch_parent:
+            swap_parent_once()
+            if state["swapped"]:
+                state["unsafe_mkdtemp"] = True
+        return original_mkdtemp(*args, **kwargs)
+
+    original_create = getattr(store_module, "_create_readonly_directory", None)
+
+    def swap_then_capability_create(*args: object, **kwargs: object) -> Path:
+        state["capability_create_called"] = True
+        swap_parent_once()
+        assert original_create is not None
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(store_module.tempfile, "mkdtemp", swap_then_mkdtemp)
+    monkeypatch.setattr(
+        store_module,
+        "_create_readonly_directory",
+        swap_then_capability_create,
+        raising=False,
+    )
+    if use_default_scratch:
+        monkeypatch.setenv("CODEX_TASK_TEMP", str(scratch_parent))
+
+    readonly: AtlasStore | None = None
+    try:
+        try:
+            readonly = AtlasStore.open_readonly(
+                database,
+                cas_root,
+                **({} if use_default_scratch else {"scratch_root": scratch_parent}),
+            )
+        except StoreConflictError:
+            pass
+        finally:
+            if readonly is not None:
+                readonly.close()
+    finally:
+        if state["swapped"]:
+            if scratch_parent.exists() and not durable.exists():
+                os.replace(scratch_parent, durable)
+            if parked.exists() and not scratch_parent.exists():
+                os.replace(parked, scratch_parent)
+
+    assert state["attempted"] is True
+    assert state["unsafe_mkdtemp"] is False
+    assert state["capability_create_called"] is True
+    assert _durable_file_state(durable) == before_files
+    assert (
+        tuple(
+            sorted(path.relative_to(durable).as_posix() for path in durable.rglob("*"))
+        )
+        == before_entries
+    )
+    assert not tuple(durable.rglob(".code-atlas-readonly-*"))
 
 
 def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:
