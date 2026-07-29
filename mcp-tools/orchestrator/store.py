@@ -251,6 +251,21 @@ class CodeTaskEvidenceBinding:
     evidence_binding_hash: str
 
 
+@dataclass(frozen=True)
+class CodeTaskReceiptAttestation:
+    """Producer-owned content address binding receipts to one code-task output."""
+
+    schema_version: str
+    workflow_id: str
+    code_task_id: str
+    code_task_version: int
+    input_snapshot_id: str
+    output_snapshot_id: str
+    workspace_hash: str
+    execution_receipt_ids: tuple[str, ...]
+    attestation_hash: str
+
+
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
@@ -267,8 +282,10 @@ class SQLiteStore:
     _MAX_CODE_TASK_ACCEPTANCE_LIST = 100
     _EVIDENCE_BINDING_SCHEMA_VERSION = "acceptance-evidence-binding/v1"
     _EVIDENCE_BINDING_EVENT_TYPE = "code_task_evidence_binding"
+    _RECEIPT_ATTESTATION_SCHEMA_VERSION = "code-task-receipt-attestation/v1"
     _HOST_TARGET_PATTERN = re.compile(r"/root(?:/[a-z0-9_]+)*\Z")
     _SAFE_ACCEPTANCE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+    _SHA256_IDENTIFIER_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
     _SAFE_OUTBOX_CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 
     def __init__(self, database: str | Path) -> None:
@@ -1130,10 +1147,7 @@ class SQLiteStore:
             """,
             (task_id, output_snapshot_id, self._MAX_CODE_TASK_EVIDENCE_ITEMS + 1),
         ).fetchall()
-        if (
-            not artifact_rows
-            or len(artifact_rows) > self._MAX_CODE_TASK_EVIDENCE_ITEMS
-        ):
+        if not artifact_rows or len(artifact_rows) > self._MAX_CODE_TASK_EVIDENCE_ITEMS:
             raise StrictIndexError("VERIFICATION_EVIDENCE_REQUIRED")
         return TaskAcceptanceEvidence(
             str(query_rows[0]["trace_id"]),
@@ -1528,20 +1542,30 @@ class SQLiteStore:
         now_utc = _utc_timestamp(now) if now is not None else _utc_now()
         with self._transaction() as cursor:
             self._require_current_lease(cursor, task_id, owner, epoch, now=now_utc)
-            workflow = cursor.execute(
+            task_context = cursor.execute(
                 """
-                SELECT workflows.state
+                SELECT
+                    workflows.state AS workflow_state,
+                    tasks.state AS task_state
                 FROM workflows JOIN tasks ON tasks.workflow_id = workflows.id
                 WHERE tasks.id = ?
                 """,
                 (task_id,),
             ).fetchone()
             if (
-                workflow is not None
-                and workflow["state"] == WorkflowState.CANCELLED.value
+                task_context is not None
+                and task_context["workflow_state"] == WorkflowState.CANCELLED.value
             ):
                 raise WorkflowCancelledError(
                     f"workflow is cancelled for task {task_id!r}"
+                )
+            if (
+                kind == "verification"
+                and task_context is not None
+                and task_context["task_state"] != TaskState.RUNNING.value
+            ):
+                raise InvalidTaskStateError(
+                    f"verification evidence requires a running task: {task_id!r}"
                 )
             artifact = cursor.execute(
                 "SELECT * FROM artifacts WHERE content_hash = ?", (content_hash,)
@@ -2115,6 +2139,42 @@ class SQLiteStore:
             _payload_hash(payload_json),
         )
 
+    @classmethod
+    def build_code_task_receipt_attestation(
+        cls,
+        *,
+        workflow_id: str,
+        code_task_id: str,
+        code_task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        workspace_hash: str,
+        execution_receipt_ids: tuple[str, ...],
+    ) -> CodeTaskReceiptAttestation:
+        """Recompute the producer-owned receipt attestation without persistence."""
+
+        payload = cls._code_task_receipt_attestation_payload(
+            workflow_id=workflow_id,
+            code_task_id=code_task_id,
+            code_task_version=code_task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            workspace_hash=workspace_hash,
+            execution_receipt_ids=execution_receipt_ids,
+        )
+        payload_json = _canonical_receipt_attestation_json(payload)
+        return CodeTaskReceiptAttestation(
+            str(payload["schema_version"]),
+            str(payload["workflow_id"]),
+            str(payload["code_task_id"]),
+            int(payload["code_task_version"]),
+            str(payload["input_snapshot_id"]),
+            str(payload["output_snapshot_id"]),
+            str(payload["workspace_hash"]),
+            tuple(payload["execution_receipt_ids"]),
+            _payload_hash(payload_json),
+        )
+
     def _insert_code_task_evidence_binding(
         self,
         cursor: sqlite3.Cursor,
@@ -2251,7 +2311,9 @@ class SQLiteStore:
                 execution_receipt_ids=tuple(payload["execution_receipt_ids"]),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise AcceptanceConflictError("code task evidence binding is corrupt") from error
+            raise AcceptanceConflictError(
+                "code task evidence binding is corrupt"
+            ) from error
         if str(row["payload_hash"]) != binding.evidence_binding_hash:
             raise AcceptanceConflictError("code task evidence binding hash is corrupt")
         return binding
@@ -2382,6 +2444,49 @@ class SQLiteStore:
                     "execution_receipt_ids", execution_receipt_ids
                 )
             ),
+        }
+
+    @classmethod
+    def _code_task_receipt_attestation_payload(
+        cls,
+        *,
+        workflow_id: str,
+        code_task_id: str,
+        code_task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        workspace_hash: str,
+        execution_receipt_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        if (
+            isinstance(code_task_version, bool)
+            or not isinstance(code_task_version, int)
+            or not 0 <= code_task_version <= 2**63 - 1
+        ):
+            raise ValueError("code_task_version must be a non-negative SQLite integer")
+        receipt_ids = cls._safe_evidence_identifier_list(
+            "execution_receipt_ids", execution_receipt_ids
+        )
+        return {
+            "schema_version": cls._RECEIPT_ATTESTATION_SCHEMA_VERSION,
+            "workflow_id": cls._safe_acceptance_identifier("workflow_id", workflow_id),
+            "code_task_id": cls._safe_acceptance_identifier(
+                "code_task_id", code_task_id
+            ),
+            "code_task_version": code_task_version,
+            "input_snapshot_id": cls._safe_acceptance_identifier(
+                "input_snapshot_id", input_snapshot_id
+            ),
+            "output_snapshot_id": cls._safe_acceptance_identifier(
+                "output_snapshot_id", output_snapshot_id
+            ),
+            "workspace_hash": cls._safe_sha256_identifier(
+                "workspace_hash", workspace_hash
+            ),
+            "execution_receipt_ids": [
+                cls._safe_sha256_identifier("execution_receipt_ids", receipt_id)
+                for receipt_id in receipt_ids
+            ],
         }
 
     @classmethod
@@ -2527,6 +2632,13 @@ class SQLiteStore:
             or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(value) is None
         ):
             raise ValueError(f"{field_name} must be a bounded opaque identifier")
+        return value
+
+    @classmethod
+    def _safe_sha256_identifier(cls, field_name: str, value: str) -> str:
+        cls._safe_acceptance_identifier(field_name, value)
+        if cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"{field_name} must be a canonical sha256 identifier")
         return value
 
     @classmethod
@@ -3157,7 +3269,16 @@ def _canonical_payload_json(payload: Mapping[str, object]) -> str:
 
 def _canonical_evidence_binding_json(payload: Mapping[str, object]) -> str:
     """Encode the ATLAS-10D binding with its independently frozen contract."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def _canonical_receipt_attestation_json(payload: Mapping[str, object]) -> str:
+    """Encode the producer receipt attestation with its frozen contract."""
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
 
 
 def _payload_hash(payload_json: str) -> str:

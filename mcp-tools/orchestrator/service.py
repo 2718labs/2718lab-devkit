@@ -319,7 +319,9 @@ class OrchestratorService:
         )
         binding = self._call(self._store.get_index_binding, code_task_id)
         if binding is None:
-            raise ServiceError("INDEX_UNAVAILABLE", "code task has no strict index binding")
+            raise ServiceError(
+                "INDEX_UNAVAILABLE", "code task has no strict index binding"
+            )
         if binding.output_snapshot_id != expected_output_snapshot_id:
             raise ServiceError(
                 "ACCEPTANCE_CONFLICT", "code task output snapshot is not current"
@@ -338,10 +340,22 @@ class OrchestratorService:
         self._validate_output_query_evidence(
             task_evidence.output_query_trace_id, binding.output_snapshot_id
         )
-        self._validate_verification_artifacts(
-            task, task_evidence.verification_artifact_hashes
+        workspace_hash = self._validate_receipt_evidence(receipt_ids)
+        receipt_attestation = self._call(
+            self._store.build_code_task_receipt_attestation,
+            workflow_id=workflow_id,
+            code_task_id=code_task_id,
+            code_task_version=task.version,
+            input_snapshot_id=binding.input_snapshot_id,
+            output_snapshot_id=binding.output_snapshot_id,
+            workspace_hash=workspace_hash,
+            execution_receipt_ids=receipt_ids,
         )
-        self._validate_receipt_evidence(receipt_ids)
+        self._validate_verification_artifacts(
+            task,
+            task_evidence.verification_artifact_hashes,
+            receipt_attestation_hash=receipt_attestation.attestation_hash,
+        )
         evidence_binding = self._call(
             self._store.build_code_task_evidence_binding,
             workflow_id=workflow_id,
@@ -857,13 +871,17 @@ class OrchestratorService:
         expected_version: int,
     ) -> None:
         if task.workflow_id != workflow_id or task.task_kind is not TaskKind.CODE:
-            raise ServiceError("ACCEPTANCE_FORBIDDEN", "task is not an accepted code task")
+            raise ServiceError(
+                "ACCEPTANCE_FORBIDDEN", "task is not an accepted code task"
+            )
         if task.version != expected_version:
             raise ServiceError("VERSION_CONFLICT", "code task version is not current")
         if task.state is not TaskState.DONE:
             raise ServiceError("INVALID_STATE", "code task is not complete")
         if not task.write_scope or not task.intent_id or not task.language:
-            raise ServiceError("ACCEPTANCE_FORBIDDEN", "code task metadata is incomplete")
+            raise ServiceError(
+                "ACCEPTANCE_FORBIDDEN", "code task metadata is incomplete"
+            )
 
     def _validate_current_index_evidence(self, task: Task, binding: Any) -> None:
         if (
@@ -871,12 +889,16 @@ class OrchestratorService:
             or not binding.output_snapshot_id
             or not binding.indexed_diff_hash
         ):
-            raise ServiceError("INDEXED_DIFF_REQUIRED", "strict output evidence is missing")
+            raise ServiceError(
+                "INDEXED_DIFF_REQUIRED", "strict output evidence is missing"
+            )
         self._assert_index_current(
             Path(binding.workspace_root), binding.output_snapshot_id, task.write_scope
         )
         if self._index_service is None:
-            raise ServiceError("INDEX_UNAVAILABLE", "project index service is unavailable")
+            raise ServiceError(
+                "INDEX_UNAVAILABLE", "project index service is unavailable"
+            )
         try:
             indexed_diff = self._index_service.diff(
                 binding.input_snapshot_id, binding.output_snapshot_id
@@ -920,7 +942,9 @@ class OrchestratorService:
         self, trace_id: str, output_snapshot_id: str
     ) -> None:
         if self._index_service is None:
-            raise ServiceError("INDEX_UNAVAILABLE", "project index service is unavailable")
+            raise ServiceError(
+                "INDEX_UNAVAILABLE", "project index service is unavailable"
+            )
         try:
             receipt = self._index_service.get_query_receipt(trace_id)
         except Exception as error:
@@ -929,13 +953,21 @@ class OrchestratorService:
             raise ServiceError("SNAPSHOT_MISMATCH", "output query is not current")
 
     def _validate_verification_artifacts(
-        self, task: Task, artifact_hashes: tuple[str, ...]
+        self,
+        task: Task,
+        artifact_hashes: tuple[str, ...],
+        *,
+        receipt_attestation_hash: str,
     ) -> None:
         if not task.result_hash:
             raise ServiceError("EVIDENCE_INCOMPLETE", "task output evidence is missing")
         if task.result_hash not in artifact_hashes:
             raise ServiceError(
                 "EVIDENCE_INCOMPLETE", "task output evidence is not verified"
+            )
+        if receipt_attestation_hash not in artifact_hashes:
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE", "execution receipt attestation is unavailable"
             )
         for artifact_hash in artifact_hashes:
             artifact = self._call(self._store.get_artifact, artifact_hash)
@@ -944,9 +976,11 @@ class OrchestratorService:
                     "EVIDENCE_INCOMPLETE", "verification evidence is unavailable"
                 )
 
-    def _validate_receipt_evidence(self, receipt_ids: tuple[str, ...]) -> None:
+    def _validate_receipt_evidence(self, receipt_ids: tuple[str, ...]) -> str:
         if self._receipt_repository is None:
-            raise ServiceError("EVIDENCE_INCOMPLETE", "receipt repository is unavailable")
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE", "receipt repository is unavailable"
+            )
         receipts: list[Any] = []
         unreadable = False
         for receipt_id in receipt_ids:
@@ -955,11 +989,16 @@ class OrchestratorService:
             except Exception:
                 unreadable = True
         if unreadable or len(receipts) != len(receipt_ids):
-            raise ServiceError("EVIDENCE_INCOMPLETE", "execution receipt is unavailable")
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE", "execution receipt is unavailable"
+            )
         workspace_hashes: set[str] = set()
         for receipt in receipts:
             workspace_hash = getattr(receipt, "workspace_hash", None)
-            if not isinstance(workspace_hash, str) or not workspace_hash:
+            if (
+                not isinstance(workspace_hash, str)
+                or self._SAFE_RECEIPT_IDENTIFIER.fullmatch(workspace_hash) is None
+            ):
                 raise ServiceError(
                     "EVIDENCE_INCOMPLETE", "execution workspace is unavailable"
                 )
@@ -971,10 +1010,19 @@ class OrchestratorService:
                 or getattr(receipt, "exit_code", None) != 0
                 for receipt in receipts
             )
-            or not any(getattr(receipt, "canonical_tool", None) == "patch" for receipt in receipts)
-            or not any(getattr(receipt, "canonical_tool", None) == "shell" for receipt in receipts)
+            or not any(
+                getattr(receipt, "canonical_tool", None) == "patch"
+                for receipt in receipts
+            )
+            or not any(
+                getattr(receipt, "canonical_tool", None) == "shell"
+                for receipt in receipts
+            )
         ):
-            raise ServiceError("EVIDENCE_INCOMPLETE", "execution evidence is incomplete")
+            raise ServiceError(
+                "EVIDENCE_INCOMPLETE", "execution evidence is incomplete"
+            )
+        return next(iter(workspace_hashes))
 
     def _validate_acceptance_request(
         self,
@@ -1040,7 +1088,9 @@ class OrchestratorService:
         try:
             parsed = datetime.fromisoformat(now.replace("Z", "+00:00"))
         except ValueError as error:
-            raise ServiceError("INVALID_REQUEST", "acceptance time is invalid") from error
+            raise ServiceError(
+                "INVALID_REQUEST", "acceptance time is invalid"
+            ) from error
         if parsed.tzinfo is None:
             raise ServiceError("INVALID_REQUEST", "acceptance time is invalid")
         return parsed.astimezone(UTC).isoformat()

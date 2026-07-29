@@ -384,9 +384,7 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
             accepted_task.version if task_version is None else task_version
         )
         accepted_coordinator_owner = (
-            self.coordinator_owner
-            if coordinator_owner is None
-            else coordinator_owner
+            self.coordinator_owner if coordinator_owner is None else coordinator_owner
         )
         accepted_coordinator_epoch = (
             self.coordinator_lease.epoch
@@ -402,9 +400,7 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
         accepted_indexed_diff_hash = (
             stored_diff if indexed_diff_hash is None else indexed_diff_hash
         )
-        accepted_intent_id = (
-            accepted_task.intent_id if intent_id is None else intent_id
-        )
+        accepted_intent_id = accepted_task.intent_id if intent_id is None else intent_id
         evidence_binding = self.store.build_code_task_evidence_binding(
             workflow_id=accepted_workflow_id,
             task_id=accepted_task.id,

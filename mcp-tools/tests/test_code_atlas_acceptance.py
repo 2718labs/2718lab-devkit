@@ -47,9 +47,18 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         self.root = Path(self._temporary_directory.name)
         self.repository = self.root / "repository"
         self.workspace = self.root / "workspace"
-        subprocess.run(["git", "init", str(self.repository)], check=True, capture_output=True)
         subprocess.run(
-            ["git", "-C", str(self.repository), "config", "user.name", "acceptance test"],
+            ["git", "init", str(self.repository)], check=True, capture_output=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repository),
+                "config",
+                "user.name",
+                "acceptance test",
+            ],
             check=True,
             capture_output=True,
         )
@@ -79,7 +88,16 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             capture_output=True,
         )
         subprocess.run(
-            ["git", "-C", str(self.repository), "worktree", "add", "--detach", str(self.workspace), "HEAD"],
+            [
+                "git",
+                "-C",
+                str(self.repository),
+                "worktree",
+                "add",
+                "--detach",
+                str(self.workspace),
+                "HEAD",
+            ],
             check=True,
             capture_output=True,
         )
@@ -210,6 +228,23 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         )
 
         self.execution_receipts = self._capture_receipts()
+        receipt_ids = tuple(
+            sorted(receipt.receipt_id for receipt in self.execution_receipts)
+        )
+        workspace_hashes = {
+            receipt.workspace_hash for receipt in self.execution_receipts
+        }
+        self.assertEqual(1, len(workspace_hashes))
+        expected_completed_version = self.running_task.version + 1
+        self.receipt_attestation = SQLiteStore.build_code_task_receipt_attestation(
+            workflow_id="workflow",
+            code_task_id="code-task",
+            code_task_version=expected_completed_version,
+            input_snapshot_id=self.input_snapshot.snapshot_id,
+            output_snapshot_id=self.output_snapshot.snapshot_id,
+            workspace_hash=next(iter(workspace_hashes)),
+            execution_receipt_ids=receipt_ids,
+        )
         self.verification_hash = "sha256:" + "a" * 64
         self.service.register_artifact(
             "workflow",
@@ -224,6 +259,19 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             snapshot_id=self.output_snapshot.snapshot_id,
             now=self._NOW,
         )
+        self.service.register_artifact(
+            "workflow",
+            "code-task",
+            owner="worker-owner",
+            epoch=self.worker_lease.epoch,
+            kind="verification",
+            content_hash=self.receipt_attestation.attestation_hash,
+            safe_path="evidence/receipt-attestation.json",
+            size=0,
+            redaction_version="r1",
+            snapshot_id=self.output_snapshot.snapshot_id,
+            now=self._NOW,
+        )
         self.completed_task = self.service.complete_task(
             "code-task",
             expected_version=self.running_task.version,
@@ -232,6 +280,7 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             result_hash=self.verification_hash,
             now=self._NOW,
         )
+        self.assertEqual(expected_completed_version, self.completed_task.version)
 
     def _capture_receipts(
         self,
@@ -337,10 +386,19 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             self.completed_task.result_hash,
             tuple(receipt.output_hash for receipt in self.execution_receipts),
         )
+        producer_evidence = self.store.task_acceptance_evidence(
+            "code-task", self.output_snapshot.snapshot_id
+        )
+        self.assertIn(
+            self.receipt_attestation.attestation_hash,
+            producer_evidence.verification_artifact_hashes,
+        )
         acceptance, outbox = self._accept()
 
         self.assertEqual("code-task", acceptance.code_task_id)
-        self.assertEqual(self.output_snapshot.snapshot_id, acceptance.output_snapshot_id)
+        self.assertEqual(
+            self.output_snapshot.snapshot_id, acceptance.output_snapshot_id
+        )
         self.assertEqual(AtlasOutboxState.PENDING, outbox.state)
         self.assertEqual(acceptance, self.store.acceptance_for_task("code-task"))
         binding = self.store.evidence_binding_for_acceptance(acceptance.acceptance_id)
@@ -351,9 +409,59 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             tuple(sorted(receipt.receipt_id for receipt in self.execution_receipts)),
             binding.execution_receipt_ids,
         )
+        self.assertIn(
+            self.receipt_attestation.attestation_hash,
+            binding.verification_artifact_hashes,
+        )
         self.assertEqual(
             binding, self.store.evidence_binding_for_ingestion(outbox.ingestion_key)
         )
+
+    def test_receipt_attestation_hash_binds_every_task_evidence_dimension(self) -> None:
+        arguments: dict[str, object] = {
+            "workflow_id": "workflow",
+            "code_task_id": "code-task",
+            "code_task_version": 3,
+            "input_snapshot_id": "input-snapshot",
+            "output_snapshot_id": "output-snapshot",
+            "workspace_hash": "sha256:" + "c" * 64,
+            "execution_receipt_ids": (
+                "sha256:" + "e" * 64,
+                "sha256:" + "f" * 64,
+            ),
+        }
+        attestation = SQLiteStore.build_code_task_receipt_attestation(**arguments)
+
+        self.assertEqual("code-task-receipt-attestation/v1", attestation.schema_version)
+        self.assertEqual(
+            "sha256:5c84b593fa2b6ee9844ad7c825a94c23255438dbe655b7fc9db67cd11bfe27be",
+            attestation.attestation_hash,
+        )
+        self.assertEqual(
+            attestation, SQLiteStore.build_code_task_receipt_attestation(**arguments)
+        )
+        self.assertEqual(
+            arguments["execution_receipt_ids"], attestation.execution_receipt_ids
+        )
+        variations = {
+            "workflow_id": "other-workflow",
+            "code_task_id": "other-task",
+            "code_task_version": 4,
+            "input_snapshot_id": "other-input",
+            "output_snapshot_id": "other-output",
+            "workspace_hash": "sha256:" + "d" * 64,
+            "execution_receipt_ids": ("sha256:" + "e" * 64,),
+        }
+        for field_name, value in variations.items():
+            changed = dict(arguments)
+            changed[field_name] = value
+            with self.subTest(field_name=field_name):
+                self.assertNotEqual(
+                    attestation.attestation_hash,
+                    SQLiteStore.build_code_task_receipt_attestation(
+                        **changed
+                    ).attestation_hash,
+                )
 
     def test_evidence_binding_matches_frozen_golden_vector(self) -> None:
         binding = SQLiteStore.build_code_task_evidence_binding(
@@ -431,12 +539,14 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         self.assertIsNone(self.store.acceptance_for_task("code-task"))
         self.assertEqual((), self.store.pending_atlas_outbox(limit=10))
 
-    def test_duplicate_acceptance_is_idempotent_and_changed_receipts_conflict(
+    def test_duplicate_acceptance_is_idempotent_and_changed_receipts_are_rejected(
         self,
     ) -> None:
         accepted = self._accept()
         self.assertEqual(accepted, self._accept())
-        self.assertEqual(1, len(self.store.list_code_task_acceptances("workflow", limit=10)))
+        self.assertEqual(
+            1, len(self.store.list_code_task_acceptances("workflow", limit=10))
+        )
         self.assertEqual(1, len(self.store.pending_atlas_outbox(limit=10)))
 
         changed_receipts = self._capture_receipts(suffix="changed")
@@ -447,7 +557,7 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
                 ]
             )
 
-        self.assertEqual("ACCEPTANCE_CONFLICT", raised.exception.code)
+        self.assertEqual("EVIDENCE_INCOMPLETE", raised.exception.code)
         self.assertEqual(accepted, self._accept())
 
     def test_authorization_gates_require_a_live_same_workflow_coordinator(self) -> None:
@@ -506,6 +616,59 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
             "{}", encoding="utf-8"
         )
         self._assert_acceptance_rejected("EVIDENCE_INCOMPLETE")
+
+    def test_same_workspace_unrelated_receipts_without_attestation_are_rejected(
+        self,
+    ) -> None:
+        unrelated = self._capture_receipts(suffix="unrelated")
+        self.assertEqual(
+            {receipt.workspace_hash for receipt in self.execution_receipts},
+            {receipt.workspace_hash for receipt in unrelated},
+        )
+
+        self._assert_acceptance_rejected(
+            "EVIDENCE_INCOMPLETE",
+            execution_receipt_ids=[receipt.receipt_id for receipt in unrelated],
+        )
+
+    def test_done_task_cannot_append_attestation_for_unrelated_receipts(
+        self,
+    ) -> None:
+        unrelated = self._capture_receipts(suffix="post-completion")
+        workspace_hashes = {receipt.workspace_hash for receipt in unrelated}
+        self.assertEqual(1, len(workspace_hashes))
+        unrelated_attestation = SQLiteStore.build_code_task_receipt_attestation(
+            workflow_id="workflow",
+            code_task_id="code-task",
+            code_task_version=self.completed_task.version,
+            input_snapshot_id=self.input_snapshot.snapshot_id,
+            output_snapshot_id=self.output_snapshot.snapshot_id,
+            workspace_hash=next(iter(workspace_hashes)),
+            execution_receipt_ids=tuple(
+                sorted(receipt.receipt_id for receipt in unrelated)
+            ),
+        )
+
+        with self.assertRaises(ServiceError) as raised:
+            self.service.register_artifact(
+                "workflow",
+                "code-task",
+                owner="worker-owner",
+                epoch=self.worker_lease.epoch,
+                kind="verification",
+                content_hash=unrelated_attestation.attestation_hash,
+                safe_path="evidence/receipt-attestation.json",
+                size=0,
+                redaction_version="r1",
+                snapshot_id=self.output_snapshot.snapshot_id,
+                now=self._NOW,
+            )
+
+        self.assertEqual("INVALID_STATE", raised.exception.code)
+        self._assert_acceptance_rejected(
+            "EVIDENCE_INCOMPLETE",
+            execution_receipt_ids=[receipt.receipt_id for receipt in unrelated],
+        )
 
     def test_failed_cross_workspace_and_missing_tool_receipts_block_acceptance(
         self,
@@ -604,7 +767,9 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(0, event_count)
 
-    def test_binding_rehydrates_after_store_recovery_and_rechecks_duplicates(self) -> None:
+    def test_binding_rehydrates_after_store_recovery_and_rechecks_duplicates(
+        self,
+    ) -> None:
         acceptance, outbox = self._accept()
         expected_binding = self.store.evidence_binding_for_acceptance(
             acceptance.acceptance_id
@@ -614,7 +779,9 @@ class CodeTaskAcceptanceServiceTests(unittest.TestCase):
 
         reopened = SQLiteStore(self.root / "orchestrator.sqlite")
         self.addCleanup(reopened.close)
-        recovered_binding = reopened.evidence_binding_for_ingestion(outbox.ingestion_key)
+        recovered_binding = reopened.evidence_binding_for_ingestion(
+            outbox.ingestion_key
+        )
         self.assertEqual(expected_binding, recovered_binding)
         recovered_service = OrchestratorService(
             reopened,
