@@ -12,8 +12,11 @@ import re
 from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
+from hmac import compare_digest
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
+
+from code_atlas.receipts import RawExecutionReceipt, ReceiptRepository
 
 from .models import Task, TaskKind, TaskState, Workflow
 from .store import Artifact, Lease, SQLiteStore, StoreError
@@ -38,6 +41,14 @@ class OrchestratorService:
     _MAX_STATUS_CODE_ACCEPTANCES = 100
     _SAFE_ACCEPTANCE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
     _SAFE_RECEIPT_IDENTIFIER = re.compile(r"sha256:[0-9a-f]{64}\Z")
+    _RECEIPT_HASH_FIELDS = (
+        "session_id_hash",
+        "turn_id_hash",
+        "command_spec_hash",
+        "input_hash",
+        "output_hash",
+        "workspace_hash",
+    )
 
     def __init__(
         self,
@@ -45,7 +56,7 @@ class OrchestratorService:
         *,
         index_service: Any | None = None,
         checkpoint_service: Any | None = None,
-        receipt_repository: Any | None = None,
+        receipt_repository: ReceiptRepository | None = None,
         evidence_root: str = "evidence",
         mailbox_count_limit: int = 100,
         mailbox_byte_limit: int = 1_048_576,
@@ -1029,52 +1040,46 @@ class OrchestratorService:
                 )
 
     def _validate_receipt_evidence(self, receipt_ids: tuple[str, ...]) -> str:
-        if self._receipt_repository is None:
-            raise ServiceError(
-                "EVIDENCE_INCOMPLETE", "receipt repository is unavailable"
-            )
-        receipts: list[Any] = []
-        unreadable = False
+        repository = self._receipt_repository
+        if type(repository) is not ReceiptRepository:
+            raise self._receipt_evidence_incomplete()
+        receipts: list[RawExecutionReceipt] = []
         for receipt_id in receipt_ids:
             try:
-                receipts.append(self._receipt_repository.read(receipt_id))
+                receipt = ReceiptRepository.read(repository, receipt_id)
             except Exception:
-                unreadable = True
-        if unreadable or len(receipts) != len(receipt_ids):
-            raise ServiceError(
-                "EVIDENCE_INCOMPLETE", "execution receipt is unavailable"
-            )
-        workspace_hashes: set[str] = set()
-        for receipt in receipts:
-            workspace_hash = getattr(receipt, "workspace_hash", None)
+                raise self._receipt_evidence_incomplete() from None
             if (
-                not isinstance(workspace_hash, str)
-                or self._SAFE_RECEIPT_IDENTIFIER.fullmatch(workspace_hash) is None
-            ):
-                raise ServiceError(
-                    "EVIDENCE_INCOMPLETE", "execution workspace is unavailable"
+                not isinstance(receipt, RawExecutionReceipt)
+                or type(receipt) is not RawExecutionReceipt
+                or type(receipt.receipt_id) is not str
+                or self._SAFE_RECEIPT_IDENTIFIER.fullmatch(receipt.receipt_id) is None
+                or not compare_digest(receipt_id, receipt.receipt_id)
+                or any(
+                    type(value) is not str
+                    or self._SAFE_RECEIPT_IDENTIFIER.fullmatch(value) is None
+                    for value in (
+                        getattr(receipt, field_name)
+                        for field_name in self._RECEIPT_HASH_FIELDS
+                    )
                 )
-            workspace_hashes.add(workspace_hash)
-        if (
-            len(workspace_hashes) != 1
-            or any(
-                getattr(receipt, "success", None) is not True
-                or getattr(receipt, "exit_code", None) != 0
-                for receipt in receipts
-            )
-            or not any(
-                getattr(receipt, "canonical_tool", None) == "patch"
-                for receipt in receipts
-            )
-            or not any(
-                getattr(receipt, "canonical_tool", None) == "shell"
-                for receipt in receipts
-            )
-        ):
-            raise ServiceError(
-                "EVIDENCE_INCOMPLETE", "execution evidence is incomplete"
-            )
+                or type(receipt.canonical_tool) is not str
+                or receipt.canonical_tool not in {"patch", "shell"}
+                or type(receipt.exit_code) is not int
+                or receipt.exit_code != 0
+                or receipt.success is not True
+            ):
+                raise self._receipt_evidence_incomplete()
+            receipts.append(receipt)
+        workspace_hashes = {receipt.workspace_hash for receipt in receipts}
+        tools = {receipt.canonical_tool for receipt in receipts}
+        if len(workspace_hashes) != 1 or tools != {"patch", "shell"}:
+            raise self._receipt_evidence_incomplete()
         return next(iter(workspace_hashes))
+
+    @staticmethod
+    def _receipt_evidence_incomplete() -> ServiceError:
+        return ServiceError("EVIDENCE_INCOMPLETE", "execution evidence is incomplete")
 
     def _validate_acceptance_request(
         self,

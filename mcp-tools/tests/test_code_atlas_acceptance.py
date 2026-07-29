@@ -8,7 +8,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -16,7 +18,11 @@ MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
-from code_atlas.receipts import HostCaptureContext, ReceiptRepository  # noqa: E402
+from code_atlas.receipts import (  # noqa: E402
+    HostCaptureContext,
+    RawExecutionReceipt,
+    ReceiptRepository,
+)
 import orchestrator.store as store_module  # noqa: E402
 from orchestrator.models import (  # noqa: E402
     AtlasOutboxState,
@@ -39,11 +45,25 @@ from project_index.service import ProjectIndexService  # noqa: E402
 from temp_support import task_scratch  # noqa: E402
 
 
+class _StaticReceiptRepository:
+    def __init__(self, records: dict[str, object]) -> None:
+        self._records = records
+
+    def read(self, receipt_id: str) -> object:
+        return self._records[receipt_id]
+
+
+class _RawExecutionReceiptSubclass(RawExecutionReceipt):
+    pass
+
+
 class CodeTaskAcceptanceFixture(unittest.TestCase):
     _NOW = "2026-07-29T01:00:00+00:00"
     _COMPLETE_IN_SETUP = False
 
     def setUp(self) -> None:
+        self._receipt_read_patcher = None
+        self.addCleanup(self._stop_receipt_read_patch)
         scratch = task_scratch("code-atlas-acceptance")
         self._temporary_directory = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self._temporary_directory.cleanup)
@@ -236,6 +256,9 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
         self.receipt_ids = tuple(
             sorted(receipt.receipt_id for receipt in self.execution_receipts)
         )
+        self.receipts_by_id = {
+            receipt.receipt_id: receipt for receipt in self.execution_receipts
+        }
         workspace_hashes = {
             receipt.workspace_hash for receipt in self.execution_receipts
         }
@@ -281,6 +304,49 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
             "code-task"
         )
         self.assertEqual(self.expected_receipt_attestation, self.receipt_attestation)
+
+    def _use_receipt_records(self, records: dict[str, object]) -> None:
+        self._stop_receipt_read_patch()
+        self._receipt_read_patcher = mock.patch.object(
+            ReceiptRepository,
+            "read",
+            autospec=True,
+            side_effect=lambda _repository, receipt_id: records[receipt_id],
+        )
+        self._receipt_read_patcher.start()
+
+    def _use_untrusted_receipt_repository(self, records: dict[str, object]) -> None:
+        self.service = OrchestratorService(
+            self.store,
+            index_service=self.index,
+            checkpoint_service=self.checkpoints,
+            receipt_repository=_StaticReceiptRepository(records),  # type: ignore[arg-type]
+        )
+
+    def _stop_receipt_read_patch(self) -> None:
+        if self._receipt_read_patcher is not None:
+            self._receipt_read_patcher.stop()
+            self._receipt_read_patcher = None
+
+    @staticmethod
+    def _duck_receipt(receipt: RawExecutionReceipt, *, exit_code: object) -> object:
+        return SimpleNamespace(
+            canonical_tool=receipt.canonical_tool,
+            workspace_hash=receipt.workspace_hash,
+            success=True,
+            exit_code=exit_code,
+        )
+
+    @staticmethod
+    def _forged_raw_receipt(receipt: RawExecutionReceipt) -> RawExecutionReceipt:
+        return replace(
+            receipt,
+            schema_version="forged-schema",
+            host="forged-host",
+            tool_use_id="unsafe tool id",
+            command_spec=(42,),  # type: ignore[arg-type]
+            observed_at="not-a-timestamp",
+        )
 
     def _capture_receipts(
         self,
@@ -429,6 +495,30 @@ class CodeTaskAcceptanceServiceTests(CodeTaskAcceptanceFixture):
         self.assertIsNone(
             self.store.get_artifact(self.receipt_attestation.attestation_hash)
         )
+
+    def test_acceptance_rejects_duck_receipts_after_real_completion(self) -> None:
+        records = dict(self.receipts_by_id)
+        replaced_id = self.receipt_ids[0]
+        records[replaced_id] = self._duck_receipt(
+            self.receipts_by_id[replaced_id], exit_code=False
+        )
+        self._use_receipt_records(records)
+
+        error = self._assert_acceptance_rejected("EVIDENCE_INCOMPLETE")
+
+        self.assertEqual("execution evidence is incomplete", str(error))
+
+    def test_acceptance_rejects_exact_but_unverified_raw_receipts(self) -> None:
+        records = dict(self.receipts_by_id)
+        replaced_id = self.receipt_ids[0]
+        records[replaced_id] = self._forged_raw_receipt(
+            self.receipts_by_id[replaced_id]
+        )
+        self._use_untrusted_receipt_repository(records)
+
+        error = self._assert_acceptance_rejected("EVIDENCE_INCOMPLETE")
+
+        self.assertEqual("execution evidence is incomplete", str(error))
 
     def test_generic_verification_artifact_cannot_replace_typed_attestation(
         self,
@@ -1085,7 +1175,7 @@ class CodeTaskAcceptanceServiceTests(CodeTaskAcceptanceFixture):
 class CodeTaskCompletionAttestationTests(CodeTaskAcceptanceFixture):
     def _assert_completion_evidence_rejected(
         self, execution_receipt_ids: list[str]
-    ) -> None:
+    ) -> ServiceError:
         with self.assertRaises(ServiceError) as raised:
             self.service.complete_task(
                 "code-task",
@@ -1107,6 +1197,112 @@ class CodeTaskCompletionAttestationTests(CodeTaskAcceptanceFixture):
             ("code-task",),
         ).fetchone()[0]
         self.assertEqual(0, owner_count)
+        return raised.exception
+
+    def test_duck_receipt_records_cannot_complete_code_tasks(self) -> None:
+        records = dict(self.receipts_by_id)
+        replaced_id = self.receipt_ids[0]
+        records[replaced_id] = self._duck_receipt(
+            self.receipts_by_id[replaced_id], exit_code=False
+        )
+        self._use_receipt_records(records)
+
+        error = self._assert_completion_evidence_rejected(list(self.receipt_ids))
+
+        self.assertEqual("execution evidence is incomplete", str(error))
+
+    def test_exact_but_unverified_raw_receipts_cannot_complete_code_tasks(
+        self,
+    ) -> None:
+        records = dict(self.receipts_by_id)
+        replaced_id = self.receipt_ids[0]
+        records[replaced_id] = self._forged_raw_receipt(
+            self.receipts_by_id[replaced_id]
+        )
+        self._use_untrusted_receipt_repository(records)
+
+        error = self._assert_completion_evidence_rejected(list(self.receipt_ids))
+
+        self.assertEqual("execution evidence is incomplete", str(error))
+
+    def test_noncanonical_receipt_status_fields_are_rejected(self) -> None:
+        for field_name, value in (
+            ("exit_code", False),
+            ("exit_code", True),
+            ("success", 1),
+            ("canonical_tool", "apply_patch"),
+        ):
+            with self.subTest(field_name=field_name, value=value):
+                records = {
+                    receipt_id: replace(receipt, **{field_name: value})
+                    for receipt_id, receipt in self.receipts_by_id.items()
+                }
+                self._use_receipt_records(records)
+
+                error = self._assert_completion_evidence_rejected(
+                    list(self.receipt_ids)
+                )
+
+                self.assertEqual("execution evidence is incomplete", str(error))
+
+    def test_receipt_ids_must_match_each_requested_repository_key(self) -> None:
+        first_id, second_id = self.receipt_ids
+        records = {
+            first_id: self.receipts_by_id[second_id],
+            second_id: self.receipts_by_id[first_id],
+        }
+        self._use_receipt_records(records)
+
+        error = self._assert_completion_evidence_rejected(list(self.receipt_ids))
+
+        self.assertEqual("execution evidence is incomplete", str(error))
+
+    def test_noncanonical_receipt_hashes_are_rejected_without_value_disclosure(
+        self,
+    ) -> None:
+        malicious_value = "not-a-sha256-or-a-safe-path"
+        for field_name in (
+            "session_id_hash",
+            "turn_id_hash",
+            "command_spec_hash",
+            "input_hash",
+            "output_hash",
+            "workspace_hash",
+        ):
+            with self.subTest(field_name=field_name):
+                records = dict(self.receipts_by_id)
+                receipt_id = self.receipt_ids[0]
+                records[receipt_id] = replace(
+                    self.receipts_by_id[receipt_id],
+                    **{field_name: malicious_value},
+                )
+                self._use_receipt_records(records)
+
+                error = self._assert_completion_evidence_rejected(
+                    list(self.receipt_ids)
+                )
+
+                self.assertEqual("execution evidence is incomplete", str(error))
+                self.assertNotIn(malicious_value, str(error))
+
+    def test_mapping_and_receipt_subclass_substitutes_are_rejected(self) -> None:
+        receipt_id = self.receipt_ids[0]
+        original = self.receipts_by_id[receipt_id]
+        substitutes = (
+            original.to_dict(),
+            _RawExecutionReceiptSubclass(**original.to_dict()),
+        )
+        for substitute in substitutes:
+            with self.subTest(substitute_type=type(substitute).__name__):
+                records = dict(self.receipts_by_id)
+                records[receipt_id] = substitute
+                self._use_receipt_records(records)
+
+                error = self._assert_completion_evidence_rejected(
+                    list(self.receipt_ids)
+                )
+
+                self.assertEqual("execution evidence is incomplete", str(error))
 
     def test_service_code_completion_requires_receipt_ids_atomically(self) -> None:
         with self.assertRaises(ServiceError) as raised:
