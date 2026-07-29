@@ -22,6 +22,8 @@ MAX_WRITE_SCOPES = 32
 MAX_STATUS_TASKS = 64
 MAX_MANIFEST_UNITS = 16
 MAX_LIST_ITEMS = 32
+MAX_GRAPH_NODES = 64
+MAX_GRAPH_EDGES = 128
 
 _TASK_ID = re.compile(r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -97,9 +99,112 @@ _ROUTES = {
     "complex": "Terra Max",
     "exceptional": "Sol High",
 }
-_ARTIFACT_SOURCE_KINDS = frozenset(
-    {"explicit_artifact_boundaries", "code_atlas_packet", "task_episode_graph"}
+_ARTIFACT_SOURCE_KINDS = frozenset({"explicit_artifact_boundaries"})
+_ATLAS_SOURCE_KINDS = frozenset({"code_atlas_packet", "task_episode_graph"})
+_ATLAS_PACKET_FIELDS = frozenset(
+    {
+        "packet_id",
+        "trace_id",
+        "workspace",
+        "snapshot_id",
+        "recipe_id",
+        "node_ids",
+        "edge_ids",
+        "evidence_windows",
+        "evidence_hashes",
+        "operations",
+        "slots",
+        "constraints",
+        "dependencies",
+        "tests",
+        "gaps",
+        "source_hashes",
+        "template_hashes",
+        "receipt_hashes",
+        "next_action",
+    }
 )
+_ATLAS_GRAPH_FIELDS = frozenset({"nodes", "edges", "truncated"})
+_ATLAS_NODE_FIELDS = frozenset(
+    {
+        "node_id",
+        "kind",
+        "payload",
+        "schema_version",
+        "extractor_id",
+        "extractor_version",
+        "provenance",
+        "source_hashes",
+        "created_at",
+        "superseded_at",
+        "quarantine_state",
+    }
+)
+_ATLAS_EDGE_FIELDS = frozenset(
+    {
+        "edge_id",
+        "relation",
+        "source_id",
+        "target_id",
+        "source_kind",
+        "target_kind",
+        "payload",
+        "schema_version",
+        "provenance",
+        "created_at",
+    }
+)
+_ATLAS_OPERATION_FIELDS = frozenset(
+    {"kind", "path_slot", "template_hash", "separator", "target_symbol_slot"}
+)
+_ATLAS_SLOT_FIELDS = frozenset({"name", "type", "required"})
+_ATLAS_CONSTRAINT_FIELDS = frozenset({"kind", "subject", "value"})
+_ATLAS_DEPENDENCY_FIELDS = frozenset({"name", "kind", "specifier"})
+_ATLAS_TEST_FIELDS = frozenset({"argv", "expected_exit_code"})
+_ATLAS_NODE_KINDS = frozenset(
+    {
+        "TaskEpisode",
+        "Intent",
+        "Recipe",
+        "CodeTemplate",
+        "AdaptationSlot",
+        "Constraint",
+        "Dependency",
+        "TestSpec",
+        "ExecutionReceipt",
+        "SourceEvidence",
+        "Language",
+        "Framework",
+    }
+)
+_ATLAS_EDGE_RELATIONS = frozenset(
+    {
+        "SOLVES",
+        "DERIVED_FROM",
+        "HAS_IMPLEMENTATION",
+        "HAS_SLOT",
+        "CONSTRAINED_BY",
+        "REQUIRES",
+        "VERIFIED_BY",
+        "CHANGES",
+        "TESTS",
+        "SUPERSEDES",
+        "BUNDLED_AS",
+    }
+)
+_ATLAS_EDGE_ENDPOINTS = {
+    "SOLVES": ({"TaskEpisode", "Recipe"}, {"Intent"}),
+    "DERIVED_FROM": ({"Recipe"}, {"TaskEpisode", "SourceEvidence"}),
+    "HAS_IMPLEMENTATION": ({"Recipe"}, {"CodeTemplate"}),
+    "HAS_SLOT": ({"Recipe"}, {"AdaptationSlot"}),
+    "CONSTRAINED_BY": ({"Recipe"}, {"Constraint"}),
+    "REQUIRES": ({"Recipe"}, {"Dependency", "Framework", "Language"}),
+    "VERIFIED_BY": ({"TaskEpisode", "Recipe"}, {"TestSpec", "ExecutionReceipt"}),
+    "CHANGES": ({"TaskEpisode"}, {"SourceEvidence"}),
+    "TESTS": ({"TestSpec", "SourceEvidence"}, {"SourceEvidence"}),
+    "SUPERSEDES": ({"Recipe"}, {"Recipe"}),
+    "BUNDLED_AS": ({"Recipe"}, {"SourceEvidence"}),
+}
 
 
 class ContractMismatchError(ValueError):
@@ -816,7 +921,831 @@ def _artifact(value: object) -> dict[str, Any]:
             _label,
             required=True,
         ),
+        "direct_contract_hashes": [],
     }
+
+
+def _bounded_records(
+    value: object,
+    field: str,
+    *,
+    maximum: int,
+    required: bool = False,
+) -> list[object]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"{field} must be a list")
+    if len(value) > maximum or (required and not value):
+        raise ValueError(f"{field} is out of bounds")
+    return list(value)
+
+
+def _atlas_text(
+    value: object,
+    field: str,
+    *,
+    maximum: int = 256,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str) or len(value) > maximum:
+        raise ValueError(f"{field} must be bounded text")
+    if not allow_empty and not value:
+        raise ValueError(f"{field} must be bounded text")
+    if value != value.strip() or any(ord(character) < 32 for character in value):
+        raise ValueError(f"{field} must be single-line text")
+    return value
+
+
+def _atlas_optional_text(value: object, field: str, *, maximum: int = 256) -> str | None:
+    if value is None:
+        return None
+    return _atlas_text(value, field, maximum=maximum, allow_empty=True)
+
+
+def _atlas_json(value: object, field: str) -> object:
+    try:
+        _canonical_json(value)
+    except ValueError as error:
+        raise ValueError(f"{field} must be JSON data") from error
+    return value
+
+
+def _atlas_hashes(
+    value: object,
+    field: str,
+    *,
+    maximum: int = MAX_LIST_ITEMS,
+    required: bool = False,
+) -> list[str]:
+    return _normalised_list(
+        value,
+        field,
+        _hash,
+        maximum=maximum,
+        required=required,
+    )
+
+
+def _derived_task_id(
+    parent_task_id: str,
+    source_prefix: str,
+    identity: object,
+) -> str:
+    suffix = hashlib.sha256(_json_bytes(identity)).hexdigest()[:12].upper()
+    reserved = len(source_prefix) + len(suffix) + 2
+    parent = parent_task_id[: 96 - reserved].rstrip("-")
+    return _task_id(f"{parent}-{source_prefix}-{suffix}", "derived task_id")
+
+
+def _hash_label(namespace: str, digest: str) -> str:
+    return f"atlas/{namespace}/{digest.removeprefix('sha256:')[:16]}"
+
+
+def _atlas_operation(value: object) -> dict[str, str]:
+    source = _mapping(value, "ImplementationPacket operation")
+    _exact_keys(source, _ATLAS_OPERATION_FIELDS, "ImplementationPacket operation")
+    target_symbol = _atlas_text(
+        source["target_symbol_slot"],
+        "ImplementationPacket operation target_symbol_slot",
+        maximum=128,
+        allow_empty=True,
+    )
+    if target_symbol:
+        target_symbol = _label(
+            target_symbol,
+            "ImplementationPacket operation target_symbol_slot",
+        )
+    return {
+        "kind": _atlas_text(
+            source["kind"], "ImplementationPacket operation kind", maximum=64
+        ),
+        "path_slot": _label(
+            source["path_slot"], "ImplementationPacket operation path_slot"
+        ),
+        "template_hash": _hash(
+            source["template_hash"], "ImplementationPacket operation template_hash"
+        ),
+        "separator": _atlas_text(
+            source["separator"],
+            "ImplementationPacket operation separator",
+            maximum=128,
+            allow_empty=True,
+        ),
+        "target_symbol_slot": target_symbol,
+    }
+
+
+def _atlas_slot(value: object) -> dict[str, Any]:
+    source = _mapping(value, "ImplementationPacket slot")
+    _exact_keys(source, _ATLAS_SLOT_FIELDS, "ImplementationPacket slot")
+    if type(source["required"]) is not bool:
+        raise ValueError("ImplementationPacket slot required must be a boolean")
+    return {
+        "name": _label(source["name"], "ImplementationPacket slot name"),
+        "type": _atlas_text(
+            source["type"], "ImplementationPacket slot type", maximum=128
+        ),
+        "required": source["required"],
+    }
+
+
+def _atlas_constraint(value: object, field: str) -> dict[str, Any]:
+    source = _mapping(value, field)
+    _exact_keys(source, _ATLAS_CONSTRAINT_FIELDS, field)
+    return {
+        "kind": _atlas_text(source["kind"], f"{field} kind", maximum=128),
+        "subject": _atlas_text(
+            source["subject"],
+            f"{field} subject",
+            maximum=128,
+            allow_empty=True,
+        ),
+        "value": _atlas_json(source["value"], f"{field} value"),
+    }
+
+
+def _atlas_dependency(value: object) -> dict[str, str]:
+    source = _mapping(value, "ImplementationPacket dependency")
+    _exact_keys(source, _ATLAS_DEPENDENCY_FIELDS, "ImplementationPacket dependency")
+    return {
+        "name": _atlas_text(
+            source["name"], "ImplementationPacket dependency name", maximum=128
+        ),
+        "kind": _atlas_text(
+            source["kind"], "ImplementationPacket dependency kind", maximum=128
+        ),
+        "specifier": _atlas_text(
+            source["specifier"],
+            "ImplementationPacket dependency specifier",
+            maximum=256,
+            allow_empty=True,
+        ),
+    }
+
+
+def _atlas_test(value: object, field: str) -> dict[str, Any]:
+    source = _mapping(value, field)
+    _exact_keys(source, _ATLAS_TEST_FIELDS, field)
+    argv = _bounded_records(
+        source["argv"],
+        f"{field} argv",
+        maximum=MAX_LIST_ITEMS,
+        required=True,
+    )
+    expected_exit_code = source["expected_exit_code"]
+    if type(expected_exit_code) is not int:
+        raise ValueError(f"{field} expected_exit_code must be an integer")
+    return {
+        "argv": [
+            _atlas_text(item, f"{field} argv item", maximum=256)
+            for item in argv
+        ],
+        "expected_exit_code": expected_exit_code,
+    }
+
+
+def _atlas_evidence_window(value: object) -> dict[str, Any]:
+    source = _mapping(value, "ImplementationPacket evidence window")
+    allowed = frozenset({"path", "content_hash", "start_line", "end_line"})
+    if not {"path", "content_hash"} <= set(source) or set(source) - allowed:
+        raise ValueError("ImplementationPacket evidence window is invalid")
+    result: dict[str, Any] = {
+        "path": _relative_scope(
+            source["path"], "ImplementationPacket evidence window path"
+        ),
+        "content_hash": _hash(
+            source["content_hash"], "ImplementationPacket evidence window content_hash"
+        ),
+    }
+    start_line = source.get("start_line")
+    end_line = source.get("end_line")
+    if start_line is not None:
+        if type(start_line) is not int or start_line < 1:
+            raise ValueError("ImplementationPacket evidence window start_line is invalid")
+        result["start_line"] = start_line
+    if end_line is not None:
+        if type(end_line) is not int or end_line < result.get("start_line", 1):
+            raise ValueError("ImplementationPacket evidence window end_line is invalid")
+        result["end_line"] = end_line
+    return result
+
+
+def _atlas_packet(value: object) -> dict[str, Any]:
+    source = _mapping(value, "ImplementationPacket")
+    _exact_keys(source, _ATLAS_PACKET_FIELDS, "ImplementationPacket")
+    packet_id = _hash(source["packet_id"], "ImplementationPacket packet_id")
+    identity = dict(source)
+    del identity["packet_id"]
+    if not hmac.compare_digest(packet_id, _sha256_json(identity)):
+        raise ValueError("ImplementationPacket packet_id does not match its fields")
+    operations = [
+        _atlas_operation(item)
+        for item in _bounded_records(
+            source["operations"],
+            "ImplementationPacket operations",
+            maximum=MAX_LIST_ITEMS,
+        )
+    ]
+    slots = [
+        _atlas_slot(item)
+        for item in _bounded_records(
+            source["slots"], "ImplementationPacket slots", maximum=MAX_LIST_ITEMS
+        )
+    ]
+    constraints = [
+        _atlas_constraint(item, "ImplementationPacket constraint")
+        for item in _bounded_records(
+            source["constraints"],
+            "ImplementationPacket constraints",
+            maximum=MAX_LIST_ITEMS,
+        )
+    ]
+    dependencies = [
+        _atlas_dependency(item)
+        for item in _bounded_records(
+            source["dependencies"],
+            "ImplementationPacket dependencies",
+            maximum=MAX_LIST_ITEMS,
+        )
+    ]
+    tests = [
+        _atlas_test(item, "ImplementationPacket test")
+        for item in _bounded_records(
+            source["tests"], "ImplementationPacket tests", maximum=MAX_LIST_ITEMS
+        )
+    ]
+    gaps = [
+        _atlas_text(item, "ImplementationPacket gap", maximum=128)
+        for item in _bounded_records(
+            source["gaps"], "ImplementationPacket gaps", maximum=MAX_LIST_ITEMS
+        )
+    ]
+    evidence_windows = [
+        _atlas_evidence_window(item)
+        for item in _bounded_records(
+            source["evidence_windows"],
+            "ImplementationPacket evidence_windows",
+            maximum=MAX_LIST_ITEMS,
+        )
+    ]
+    if len({slot["name"] for slot in slots}) != len(slots):
+        raise ValueError("ImplementationPacket slot names must be unique")
+    return {
+        "packet_id": packet_id,
+        "trace_id": _hash(source["trace_id"], "ImplementationPacket trace_id"),
+        "workspace": _atlas_text(
+            source["workspace"], "ImplementationPacket workspace", maximum=512
+        ),
+        "snapshot_id": _hash(
+            source["snapshot_id"], "ImplementationPacket snapshot_id"
+        ),
+        "recipe_id": _hash(source["recipe_id"], "ImplementationPacket recipe_id"),
+        "node_ids": _atlas_hashes(
+            source["node_ids"], "ImplementationPacket node_ids", maximum=MAX_GRAPH_NODES
+        ),
+        "edge_ids": _atlas_hashes(
+            source["edge_ids"], "ImplementationPacket edge_ids", maximum=MAX_GRAPH_EDGES
+        ),
+        "evidence_windows": evidence_windows,
+        "evidence_hashes": _atlas_hashes(
+            source["evidence_hashes"], "ImplementationPacket evidence_hashes"
+        ),
+        "operations": operations,
+        "slots": slots,
+        "constraints": constraints,
+        "dependencies": dependencies,
+        "tests": tests,
+        "gaps": sorted(set(gaps)),
+        "source_hashes": _atlas_hashes(
+            source["source_hashes"], "ImplementationPacket source_hashes"
+        ),
+        "template_hashes": _atlas_hashes(
+            source["template_hashes"], "ImplementationPacket template_hashes"
+        ),
+        "receipt_hashes": _atlas_hashes(
+            source["receipt_hashes"], "ImplementationPacket receipt_hashes"
+        ),
+        "next_action": _atlas_text(
+            source["next_action"], "ImplementationPacket next_action", maximum=128
+        ),
+    }
+
+
+def _packet_path_bindings(
+    value: object,
+    path_slots: set[str],
+) -> tuple[dict[str, str] | None, str]:
+    source = _mapping(value, "path_bindings")
+    if len(source) > MAX_LIST_ITEMS:
+        raise ValueError("path_bindings is out of bounds")
+    normalized_slots = {
+        _label(slot, "path binding slot") for slot in source
+    }
+    if normalized_slots != path_slots:
+        return None, "ImplementationPacket path bindings do not cover its operation slots."
+    bindings = {
+        _label(slot, "path binding slot"): _relative_scope(
+            path, "path binding value"
+        )
+        for slot, path in source.items()
+    }
+    if len(bindings) != len(source):
+        raise ValueError("path binding slots must be unique")
+    return dict(sorted(bindings.items())), ""
+
+
+def _packet_units(
+    packet_value: object,
+    bindings_value: object,
+    parent_task_id: str,
+) -> tuple[list[dict[str, Any]] | None, str]:
+    packet = _atlas_packet(packet_value)
+    if (
+        packet["gaps"]
+        or packet["next_action"] != "code_atlas_render"
+        or not packet["operations"]
+        or not packet["tests"]
+        or not packet["node_ids"]
+        or not packet["edge_ids"]
+        or not packet["evidence_hashes"]
+        or not packet["source_hashes"]
+        or not packet["receipt_hashes"]
+    ):
+        return None, "ImplementationPacket does not contain complete verified evidence."
+    operation_hashes = {operation["template_hash"] for operation in packet["operations"]}
+    if operation_hashes != set(packet["template_hashes"]):
+        return None, "ImplementationPacket template evidence does not match operations."
+
+    used_slots = {operation["path_slot"] for operation in packet["operations"]}
+    slots_by_name = {slot["name"]: slot for slot in packet["slots"]}
+    if any(
+        slot_name not in slots_by_name
+        or slots_by_name[slot_name]["type"] != "relative_python_path"
+        for slot_name in used_slots
+    ):
+        return None, "ImplementationPacket lacks verified relative path slots."
+    bindings, reason = _packet_path_bindings(bindings_value, used_slots)
+    if bindings is None:
+        return None, reason
+    for constraint in packet["constraints"]:
+        if constraint["kind"] != "path_suffix" or constraint["subject"] not in bindings:
+            continue
+        suffix = constraint["value"]
+        if not isinstance(suffix, str) or not suffix or not bindings[
+            constraint["subject"]
+        ].endswith(suffix):
+            return None, "ImplementationPacket path constraints do not prove bindings."
+
+    operations_by_path: dict[str, list[dict[str, str]]] = {}
+    for operation in sorted(
+        packet["operations"],
+        key=lambda item: (item["path_slot"], item["kind"], item["template_hash"]),
+    ):
+        path = bindings[operation["path_slot"]]
+        operations_by_path.setdefault(path, []).append(operation)
+    if len(operations_by_path) > MAX_MANIFEST_UNITS:
+        raise ValueError("packet derives too many work units")
+
+    task_by_path = {
+        path: _derived_task_id(
+            parent_task_id,
+            "P",
+            {"packet_id": packet["packet_id"], "path": path},
+        )
+        for path in operations_by_path
+    }
+    evidence = {
+        *packet["evidence_hashes"],
+        *packet["source_hashes"],
+        *packet["template_hashes"],
+        *packet["receipt_hashes"],
+    }
+    evidence.update(window["content_hash"] for window in packet["evidence_windows"])
+    direct_contract_hashes = [
+        _sha256_json(
+            {
+                "kind": "code_atlas_handoff",
+                "packet_id": packet["packet_id"],
+                "recipe_id": packet["recipe_id"],
+            }
+        )
+    ]
+    handoff_contracts = sorted(
+        {
+            _hash_label("packet", packet["packet_id"]),
+            *(_hash_label("contract", item) for item in direct_contract_hashes),
+        }
+    )
+    acceptance_constraints = sorted(_sha256_json(test) for test in packet["tests"])
+    units = []
+    for path in sorted(operations_by_path):
+        units.append(
+            {
+                "task_id": task_by_path[path],
+                "goal": (
+                    f"Apply {len(operations_by_path[path])} bounded "
+                    f"Code Atlas operation(s) to {path}"
+                ),
+                "output_boundary": f"file {path}",
+                "write_scope": [path],
+                "depends_on": [],
+                "required_evidence": sorted(evidence),
+                "recommended_route": _ROUTES["routine"],
+                "handoff_contracts": handoff_contracts,
+                "direct_contract_hashes": direct_contract_hashes,
+                "operation_count": len(operations_by_path[path]),
+                "acceptance_constraints": acceptance_constraints,
+                "task_node_ids": packet["node_ids"],
+                "contract_node_ids": [],
+                "unit_kind": "code",
+            }
+        )
+    verification_id = _derived_task_id(
+        parent_task_id,
+        "V",
+        {"packet_id": packet["packet_id"], "kind": "verification"},
+    )
+    units.append(
+        {
+            "task_id": verification_id,
+            "goal": "Run ImplementationPacket verification constraints",
+            "output_boundary": f"verification {packet['packet_id']}",
+            "write_scope": [],
+            "depends_on": sorted(task_by_path.values()),
+            "required_evidence": sorted(evidence),
+            "recommended_route": _ROUTES["moderate"],
+            "handoff_contracts": handoff_contracts,
+            "direct_contract_hashes": direct_contract_hashes,
+            "operation_count": 0,
+            "acceptance_constraints": acceptance_constraints,
+            "task_node_ids": packet["node_ids"],
+            "contract_node_ids": [],
+            "unit_kind": "verification",
+        }
+    )
+    return units, ""
+
+
+def _atlas_node(value: object) -> dict[str, Any]:
+    source = _mapping(value, "GraphQueryResult node")
+    _exact_keys(source, _ATLAS_NODE_FIELDS, "GraphQueryResult node")
+    kind = _atlas_text(source["kind"], "GraphQueryResult node kind", maximum=32)
+    if kind not in _ATLAS_NODE_KINDS:
+        raise ValueError("GraphQueryResult node kind is unsupported")
+    provenance = _atlas_text(
+        source["provenance"], "GraphQueryResult node provenance", maximum=32
+    )
+    if provenance not in {"observed", "resolved", "declared"}:
+        raise ValueError("GraphQueryResult node provenance is invalid")
+    payload = _atlas_json(source["payload"], "GraphQueryResult node payload")
+    node_id = _hash(source["node_id"], "GraphQueryResult node_id")
+    identity = {
+        "kind": kind,
+        "schema_version": _atlas_text(
+            source["schema_version"], "GraphQueryResult node schema_version", maximum=32
+        ),
+        "extractor_id": _atlas_text(
+            source["extractor_id"],
+            "GraphQueryResult node extractor_id",
+            maximum=128,
+            allow_empty=True,
+        ),
+        "extractor_version": _atlas_text(
+            source["extractor_version"],
+            "GraphQueryResult node extractor_version",
+            maximum=128,
+            allow_empty=True,
+        ),
+        "provenance": provenance,
+        "payload": payload,
+        "source_hashes": list(source["source_hashes"]),
+    }
+    if not hmac.compare_digest(node_id, _sha256_json(identity)):
+        raise ValueError("GraphQueryResult node_id does not match its fields")
+    return {
+        "node_id": node_id,
+        "kind": kind,
+        "payload": payload,
+        "source_hashes": _atlas_hashes(
+            source["source_hashes"],
+            "GraphQueryResult node source_hashes",
+            maximum=MAX_LIST_ITEMS,
+        ),
+        "schema_version": identity["schema_version"],
+        "extractor_id": identity["extractor_id"],
+        "extractor_version": identity["extractor_version"],
+        "provenance": provenance,
+        "created_at": _atlas_optional_text(
+            source["created_at"], "GraphQueryResult node created_at", maximum=64
+        ),
+        "superseded_at": _atlas_optional_text(
+            source["superseded_at"], "GraphQueryResult node superseded_at", maximum=64
+        ),
+        "quarantine_state": _atlas_optional_text(
+            source["quarantine_state"],
+            "GraphQueryResult node quarantine_state",
+            maximum=64,
+        ),
+    }
+
+
+def _atlas_edge(value: object) -> dict[str, Any]:
+    source = _mapping(value, "GraphQueryResult edge")
+    _exact_keys(source, _ATLAS_EDGE_FIELDS, "GraphQueryResult edge")
+    relation = _atlas_text(
+        source["relation"], "GraphQueryResult edge relation", maximum=32
+    )
+    if relation not in _ATLAS_EDGE_RELATIONS:
+        raise ValueError("GraphQueryResult edge relation is unsupported")
+    source_kind = _atlas_text(
+        source["source_kind"], "GraphQueryResult edge source_kind", maximum=32
+    )
+    target_kind = _atlas_text(
+        source["target_kind"], "GraphQueryResult edge target_kind", maximum=32
+    )
+    expected_sources, expected_targets = _ATLAS_EDGE_ENDPOINTS[relation]
+    if source_kind not in expected_sources or target_kind not in expected_targets:
+        raise ValueError("GraphQueryResult edge has invalid endpoint kinds")
+    provenance = _atlas_text(
+        source["provenance"], "GraphQueryResult edge provenance", maximum=32
+    )
+    if provenance not in {"observed", "resolved", "declared"}:
+        raise ValueError("GraphQueryResult edge provenance is invalid")
+    payload = _atlas_json(source["payload"], "GraphQueryResult edge payload")
+    edge_id = _hash(source["edge_id"], "GraphQueryResult edge_id")
+    identity = {
+        "relation": relation,
+        "source_id": source["source_id"],
+        "target_id": source["target_id"],
+        "schema_version": source["schema_version"],
+        "provenance": provenance,
+        "payload": payload,
+    }
+    if not hmac.compare_digest(edge_id, _sha256_json(identity)):
+        raise ValueError("GraphQueryResult edge_id does not match its fields")
+    return {
+        "edge_id": edge_id,
+        "relation": relation,
+        "source_id": _hash(source["source_id"], "GraphQueryResult edge source_id"),
+        "target_id": _hash(source["target_id"], "GraphQueryResult edge target_id"),
+        "source_kind": source_kind,
+        "target_kind": target_kind,
+        "payload": payload,
+        "schema_version": _atlas_text(
+            source["schema_version"],
+            "GraphQueryResult edge schema_version",
+            maximum=32,
+        ),
+        "provenance": provenance,
+        "created_at": _atlas_optional_text(
+            source["created_at"], "GraphQueryResult edge created_at", maximum=64
+        ),
+    }
+
+
+def _atlas_graph(value: object) -> dict[str, Any]:
+    source = _mapping(value, "GraphQueryResult")
+    _exact_keys(source, _ATLAS_GRAPH_FIELDS, "GraphQueryResult")
+    if type(source["truncated"]) is not bool:
+        raise ValueError("GraphQueryResult truncated must be a boolean")
+    nodes = [
+        _atlas_node(item)
+        for item in _bounded_records(
+            source["nodes"], "GraphQueryResult nodes",
+            maximum=MAX_GRAPH_NODES,
+        )
+    ]
+    edges = [
+        _atlas_edge(item)
+        for item in _bounded_records(
+            source["edges"], "GraphQueryResult edges",
+            maximum=MAX_GRAPH_EDGES,
+        )
+    ]
+    nodes_by_id = {node["node_id"]: node for node in nodes}
+    if len(nodes_by_id) != len(nodes):
+        raise ValueError("GraphQueryResult node ids must be unique")
+    if len({edge["edge_id"] for edge in edges}) != len(edges):
+        raise ValueError("GraphQueryResult edge ids must be unique")
+    for edge in edges:
+        if edge["source_id"] not in nodes_by_id or edge["target_id"] not in nodes_by_id:
+            raise ValueError("GraphQueryResult edge references an unknown node")
+        source_node = nodes_by_id[edge["source_id"]]
+        target_node = nodes_by_id[edge["target_id"]]
+        if (
+            source_node["kind"] != edge["source_kind"]
+            or target_node["kind"] != edge["target_kind"]
+        ):
+            raise ValueError("GraphQueryResult edge node kinds do not match")
+    return {
+        "truncated": source["truncated"],
+        "nodes": sorted(nodes, key=lambda item: item["node_id"]),
+        "edges": sorted(edges, key=lambda item: item["edge_id"]),
+    }
+
+
+def _episode_units(
+    graph_value: object,
+    parent_task_id: str,
+) -> tuple[list[dict[str, Any]] | None, str]:
+    graph = _atlas_graph(graph_value)
+    if graph["truncated"]:
+        return None, "GraphQueryResult is truncated."
+    nodes_by_id = {node["node_id"]: node for node in graph["nodes"]}
+    episode_ids = [
+        node_id
+        for node_id, node in sorted(nodes_by_id.items())
+        if node["kind"] == "TaskEpisode"
+    ]
+    if not episode_ids:
+        return None, "GraphQueryResult contains no TaskEpisode evidence."
+    if len(episode_ids) > MAX_MANIFEST_UNITS:
+        raise ValueError("GraphQueryResult derives too many work units")
+
+    change_edges: dict[str, list[dict[str, Any]]] = {
+        node_id: [] for node_id in episode_ids
+    }
+    verification_edges: dict[str, list[dict[str, Any]]] = {
+        node_id: [] for node_id in episode_ids
+    }
+    recipes_by_episode: dict[str, set[str]] = {
+        node_id: set() for node_id in episode_ids
+    }
+    for edge in graph["edges"]:
+        if edge["relation"] == "CHANGES" and edge["source_id"] in change_edges:
+            change_edges[edge["source_id"]].append(edge)
+        elif edge["relation"] == "VERIFIED_BY" and edge["source_id"] in verification_edges:
+            verification_edges[edge["source_id"]].append(edge)
+        elif edge["relation"] == "DERIVED_FROM" and edge["target_id"] in recipes_by_episode:
+            recipes_by_episode[edge["target_id"]].add(edge["source_id"])
+
+    scopes_by_episode: dict[str, set[str]] = {}
+    evidence_by_episode: dict[str, set[str]] = {}
+    acceptance_by_episode: dict[str, set[str]] = {}
+    for episode_id in episode_ids:
+        episode = nodes_by_id[episode_id]
+        payload = _mapping(episode["payload"], "TaskEpisode payload")
+        if payload.get("task_kind") != "code":
+            return None, "TaskEpisode is not a verified code task."
+        scopes: set[str] = set()
+        evidence = set(episode["source_hashes"])
+        for edge in change_edges[episode_id]:
+            source = nodes_by_id[edge["target_id"]]
+            payload = _mapping(source["payload"], "SourceEvidence payload")
+            path = payload.get("path")
+            if path is None:
+                continue
+            scopes.add(_relative_scope(path, "SourceEvidence path"))
+            if not source["source_hashes"]:
+                return None, "SourceEvidence lacks source hashes."
+            evidence.add(source["node_id"])
+            evidence.update(source["source_hashes"])
+        if not scopes:
+            return None, "TaskEpisode lacks concrete changed-path evidence."
+
+        acceptance: set[str] = set()
+        for edge in verification_edges[episode_id]:
+            verification = nodes_by_id[edge["target_id"]]
+            if verification["kind"] == "TestSpec":
+                _atlas_test(verification["payload"], "TestSpec payload")
+            if not verification["source_hashes"]:
+                return None, "TaskEpisode verification lacks source hashes."
+            acceptance.add(verification["node_id"])
+            evidence.add(verification["node_id"])
+            evidence.update(verification["source_hashes"])
+        if not acceptance:
+            return None, "TaskEpisode lacks VERIFIED_BY evidence."
+        if not evidence:
+            return None, "TaskEpisode lacks source evidence."
+        scopes_by_episode[episode_id] = scopes
+        evidence_by_episode[episode_id] = evidence
+        acceptance_by_episode[episode_id] = acceptance
+
+    episodes_by_recipe: dict[str, set[str]] = {}
+    for episode_id, recipe_ids in recipes_by_episode.items():
+        for recipe_id in recipe_ids:
+            episodes_by_recipe.setdefault(recipe_id, set()).add(episode_id)
+    dependencies_by_episode: dict[str, set[str]] = {
+        node_id: set() for node_id in episode_ids
+    }
+    for edge in graph["edges"]:
+        if edge["relation"] != "SUPERSEDES":
+            continue
+        for current_episode in episodes_by_recipe.get(edge["source_id"], set()):
+            dependencies_by_episode[current_episode].update(
+                episodes_by_recipe.get(edge["target_id"], set()) - {current_episode}
+            )
+
+    graph_fingerprint = _sha256_json(
+        {
+            "nodes": graph["nodes"],
+            "edges": graph["edges"],
+            "truncated": False,
+        }
+    )
+    contracts_by_episode = {
+        node_id: [
+            _sha256_json(
+                {
+                    "kind": "code_atlas_task_episode_handoff",
+                    "graph_fingerprint": graph_fingerprint,
+                    "task_episode_node_id": node_id,
+                }
+            )
+        ]
+        for node_id in episode_ids
+    }
+    contract_nodes_by_episode = {node_id: [] for node_id in episode_ids}
+    task_by_episode = {
+        node_id: _derived_task_id(
+            parent_task_id,
+            "E",
+            {"graph_fingerprint": graph_fingerprint, "node_id": node_id},
+        )
+        for node_id in episode_ids
+    }
+    units = []
+    for node_id in episode_ids:
+        handoff_contracts = {
+            _hash_label("episode", node_id),
+        }
+        handoff_contracts.update(
+            _hash_label("contract", contract_hash)
+            for contract_hash in contracts_by_episode[node_id]
+        )
+        units.append(
+            {
+                "task_id": task_by_episode[node_id],
+                "goal": f"Execute verified TaskEpisode {node_id[:24]}",
+                "output_boundary": f"TaskEpisode {node_id}",
+                "write_scope": sorted(scopes_by_episode[node_id]),
+                "depends_on": sorted(
+                    task_by_episode[dependency_id]
+                    for dependency_id in dependencies_by_episode[node_id]
+                ),
+                "required_evidence": sorted(evidence_by_episode[node_id]),
+                "recommended_route": _ROUTES["routine"],
+                "handoff_contracts": sorted(handoff_contracts),
+                "direct_contract_hashes": sorted(contracts_by_episode[node_id]),
+                "task_node_ids": [node_id],
+                "contract_node_ids": contract_nodes_by_episode[node_id],
+                "acceptance_constraints": sorted(acceptance_by_episode[node_id]),
+                "unit_kind": "code",
+            }
+        )
+    all_evidence = sorted(
+        {
+            evidence
+            for episode_id in episode_ids
+            for evidence in evidence_by_episode[episode_id]
+        }
+    )
+    all_contracts = sorted(
+        {
+            contract
+            for episode_id in episode_ids
+            for contract in contracts_by_episode[episode_id]
+        }
+    )
+    verification_id = _derived_task_id(
+        parent_task_id,
+        "V",
+        {"graph_fingerprint": graph_fingerprint, "kind": "verification"},
+    )
+    units.append(
+        {
+            "task_id": verification_id,
+            "goal": "Run TaskEpisode graph verification constraints",
+            "output_boundary": f"verification {graph_fingerprint}",
+            "write_scope": [],
+            "depends_on": sorted(task_by_episode.values()),
+            "required_evidence": all_evidence,
+            "recommended_route": _ROUTES["moderate"],
+            "handoff_contracts": sorted(
+                {
+                    _hash_label("graph", graph_fingerprint),
+                    *(_hash_label("contract", item) for item in all_contracts),
+                }
+            ),
+            "direct_contract_hashes": all_contracts,
+            "task_node_ids": episode_ids,
+            "contract_node_ids": sorted(
+                {
+                    node_id
+                    for episode_id in episode_ids
+                    for node_id in contract_nodes_by_episode[episode_id]
+                }
+            ),
+            "acceptance_constraints": sorted(
+                {
+                    constraint
+                    for episode_id in episode_ids
+                    for constraint in acceptance_by_episode[episode_id]
+                }
+            ),
+            "unit_kind": "verification",
+        }
+    )
+    return units, ""
 
 
 def _ensure_acyclic(units: Mapping[str, Mapping[str, Any]]) -> None:
@@ -886,76 +1815,49 @@ def _maximal_ready_wave(
     return list(best)
 
 
-def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    """Compile declared artifact boundaries into safe, deterministic execution waves."""
+def _needs_design_plan(
+    *,
+    task_id: str,
+    goal: str,
+    capacity: int,
+    source_kind: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "schema": "team-efficiency/decomposition-plan-v1",
+        "status": "needs_design",
+        "task_id": task_id,
+        "goal": goal,
+        "capacity": capacity,
+        "source_kind": source_kind,
+        "reason": reason,
+        "units": [],
+        "conflict_graph": {},
+        "waves": [],
+    }
 
-    if len(_json_bytes(manifest)) > MAX_MANIFEST_BYTES:
-        raise ValueError("work-package manifest exceeds its byte budget")
-    source = _mapping(manifest, "work-package manifest")
-    common = frozenset({"schema", "task_id", "goal", "capacity", "decomposition"})
-    decomposition = _text(source.get("decomposition"), "decomposition", maximum=32)
-    if decomposition in {"semantic", "needs_design"}:
-        source_kind = _manifest_source_kind(
-            source,
-            common,
-            default="none",
-            allowed=frozenset({"none"}),
-        )
-        capacity = source["capacity"]
-        if type(capacity) is not int or not 1 <= capacity <= MAX_MANIFEST_UNITS:
-            raise ValueError("capacity is out of bounds")
-        if source["schema"] != "team-efficiency/work-package-v1":
-            raise ValueError("work-package schema is invalid")
-        return {
-            "schema": "team-efficiency/decomposition-plan-v1",
-            "status": "needs_design",
-            "task_id": _task_id(source["task_id"]),
-            "goal": _manifest_text(source["goal"], "goal"),
-            "capacity": capacity,
-            "source_kind": source_kind,
-            "reason": "Semantic decomposition requires Sol-owned design.",
-            "units": [],
-            "conflict_graph": {},
-            "waves": [],
-        }
 
-    expected = common | {"artifacts"}
-    source_kind = _manifest_source_kind(
-        source,
-        expected,
-        default="explicit_artifact_boundaries",
-        allowed=_ARTIFACT_SOURCE_KINDS,
-    )
-    if source["schema"] != "team-efficiency/work-package-v1":
-        raise ValueError("work-package schema is invalid")
-    if decomposition != "artifact_boundaries":
-        raise ValueError("work-package decomposition is invalid")
-    capacity = source["capacity"]
-    if type(capacity) is not int or not 1 <= capacity <= MAX_MANIFEST_UNITS:
-        raise ValueError("capacity is out of bounds")
-    artifacts = source["artifacts"]
-    if not isinstance(artifacts, Sequence) or isinstance(
-        artifacts, (str, bytes, bytearray)
-    ):
-        raise ValueError("artifacts must be a list")
-    if not artifacts or len(artifacts) > MAX_MANIFEST_UNITS:
-        raise ValueError("artifact count is out of bounds")
-    units = sorted(
-        (_artifact(artifact) for artifact in artifacts),
-        key=lambda unit: unit["task_id"],
-    )
+def _scheduled_plan(
+    *,
+    task_id: str,
+    goal: str,
+    capacity: int,
+    source_kind: str,
+    units: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    units = sorted(units, key=lambda unit: unit["task_id"])
     unit_by_id = {unit["task_id"]: unit for unit in units}
     if len(unit_by_id) != len(units):
-        raise ValueError("artifact task ids must be unique")
+        raise ValueError("derived task ids must be unique")
     boundaries = [unit["output_boundary"] for unit in units]
     if len(set(boundaries)) != len(boundaries):
-        raise ValueError("artifact output boundaries must be unique")
+        raise ValueError("derived output boundaries must be unique")
     for unit in units:
         dependencies = unit["depends_on"]
         if unit["task_id"] in dependencies or not set(dependencies).issubset(
             unit_by_id
         ):
-            raise ValueError("artifact dependencies must name other known artifacts")
+            raise ValueError("derived dependencies must name other known units")
     _ensure_acyclic(unit_by_id)
     graph = _conflict_graph(units)
 
@@ -980,14 +1882,109 @@ def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema": "team-efficiency/decomposition-plan-v1",
         "status": "planned",
-        "task_id": _task_id(source["task_id"]),
-        "goal": _manifest_text(source["goal"], "goal"),
+        "task_id": task_id,
+        "goal": goal,
         "capacity": capacity,
         "source_kind": source_kind,
         "units": units,
         "conflict_graph": graph,
         "waves": waves,
     }
+
+
+def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Compile manual boundaries or verified Code Atlas evidence into safe waves."""
+
+    if len(_json_bytes(manifest)) > MAX_MANIFEST_BYTES:
+        raise ValueError("work-package manifest exceeds its byte budget")
+    source = _mapping(manifest, "work-package manifest")
+    common = frozenset({"schema", "task_id", "goal", "capacity", "decomposition"})
+    if source.get("schema") != "team-efficiency/work-package-v1":
+        raise ValueError("work-package schema is invalid")
+    task_id = _task_id(source.get("task_id"))
+    goal = _manifest_text(source.get("goal"), "goal")
+    capacity = source.get("capacity")
+    if type(capacity) is not int or not 1 <= capacity <= MAX_MANIFEST_UNITS:
+        raise ValueError("capacity is out of bounds")
+    decomposition = _text(source.get("decomposition"), "decomposition", maximum=32)
+
+    if decomposition in {"semantic", "needs_design"}:
+        source_kind = _manifest_source_kind(
+            source,
+            common,
+            default="none",
+            allowed=frozenset({"none"}),
+        )
+        return _needs_design_plan(
+            task_id=task_id,
+            goal=goal,
+            capacity=capacity,
+            source_kind=source_kind,
+            reason="Semantic decomposition requires Sol-owned design.",
+        )
+
+    if decomposition == "artifact_boundaries":
+        expected = common | {"artifacts"}
+        source_kind = _manifest_source_kind(
+            source,
+            expected,
+            default="explicit_artifact_boundaries",
+            allowed=_ARTIFACT_SOURCE_KINDS,
+        )
+        artifacts = source["artifacts"]
+        if not isinstance(artifacts, Sequence) or isinstance(
+            artifacts, (str, bytes, bytearray)
+        ):
+            raise ValueError("artifacts must be a list")
+        if not artifacts or len(artifacts) > MAX_MANIFEST_UNITS:
+            raise ValueError("artifact count is out of bounds")
+        units = [_artifact(artifact) for artifact in artifacts]
+        return _scheduled_plan(
+            task_id=task_id,
+            goal=goal,
+            capacity=capacity,
+            source_kind=source_kind,
+            units=units,
+        )
+
+    if decomposition != "atlas_evidence":
+        raise ValueError("work-package decomposition is invalid")
+    source_kind = _text(source.get("source_kind"), "source_kind", maximum=64)
+    if source_kind not in _ATLAS_SOURCE_KINDS:
+        raise ValueError("work-package source_kind is invalid")
+    if source_kind == "code_atlas_packet":
+        _exact_keys(
+            source,
+            common | {"source_kind", "packet", "path_bindings"},
+            "work-package manifest",
+        )
+        units, reason = _packet_units(
+            source["packet"],
+            source["path_bindings"],
+            task_id,
+        )
+    else:
+        _exact_keys(
+            source,
+            common | {"source_kind", "graph"},
+            "work-package manifest",
+        )
+        units, reason = _episode_units(source["graph"], task_id)
+    if units is None:
+        return _needs_design_plan(
+            task_id=task_id,
+            goal=goal,
+            capacity=capacity,
+            source_kind=source_kind,
+            reason=reason,
+        )
+    return _scheduled_plan(
+        task_id=task_id,
+        goal=goal,
+        capacity=capacity,
+        source_kind=source_kind,
+        units=units,
+    )
 
 
 def plan_waves(manifest: Mapping[str, Any]) -> dict[str, Any]:

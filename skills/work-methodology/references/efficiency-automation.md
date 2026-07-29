@@ -47,9 +47,10 @@ never invokes a verification lane; incomplete fingerprints cannot match.
 
 ## Deterministic work-package planning
 
-`decompose` and `plan-waves` compile an explicit, bounded artifact manifest
-into deterministic execution waves. They do not create semantic architecture
-or task boundaries.
+The decompose and plan-waves commands never invent semantic architecture. They
+accept either a legacy explicit artifact manifest or a separately shaped
+atlas_evidence manifest. In both cases the scheduler emits the largest safe
+ready wave up to declared capacity, using a stable task-id tie-break.
 
 ```json
 {
@@ -58,7 +59,7 @@ or task boundaries.
   "goal": "Deliver one bounded result",
   "capacity": 2,
   "decomposition": "artifact_boundaries",
-  "source_kind": "code_atlas_packet",
+  "source_kind": "explicit_artifact_boundaries",
   "artifacts": [
     {
       "task_id": "ATLAS-12B-A",
@@ -74,29 +75,56 @@ or task boundaries.
 }
 ```
 
-`source_kind` is optional; the default is `explicit_artifact_boundaries`.
-`code_atlas_packet` and `task_episode_graph` preserve the provenance of a
-known, accepted Code Atlas implementation packet or TaskEpisode graph. The
-helper does not import or call Code Atlas: it validates and compiles only the
-graph-derived boundaries provided in the manifest.
+Source kind is optional only for the legacy mode; its default is
+explicit_artifact_boundaries. A legacy artifacts list must not be labelled as
+Code Atlas evidence. Every artifact must have a unique task id and output
+boundary, a non-empty relative write scope, declared dependencies, required
+evidence, complexity, and explicit handoff contracts. Equal paths and
+ancestor/descendant paths conflict. Unsafe, wildcard-like, absolute,
+traversal, unknown-dependency, and cyclic manifests are rejected.
 
-Every artifact must have a unique task id and output boundary, a non-empty
-relative write scope, declared dependencies, required evidence, complexity,
-and explicit handoff contracts. Scopes are normalized and form a conflict graph:
-equal paths and ancestor/descendant paths conflict. Unsafe, wildcard-like,
-absolute, traversal, unknown-dependency, and cyclic manifests are rejected.
+### Verified Code Atlas evidence
 
-The resulting units retain task id, goal, output boundary, normalized scope,
-dependencies, required evidence, recommended route, and handoff contracts.
-The planner emits the largest safe ready wave up to declared capacity, then
-uses a stable task-id tie-break. Routes are `Terra High` for `routine`, `Terra
-Max` for `moderate` or `complex`, and `Sol High` only for `exceptional` work.
+Code Atlas planning requires decomposition atlas_evidence and one of two real
+model serializations:
 
-When no explicit artifact boundaries or graph-derived template exists, submit a
-manifest with `"decomposition": "semantic"`. The result is
-`"status": "needs_design"` with no invented units. Sol owns semantic
-architecture, dispatch decisions, review, integration, and final acceptance;
-this helper only compiles, validates, and schedules declared boundaries.
+- code_atlas_packet accepts an exact ImplementationPacket.to_dict() object plus
+  path_bindings. Bindings are render inputs, not a replacement schema: their
+  keys must exactly cover actual TemplateOperation.path_slot values, and every
+  used slot must be an actual SlotSpec of type relative_python_path.
+- task_episode_graph accepts an exact GraphQueryResult.to_dict() object. Its
+  scopes come only from real TaskEpisode --CHANGES--> SourceEvidence edges and
+  concrete SourceEvidence payload paths; this mode has no path-binding field.
+
+The helper validates every public dataclass field from the packet, graph, node,
+edge, operation, slot, constraint, dependency, and test records. It checks
+Code Atlas packet/node/edge canonical identifiers, permits only actual NodeKind
+and EdgeRelation values, and rejects look-alike graph fields. It does not
+import or call Code Atlas, a remote service, an LLM, or a vector store; it
+consumes inert JSON produced by to_dict().
+
+For a complete packet, operations resolving to one target path merge into one
+code unit. Distinct safe paths can share the first wave; a verification unit
+depends on every code unit and therefore cannot run early. DependencySpec
+describes environment requirements, not invented task edges. The direct
+contract hash is canonically derived from the verified packet_id and recipe_id;
+no extra packet field or ConstraintSpec convention is accepted.
+
+For a TaskEpisode graph, each code unit is a real code TaskEpisode. CHANGES
+evidence supplies its write scope and VERIFIED_BY TestSpec or ExecutionReceipt
+evidence supplies its acceptance evidence. Its direct contract hash is
+canonically derived from the normalized verified graph fingerprint and its
+TaskEpisode node id. It is an execution-contract identity, not a graph
+handoff-node claim. A Recipe --SUPERSEDES--> Recipe edge serializes the newer
+episode behind the older one; overlapping source-evidence paths are also
+serialized by the conflict graph. Sharing a graph fingerprint never creates a
+dependency edge by itself.
+
+Truncated graphs, packet gaps, missing render slots, missing concrete changed
+paths, missing verified evidence, or unknown semantics return status
+needs_design with no units or waves. Malformed paths, hashes, identifiers,
+fields, or graph endpoints are rejected. Sol owns the resulting design
+decision, dispatch, review, integration, and final acceptance.
 
 ## CLI
 
