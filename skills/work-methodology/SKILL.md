@@ -12,7 +12,7 @@ description: Use when a 2718lab engineering task spans multiple files or agents,
 - 多代理或需要持久计划：读 `references/work-packages.md`。
 - 需要创建、领取或恢复任务：读 `references/orchestration-runtime.md`。
 - 需要选择 team 形状或写 dispatch：读 `references/team-patterns.md`。
-- 需要生成安全的本地启动计划、恢复包、Todo 状态、契约/缓存检查、手工工件 wave，或基于 `ImplementationPacket.to_dict()` / observed `GraphQueryResult.to_dict()` 的 Atlas 证据 wave 与工作流注册计划：读 `references/efficiency-automation.md`。
+- 需要生成安全的本地启动计划、恢复包、Todo 状态、契约/缓存检查、手工工件 wave，或基于 `ImplementationPacket.to_dict()` / observed `GraphQueryResult.to_dict()` 的 Atlas 证据 wave 与工作流生命周期计划：读 `references/efficiency-automation.md`。
 - 不确定框架/API：读 `references/grounding-discipline.md`。
 - 准备交付：读 `references/verification-checklist.md`。
 
@@ -72,6 +72,10 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 ### 3. 使用插件编排
 
 多代理任务优先使用 `2718lab-tools` 的可执行编排：SQLite 保存任务 DAG、租约、事件和内容哈希，MCP 返回 ready wave、claim 结果和角色化上下文。Markdown 工作包是面向人和 agent 的投影视图，不是权威状态。
+
+执行 `team_efficiency.py` 生成的生命周期计划时，先按拓扑顺序完成全部 `workflow_register_task`，再逐 wave 调用 `workflow_ready`、`workflow_claim` 和 `workflow_endpoint_bind`；只有当前 wave 的所有任务都达到 `DONE` 才进入下一 wave。`workflow_ready` 因先前已将任务提升为 READY 而返回空集时，仍以 SQLite 中的持久任务状态为 claim 前置条件，不要求返回集合与计划 wave 完全相等。
+
+`task_episode_graph` 只能由可信 host 转发真实 Code Atlas 输出。规范化哈希、标识符和 provenance 字段只验证内部一致性，不认证调用方提供的 JSON 来源；observed fixture 也不是端到端真实性证据，来源认证边界由 ATLAS-12C 完成。
 
 严格索引任务在 `workflow_register_task` 时标记 `strict_index=true`：先 `project_index_sync`，再 `project_index_query` 取得 `trace_id`，创建 `worktree_checkpoint_create`，写入后以 `project_index_sync(bind_as="output")` 和再次查询确认输出；最后登记 `workflow_artifact_register(kind="verification", snapshot_id=...)`，才可 `workflow_complete`。旧任务保持 `strict_index=false`。
 

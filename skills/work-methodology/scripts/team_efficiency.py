@@ -2158,11 +2158,31 @@ def _host_binding(reference: str) -> dict[str, str]:
 
 def _registration_plan(
     units: Sequence[Mapping[str, Any]],
+    waves: Sequence[Sequence[Mapping[str, Any]]],
     *,
     strict_index: bool,
 ) -> dict[str, Any]:
-    calls = []
-    for unit in sorted(units, key=lambda item: item["task_id"]):
+    unit_by_id = {unit["task_id"]: unit for unit in units}
+    wave_task_ids = [[unit["task_id"] for unit in wave] for wave in waves]
+    if any(task_ids != sorted(task_ids) for task_ids in wave_task_ids):
+        raise ValueError("execution wave task ids must use stable task-id order")
+    registration_order = [task_id for task_ids in wave_task_ids for task_id in task_ids]
+    if len(registration_order) != len(unit_by_id) or set(registration_order) != set(
+        unit_by_id
+    ):
+        raise ValueError(
+            "registration order must cover every derived unit exactly once"
+        )
+    registered: set[str] = set()
+    for task_id in registration_order:
+        if not set(unit_by_id[task_id]["depends_on"]) <= registered:
+            raise ValueError("registration order must place dependencies first")
+        registered.add(task_id)
+
+    register_steps = []
+    task_steps: dict[str, dict[str, Any]] = {}
+    for task_id in registration_order:
+        unit = unit_by_id[task_id]
         input_hash = _sha256_json(
             {
                 "kind": "team_efficiency_task_input_v1",
@@ -2187,73 +2207,105 @@ def _registration_plan(
         )
         if len(card.encode("utf-8")) > MAX_REGISTRATION_CARD_BYTES:
             raise ValueError("registration card exceeds its byte budget")
-        calls.append(
+        register_steps.append(
             {
-                "task_id": unit["task_id"],
-                "workflow_register_task": {
-                    "tool": "workflow_register_task",
+                "tool": "workflow_register_task",
+                "arguments": {
+                    "workflow_id": _host_binding("workflow_id"),
+                    "task_id": unit["task_id"],
+                    "title": unit["goal"],
+                    "owner_role": unit["recommended_route"],
+                    "card": card,
+                    "dependencies": list(unit["depends_on"]),
+                    "write_scope": list(unit["write_scope"]),
+                    "direct_contract_hashes": list(unit["direct_contract_hashes"]),
+                    "required_evidence": list(unit["required_evidence"]),
+                    "input_hash": input_hash,
+                    "strict_index": strict_index,
+                    "workspace_root": _host_binding("workspace_root"),
+                    "input_snapshot_id": _host_binding("input_snapshot_id"),
+                    "task_node_ids": list(unit["task_node_ids"]),
+                    "contract_node_ids": list(unit["contract_node_ids"]),
+                },
+                "host_bound_fields": [
+                    "input_snapshot_id",
+                    "workflow_id",
+                    "workspace_root",
+                ],
+            }
+        )
+        task_steps[task_id] = {
+            "task_id": task_id,
+            "workflow_claim": {
+                "tool": "workflow_claim",
+                "arguments": {
+                    "task_id": task_id,
+                    "owner": _host_binding("owner"),
+                    "expires_at": _host_binding("expires_at"),
+                    "host_target": _host_binding("host_target"),
+                    "now": _host_binding("now"),
+                },
+                "host_bound_fields": [
+                    "expires_at",
+                    "host_target",
+                    "now",
+                    "owner",
+                ],
+            },
+            "workflow_endpoint_bind": {
+                "tool": "workflow_endpoint_bind",
+                "arguments": {
+                    "workflow_id": _host_binding("workflow_id"),
+                    "task_id": task_id,
+                    "owner": _host_binding("owner"),
+                    "lease_epoch": _host_binding("lease_epoch"),
+                    "host_target": _host_binding("host_target"),
+                    "now": _host_binding("now"),
+                },
+                "host_bound_fields": [
+                    "host_target",
+                    "lease_epoch",
+                    "now",
+                    "owner",
+                    "workflow_id",
+                ],
+            },
+        }
+
+    execution_waves = []
+    for index, task_ids in enumerate(wave_task_ids):
+        execution_waves.append(
+            {
+                "wave_index": index + 1,
+                "task_ids": task_ids,
+                "workflow_ready": {
+                    "tool": "workflow_ready",
                     "arguments": {
                         "workflow_id": _host_binding("workflow_id"),
-                        "task_id": unit["task_id"],
-                        "title": unit["goal"],
-                        "owner_role": unit["recommended_route"],
-                        "card": card,
-                        "dependencies": list(unit["depends_on"]),
-                        "write_scope": list(unit["write_scope"]),
-                        "direct_contract_hashes": list(unit["direct_contract_hashes"]),
-                        "required_evidence": list(unit["required_evidence"]),
-                        "input_hash": input_hash,
-                        "strict_index": strict_index,
-                        "workspace_root": _host_binding("workspace_root"),
-                        "input_snapshot_id": _host_binding("input_snapshot_id"),
-                        "task_node_ids": list(unit["task_node_ids"]),
-                        "contract_node_ids": list(unit["contract_node_ids"]),
                     },
-                    "host_bound_fields": [
-                        "input_snapshot_id",
-                        "workflow_id",
-                        "workspace_root",
-                    ],
+                    "host_bound_fields": ["workflow_id"],
                 },
-                "workflow_claim": {
-                    "tool": "workflow_claim",
-                    "arguments": {
-                        "task_id": unit["task_id"],
-                        "owner": _host_binding("owner"),
-                        "expires_at": _host_binding("expires_at"),
-                        "host_target": _host_binding("host_target"),
-                        "now": _host_binding("now"),
-                    },
-                    "host_bound_fields": [
-                        "expires_at",
-                        "host_target",
-                        "now",
-                        "owner",
-                    ],
+                "ready_result_policy": {
+                    "allow_empty_result": True,
+                    "require_exact_task_set": False,
+                    "claim_precondition": "READY",
                 },
-                "workflow_endpoint_bind": {
-                    "tool": "workflow_endpoint_bind",
-                    "arguments": {
-                        "workflow_id": _host_binding("workflow_id"),
-                        "task_id": unit["task_id"],
-                        "owner": _host_binding("owner"),
-                        "lease_epoch": _host_binding("lease_epoch"),
-                        "host_target": _host_binding("host_target"),
-                        "now": _host_binding("now"),
-                    },
-                    "host_bound_fields": [
-                        "host_target",
-                        "lease_epoch",
-                        "now",
-                        "owner",
-                        "workflow_id",
-                    ],
+                "task_steps": [task_steps[task_id] for task_id in task_ids],
+                "completion_barrier": {
+                    "condition": "all_tasks_reach_state",
+                    "task_ids": task_ids,
+                    "required_state": "DONE",
+                    "advance_to_wave_index": (
+                        index + 2 if index + 1 < len(wave_task_ids) else None
+                    ),
                 },
             }
         )
     return {
-        "schema": "team-efficiency/workflow-registration-plan-v1",
-        "units": calls,
+        "schema": "team-efficiency/workflow-lifecycle-plan-v1",
+        "registration_order": registration_order,
+        "register_steps": register_steps,
+        "execution_waves": execution_waves,
     }
 
 
@@ -2276,7 +2328,7 @@ def _needs_design_plan(
         "units": [],
         "conflict_graph": {},
         "waves": [],
-        "registration_plan": _registration_plan((), strict_index=False),
+        "registration_plan": _registration_plan((), (), strict_index=False),
     }
 
 
@@ -2334,6 +2386,7 @@ def _scheduled_plan(
         "waves": waves,
         "registration_plan": _registration_plan(
             units,
+            waves,
             strict_index=source_kind in _ATLAS_SOURCE_KINDS,
         ),
     }

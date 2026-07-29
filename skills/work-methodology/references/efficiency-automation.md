@@ -84,16 +84,17 @@ traversal, unknown-dependency, and cyclic manifests are rejected.
 ### Verified Code Atlas evidence
 
 Code Atlas planning requires decomposition atlas_evidence and one of two real
-model serializations:
+model serializations forwarded by a trusted host:
 
 - code_atlas_packet accepts an exact ImplementationPacket.to_dict() object plus
   path_bindings. Bindings are render inputs, not a replacement schema: their
   keys must exactly cover actual TemplateOperation.path_slot values, and every
   used slot must be an actual SlotSpec of type relative_python_path.
-- `task_episode_graph` requires the extractor's explicit `eligible` boolean and
-  an exact `GraphQueryResult.to_dict()` object. Its scopes come only from real
-  `TaskEpisode --CHANGES--> SourceEvidence` edges and concrete
-  `SourceEvidence` payload paths; this mode has no path-binding field.
+- `task_episode_graph` requires a trusted host to forward the real extractor's
+  explicit `eligible` boolean and exact `GraphQueryResult.to_dict()` object.
+  Its scopes come only from real `TaskEpisode --CHANGES--> SourceEvidence`
+  edges and concrete `SourceEvidence` payload paths; this mode has no
+  path-binding field.
 
 The helper validates every public dataclass field from the packet, graph, node,
 edge, operation, slot, constraint, dependency, and test records. It checks
@@ -101,6 +102,12 @@ Code Atlas packet/node/edge canonical identifiers, permits only actual NodeKind
 and EdgeRelation values, and rejects look-alike graph fields. It does not
 import or call Code Atlas, a remote service, an LLM, or a vector store; it
 consumes inert JSON produced by to_dict().
+
+Canonical identifiers, content hashes, and provenance fields establish
+internal consistency only; they do not authenticate the source of caller-
+supplied JSON. The host is responsible for forwarding real Code Atlas output
+across a trusted boundary. Caller-crafted data is not authenticated merely
+because it reproduces valid hashes or labels.
 
 For a complete packet, operations resolving to one target path merge into one
 code unit. Distinct safe paths can share the first wave; a verification unit
@@ -128,8 +135,10 @@ The current upstream `PythonRecipeExtractor` constructs its edges with the
 model's default `declared` provenance. Its unchanged
 `ExtractionResult -> GraphQueryResult.to_dict()` output therefore fails closed
 with reason `ATLAS_EDGE_UNVERIFIED`. The positive trust-contract fixture is
-only a consumer contract: real end-to-end planning remains gated on upstream
-promotion of accepted-task edges to observed provenance.
+only a consumer contract, not an end-to-end or source-authenticity test. Real
+end-to-end planning remains gated on upstream promotion of accepted-task edges
+to observed provenance, and ATLAS-12C completes the trusted-source authenticity
+boundary.
 
 The graph execution-contract hash uses only a canonical sorted set of
 participating node ids and edge ids plus the `TaskEpisode` id. Creation times
@@ -146,20 +155,35 @@ malformed graph evidence returns `needs_design` with a stable
 `ATLAS_*` reason and no units, waves, or raw exception text. Packet gaps and
 missing render slots also return `needs_design`.
 
-### Workflow registration plan
+### Workflow lifecycle plan
 
 Every result includes a versioned
-`team-efficiency/workflow-registration-plan-v1` registration plan. Each
-operation is a `{tool, arguments, host_bound_fields}` descriptor whose
-argument names match the real MCP function signature. Each planned unit
-contains, in order:
+`team-efficiency/workflow-lifecycle-plan-v1` lifecycle plan under the stable
+`registration_plan` result key. Each operation is a
+`{tool, arguments, host_bound_fields}` descriptor whose argument names match
+the real MCP function signature.
 
-1. `workflow_register_task` with exactly `workflow_id`, `task_id`, `title`,
-   `owner_role`, and `card`;
-2. `workflow_claim` with `task_id`, `owner`, and `expires_at`, plus optional
-   `host_target` and `now`; and
-3. `workflow_endpoint_bind` with `workflow_id`, `task_id`, `owner`,
-   `lease_epoch`, and `host_target`, plus optional `now`.
+The host executes the plan in two separated phases:
+
+1. Register all tasks by following `registration_order` and `register_steps`.
+   This is a stable topological order: every dependency is registered before
+   its dependent. The required parameters for `workflow_register_task` are
+   `workflow_id`, `task_id`, `title`, `owner_role`, and `card`.
+2. Process `execution_waves` in order. Each wave first invokes
+   `workflow_ready`, whose sole required parameter is `workflow_id`, then
+   invokes that wave's `workflow_claim` and `workflow_endpoint_bind`
+   descriptors. The required parameters for `workflow_claim` are `task_id`,
+   `owner`, and `expires_at`; the required parameters for
+   `workflow_endpoint_bind` are `workflow_id`, `task_id`, `owner`,
+   `lease_epoch`, and `host_target`.
+
+`workflow_ready` promotes dependency-satisfied NEW tasks, but it may return an
+empty result when an earlier capacity-limited wave already promoted a later
+task to READY. The plan therefore does not require the returned ready-task set
+to equal the scheduled wave. Claims use durable task state as their
+precondition. A machine-readable completion barrier permits advancing only
+after every task in the current wave reaches `DONE`; claim and bind never
+immediately follow an individual registration step.
 
 `workflow_register_task.arguments` places `dependencies`, `write_scope`,
 `direct_contract_hashes`, `task_node_ids`, `contract_node_ids`,

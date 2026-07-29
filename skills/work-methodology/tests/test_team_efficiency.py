@@ -39,6 +39,9 @@ from code_atlas.extractors import (  # noqa: E402
     ExtractionRequest,
     PythonRecipeExtractor,
 )
+from orchestrator.models import Task, TaskState, Workflow, WorkflowKind  # noqa: E402
+from orchestrator.service import OrchestratorService  # noqa: E402
+from orchestrator.store import SQLiteStore  # noqa: E402
 from project_index.models import SnapshotFile  # noqa: E402
 
 
@@ -178,9 +181,160 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.repo = (
             Path(r"D:\bun\tmp\codex\2718-devkit\worktrees") / "atlas12b-team-efficiency"
         )
+        self._stores: list[SQLiteStore] = []
 
     def tearDown(self) -> None:
+        for store in reversed(self._stores):
+            store.close()
         self._temporary_directory.cleanup()
+
+    def orchestrator(
+        self,
+        database_name: str,
+        workflow_id: str,
+    ) -> tuple[SQLiteStore, OrchestratorService]:
+        store = SQLiteStore(self.temp / database_name)
+        self._stores.append(store)
+        service = OrchestratorService(store)
+        service.create_workflow(
+            Workflow(
+                workflow_id,
+                WorkflowKind.DAG,
+                "Lifecycle regression",
+                "Execute the generated lifecycle plan against durable SQLite state.",
+            )
+        )
+        return store, service
+
+    def resolve_host_arguments(
+        self,
+        descriptor: dict[str, object],
+        bindings: dict[str, object],
+    ) -> dict[str, object]:
+        self.assertEqual(
+            {"tool", "arguments", "host_bound_fields"},
+            set(descriptor),
+        )
+        arguments = copy.deepcopy(descriptor["arguments"])
+        self.assertIsInstance(arguments, dict)
+        for field in descriptor["host_bound_fields"]:
+            reference = arguments[field]
+            self.assertEqual("host", reference["source"])
+            self.assertEqual(field, reference["ref"])
+            self.assertTrue(reference["description"])
+            arguments[field] = bindings[field]
+        return arguments
+
+    def execute_lifecycle(
+        self,
+        *,
+        plan: dict[str, object],
+        store: SQLiteStore,
+        service: OrchestratorService,
+        workflow_id: str,
+    ) -> list[list[str]]:
+        lifecycle = plan["registration_plan"]
+        base_bindings: dict[str, object] = {
+            "workflow_id": workflow_id,
+            "workspace_root": str(self.repo),
+            "input_snapshot_id": "snapshot-lifecycle",
+        }
+        for descriptor in lifecycle["register_steps"]:
+            arguments = self.resolve_host_arguments(descriptor, base_bindings)
+            service.register_task(
+                Task(
+                    id=arguments["task_id"],
+                    workflow_id=arguments["workflow_id"],
+                    title=arguments["title"],
+                    owner_role=arguments["owner_role"],
+                    dependencies=tuple(arguments["dependencies"]),
+                    write_scope=tuple(arguments["write_scope"]),
+                ),
+                card=arguments["card"],
+                direct_contract_hashes=tuple(arguments["direct_contract_hashes"]),
+                required_evidence=tuple(arguments["required_evidence"]),
+                input_hash=arguments["input_hash"],
+                strict_index=arguments["strict_index"],
+                workspace_root=arguments["workspace_root"],
+                input_snapshot_id=arguments["input_snapshot_id"],
+                task_node_ids=tuple(arguments["task_node_ids"]),
+                contract_node_ids=tuple(arguments["contract_node_ids"]),
+            )
+
+        ready_results: list[list[str]] = []
+        for wave_offset, wave in enumerate(lifecycle["execution_waves"]):
+            ready_arguments = self.resolve_host_arguments(
+                wave["workflow_ready"],
+                base_bindings,
+            )
+            ready_results.append(
+                [task.id for task in service.ready_wave(ready_arguments["workflow_id"])]
+            )
+            for task_step in wave["task_steps"]:
+                task_id = task_step["task_id"]
+                slug = task_id.lower().replace("-", "_")
+                task_bindings = {
+                    **base_bindings,
+                    "owner": f"owner-{slug}",
+                    "expires_at": "2030-01-01T00:10:00+00:00",
+                    "host_target": f"/root/{slug}",
+                    "now": "2030-01-01T00:00:00+00:00",
+                }
+                claim = self.resolve_host_arguments(
+                    task_step["workflow_claim"],
+                    task_bindings,
+                )
+                running, lease = service.claim_task(
+                    claim["task_id"],
+                    claim["owner"],
+                    expires_at=claim["expires_at"],
+                    host_target=claim["host_target"],
+                    now=claim["now"],
+                )
+                task_bindings["lease_epoch"] = lease.epoch
+                bind = self.resolve_host_arguments(
+                    task_step["workflow_endpoint_bind"],
+                    task_bindings,
+                )
+                bound = service.bind_endpoint(
+                    bind["workflow_id"],
+                    bind["task_id"],
+                    owner=bind["owner"],
+                    epoch=bind["lease_epoch"],
+                    host_target=bind["host_target"],
+                    now=bind["now"],
+                )
+                self.assertEqual(bind["host_target"], bound.host_target)
+                done = service.complete_task(
+                    task_id,
+                    expected_version=running.version,
+                    owner=lease.owner,
+                    epoch=lease.epoch,
+                    now=task_bindings["now"],
+                )
+                self.assertEqual(TaskState.DONE, done.state)
+
+            barrier = wave["completion_barrier"]
+            self.assertEqual("all_tasks_reach_state", barrier["condition"])
+            self.assertEqual(wave["task_ids"], barrier["task_ids"])
+            self.assertEqual("DONE", barrier["required_state"])
+            expected_next = (
+                wave_offset + 2
+                if wave_offset + 1 < len(lifecycle["execution_waves"])
+                else None
+            )
+            self.assertEqual(expected_next, barrier["advance_to_wave_index"])
+            states = {
+                task.id: task.state
+                for task in store.list_tasks(workflow_id)
+                if task.id in barrier["task_ids"]
+            }
+            self.assertEqual(
+                {TaskState.DONE},
+                set(states.values()),
+                "the next lifecycle wave must wait for every barrier task",
+            )
+        return ready_results
 
     def bootstrap_kwargs(self) -> dict[str, object]:
         return {
@@ -1225,6 +1379,90 @@ class TeamEfficiencyTests(unittest.TestCase):
             json.loads(output.getvalue())["reason"],
         )
 
+    def test_registration_plan_registers_dependencies_before_dependents(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        manifest = self.decomposition_manifest()
+        manifest["artifacts"][0]["depends_on"] = ["ATLAS-12B-B"]
+        manifest["artifacts"] = manifest["artifacts"][:2]
+        plan = helper.decompose(manifest)
+        workflow_id = "dependency-registration"
+        store, service = self.orchestrator(
+            "dependency-registration.sqlite",
+            workflow_id,
+        )
+        lifecycle = plan["registration_plan"]
+
+        self.assertEqual(
+            ["ATLAS-12B-B", "ATLAS-12B-A"],
+            lifecycle["registration_order"],
+        )
+        self.assertEqual(
+            lifecycle["registration_order"],
+            [
+                descriptor["arguments"]["task_id"]
+                for descriptor in lifecycle["register_steps"]
+            ],
+        )
+        self.assertEqual(
+            [["ATLAS-12B-B"], ["ATLAS-12B-A"]],
+            [[unit["task_id"] for unit in wave] for wave in plan["waves"]],
+        )
+        self.assertEqual(
+            [["ATLAS-12B-B"], ["ATLAS-12B-A"]],
+            [wave["task_ids"] for wave in lifecycle["execution_waves"]],
+        )
+        self.assertEqual(
+            [["ATLAS-12B-B"], ["ATLAS-12B-A"]],
+            self.execute_lifecycle(
+                plan=plan,
+                store=store,
+                service=service,
+                workflow_id=workflow_id,
+            ),
+        )
+
+    def test_lifecycle_ready_allows_capacity_split_tasks_already_ready(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        manifest = self.decomposition_manifest()
+        manifest["artifacts"][2]["depends_on"] = []
+        plan = helper.decompose(manifest)
+        workflow_id = "capacity-split-ready"
+        store, service = self.orchestrator(
+            "capacity-split-ready.sqlite",
+            workflow_id,
+        )
+        lifecycle = plan["registration_plan"]
+
+        self.assertEqual(
+            [["ATLAS-12B-A", "ATLAS-12B-B"], ["ATLAS-12B-C"]],
+            [wave["task_ids"] for wave in lifecycle["execution_waves"]],
+        )
+        for wave in lifecycle["execution_waves"]:
+            self.assertEqual(
+                {
+                    "allow_empty_result": True,
+                    "require_exact_task_set": False,
+                    "claim_precondition": "READY",
+                },
+                wave["ready_result_policy"],
+            )
+        self.assertEqual(
+            [
+                ["ATLAS-12B-A", "ATLAS-12B-B", "ATLAS-12B-C"],
+                [],
+            ],
+            self.execute_lifecycle(
+                plan=plan,
+                store=store,
+                service=service,
+                workflow_id=workflow_id,
+            ),
+        )
+
     def test_planned_units_emit_versioned_executable_registration_calls(
         self,
     ) -> None:
@@ -1235,18 +1473,27 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         registration = plan["registration_plan"]
         self.assertEqual(
-            "team-efficiency/workflow-registration-plan-v1",
+            "team-efficiency/workflow-lifecycle-plan-v1",
             registration["schema"],
         )
-        self.assertEqual(len(plan["units"]), len(registration["units"]))
-        first = registration["units"][0]
+        top_level_waves = [[unit["task_id"] for unit in wave] for wave in plan["waves"]]
+        self.assertEqual(
+            [task_id for wave in top_level_waves for task_id in wave],
+            registration["registration_order"],
+        )
+        self.assertEqual(
+            top_level_waves,
+            [wave["task_ids"] for wave in registration["execution_waves"]],
+        )
+        self.assertEqual(len(plan["units"]), len(registration["register_steps"]))
+        first = registration["register_steps"][0]
         self.assertEqual(
             {"tool", "arguments", "host_bound_fields"},
-            set(first["workflow_register_task"]),
+            set(first),
         )
         self.assertEqual(
             "workflow_register_task",
-            first["workflow_register_task"]["tool"],
+            first["tool"],
         )
         self.assertEqual(
             {
@@ -1266,26 +1513,11 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "task_node_ids",
                 "contract_node_ids",
             },
-            set(first["workflow_register_task"]["arguments"]),
+            set(first["arguments"]),
         )
         self.assertIsInstance(
-            first["workflow_register_task"]["arguments"]["card"],
+            first["arguments"]["card"],
             str,
-        )
-        self.assertEqual(
-            {"task_id", "owner", "expires_at", "host_target", "now"},
-            set(first["workflow_claim"]["arguments"]),
-        )
-        self.assertEqual(
-            {
-                "workflow_id",
-                "task_id",
-                "owner",
-                "lease_epoch",
-                "host_target",
-                "now",
-            },
-            set(first["workflow_endpoint_bind"]["arguments"]),
         )
         server_tree = ast.parse(
             (ROOT.parents[1] / "mcp-tools" / "server.py").read_text(encoding="utf-8")
@@ -1295,6 +1527,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         for node in server_tree.body:
             if not isinstance(node, ast.FunctionDef) or node.name not in {
                 "workflow_register_task",
+                "workflow_ready",
                 "workflow_claim",
                 "workflow_endpoint_bind",
             }:
@@ -1303,6 +1536,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             signatures[node.name] = set(names)
             required_count = len(names) - len(node.args.defaults)
             required[node.name] = set(names[:required_count])
+        self.assertEqual({"workflow_id"}, signatures["workflow_ready"])
+        self.assertEqual({"workflow_id"}, required["workflow_ready"])
         self.assertEqual(
             {
                 "workflow_id",
@@ -1322,25 +1557,25 @@ class TeamEfficiencyTests(unittest.TestCase):
             required["workflow_endpoint_bind"],
         )
         unit_by_id = {unit["task_id"]: unit for unit in plan["units"]}
-        for call in registration["units"]:
-            unit = unit_by_id[call["task_id"]]
-            for operation_name in (
-                "workflow_register_task",
-                "workflow_claim",
-                "workflow_endpoint_bind",
-            ):
-                operation = call[operation_name]
-                self.assertEqual(operation_name, operation["tool"])
-                self.assertEqual(
-                    signatures[operation_name],
-                    set(operation["arguments"]),
-                )
-                self.assertEqual(
-                    sorted(operation["host_bound_fields"]),
-                    operation["host_bound_fields"],
-                )
-            register = call["workflow_register_task"]
+        registered: set[str] = set()
+        for register in registration["register_steps"]:
             arguments = register["arguments"]
+            task_id = arguments["task_id"]
+            unit = unit_by_id[task_id]
+            self.assertEqual("workflow_register_task", register["tool"])
+            self.assertEqual(
+                signatures["workflow_register_task"],
+                set(arguments),
+            )
+            self.assertEqual(
+                sorted(register["host_bound_fields"]),
+                register["host_bound_fields"],
+            )
+            self.assertTrue(
+                set(unit["depends_on"]) <= registered,
+                "register_steps must be a dependency-first topological order",
+            )
+            registered.add(task_id)
             self.assertEqual(unit["depends_on"], arguments["dependencies"])
             self.assertEqual(unit["write_scope"], arguments["write_scope"])
             self.assertEqual(
@@ -1379,22 +1614,64 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual("host", arguments[field]["source"])
                 self.assertEqual(field, arguments[field]["ref"])
                 self.assertTrue(arguments[field]["description"])
-            for operation_descriptor, fields in (
-                (
-                    call["workflow_claim"],
-                    ("owner", "expires_at", "host_target", "now"),
-                ),
-                (
-                    call["workflow_endpoint_bind"],
-                    ("owner", "lease_epoch", "host_target", "now"),
-                ),
-            ):
-                operation = operation_descriptor["arguments"]
-                for field in fields:
-                    self.assertIn(field, operation_descriptor["host_bound_fields"])
-                    self.assertEqual("host", operation[field]["source"])
-                    self.assertEqual(field, operation[field]["ref"])
-                    self.assertTrue(operation[field]["description"])
+
+        for wave_index, wave in enumerate(registration["execution_waves"], start=1):
+            self.assertEqual(wave_index, wave["wave_index"])
+            self.assertEqual(sorted(wave["task_ids"]), wave["task_ids"])
+            ready = wave["workflow_ready"]
+            self.assertEqual("workflow_ready", ready["tool"])
+            self.assertEqual(signatures["workflow_ready"], set(ready["arguments"]))
+            self.assertEqual(["workflow_id"], ready["host_bound_fields"])
+            self.assertEqual(
+                {
+                    "allow_empty_result": True,
+                    "require_exact_task_set": False,
+                    "claim_precondition": "READY",
+                },
+                wave["ready_result_policy"],
+            )
+            self.assertEqual(
+                wave["task_ids"],
+                [step["task_id"] for step in wave["task_steps"]],
+            )
+            barrier = wave["completion_barrier"]
+            self.assertEqual("all_tasks_reach_state", barrier["condition"])
+            self.assertEqual(wave["task_ids"], barrier["task_ids"])
+            self.assertEqual("DONE", barrier["required_state"])
+            self.assertEqual(
+                wave_index + 1
+                if wave_index < len(registration["execution_waves"])
+                else None,
+                barrier["advance_to_wave_index"],
+            )
+            for task_step in wave["task_steps"]:
+                for operation_name, fields in (
+                    (
+                        "workflow_claim",
+                        ("owner", "expires_at", "host_target", "now"),
+                    ),
+                    (
+                        "workflow_endpoint_bind",
+                        ("owner", "lease_epoch", "host_target", "now"),
+                    ),
+                ):
+                    operation_descriptor = task_step[operation_name]
+                    self.assertEqual(operation_name, operation_descriptor["tool"])
+                    self.assertEqual(
+                        signatures[operation_name],
+                        set(operation_descriptor["arguments"]),
+                    )
+                    self.assertEqual(
+                        sorted(operation_descriptor["host_bound_fields"]),
+                        operation_descriptor["host_bound_fields"],
+                    )
+                    operation = operation_descriptor["arguments"]
+                    self.assertEqual(task_step["task_id"], operation["task_id"])
+                    for field in fields:
+                        self.assertIn(field, operation_descriptor["host_bound_fields"])
+                        self.assertEqual("host", operation[field]["source"])
+                        self.assertEqual(field, operation[field]["ref"])
+                        self.assertTrue(operation[field]["description"])
 
         rendered = json.dumps(registration, sort_keys=True)
         self.assertNotIn(manifest["packet"]["trace_id"], rendered)
