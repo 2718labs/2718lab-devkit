@@ -286,9 +286,17 @@ def resolve_role(
         role = "code"
         complexity = "exceptional"
 
-    route, route_error = _profile_route(
-        profiles or HOST_PROFILES, host, role, complexity
-    )
+    policy = HOST_PROFILES if profiles is None else profiles
+    if not isinstance(policy, Mapping):
+        return _result(
+            RoutingStatus.REJECTED,
+            requested_host=host,
+            requested_role=raw_role,
+            requested_model=supplied_model,
+            requested_reasoning=supplied_reasoning,
+            reason="invalid_policy",
+        )
+    route, route_error = _profile_route(policy, host, role, complexity)
     if route is None:
         return _result(
             RoutingStatus.REJECTED,

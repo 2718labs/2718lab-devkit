@@ -28,6 +28,67 @@ def load_validator():
     return module
 
 
+def valid_integration_record() -> dict[str, object]:
+    task_id = "ATLAS-12A"
+    source_branch = "feature/code-atlas-v1-routing"
+    source_worktree = "D:/bun/tmp/codex/2718-devkit/worktrees/atlas12a-routing"
+    candidate_commit = "a" * 40
+    evidence_hash = f"sha256:{'b' * 64}"
+    return {
+        "task_id": task_id,
+        "source_branch": source_branch,
+        "source_worktree": source_worktree,
+        "candidate_commit": candidate_commit,
+        "base_revision": "c" * 40,
+        "evidence_hash": evidence_hash,
+        "integration_order": 1,
+        "review_receipt": {
+            "receipt_hash": f"sha256:{'d' * 64}",
+            "reviewer_role": "sol",
+            "reviewer_task_id": "ATLAS-COORDINATOR",
+            "decision": "accepted",
+            "task_id": task_id,
+            "candidate_commit": candidate_commit,
+            "source_branch": source_branch,
+            "source_worktree": source_worktree,
+            "evidence_hash": evidence_hash,
+        },
+        "active_write_scopes": [],
+    }
+
+
+def valid_resume_packet() -> dict[str, object]:
+    return {
+        "workflow_id": "atlas-workflow",
+        "task_id": "ATLAS-12A",
+        "lease_epoch": 4,
+        "current_endpoint": "/root/atlas12a_resume",
+        "base_commit": "a" * 40,
+        "candidate_commit": "b" * 40,
+        "branch_or_worktree": "feature/code-atlas-v1-routing",
+        "write_scope_hash": f"sha256:{'c' * 64}",
+        "latest_red": {
+            "command": "python -m pytest focused",
+            "result": "1 failed",
+        },
+        "latest_green": {
+            "command": "python -m pytest focused",
+            "result": "32 passed",
+        },
+        "contract_hashes": [f"sha256:{'d' * 64}"],
+        "evidence_hashes": [f"sha256:{'e' * 64}"],
+        "next_action": "run core verification lane",
+        "redacted": True,
+        "resume_steps": [
+            "workflow_endpoint_bind",
+            "workflow_inbox",
+            "workflow_artifact_resolve",
+            "workflow_message_ack",
+            "resume_next_action",
+        ],
+    }
+
+
 class WorkPackageValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         temp_root = Path(os.environ["CODEX_TASK_TEMP"])
@@ -324,6 +385,100 @@ class WorkPackageValidationTests(unittest.TestCase):
         self.assertTrue(any("one owner" in error.lower() for error in errors))
         self.assertTrue(any("write scope" in error.lower() for error in errors))
 
+    def test_parallel_integration_requires_bound_non_worker_sol_receipt(self) -> None:
+        validator = load_validator()
+        valid_record = valid_integration_record()
+
+        self.assertEqual(
+            [], validator.validate_parallel_integration_record(valid_record)
+        )
+
+        missing_receipt = {**valid_record}
+        missing_receipt.pop("review_receipt")
+        worker_receipt = {
+            **valid_record,
+            "review_receipt": {
+                **valid_record["review_receipt"],
+                "reviewer_task_id": valid_record["task_id"],
+            },
+        }
+        wrong_source = {
+            **valid_record,
+            "review_receipt": {
+                **valid_record["review_receipt"],
+                "source_branch": "feature/unreviewed-branch",
+            },
+        }
+        invalid_receipt_hash = {
+            **valid_record,
+            "review_receipt": {
+                **valid_record["review_receipt"],
+                "receipt_hash": "not-a-receipt-hash",
+            },
+        }
+
+        missing_errors = validator.validate_parallel_integration_record(missing_receipt)
+        worker_errors = validator.validate_parallel_integration_record(worker_receipt)
+        source_errors = validator.validate_parallel_integration_record(wrong_source)
+        hash_errors = validator.validate_parallel_integration_record(
+            invalid_receipt_hash
+        )
+
+        self.assertTrue(any("review_receipt" in error for error in missing_errors))
+        self.assertTrue(any("non-worker Sol" in error for error in worker_errors))
+        self.assertTrue(any("source_branch" in error for error in source_errors))
+        self.assertTrue(any("receipt_hash" in error for error in hash_errors))
+
+    def test_unknown_scope_state_fails_closed_and_cannot_hide_overlap(self) -> None:
+        validator = load_validator()
+        record = {
+            **valid_integration_record(),
+            "active_write_scopes": [
+                {"task": "ATLAS-12A", "state": "running", "paths": ["src"]},
+                {
+                    "task": "ATLAS-12B",
+                    "state": "pretend_finished",
+                    "paths": ["src/routing.py"],
+                },
+            ],
+        }
+
+        errors = validator.validate_parallel_integration_record(record)
+
+        self.assertTrue(any("unknown state" in error for error in errors))
+        self.assertTrue(
+            any("overlapping active write scopes" in error for error in errors)
+        )
+
+        terminal = {
+            **record,
+            "active_write_scopes": [
+                {"task": "ATLAS-12A", "state": "running", "paths": ["src"]},
+                {
+                    "task": "ATLAS-12B",
+                    "state": "done",
+                    "paths": ["src/routing.py"],
+                },
+            ],
+        }
+        terminal_errors = validator.validate_parallel_integration_record(terminal)
+        self.assertFalse(
+            any("overlapping active write scopes" in error for error in terminal_errors)
+        )
+
+        non_text_state = {
+            **record,
+            "active_write_scopes": [
+                {"task": "ATLAS-12A", "state": "running", "paths": ["src"]},
+                {"task": "ATLAS-12B", "state": [], "paths": ["src/routing.py"]},
+            ],
+        }
+        non_text_errors = validator.validate_parallel_integration_record(non_text_state)
+        self.assertTrue(any("unknown state" in error for error in non_text_errors))
+        self.assertTrue(
+            any("overlapping active write scopes" in error for error in non_text_errors)
+        )
+
     def test_verification_lanes_block_core_failures_and_bound_deferrals(self) -> None:
         validator = load_validator()
         valid_record = {
@@ -394,32 +549,7 @@ class WorkPackageValidationTests(unittest.TestCase):
 
     def test_resume_packet_and_interface_handoff_are_bounded_and_ordered(self) -> None:
         validator = load_validator()
-        packet = {
-            "workflow_id": "atlas-workflow",
-            "task_id": "ATLAS-12A",
-            "lease_epoch": 4,
-            "current_endpoint": "agent-7",
-            "base_commit": "de41eb5",
-            "candidate_commit": "candidate-sha",
-            "branch_or_worktree": "feature/code-atlas-v1-routing",
-            "write_scope_hash": "scope-sha",
-            "latest_red": {"command": "python -m pytest focused", "result": "1 failed"},
-            "latest_green": {
-                "command": "python -m pytest focused",
-                "result": "29 passed",
-            },
-            "contract_hashes": ["contract-sha"],
-            "evidence_hashes": ["evidence-sha"],
-            "next_action": "run core verification lane",
-            "redacted": True,
-            "resume_steps": [
-                "workflow_endpoint_bind",
-                "workflow_inbox",
-                "workflow_artifact_resolve",
-                "workflow_message_ack",
-                "resume_next_action",
-            ],
-        }
+        packet = valid_resume_packet()
         handoff = {
             "artifact_kind": "contract",
             "artifact_hash": "contract-sha",
@@ -462,6 +592,38 @@ class WorkPackageValidationTests(unittest.TestCase):
                 for error in validator.validate_mcp_handoff_record(unordered_handoff)
             )
         )
+
+    def test_resume_packet_rejects_unbounded_or_unstructured_payloads(self) -> None:
+        validator = load_validator()
+        packet = valid_resume_packet()
+        invalid_packets = {
+            "workflow text": {**packet, "workflow_id": "x" * 10_000},
+            "task identity": {**packet, "task_id": "ATLAS 12A\nstdout: secret"},
+            "lease epoch": {**packet, "lease_epoch": 2**80},
+            "endpoint": {**packet, "current_endpoint": "agent\nstderr: secret"},
+            "commit": {**packet, "candidate_commit": "candidate-sha"},
+            "branch/worktree": {**packet, "branch_or_worktree": "x" * 10_000},
+            "scope hash": {**packet, "write_scope_hash": "scope-sha"},
+            "next action": {**packet, "next_action": "x" * 10_000},
+            "artifact hash": {
+                **packet,
+                "contract_hashes": ["token=raw-secret-value"],
+            },
+            "raw log summary": {
+                **packet,
+                "latest_green": {
+                    "command": "python -m pytest focused",
+                    "result": "Authorization: Bearer raw-secret-value",
+                },
+            },
+        }
+
+        for label, invalid in invalid_packets.items():
+            with self.subTest(label=label):
+                self.assertTrue(
+                    validator.validate_crash_resume_packet(invalid),
+                    f"unsafe packet accepted: {label}",
+                )
 
 
 if __name__ == "__main__":

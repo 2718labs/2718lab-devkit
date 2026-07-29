@@ -53,8 +53,33 @@ STRICT_READ_ONLY_TASK_SEQUENCE = (
     "workflow_complete",
 )
 DOCUMENTATION_SUFFIXES = frozenset({".adoc", ".md", ".mdx", ".rst", ".txt"})
-ACTIVE_SCOPE_STATES = frozenset({"active", "claimed", "in_progress", "running"})
+NONTERMINAL_SCOPE_STATES = frozenset(
+    {
+        "active",
+        "blocked",
+        "ci_gate",
+        "claimed",
+        "in_progress",
+        "integrating",
+        "new",
+        "patching",
+        "pending",
+        "ready",
+        "release_gate",
+        "reviewing",
+        "running",
+        "sol_review",
+        "triaged",
+        "verifying",
+    }
+)
+TERMINAL_SCOPE_STATES = frozenset(
+    {"accepted", "cancelled", "completed", "done", "failed", "released"}
+)
 INTEGRATION_RECORD_FIELDS = (
+    "task_id",
+    "source_branch",
+    "source_worktree",
     "candidate_commit",
     "base_revision",
     "evidence_hash",
@@ -111,6 +136,22 @@ FORBIDDEN_RESUME_FIELDS = frozenset(
 )
 MAX_RESUME_TEXT_LENGTH = 512
 MAX_RESUME_HASHES = 16
+MAX_RESUME_ENDPOINT_LENGTH = 256
+MAX_RESUME_REF_LENGTH = 260
+MAX_RESUME_NEXT_ACTION_LENGTH = 256
+MAX_LEASE_EPOCH = 2**63 - 1
+IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+ENDPOINT_RE = re.compile(r"^/?[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
+COMMIT_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+ARTIFACT_HASH_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
+BRANCH_OR_WORKTREE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\\: @-]{0,259}$")
+FORBIDDEN_RESUME_PAYLOAD_RE = re.compile(
+    r"(?:authorization|api[-_]?key|password|passwd|secret|token|stdout|stderr)\s*[:=]"
+    r"|traceback \(most recent call last\)"
+    r"|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+    r"|(?:^|\s)\[(?:debug|info|warning|error|critical)\]",
+    re.IGNORECASE,
+)
 
 
 def _read(path: Path, errors: list[str]) -> str:
@@ -196,6 +237,36 @@ def _scope_overlap(left: str, right: str) -> bool:
     return left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
 
 
+def _validate_sol_review_receipt(
+    record: Mapping[str, object], errors: list[str]
+) -> None:
+    receipt = record.get("review_receipt")
+    if not isinstance(receipt, Mapping):
+        errors.append("integration record missing review_receipt")
+        return
+    for field in ("receipt_hash", "reviewer_role", "reviewer_task_id", "decision"):
+        value = receipt.get(field)
+        if not isinstance(value, str) or not value:
+            errors.append(f"integration review_receipt missing {field}")
+    if not _is_artifact_hash(receipt.get("receipt_hash")):
+        errors.append("integration review_receipt has invalid receipt_hash")
+    reviewer_role = receipt.get("reviewer_role")
+    reviewer_task_id = receipt.get("reviewer_task_id")
+    if reviewer_role != "sol" or reviewer_task_id == record.get("task_id"):
+        errors.append("integration review_receipt must be from non-worker Sol")
+    if receipt.get("decision") != "accepted":
+        errors.append("integration review_receipt decision must be accepted")
+    for field in (
+        "task_id",
+        "candidate_commit",
+        "source_branch",
+        "source_worktree",
+        "evidence_hash",
+    ):
+        if receipt.get(field) != record.get(field):
+            errors.append(f"integration review_receipt is not bound to {field}")
+
+
 def validate_parallel_integration_record(record: Mapping[str, object]) -> list[str]:
     """Validate a local candidate-integration record without touching Git/network."""
 
@@ -209,6 +280,7 @@ def validate_parallel_integration_record(record: Mapping[str, object]) -> list[s
                 errors.append("integration record missing positive integration_order")
         elif not isinstance(value, str) or not value:
             errors.append(f"integration record missing {field}")
+    _validate_sol_review_receipt(record, errors)
     if (
         record.get("direct_worker_merge") is True
         or record.get("worker_claimed_merge") is True
@@ -224,8 +296,10 @@ def validate_parallel_integration_record(record: Mapping[str, object]) -> list[s
             errors.append(f"active write scope {index} must be a mapping")
             continue
         state = scope.get("state")
-        if state not in ACTIVE_SCOPE_STATES:
+        if isinstance(state, str) and state in TERMINAL_SCOPE_STATES:
             continue
+        if not isinstance(state, str) or state not in NONTERMINAL_SCOPE_STATES:
+            errors.append(f"active write scope {index} has unknown state: {state}")
         task = scope.get("task")
         paths = scope.get("paths")
         if not isinstance(task, str) or not task:
@@ -255,6 +329,35 @@ def validate_parallel_integration_record(record: Mapping[str, object]) -> list[s
 
 def _nonempty_text(value: object) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _is_bounded_compact_text(value: object, max_length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= max_length
+        and value == value.strip()
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+        and FORBIDDEN_RESUME_PAYLOAD_RE.search(value) is None
+    )
+
+
+def _is_artifact_hash(value: object) -> bool:
+    return isinstance(value, str) and ARTIFACT_HASH_RE.fullmatch(value) is not None
+
+
+def _validate_resume_text(
+    field: str,
+    value: object,
+    errors: list[str],
+    *,
+    max_length: int,
+    pattern: re.Pattern[str] | None = None,
+) -> None:
+    if not _is_bounded_compact_text(value, max_length):
+        errors.append(f"crash-resume packet has invalid or unbounded {field}")
+        return
+    if pattern is not None and pattern.fullmatch(value) is None:
+        errors.append(f"crash-resume packet has invalid {field}")
 
 
 def _require_record_text(
@@ -354,17 +457,17 @@ def _validate_resume_summary(field: str, value: object, errors: list[str]) -> No
     if not isinstance(value, Mapping):
         errors.append(f"resume packet missing {field} summary")
         return
-    if set(value) != {"command", "result"}:
+    if len(value) != 2 or set(value) != {"command", "result"}:
         errors.append(
             f"resume packet {field} summary must contain command and result only"
         )
         return
     for key in ("command", "result"):
         summary_value = value.get(key)
-        if not _nonempty_text(summary_value):
-            errors.append(f"resume packet {field} summary missing {key}")
-        elif len(summary_value) > MAX_RESUME_TEXT_LENGTH:
-            errors.append(f"resume packet {field} summary is unbounded")
+        if not _is_bounded_compact_text(summary_value, MAX_RESUME_TEXT_LENGTH):
+            errors.append(
+                f"resume packet {field} summary has invalid or unbounded {key}"
+            )
 
 
 def _validate_resume_hashes(field: str, value: object, errors: list[str]) -> None:
@@ -374,8 +477,8 @@ def _validate_resume_hashes(field: str, value: object, errors: list[str]) -> Non
     if not value or len(value) > MAX_RESUME_HASHES:
         errors.append(f"resume packet {field} must be a bounded non-empty sequence")
         return
-    if not all(_nonempty_text(item) for item in value):
-        errors.append(f"resume packet {field} must contain only hashes")
+    if not all(_is_artifact_hash(item) for item in value):
+        errors.append(f"resume packet {field} must contain only bounded SHA-256 hashes")
 
 
 def validate_crash_resume_packet(packet: Mapping[str, object]) -> list[str]:
@@ -384,29 +487,59 @@ def validate_crash_resume_packet(packet: Mapping[str, object]) -> list[str]:
     if not isinstance(packet, Mapping):
         return ["crash-resume packet must be a mapping"]
     errors: list[str] = []
+    if len(packet) > len(RESUME_PACKET_FIELDS):
+        errors.append("crash-resume packet container is unbounded")
     for field in packet:
         if isinstance(field, str) and field.casefold() in FORBIDDEN_RESUME_FIELDS:
             errors.append(f"crash-resume packet contains forbidden field: {field}")
         elif field not in RESUME_PACKET_FIELDS:
             errors.append(f"crash-resume packet contains unknown field: {field}")
-    for field in (
-        "workflow_id",
-        "task_id",
+    for field in ("workflow_id", "task_id"):
+        _validate_resume_text(
+            field,
+            packet.get(field),
+            errors,
+            max_length=128,
+            pattern=IDENTITY_RE,
+        )
+    _validate_resume_text(
         "current_endpoint",
-        "base_commit",
-        "candidate_commit",
+        packet.get("current_endpoint"),
+        errors,
+        max_length=MAX_RESUME_ENDPOINT_LENGTH,
+        pattern=ENDPOINT_RE,
+    )
+    for field in ("base_commit", "candidate_commit"):
+        _validate_resume_text(
+            field,
+            packet.get(field),
+            errors,
+            max_length=64,
+            pattern=COMMIT_RE,
+        )
+    _validate_resume_text(
         "branch_or_worktree",
-        "write_scope_hash",
+        packet.get("branch_or_worktree"),
+        errors,
+        max_length=MAX_RESUME_REF_LENGTH,
+        pattern=BRANCH_OR_WORKTREE_RE,
+    )
+    if not _is_artifact_hash(packet.get("write_scope_hash")):
+        errors.append("crash-resume packet has invalid write_scope_hash")
+    _validate_resume_text(
         "next_action",
-    ):
-        _require_record_text(packet, field, errors, prefix="crash-resume packet")
+        packet.get("next_action"),
+        errors,
+        max_length=MAX_RESUME_NEXT_ACTION_LENGTH,
+    )
     lease_epoch = packet.get("lease_epoch")
     if (
         isinstance(lease_epoch, bool)
         or not isinstance(lease_epoch, int)
         or lease_epoch < 1
+        or lease_epoch > MAX_LEASE_EPOCH
     ):
-        errors.append("crash-resume packet missing positive lease_epoch")
+        errors.append("crash-resume packet has invalid bounded lease_epoch")
     if packet.get("redacted") is not True:
         errors.append("crash-resume packet must be explicitly redacted")
     _validate_resume_summary("latest_red", packet.get("latest_red"), errors)

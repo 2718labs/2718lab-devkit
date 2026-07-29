@@ -105,6 +105,32 @@ def test_router_fails_closed_for_unknown_capability_and_substitution() -> None:
     assert unknown.reason == "unknown_host"
 
 
+def test_empty_or_invalid_custom_profiles_never_fall_back_to_defaults() -> None:
+    empty = resolve_role(
+        {"host": "codex", "role": "code"},
+        _codex_capabilities(),
+        profiles={},
+    )
+    malformed = resolve_role(
+        {"host": "codex", "role": "code"},
+        _codex_capabilities(),
+        profiles={"hosts": []},
+    )
+    wrong_type = resolve_role(
+        {"host": "codex", "role": "code"},
+        _codex_capabilities(),
+        profiles=[],  # type: ignore[arg-type]
+    )
+
+    assert empty.status is RoutingStatus.REJECTED
+    assert empty.reason == "invalid_policy"
+    assert empty.effective_model is None
+    assert malformed.status is RoutingStatus.REJECTED
+    assert malformed.reason == "invalid_policy"
+    assert wrong_type.status is RoutingStatus.REJECTED
+    assert wrong_type.reason == "invalid_policy"
+
+
 def test_claude_profiles_and_fable_escalation_are_explicit() -> None:
     coordinator = resolve_role(
         {"host": "claude", "role": "coordinator"}, _claude_capabilities()
