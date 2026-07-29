@@ -1,7 +1,7 @@
 {
   "name": "2718lab-devkit",
-  "version": "0.2.0+codex.20260725190515",
-  "description": "2718lab development toolkit with Bugkiller workflow orchestration, plugin-bundled roles, and MCP coordination.",
+  "version": "0.3.0+codex.20260729030000",
+  "description": "2718lab development toolkit with release-candidate Code Atlas metadata and frozen interface contracts pending ATLAS-11 registration and ATLAS-13 E2E acceptance, plus Bugkiller workflow orchestration and MCP coordination. 2718lab 开发工具包，提供等待 ATLAS-11 注册和 ATLAS-13 E2E 验收的 Code Atlas 发布候选元数据与冻结接口契约，以及 Bugkiller 工作流编排与 MCP 协调。",
   "author": {
     "name": "2718lab",
     "url": "https://github.com/2718lab"
@@ -16,26 +16,40 @@
     "python-engineering",
     "open-source",
     "chatbot-plugin",
-    "skills"
+    "skills",
+    "code-atlas",
+    "automatic-ingestion",
+    "graph-recipes",
+    "team-decomposition",
+    "release-candidate",
+    "interface-contract",
+    "activation-gate"
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "2718lab DevKit",
-    "shortDescription": "Bugkiller \u4e0e 2718lab \u5de5\u7a0b\u5f00\u53d1\u5de5\u5177\u5305",
-    "longDescription": "\u9762\u5411 Codex \u7684 Bugkiller \u591a\u4ee3\u7406\u5de5\u4f5c\u6d41\uff0c\u4ee5\u53ca AstrBot \u63d2\u4ef6\u3001MCP \u670d\u52a1\u3001Python \u5de5\u7a0b\u3001\u5f00\u6e90\u4ed3\u5e93\u8fd0\u8425\u4e0e\u4ea4\u4ed8\u9a8c\u8bc1\u5de5\u5177\u5305\u3002",
+    "shortDescription": "2718lab developer toolkit with Code Atlas release-candidate contracts / 含 Code Atlas 发布候选契约的 2718lab 开发工具包",
+    "longDescription": "English-first 2718lab development toolkit with Code Atlas release-candidate metadata and frozen interfaces pending ATLAS-11 registration and ATLAS-13 E2E acceptance, plus Bugkiller workflow orchestration and MCP coordination. 面向 Codex 的 2718lab 开发工具包，提供等待 ATLAS-11 注册和 ATLAS-13 E2E 验收的 Code Atlas 发布候选元数据与冻结接口，以及 Bugkiller 工作流编排与 MCP 协调。",
     "developerName": "2718lab",
     "category": "Developer Tools",
     "capabilities": [
       "Skills",
       "MCP",
-      "Agents"
+      "Agents",
+      "Release-candidate contract metadata",
+      "Frozen interface definitions",
+      "Activation-gate documentation",
+      "Activation-gated Code Atlas contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)",
+      "Activation-gated automatic ingestion contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)",
+      "Activation-gated graph recipes contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)",
+      "Activation-gated team decomposition contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)"
     ],
     "websiteURL": "https://github.com/2718lab/2718lab-devkit",
     "defaultPrompt": [
-      "\u7528 Bugkiller \u5206\u8bca\u3001\u4fee\u590d\u5e76\u9a8c\u8bc1\u5f53\u524d\u4ed3\u5e93\u4e2d\u7684\u8fd9\u4e2a\u95ee\u9898\u3002",
-      "\u6309 2718lab \u89c4\u8303\u521b\u5efa\u4e00\u4e2a AstrBot \u63d2\u4ef6\u3002",
-      "\u6309 2718lab \u89c4\u8303\u521b\u5efa\u6216\u68c0\u67e5\u4e00\u4e2a Python MCP \u670d\u52a1\u3002"
+      "Review the Code Atlas v0.3 release-candidate contract and its ATLAS-11 activation gate.",
+      "Use the available Bugkiller tooling to decompose this engineering request with evidence gates.",
+      "审阅 Code Atlas v0.3 发布候选契约及其 ATLAS-11 激活门。"
     ]
   }
 }

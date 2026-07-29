@@ -1,7 +1,7 @@
 {
   "name": "2718lab-devkit",
-  "version": "0.2.0",
-  "description": "2718lab 工作室开发技能包，包含 Bugkiller 工作流、插件捆绑角色与 MCP 协调服务；遵循框架保真、渐进式披露和交付前验证。",
+  "version": "0.3.0",
+  "description": "2718lab development toolkit with release-candidate Code Atlas metadata and frozen interface contracts pending ATLAS-11 registration and ATLAS-13 E2E acceptance, plus Bugkiller workflow and MCP coordination. 2718lab 开发工具包，提供等待 ATLAS-11 注册和 ATLAS-13 E2E 验收的 Code Atlas 发布候选元数据与冻结接口契约，以及 Bugkiller 工作流与 MCP 协调。",
   "author": {
     "name": "2718lab"
   },
@@ -13,6 +13,13 @@
     "python-engineering",
     "open-source",
     "chatbot-plugin",
-    "skills"
+    "skills",
+    "code-atlas",
+    "automatic-ingestion",
+    "graph-recipes",
+    "team-decomposition",
+    "release-candidate",
+    "interface-contract",
+    "activation-gate"
   ]
 }
