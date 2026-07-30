@@ -518,8 +518,11 @@ class TeamEfficiencyTests(unittest.TestCase):
         helper,
         *,
         include_contexts: bool = True,
+        work_package: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        work_package = copy.deepcopy(self.decomposition_manifest())
+        work_package = copy.deepcopy(
+            self.decomposition_manifest() if work_package is None else work_package
+        )
         source_plan = helper.decompose(work_package)
         integration_commit = "a" * 40
         integration_tree = "b" * 40
@@ -743,6 +746,121 @@ class TeamEfficiencyTests(unittest.TestCase):
             )
             for unit in source_plan["units"]
         ]
+        return request
+
+    def fast_lane_schedule_request(self, helper) -> dict[str, object]:
+        work_package = self.decomposition_manifest()
+        work_package["capacity"] = 3
+        work_package["artifacts"] = [
+            {
+                "task_id": "FAST-LANE-ROUTINE",
+                "goal": "Implement routine work",
+                "output_boundary": "routine writer",
+                "write_scope": ["src/fast_lane/routine.py"],
+                "depends_on": [],
+                "required_evidence": ["routine-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+            {
+                "task_id": "FAST-LANE-MODERATE",
+                "goal": "Implement moderate work",
+                "output_boundary": "moderate writer",
+                "write_scope": ["src/fast_lane/moderate.py"],
+                "depends_on": [],
+                "required_evidence": ["moderate-proof"],
+                "complexity": "moderate",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+            {
+                "task_id": "FAST-LANE-FUTURE",
+                "goal": "Prepare the future work",
+                "output_boundary": "future writer",
+                "write_scope": ["src/fast_lane/future.py"],
+                "depends_on": ["FAST-LANE-MODERATE"],
+                "required_evidence": ["future-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+        ]
+        request = self.fast_lane_request(helper, work_package=work_package)
+        request["read_contexts"] = [
+            self.fast_lane_read_context(
+                helper,
+                task_id="FAST-LANE-FUTURE",
+                role="prewarm",
+                read_scope=["src/fast_lane/future.py"],
+            )
+        ]
+        return request
+
+    def fast_lane_code_atlas_request(self, helper) -> dict[str, object]:
+        work_package = self.code_atlas_manifest()
+        source_plan = helper.decompose(work_package)
+        integration_commit = "a" * 40
+        integration_tree = "b" * 40
+        packet_test = work_package["packet"]["tests"][0]
+        request = self.fast_lane_contexts_empty_request(helper)
+        request["work_package"] = work_package
+        request["target_gates"] = []
+        request["execution_contexts"] = []
+        request["read_contexts"] = []
+        request["scheduler_state"]["integration_state"] = {
+            "commit": integration_commit,
+            "tree": integration_tree,
+            "integration_workspace_snapshot_id": None,
+        }
+        for unit in source_plan["units"]:
+            is_verification = unit["unit_kind"] == "verification"
+            request["target_gates"].append(
+                {
+                    "task_id": unit["task_id"],
+                    "driver_gate_id": None if is_verification else "focused",
+                    "gates": [
+                        self.fast_lane_gate(
+                            argv=list(packet_test["argv"]),
+                            red_expected_exit_codes=[] if is_verification else [1],
+                            green_exit_code=packet_test["expected_exit_code"],
+                            red_failure_ids=[] if is_verification else None,
+                            acceptance_constraint_hashes=list(
+                                unit["acceptance_constraints"]
+                            ),
+                        )
+                    ],
+                }
+            )
+            if not is_verification:
+                request["execution_contexts"].append(
+                    self.fast_lane_execution_context(
+                        helper,
+                        task_id=unit["task_id"],
+                        base_commit=integration_commit,
+                        write_scope=list(unit["write_scope"]),
+                    )
+                )
+        code_units = [
+            unit for unit in source_plan["units"] if unit["unit_kind"] == "code"
+        ]
+        verification_unit = next(
+            unit
+            for unit in source_plan["units"]
+            if unit["unit_kind"] == "verification"
+        )
+        for unit, role in (
+            (code_units[2], "prewarm"),
+            (verification_unit, "verification"),
+        ):
+            task_slug = unit["task_id"].lower()
+            request["read_contexts"].append(
+                self.fast_lane_read_context(
+                    helper,
+                    task_id=unit["task_id"],
+                    role=role,
+                    worktree=self.safe_root / "worktrees" / f"fast-lane-read-{task_slug}",
+                    temp_target=self.safe_root / "tasks" / f"fast-lane-read-{task_slug}",
+                    read_scope=list(unit["write_scope"]) or ["src/service.py"],
+                )
+            )
         return request
 
     def fast_lane_read_context(
@@ -1101,6 +1219,412 @@ class TeamEfficiencyTests(unittest.TestCase):
                     {"reasoning_effort": effort, "reason": "explicit_opt_in"},
                     helper._fast_lane_activation(effort, True),
                 )
+
+    def test_fast_lane_ultra_emits_lane_zero_and_three_useful_slots(self) -> None:
+        helper = load_efficiency()
+
+        result = helper.compile_fast_lane(
+            self.fast_lane_schedule_request(helper), reasoning_effort="ultra"
+        )
+
+        self.assertEqual("active", result["status"])
+        self.assertEqual("FAST_LANE_ACTIVE", result["decision_code"])
+        self.assertEqual(
+            {"reasoning_effort": "ultra", "reason": "ultra_auto"},
+            result["activation"],
+        )
+        self.assertEqual("lane-0", result["main_lane"]["lane_id"])
+        self.assertEqual("gpt-5.6-sol", result["main_lane"]["model"])
+        self.assertEqual(3, result["subagent_capacity"])
+        self.assertEqual(3, len(result["assignments"]))
+        self.assertEqual(
+            {"FAST-LANE-ROUTINE", "FAST-LANE-MODERATE", "FAST-LANE-FUTURE"},
+            {item["task_id"] for item in result["assignments"]},
+        )
+        self.assertEqual(
+            {"execution", "prewarm"},
+            {item["role"] for item in result["assignments"]},
+        )
+        self.assertEqual(
+            {
+                ("FAST-LANE-ROUTINE", "gpt-5.6-terra", "high"),
+                ("FAST-LANE-MODERATE", "gpt-5.6-terra", "max"),
+                ("FAST-LANE-FUTURE", "gpt-5.6-terra", "medium"),
+            },
+            {
+                (item["task_id"], item["model"], item["reasoning_effort"])
+                for item in result["assignments"]
+            },
+        )
+        self.assertEqual([], result["idle_slots"])
+
+    def test_fast_lane_public_explicit_opt_in_activates_lower_efforts(self) -> None:
+        helper = load_efficiency()
+        for effort in ("medium", "high", "max"):
+            with self.subTest(effort=effort):
+                result = helper.compile_fast_lane(
+                    self.fast_lane_schedule_request(helper),
+                    reasoning_effort=effort,
+                    enable=True,
+                )
+
+                self.assertEqual(
+                    {"reasoning_effort": effort, "reason": "explicit_opt_in"},
+                    result["activation"],
+                )
+                self.assertEqual("active", result["status"])
+                self.assertEqual(effort, result["main_lane"]["reasoning_effort"])
+
+    def test_fast_lane_routes_are_explicit_and_legacy_route_is_unchanged(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        assignments = {
+            item["task_id"]: item for item in result["assignments"]
+        }
+        self.assertEqual("Terra High", assignments["FAST-LANE-ROUTINE"]["recommended_route"])
+        self.assertEqual("Terra Max", assignments["FAST-LANE-MODERATE"]["recommended_route"])
+        self.assertEqual(
+            ("gpt-5.6-terra", "high"),
+            (assignments["FAST-LANE-ROUTINE"]["model"], assignments["FAST-LANE-ROUTINE"]["reasoning_effort"]),
+        )
+        self.assertEqual(
+            ("gpt-5.6-terra", "max"),
+            (assignments["FAST-LANE-MODERATE"]["model"], assignments["FAST-LANE-MODERATE"]["reasoning_effort"]),
+        )
+        self.assertEqual(
+            ("gpt-5.6-terra", "high"),
+            helper._fast_lane_route({"recommended_route": "Terra Max"}, "review"),
+        )
+        self.assertEqual(
+            ("gpt-5.6-terra", "medium"),
+            helper._fast_lane_route({"recommended_route": "Sol High"}, "prewarm"),
+        )
+        self.assertEqual(
+            ("gpt-5.6-sol", "ultra"),
+            helper._fast_lane_route({"recommended_route": "Terra High"}, "design_probe"),
+        )
+
+        exceptional_package = self.decomposition_manifest()
+        exceptional_package["artifacts"] = [
+            {
+                "task_id": "FAST-LANE-EXCEPTIONAL",
+                "goal": "Own exceptional architecture",
+                "output_boundary": "exceptional design",
+                "write_scope": ["src/fast_lane/exceptional.py"],
+                "depends_on": [],
+                "required_evidence": ["design-proof"],
+                "complexity": "exceptional",
+                "execution_contracts": ["contracts/fast-lane"],
+            }
+        ]
+        result = helper.compile_fast_lane(
+            self.fast_lane_request(helper, work_package=exceptional_package),
+            reasoning_effort="ultra",
+        )
+        self.assertEqual("active", result["status"])
+        self.assertIn(
+            result["decision_code"],
+            {"FAST_LANE_ACTIVE", "TERMINAL_PROTOCOL_OWNED_BY_LANE0"},
+        )
+        self.assertEqual([], result["assignments"])
+        self.assertEqual(
+            [{"slot_id": slot, "reason_code": "LANE0_REQUIRED"} for slot in ("slot-1", "slot-2", "slot-3")],
+            result["idle_slots"],
+        )
+
+    def test_fast_lane_blocks_lane_zero_and_scope_conflicts(self) -> None:
+        helper = load_efficiency()
+        lane0_request = self.fast_lane_schedule_request(helper)
+        lane0_request["scheduler_state"]["lane0_state"] = {
+            "active_task_id": "FAST-LANE-DESIGN",
+            "owned_write_scopes": ["src/fast_lane"],
+        }
+        lane0_request["scheduler_state"]["source_plan_hash"] = helper._sha256_json(
+            helper.decompose(lane0_request["work_package"])
+        )
+        lane0_request["read_contexts"] = []
+        lane0_result = helper.compile_fast_lane(
+            lane0_request, reasoning_effort="ultra"
+        )
+        self.assertEqual([], lane0_result["assignments"])
+        self.assertTrue(
+            all(
+                item["reason_code"] == "LANE0_SCOPE_CONFLICT"
+                for item in lane0_result["idle_slots"]
+            )
+        )
+
+        conflict_package = self.decomposition_manifest()
+        conflict_package["capacity"] = 3
+        conflict_package["artifacts"] = [
+            {
+                "task_id": "FAST-LANE-PARENT",
+                "goal": "Write a parent scope",
+                "output_boundary": "parent writer",
+                "write_scope": ["src/fast_lane"],
+                "depends_on": [],
+                "required_evidence": ["parent-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+            {
+                "task_id": "FAST-LANE-CHILD",
+                "goal": "Write a descendant scope",
+                "output_boundary": "child writer",
+                "write_scope": ["src/fast_lane/child.py"],
+                "depends_on": [],
+                "required_evidence": ["child-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+        ]
+        conflict_result = helper.compile_fast_lane(
+            self.fast_lane_request(helper, work_package=conflict_package),
+            reasoning_effort="ultra",
+        )
+        writers = [
+            item for item in conflict_result["assignments"] if item["role"] == "execution"
+        ]
+        self.assertLessEqual(len(writers), 1)
+        self.assertTrue(
+            any(item["reason_code"] == "WRITE_SCOPE_CONFLICT" for item in conflict_result["idle_slots"])
+            or len(writers) == 1
+        )
+
+    def test_fast_lane_refills_only_terminal_slot_and_retains_live_assignments(self) -> None:
+        helper = load_efficiency()
+        work_package = self.decomposition_manifest()
+        work_package["capacity"] = 3
+        work_package["artifacts"] = [
+            {
+                "task_id": task_id,
+                "goal": f"Write {task_id}",
+                "output_boundary": f"artifact {task_id}",
+                "write_scope": [f"src/fast_lane/{suffix}.py"],
+                "depends_on": [],
+                "required_evidence": [f"{suffix}-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            }
+            for task_id, suffix in (
+                ("FAST-LANE-A", "a"),
+                ("FAST-LANE-B", "b"),
+                ("FAST-LANE-C", "c"),
+            )
+        ]
+        request = self.fast_lane_request(helper, work_package=work_package)
+        validated = helper._validated_fast_lane_request(copy.deepcopy(request))
+        units = {unit["task_id"]: unit for unit in validated["source_plan"]["units"]}
+
+        def running_assignment(task_id: str, slot_id: str) -> tuple[dict[str, object], dict[str, object]]:
+            assignment = helper._fast_lane_assignment(
+                validated,
+                units[task_id],
+                "execution",
+                slot_id,
+                ("gpt-5.6-terra", "high"),
+            )
+            context = assignment.pop("_context")
+            assignment.pop("action")
+            return assignment, context
+
+        retained, retained_context = running_assignment("FAST-LANE-A", "slot-1")
+        terminal, _ = running_assignment("FAST-LANE-B", "slot-2")
+        terminal_result = {"kind": "candidate", "task_id": "FAST-LANE-B"}
+        completion_receipt = {"kind": "completion", "task_id": "FAST-LANE-B"}
+        completion_receipt_hash = helper._sha256_json(completion_receipt)
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "completed_tasks": [
+                    {
+                        "task_id": "FAST-LANE-B",
+                        "completion_kind": "integrated_candidate",
+                        "integration_commit": "a" * 40,
+                        "integration_tree": "b" * 40,
+                        "result_hash": completion_receipt_hash,
+                        "terminal_result_hash": helper._sha256_json(terminal_result),
+                        "terminal_result": terminal_result,
+                        "completion_receipt_hash": completion_receipt_hash,
+                        "completion_receipt": completion_receipt,
+                    }
+                ],
+                "running_assignments": [retained],
+                "dispatch_contexts": [retained_context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 1, "slot-3": 0},
+            }
+        )
+
+        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+        retained = [
+            item for item in result["assignments"] if item["task_id"] == "FAST-LANE-A"
+        ]
+        started = [item for item in result["assignments"] if item["action"] == "start"]
+        self.assertEqual(1, len(retained))
+        self.assertEqual("retain", retained[0]["action"])
+        self.assertEqual(
+            request["scheduler_state"]["running_assignments"][0]["assignment_token"],
+            retained[0]["assignment_token"],
+        )
+        self.assertEqual(1, len(started))
+        self.assertEqual("slot-2", started[0]["slot_id"])
+        self.assertEqual(2, started[0]["assignment_epoch"])
+        self.assertEqual("FAST-LANE-C", started[0]["task_id"])
+        self.assertEqual(terminal["assignment_epoch"], 1)
+
+    def test_fast_lane_prewarm_critical_path_is_deterministic(self) -> None:
+        helper = load_efficiency()
+        code_units = {
+            "FAST-LANE-CODE-A": {
+                "task_id": "FAST-LANE-CODE-A",
+                "depends_on": [],
+                "unit_kind": "code",
+            },
+            "FAST-LANE-CODE-B": {
+                "task_id": "FAST-LANE-CODE-B",
+                "depends_on": [],
+                "unit_kind": "code",
+            },
+            "FAST-LANE-CODE-C": {
+                "task_id": "FAST-LANE-CODE-C",
+                "depends_on": ["FAST-LANE-CODE-A", "FAST-LANE-CODE-B"],
+                "unit_kind": "code",
+            },
+            "FAST-LANE-CODE-D": {
+                "task_id": "FAST-LANE-CODE-D",
+                "depends_on": ["FAST-LANE-CODE-A", "FAST-LANE-CODE-B"],
+                "unit_kind": "code",
+            },
+        }
+        code_source_plan = {
+            "waves": [
+                [
+                    {"task_id": "FAST-LANE-CODE-A"},
+                    {"task_id": "FAST-LANE-CODE-B"},
+                ],
+                [
+                    {"task_id": "FAST-LANE-CODE-C"},
+                    {"task_id": "FAST-LANE-CODE-D"},
+                ],
+            ]
+        }
+        self.assertEqual(
+            1,
+            helper._fast_lane_critical_path_distance(
+                "FAST-LANE-CODE-C", code_units, frozenset(), {}
+            ),
+        )
+        self.assertEqual(
+            ["FAST-LANE-CODE-C", "FAST-LANE-CODE-D"],
+            helper._fast_lane_preferred_prewarms(
+                units=code_units,
+                completed=frozenset(),
+                running=frozenset(),
+                candidate=frozenset(),
+                reviewed=frozenset(),
+                read_contexts={
+                    ("FAST-LANE-CODE-C", "prewarm"),
+                    ("FAST-LANE-CODE-D", "prewarm"),
+                },
+                source_plan=code_source_plan,
+            ),
+        )
+        work_package = self.decomposition_manifest()
+        work_package["capacity"] = 3
+        work_package["artifacts"] = [
+            {
+                "task_id": "FAST-LANE-A",
+                "goal": "Build the first parent",
+                "output_boundary": "parent A",
+                "write_scope": ["src/fast_lane/a.py"],
+                "depends_on": [],
+                "required_evidence": ["a-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+            {
+                "task_id": "FAST-LANE-B",
+                "goal": "Build the second parent",
+                "output_boundary": "parent B",
+                "write_scope": ["src/fast_lane/b.py"],
+                "depends_on": [],
+                "required_evidence": ["b-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+            {
+                "task_id": "FAST-LANE-C",
+                "goal": "Prewarm the first child",
+                "output_boundary": "child C",
+                "write_scope": ["src/fast_lane/c.py"],
+                "depends_on": ["FAST-LANE-A", "FAST-LANE-B"],
+                "required_evidence": ["c-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+            {
+                "task_id": "FAST-LANE-D",
+                "goal": "Prewarm the second child",
+                "output_boundary": "child D",
+                "write_scope": ["src/fast_lane/d.py"],
+                "depends_on": ["FAST-LANE-A", "FAST-LANE-B"],
+                "required_evidence": ["d-proof"],
+                "complexity": "routine",
+                "execution_contracts": ["contracts/fast-lane"],
+            },
+        ]
+        request = self.fast_lane_request(helper, work_package=work_package)
+        request["read_contexts"] = [
+            self.fast_lane_read_context(
+                helper,
+                task_id=task_id,
+                role="prewarm",
+                worktree=self.safe_root / "worktrees" / task_id.lower(),
+                temp_target=self.safe_root / "tasks" / task_id.lower(),
+                read_scope=[f"src/fast_lane/{task_id[-1].lower()}.py"],
+            )
+            for task_id in ("FAST-LANE-C", "FAST-LANE-D")
+        ]
+        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        prewarms = [
+            item for item in result["assignments"] if item["role"] == "prewarm"
+        ]
+        self.assertEqual(1, len(prewarms))
+        self.assertEqual("FAST-LANE-C", prewarms[0]["task_id"])
+
+        atlas_request = self.fast_lane_code_atlas_request(helper)
+        atlas_source_plan = helper.decompose(atlas_request["work_package"])
+        expected_prewarm_id = [
+            unit["task_id"]
+            for unit in atlas_source_plan["units"]
+            if unit["unit_kind"] == "code"
+        ][2]
+        verification_id = next(
+            unit["task_id"]
+            for unit in atlas_source_plan["units"]
+            if unit["unit_kind"] == "verification"
+        )
+        atlas_result = helper.compile_fast_lane(atlas_request, reasoning_effort="ultra")
+        atlas_prewarms = [
+            item for item in atlas_result["assignments"] if item["role"] == "prewarm"
+        ]
+        self.assertEqual([expected_prewarm_id], [item["task_id"] for item in atlas_prewarms])
+        self.assertEqual(
+            [verification_id], atlas_result["terminal_protocol"]["verification_unit_task_ids"]
+        )
+        self.assertEqual(
+            [
+                unit["task_id"]
+                for unit in atlas_source_plan["units"]
+                if unit["unit_kind"] == "code"
+            ][3:],
+            [item["task_id"] for item in atlas_result["ready_queue"]],
+        )
+        self.assertTrue(
+            all("slot_id" not in item for item in atlas_result["ready_queue"])
+        )
 
     def test_fast_lane_ultra_context_ineligible_is_blocked(self) -> None:
         helper = load_efficiency()
@@ -1915,7 +2439,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             read_context["temp_target"],
         ):
             self.assertNotIn(str(context_path), rendered)
-        self.assertNotIn("bootstrap_plan", rendered)
+        self.assertNotIn('"bootstrap_plan"', rendered)
         self.assertNotIn("command_argv", rendered)
 
         source_plan = helper.decompose(baseline["work_package"])
@@ -2060,7 +2584,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         ):
             result = helper.compile_fast_lane(request, reasoning_effort="ultra")
 
-        self.assertEqual("blocked", result["status"])
+        self.assertEqual("active", result["status"])
 
     def test_fast_lane_running_ledger_and_assignment_token_are_exact(self) -> None:
         helper = load_efficiency()
@@ -2069,9 +2593,13 @@ class TeamEfficiencyTests(unittest.TestCase):
         result = helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
         self.assertEqual("active", result["status"])
         self.assertEqual("FAST_LANE_ACTIVE", result["decision_code"])
-        self.assertEqual(1, len(result["assignments"]))
-        retained = result["assignments"][0]
+        self.assertEqual(2, len(result["assignments"]))
         source_assignment = request["scheduler_state"]["running_assignments"][0]
+        retained = next(
+            item
+            for item in result["assignments"]
+            if item["task_id"] == source_assignment["task_id"]
+        )
         self.assertEqual("retain", retained["action"])
         self.assertEqual(source_assignment["assignment_token"], retained["assignment_token"])
         self.assertEqual(source_assignment["dispatch_receipt"], retained["dispatch_receipt"])

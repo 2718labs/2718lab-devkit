@@ -2357,6 +2357,382 @@ def _scope_conflicts(left: Sequence[str], right: Sequence[str]) -> bool:
     return False
 
 
+def _fast_lane_unit_index(
+    source_plan: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    units = source_plan.get("units", [])
+    return {str(unit["task_id"]): unit for unit in units if isinstance(unit, Mapping)}
+
+
+def _fast_lane_topology_index(
+    units: Mapping[str, Mapping[str, Any]],
+) -> dict[str, int]:
+    remaining = {task_id: set(unit.get("depends_on", [])) for task_id, unit in units.items()}
+    ordered: list[str] = []
+    while remaining:
+        ready = sorted(task_id for task_id, deps in remaining.items() if not deps)
+        if not ready:
+            raise ValueError("fast-lane dependency graph contains a cycle")
+        ordered.extend(ready)
+        for task_id in ready:
+            del remaining[task_id]
+        for deps in remaining.values():
+            deps.difference_update(ready)
+    return {task_id: index for index, task_id in enumerate(ordered)}
+
+
+def _fast_lane_completed_ids(
+    scheduler_state: Mapping[str, Any],
+) -> frozenset[str]:
+    return frozenset(record["task_id"] for record in scheduler_state.get("completed_tasks", []))
+
+
+def _fast_lane_dependency_ready(
+    unit: Mapping[str, Any], completed: frozenset[str]
+) -> bool:
+    return set(unit.get("depends_on", [])) <= completed
+
+
+def _fast_lane_conflict_graph(
+    units: Mapping[str, Mapping[str, Any]],
+    *,
+    lane0_scopes: Sequence[str] = (),
+    running: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, list[str]]:
+    graph = _conflict_graph(list(units.values()))
+    for task_id, unit in units.items():
+        if lane0_scopes and _scope_conflicts(unit.get("write_scope", []), lane0_scopes):
+            graph.setdefault(task_id, []).append("lane-0")
+        for assignment in running:
+            if assignment.get("role") != "execution" or assignment.get("task_id") == task_id:
+                continue
+            other = units.get(str(assignment.get("task_id")))
+            if other and _scope_conflicts(unit.get("write_scope", []), other.get("write_scope", [])):
+                graph.setdefault(task_id, []).append(str(assignment.get("task_id")))
+    return {task_id: sorted(set(neighbors)) for task_id, neighbors in sorted(graph.items())}
+
+
+def _fast_lane_critical_path_distance(
+    task_id: str,
+    units: Mapping[str, Mapping[str, Any]],
+    completed: frozenset[str],
+    memo: dict[str, int],
+) -> int:
+    if task_id in memo:
+        return memo[task_id]
+    unfinished = [
+        dependency
+        for dependency in units[task_id].get("depends_on", [])
+        if dependency not in completed
+    ]
+    distance = 0 if not unfinished else 1 + max(
+        _fast_lane_critical_path_distance(dependency, units, completed, memo)
+        for dependency in unfinished
+    )
+    memo[task_id] = distance
+    return distance
+
+
+def _fast_lane_ready_items(
+    units: Mapping[str, Mapping[str, Any]],
+    completed: frozenset[str],
+    blocked: frozenset[str],
+    running: frozenset[str],
+    candidate: frozenset[str],
+    reviewed: frozenset[str],
+    *,
+    conflict_graph: Mapping[str, Sequence[str]] | None = None,
+) -> list[Mapping[str, Any]]:
+    graph = conflict_graph or _fast_lane_conflict_graph(units)
+    ready: list[Mapping[str, Any]] = []
+    for task_id, unit in units.items():
+        if task_id in completed | blocked | running | candidate | reviewed:
+            continue
+        if unit.get("unit_kind") == "verification":
+            continue
+        if _fast_lane_dependency_ready(unit, completed) and "lane-0" not in graph.get(task_id, ()):
+            ready.append(unit)
+    return sorted(ready, key=lambda item: str(item["task_id"]))
+
+
+def _fast_lane_preferred_prewarms(
+    *,
+    units: Mapping[str, Mapping[str, Any]],
+    completed: frozenset[str],
+    running: frozenset[str],
+    candidate: frozenset[str],
+    reviewed: frozenset[str],
+    read_contexts: set[tuple[str, str]],
+    source_plan: Mapping[str, Any],
+    blocked: frozenset[str] = frozenset(),
+) -> list[str]:
+    topology = _fast_lane_topology_index(units)
+    wave_index = {
+        str(unit.get("task_id")): index
+        for index, wave in enumerate(source_plan.get("waves", []))
+        for unit in wave
+        if isinstance(unit, Mapping)
+    }
+    memo: dict[str, int] = {}
+    candidates: list[tuple[tuple[int, int, int, str], str]] = []
+    occupied = completed | blocked | running | candidate | reviewed
+    for task_id, unit in units.items():
+        if task_id in occupied or unit.get("unit_kind") not in {None, "artifact", "code"}:
+            continue
+        if (task_id, "prewarm") not in read_contexts:
+            continue
+        distance = _fast_lane_critical_path_distance(task_id, units, completed, memo)
+        candidates.append(((distance, topology.get(task_id, 0), wave_index.get(task_id, 0), task_id), task_id))
+    return [task_id for _, task_id in sorted(candidates)]
+
+
+def _fast_lane_validate_retained_assignments(
+    validated: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    return list(validated["scheduler_state"].get("running_assignments", []))
+
+
+def _fast_lane_select_actions(
+    validated: Mapping[str, Any],
+    activation: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    source_plan = validated["source_plan"]
+    units = _fast_lane_unit_index(source_plan)
+    state = validated["scheduler_state"]
+    completed = _fast_lane_completed_ids(state)
+    blocked = frozenset(state.get("blocked_task_ids", []))
+    running = {assignment["task_id"] for assignment in state.get("running_assignments", [])}
+    candidates = {record["task_id"] for record in state.get("review_ready_candidates", [])}
+    reviewed = {record["task_id"] for record in state.get("reviewed_candidates", [])}
+    lane0 = state.get("lane0_state", {})
+    lane0_scopes = lane0.get("owned_write_scopes", [])
+    graph = _fast_lane_conflict_graph(units, lane0_scopes=lane0_scopes, running=state.get("running_assignments", []))
+    actions: list[dict[str, Any]] = []
+    for assignment in _fast_lane_validate_retained_assignments(validated):
+        actions.append({**assignment, "action": "retain"})
+    used_slots = {assignment["slot_id"] for assignment in actions}
+    free_slots = [slot for slot in FAST_LANE_SLOT_IDS if slot not in used_slots]
+    capacity = min(int(source_plan.get("capacity", 0)), len(FAST_LANE_SLOT_IDS))
+    writers = sum(1 for assignment in actions if assignment.get("role") == "execution")
+    ready = _fast_lane_ready_items(units, completed, blocked, frozenset(running), frozenset(candidates), frozenset(reviewed), conflict_graph=graph)
+    ready_ids = {str(unit["task_id"]) for unit in ready}
+    selected_scopes = [
+        units[assignment["task_id"]].get("write_scope", [])
+        for assignment in actions
+        if assignment.get("role") == "execution" and assignment.get("task_id") in units
+    ]
+    for unit in ready:
+        if not free_slots or writers >= min(capacity, 2):
+            break
+        if any(_scope_conflicts(unit.get("write_scope", []), scope) for scope in selected_scopes):
+            continue
+        route = _fast_lane_route(unit, "execution")
+        if route is None:
+            continue
+        slot_id = free_slots.pop(0)
+        assignment = _fast_lane_assignment(validated, unit, "execution", slot_id, route)
+        actions.append(assignment)
+        selected_scopes.append(unit.get("write_scope", []))
+        writers += 1
+    read_contexts = {(context["task_id"], context["role"]) for context in validated.get("read_contexts", [])}
+    review_records = sorted(
+        state.get("review_ready_candidates", []), key=lambda item: item["task_id"]
+    )
+    if free_slots:
+        for record in review_records:
+            task_id = record["task_id"]
+            if (task_id, "review") not in read_contexts or task_id not in units:
+                continue
+            slot_id = free_slots.pop(0)
+            assignment = _fast_lane_assignment(
+                validated,
+                units[task_id],
+                "review",
+                slot_id,
+                ("gpt-5.6-terra", "high"),
+            )
+            actions.append(assignment)
+            break
+    design_ids = sorted(state.get("pending_design_probe_task_ids", []))
+    if free_slots:
+        for task_id in design_ids:
+            if (task_id, "design_probe") not in read_contexts or task_id not in units:
+                continue
+            slot_id = free_slots.pop(0)
+            assignment = _fast_lane_assignment(
+                validated,
+                units[task_id],
+                "design_probe",
+                slot_id,
+                ("gpt-5.6-sol", "ultra"),
+            )
+            actions.append(assignment)
+            break
+    scheduled_ids = {str(item["task_id"]) for item in actions}
+    prewarm_ids = _fast_lane_preferred_prewarms(
+        units=units,
+        completed=completed,
+        running=frozenset(running | scheduled_ids),
+        candidate=frozenset(candidates),
+        reviewed=frozenset(reviewed),
+        read_contexts=read_contexts,
+        source_plan=source_plan,
+        blocked=blocked,
+    )
+    if free_slots and prewarm_ids:
+        task_id = prewarm_ids[0]
+        unit = units[task_id]
+        slot_id = free_slots.pop(0)
+        assignment = _fast_lane_assignment(validated, unit, "prewarm", slot_id, ("gpt-5.6-terra", "medium"))
+        actions.append(assignment)
+    if free_slots and writers < capacity:
+        for unit in ready:
+            if not free_slots or str(unit["task_id"]) in ready_ids and any(item.get("task_id") == unit["task_id"] for item in actions):
+                continue
+            if any(_scope_conflicts(unit.get("write_scope", []), scope) for scope in selected_scopes):
+                continue
+            route = _fast_lane_route(unit, "execution")
+            if route is None:
+                continue
+            slot_id = free_slots.pop(0)
+            assignment = _fast_lane_assignment(validated, unit, "execution", slot_id, route)
+            actions.append(assignment)
+            selected_scopes.append(unit.get("write_scope", []))
+            writers += 1
+            break
+    remaining_ids = set(units) - completed - blocked - {
+        str(item["task_id"]) for item in actions
+    }
+    if any(
+        _fast_lane_route(units[task_id], "execution") is None
+        for task_id in remaining_ids
+        if units[task_id].get("unit_kind") != "verification"
+    ):
+        idle_reason = "LANE0_REQUIRED"
+    elif any(
+        not _fast_lane_dependency_ready(units[task_id], completed)
+        for task_id in remaining_ids
+    ):
+        idle_reason = "WAITING_FOR_DEPENDENCY"
+    elif any(
+        any(
+            _scope_conflicts(units[task_id].get("write_scope", []), scope)
+            for scope in selected_scopes
+        )
+        for task_id in remaining_ids
+    ):
+        idle_reason = "WRITE_SCOPE_CONFLICT"
+    else:
+        idle_reason = "NO_SAFE_INDEPENDENT_WORK"
+    return actions, [
+        {"slot_id": slot, "reason_code": idle_reason} for slot in free_slots
+    ]
+
+
+def _fast_lane_build_schedule(
+    validated: Mapping[str, Any], activation: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    return _fast_lane_select_actions(validated, activation)
+
+
+def _fast_lane_assignment(
+    validated: Mapping[str, Any],
+    unit: Mapping[str, Any],
+    role: str,
+    slot_id: str,
+    route: tuple[str, str],
+) -> dict[str, Any]:
+    state = validated["scheduler_state"]
+    epoch = int(state.get("slot_epochs", {}).get(slot_id, 0)) + 1
+    task_id = str(unit["task_id"])
+    context = _fast_lane_build_dispatch_context(validated, unit, role)
+    receipt = {
+        "schema": "team-efficiency/fast-lane-dispatch-receipt-v1",
+        "source_plan_hash": validated["source_plan_hash"],
+        "task_id": task_id,
+        "role": role,
+        "slot_id": slot_id,
+        "assignment_epoch": epoch,
+        "model": route[0],
+        "reasoning_effort": route[1],
+        "dispatch_context_hash": context["context_hash"],
+        "target_gates_hash": context["target_gates_hash"],
+        "execution_context_hash": context["execution_context_hash"],
+        "read_context_hash": context["read_context_hash"],
+        "recovery_of_assignment_token": None,
+    }
+    token = _fast_lane_assignment_token(receipt)
+    return {
+        "slot_id": slot_id,
+        "action": "start",
+        "task_id": task_id,
+        "role": role,
+        "assignment_epoch": epoch,
+        "assignment_token": token,
+        "context_hash": context["context_hash"],
+        "model": route[0],
+        "reasoning_effort": route[1],
+        "dispatch_receipt": receipt,
+        "_context": context,
+    }
+
+
+def _fast_lane_build_dispatch_context(
+    validated: Mapping[str, Any], unit: Mapping[str, Any], role: str
+) -> dict[str, Any]:
+    task_id = str(unit["task_id"])
+    execution = (
+        next(
+            (item for item in validated["execution_contexts"] if item["task_id"] == task_id),
+            None,
+        )
+        if role == "execution"
+        else None
+    )
+    read = next((item for item in validated["read_contexts"] if item["task_id"] == task_id and item["role"] == role), None)
+    target = (
+        next((item for item in validated["target_gates"] if item["task_id"] == task_id), None)
+        if role == "execution"
+        else None
+    )
+    candidate = next(
+        (
+            item
+            for item in validated["scheduler_state"].get("review_ready_candidates", [])
+            if item["task_id"] == task_id
+        ),
+        None,
+    )
+    normalized = {
+        "task_id": task_id,
+        "role": role,
+        "source_plan_hash": validated["source_plan_hash"],
+        "integration_commit": validated["scheduler_state"]["integration_state"]["commit"],
+        "integration_tree": validated["scheduler_state"]["integration_state"]["tree"],
+        "workspace_input_snapshot_id": None if (execution is None and read is None) else (execution or read)["workspace_input_snapshot_id"],
+        "direct_dependency_result_hashes": [],
+        "direct_contract_hashes": list(unit.get("direct_contract_hashes", [])),
+        "required_evidence": list(unit.get("required_evidence", [])),
+        "task_node_ids": list(unit.get("task_node_ids", [])),
+        "contract_node_ids": list(unit.get("contract_node_ids", [])),
+        "acceptance_constraints": list(unit.get("acceptance_constraints", [])),
+        "execution_context_hash": None if execution is None else _sha256_json(execution),
+        "bootstrap_plan_hash": None if execution is None else _sha256_json(execution["bootstrap_plan"]),
+        "base_commit": None if execution is None else execution["bootstrap_plan"]["base_commit"],
+        "branch": None if execution is None else execution["bootstrap_plan"]["branch"],
+        "write_scope_hash": _sha256_json(unit.get("write_scope", [])),
+        "read_context_hash": None if read is None else _sha256_json(read),
+        "target_gates_hash": None if target is None else _sha256_json({"driver_gate_id": target["driver_gate_id"], "target_gates": target["gates"]}),
+        "candidate_commit": None if candidate is None or role != "review" else candidate["candidate_commit"],
+        "red_evidence_hashes": [],
+        "green_evidence_hashes": [],
+        "basis_hash": _sha256_json(read) if role in {"prewarm", "design_probe"} and read is not None else None,
+        "prewarm_evidence_hash": None,
+        "prewarm_revalidation_evidence_hash": None,
+    }
+    return {"context_hash": _sha256_json(normalized), **normalized}
+
+
 def _conflict_graph(units: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
     graph = {unit["task_id"]: [] for unit in units}
     for index, left in enumerate(units):
@@ -2816,6 +3192,26 @@ def _fast_lane_activation(
     else:
         reason = None
     return {"reasoning_effort": effort, "reason": reason}
+
+
+def _fast_lane_route(
+    unit: Mapping[str, Any], role: str
+) -> tuple[str, str] | None:
+    """Resolve executable fast-lane routing without mutating legacy labels."""
+    if role == "design_probe":
+        return ("gpt-5.6-sol", "ultra")
+    if role == "prewarm":
+        return ("gpt-5.6-terra", "medium")
+    if role == "review":
+        return ("gpt-5.6-terra", "high")
+    route = unit.get("recommended_route")
+    if route == "Terra High":
+        return ("gpt-5.6-terra", "high")
+    if route == "Terra Max":
+        return ("gpt-5.6-terra", "max")
+    if route == "Sol High":
+        return None
+    raise ValueError("unit route is invalid")
 
 
 def _fast_lane_red_failure_fingerprint(
@@ -3283,7 +3679,12 @@ def _validated_fast_lane_contexts(
         execution_task_ids.add(task_id)
         execution_contexts.append(normalized)
 
-    if execution_records and execution_task_ids != set(units_by_task_id):
+    execution_capable_ids = {
+        task_id
+        for task_id, unit in units_by_task_id.items()
+        if unit.get("unit_kind") != "verification"
+    }
+    if execution_records and execution_task_ids != execution_capable_ids:
         raise ValueError("execution contexts must cover the source task set")
 
     codex_root = Path(r"D:\bun\tmp\codex").resolve(strict=False)
@@ -4140,6 +4541,8 @@ def _fast_lane_main_lane(
     activation: Mapping[str, Any],
     *,
     next_action: str | None,
+    owned_write_scopes: Sequence[str] = (),
+    excluded_write_scopes: Sequence[str] = (),
 ) -> dict[str, Any]:
     return {
         "lane_id": "lane-0",
@@ -4152,8 +4555,8 @@ def _fast_lane_main_lane(
             "reasoning_effort": "ultra",
             "max_concurrent": 1,
         },
-        "owned_write_scopes": [],
-        "excluded_write_scopes": [],
+        "owned_write_scopes": list(owned_write_scopes),
+        "excluded_write_scopes": list(excluded_write_scopes),
     }
 
 
@@ -4227,13 +4630,18 @@ def _fast_lane_assignment_output(
         ),
         None,
     )
-    context = next(
-        (
-            context
-            for context in validated["scheduler_state"]["dispatch_contexts"]
-            if context["task_id"] == task_id and context["role"] == role
-        ),
-        None,
+    supplied_context = assignment.get("_context")
+    context = (
+        supplied_context
+        if isinstance(supplied_context, Mapping)
+        else next(
+            (
+                context
+                for context in validated["scheduler_state"]["dispatch_contexts"]
+                if context["task_id"] == task_id and context["role"] == role
+            ),
+            None,
+        )
     )
     if context is None:
         raise ValueError("assignment context is not available")
@@ -4241,6 +4649,8 @@ def _fast_lane_assignment_output(
     execution_context_hash = context["execution_context_hash"]
     read_context_hash = context["read_context_hash"]
     write_scope = list(unit.get("write_scope", []))
+    completed = _fast_lane_completed_ids(validated["scheduler_state"])
+    role_target = target if role == "execution" else None
     output: dict[str, Any] = {
         "slot_id": assignment["slot_id"],
         "action": "retain",
@@ -4269,15 +4679,19 @@ def _fast_lane_assignment_output(
         "write_scope_hash": context["write_scope_hash"],
         "write_scope": write_scope,
         "depends_on": list(unit.get("depends_on", [])),
-        "unmet_dependencies": [],
+        "unmet_dependencies": sorted(
+            dependency
+            for dependency in unit.get("depends_on", [])
+            if dependency not in completed
+        ),
         "required_evidence": list(unit.get("required_evidence", [])),
         "execution_contracts": list(unit.get("execution_contracts", [])),
         "direct_contract_hashes": list(context["direct_contract_hashes"]),
         "task_node_ids": list(context["task_node_ids"]),
         "contract_node_ids": list(context["contract_node_ids"]),
         "acceptance_constraints": list(context["acceptance_constraints"]),
-        "driver_gate_id": None if target is None else target["driver_gate_id"],
-        "target_gates": [] if target is None else list(target["gates"]),
+        "driver_gate_id": None if role_target is None else role_target["driver_gate_id"],
+        "target_gates": [] if role_target is None else list(role_target["gates"]),
         "candidate_commit": context["candidate_commit"],
         "basis_hash": context["basis_hash"],
     }
@@ -4285,6 +4699,109 @@ def _fast_lane_assignment_output(
         output["model"] = "gpt-5.6-terra"
         output["reasoning_effort"] = "medium"
     return output
+
+
+def _fast_lane_queue_item(
+    validated: Mapping[str, Any],
+    unit: Mapping[str, Any],
+    role: str,
+    route: tuple[str, str],
+) -> dict[str, Any]:
+    assignment = _fast_lane_assignment(validated, unit, role, "slot-1", route)
+    output = _fast_lane_assignment_output(validated, assignment)
+    return {
+        key: value
+        for key, value in output.items()
+        if key
+        not in {
+            "slot_id",
+            "action",
+            "assignment_epoch",
+            "assignment_token",
+            "dispatch_receipt",
+        }
+    }
+
+
+def _fast_lane_queues(
+    validated: Mapping[str, Any],
+    assignments: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    source_plan = validated["source_plan"]
+    units = _fast_lane_unit_index(source_plan)
+    state = validated["scheduler_state"]
+    completed = _fast_lane_completed_ids(state)
+    blocked = frozenset(state.get("blocked_task_ids", []))
+    running = {assignment["task_id"] for assignment in state.get("running_assignments", [])}
+    candidates = {record["task_id"] for record in state.get("review_ready_candidates", [])}
+    reviewed = {record["task_id"] for record in state.get("reviewed_candidates", [])}
+    read_contexts = {(context["task_id"], context["role"]) for context in validated["read_contexts"]}
+    assigned_keys = {(assignment["task_id"], assignment["role"]) for assignment in assignments}
+    assigned_task_ids = {task_id for task_id, _ in assigned_keys}
+    graph = _fast_lane_conflict_graph(
+        units,
+        lane0_scopes=state["lane0_state"]["owned_write_scopes"],
+        running=state["running_assignments"],
+    )
+    ready_queue = [
+        _fast_lane_queue_item(validated, unit, "execution", route)
+        for unit in _fast_lane_ready_items(
+            units,
+            completed,
+            blocked,
+            frozenset(running),
+            frozenset(candidates),
+            frozenset(reviewed),
+            conflict_graph=graph,
+        )
+        if (route := _fast_lane_route(unit, "execution")) is not None
+        and unit["task_id"] not in assigned_task_ids
+    ]
+    review_queue = [
+        _fast_lane_queue_item(
+            validated,
+            units[record["task_id"]],
+            "review",
+            ("gpt-5.6-terra", "high"),
+        )
+        for record in state.get("review_ready_candidates", [])
+        if record["task_id"] in units
+        and (record["task_id"], "review") in read_contexts
+        and (record["task_id"], "review") not in assigned_keys
+    ]
+    occupied = frozenset(running | {task_id for task_id, _ in assigned_keys})
+    prewarm_queue = [
+        _fast_lane_queue_item(
+            validated,
+            units[task_id],
+            "prewarm",
+            ("gpt-5.6-terra", "medium"),
+        )
+        for task_id in _fast_lane_preferred_prewarms(
+            units=units,
+            completed=completed,
+            running=occupied,
+            candidate=frozenset(candidates),
+            reviewed=frozenset(reviewed),
+            read_contexts=read_contexts,
+            source_plan=source_plan,
+            blocked=blocked,
+        )
+        if (task_id, "prewarm") not in assigned_keys
+    ]
+    design_queue = [
+        _fast_lane_queue_item(
+            validated,
+            units[task_id],
+            "design_probe",
+            ("gpt-5.6-sol", "ultra"),
+        )
+        for task_id in sorted(state.get("pending_design_probe_task_ids", []))
+        if task_id in units
+        and (task_id, "design_probe") in read_contexts
+        and (task_id, "design_probe") not in assigned_keys
+    ]
+    return ready_queue, review_queue, prewarm_queue, design_queue
 
 
 def _render_fast_lane_status(
@@ -4295,13 +4812,45 @@ def _render_fast_lane_status(
     decision_code: str,
     idle_reason: str,
     next_action: str | None,
+    planned_assignments: Sequence[Mapping[str, Any]] | None = None,
+    idle_slots: Sequence[Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     source_plan = _mapping(validated["source_plan"], "source plan")
-    running_assignments = validated["scheduler_state"]["running_assignments"]
+    running_assignments = list(
+        validated["scheduler_state"]["running_assignments"]
+        if planned_assignments is None
+        else planned_assignments
+    )
     assignments = [
-        _fast_lane_assignment_output(validated, assignment)
+        {
+            **_fast_lane_assignment_output(validated, assignment),
+            "action": assignment.get("action", "retain"),
+        }
         for assignment in running_assignments
     ]
+    owned_scopes = list(
+        validated["scheduler_state"]["lane0_state"].get("owned_write_scopes", [])
+    )
+    unit_by_task_id = _fast_lane_unit_index(source_plan)
+    excluded_scopes = sorted(
+        {
+            scope
+            for assignment in running_assignments
+            if assignment.get("role") == "execution"
+            for scope in unit_by_task_id.get(str(assignment.get("task_id")), {}).get(
+                "write_scope", []
+            )
+        }
+    )
+    if status == "active":
+        ready_queue, review_queue, prewarm_queue, design_queue = _fast_lane_queues(
+            validated, running_assignments
+        )
+    else:
+        ready_queue = []
+        review_queue = []
+        prewarm_queue = []
+        design_queue = []
     result: dict[str, Any] = {
         "schema": "team-efficiency/fast-lane-plan-v1",
         "status": status,
@@ -4309,15 +4858,20 @@ def _render_fast_lane_status(
         "activation": dict(activation),
         "source_plan_hash": validated["source_plan_hash"],
         "phase": _fast_lane_phase(validated["scheduler_state"]),
-        "main_lane": _fast_lane_main_lane(activation, next_action=next_action),
+        "main_lane": _fast_lane_main_lane(
+            activation,
+            next_action=next_action,
+            owned_write_scopes=owned_scopes,
+            excluded_write_scopes=excluded_scopes,
+        ),
         "subagent_capacity": len(FAST_LANE_SLOT_IDS),
         "assignments": assignments,
-        "ready_queue": [],
-        "review_queue": [],
-        "prewarm_queue": [],
-        "design_queue": [],
+        "ready_queue": ready_queue,
+        "review_queue": review_queue,
+        "prewarm_queue": prewarm_queue,
+        "design_queue": design_queue,
         "invalidated_evidence_task_ids": [],
-        "idle_slots": _fast_lane_idle_slots(
+        "idle_slots": list(idle_slots) if idle_slots is not None else _fast_lane_idle_slots(
             idle_reason, [assignment["slot_id"] for assignment in running_assignments]
         ),
         "refill_plan": _fast_lane_refill_plan(),
@@ -4374,14 +4928,47 @@ def _render_fast_lane_plan(
             idle_reason="OPT_IN_REQUIRED",
             next_action=None,
         )
-    if validated["scheduler_state"]["running_assignments"]:
+    if validated["scheduler_state"]["running_assignments"] or validated["execution_contexts"]:
+        actions, idle_slots = _fast_lane_build_schedule(validated, activation)
+        if actions:
+            return _render_fast_lane_status(
+                validated,
+                activation,
+                status="active",
+                decision_code="FAST_LANE_ACTIVE",
+                idle_reason="NO_SAFE_INDEPENDENT_WORK",
+                next_action="adjudicate_and_integrate",
+                planned_assignments=actions,
+                idle_slots=idle_slots,
+            )
+        lane0_scopes = validated["scheduler_state"]["lane0_state"]["owned_write_scopes"]
+        source_units = validated["source_plan"].get("units", [])
+        if lane0_scopes and any(
+            _scope_conflicts(unit.get("write_scope", []), lane0_scopes)
+            for unit in source_units
+            if unit.get("write_scope")
+        ):
+            reason = "LANE0_SCOPE_CONFLICT"
+        elif any(
+            _scope_conflicts(left.get("write_scope", []), right.get("write_scope", []))
+            for index, left in enumerate(source_units)
+            for right in source_units[index + 1 :]
+            if left.get("write_scope") and right.get("write_scope")
+        ):
+            reason = "WRITE_SCOPE_CONFLICT"
+        elif any(_fast_lane_route(unit, "execution") is None for unit in source_units if unit.get("unit_kind") != "verification"):
+            reason = "LANE0_REQUIRED"
+        else:
+            reason = "NO_SAFE_INDEPENDENT_WORK"
         return _render_fast_lane_status(
             validated,
             activation,
             status="active",
             decision_code="FAST_LANE_ACTIVE",
-            idle_reason="NO_SAFE_INDEPENDENT_WORK",
+            idle_reason=reason,
             next_action="adjudicate_and_integrate",
+            planned_assignments=[],
+            idle_slots=_fast_lane_idle_slots(reason),
         )
     contexts = validated["execution_contexts"]
     has_execution_contexts = isinstance(contexts, Sequence) and not isinstance(
