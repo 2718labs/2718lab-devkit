@@ -627,6 +627,23 @@ class TeamEfficiencyTests(unittest.TestCase):
     def fast_lane_contexts_empty_request(self, helper) -> dict[str, object]:
         return self.fast_lane_request(helper, include_contexts=False)
 
+    def run_fast_lane_cli(
+        self,
+        helper,
+        arguments: list[str],
+    ) -> tuple[int, str, str]:
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            try:
+                exit_code = helper.main(arguments)
+            except SystemExit as error:
+                exit_code = error.code
+        return exit_code, output.getvalue(), errors.getvalue()
+
     def code_atlas_manifest(self) -> dict[str, object]:
         def digest(marker: str) -> str:
             return f"sha256:{marker * 64}"
@@ -870,6 +887,187 @@ class TeamEfficiencyTests(unittest.TestCase):
             )
         )
 
+    def test_fast_lane_cli_effort_errors_are_stable(self) -> None:
+        helper = load_efficiency()
+        request_path = self.temp / "fast-lane-request.json"
+        request_path.write_text(
+            json.dumps(self.fast_lane_contexts_empty_request(helper)),
+            encoding="utf-8",
+        )
+        embedded_effort_path = self.temp / "fast-lane-embedded-effort.json"
+        embedded_effort = self.fast_lane_contexts_empty_request(helper)
+        embedded_effort["reasoning_effort"] = "ultra"
+        embedded_effort_path.write_text(json.dumps(embedded_effort), encoding="utf-8")
+
+        cases = (
+            ("missing", ["fast-lane", "--input", str(request_path)]),
+            (
+                "unknown",
+                [
+                    "fast-lane",
+                    "--input",
+                    str(request_path),
+                    "--reasoning-effort",
+                    "unsupported",
+                ],
+            ),
+            (
+                "duplicate",
+                [
+                    "fast-lane",
+                    "--input",
+                    str(request_path),
+                    "--reasoning-effort",
+                    "ultra",
+                    "--reasoning-effort",
+                    "max",
+                ],
+            ),
+            (
+                "embedded",
+                [
+                    "fast-lane",
+                    "--input",
+                    str(embedded_effort_path),
+                    "--reasoning-effort",
+                    "ultra",
+                ],
+            ),
+        )
+        for name, arguments in cases:
+            with self.subTest(name=name):
+                exit_code, output, errors = self.run_fast_lane_cli(helper, arguments)
+                self.assertEqual(2, exit_code)
+                self.assertEqual("", output)
+                self.assertTrue(errors.startswith("error: "))
+                self.assertLessEqual(len(errors), 256)
+
+    def test_fast_lane_cli_uses_explicit_dispatch_not_decompose_fallback(self) -> None:
+        helper = load_efficiency()
+        request_path = self.temp / "fast-lane-dispatch.json"
+        request_path.write_text(
+            json.dumps(self.fast_lane_contexts_empty_request(helper)),
+            encoding="utf-8",
+        )
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        result = json.loads(output)
+        self.assertEqual("team-efficiency/fast-lane-plan-v1", result["schema"])
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+
+    def test_fast_lane_top_level_fields_are_exact(self) -> None:
+        helper = load_efficiency()
+        expected_fields = helper._FAST_LANE_PLAN_FIELDS
+        needs_design_request = self.fast_lane_contexts_empty_request(helper)
+        needs_design_request["work_package"] = {
+            "schema": "team-efficiency/work-package-v1",
+            "task_id": "ATLAS-12B",
+            "goal": "Choose architecture before implementation",
+            "capacity": 2,
+            "decomposition": "semantic",
+        }
+        cases = (
+            (
+                "inactive",
+                helper.compile_fast_lane(
+                    self.fast_lane_contexts_empty_request(helper),
+                    reasoning_effort="max",
+                    enable=False,
+                ),
+                "inactive",
+                "EXPLICIT_OPT_IN_REQUIRED",
+                "OPT_IN_REQUIRED",
+                None,
+                None,
+            ),
+            (
+                "blocked",
+                helper.compile_fast_lane(
+                    self.fast_lane_contexts_empty_request(helper),
+                    reasoning_effort="ultra",
+                ),
+                "blocked",
+                "NO_SAFE_WORK",
+                "EXECUTION_CONTEXT_MISSING",
+                "ultra_auto",
+                None,
+            ),
+            (
+                "needs_design",
+                helper.compile_fast_lane(
+                    needs_design_request,
+                    reasoning_effort="ultra",
+                ),
+                "needs_design",
+                "WORK_PACKAGE_NEEDS_DESIGN",
+                "WORK_PACKAGE_NEEDS_DESIGN",
+                "ultra_auto",
+                "design_required",
+            ),
+        )
+        for (
+            name,
+            result,
+            status,
+            decision_code,
+            idle_reason,
+            activation_reason,
+            next_action,
+        ) in cases:
+            with self.subTest(name=name):
+                self.assertEqual(expected_fields, set(result))
+                self.assertEqual(status, result["status"])
+                self.assertEqual(decision_code, result["decision_code"])
+                self.assertEqual(activation_reason, result["activation"]["reason"])
+                self.assertEqual(next_action, result["main_lane"]["next_action"])
+                self.assertEqual([], result["assignments"])
+                self.assertEqual([], result["ready_queue"])
+                self.assertEqual([], result["review_queue"])
+                self.assertEqual([], result["prewarm_queue"])
+                self.assertEqual([], result["design_queue"])
+                self.assertEqual(
+                    [
+                        {"slot_id": "slot-1", "reason_code": idle_reason},
+                        {"slot_id": "slot-2", "reason_code": idle_reason},
+                        {"slot_id": "slot-3", "reason_code": idle_reason},
+                    ],
+                    result["idle_slots"],
+                )
+                self.assertEqual(
+                    {"slot-1", "slot-2", "slot-3"},
+                    {item["slot_id"] for item in result["idle_slots"]},
+                )
+                self.assertEqual(
+                    result["plan_hash"],
+                    helper._sha256_json(
+                        {
+                            key: value
+                            for key, value in result.items()
+                            if key != "plan_hash"
+                        }
+                    ),
+                )
+                self.assertLessEqual(
+                    len(helper._json_bytes(result)), helper.MAX_MANIFEST_BYTES
+                )
+        self.assertEqual(
+            "design_required",
+            cases[2][1]["main_lane"]["next_action"],
+        )
+
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
 
@@ -924,6 +1122,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "git worktree add",
             "Git common directory",
             "post-apply attestation",
+            "parked endpoint bootstrap",
             "inert",
             "inert dispatch descriptors",
             "no model call",

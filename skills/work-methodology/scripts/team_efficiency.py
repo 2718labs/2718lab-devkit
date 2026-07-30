@@ -26,6 +26,11 @@ MAX_LIST_ITEMS = 32
 MAX_GRAPH_NODES = 64
 MAX_GRAPH_EDGES = 128
 MAX_REGISTRATION_CARD_BYTES = 4 * 1024
+MAX_GATE_TIMEOUT_SECONDS = 3600
+FAST_LANE_SLOT_IDS = ("slot-1", "slot-2", "slot-3")
+FAST_LANE_REASONING_EFFORTS = frozenset(
+    {"low", "medium", "high", "xhigh", "max", "ultra"}
+)
 
 _TASK_ID = re.compile(r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -93,6 +98,50 @@ _CACHE_FIELDS = frozenset(
         "platform_fingerprint",
         "dependency_lock_hashes",
         "test_lane",
+    }
+)
+_FAST_LANE_REQUEST_FIELDS = frozenset(
+    {
+        "schema",
+        "work_package",
+        "target_gates",
+        "execution_contexts",
+        "read_contexts",
+        "remediation_request",
+        "scheduler_state",
+    }
+)
+_FAST_LANE_PLAN_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "decision_code",
+        "activation",
+        "source_plan_hash",
+        "phase",
+        "main_lane",
+        "subagent_capacity",
+        "assignments",
+        "ready_queue",
+        "review_queue",
+        "prewarm_queue",
+        "design_queue",
+        "invalidated_evidence_task_ids",
+        "idle_slots",
+        "refill_plan",
+        "terminal_protocol",
+        "workflow_policy",
+        "plan_hash",
+    }
+)
+_FAST_LANE_PHASES = frozenset(
+    {
+        "execution",
+        "integration_regression",
+        "blocker_review",
+        "remediation",
+        "acceptance",
+        "stopped",
     }
 )
 _ROUTES = {
@@ -2525,6 +2574,248 @@ def plan_waves(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return decompose(manifest)
 
 
+def _fast_lane_effort(value: object) -> str:
+    effort = _text(value, "reasoning_effort", maximum=16)
+    if effort not in FAST_LANE_REASONING_EFFORTS:
+        raise ValueError("reasoning_effort is invalid")
+    return effort
+
+
+def _one_fast_lane_effort(values: object) -> str:
+    if (
+        not isinstance(values, Sequence)
+        or isinstance(values, (str, bytes, bytearray))
+        or len(values) != 1
+    ):
+        raise ValueError("fast-lane requires exactly one reasoning effort")
+    return _fast_lane_effort(values[0])
+
+
+def _fast_lane_activation(
+    reasoning_effort: object, enable: object
+) -> dict[str, str | None]:
+    if type(enable) is not bool:
+        raise ValueError("enable must be a boolean")
+    effort = _fast_lane_effort(reasoning_effort)
+    if effort == "ultra":
+        reason = "ultra_auto"
+    elif enable:
+        reason = "explicit_opt_in"
+    else:
+        reason = None
+    return {"reasoning_effort": effort, "reason": reason}
+
+
+def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    candidate = _mapping(request, "fast-lane request")
+    _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+    if candidate["schema"] != "team-efficiency/fast-lane-request-v1":
+        raise ValueError("fast-lane request schema is invalid")
+    if len(_json_bytes(candidate)) > MAX_MANIFEST_INPUT_BYTES:
+        raise ValueError("fast-lane request exceeds its byte budget")
+    source_plan = decompose(candidate["work_package"])
+    return {
+        "source_plan": source_plan,
+        "source_plan_hash": _sha256_json(source_plan),
+        "target_gates": candidate["target_gates"],
+        "execution_contexts": candidate["execution_contexts"],
+        "read_contexts": candidate["read_contexts"],
+        "remediation_request": candidate["remediation_request"],
+        "scheduler_state": candidate["scheduler_state"],
+    }
+
+
+def _fast_lane_phase(value: object) -> str:
+    scheduler_state = _mapping(value, "scheduler_state")
+    phase = scheduler_state.get("phase")
+    if phase not in _FAST_LANE_PHASES:
+        raise ValueError("fast-lane phase is invalid")
+    return phase
+
+
+def _fast_lane_idle_slots(reason_code: str) -> list[dict[str, str]]:
+    return [
+        {"slot_id": slot_id, "reason_code": reason_code}
+        for slot_id in FAST_LANE_SLOT_IDS
+    ]
+
+
+def _fast_lane_main_lane(
+    activation: Mapping[str, Any],
+    *,
+    next_action: str | None,
+) -> dict[str, Any]:
+    return {
+        "lane_id": "lane-0",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": activation["reasoning_effort"],
+        "next_action": next_action,
+        "design_owner": "main-sol",
+        "parallel_design": {
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "ultra",
+            "max_concurrent": 1,
+        },
+        "owned_write_scopes": [],
+        "excluded_write_scopes": [],
+    }
+
+
+def _fast_lane_refill_plan() -> dict[str, Any]:
+    return {
+        "trigger": "slot_terminal_event",
+        "dispatch_at": "next_host_dispatch_boundary",
+        "priority": [
+            "restore_two_safe_execution_slots",
+            "declared_verification_unit",
+            "candidate_review",
+            "lane0_approved_design_probe",
+            "dependency_prewarmer",
+            "third_safe_execution",
+        ],
+        "polling": False,
+    }
+
+
+def _fast_lane_terminal_protocol(source_plan: Mapping[str, Any]) -> dict[str, Any]:
+    verification_unit_task_ids = [
+        unit["task_id"]
+        for unit in source_plan["units"]
+        if unit.get("unit_kind") == "verification"
+    ]
+    return {
+        "owner": "lane0_and_work_methodology_skill",
+        "compiler_schedules_declared_verification_units": True,
+        "compiler_schedules_ad_hoc_terminal_slots": False,
+        "verification_unit_task_ids": verification_unit_task_ids,
+        "integration_regression_passes": 1,
+        "blocker_reviews": 1,
+        "global_targeted_remediation_rounds": 1,
+        "wide_or_shared_scope_remediation": "stop_for_lane0",
+    }
+
+
+def _fast_lane_workflow_policy() -> dict[str, Any]:
+    return {
+        "owner": "work_methodology_skill",
+        "boundary_operations": [],
+        "conditional_operations": [],
+        "operation_set_is_closed_capability_list": False,
+        "mid_item_status_polling": False,
+        "recovery_status_reads": "start_or_recovery_boundary_only",
+        "release_tool_available": False,
+    }
+
+
+def _render_fast_lane_status(
+    validated: Mapping[str, Any],
+    activation: Mapping[str, Any],
+    *,
+    status: str,
+    decision_code: str,
+    idle_reason: str,
+    next_action: str | None,
+) -> dict[str, Any]:
+    source_plan = _mapping(validated["source_plan"], "source plan")
+    result: dict[str, Any] = {
+        "schema": "team-efficiency/fast-lane-plan-v1",
+        "status": status,
+        "decision_code": decision_code,
+        "activation": dict(activation),
+        "source_plan_hash": validated["source_plan_hash"],
+        "phase": _fast_lane_phase(validated["scheduler_state"]),
+        "main_lane": _fast_lane_main_lane(activation, next_action=next_action),
+        "subagent_capacity": len(FAST_LANE_SLOT_IDS),
+        "assignments": [],
+        "ready_queue": [],
+        "review_queue": [],
+        "prewarm_queue": [],
+        "design_queue": [],
+        "invalidated_evidence_task_ids": [],
+        "idle_slots": _fast_lane_idle_slots(idle_reason),
+        "refill_plan": _fast_lane_refill_plan(),
+        "terminal_protocol": _fast_lane_terminal_protocol(source_plan),
+        "workflow_policy": _fast_lane_workflow_policy(),
+    }
+    result["plan_hash"] = _sha256_json(result)
+    _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    if len(_json_bytes(result)) > MAX_MANIFEST_BYTES:
+        raise ValueError("fast-lane plan exceeds its byte budget")
+    return result
+
+
+def _fast_lane_needs_design_plan(
+    validated: Mapping[str, Any], activation: Mapping[str, Any]
+) -> dict[str, Any]:
+    return _render_fast_lane_status(
+        validated,
+        activation,
+        status="needs_design",
+        decision_code="WORK_PACKAGE_NEEDS_DESIGN",
+        idle_reason="WORK_PACKAGE_NEEDS_DESIGN",
+        next_action="design_required",
+    )
+
+
+def _fast_lane_stopped_plan(
+    validated: Mapping[str, Any], activation: Mapping[str, Any]
+) -> dict[str, Any]:
+    return _render_fast_lane_status(
+        validated,
+        activation,
+        status="stopped",
+        decision_code="AUTOMATION_STOPPED",
+        idle_reason="AUTOMATION_STOPPED",
+        next_action=None,
+    )
+
+
+def _render_fast_lane_plan(
+    validated: Mapping[str, Any], activation: Mapping[str, Any]
+) -> dict[str, Any]:
+    source_plan = _mapping(validated["source_plan"], "source plan")
+    if source_plan["status"] == "needs_design":
+        return _fast_lane_needs_design_plan(validated, activation)
+    if _fast_lane_phase(validated["scheduler_state"]) == "stopped":
+        return _fast_lane_stopped_plan(validated, activation)
+    if activation["reason"] is None:
+        return _render_fast_lane_status(
+            validated,
+            activation,
+            status="inactive",
+            decision_code="EXPLICIT_OPT_IN_REQUIRED",
+            idle_reason="OPT_IN_REQUIRED",
+            next_action=None,
+        )
+    contexts = validated["execution_contexts"]
+    has_execution_contexts = isinstance(contexts, Sequence) and not isinstance(
+        contexts, (str, bytes, bytearray)
+    ) and bool(contexts)
+    return _render_fast_lane_status(
+        validated,
+        activation,
+        status="blocked",
+        decision_code="NO_SAFE_WORK",
+        idle_reason=(
+            "NO_SAFE_INDEPENDENT_WORK"
+            if has_execution_contexts
+            else "EXECUTION_CONTEXT_MISSING"
+        ),
+        next_action=None,
+    )
+
+
+def compile_fast_lane(
+    request: Mapping[str, Any],
+    *,
+    reasoning_effort: str,
+    enable: bool = False,
+) -> dict[str, Any]:
+    activation = _fast_lane_activation(reasoning_effort, enable)
+    validated = _validated_fast_lane_request(request)
+    return _render_fast_lane_plan(validated, activation)
+
+
 def _read_json(path_text: str, *, maximum: int) -> Any:
     path = Path(path_text)
     payload = path.read_bytes()
@@ -2558,6 +2849,11 @@ def _parser() -> argparse.ArgumentParser:
     for command in ("resume-packet", "status", "cache-key", "decompose", "plan-waves"):
         item = commands.add_parser(command)
         item.add_argument("--input", required=True)
+
+    fast_lane = commands.add_parser("fast-lane")
+    fast_lane.add_argument("--input", required=True)
+    fast_lane.add_argument("--reasoning-effort", action="append", default=[])
+    fast_lane.add_argument("--enable", action="store_true")
 
     contract = commands.add_parser("contract-check")
     contract.add_argument("--producer", required=True)
@@ -2593,6 +2889,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "cache-key":
             inputs = _read_json(args.input, maximum=MAX_PACKET_BYTES)
             _print_json(make_cache_metadata(inputs))
+        elif args.command == "fast-lane":
+            request = _read_json(args.input, maximum=MAX_MANIFEST_INPUT_BYTES)
+            result = compile_fast_lane(
+                _mapping(request, "fast-lane request"),
+                reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),
+                enable=args.enable,
+            )
+            _print_json(result)
         else:
             manifest = _read_json(args.input, maximum=MAX_MANIFEST_INPUT_BYTES)
             _print_json(decompose(manifest))
