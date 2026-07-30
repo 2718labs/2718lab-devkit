@@ -213,6 +213,53 @@ ones) before passing `arguments` directly to the named MCP tool. These are
 runtime bindings, not fake values. The plan never copies an absolute
 workspace, trace id, or snapshot id from Atlas evidence.
 
+## Ultra Fast Lane
+
+`fast-lane` compiles the exact
+`team-efficiency/fast-lane-request-v1` request into a deterministic
+`team-efficiency/fast-lane-plan-v1` result. It is a pure compiler: all target
+gates, contexts, receipts, tokens, and workflow operations are inert data. The
+helper does not call a model, spawn an agent, contact a remote service, run a
+gate, mutate Git, claim a lease, bind an endpoint, or complete a workflow.
+
+The host invokes `fast-lane` with an explicit reasoning effort. `ultra` is the
+automatic activation path; lower efforts require explicit `--enable` and
+otherwise return an inactive plan. Descriptors always carry explicit model and
+effort: prewarm is `gpt-5.6-terra` / `medium`; routine implementation and
+ordinary verification are `gpt-5.6-terra` / `high`; moderate-or-harder
+implementation and verification are `gpt-5.6-terra` / `max`; review is
+`gpt-5.6-terra` / `high`; and a bounded design probe is `gpt-5.6-sol` /
+`ultra`. Main Sol lane 0 owns design, integration, risk decisions, and final
+acceptance.
+
+The request supplies bounded work-package, target-gate, execution-context,
+read-context, remediation, and scheduler-state data. The plan binds a source
+plan hash, partitions exactly three subagent slots into start/retain
+assignments and honest idle slots, and carries canonical dispatch
+receipts/tokens. The host spawns only `action="start"`; it never respawns a
+retained assignment and refills a free slot only after a terminal event.
+Prewarm is read-only evidence, not acceptance evidence: a later writer may
+reuse it only after current-basis delta revalidation passes.
+
+The terminal protocol is bounded to one integration regression pass, one
+blocker review, and at most one global targeted remediation. Candidate or
+review results never unlock a dependency; lane 0 integration, artifact
+registration, and durable workflow completion remain required.
+
+The compiler proves only request consistency. All execution and read `repo`
+anchors must agree, and worker/read worktrees must differ from that anchor.
+Before executing a descriptor, the host matches the request anchor to its
+trusted shared integration worktree; before `git worktree add`, it rejects a
+mismatch without mutation. After apply, the host re-resolves the created
+target, verifies that it equals the planned worker worktree and shares the
+trusted anchor's Git common directory, and records that post-apply attestation
+as host evidence. The host never substitutes the integration worktree for a
+worker or read worktree.
+
+Rendered plans contain redacted bounded metadata only: no absolute
+repo/worktree/temp paths, prompts, raw command output, secrets, or raw
+external receipt bodies.
+
 ## CLI
 
 ```text
@@ -222,4 +269,6 @@ python scripts/team_efficiency.py contract-check --producer <producer.json> --co
 python scripts/team_efficiency.py cache-key --input <cache-inputs.json>
 python scripts/team_efficiency.py decompose --input <work-package.json>
 python scripts/team_efficiency.py plan-waves --input <work-package.json>
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort max --enable
 ```

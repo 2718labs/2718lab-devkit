@@ -12,7 +12,7 @@ description: Use when a 2718lab engineering task spans multiple files or agents,
 - 多代理或需要持久计划：读 `references/work-packages.md`。
 - 需要创建、领取或恢复任务：读 `references/orchestration-runtime.md`。
 - 需要选择 team 形状或写 dispatch：读 `references/team-patterns.md`。
-- 需要生成安全的本地启动计划、恢复包、Todo 状态、契约/缓存检查、手工工件 wave，或基于 `ImplementationPacket.to_dict()` / observed `GraphQueryResult.to_dict()` 的 Atlas 证据 wave 与工作流生命周期计划：读 `references/efficiency-automation.md`。
+- 需要生成安全的本地启动计划、恢复包、Todo 状态、契约/缓存检查、手工工件 wave、Fast Lane request/plan，或基于 `ImplementationPacket.to_dict()` / observed `GraphQueryResult.to_dict()` 的 Atlas 证据 wave 与工作流生命周期计划：读 `references/efficiency-automation.md`。
 - 不确定框架/API：读 `references/grounding-discipline.md`。
 - 准备交付：读 `references/verification-checklist.md`。
 
@@ -88,6 +88,26 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 ### 5. 调度与回传
 
 按 `references/team-patterns.md` 选择最小 team。每个 dispatch 必须给出任务卡绝对路径、允许写入的路径、依赖、验收命令和禁止事项。代理只回传：改动文件、真实命令输出、结论和阻塞项。
+
+#### Ultra Fast Lane
+
+对实质性的 Ultra 任务，host 调用：
+
+```text
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
+```
+
+`ultra` 自动激活；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不运行 gate、不改写 Git、不领取或完成 workflow。lane 0/main Sol 始终负责设计、集成、风险决策和最终验收。
+
+host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后 refill，且没有安全有用的工作时必须如实保留 idle slot。路由下限为：
+
+```text
+prewarm: gpt-5.6-terra / medium
+routine implementation and ordinary verification: gpt-5.6-terra / high
+moderate-or-harder implementation and verification: gpt-5.6-terra / max
+review: gpt-5.6-terra / high
+bounded design probe: gpt-5.6-sol / ultra
+```
 
 ### 6. 验证与交付
 
