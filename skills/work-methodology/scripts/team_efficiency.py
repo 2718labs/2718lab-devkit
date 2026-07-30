@@ -2627,7 +2627,7 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
 def _fast_lane_phase(value: object) -> str:
     scheduler_state = _mapping(value, "scheduler_state")
-    phase = scheduler_state.get("phase")
+    phase = _text(scheduler_state.get("phase"), "scheduler_state.phase", maximum=32)
     if phase not in _FAST_LANE_PHASES:
         raise ValueError("fast-lane phase is invalid")
     return phase

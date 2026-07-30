@@ -970,7 +970,27 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def test_fast_lane_top_level_fields_are_exact(self) -> None:
         helper = load_efficiency()
-        expected_fields = helper._FAST_LANE_PLAN_FIELDS
+        expected_fields = {
+            "schema",
+            "status",
+            "decision_code",
+            "activation",
+            "source_plan_hash",
+            "phase",
+            "main_lane",
+            "subagent_capacity",
+            "assignments",
+            "ready_queue",
+            "review_queue",
+            "prewarm_queue",
+            "design_queue",
+            "invalidated_evidence_task_ids",
+            "idle_slots",
+            "refill_plan",
+            "terminal_protocol",
+            "workflow_policy",
+            "plan_hash",
+        }
         needs_design_request = self.fast_lane_contexts_empty_request(helper)
         needs_design_request["work_package"] = {
             "schema": "team-efficiency/work-package-v1",
@@ -1031,13 +1051,120 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual(expected_fields, set(result))
                 self.assertEqual(status, result["status"])
                 self.assertEqual(decision_code, result["decision_code"])
+                self.assertEqual(
+                    {"reasoning_effort", "reason"}, set(result["activation"])
+                )
                 self.assertEqual(activation_reason, result["activation"]["reason"])
+                self.assertEqual(
+                    {
+                        "lane_id",
+                        "model",
+                        "reasoning_effort",
+                        "next_action",
+                        "design_owner",
+                        "parallel_design",
+                        "owned_write_scopes",
+                        "excluded_write_scopes",
+                    },
+                    set(result["main_lane"]),
+                )
+                self.assertEqual(
+                    {
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "ultra",
+                        "max_concurrent": 1,
+                    },
+                    result["main_lane"]["parallel_design"],
+                )
                 self.assertEqual(next_action, result["main_lane"]["next_action"])
                 self.assertEqual([], result["assignments"])
                 self.assertEqual([], result["ready_queue"])
                 self.assertEqual([], result["review_queue"])
                 self.assertEqual([], result["prewarm_queue"])
                 self.assertEqual([], result["design_queue"])
+                self.assertEqual(
+                    {
+                        "trigger": "slot_terminal_event",
+                        "dispatch_at": "next_host_dispatch_boundary",
+                        "priority": [
+                            "restore_two_safe_execution_slots",
+                            "declared_verification_unit",
+                            "candidate_review",
+                            "lane0_approved_design_probe",
+                            "dependency_prewarmer",
+                            "third_safe_execution",
+                        ],
+                        "polling": False,
+                    },
+                    result["refill_plan"],
+                )
+                self.assertEqual(
+                    {
+                        "owner",
+                        "compiler_schedules_declared_verification_units",
+                        "compiler_schedules_ad_hoc_terminal_slots",
+                        "verification_unit_task_ids",
+                        "integration_regression_passes",
+                        "blocker_reviews",
+                        "global_targeted_remediation_rounds",
+                        "wide_or_shared_scope_remediation",
+                    },
+                    set(result["terminal_protocol"]),
+                )
+                self.assertEqual(
+                    "lane0_and_work_methodology_skill",
+                    result["terminal_protocol"]["owner"],
+                )
+                self.assertTrue(
+                    result["terminal_protocol"][
+                        "compiler_schedules_declared_verification_units"
+                    ]
+                )
+                self.assertFalse(
+                    result["terminal_protocol"][
+                        "compiler_schedules_ad_hoc_terminal_slots"
+                    ]
+                )
+                self.assertEqual(
+                    1, result["terminal_protocol"]["integration_regression_passes"]
+                )
+                self.assertEqual(1, result["terminal_protocol"]["blocker_reviews"])
+                self.assertEqual(
+                    1,
+                    result["terminal_protocol"]["global_targeted_remediation_rounds"],
+                )
+                self.assertEqual(
+                    "stop_for_lane0",
+                    result["terminal_protocol"]["wide_or_shared_scope_remediation"],
+                )
+                self.assertEqual(
+                    {
+                        "owner",
+                        "boundary_operations",
+                        "conditional_operations",
+                        "operation_set_is_closed_capability_list",
+                        "mid_item_status_polling",
+                        "recovery_status_reads",
+                        "release_tool_available",
+                    },
+                    set(result["workflow_policy"]),
+                )
+                self.assertEqual(
+                    "work_methodology_skill", result["workflow_policy"]["owner"]
+                )
+                self.assertEqual([], result["workflow_policy"]["boundary_operations"])
+                self.assertEqual([], result["workflow_policy"]["conditional_operations"])
+                self.assertFalse(
+                    result["workflow_policy"][
+                        "operation_set_is_closed_capability_list"
+                    ]
+                )
+                self.assertFalse(result["workflow_policy"]["mid_item_status_polling"])
+                self.assertEqual(
+                    "start_or_recovery_boundary_only",
+                    result["workflow_policy"]["recovery_status_reads"],
+                )
+                self.assertFalse(result["workflow_policy"]["release_tool_available"])
                 self.assertEqual(
                     [
                         {"slot_id": "slot-1", "reason_code": idle_reason},
@@ -1067,6 +1194,80 @@ class TeamEfficiencyTests(unittest.TestCase):
             "design_required",
             cases[2][1]["main_lane"]["next_action"],
         )
+
+    def test_fast_lane_rejects_non_boolean_enable(self) -> None:
+        helper = load_efficiency()
+
+        for invalid_enable in (1, 0, None, "true"):
+            with self.subTest(enable=repr(invalid_enable)):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(
+                        self.fast_lane_contexts_empty_request(helper),
+                        reasoning_effort="max",
+                        enable=invalid_enable,
+                    )
+
+    def test_fast_lane_request_rejects_noncanonical_or_oversized_values(self) -> None:
+        helper = load_efficiency()
+        noncanonical = self.fast_lane_contexts_empty_request(helper)
+        noncanonical["scheduler_state"]["source_plan_hash"] = float("nan")
+        oversized = self.fast_lane_contexts_empty_request(helper)
+        oversized["work_package"]["goal"] = "x" * (
+            helper.MAX_MANIFEST_INPUT_BYTES + 1
+        )
+        self.assertGreater(
+            len(helper._json_bytes(oversized)), helper.MAX_MANIFEST_INPUT_BYTES
+        )
+
+        for name, request in (
+            ("nan", noncanonical),
+            ("oversized", oversized),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+    def test_fast_lane_request_shell_requires_exact_top_level_fields(self) -> None:
+        helper = load_efficiency()
+        missing_read_contexts = self.fast_lane_contexts_empty_request(helper)
+        del missing_read_contexts["read_contexts"]
+        unexpected_field = self.fast_lane_contexts_empty_request(helper)
+        unexpected_field["unexpected"] = True
+
+        for name, request in (
+            ("missing_read_contexts", missing_read_contexts),
+            ("unexpected", unexpected_field),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_nontext_phase_in_api_and_cli(self) -> None:
+        helper = load_efficiency()
+
+        for name, invalid_phase in (("list", []), ("object", {})):
+            request = self.fast_lane_contexts_empty_request(helper)
+            request["scheduler_state"]["phase"] = invalid_phase
+            with self.subTest(api=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+            request_path = self.temp / f"fast-lane-invalid-phase-{name}.json"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+            with self.subTest(cli=name):
+                exit_code, output, errors = self.run_fast_lane_cli(
+                    helper,
+                    [
+                        "fast-lane",
+                        "--input",
+                        str(request_path),
+                        "--reasoning-effort",
+                        "ultra",
+                    ],
+                )
+                self.assertEqual(2, exit_code)
+                self.assertEqual("", output)
+                self.assertTrue(errors.startswith("error: "))
 
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
