@@ -170,6 +170,16 @@ def load_efficiency():
     return module
 
 
+def canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 class TeamEfficiencyTests(unittest.TestCase):
     def setUp(self) -> None:
         task_temp = Path(os.environ["CODEX_TASK_TEMP"])
@@ -502,6 +512,121 @@ class TeamEfficiencyTests(unittest.TestCase):
             ],
         }
 
+    def fast_lane_request(
+        self,
+        helper,
+        *,
+        include_contexts: bool = True,
+    ) -> dict[str, object]:
+        work_package = copy.deepcopy(self.decomposition_manifest())
+        source_plan = helper.decompose(work_package)
+        integration_commit = "a" * 40
+        integration_tree = "b" * 40
+        target_gates: list[dict[str, object]] = []
+        execution_contexts: list[dict[str, object]] = []
+
+        for unit in source_plan["units"]:
+            task_id = unit["task_id"]
+            task_slug = task_id.lower()
+            failure_ids = [
+                "tests.test_team_efficiency.TeamEfficiencyTests."
+                f"test_fast_lane_{task_slug}_driver"
+            ]
+            target_gates.append(
+                {
+                    "task_id": task_id,
+                    "driver_gate_id": "focused",
+                    "gates": [
+                        {
+                            "gate_id": "focused",
+                            "argv": [
+                                "python",
+                                "-m",
+                                "unittest",
+                                "tests.test_team_efficiency",
+                            ],
+                            "red_expected_exit_codes": [1],
+                            "green_expected_exit_code": 0,
+                            "timeout_seconds": 300,
+                            "red_failure_ids": failure_ids,
+                            "red_failure_fingerprint": helper._sha256_json(
+                                {
+                                    "schema": "team-efficiency/red-failure-identity-v1",
+                                    "gate_id": "focused",
+                                    "failure_ids": failure_ids,
+                                }
+                            ),
+                            "acceptance_constraint_hashes": [],
+                        }
+                    ],
+                }
+            )
+            execution_contexts.append(
+                {
+                    "task_id": task_id,
+                    "bootstrap_plan": helper.build_bootstrap_plan(
+                        task_id=task_id,
+                        base_commit=integration_commit,
+                        branch=f"codex/fast-lane-{task_slug}",
+                        write_scope=unit["write_scope"],
+                        repo=self.repo,
+                        project=self.project,
+                        worktree=self.safe_root / "worktrees" / f"fast-lane-{task_slug}",
+                        temp_target=self.safe_root / "tasks" / f"fast-lane-{task_slug}",
+                    ),
+                    "workspace_input_snapshot_id": None,
+                }
+            )
+
+        return {
+            "schema": "team-efficiency/fast-lane-request-v1",
+            "work_package": work_package,
+            "target_gates": target_gates,
+            "execution_contexts": execution_contexts if include_contexts else [],
+            "read_contexts": [],
+            "remediation_request": None,
+            "scheduler_state": {
+                "source_plan_hash": None,
+                "phase": "execution",
+                "integration_state": {
+                    "commit": integration_commit,
+                    "tree": integration_tree,
+                    "integration_workspace_snapshot_id": None,
+                },
+                "lane0_state": {
+                    "active_task_id": None,
+                    "owned_write_scopes": [],
+                },
+                "completed_tasks": [],
+                "review_ready_candidates": [],
+                "reviewed_candidates": [],
+                "prewarmed_evidence": [],
+                "design_evidence": [],
+                "running_assignments": [],
+                "dispatch_contexts": [],
+                "blocked_task_ids": [],
+                "pending_design_probe_task_ids": [],
+                "slot_epochs": {
+                    "slot-1": 0,
+                    "slot-2": 0,
+                    "slot-3": 0,
+                },
+                "global_remediation": {
+                    "round": 0,
+                    "state": "not_requested",
+                    "task_id": None,
+                    "affected_task_ids": [],
+                    "blocker_review_hash": None,
+                    "finding_hash": None,
+                    "dispatch_receipt": None,
+                    "completion_receipt_hash": None,
+                },
+            },
+        }
+
+    def fast_lane_contexts_empty_request(self, helper) -> dict[str, object]:
+        return self.fast_lane_request(helper, include_contexts=False)
+
     def code_atlas_manifest(self) -> dict[str, object]:
         def digest(marker: str) -> str:
             return f"sha256:{marker * 64}"
@@ -688,6 +813,126 @@ class TeamEfficiencyTests(unittest.TestCase):
             "eligible": True,
             "graph": graph.to_dict(),
         }
+
+    def test_fast_lane_ultra_auto_activation(self) -> None:
+        helper = load_efficiency()
+
+        activation = helper._fast_lane_activation("ultra", False)
+
+        self.assertEqual(
+            {"reasoning_effort": "ultra", "reason": "ultra_auto"},
+            activation,
+        )
+
+    def test_fast_lane_lower_effort_requires_explicit_enable(self) -> None:
+        helper = load_efficiency()
+
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                self.assertEqual(
+                    {"reasoning_effort": effort, "reason": "explicit_opt_in"},
+                    helper._fast_lane_activation(effort, True),
+                )
+
+    def test_fast_lane_ultra_context_ineligible_is_blocked(self) -> None:
+        helper = load_efficiency()
+
+        result = helper.compile_fast_lane(
+            self.fast_lane_contexts_empty_request(helper),
+            reasoning_effort="ultra",
+        )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual("ultra_auto", result["activation"]["reason"])
+        self.assertEqual([], result["assignments"])
+
+    def test_fast_lane_lower_effort_without_enable_is_exactly_inactive(self) -> None:
+        helper = load_efficiency()
+
+        result = helper.compile_fast_lane(
+            self.fast_lane_contexts_empty_request(helper),
+            reasoning_effort="max",
+            enable=False,
+        )
+
+        self.assertEqual("inactive", result["status"])
+        self.assertEqual("EXPLICIT_OPT_IN_REQUIRED", result["decision_code"])
+        self.assertEqual([], result["assignments"])
+        self.assertEqual(
+            {"slot-1", "slot-2", "slot-3"},
+            {item["slot_id"] for item in result["idle_slots"]},
+        )
+        self.assertTrue(
+            all(
+                item["reason_code"] == "OPT_IN_REQUIRED"
+                for item in result["idle_slots"]
+            )
+        )
+
+    def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
+        helper = load_efficiency()
+
+        payload = canonical_bytes(helper.decompose(self.decomposition_manifest()))
+        waves_payload = canonical_bytes(helper.plan_waves(self.decomposition_manifest()))
+
+        self.assertEqual(payload, waves_payload)
+        self.assertEqual(11730, len(payload))
+        self.assertEqual(
+            "f736b99d55bc562252d1fd6a98fb0f2d12813b0b50ba518f88d4f12c298a7775",
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+    def test_skill_documents_ultra_auto_policy(self) -> None:
+        document = SKILL.read_text(encoding="utf-8")
+
+        for expected in (
+            "python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra",
+            "Ultra automatic activation",
+            "--enable",
+            "main Sol",
+            'action="start"',
+            'action="retain"',
+            "terminal",
+            "no safe useful work",
+            "prewarm: gpt-5.6-terra / medium",
+            "routine implementation and ordinary verification: gpt-5.6-terra / high",
+            "moderate-or-harder implementation and verification: gpt-5.6-terra / max",
+            "review: gpt-5.6-terra / high",
+            "bounded design probe: gpt-5.6-sol / ultra",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, document)
+
+    def test_efficiency_reference_documents_host_contract(self) -> None:
+        document = (ROOT / "references" / "efficiency-automation.md").read_text(
+            encoding="utf-8"
+        )
+
+        for expected in (
+            "team-efficiency/fast-lane-request-v1",
+            "team-efficiency/fast-lane-plan-v1",
+            "ultra_auto",
+            "explicit_opt_in",
+            "python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra",
+            "python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort max --enable",
+            "target gates",
+            "canonical repo anchor",
+            "trusted shared integration worktree",
+            "git worktree add",
+            "Git common directory",
+            "inert",
+            "no model call",
+            "agent spawn",
+            "remote service",
+            "Git mutation",
+            "workflow call",
+            "one regression",
+            "one blocker review",
+            "one global remediation",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, document)
 
     def test_bootstrap_defaults_to_a_dry_run_with_only_safe_git_argv(self) -> None:
         helper = load_efficiency()
