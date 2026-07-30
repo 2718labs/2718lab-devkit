@@ -689,6 +689,61 @@ class TeamEfficiencyTests(unittest.TestCase):
             ),
         }
 
+    def fast_lane_execution_context(
+        self,
+        helper,
+        *,
+        task_id: str,
+        bootstrap_task_id: str | None = None,
+        base_commit: str,
+        write_scope: list[str],
+        branch: str | None = None,
+        worktree: str | Path | None = None,
+        temp_target: str | Path | None = None,
+    ) -> dict[str, object]:
+        task_slug = task_id.lower()
+        return {
+            "task_id": task_id,
+            "bootstrap_plan": helper.build_bootstrap_plan(
+                task_id=(
+                    task_id if bootstrap_task_id is None else bootstrap_task_id
+                ),
+                base_commit=base_commit,
+                branch=(
+                    f"codex/fast-lane-{task_slug}" if branch is None else branch
+                ),
+                write_scope=write_scope,
+                repo=self.repo,
+                project=self.project,
+                worktree=(
+                    self.safe_root / "worktrees" / f"fast-lane-{task_slug}"
+                    if worktree is None
+                    else worktree
+                ),
+                temp_target=(
+                    self.safe_root / "tasks" / f"fast-lane-{task_slug}"
+                    if temp_target is None
+                    else temp_target
+                ),
+            ),
+            "workspace_input_snapshot_id": None,
+        }
+
+    def fully_bound_fast_lane_manual_request(self, helper) -> dict[str, object]:
+        request = self.fast_lane_contexts_empty_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        base_commit = request["scheduler_state"]["integration_state"]["commit"]
+        request["execution_contexts"] = [
+            self.fast_lane_execution_context(
+                helper,
+                task_id=unit["task_id"],
+                base_commit=base_commit,
+                write_scope=list(unit["write_scope"]),
+            )
+            for unit in source_plan["units"]
+        ]
+        return request
+
     def run_fast_lane_cli(
         self,
         helper,
@@ -1602,6 +1657,113 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertEqual("", output)
         self.assertEqual("error: ATLAS_GATE_UNVERIFIED\n", errors)
+
+    def test_fast_lane_rejects_unsafe_gates_and_unbound_contexts(self) -> None:
+        helper = load_efficiency()
+        baseline = self.fully_bound_fast_lane_manual_request(helper)
+        for context in baseline["execution_contexts"]:
+            self.assertEqual(
+                {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"},
+                set(context),
+            )
+            self.assertIsNone(context["workspace_input_snapshot_id"])
+        baseline_result = helper.compile_fast_lane(
+            copy.deepcopy(baseline), reasoning_effort="ultra"
+        )
+        self.assertEqual("team-efficiency/fast-lane-plan-v1", baseline_result["schema"])
+
+        unsafe_argv_cases = (
+            ("cmd_wrapper", ["cmd", "/c", "echo unsafe"]),
+            ("sh_wrapper", ["sh", "-c", "echo unsafe"]),
+            ("windows_absolute", ["python", r"C:\Windows\System32\cmd.exe"]),
+            ("posix_absolute", ["python", "/etc/passwd"]),
+            ("traversal", ["python", "../outside"]),
+            ("embedded_posix_absolute", ["python", "--file=/etc/passwd"]),
+            ("secret_marker", ["python", "secret=token"]),
+            ("empty_component", ["python", ""]),
+            ("empty", []),
+            ("too_many", ["python"] * 33),
+            ("too_long", ["python", "x" * 257]),
+        )
+        for name, argv in unsafe_argv_cases:
+            with self.subTest(case=name):
+                request = copy.deepcopy(baseline)
+                request["target_gates"][0]["gates"][0]["argv"] = argv
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+        source_plan = helper.decompose(baseline["work_package"])
+        first_unit, second_unit = source_plan["units"][:2]
+        base_commit = baseline["scheduler_state"]["integration_state"]["commit"]
+        first_context = baseline["execution_contexts"][0]
+        context_cases: list[tuple[str, dict[str, object]]] = []
+
+        task_mismatch = copy.deepcopy(baseline)
+        task_mismatch["execution_contexts"][0] = self.fast_lane_execution_context(
+            helper,
+            task_id=first_unit["task_id"],
+            bootstrap_task_id=second_unit["task_id"],
+            base_commit=base_commit,
+            write_scope=list(first_unit["write_scope"]),
+        )
+        context_cases.append(("task_mismatch", task_mismatch))
+
+        base_mismatch = copy.deepcopy(baseline)
+        base_mismatch["execution_contexts"][0] = self.fast_lane_execution_context(
+            helper,
+            task_id=first_unit["task_id"],
+            base_commit="b" * 40,
+            write_scope=list(first_unit["write_scope"]),
+        )
+        context_cases.append(("base_mismatch", base_mismatch))
+
+        scope_mismatch = copy.deepcopy(baseline)
+        scope_mismatch["execution_contexts"][0] = self.fast_lane_execution_context(
+            helper,
+            task_id=first_unit["task_id"],
+            base_commit=base_commit,
+            write_scope=["skills/work-methodology/references/context-unrelated.md"],
+        )
+        context_cases.append(("scope_mismatch", scope_mismatch))
+
+        duplicate_branch = copy.deepcopy(baseline)
+        duplicate_branch["execution_contexts"][1] = self.fast_lane_execution_context(
+            helper,
+            task_id=second_unit["task_id"],
+            base_commit=base_commit,
+            write_scope=list(second_unit["write_scope"]),
+            branch=first_context["bootstrap_plan"]["branch"],
+        )
+        context_cases.append(("duplicate_branch", duplicate_branch))
+
+        duplicate_worktree = copy.deepcopy(baseline)
+        duplicate_worktree["execution_contexts"][1] = self.fast_lane_execution_context(
+            helper,
+            task_id=second_unit["task_id"],
+            base_commit=base_commit,
+            write_scope=list(second_unit["write_scope"]),
+            worktree=first_context["bootstrap_plan"]["worktree"],
+        )
+        context_cases.append(("duplicate_worktree", duplicate_worktree))
+
+        duplicate_temp = copy.deepcopy(baseline)
+        duplicate_temp["execution_contexts"][1] = self.fast_lane_execution_context(
+            helper,
+            task_id=second_unit["task_id"],
+            base_commit=base_commit,
+            write_scope=list(second_unit["write_scope"]),
+            temp_target=first_context["bootstrap_plan"]["temp_target"],
+        )
+        context_cases.append(("duplicate_temp", duplicate_temp))
+
+        missing_execution_binding = copy.deepcopy(baseline)
+        del missing_execution_binding["execution_contexts"][0]
+        context_cases.append(("missing_execution_binding", missing_execution_binding))
+
+        for name, invalid_request in context_cases:
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
 
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
