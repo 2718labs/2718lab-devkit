@@ -2653,6 +2653,7 @@ def _fast_lane_argv(value: object, field: str) -> list[str]:
             folded in _FAST_LANE_SHELL_WRAPPERS
             or folded in _FAST_LANE_SHELL_ARGUMENTS
             or token.startswith("\\")
+            or "=/" in token
             or ".." in token
             or any(ord(character) == 127 for character in token)
         ):
@@ -2856,6 +2857,8 @@ def _validated_fast_lane_target_gates(
             )
             if verified_test_hash not in expected_acceptance:
                 raise ValueError("packet target gate is not a verified test")
+            if gate["acceptance_constraint_hashes"] != [verified_test_hash]:
+                raise ValueError("packet target gate coverage is ambiguous")
         unit_kind = _text(unit["unit_kind"], "source plan unit.unit_kind", maximum=32)
         if unit_kind == "verification":
             if driver_gate_id is not None or any(
