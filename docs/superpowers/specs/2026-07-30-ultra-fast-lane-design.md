@@ -169,8 +169,10 @@ Fast-lane routing is a policy overlay; it does not mutate the existing
 | --- | --- |
 | Main architecture, exceptional work, integration, final acceptance | main `gpt-5.6-sol` lane 0 at the host-declared effort |
 | Bounded parallel architecture alternative or adversarial design review | `model=gpt-5.6-sol`, `reasoning_effort=ultra` |
-| Routine implementation, evidence, ordinary validation | `model=gpt-5.6-terra`, `reasoning_effort=high` |
-| Moderate or harder implementation/debugging execution | `model=gpt-5.6-terra`, `reasoning_effort=max` |
+| Read-only prewarm | `model=gpt-5.6-terra`, `reasoning_effort=medium` |
+| Candidate review | `model=gpt-5.6-terra`, `reasoning_effort=high` |
+| Routine implementation, evidence, or verification | `model=gpt-5.6-terra`, `reasoning_effort=high` |
+| Moderate or harder implementation/debugging/verification execution | `model=gpt-5.6-terra`, `reasoning_effort=max` |
 
 Terra never owns architecture. A Sol Ultra design subagent returns candidate
 reasoning; lane 0 retains the decision and acceptance. The legacy
@@ -374,7 +376,15 @@ assignment or execution item in `ready_queue` requires exactly one. A unit
 without one can only be read-only-prewarmed or reported with
 `EXECUTION_CONTEXT_MISSING`; it cannot become a writer. Across contexts,
 branch, worktree, and temp target are each unique, and no worker worktree may
-equal the integration worktree. A new execution dispatch requires
+equal the integration worktree. Every nested `bootstrap_plan.repo` is the
+canonical shared integration-worktree anchor and all such anchors must agree;
+therefore the compiler can compare each planned worker worktree with that
+anchor without adding a request field. The host re-resolves and attests the
+trusted integration worktree, requires its canonical path to equal the request
+anchor, and attests the same non-equality before applying a bootstrap plan.
+After apply it also verifies the planned target and Git common-directory
+identity. A failed pre-apply attestation must not run `git worktree add`. A new
+execution dispatch requires
 `bootstrap_plan.base_commit == integration_state.commit`; a retained worker
 may carry an older immutable base only through its already validated token.
 Lease recovery is not a fresh execution dispatch. It may reuse the exact
@@ -420,12 +430,19 @@ substituted as the strict task's workspace.
 `role` is one of `verification`, `prewarm`, `review`, or `design_probe`.
 `(task_id, role)` is unique. Git object IDs are complete 40- or 64-character
 lowercase hexadecimal IDs. Repository and worktree must resolve to the same
-repository; `read_scope` is normalized, relative, bounded, and read-only.
+repository. Every `repo` is the same canonical shared
+integration-worktree anchor used by execution contexts; a differing anchor
+fails closed. `read_scope` is normalized, relative, bounded, and read-only.
 Worktree and temp paths must be unique across all contexts, must not equal the
 shared integration worktree, and the temp path must remain inside the
 task-specific `D:\bun\tmp\codex\<project-or-thread>` root. Test caches,
 bytecode, logs, and other incidental writes are redirected to `temp_target`;
-the source worktree remains unchanged.
+the source worktree remains unchanged. The host re-resolves repository identity
+and canonical paths before it executes a read-only descriptor, requires the
+request anchor to equal its trusted shared integration worktree, and records
+the non-equality as host evidence; it never substitutes the integration
+worktree. Compiler validation proves request consistency, not trusted-anchor
+identity.
 
 A new verification dispatch requires exactly one read context whose commit and
 tree match the current integration state and whose non-null input snapshot was
@@ -663,7 +680,8 @@ and confer no write ownership. Verification is permitted only for
 `unit_kind = "verification"` in `integration_regression`. A design probe
 always uses `model=gpt-5.6-sol` and `reasoning_effort=ultra`; ordinary
 evidence, implementation, and verification use only the explicit Terra routes
-in Section 6.3.
+in Section 6.3. Prewarm is the intentional lower-cost exception and always
+uses `model=gpt-5.6-terra`, `reasoning_effort=medium`.
 
 All scheduler lists reject unknown fields and are bounded by the work-package
 unit limit plus the single remediation exception. Their exact keys and
@@ -1031,7 +1049,7 @@ input example in Section 7:
         "slot_id": "slot-3",
         "assignment_epoch": 2,
         "model": "gpt-5.6-terra",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
         "dispatch_context_hash": "sha256:...",
         "target_gates_hash": null,
         "execution_context_hash": null,
@@ -1046,7 +1064,7 @@ input example in Section 7:
       "recommended_route": "Terra High",
       "role": "prewarm",
       "model": "gpt-5.6-terra",
-      "reasoning_effort": "high",
+      "reasoning_effort": "medium",
       "access": "read_only",
       "context_hash": "sha256:...",
       "execution_context_hash": null,
@@ -1132,7 +1150,7 @@ input example in Section 7:
       "recommended_route": "Terra High",
       "role": "prewarm",
       "model": "gpt-5.6-terra",
-      "reasoning_effort": "high",
+      "reasoning_effort": "medium",
       "access": "read_only",
       "context_hash": "sha256:...",
       "execution_context_hash": null,
@@ -1427,6 +1445,16 @@ At that event, the host consumes the already ordered refill plan immediately:
 5. otherwise use the support slot as a third safe writer when the work-package
    capacity permits;
 6. otherwise place the slot in `idle_slots` with a stable reason.
+
+For step 4, a future unit is an unfinished, unblocked, execution-capable
+artifact or Code Atlas code unit with no running assignment, candidate, or
+review state and an exact `(task_id, prewarm)` read context. Verification units
+are not eligible. Its readiness distance is `0` when all dependencies are
+complete and otherwise `1 + max(distance(dependency))` across unfinished
+dependencies. The host chooses the smallest distance, then the stable Kahn
+topology index, legacy wave index, and task ID. The Kahn ready set is ordered by
+task ID. This critical-path definition makes multi-parent DAG selection
+deterministic.
 
 Refill is event-driven. Neither the helper nor the host should busy-poll a
 subagent. A prewarmer cannot modify files, claim a writer lease, or be counted
@@ -1841,7 +1869,10 @@ cover:
 - a terminal event refills one slot without waiting for other running slots;
 - retained assignments are marked `retain` and only the free slot is `start`;
 - assignment epochs and tokens reject late or duplicate results;
-- dependency-nearest prewarm selection is deterministic;
+- dependency-nearest prewarm selection uses the specified readiness
+  critical-path distance and deterministic tie breakers;
+- every prewarm dispatch is Terra Medium, read-only, and carries no gate,
+  lease, claim, or write ownership;
 - a prewarm observation survives dependency completion only through a passing
   current-basis delta revalidation; stale delta evidence is never dispatched;
 - no-safe-work emits exact `idle_slots` records and stable reason codes;
@@ -1985,7 +2016,7 @@ The feature is accepted when:
    dependencies, a second global remediation, and `needs_design` all fail
    closed;
 8. every dispatched model and reasoning effort is explicit, with Sol Ultra
-   reserved for bounded design probes;
+   reserved for bounded design probes and Terra Medium reserved for prewarm;
 9. documentation clearly states the host-declared effort limitation, compiler
    ownership of declared verification scheduling, and lane-0/skill ownership
    of terminal execution and acceptance;
