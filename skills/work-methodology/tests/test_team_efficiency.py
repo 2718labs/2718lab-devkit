@@ -578,7 +578,9 @@ class TeamEfficiencyTests(unittest.TestCase):
                         worktree=self.safe_root / "worktrees" / f"fast-lane-{task_slug}",
                         temp_target=self.safe_root / "tasks" / f"fast-lane-{task_slug}",
                     ),
-                    "workspace_input_snapshot_id": None,
+                    "workspace_input_snapshot_id": self.fast_lane_execution_snapshot_id(
+                        helper, task_id
+                    ),
                 }
             )
 
@@ -730,8 +732,13 @@ class TeamEfficiencyTests(unittest.TestCase):
                     else temp_target
                 ),
             ),
-            "workspace_input_snapshot_id": None,
+            "workspace_input_snapshot_id": self.fast_lane_execution_snapshot_id(
+                helper, task_id
+            ),
         }
+
+    def fast_lane_execution_snapshot_id(self, helper, task_id: str) -> str:
+        return helper._sha256_json({"snapshot": task_id, "role": "execution"})
 
     def fully_bound_fast_lane_manual_request(self, helper) -> dict[str, object]:
         request = self.fast_lane_contexts_empty_request(helper)
@@ -995,6 +1002,199 @@ class TeamEfficiencyTests(unittest.TestCase):
         request["scheduler_state"]["running_assignments"] = [assignment]
         request["scheduler_state"]["dispatch_contexts"] = [dispatch_context]
         return request
+
+    def fast_lane_assignment_for(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        task_id: str,
+        role: str = "execution",
+        slot_id: str = "slot-1",
+        route: tuple[str, str] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        try:
+            validated = helper._validated_fast_lane_request(copy.deepcopy(request))
+        except ValueError as error:
+            self.fail(f"fast-lane assignment fixture must validate: {error}")
+        unit = next(
+            item
+            for item in validated["source_plan"]["units"]
+            if item["task_id"] == task_id
+        )
+        resolved_route = (
+            helper._fast_lane_route(unit, role) if route is None else route
+        )
+        self.assertIsNotNone(resolved_route)
+        assignment = helper._fast_lane_assignment(
+            validated, unit, role, slot_id, resolved_route
+        )
+        context = assignment.pop("_context")
+        assignment.pop("action")
+        return assignment, context, validated
+
+    def fast_lane_terminal_result(
+        self,
+        helper,
+        assignment: dict[str, object],
+        *,
+        outcome: str | None = None,
+        candidate_commit: str = "c" * 40,
+        candidate_tree: str = "d" * 40,
+    ) -> dict[str, object]:
+        task_id = str(assignment["task_id"])
+        role = str(assignment["role"])
+        def marker(label: str) -> str:
+            return helper._sha256_json(
+                {"terminal": label, "task_id": task_id, "role": role}
+            )
+        defaults = {
+            "execution": "candidate",
+            "verification": "verified",
+            "prewarm": "evidence",
+            "review": "pass",
+            "design_probe": "evidence",
+        }
+        resolved_outcome = defaults[role] if outcome is None else outcome
+        candidate = role == "execution" and resolved_outcome == "candidate"
+        verified = role == "verification" and resolved_outcome == "verified"
+        observed = role in {"prewarm", "design_probe"} and resolved_outcome == "evidence"
+        reviewed = role == "review" and resolved_outcome == "pass"
+        return {
+            "schema": "team-efficiency/fast-lane-terminal-result-v1",
+            "dispatch_receipt": copy.deepcopy(assignment["dispatch_receipt"]),
+            "assignment_token": assignment["assignment_token"],
+            "task_id": task_id,
+            "role": role,
+            "outcome": resolved_outcome,
+            "candidate_commit": candidate_commit if candidate else None,
+            "candidate_tree": candidate_tree if candidate else None,
+            "red_evidence_hashes": [marker("red")] if candidate else [],
+            "green_evidence_hashes": [marker("green")] if candidate or verified else [],
+            "evidence_hash": marker("evidence") if verified or observed else None,
+            "review_hash": marker("review") if reviewed else None,
+            "input_query_trace_id": marker("input-query") if candidate or verified else None,
+            "checkpoint_id": marker("checkpoint") if candidate else None,
+            "output_workspace_snapshot_id": marker("output-snapshot") if candidate else None,
+            "output_query_trace_id": marker("output-query") if candidate else None,
+        }
+
+    def fast_lane_completion_receipt(
+        self,
+        helper,
+        terminal_result: dict[str, object],
+        *,
+        completion_kind: str = "integrated_candidate",
+        integration_commit: str = "a" * 40,
+        integration_tree: str = "b" * 40,
+        workspace_input_snapshot_id: str | None = None,
+    ) -> dict[str, object]:
+        writer = completion_kind == "integrated_candidate"
+        task_id = str(terminal_result["task_id"])
+        snapshot = workspace_input_snapshot_id
+        if snapshot is None:
+            snapshot = (
+                self.fast_lane_execution_snapshot_id(helper, task_id)
+                if writer
+                else helper._sha256_json({"snapshot": task_id})
+            )
+        return {
+            "schema": "team-efficiency/fast-lane-completion-receipt-v1",
+            "terminal_result_hash": helper._sha256_json(terminal_result),
+            "workflow_id_hash": helper._sha256_json(
+                {"workflow": terminal_result["task_id"]}
+            ),
+            "task_id": terminal_result["task_id"],
+            "completion_kind": completion_kind,
+            "integration_commit": integration_commit,
+            "integration_tree": integration_tree,
+            "candidate_commit": terminal_result["candidate_commit"] if writer else None,
+            "candidate_tree": terminal_result["candidate_tree"] if writer else None,
+            "integration_proof_hash": helper._sha256_json(
+                {"integration": terminal_result["task_id"]}
+            ) if writer else None,
+            "workspace_input_snapshot_id": snapshot,
+            "output_workspace_snapshot_id": (
+                terminal_result["output_workspace_snapshot_id"] if writer else None
+            ),
+            "verification_evidence_hashes": list(
+                terminal_result["green_evidence_hashes"]
+            ),
+        }
+
+    def fast_lane_completed_record(
+        self,
+        helper,
+        terminal_result: dict[str, object],
+        *,
+        completion_kind: str = "integrated_candidate",
+        workspace_input_snapshot_id: str | None = None,
+    ) -> dict[str, object]:
+        receipt = self.fast_lane_completion_receipt(
+            helper,
+            terminal_result,
+            completion_kind=completion_kind,
+            workspace_input_snapshot_id=workspace_input_snapshot_id,
+        )
+        receipt_hash = helper._sha256_json(receipt)
+        return {
+            "task_id": terminal_result["task_id"],
+            "completion_kind": completion_kind,
+            "integration_commit": receipt["integration_commit"],
+            "integration_tree": receipt["integration_tree"],
+            "result_hash": receipt_hash,
+            "terminal_result_hash": helper._sha256_json(terminal_result),
+            "terminal_result": terminal_result,
+            "completion_receipt_hash": receipt_hash,
+            "completion_receipt": receipt,
+        }
+
+    def fast_lane_remediation_request(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        write_scope: list[str] | None = None,
+        round_value: int = 1,
+    ) -> dict[str, object]:
+        source_plan = helper.decompose(request["work_package"])
+        source_plan_hash = helper._sha256_json(source_plan)
+        source_unit = source_plan["units"][0]
+        blocker_review_hash = helper._sha256_json({"blocker": "one"})
+        seed = helper._sha256_json(
+            {
+                "schema": "fast-lane-remediation-id-v1",
+                "source_plan_hash": source_plan_hash,
+                "blocker_review_hash": blocker_review_hash,
+                "round": 1,
+            }
+        )
+        task_id = "FLR1-" + seed.removeprefix("sha256:")[:24]
+        scope = list(source_unit["write_scope"] if write_scope is None else write_scope)
+        gate = self.fast_lane_gate(gate_id="remediation-focused")
+        return {
+            "schema": "team-efficiency/fast-lane-remediation-request-v1",
+            "round": round_value,
+            "task_id": task_id,
+            "source_plan_hash": source_plan_hash,
+            "blocker_review_hash": blocker_review_hash,
+            "finding_hash": helper._sha256_json({"finding": "one"}),
+            "severity": "important",
+            "affected_task_ids": [source_unit["task_id"]],
+            "dependencies": [source_unit["task_id"]],
+            "base_integration_commit": request["scheduler_state"]["integration_state"]["commit"],
+            "base_integration_tree": request["scheduler_state"]["integration_state"]["tree"],
+            "goal": "Apply one bounded approved remediation",
+            "output_boundary": "bounded remediation candidate",
+            "write_scope": scope,
+            "direct_contract_hashes": list(source_unit["direct_contract_hashes"]),
+            "required_evidence": ["focused-remediation-test"],
+            "task_node_ids": [helper._sha256_json({"remediation": task_id})],
+            "contract_node_ids": [],
+            "acceptance_constraints": [],
+            "driver_gate_id": "remediation-focused",
+            "target_gates": [gate],
+        }
 
     def run_fast_lane_cli(
         self,
@@ -1430,28 +1630,17 @@ class TeamEfficiencyTests(unittest.TestCase):
             return assignment, context
 
         retained, retained_context = running_assignment("FAST-LANE-A", "slot-1")
-        terminal, _ = running_assignment("FAST-LANE-B", "slot-2")
-        terminal_result = {"kind": "candidate", "task_id": "FAST-LANE-B"}
-        completion_receipt = {"kind": "completion", "task_id": "FAST-LANE-B"}
-        completion_receipt_hash = helper._sha256_json(completion_receipt)
+        terminal, terminal_context = running_assignment("FAST-LANE-B", "slot-2")
+        terminal_result = self.fast_lane_terminal_result(helper, terminal)
+        completed_record = self.fast_lane_completed_record(helper, terminal_result)
         request["scheduler_state"].update(
             {
                 "source_plan_hash": validated["source_plan_hash"],
                 "completed_tasks": [
-                    {
-                        "task_id": "FAST-LANE-B",
-                        "completion_kind": "integrated_candidate",
-                        "integration_commit": "a" * 40,
-                        "integration_tree": "b" * 40,
-                        "result_hash": completion_receipt_hash,
-                        "terminal_result_hash": helper._sha256_json(terminal_result),
-                        "terminal_result": terminal_result,
-                        "completion_receipt_hash": completion_receipt_hash,
-                        "completion_receipt": completion_receipt,
-                    }
+                    completed_record
                 ],
                 "running_assignments": [retained],
-                "dispatch_contexts": [retained_context],
+                "dispatch_contexts": [retained_context, terminal_context],
                 "slot_epochs": {"slot-1": 1, "slot-2": 1, "slot-3": 0},
             }
         )
@@ -1473,6 +1662,189 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(2, started[0]["assignment_epoch"])
         self.assertEqual("FAST-LANE-C", started[0]["task_id"])
         self.assertEqual(terminal["assignment_epoch"], 1)
+
+    def test_fast_lane_host_slot_occupancy_excludes_nonrunning_states(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+        assignment = copy.deepcopy(request["scheduler_state"]["running_assignments"][0])
+        binding = {
+            "workflow_id": "FASTLANE-20260730",
+            "task_id": assignment["task_id"],
+            "slot_id": assignment["slot_id"],
+            "assignment_epoch": assignment["assignment_epoch"],
+            "assignment_token": assignment["assignment_token"],
+            "context_hash": assignment["context_hash"],
+            "lease_epoch": 7,
+            "endpoint": "/root/fastlane_task5_writer",
+            "state": "running",
+        }
+        lease = {
+            "task_id": assignment["task_id"],
+            "lease_epoch": 7,
+            "endpoint": "/root/fastlane_task5_writer",
+            "state": "running",
+        }
+
+        for state in ("completed", "failed", "blocked", "expired", "interrupted", "pending_init"):
+            with self.subTest(state=state):
+                inactive = {**binding, "state": state}
+                audit = helper._fast_lane_host_slot_occupancy_audit(
+                    workflow_id="FASTLANE-20260730",
+                    source_plan_hash=request["scheduler_state"]["source_plan_hash"],
+                    phase="execution",
+                    running_assignments=[assignment],
+                    host_bindings=[inactive],
+                    current_leases=[lease],
+                )
+                self.assertEqual([], audit["active_slot_ids"])
+                self.assertEqual(
+                    ["slot-1", "slot-2", "slot-3"], audit["vacant_slot_ids"]
+                )
+
+    def test_fast_lane_host_slot_occupancy_requires_matching_lease_endpoint_and_assignment(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+        assignment = copy.deepcopy(request["scheduler_state"]["running_assignments"][0])
+        binding = {
+            "workflow_id": "FASTLANE-20260730",
+            "task_id": assignment["task_id"],
+            "slot_id": assignment["slot_id"],
+            "assignment_epoch": assignment["assignment_epoch"],
+            "assignment_token": assignment["assignment_token"],
+            "context_hash": assignment["context_hash"],
+            "lease_epoch": 7,
+            "endpoint": "/root/fastlane_task5_writer",
+            "state": "running",
+        }
+        lease = {
+            "task_id": assignment["task_id"],
+            "lease_epoch": 7,
+            "endpoint": "/root/fastlane_task5_writer",
+            "state": "running",
+        }
+
+        invalid_bindings = (
+            ("task_id", "FAST-LANE-FORGED"),
+            ("slot_id", "slot-2"),
+            ("assignment_epoch", 8),
+            ("assignment_token", "sha256:" + "0" * 64),
+            ("context_hash", "sha256:" + "1" * 64),
+            ("lease_epoch", 8),
+            ("endpoint", "/root/other_worker"),
+        )
+        for field, value in invalid_bindings:
+            with self.subTest(field=field):
+                invalid = {**binding, field: value}
+                audit = helper._fast_lane_host_slot_occupancy_audit(
+                    workflow_id="FASTLANE-20260730",
+                    source_plan_hash=request["scheduler_state"]["source_plan_hash"],
+                    phase="execution",
+                    running_assignments=[assignment],
+                    host_bindings=[invalid],
+                    current_leases=[lease],
+                )
+                self.assertEqual([], audit["active_slot_ids"])
+                self.assertIn("slot-1", audit["vacant_slot_ids"])
+
+    def test_fast_lane_host_slot_audit_emits_deterministic_next_boundary_refill(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+        assignment = copy.deepcopy(request["scheduler_state"]["running_assignments"][0])
+        binding = {
+            "workflow_id": "FASTLANE-20260730",
+            "task_id": assignment["task_id"],
+            "slot_id": assignment["slot_id"],
+            "assignment_epoch": assignment["assignment_epoch"],
+            "assignment_token": assignment["assignment_token"],
+            "context_hash": assignment["context_hash"],
+            "lease_epoch": 7,
+            "endpoint": "/root/fastlane_task5_writer",
+            "state": "running",
+        }
+        lease = {
+            "task_id": assignment["task_id"],
+            "lease_epoch": 7,
+            "endpoint": "/root/fastlane_task5_writer",
+            "state": "running",
+        }
+
+        first = helper._fast_lane_host_slot_occupancy_audit(
+            workflow_id="FASTLANE-20260730",
+            source_plan_hash=request["scheduler_state"]["source_plan_hash"],
+            phase="execution",
+            running_assignments=[assignment],
+            host_bindings=[binding],
+            current_leases=[lease],
+        )
+        second = helper._fast_lane_host_slot_occupancy_audit(
+            workflow_id="FASTLANE-20260730",
+            source_plan_hash=request["scheduler_state"]["source_plan_hash"],
+            phase="execution",
+            running_assignments=[assignment],
+            host_bindings=[binding],
+            current_leases=[lease],
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(["slot-1"], first["active_slot_ids"])
+        self.assertEqual(["slot-2", "slot-3"], first["vacant_slot_ids"])
+        self.assertEqual(
+            {
+                "schema": "team-efficiency/fast-lane-refill-trigger-v1",
+                "source_plan_hash": request["scheduler_state"]["source_plan_hash"],
+                "phase": "execution",
+                "active_slot_ids": ["slot-1"],
+                "vacant_slot_ids": ["slot-2", "slot-3"],
+                "reason": "under_capacity_true_running_slots",
+                "dispatch_at": "next_host_dispatch_boundary",
+            },
+            first["refill_trigger"],
+        )
+        self.assertEqual(
+            helper._sha256_json(first["refill_trigger"]), first["refill_trigger_hash"]
+        )
+
+    def test_fast_lane_host_slot_audit_filters_stale_assignments_before_refill(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+        assignment = request["scheduler_state"]["running_assignments"][0]
+        host_status = {
+            "workflow_id": "FASTLANE-20260730",
+            "current_leases": [
+                {
+                    "task_id": assignment["task_id"],
+                    "lease_epoch": 7,
+                    "endpoint": "/root/fastlane_task5_writer",
+                    "state": "completed",
+                }
+            ],
+            "host_bindings": [
+                {
+                    "workflow_id": "FASTLANE-20260730",
+                    "task_id": assignment["task_id"],
+                    "slot_id": assignment["slot_id"],
+                    "assignment_epoch": assignment["assignment_epoch"],
+                    "assignment_token": assignment["assignment_token"],
+                    "context_hash": assignment["context_hash"],
+                    "lease_epoch": 7,
+                    "endpoint": "/root/fastlane_task5_writer",
+                    "state": "completed",
+                }
+            ],
+        }
+
+        result = helper.compile_fast_lane(
+            request, reasoning_effort="ultra", host_status=host_status
+        )
+
+        self.assertEqual("active", result["status"])
+        self.assertEqual("slot-1", result["assignments"][0]["slot_id"])
+        self.assertEqual("start", result["assignments"][0]["action"])
+        self.assertEqual(2, result["assignments"][0]["assignment_epoch"])
+        occupancy = result["refill_plan"]["occupancy_audit"]
+        self.assertEqual([], occupancy["active_slot_ids"])
+        self.assertEqual(
+            ["slot-1", "slot-2", "slot-3"], occupancy["vacant_slot_ids"]
+        )
 
     def test_fast_lane_prewarm_critical_path_is_deterministic(self) -> None:
         helper = load_efficiency()
@@ -1927,8 +2299,29 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual(
                     "work_methodology_skill", result["workflow_policy"]["owner"]
                 )
-                self.assertEqual([], result["workflow_policy"]["boundary_operations"])
-                self.assertEqual([], result["workflow_policy"]["conditional_operations"])
+                self.assertEqual(
+                    [
+                        "strict_writer_start",
+                        "strict_writer_execution_and_completion_preparation",
+                        "strict_writer_completion",
+                        "read_only_verification_lifecycle",
+                        "lease_recovery_without_bound_output",
+                        "lease_recovery_with_valid_bound_output",
+                    ],
+                    [
+                        item["boundary"]
+                        for item in result["workflow_policy"]["boundary_operations"]
+                    ],
+                )
+                self.assertEqual(
+                    [
+                        {
+                            "condition": "claim_host_target_unavailable_or_rebind_required",
+                            "operation": "workflow_endpoint_bind",
+                        }
+                    ],
+                    result["workflow_policy"]["conditional_operations"],
+                )
                 self.assertFalse(
                     result["workflow_policy"][
                         "operation_set_is_closed_capability_list"
@@ -2324,7 +2717,10 @@ class TeamEfficiencyTests(unittest.TestCase):
                 {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"},
                 set(context),
             )
-            self.assertIsNone(context["workspace_input_snapshot_id"])
+            self.assertEqual(
+                self.fast_lane_execution_snapshot_id(helper, context["task_id"]),
+                context["workspace_input_snapshot_id"],
+            )
         baseline_result = helper.compile_fast_lane(
             copy.deepcopy(baseline), reasoning_effort="ultra"
         )
@@ -2657,6 +3053,1103 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_invalid_or_overlapping_scheduler_state(self) -> None:
+        helper = load_efficiency()
+
+        with self.subTest("initial_null_source_hash_uses_derived_hash_for_host_audit"):
+            pristine = self.fully_bound_fast_lane_manual_request(helper)
+            try:
+                result = helper.compile_fast_lane(
+                    pristine,
+                    reasoning_effort="ultra",
+                    host_status={
+                        "workflow_id": "FASTLANE-20260730",
+                        "current_leases": [],
+                        "host_bindings": [],
+                    },
+                )
+            except ValueError as error:
+                self.fail(f"initial null scheduler hash must support host audit: {error}")
+            audit = result["refill_plan"]["occupancy_audit"]
+            self.assertEqual([], audit["active_slot_ids"])
+            self.assertEqual(
+                ["slot-1", "slot-2", "slot-3"], audit["vacant_slot_ids"]
+            )
+            self.assertEqual(
+                "next_host_dispatch_boundary",
+                audit["refill_trigger"]["dispatch_at"],
+            )
+
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        source_task_id = helper.decompose(request["work_package"])["units"][0]["task_id"]
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=source_task_id
+        )
+        terminal = self.fast_lane_terminal_result(helper, assignment)
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "completed_tasks": [self.fast_lane_completed_record(helper, terminal)],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+                "lane0_state": {
+                    "active_task_id": source_task_id,
+                    "owned_write_scopes": [],
+                },
+            }
+        )
+        with self.subTest("lane_zero_cannot_reopen_completed_work"):
+            with self.assertRaises(ValueError):
+                helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+    def test_fast_lane_candidate_never_unlocks_before_lane_zero_completion(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id="FAST-LANE-MODERATE"
+        )
+        terminal = self.fast_lane_terminal_result(helper, assignment)
+        candidate = {
+            "task_id": "FAST-LANE-MODERATE",
+            "candidate_commit": terminal["candidate_commit"],
+            "candidate_tree": terminal["candidate_tree"],
+            "red_evidence_hashes": terminal["red_evidence_hashes"],
+            "green_evidence_hashes": terminal["green_evidence_hashes"],
+            "terminal_result_hash": helper._sha256_json(terminal),
+            "terminal_result": terminal,
+        }
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "review_ready_candidates": [candidate],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        self.assertNotIn(
+            "FAST-LANE-FUTURE",
+            [
+                item["task_id"]
+                for item in result["assignments"]
+                if item["role"] == "execution"
+            ],
+        )
+        self.assertNotIn(
+            "FAST-LANE-FUTURE",
+            [item["task_id"] for item in result["ready_queue"]],
+        )
+
+        cross_role = copy.deepcopy(request)
+        cross_role_terminal = cross_role["scheduler_state"][
+            "review_ready_candidates"
+        ][0]["terminal_result"]
+        cross_role_terminal["role"] = "prewarm"
+        cross_role["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result_hash"
+        ] = helper._sha256_json(cross_role_terminal)
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(cross_role, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_forged_stale_duplicate_or_cross_role_tokens(self) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        task_id = source_plan["units"][0]["task_id"]
+        other_task_id = source_plan["units"][1]["task_id"]
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=task_id
+        )
+        terminal = self.fast_lane_terminal_result(helper, assignment)
+        candidate = {
+            "task_id": task_id,
+            "candidate_commit": terminal["candidate_commit"],
+            "candidate_tree": terminal["candidate_tree"],
+            "red_evidence_hashes": terminal["red_evidence_hashes"],
+            "green_evidence_hashes": terminal["green_evidence_hashes"],
+            "terminal_result_hash": helper._sha256_json(terminal),
+            "terminal_result": terminal,
+        }
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "review_ready_candidates": [candidate],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+
+        forged = copy.deepcopy(request)
+        forged_terminal = forged["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result"
+        ]
+        forged_terminal["assignment_token"] = "sha256:" + "0" * 64
+        forged["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result_hash"
+        ] = helper._sha256_json(forged_terminal)
+
+        stale = copy.deepcopy(request)
+        stale_terminal = stale["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result"
+        ]
+        stale_terminal["dispatch_receipt"]["source_plan_hash"] = "sha256:" + "1" * 64
+        stale["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result_hash"
+        ] = helper._sha256_json(stale_terminal)
+
+        cross_role = copy.deepcopy(request)
+        cross_role_terminal = cross_role["scheduler_state"][
+            "review_ready_candidates"
+        ][0]["terminal_result"]
+        cross_role_terminal["role"] = "review"
+        cross_role["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result_hash"
+        ] = helper._sha256_json(cross_role_terminal)
+
+        forged_recovery = copy.deepcopy(request)
+        recovered_terminal = forged_recovery["scheduler_state"][
+            "review_ready_candidates"
+        ][0]["terminal_result"]
+        recovered_receipt = recovered_terminal["dispatch_receipt"]
+        recovered_receipt["assignment_epoch"] = 2
+        recovered_receipt["recovery_of_assignment_token"] = "sha256:" + "2" * 64
+        recovered_terminal["assignment_token"] = helper._sha256_json(
+            recovered_receipt
+        )
+        forged_recovery["scheduler_state"]["slot_epochs"]["slot-1"] = 2
+        forged_recovery["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result_hash"
+        ] = helper._sha256_json(recovered_terminal)
+
+        stale_epoch = copy.deepcopy(request)
+        stale_epoch["scheduler_state"]["slot_epochs"]["slot-1"] = 2
+
+        stale_running = self.fast_lane_running_request(helper)
+        stale_running["scheduler_state"]["slot_epochs"]["slot-1"] = 2
+
+        duplicate = copy.deepcopy(request)
+        duplicate_terminal = duplicate["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result"
+        ]
+        duplicate["scheduler_state"]["prewarmed_evidence"] = [
+            {
+                "task_id": other_task_id,
+                "observation_basis_hash": helper._sha256_json({"basis": "duplicate"}),
+                "evidence_hash": helper._sha256_json({"evidence": "duplicate"}),
+                "terminal_result_hash": helper._sha256_json(duplicate_terminal),
+                "terminal_result": duplicate_terminal,
+                "revalidation_basis_hash": None,
+                "dependency_delta_hash": None,
+                "revalidation_evidence_hash": None,
+            }
+        ]
+
+        for name, invalid in (
+            ("forged", forged),
+            ("stale", stale),
+            ("cross_role", cross_role),
+            ("forged_recovery", forged_recovery),
+            ("stale_terminal_epoch", stale_epoch),
+            ("stale_running_epoch", stale_running),
+            ("duplicate", duplicate),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(invalid, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_resigned_terminal_receipt_with_wrong_route(self) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        task_id = helper.decompose(request["work_package"])["units"][0]["task_id"]
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=task_id
+        )
+        terminal_result = self.fast_lane_terminal_result(helper, assignment)
+        candidate = {
+            "task_id": task_id,
+            "candidate_commit": terminal_result["candidate_commit"],
+            "candidate_tree": terminal_result["candidate_tree"],
+            "red_evidence_hashes": terminal_result["red_evidence_hashes"],
+            "green_evidence_hashes": terminal_result["green_evidence_hashes"],
+            "terminal_result_hash": helper._sha256_json(terminal_result),
+            "terminal_result": terminal_result,
+        }
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "review_ready_candidates": [candidate],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+
+        forged = copy.deepcopy(request)
+        forged_terminal = forged["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result"
+        ]
+        forged_receipt = forged_terminal["dispatch_receipt"]
+        forged_receipt["reasoning_effort"] = "low"
+        forged_terminal["assignment_token"] = helper._sha256_json(forged_receipt)
+        forged["scheduler_state"]["review_ready_candidates"][0][
+            "terminal_result_hash"
+        ] = helper._sha256_json(forged_terminal)
+
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_resigned_running_receipt_with_wrong_route(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+
+        forged = copy.deepcopy(request)
+        assignment = forged["scheduler_state"]["running_assignments"][0]
+        receipt = assignment["dispatch_receipt"]
+        assignment["reasoning_effort"] = "low"
+        receipt["reasoning_effort"] = "low"
+        assignment["assignment_token"] = helper._sha256_json(receipt)
+
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_completion_snapshot_not_bound_to_dispatch_context(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        task_id = helper.decompose(request["work_package"])["units"][0]["task_id"]
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=task_id
+        )
+        terminal_result = self.fast_lane_terminal_result(helper, assignment)
+        completed = self.fast_lane_completed_record(helper, terminal_result)
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "completed_tasks": [completed],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+
+        forged = copy.deepcopy(request)
+        completed = forged["scheduler_state"]["completed_tasks"][0]
+        receipt = completed["completion_receipt"]
+        receipt["workspace_input_snapshot_id"] = helper._sha256_json(
+            {"snapshot": "forged"}
+        )
+        receipt_hash = helper._sha256_json(receipt)
+        completed["completion_receipt_hash"] = receipt_hash
+        completed["result_hash"] = receipt_hash
+
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_verification_completion_not_bound_to_read_context(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_code_atlas_request(helper)
+        verification_unit = next(
+            unit
+            for unit in helper.decompose(request["work_package"])["units"]
+            if unit["unit_kind"] == "verification"
+        )
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper,
+            request,
+            task_id=verification_unit["task_id"],
+            role="verification",
+        )
+        terminal_result = self.fast_lane_terminal_result(helper, assignment)
+        completed = self.fast_lane_completed_record(
+            helper,
+            terminal_result,
+            completion_kind="verification_evidence",
+        )
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "phase": "integration_regression",
+                "completed_tasks": [completed],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+
+        for name, updates in (
+            (
+                "snapshot",
+                {
+                    "workspace_input_snapshot_id": helper._sha256_json(
+                        {"snapshot": "forged"}
+                    )
+                },
+            ),
+            (
+                "integration_commit",
+                {"integration_commit": "c" * 40},
+            ),
+            (
+                "integration_tree",
+                {"integration_tree": "c" * 40},
+            ),
+        ):
+            with self.subTest(case=name):
+                forged = copy.deepcopy(request)
+                completed = forged["scheduler_state"]["completed_tasks"][0]
+                receipt = completed["completion_receipt"]
+                receipt.update(updates)
+                receipt_hash = helper._sha256_json(receipt)
+                completed["completion_receipt_hash"] = receipt_hash
+                completed["result_hash"] = receipt_hash
+                if name in {"integration_commit", "integration_tree"}:
+                    completed["integration_commit"] = receipt["integration_commit"]
+                    completed["integration_tree"] = receipt["integration_tree"]
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(forged, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_forged_prewarm_dispatch_bindings(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        future = next(
+            unit
+            for unit in source_plan["units"]
+            if unit["task_id"] == "FAST-LANE-FUTURE"
+        )
+        request["execution_contexts"] = [
+            self.fast_lane_execution_context(
+                helper,
+                task_id=unit["task_id"],
+                base_commit=request["scheduler_state"]["integration_state"]["commit"],
+                write_scope=list(unit["write_scope"]),
+            )
+            for unit in source_plan["units"]
+        ]
+        request["scheduler_state"]["source_plan_hash"] = helper._sha256_json(source_plan)
+        prewarm_assignment, prewarm_context, validated = self.fast_lane_assignment_for(
+            helper,
+            request,
+            task_id=future["task_id"],
+            role="prewarm",
+            route=("gpt-5.6-terra", "medium"),
+        )
+        prewarm_terminal = self.fast_lane_terminal_result(helper, prewarm_assignment)
+        prewarm_record = {
+            "task_id": future["task_id"],
+            "observation_basis_hash": prewarm_context["basis_hash"],
+            "evidence_hash": prewarm_terminal["evidence_hash"],
+            "terminal_result_hash": helper._sha256_json(prewarm_terminal),
+            "terminal_result": prewarm_terminal,
+            "revalidation_basis_hash": helper._sha256_json({"basis": future["task_id"]}),
+            "dependency_delta_hash": helper._sha256_json({"delta": future["task_id"]}),
+            "revalidation_evidence_hash": helper._sha256_json(
+                {"revalidated": future["task_id"]}
+            ),
+        }
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "prewarmed_evidence": [prewarm_record],
+                "dispatch_contexts": [prewarm_context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        _, execution_context, _ = self.fast_lane_assignment_for(
+            helper,
+            request,
+            task_id=future["task_id"],
+            role="execution",
+            slot_id="slot-2",
+        )
+        request["scheduler_state"]["dispatch_contexts"] = [
+            prewarm_context,
+            execution_context,
+        ]
+        request["scheduler_state"]["slot_epochs"] = {
+            "slot-1": 1,
+            "slot-2": 1,
+            "slot-3": 0,
+        }
+        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+
+        forged = copy.deepcopy(request)
+        forged_context = next(
+            item
+            for item in forged["scheduler_state"]["dispatch_contexts"]
+            if item["role"] == "execution"
+        )
+        forged_context["prewarm_evidence_hash"] = helper._sha256_json(
+            {"forged": "prewarm"}
+        )
+        context_without_hash = dict(forged_context)
+        context_without_hash.pop("context_hash")
+        forged_context["context_hash"] = helper._sha256_json(context_without_hash)
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+
+    def test_fast_lane_review_must_bind_the_candidate_context(self) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        task_id = source_plan["units"][0]["task_id"]
+        assignment, execution_context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=task_id
+        )
+        candidate_terminal = self.fast_lane_terminal_result(helper, assignment)
+        candidate = {
+            "task_id": task_id,
+            "candidate_commit": candidate_terminal["candidate_commit"],
+            "candidate_tree": candidate_terminal["candidate_tree"],
+            "red_evidence_hashes": candidate_terminal["red_evidence_hashes"],
+            "green_evidence_hashes": candidate_terminal["green_evidence_hashes"],
+            "terminal_result_hash": helper._sha256_json(candidate_terminal),
+            "terminal_result": candidate_terminal,
+        }
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "review_ready_candidates": [candidate],
+                "dispatch_contexts": [execution_context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        request["read_contexts"] = [
+            self.fast_lane_read_context(
+                helper,
+                task_id=task_id,
+                role="review",
+                read_scope=list(source_plan["units"][0]["write_scope"]),
+            )
+        ]
+        review_assignment, review_context, _ = self.fast_lane_assignment_for(
+            helper,
+            request,
+            task_id=task_id,
+            role="review",
+            slot_id="slot-2",
+        )
+        review_terminal = self.fast_lane_terminal_result(helper, review_assignment)
+        reviewed = {
+            "task_id": task_id,
+            "candidate_commit": candidate_terminal["candidate_commit"],
+            "candidate_tree": candidate_terminal["candidate_tree"],
+            "red_evidence_hashes": candidate_terminal["red_evidence_hashes"],
+            "green_evidence_hashes": candidate_terminal["green_evidence_hashes"],
+            "review_hash": review_terminal["review_hash"],
+            "outcome": "pass",
+            "terminal_result_hash": helper._sha256_json(candidate_terminal),
+            "terminal_result": candidate_terminal,
+            "review_terminal_result_hash": helper._sha256_json(review_terminal),
+            "review_terminal_result": review_terminal,
+        }
+        request["scheduler_state"].update(
+            {
+                "review_ready_candidates": [],
+                "reviewed_candidates": [reviewed],
+                "dispatch_contexts": [execution_context, review_context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 1, "slot-3": 0},
+            }
+        )
+        helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+        forged = copy.deepcopy(request)
+        forged_context = forged["scheduler_state"]["dispatch_contexts"][1]
+        forged_context["candidate_commit"] = "e" * 40
+        forged_context["context_hash"] = helper._sha256_json(
+            {
+                key: value
+                for key, value in forged_context.items()
+                if key != "context_hash"
+            }
+        )
+        forged_terminal = forged["scheduler_state"]["reviewed_candidates"][0][
+            "review_terminal_result"
+        ]
+        forged_terminal["dispatch_receipt"]["dispatch_context_hash"] = (
+            forged_context["context_hash"]
+        )
+        forged_terminal["assignment_token"] = helper._sha256_json(
+            forged_terminal["dispatch_receipt"]
+        )
+        forged["scheduler_state"]["reviewed_candidates"][0][
+            "review_terminal_result_hash"
+        ] = helper._sha256_json(forged_terminal)
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+
+    def test_fast_lane_packet_and_episode_verification_is_declared(self) -> None:
+        helper = load_efficiency()
+        packet = self.fast_lane_code_atlas_request(helper)
+        packet_source = helper.decompose(packet["work_package"])
+        code_units = [
+            unit for unit in packet_source["units"] if unit["unit_kind"] == "code"
+        ]
+        contexts: list[dict[str, object]] = []
+        completed: list[dict[str, object]] = []
+        for unit in code_units:
+            assignment, context, _ = self.fast_lane_assignment_for(
+                helper, packet, task_id=unit["task_id"]
+            )
+            contexts.append(context)
+            completed.append(
+                self.fast_lane_completed_record(
+                    helper, self.fast_lane_terminal_result(helper, assignment)
+                )
+            )
+        packet["scheduler_state"].update(
+            {
+                "source_plan_hash": helper._sha256_json(packet_source),
+                "phase": "integration_regression",
+                "completed_tasks": completed,
+                "dispatch_contexts": contexts,
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        try:
+            packet_result = helper.compile_fast_lane(packet, reasoning_effort="ultra")
+        except ValueError as error:
+            self.fail(f"declared packet verification must compile: {error}")
+        self.assertEqual("integration_regression", packet_result["phase"])
+        self.assertEqual(1, len(packet_result["assignments"]))
+        verification = packet_result["assignments"][0]
+        self.assertEqual("verification", verification["role"])
+        self.assertEqual("read_only", verification["access"])
+        self.assertEqual([], verification["write_scope"])
+        self.assertIsNone(verification["execution_context_hash"])
+        self.assertIsNotNone(verification["read_context_hash"])
+        self.assertIsNone(verification["driver_gate_id"])
+        self.assertTrue(verification["target_gates"])
+        self.assertEqual([], packet_result["ready_queue"])
+        self.assertEqual([], packet_result["review_queue"])
+        self.assertEqual([], packet_result["prewarm_queue"])
+        self.assertEqual([], packet_result["design_queue"])
+
+        queued_execution = self.fast_lane_code_atlas_request(helper)
+        queued_execution["scheduler_state"]["phase"] = "integration_regression"
+        queued_result = helper.compile_fast_lane(
+            queued_execution, reasoning_effort="ultra"
+        )
+        self.assertEqual([], queued_result["assignments"])
+        self.assertEqual([], queued_result["ready_queue"])
+        self.assertEqual([], queued_result["review_queue"])
+        self.assertEqual([], queued_result["prewarm_queue"])
+        self.assertEqual([], queued_result["design_queue"])
+
+        episode_source = helper.decompose(self.extractor_episode_manifest())
+        episode_targets = []
+        for unit in episode_source["units"]:
+            gate = self.fast_lane_gate(
+                gate_id="declared",
+                red_expected_exit_codes=(
+                    [] if unit["unit_kind"] == "verification" else [1]
+                ),
+                red_failure_ids=(
+                    [] if unit["unit_kind"] == "verification" else None
+                ),
+                acceptance_constraint_hashes=list(unit["acceptance_constraints"]),
+            )
+            episode_targets.append(
+                {
+                    "task_id": unit["task_id"],
+                    "driver_gate_id": (
+                        None if unit["unit_kind"] == "verification" else "declared"
+                    ),
+                    "gates": [gate],
+                }
+            )
+        episode_gates = helper._validated_fast_lane_target_gates(
+            episode_targets, episode_source
+        )
+        self.assertEqual(
+            [unit["task_id"] for unit in episode_source["units"]],
+            [target["task_id"] for target in episode_gates],
+        )
+
+    def test_fast_lane_allows_one_narrow_remediation_then_stops(self) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        source_task_id = source_plan["units"][0]["task_id"]
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=source_task_id
+        )
+        completed = self.fast_lane_completed_record(
+            helper, self.fast_lane_terminal_result(helper, assignment)
+        )
+        remediation = self.fast_lane_remediation_request(helper, request)
+        try:
+            remediation_context = self.fast_lane_execution_context(
+                helper,
+                task_id=remediation["task_id"],
+                base_commit=request["scheduler_state"]["integration_state"]["commit"],
+                branch=f"codex/{remediation['task_id'].lower()}",
+                write_scope=list(remediation["write_scope"]),
+            )
+        except ValueError as error:
+            self.fail(f"remediation execution context must be accepted: {error}")
+        request["execution_contexts"].append(remediation_context)
+        request["remediation_request"] = remediation
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "phase": "remediation",
+                "completed_tasks": [completed],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+                "global_remediation": {
+                    "round": 1,
+                    "state": "approved",
+                    "task_id": remediation["task_id"],
+                    "affected_task_ids": [source_task_id],
+                    "blocker_review_hash": remediation["blocker_review_hash"],
+                    "finding_hash": remediation["finding_hash"],
+                    "dispatch_receipt": None,
+                    "completion_receipt_hash": None,
+                },
+            }
+        )
+        try:
+            result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        except ValueError as error:
+            self.fail(f"narrow remediation must compile once: {error}")
+        self.assertEqual("active", result["status"])
+        self.assertEqual(
+            [remediation["task_id"]],
+            [item["task_id"] for item in result["assignments"]],
+        )
+
+        broad = copy.deepcopy(request)
+        broad["remediation_request"]["write_scope"] = ["src"]
+        broad_result = helper.compile_fast_lane(broad, reasoning_effort="ultra")
+        self.assertEqual("stopped", broad_result["status"])
+        self.assertEqual("AUTOMATION_STOPPED", broad_result["decision_code"])
+        self.assertEqual([], broad_result["assignments"])
+
+        round_two = copy.deepcopy(request)
+        round_two["remediation_request"]["round"] = 2
+        round_two_result = helper.compile_fast_lane(round_two, reasoning_effort="ultra")
+        self.assertEqual("stopped", round_two_result["status"])
+        self.assertEqual([], round_two_result["assignments"])
+
+    def test_fast_lane_rejects_unbound_global_remediation_receipts(self) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        source_task_id = source_plan["units"][0]["task_id"]
+        assignment, context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=source_task_id
+        )
+        completed = self.fast_lane_completed_record(
+            helper, self.fast_lane_terminal_result(helper, assignment)
+        )
+        remediation = self.fast_lane_remediation_request(helper, request)
+        remediation_context = self.fast_lane_execution_context(
+            helper,
+            task_id=remediation["task_id"],
+            base_commit=request["scheduler_state"]["integration_state"]["commit"],
+            branch=f"codex/{remediation['task_id'].lower()}",
+            write_scope=list(remediation["write_scope"]),
+        )
+        request["execution_contexts"].append(remediation_context)
+        request["remediation_request"] = remediation
+        request["scheduler_state"].update(
+            {
+                "source_plan_hash": validated["source_plan_hash"],
+                "phase": "remediation",
+                "completed_tasks": [completed],
+                "dispatch_contexts": [context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+                "global_remediation": {
+                    "round": 1,
+                    "state": "approved",
+                    "task_id": remediation["task_id"],
+                    "affected_task_ids": [source_task_id],
+                    "blocker_review_hash": remediation["blocker_review_hash"],
+                    "finding_hash": remediation["finding_hash"],
+                    "dispatch_receipt": None,
+                    "completion_receipt_hash": None,
+                },
+            }
+        )
+        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+
+        remediation_assignment, remediation_dispatch_context, _ = (
+            self.fast_lane_assignment_for(
+                helper,
+                request,
+                task_id=remediation["task_id"],
+                slot_id="slot-2",
+            )
+        )
+        running = copy.deepcopy(request)
+        running["scheduler_state"]["running_assignments"] = [
+            remediation_assignment
+        ]
+        running["scheduler_state"]["dispatch_contexts"] = [
+            context,
+            remediation_dispatch_context,
+        ]
+        running["scheduler_state"]["slot_epochs"]["slot-2"] = 1
+        running_global = running["scheduler_state"]["global_remediation"]
+        running_global["state"] = "running"
+        running_global["dispatch_receipt"] = copy.deepcopy(
+            remediation_assignment["dispatch_receipt"]
+        )
+        helper.compile_fast_lane(copy.deepcopy(running), reasoning_effort="ultra")
+
+        forged_running = copy.deepcopy(running)
+        forged_running["scheduler_state"]["global_remediation"][
+            "dispatch_receipt"
+        ] = {"forged": "receipt"}
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged_running, reasoning_effort="ultra")
+
+        remediation_terminal = self.fast_lane_terminal_result(
+            helper, remediation_assignment
+        )
+        remediation_completed = self.fast_lane_completed_record(
+            helper, remediation_terminal
+        )
+        completed_request = copy.deepcopy(running)
+        completed_request["scheduler_state"]["running_assignments"] = []
+        completed_request["scheduler_state"]["completed_tasks"] = [
+            completed,
+            remediation_completed,
+        ]
+        completed_global = completed_request["scheduler_state"][
+            "global_remediation"
+        ]
+        completed_global["state"] = "completed"
+        completed_global["dispatch_receipt"] = copy.deepcopy(
+            remediation_terminal["dispatch_receipt"]
+        )
+        completed_global["completion_receipt_hash"] = remediation_completed[
+            "completion_receipt_hash"
+        ]
+        helper.compile_fast_lane(
+            copy.deepcopy(completed_request), reasoning_effort="ultra"
+        )
+
+        forged_completed = copy.deepcopy(completed_request)
+        forged_completed["scheduler_state"]["global_remediation"][
+            "completion_receipt_hash"
+        ] = "sha256:" + "0" * 64
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged_completed, reasoning_effort="ultra")
+
+    def test_fast_lane_terminal_protocol_is_bounded(self) -> None:
+        helper = load_efficiency()
+        for phase in ("blocker_review", "acceptance"):
+            request = self.fully_bound_fast_lane_manual_request(helper)
+            request["scheduler_state"]["phase"] = phase
+            with self.subTest(phase=phase):
+                result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+                self.assertEqual("active", result["status"])
+                self.assertEqual(
+                    "TERMINAL_PROTOCOL_OWNED_BY_LANE0", result["decision_code"]
+                )
+                self.assertEqual([], result["assignments"])
+                self.assertEqual([], result["ready_queue"])
+                self.assertEqual([], result["review_queue"])
+                self.assertEqual([], result["prewarm_queue"])
+                self.assertEqual([], result["design_queue"])
+                self.assertEqual(
+                    [
+                        {"slot_id": "slot-1", "reason_code": "TERMINAL_PHASE_OWNED_BY_LANE0"},
+                        {"slot_id": "slot-2", "reason_code": "TERMINAL_PHASE_OWNED_BY_LANE0"},
+                        {"slot_id": "slot-3", "reason_code": "TERMINAL_PHASE_OWNED_BY_LANE0"},
+                    ],
+                    result["idle_slots"],
+                )
+                self.assertEqual(1, result["terminal_protocol"]["integration_regression_passes"])
+                self.assertEqual(1, result["terminal_protocol"]["blocker_reviews"])
+                self.assertEqual(
+                    1,
+                    result["terminal_protocol"][
+                        "global_targeted_remediation_rounds"
+                    ],
+                )
+
+    def test_fast_lane_recovery_branches_are_phase_aware(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+        old_assignment = copy.deepcopy(
+            request["scheduler_state"]["running_assignments"][0]
+        )
+        recovered = copy.deepcopy(old_assignment)
+        recovered_receipt = recovered["dispatch_receipt"]
+        recovered_receipt["assignment_epoch"] = 2
+        recovered_receipt["recovery_of_assignment_token"] = old_assignment[
+            "assignment_token"
+        ]
+        recovered["assignment_epoch"] = 2
+        recovered["assignment_token"] = helper._sha256_json(recovered_receipt)
+        request["scheduler_state"]["running_assignments"] = [recovered]
+        request["scheduler_state"]["slot_epochs"]["slot-1"] = 2
+        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        self.assertEqual(recovered["assignment_token"], result["assignments"][0]["assignment_token"])
+
+        forged_predecessor = copy.deepcopy(request)
+        forged_receipt = forged_predecessor["scheduler_state"][
+            "running_assignments"
+        ][0]["dispatch_receipt"]
+        forged_receipt["recovery_of_assignment_token"] = "sha256:" + "0" * 64
+        forged_predecessor["scheduler_state"]["running_assignments"][0][
+            "assignment_token"
+        ] = helper._sha256_json(forged_receipt)
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(forged_predecessor, reasoning_effort="ultra")
+
+        wrong_phase = copy.deepcopy(request)
+        wrong_phase["scheduler_state"]["phase"] = "integration_regression"
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(wrong_phase, reasoning_effort="ultra")
+
+    def test_fast_lane_workflow_policy_is_exact_and_ordered(self) -> None:
+        helper = load_efficiency()
+        result = helper.compile_fast_lane(
+            self.fully_bound_fast_lane_manual_request(helper),
+            reasoning_effort="ultra",
+        )
+        self.assertEqual(
+            {
+                "owner": "work_methodology_skill",
+                "boundary_operations": [
+                    {
+                        "boundary": "strict_writer_start",
+                        "roles": ["execution"],
+                        "operations": [
+                            "project_index_sync_input_worker_worktree",
+                            "workflow_create_if_absent",
+                            "workflow_register_task_strict_index",
+                            "workflow_ready",
+                            "host_spawn_exact_route",
+                            "workflow_claim_with_host_target",
+                        ],
+                    },
+                    {
+                        "boundary": "strict_writer_execution_and_completion_preparation",
+                        "roles": ["execution"],
+                        "operations": [
+                            "project_index_query_input",
+                            "worktree_checkpoint_create_before_first_write",
+                            "native_scoped_write_and_target_gates",
+                            "project_index_sync_output_worker_worktree",
+                            "project_index_query_output",
+                        ],
+                    },
+                    {
+                        "boundary": "strict_writer_completion",
+                        "roles": ["execution"],
+                        "operations": [
+                            "host_attest_and_lane0_integrate",
+                            "workflow_artifact_register_completion_receipt_at_output_snapshot",
+                            "workflow_complete_with_completion_receipt_hash",
+                        ],
+                    },
+                    {
+                        "boundary": "read_only_verification_lifecycle",
+                        "roles": ["verification"],
+                        "operations": [
+                            "project_index_sync_input_read_worktree",
+                            "workflow_create_if_absent",
+                            "workflow_register_task_strict_index",
+                            "workflow_ready",
+                            "host_spawn_exact_route",
+                            "workflow_claim_with_host_target",
+                            "project_index_query_input",
+                            "run_all_green_target_gates",
+                            "workflow_artifact_register_completion_receipt_at_input_snapshot",
+                            "workflow_complete_with_completion_receipt_hash",
+                        ],
+                    },
+                    {
+                        "boundary": "lease_recovery_without_bound_output",
+                        "roles": ["execution", "verification"],
+                        "operations": [
+                            "workflow_status_once_for_recovery",
+                            "verify_bound_input_snapshot_current_or_stop",
+                            "workflow_claim_new_lease_epoch",
+                            "reuse_predecessor_dispatch_context",
+                            "issue_new_dispatch_receipt_and_token",
+                            "reject_old_epoch_receipt_and_token",
+                            "reestablish_current_input_query_and_required_write_evidence",
+                        ],
+                    },
+                    {
+                        "boundary": "lease_recovery_with_valid_bound_output",
+                        "roles": ["execution"],
+                        "operations": [
+                            "require_host_persisted_attested_output_snapshot",
+                            "workflow_status_once_for_recovery",
+                            "workflow_claim_new_lease_epoch",
+                            "reuse_predecessor_dispatch_context",
+                            "issue_new_dispatch_receipt_and_token",
+                            "reject_old_epoch_receipt_and_token",
+                            "verify_workspace_matches_bound_output_snapshot",
+                            "reregister_new_lease_output_query_and_verification_evidence",
+                            "continue_host_attested_completion_without_new_input_checkpoint",
+                        ],
+                    },
+                ],
+                "conditional_operations": [
+                    {
+                        "condition": "claim_host_target_unavailable_or_rebind_required",
+                        "operation": "workflow_endpoint_bind",
+                    }
+                ],
+                "operation_set_is_closed_capability_list": False,
+                "mid_item_status_polling": False,
+                "recovery_status_reads": "start_or_recovery_boundary_only",
+                "release_tool_available": False,
+            },
+            result["workflow_policy"],
+        )
+
+    def test_fast_lane_phase_and_role_shapes_are_exact(self) -> None:
+        helper = load_efficiency()
+        result = helper.compile_fast_lane(
+            self.fast_lane_schedule_request(helper), reasoning_effort="ultra"
+        )
+        expected_assignment_fields = {
+            "slot_id",
+            "action",
+            "assignment_epoch",
+            "assignment_token",
+            "dispatch_receipt",
+            "task_id",
+            "goal",
+            "output_boundary",
+            "unit_kind",
+            "operation_count",
+            "recommended_route",
+            "role",
+            "model",
+            "reasoning_effort",
+            "access",
+            "context_hash",
+            "execution_context_hash",
+            "read_context_hash",
+            "workspace_input_snapshot_id",
+            "read_base_commit",
+            "read_tree",
+            "base_commit",
+            "bootstrap_plan_hash",
+            "branch",
+            "write_scope_hash",
+            "write_scope",
+            "depends_on",
+            "unmet_dependencies",
+            "required_evidence",
+            "execution_contracts",
+            "direct_contract_hashes",
+            "task_node_ids",
+            "contract_node_ids",
+            "acceptance_constraints",
+            "driver_gate_id",
+            "target_gates",
+            "candidate_commit",
+            "basis_hash",
+        }
+        for assignment in result["assignments"]:
+            with self.subTest(role=assignment["role"]):
+                self.assertEqual(expected_assignment_fields, set(assignment))
+        execution = next(
+            assignment
+            for assignment in result["assignments"]
+            if assignment["role"] == "execution"
+        )
+        self.assertEqual("exclusive_write", execution["access"])
+        self.assertIsNotNone(execution["execution_context_hash"])
+        self.assertIsNone(execution["read_context_hash"])
+        self.assertIsNone(execution["read_base_commit"])
+        self.assertIsNone(execution["read_tree"])
+        self.assertIsNotNone(execution["driver_gate_id"])
+        self.assertTrue(execution["target_gates"])
+        prewarm = next(
+            assignment
+            for assignment in result["assignments"]
+            if assignment["role"] == "prewarm"
+        )
+        self.assertEqual("read_only", prewarm["access"])
+        self.assertIsNone(prewarm["execution_context_hash"])
+        self.assertIsNotNone(prewarm["read_context_hash"])
+        self.assertIsNotNone(prewarm["read_base_commit"])
+        self.assertIsNotNone(prewarm["read_tree"])
+        self.assertIsNone(prewarm["driver_gate_id"])
+        self.assertEqual([], prewarm["target_gates"])
+        self.assertIsNotNone(prewarm["basis_hash"])
+
+        stale_prewarm = self.fast_lane_schedule_request(helper)
+        prewarm_assignment, prewarm_context, prewarm_validated = (
+            self.fast_lane_assignment_for(
+                helper,
+                stale_prewarm,
+                task_id="FAST-LANE-FUTURE",
+                role="prewarm",
+                route=("gpt-5.6-terra", "medium"),
+            )
+        )
+        parent_assignment, parent_context, _ = self.fast_lane_assignment_for(
+            helper, stale_prewarm, task_id="FAST-LANE-MODERATE"
+        )
+        prewarm_terminal = self.fast_lane_terminal_result(
+            helper, prewarm_assignment
+        )
+        stale_prewarm["scheduler_state"].update(
+            {
+                "source_plan_hash": prewarm_validated["source_plan_hash"],
+                "completed_tasks": [
+                    self.fast_lane_completed_record(
+                        helper,
+                        self.fast_lane_terminal_result(helper, parent_assignment),
+                    )
+                ],
+                "prewarmed_evidence": [
+                    {
+                        "task_id": "FAST-LANE-FUTURE",
+                        "observation_basis_hash": prewarm_context["basis_hash"],
+                        "evidence_hash": prewarm_terminal["evidence_hash"],
+                        "terminal_result_hash": helper._sha256_json(prewarm_terminal),
+                        "terminal_result": prewarm_terminal,
+                        "revalidation_basis_hash": None,
+                        "dependency_delta_hash": None,
+                        "revalidation_evidence_hash": None,
+                    }
+                ],
+                "dispatch_contexts": [parent_context, prewarm_context],
+                "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
+            }
+        )
+        stale_prewarm_result = helper.compile_fast_lane(
+            stale_prewarm, reasoning_effort="ultra"
+        )
+        self.assertEqual(
+            ["FAST-LANE-FUTURE"],
+            stale_prewarm_result["invalidated_evidence_task_ids"],
+        )
+
+        terminal = self.fully_bound_fast_lane_manual_request(helper)
+        terminal["scheduler_state"]["phase"] = "acceptance"
+        terminal_result = helper.compile_fast_lane(terminal, reasoning_effort="ultra")
+        self.assertEqual("active", terminal_result["status"])
+        self.assertEqual(
+            "TERMINAL_PROTOCOL_OWNED_BY_LANE0", terminal_result["decision_code"]
+        )
+        self.assertEqual([], terminal_result["assignments"])
+
+        stopped = self.fully_bound_fast_lane_manual_request(helper)
+        stopped["scheduler_state"]["phase"] = "stopped"
+        stopped_result = helper.compile_fast_lane(stopped, reasoning_effort="ultra")
+        self.assertEqual("stopped", stopped_result["status"])
+        self.assertEqual("AUTOMATION_STOPPED", stopped_result["decision_code"])
+        self.assertEqual([], stopped_result["assignments"])
 
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
