@@ -217,16 +217,17 @@ workspace, trace id, or snapshot id from Atlas evidence.
 
 `fast-lane` compiles the exact
 `team-efficiency/fast-lane-request-v1` request into a deterministic
-`team-efficiency/fast-lane-plan-v1` result. It is a pure compiler: all target
-gates, contexts, receipts, tokens, and workflow operations are inert data. The
-helper does not call a model, spawn an agent, contact a remote service, run a
-gate, mutate Git, make a workflow call, claim a lease, bind an endpoint, or
-complete a workflow.
+`team-efficiency/fast-lane-plan-v1` result. It is a pure compiler: all target gates,
+contexts, receipts, tokens, and workflow operations are inert data. The
+helper performs no model call, agent spawn, remote service contact, gate run,
+Git mutation, workflow call, lease claim, endpoint bind, or workflow
+completion.
 
 The host invokes `fast-lane` with an explicit reasoning effort. `ultra` is the
-automatic activation path; lower efforts require explicit `--enable` and
-otherwise return an inactive plan. Descriptors always carry explicit model and
-effort: prewarm is `gpt-5.6-terra` / `medium`; routine implementation and
+automatic activation path (`ultra_auto`); lower efforts require explicit
+`--enable` (`explicit_opt_in`) and otherwise return an inactive plan.
+Descriptors always carry explicit model and effort: prewarm is
+`gpt-5.6-terra` / `medium`; routine implementation and
 ordinary verification are `gpt-5.6-terra` / `high`; moderate-or-harder
 implementation and verification are `gpt-5.6-terra` / `max`; review is
 `gpt-5.6-terra` / `high`; and a bounded design probe is `gpt-5.6-sol` /
@@ -244,15 +245,15 @@ the compiler nor the host polls commentary updates or refills from commentary
 Prewarm is read-only evidence, not acceptance evidence: a later writer may
 reuse it only after current-basis delta revalidation passes.
 
-The terminal protocol is bounded to one integration regression pass, one
-blocker review, and at most one global targeted remediation. Candidate or
-review results never unlock a dependency; lane 0 integration, artifact
+The terminal protocol is bounded to one regression (the integration regression
+pass), one blocker review, and at most one global remediation (targeted to the
+finding). Candidate or review results never unlock a dependency; lane 0 integration, artifact
 registration, and durable workflow completion remain required.
 
 The compiler proves only request consistency. All execution and read `repo`
-anchors must agree, and worker/read worktrees must differ from that anchor.
-Before executing a descriptor, the host matches the request anchor to its
-trusted shared integration worktree; before `git worktree add`, it rejects a
+anchors must agree on a canonical repo anchor, and worker/read worktrees must
+differ from that anchor. Before executing a descriptor, the host matches the
+request anchor to its trusted shared integration worktree; before `git worktree add`, it rejects a
 mismatch without mutation. After apply, the host re-resolves the created
 target, verifies that it equals the planned worker worktree and shares the
 trusted anchor's Git common directory, and records that post-apply attestation
