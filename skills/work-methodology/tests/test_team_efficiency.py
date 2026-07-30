@@ -787,6 +787,97 @@ class TeamEfficiencyTests(unittest.TestCase):
             ),
         }
 
+    def fast_lane_running_request(self, helper) -> dict[str, object]:
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        source_plan_hash = helper._sha256_json(source_plan)
+        unit = source_plan["units"][0]
+        task_id = unit["task_id"]
+        execution_context = request["execution_contexts"][0]
+        bootstrap_plan = execution_context["bootstrap_plan"]
+        execution_context_hash = helper._sha256_json(execution_context)
+        bootstrap_plan_hash = helper._sha256_json(bootstrap_plan)
+        write_scope_hash = helper._sha256_json(bootstrap_plan["write_scope"])
+        target = next(
+            target
+            for target in request["target_gates"]
+            if target["task_id"] == task_id
+        )
+        target_gates_hash = helper._sha256_json(
+            {
+                "driver_gate_id": target["driver_gate_id"],
+                "target_gates": target["gates"],
+            }
+        )
+        context_without_hash = {
+            "task_id": task_id,
+            "role": "execution",
+            "source_plan_hash": source_plan_hash,
+            "integration_commit": request["scheduler_state"]["integration_state"][
+                "commit"
+            ],
+            "integration_tree": request["scheduler_state"]["integration_state"][
+                "tree"
+            ],
+            "workspace_input_snapshot_id": execution_context[
+                "workspace_input_snapshot_id"
+            ],
+            "direct_dependency_result_hashes": [],
+            "direct_contract_hashes": unit["direct_contract_hashes"],
+            "required_evidence": unit["required_evidence"],
+            "task_node_ids": unit["task_node_ids"],
+            "contract_node_ids": unit["contract_node_ids"],
+            "acceptance_constraints": [],
+            "execution_context_hash": execution_context_hash,
+            "bootstrap_plan_hash": bootstrap_plan_hash,
+            "base_commit": bootstrap_plan["base_commit"],
+            "branch": bootstrap_plan["branch"],
+            "write_scope_hash": write_scope_hash,
+            "read_context_hash": None,
+            "target_gates_hash": target_gates_hash,
+            "candidate_commit": None,
+            "red_evidence_hashes": [],
+            "green_evidence_hashes": [],
+            "basis_hash": None,
+            "prewarm_evidence_hash": None,
+            "prewarm_revalidation_evidence_hash": None,
+        }
+        dispatch_context = {
+            "context_hash": helper._sha256_json(context_without_hash),
+            **context_without_hash,
+        }
+        receipt = {
+            "schema": "team-efficiency/fast-lane-dispatch-receipt-v1",
+            "source_plan_hash": source_plan_hash,
+            "task_id": task_id,
+            "role": "execution",
+            "slot_id": "slot-1",
+            "assignment_epoch": 1,
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "high",
+            "dispatch_context_hash": dispatch_context["context_hash"],
+            "target_gates_hash": target_gates_hash,
+            "execution_context_hash": execution_context_hash,
+            "read_context_hash": None,
+            "recovery_of_assignment_token": None,
+        }
+        assignment = {
+            "slot_id": "slot-1",
+            "task_id": task_id,
+            "role": "execution",
+            "assignment_epoch": 1,
+            "assignment_token": helper._sha256_json(receipt),
+            "context_hash": dispatch_context["context_hash"],
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "high",
+            "dispatch_receipt": receipt,
+        }
+        request["scheduler_state"]["source_plan_hash"] = source_plan_hash
+        request["scheduler_state"]["slot_epochs"]["slot-1"] = 1
+        request["scheduler_state"]["running_assignments"] = [assignment]
+        request["scheduler_state"]["dispatch_contexts"] = [dispatch_context]
+        return request
+
     def run_fast_lane_cli(
         self,
         helper,
@@ -1970,6 +2061,74 @@ class TeamEfficiencyTests(unittest.TestCase):
             result = helper.compile_fast_lane(request, reasoning_effort="ultra")
 
         self.assertEqual("blocked", result["status"])
+
+    def test_fast_lane_running_ledger_and_assignment_token_are_exact(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+
+        result = helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        self.assertEqual("active", result["status"])
+        self.assertEqual("FAST_LANE_ACTIVE", result["decision_code"])
+        self.assertEqual(1, len(result["assignments"]))
+        retained = result["assignments"][0]
+        source_assignment = request["scheduler_state"]["running_assignments"][0]
+        self.assertEqual("retain", retained["action"])
+        self.assertEqual(source_assignment["assignment_token"], retained["assignment_token"])
+        self.assertEqual(source_assignment["dispatch_receipt"], retained["dispatch_receipt"])
+        self.assertEqual("execution", retained["role"])
+        self.assertEqual("gpt-5.6-terra", retained["model"])
+        self.assertEqual("high", retained["reasoning_effort"])
+        self.assertEqual(
+            source_assignment["assignment_token"],
+            helper._sha256_json(source_assignment["dispatch_receipt"]),
+        )
+        self.assertNotIn(str(self.repo), json.dumps(result, sort_keys=True))
+
+        invalid_requests: list[tuple[str, dict[str, object]]] = []
+
+        forged_token = copy.deepcopy(request)
+        forged_token["scheduler_state"]["running_assignments"][0][
+            "assignment_token"
+        ] = "sha256:" + "0" * 64
+        invalid_requests.append(("forged_token", forged_token))
+
+        receipt_role = copy.deepcopy(request)
+        assignment = receipt_role["scheduler_state"]["running_assignments"][0]
+        assignment["role"] = "review"
+        assignment["dispatch_receipt"]["role"] = "review"
+        assignment["assignment_token"] = helper._sha256_json(
+            assignment["dispatch_receipt"]
+        )
+        invalid_requests.append(("receipt_role", receipt_role))
+
+        context_hash = copy.deepcopy(request)
+        context_hash["scheduler_state"]["dispatch_contexts"][0]["context_hash"] = (
+            "sha256:" + "1" * 64
+        )
+        invalid_requests.append(("context_hash", context_hash))
+
+        duplicate_lifecycle = copy.deepcopy(request)
+        duplicate_lifecycle["scheduler_state"]["blocked_task_ids"] = [
+            duplicate_lifecycle["scheduler_state"]["running_assignments"][0]["task_id"]
+        ]
+        invalid_requests.append(("duplicate_lifecycle", duplicate_lifecycle))
+
+        unknown_scheduler_field = copy.deepcopy(request)
+        unknown_scheduler_field["scheduler_state"]["unexpected"] = True
+        invalid_requests.append(("unknown_scheduler_field", unknown_scheduler_field))
+
+        for name, invalid_request in invalid_requests:
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_malformed_remediation_request(self) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+        request["remediation_request"] = {}
+
+        with self.assertRaises(ValueError):
+            helper.compile_fast_lane(request, reasoning_effort="ultra")
 
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
