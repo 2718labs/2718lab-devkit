@@ -218,7 +218,7 @@ workspace, trace id, or snapshot id from Atlas evidence.
 `fast-lane` compiles the exact
 `team-efficiency/fast-lane-request-v1` request into a deterministic
 `team-efficiency/fast-lane-plan-v1` result. It is a pure compiler: all target gates,
-contexts, receipts, tokens, and workflow operations are inert data. The
+contexts, receipts, tokens, and workflow operations are inert dispatch descriptors. The
 helper performs no model call, agent spawn, remote service contact, gate run,
 Git mutation, workflow call, lease claim, endpoint bind, or workflow
 completion.

@@ -99,7 +99,7 @@ python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --r
 
 `ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不运行 gate、不改写 Git、不领取或完成 workflow。lane 0/main Sol 始终负责设计、集成、风险决策和最终验收。
 
-host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件（terminal event）后 refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。路由下限为：
+host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后（only after a terminal event）refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。路由下限为：
 
 ```text
 prewarm: gpt-5.6-terra / medium
