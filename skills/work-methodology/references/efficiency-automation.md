@@ -213,6 +213,71 @@ ones) before passing `arguments` directly to the named MCP tool. These are
 runtime bindings, not fake values. The plan never copies an absolute
 workspace, trace id, or snapshot id from Atlas evidence.
 
+## Ultra Fast Lane
+
+`fast-lane` compiles the exact
+`team-efficiency/fast-lane-request-v1` request into a deterministic
+`team-efficiency/fast-lane-plan-v1` result. It is a pure compiler: all target gates,
+contexts, receipts, tokens, and workflow operations are inert dispatch descriptors. The
+helper performs no model call, agent spawn, remote service contact, gate run,
+Git mutation, workflow call, lease claim, endpoint bind, or workflow
+completion.
+
+The host invokes `fast-lane` with an explicit reasoning effort. `ultra` is the
+automatic activation path (`ultra_auto`); lower efforts require explicit
+`--enable` (`explicit_opt_in`) and otherwise return an inactive plan.
+Descriptors always carry explicit model and effort: prewarm is
+`gpt-5.6-terra` / `medium`; routine implementation and
+ordinary verification are `gpt-5.6-terra` / `high`; moderate-or-harder
+implementation and verification are `gpt-5.6-terra` / `max`; review is
+`gpt-5.6-terra` / `high`; and a bounded design probe is `gpt-5.6-sol` /
+`ultra`. Main Sol lane 0 owns design, integration, risk decisions, and final
+acceptance.
+
+The request supplies bounded work-package, target-gate, execution-context,
+read-context, remediation, and scheduler-state data. The plan binds a source
+plan hash, partitions exactly three subagent slots into start/retain
+assignments and honest idle slots, and carries canonical dispatch
+receipts/tokens. The host spawns only `action="start"`; it never respawns a
+retained assignment and refills a free slot only after a terminal event. Neither
+the compiler nor the host polls commentary updates or refills from commentary
+(`no commentary polling`).
+
+Where the declared lifecycle orders `host_spawn_exact_route` before
+`workflow_claim_with_host_target`, that spawn is a `parked endpoint bootstrap`,
+not prewarm: it may create an inert route solely to obtain `host_target`. Until
+the claim succeeds, and `workflow_endpoint_bind` succeeds when its declared
+condition applies, the host MUST NOT deliver a task payload or permit that
+worker to read a worktree, run a target gate, write, checkpoint, sync or query
+project state, or emit a receipt, candidate, or terminal result. The first
+execution or verification authorization must bind the claimed task, owner,
+lease epoch, and exact parked `host_target`. A failed, stale, or rejected claim
+leaves the parked worker inert and creates no durable task transition. This is
+a host invariant; it adds no compiler operation. Prewarm remains its separate
+read-only role and is not a name for this bootstrap.
+
+Prewarm is read-only evidence, not acceptance evidence: a later writer may
+reuse it only after current-basis delta revalidation passes.
+
+The terminal protocol is bounded to one regression (the integration regression
+pass), one blocker review, and at most one global remediation (targeted to the
+finding). Candidate or review results never unlock a dependency; lane 0 integration, artifact
+registration, and durable workflow completion remain required.
+
+The compiler proves only request consistency. All execution and read `repo`
+anchors must agree on a canonical repo anchor, and worker/read worktrees must
+differ from that anchor. Before executing a descriptor, the host matches the
+request anchor to its trusted shared integration worktree; before `git worktree add`, it rejects a
+mismatch without mutation. After apply, the host re-resolves the created
+target, verifies that it equals the planned worker worktree and shares the
+trusted anchor's Git common directory, and records that post-apply attestation
+as host evidence. The host never substitutes the integration worktree for a
+worker or read worktree.
+
+Rendered plans contain redacted bounded metadata only: no absolute
+repo/worktree/temp paths, prompts, raw command output, secrets, or raw
+external receipt bodies.
+
 ## CLI
 
 ```text
@@ -222,4 +287,6 @@ python scripts/team_efficiency.py contract-check --producer <producer.json> --co
 python scripts/team_efficiency.py cache-key --input <cache-inputs.json>
 python scripts/team_efficiency.py decompose --input <work-package.json>
 python scripts/team_efficiency.py plan-waves --input <work-package.json>
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort max --enable
 ```
