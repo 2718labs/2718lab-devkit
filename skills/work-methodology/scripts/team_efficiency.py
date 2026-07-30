@@ -111,6 +111,25 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
         "scheduler_state",
     }
 )
+_FAST_LANE_EXECUTION_CONTEXT_FIELDS = frozenset(
+    {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"}
+)
+_FAST_LANE_READ_CONTEXT_FIELDS = frozenset(
+    {
+        "task_id",
+        "role",
+        "repo",
+        "worktree",
+        "base_commit",
+        "tree",
+        "workspace_input_snapshot_id",
+        "read_scope",
+        "temp_target",
+    }
+)
+_FAST_LANE_READ_ROLES = frozenset(
+    {"verification", "prewarm", "review", "design_probe"}
+)
 _FAST_LANE_GATE_FIELDS = frozenset(
     {
         "gate_id",
@@ -2883,6 +2902,274 @@ def _validated_fast_lane_target_gates(
     return normalized_targets
 
 
+def _fast_lane_integration_state(value: object) -> dict[str, Any]:
+    scheduler_state = _mapping(value, "scheduler_state")
+    integration = _mapping(
+        scheduler_state.get("integration_state"), "scheduler_state.integration_state"
+    )
+    commit = _git_id(
+        integration.get("commit"), "scheduler_state.integration_state.commit"
+    )
+    tree = _git_id(
+        integration.get("tree"), "scheduler_state.integration_state.tree"
+    )
+    snapshot_value = integration.get("integration_workspace_snapshot_id")
+    snapshot = (
+        None
+        if snapshot_value is None
+        else _hash(
+            snapshot_value,
+            "scheduler_state.integration_state.integration_workspace_snapshot_id",
+        )
+    )
+    return {
+        "commit": commit,
+        "tree": tree,
+        "integration_workspace_snapshot_id": snapshot,
+    }
+
+
+def _validated_fast_lane_execution_context(
+    value: object,
+    unit: Mapping[str, Any],
+    integration_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    context = _mapping(value, "execution context")
+    _exact_keys(context, _FAST_LANE_EXECUTION_CONTEXT_FIELDS, "execution context")
+    task_id = _task_id(context["task_id"], "execution context.task_id")
+    plan = _validated_bootstrap_plan(context["bootstrap_plan"])
+    if task_id != plan["task_id"]:
+        raise ValueError("execution context task does not match bootstrap plan")
+
+    unit_scope = _normalised_scopes(
+        unit.get("write_scope"), f"execution context {task_id}.write_scope"
+    )
+    if plan["write_scope"] != unit_scope:
+        raise ValueError("execution context write scope does not match source unit")
+    if plan["base_commit"] != integration_state["commit"]:
+        raise ValueError("execution context base does not match integration commit")
+
+    snapshot_value = context["workspace_input_snapshot_id"]
+    snapshot = (
+        None
+        if snapshot_value is None
+        else _hash(snapshot_value, "execution context.workspace_input_snapshot_id")
+    )
+    strict_index = unit.get("strict_index")
+    if strict_index is not None and type(strict_index) is not bool:
+        raise ValueError("execution context strict_index is invalid")
+    if strict_index is True and snapshot is None:
+        raise ValueError("strict execution context requires an input snapshot")
+    return {
+        "task_id": task_id,
+        "bootstrap_plan": plan,
+        "workspace_input_snapshot_id": snapshot,
+    }
+
+
+def _validated_fast_lane_read_context(
+    value: object,
+    unit: Mapping[str, Any],
+    integration_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    context = _mapping(value, "read context")
+    _exact_keys(context, _FAST_LANE_READ_CONTEXT_FIELDS, "read context")
+    task_id = _task_id(context["task_id"], "read context.task_id")
+    role = _text(context["role"], "read context.role", maximum=32)
+    if role not in _FAST_LANE_READ_ROLES:
+        raise ValueError("read context role is invalid")
+    repo = _absolute_path(context["repo"], "read context.repo")
+    worktree = _absolute_path(context["worktree"], "read context.worktree")
+    if worktree == repo:
+        raise ValueError("read context worktree must differ from repo")
+    base_commit = _git_id(context["base_commit"], "read context.base_commit")
+    tree = _git_id(context["tree"], "read context.tree")
+    snapshot = _hash(
+        context["workspace_input_snapshot_id"],
+        "read context.workspace_input_snapshot_id",
+    )
+    read_scope = _normalised_scopes(context["read_scope"], "read context.read_scope")
+    temp_target = _absolute_path(context["temp_target"], "read context.temp_target")
+
+    unit_kind = unit.get("unit_kind")
+    if role == "verification" and unit_kind is not None and unit_kind != "verification":
+        raise ValueError("verification read context must bind a verification unit")
+    if role == "verification":
+        if base_commit != integration_state["commit"]:
+            raise ValueError("verification read context commit is stale")
+        if tree != integration_state["tree"]:
+            raise ValueError("verification read context tree is stale")
+    return {
+        "task_id": task_id,
+        "role": role,
+        "repo": str(repo),
+        "worktree": str(worktree),
+        "base_commit": base_commit,
+        "tree": tree,
+        "workspace_input_snapshot_id": snapshot,
+        "read_scope": read_scope,
+        "temp_target": str(temp_target),
+    }
+
+
+def _fast_lane_path_identity(value: str | Path) -> str:
+    return str(value).casefold()
+
+
+def _validated_fast_lane_contexts(
+    execution_value: object,
+    read_value: object,
+    source_plan: Mapping[str, Any],
+    scheduler_state: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    execution_records = _bounded_records(
+        execution_value,
+        "execution_contexts",
+        maximum=MAX_MANIFEST_UNITS,
+    )
+    read_records = _bounded_records(
+        read_value,
+        "read_contexts",
+        maximum=MAX_MANIFEST_UNITS,
+    )
+    if source_plan.get("status") != "planned":
+        if execution_records or read_records:
+            raise ValueError("contexts require a planned source")
+        return [], []
+
+    units_value = source_plan.get("units")
+    units = _bounded_records(
+        units_value, "source plan.units", maximum=MAX_MANIFEST_UNITS
+    )
+    units_by_task_id: dict[str, Mapping[str, Any]] = {}
+    for index, item in enumerate(units):
+        unit = _mapping(item, f"source plan.units[{index}]")
+        task_id = _task_id(
+            unit.get("task_id"), f"source plan.units[{index}].task_id"
+        )
+        if task_id in units_by_task_id:
+            raise ValueError("source plan contains duplicate task ids")
+        units_by_task_id[task_id] = unit
+    integration_state = _fast_lane_integration_state(scheduler_state)
+
+    execution_contexts: list[dict[str, Any]] = []
+    read_contexts: list[dict[str, Any]] = []
+    execution_task_ids: set[str] = set()
+    read_keys: set[tuple[str, str]] = set()
+    branches: set[str] = set()
+    worktrees: set[str] = set()
+    temp_targets: set[str] = set()
+    repo_anchor: str | None = None
+    project_roots: list[Path] = []
+
+    for index, record in enumerate(execution_records):
+        field = f"execution_contexts[{index}]"
+        context = _mapping(record, field)
+        task_id = _task_id(context.get("task_id"), f"{field}.task_id")
+        if task_id not in units_by_task_id:
+            raise ValueError("execution context task is unknown")
+        if task_id in execution_task_ids:
+            raise ValueError("execution_contexts contains duplicate task ids")
+        normalized = _validated_fast_lane_execution_context(
+            record,
+            units_by_task_id[task_id],
+            integration_state,
+        )
+        plan = normalized["bootstrap_plan"]
+        repo = _absolute_path(plan["repo"], f"{field}.bootstrap_plan.repo")
+        worktree = _absolute_path(
+            plan["worktree"], f"{field}.bootstrap_plan.worktree"
+        )
+        temp_target = _absolute_path(
+            plan["temp_target"], f"{field}.bootstrap_plan.temp_target"
+        )
+        repo_id = _fast_lane_path_identity(repo)
+        if repo_anchor is None:
+            repo_anchor = repo_id
+        elif repo_anchor != repo_id:
+            raise ValueError("fast-lane contexts must share one repo anchor")
+        worktree_id = _fast_lane_path_identity(worktree)
+        temp_id = _fast_lane_path_identity(temp_target)
+        if worktree_id == repo_anchor:
+            raise ValueError("execution context worktree must differ from repo")
+        if worktree_id in worktrees:
+            raise ValueError("fast-lane contexts contain duplicate worktrees")
+        if temp_id in temp_targets:
+            raise ValueError("fast-lane contexts contain duplicate temp targets")
+        if temp_id == worktree_id:
+            raise ValueError("fast-lane context worktree and temp target must differ")
+        branch = plan["branch"].casefold()
+        if branch in branches:
+            raise ValueError("fast-lane contexts contain duplicate branches")
+        branches.add(branch)
+        worktrees.add(worktree_id)
+        temp_targets.add(temp_id)
+        _, project_root = _project_root(plan["project"])
+        project_roots.append(project_root)
+        execution_task_ids.add(task_id)
+        execution_contexts.append(normalized)
+
+    if execution_records and execution_task_ids != set(units_by_task_id):
+        raise ValueError("execution contexts must cover the source task set")
+
+    codex_root = Path(r"D:\bun\tmp\codex").resolve(strict=False)
+    for index, record in enumerate(read_records):
+        field = f"read_contexts[{index}]"
+        context = _mapping(record, field)
+        task_id = _task_id(context.get("task_id"), f"{field}.task_id")
+        if task_id not in units_by_task_id:
+            raise ValueError("read context task is unknown")
+        normalized = _validated_fast_lane_read_context(
+            record,
+            units_by_task_id[task_id],
+            integration_state,
+        )
+        role = normalized["role"]
+        key = (task_id, role)
+        if key in read_keys:
+            raise ValueError("read_contexts contains duplicate task roles")
+        read_keys.add(key)
+        repo = _absolute_path(normalized["repo"], f"{field}.repo")
+        worktree = _absolute_path(normalized["worktree"], f"{field}.worktree")
+        temp_target = _absolute_path(normalized["temp_target"], f"{field}.temp_target")
+        repo_id = _fast_lane_path_identity(repo)
+        if repo_anchor is None:
+            repo_anchor = repo_id
+        elif repo_anchor != repo_id:
+            raise ValueError("fast-lane contexts must share one repo anchor")
+        worktree_id = _fast_lane_path_identity(worktree)
+        temp_id = _fast_lane_path_identity(temp_target)
+        if worktree_id == repo_anchor:
+            raise ValueError("read context worktree must differ from repo")
+        if worktree_id in worktrees:
+            raise ValueError("fast-lane contexts contain duplicate worktrees")
+        if temp_id in temp_targets:
+            raise ValueError("fast-lane contexts contain duplicate temp targets")
+        if temp_id == worktree_id:
+            raise ValueError("fast-lane context worktree and temp target must differ")
+        roots = project_roots or [codex_root]
+        if not any(
+            temp_target != root and temp_target.is_relative_to(root)
+            for root in roots
+        ):
+            raise ValueError("read context temp target must stay below the task root")
+        worktrees.add(worktree_id)
+        temp_targets.add(temp_id)
+        read_contexts.append(normalized)
+    phase = _text(scheduler_state.get("phase"), "scheduler_state.phase", maximum=32)
+    if phase == "integration_regression":
+        verification_contexts = [
+            context
+            for context in read_contexts
+            if context["role"] == "verification"
+        ]
+        if len(verification_contexts) != 1:
+            raise ValueError(
+                "integration regression requires one verification read context"
+            )
+    return execution_contexts, read_contexts
+
+
 def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
     candidate = _mapping(request, "fast-lane request")
     _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
@@ -2891,14 +3178,20 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
     if len(_json_bytes(candidate)) > MAX_MANIFEST_INPUT_BYTES:
         raise ValueError("fast-lane request exceeds its byte budget")
     source_plan = decompose(candidate["work_package"])
+    execution_contexts, read_contexts = _validated_fast_lane_contexts(
+        candidate["execution_contexts"],
+        candidate["read_contexts"],
+        source_plan,
+        candidate["scheduler_state"],
+    )
     return {
         "source_plan": source_plan,
         "source_plan_hash": _sha256_json(source_plan),
         "target_gates": _validated_fast_lane_target_gates(
             candidate["target_gates"], source_plan
         ),
-        "execution_contexts": candidate["execution_contexts"],
-        "read_contexts": candidate["read_contexts"],
+        "execution_contexts": execution_contexts,
+        "read_contexts": read_contexts,
         "remediation_request": candidate["remediation_request"],
         "scheduler_state": candidate["scheduler_state"],
     }

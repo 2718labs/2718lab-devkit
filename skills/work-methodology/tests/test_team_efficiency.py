@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -743,6 +744,48 @@ class TeamEfficiencyTests(unittest.TestCase):
             for unit in source_plan["units"]
         ]
         return request
+
+    def fast_lane_read_context(
+        self,
+        helper,
+        *,
+        task_id: str = "ATLAS-12B-A",
+        role: str = "prewarm",
+        repo: str | Path | None = None,
+        worktree: str | Path | None = None,
+        temp_target: str | Path | None = None,
+        base_commit: str = "a" * 40,
+        tree: str = "b" * 40,
+        workspace_input_snapshot_id: str | None = None,
+        read_scope: list[str] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "task_id": task_id,
+            "role": role,
+            "repo": str(self.repo if repo is None else repo),
+            "worktree": str(
+                self.safe_root / "worktrees" / "fast-lane-read"
+                if worktree is None
+                else worktree
+            ),
+            "base_commit": base_commit,
+            "tree": tree,
+            "workspace_input_snapshot_id": (
+                helper._sha256_json({"snapshot": task_id})
+                if workspace_input_snapshot_id is None
+                else workspace_input_snapshot_id
+            ),
+            "read_scope": (
+                ["skills/work-methodology/scripts/team_efficiency.py"]
+                if read_scope is None
+                else read_scope
+            ),
+            "temp_target": str(
+                self.safe_root / "tasks" / "fast-lane-read"
+                if temp_target is None
+                else temp_target
+            ),
+        }
 
     def run_fast_lane_cli(
         self,
@@ -1764,6 +1807,169 @@ class TeamEfficiencyTests(unittest.TestCase):
             with self.subTest(case=name):
                 with self.assertRaises(ValueError):
                     helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+
+    def test_fast_lane_context_anchor_uniqueness_and_path_redaction(self) -> None:
+        helper = load_efficiency()
+        baseline = self.fully_bound_fast_lane_manual_request(helper)
+        read_context = self.fast_lane_read_context(helper)
+        baseline["read_contexts"] = [read_context]
+
+        result = helper.compile_fast_lane(
+            copy.deepcopy(baseline), reasoning_effort="ultra"
+        )
+        rendered = json.dumps(result, sort_keys=True)
+        for context_path in (
+            self.repo,
+            read_context["worktree"],
+            read_context["temp_target"],
+        ):
+            self.assertNotIn(str(context_path), rendered)
+        self.assertNotIn("bootstrap_plan", rendered)
+        self.assertNotIn("command_argv", rendered)
+
+        source_plan = helper.decompose(baseline["work_package"])
+        first_unit = source_plan["units"][0]
+        integration = baseline["scheduler_state"]["integration_state"]
+        verification_read = self.fast_lane_read_context(
+            helper,
+            task_id=first_unit["task_id"],
+            role="verification",
+            base_commit=integration["commit"],
+            tree=integration["tree"],
+        )
+
+        invalid_cases: list[tuple[str, dict[str, object]]] = []
+
+        anchor_mismatch = copy.deepcopy(baseline)
+        anchor_mismatch["read_contexts"] = [
+            self.fast_lane_read_context(
+                helper,
+                repo=self.safe_root / "other-repository",
+            )
+        ]
+        invalid_cases.append(("anchor_mismatch", anchor_mismatch))
+
+        worktree_is_repo = copy.deepcopy(baseline)
+        worktree_is_repo["read_contexts"] = [
+            self.fast_lane_read_context(helper, worktree=self.repo)
+        ]
+        invalid_cases.append(("worktree_is_repo", worktree_is_repo))
+
+        execution_worktree_collision = copy.deepcopy(baseline)
+        execution_worktree_collision["read_contexts"] = [
+            self.fast_lane_read_context(
+                helper,
+                worktree=baseline["execution_contexts"][0]["bootstrap_plan"][
+                    "worktree"
+                ],
+            )
+        ]
+        invalid_cases.append(
+            ("execution_worktree_collision", execution_worktree_collision)
+        )
+
+        execution_temp_collision = copy.deepcopy(baseline)
+        execution_temp_collision["read_contexts"] = [
+            self.fast_lane_read_context(
+                helper,
+                temp_target=baseline["execution_contexts"][0]["bootstrap_plan"][
+                    "temp_target"
+                ],
+            )
+        ]
+        invalid_cases.append(("execution_temp_collision", execution_temp_collision))
+
+        temp_target_is_task_root = copy.deepcopy(baseline)
+        temp_target_is_task_root["read_contexts"] = [
+            self.fast_lane_read_context(helper, temp_target=self.safe_root)
+        ]
+        invalid_cases.append(("temp_target_is_task_root", temp_target_is_task_root))
+
+        duplicate_read_targets = copy.deepcopy(baseline)
+        duplicate_read_targets["read_contexts"] = [
+            self.fast_lane_read_context(helper),
+            self.fast_lane_read_context(
+                helper,
+                task_id="ATLAS-12B-B",
+                worktree=self.safe_root / "worktrees" / "fast-lane-read",
+                temp_target=self.safe_root / "tasks" / "fast-lane-read",
+            ),
+        ]
+        invalid_cases.append(("duplicate_read_targets", duplicate_read_targets))
+
+        verification_commit_mismatch = copy.deepcopy(baseline)
+        verification_read["base_commit"] = "c" * 40
+        verification_commit_mismatch["read_contexts"] = [verification_read]
+        invalid_cases.append(
+            ("verification_commit_mismatch", verification_commit_mismatch)
+        )
+
+        verification_tree_mismatch = copy.deepcopy(baseline)
+        verification_read = self.fast_lane_read_context(
+            helper,
+            task_id=first_unit["task_id"],
+            role="verification",
+            base_commit=integration["commit"],
+            tree="c" * 40,
+        )
+        verification_tree_mismatch["read_contexts"] = [verification_read]
+        invalid_cases.append(
+            ("verification_tree_mismatch", verification_tree_mismatch)
+        )
+
+        verification_snapshot_missing = copy.deepcopy(baseline)
+        verification_read = self.fast_lane_read_context(
+            helper,
+            task_id=first_unit["task_id"],
+            role="verification",
+            base_commit=integration["commit"],
+            tree=integration["tree"],
+            workspace_input_snapshot_id=None,
+        )
+        verification_read["workspace_input_snapshot_id"] = None
+        verification_snapshot_missing["read_contexts"] = [verification_read]
+        invalid_cases.append(
+            ("verification_snapshot_missing", verification_snapshot_missing)
+        )
+
+        verification_context_missing = copy.deepcopy(baseline)
+        verification_context_missing["scheduler_state"]["phase"] = (
+            "integration_regression"
+        )
+        verification_context_missing["read_contexts"] = []
+        invalid_cases.append(
+            ("verification_context_missing", verification_context_missing)
+        )
+
+        for name, invalid_request in invalid_cases:
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+
+    def test_fast_lane_has_no_external_side_effect(self) -> None:
+        helper = load_efficiency()
+        request = self.fully_bound_fast_lane_manual_request(helper)
+
+        with (
+            mock.patch.object(
+                helper.subprocess,
+                "run",
+                side_effect=AssertionError("compile must not run subprocesses"),
+            ),
+            mock.patch.object(
+                helper,
+                "apply_bootstrap_plan",
+                side_effect=AssertionError("compile must not apply bootstrap plans"),
+            ),
+            mock.patch.object(
+                helper.Path,
+                "mkdir",
+                side_effect=AssertionError("compile must not create directories"),
+            ),
+        ):
+            result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+        self.assertEqual("blocked", result["status"])
 
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
