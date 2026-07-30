@@ -111,6 +111,19 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
         "scheduler_state",
     }
 )
+_FAST_LANE_GATE_FIELDS = frozenset(
+    {
+        "gate_id",
+        "argv",
+        "red_expected_exit_codes",
+        "green_expected_exit_code",
+        "timeout_seconds",
+        "red_failure_ids",
+        "red_failure_fingerprint",
+        "acceptance_constraint_hashes",
+    }
+)
+_FAST_LANE_TARGET_GATE_FIELDS = frozenset({"task_id", "driver_gate_id", "gates"})
 _FAST_LANE_PLAN_FIELDS = frozenset(
     {
         "schema",
@@ -143,6 +156,12 @@ _FAST_LANE_PHASES = frozenset(
         "acceptance",
         "stopped",
     }
+)
+_FAST_LANE_SHELL_WRAPPERS = frozenset(
+    {"bash", "cmd", "cmd.exe", "fish", "powershell", "pwsh", "sh", "zsh"}
+)
+_FAST_LANE_SHELL_ARGUMENTS = frozenset(
+    {"--command", "--encodedcommand", "-c", "-command", "/c", "/k"}
 )
 _ROUTES = {
     "routine": "Terra High",
@@ -2606,6 +2625,261 @@ def _fast_lane_activation(
     return {"reasoning_effort": effort, "reason": reason}
 
 
+def _fast_lane_red_failure_fingerprint(
+    gate_id: str, failure_ids: Sequence[str]
+) -> str | None:
+    if not failure_ids:
+        return None
+    return _sha256_json(
+        {
+            "schema": "team-efficiency/red-failure-identity-v1",
+            "gate_id": gate_id,
+            "failure_ids": sorted(failure_ids),
+        }
+    )
+
+
+def _fast_lane_argv(value: object, field: str) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"{field} must be a list")
+    if not value or len(value) > MAX_LIST_ITEMS:
+        raise ValueError(f"{field} is out of bounds")
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        token = _text(item, f"{field}[{index}]", maximum=256)
+        _reject_sensitive_or_absolute_text(token, f"{field}[{index}]")
+        folded = token.casefold()
+        if (
+            folded in _FAST_LANE_SHELL_WRAPPERS
+            or folded in _FAST_LANE_SHELL_ARGUMENTS
+            or token.startswith("\\")
+            or ".." in token
+            or any(ord(character) == 127 for character in token)
+        ):
+            raise ValueError(f"{field} contains an unsafe command token")
+        normalized.append(token)
+    return normalized
+
+
+def _fast_lane_exit_codes(value: object, field: str) -> list[int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"{field} must be a list")
+    if len(value) > MAX_LIST_ITEMS:
+        raise ValueError(f"{field} is out of bounds")
+    normalized: list[int] = []
+    for item in value:
+        if type(item) is not int or not 1 <= item <= 255:
+            raise ValueError(f"{field} must contain nonzero exit codes")
+        normalized.append(item)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{field} contains duplicates")
+    return sorted(normalized)
+
+
+def _fast_lane_failure_ids(value: object, field: str) -> list[str]:
+    def normalize(item: object, nested_field: str) -> str:
+        failure_id = _text(item, nested_field, maximum=256)
+        _reject_sensitive_or_absolute_text(failure_id, nested_field)
+        if (
+            failure_id.startswith("\\")
+            or ".." in failure_id
+            or any(ord(character) == 127 for character in failure_id)
+        ):
+            raise ValueError(f"{nested_field} is unsafe")
+        return failure_id
+
+    return _normalised_list(
+        value,
+        field,
+        normalize,
+        maximum=MAX_LIST_ITEMS,
+    )
+
+
+def _validated_fast_lane_gate(value: object, field: str) -> dict[str, Any]:
+    gate = _mapping(value, field)
+    _exact_keys(gate, _FAST_LANE_GATE_FIELDS, field)
+    gate_id = _label(gate["gate_id"], f"{field}.gate_id")
+    argv = _fast_lane_argv(gate["argv"], f"{field}.argv")
+    red_expected_exit_codes = _fast_lane_exit_codes(
+        gate["red_expected_exit_codes"], f"{field}.red_expected_exit_codes"
+    )
+    green_expected_exit_code = gate["green_expected_exit_code"]
+    if type(green_expected_exit_code) is not int or not 0 <= green_expected_exit_code <= 255:
+        raise ValueError(f"{field}.green_expected_exit_code is invalid")
+    timeout_seconds = gate["timeout_seconds"]
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_GATE_TIMEOUT_SECONDS:
+        raise ValueError(f"{field}.timeout_seconds is invalid")
+    red_failure_ids = _fast_lane_failure_ids(
+        gate["red_failure_ids"], f"{field}.red_failure_ids"
+    )
+    expected_fingerprint = _fast_lane_red_failure_fingerprint(
+        gate_id, red_failure_ids
+    )
+    fingerprint_value = gate["red_failure_fingerprint"]
+    if expected_fingerprint is None:
+        if fingerprint_value is not None:
+            raise ValueError(f"{field}.red_failure_fingerprint must be null")
+        red_failure_fingerprint = None
+    else:
+        red_failure_fingerprint = _hash(
+            fingerprint_value, f"{field}.red_failure_fingerprint"
+        )
+        if red_failure_fingerprint != expected_fingerprint:
+            raise ValueError(f"{field}.red_failure_fingerprint is invalid")
+    return {
+        "gate_id": gate_id,
+        "argv": argv,
+        "red_expected_exit_codes": red_expected_exit_codes,
+        "green_expected_exit_code": green_expected_exit_code,
+        "timeout_seconds": timeout_seconds,
+        "red_failure_ids": red_failure_ids,
+        "red_failure_fingerprint": red_failure_fingerprint,
+        "acceptance_constraint_hashes": _normalised_list(
+            gate["acceptance_constraint_hashes"],
+            f"{field}.acceptance_constraint_hashes",
+            _hash,
+            maximum=MAX_LIST_ITEMS,
+        ),
+    }
+
+
+def _validated_fast_lane_target_gates(
+    value: object, source_plan_value: object
+) -> list[dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("target_gates must be a list")
+    if not value or len(value) > MAX_MANIFEST_UNITS:
+        raise ValueError("target_gates is out of bounds")
+    normalized_targets: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        field = f"target_gates[{index}]"
+        target = _mapping(item, field)
+        _exact_keys(target, _FAST_LANE_TARGET_GATE_FIELDS, field)
+        task_id = _task_id(target["task_id"], f"{field}.task_id")
+        driver_value = target["driver_gate_id"]
+        driver_gate_id = (
+            None
+            if driver_value is None
+            else _label(driver_value, f"{field}.driver_gate_id")
+        )
+        gates_value = target["gates"]
+        if not isinstance(gates_value, Sequence) or isinstance(
+            gates_value, (str, bytes, bytearray)
+        ):
+            raise ValueError(f"{field}.gates must be a list")
+        if not gates_value or len(gates_value) > MAX_LIST_ITEMS:
+            raise ValueError(f"{field}.gates is out of bounds")
+        gates = [
+            _validated_fast_lane_gate(gate, f"{field}.gates[{gate_index}]")
+            for gate_index, gate in enumerate(gates_value)
+        ]
+        gate_ids = [gate["gate_id"] for gate in gates]
+        if len(set(gate_ids)) != len(gate_ids):
+            raise ValueError(f"{field}.gates contains duplicate gate ids")
+        gates = sorted(gates, key=lambda gate: gate["gate_id"])
+        if driver_gate_id is not None and driver_gate_id not in set(gate_ids):
+            raise ValueError(f"{field}.driver_gate_id is not a declared gate")
+        normalized_targets.append(
+            {
+                "task_id": task_id,
+                "driver_gate_id": driver_gate_id,
+                "gates": gates,
+            }
+        )
+    target_ids = [target["task_id"] for target in normalized_targets]
+    if len(set(target_ids)) != len(target_ids):
+        raise ValueError("target_gates contains duplicate task ids")
+    normalized_targets = sorted(normalized_targets, key=lambda target: target["task_id"])
+
+    source_plan = _mapping(source_plan_value, "source plan")
+    if _text(source_plan["status"], "source plan.status", maximum=32) != "planned":
+        return normalized_targets
+    source_kind = _text(source_plan["source_kind"], "source plan.source_kind", maximum=64)
+    if source_kind == "task_episode_graph":
+        raise ValueError("ATLAS_GATE_UNVERIFIED")
+    units_value = source_plan["units"]
+    if not isinstance(units_value, Sequence) or isinstance(
+        units_value, (str, bytes, bytearray)
+    ):
+        raise ValueError("source plan.units must be a list")
+    units_by_task_id: dict[str, Mapping[str, Any]] = {}
+    for index, item in enumerate(units_value):
+        unit = _mapping(item, f"source plan.units[{index}]")
+        unit_task_id = _task_id(unit["task_id"], f"source plan.units[{index}].task_id")
+        if unit_task_id in units_by_task_id:
+            raise ValueError("source plan contains duplicate task ids")
+        units_by_task_id[unit_task_id] = unit
+    if sorted(target_ids) != sorted(units_by_task_id):
+        raise ValueError("target_gates must match the source plan task set")
+
+    for target in normalized_targets:
+        unit = units_by_task_id[target["task_id"]]
+        gates = target["gates"]
+        driver_gate_id = target["driver_gate_id"]
+        if source_kind == "explicit_artifact_boundaries":
+            if (
+                len(gates) != 1
+                or driver_gate_id != gates[0]["gate_id"]
+                or gates[0]["acceptance_constraint_hashes"]
+                or not gates[0]["red_expected_exit_codes"]
+                or not gates[0]["red_failure_ids"]
+                or gates[0]["red_failure_fingerprint"] is None
+            ):
+                raise ValueError("manual artifact target gate is invalid")
+            continue
+        if source_kind != "code_atlas_packet":
+            raise ValueError("ATLAS_GATE_UNVERIFIED")
+        expected_acceptance = _normalised_list(
+            unit["acceptance_constraints"],
+            f"source plan unit {target['task_id']}.acceptance_constraints",
+            _hash,
+            maximum=MAX_LIST_ITEMS,
+            required=True,
+        )
+        gate_acceptance = [
+            constraint
+            for gate in gates
+            for constraint in gate["acceptance_constraint_hashes"]
+        ]
+        if (
+            len(set(gate_acceptance)) != len(gate_acceptance)
+            or sorted(gate_acceptance) != expected_acceptance
+        ):
+            raise ValueError("packet target acceptance constraints are invalid")
+        for gate in gates:
+            verified_test_hash = _sha256_json(
+                {
+                    "argv": gate["argv"],
+                    "expected_exit_code": gate["green_expected_exit_code"],
+                }
+            )
+            if verified_test_hash not in expected_acceptance:
+                raise ValueError("packet target gate is not a verified test")
+        unit_kind = _text(unit["unit_kind"], "source plan unit.unit_kind", maximum=32)
+        if unit_kind == "verification":
+            if driver_gate_id is not None or any(
+                gate["red_expected_exit_codes"]
+                or gate["red_failure_ids"]
+                or gate["red_failure_fingerprint"] is not None
+                for gate in gates
+            ):
+                raise ValueError("verification target gate must not define RED state")
+        elif driver_gate_id is None:
+            raise ValueError("packet code target requires a driver gate")
+        else:
+            driver_gate = next(
+                gate for gate in gates if gate["gate_id"] == driver_gate_id
+            )
+            if (
+                not driver_gate["red_expected_exit_codes"]
+                or not driver_gate["red_failure_ids"]
+                or driver_gate["red_failure_fingerprint"] is None
+            ):
+                raise ValueError("packet driver gate must define RED identity")
+    return normalized_targets
+
+
 def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
     candidate = _mapping(request, "fast-lane request")
     _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
@@ -2617,7 +2891,9 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source_plan": source_plan,
         "source_plan_hash": _sha256_json(source_plan),
-        "target_gates": candidate["target_gates"],
+        "target_gates": _validated_fast_lane_target_gates(
+            candidate["target_gates"], source_plan
+        ),
         "execution_contexts": candidate["execution_contexts"],
         "read_contexts": candidate["read_contexts"],
         "remediation_request": candidate["remediation_request"],
