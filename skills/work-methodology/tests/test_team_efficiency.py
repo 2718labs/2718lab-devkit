@@ -1456,6 +1456,153 @@ class TeamEfficiencyTests(unittest.TestCase):
                     invalid_verification_request, reasoning_effort="ultra"
                 )
 
+    def test_fast_lane_rejects_unsafe_manual_gate_inputs(self) -> None:
+        helper = load_efficiency()
+
+        def local_red_fingerprint(gate_id: str, failure_ids: list[str]) -> str:
+            payload = json.dumps(
+                {
+                    "schema": "team-efficiency/red-failure-identity-v1",
+                    "gate_id": gate_id,
+                    "failure_ids": sorted(failure_ids),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+        absolute_option = self.fast_lane_contexts_empty_request(helper)
+        absolute_option["target_gates"][0]["gates"][0]["argv"].append(
+            "--file=/etc/passwd"
+        )
+        with self.subTest(case="argv_embedded_posix_absolute"):
+            with self.assertRaises(ValueError):
+                helper.compile_fast_lane(absolute_option, reasoning_effort="ultra")
+
+        for name, failure_id in (
+            ("secret", "secret=token"),
+            ("absolute", "/etc/passwd"),
+            ("traversal", "../outside"),
+        ):
+            with self.subTest(case=name):
+                request = self.fast_lane_contexts_empty_request(helper)
+                gate = request["target_gates"][0]["gates"][0]
+                gate["red_failure_ids"] = [failure_id]
+                gate["red_failure_fingerprint"] = local_red_fingerprint(
+                    gate["gate_id"], gate["red_failure_ids"]
+                )
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+    def test_fast_lane_rejects_ambiguous_packet_gate_coverage(self) -> None:
+        helper = load_efficiency()
+
+        def local_hash(value: object) -> str:
+            payload = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+        manifest = self.code_atlas_manifest()
+        packet = manifest["packet"]
+        packet["tests"].append(
+            {
+                "argv": ["python", "-m", "pytest", "tests/test_secondary.py"],
+                "expected_exit_code": 0,
+            }
+        )
+        packet_identity = copy.deepcopy(packet)
+        del packet_identity["packet_id"]
+        packet["packet_id"] = local_hash(packet_identity)
+        plan = helper.decompose(manifest)
+        test_hashes = [
+            local_hash(
+                {
+                    "argv": test_spec["argv"],
+                    "expected_exit_code": test_spec["expected_exit_code"],
+                }
+            )
+            for test_spec in packet["tests"]
+        ]
+        request = self.fast_lane_contexts_empty_request(helper)
+        request["work_package"] = manifest
+        request["target_gates"] = []
+        for unit in plan["units"]:
+            is_verification = unit["unit_kind"] == "verification"
+            gates = []
+            for gate_id, test_spec, test_hash in zip(
+                ("focused", "coverage"), packet["tests"], test_hashes
+            ):
+                gates.append(
+                    self.fast_lane_gate(
+                        gate_id=gate_id,
+                        argv=list(test_spec["argv"]),
+                        red_expected_exit_codes=[] if is_verification else [1],
+                        green_exit_code=test_spec["expected_exit_code"],
+                        red_failure_ids=[] if is_verification else None,
+                        acceptance_constraint_hashes=[test_hash],
+                    )
+                )
+            request["target_gates"].append(
+                {
+                    "task_id": unit["task_id"],
+                    "driver_gate_id": None if is_verification else "focused",
+                    "gates": gates,
+                }
+            )
+
+        with self.subTest(case="two_test_specs_have_exact_two_gate_baseline"):
+            result = helper.compile_fast_lane(
+                copy.deepcopy(request), reasoning_effort="ultra"
+            )
+            self.assertEqual("blocked", result["status"])
+
+        overclaimed = copy.deepcopy(request)
+        overclaimed_first_gate = copy.deepcopy(
+            overclaimed["target_gates"][0]["gates"][0]
+        )
+        overclaimed_first_gate["acceptance_constraint_hashes"] = sorted(test_hashes)
+        overclaimed["target_gates"][0]["gates"] = [overclaimed_first_gate]
+        missing_coverage = copy.deepcopy(request)
+        missing_coverage["target_gates"][0]["gates"][1][
+            "acceptance_constraint_hashes"
+        ] = []
+        command_mismatch = copy.deepcopy(request)
+        command_mismatch["target_gates"][0]["gates"][0]["argv"] = [
+            "python",
+            "-m",
+            "pytest",
+            "tests/not_verified.py",
+        ]
+        for name, invalid_request in (
+            ("single_gate_overclaims_two_constraints", overclaimed),
+            ("missing_coverage", missing_coverage),
+            ("command_mismatch", command_mismatch),
+        ):
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(ValueError, r"^ATLAS_GATE_UNVERIFIED$"):
+                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+
+        request_path = self.temp / "fast-lane-atlas-gate-regression.json"
+        request_path.write_text(json.dumps(overclaimed), encoding="utf-8")
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+        self.assertEqual(2, exit_code)
+        self.assertEqual("", output)
+        self.assertEqual("error: ATLAS_GATE_UNVERIFIED\n", errors)
+
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
 

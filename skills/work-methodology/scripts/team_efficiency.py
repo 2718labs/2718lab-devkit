@@ -2847,7 +2847,7 @@ def _validated_fast_lane_target_gates(
             len(set(gate_acceptance)) != len(gate_acceptance)
             or sorted(gate_acceptance) != expected_acceptance
         ):
-            raise ValueError("packet target acceptance constraints are invalid")
+            raise ValueError("ATLAS_GATE_UNVERIFIED")
         for gate in gates:
             verified_test_hash = _sha256_json(
                 {
@@ -2856,9 +2856,9 @@ def _validated_fast_lane_target_gates(
                 }
             )
             if verified_test_hash not in expected_acceptance:
-                raise ValueError("packet target gate is not a verified test")
+                raise ValueError("ATLAS_GATE_UNVERIFIED")
             if gate["acceptance_constraint_hashes"] != [verified_test_hash]:
-                raise ValueError("packet target gate coverage is ambiguous")
+                raise ValueError("ATLAS_GATE_UNVERIFIED")
         unit_kind = _text(unit["unit_kind"], "source plan unit.unit_kind", maximum=32)
         if unit_kind == "verification":
             if driver_gate_id is not None or any(
