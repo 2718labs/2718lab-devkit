@@ -220,7 +220,8 @@ workspace, trace id, or snapshot id from Atlas evidence.
 `team-efficiency/fast-lane-plan-v1` result. It is a pure compiler: all target
 gates, contexts, receipts, tokens, and workflow operations are inert data. The
 helper does not call a model, spawn an agent, contact a remote service, run a
-gate, mutate Git, claim a lease, bind an endpoint, or complete a workflow.
+gate, mutate Git, make a workflow call, claim a lease, bind an endpoint, or
+complete a workflow.
 
 The host invokes `fast-lane` with an explicit reasoning effort. `ultra` is the
 automatic activation path; lower efforts require explicit `--enable` and
@@ -237,7 +238,9 @@ read-context, remediation, and scheduler-state data. The plan binds a source
 plan hash, partitions exactly three subagent slots into start/retain
 assignments and honest idle slots, and carries canonical dispatch
 receipts/tokens. The host spawns only `action="start"`; it never respawns a
-retained assignment and refills a free slot only after a terminal event.
+retained assignment and refills a free slot only after a terminal event. Neither
+the compiler nor the host polls commentary updates or refills from commentary
+(`no commentary polling`).
 Prewarm is read-only evidence, not acceptance evidence: a later writer may
 reuse it only after current-basis delta revalidation passes.
 
