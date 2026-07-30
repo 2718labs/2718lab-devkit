@@ -631,7 +631,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
         *,
         gate_id: str = "focused",
+        argv: list[str] | None = None,
         red_expected_exit_codes: list[int] | None = None,
+        green_exit_code: int = 0,
         red_failure_ids: list[str] | None = None,
         acceptance_constraint_hashes: list[str] | None = None,
     ) -> dict[str, object]:
@@ -665,14 +667,18 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         return {
             "gate_id": gate_id,
-            "argv": [
-                "python",
-                "-m",
-                "unittest",
-                "tests.test_team_efficiency",
-            ],
+            "argv": (
+                [
+                    "python",
+                    "-m",
+                    "unittest",
+                    "tests.test_team_efficiency",
+                ]
+                if argv is None
+                else argv
+            ),
             "red_expected_exit_codes": normalized_red_codes,
-            "green_expected_exit_code": 0,
+            "green_expected_exit_code": green_exit_code,
             "timeout_seconds": 300,
             "red_failure_ids": normalized_failure_ids,
             "red_failure_fingerprint": red_failure_fingerprint,
@@ -1362,15 +1368,27 @@ class TeamEfficiencyTests(unittest.TestCase):
         extra_key["target_gates"][0]["gates"][0]["unexpected"] = True
         invalid_requests.append(("extra_gate_key", extra_key))
 
+        missing_target_key = copy.deepcopy(request)
+        del missing_target_key["target_gates"][0]["driver_gate_id"]
+        invalid_requests.append(("missing_target_key", missing_target_key))
+
+        extra_target_key = copy.deepcopy(request)
+        extra_target_key["target_gates"][0]["unexpected"] = True
+        invalid_requests.append(("extra_target_key", extra_target_key))
+
         no_driver = copy.deepcopy(request)
         no_driver["target_gates"][0]["driver_gate_id"] = None
         invalid_requests.append(("no_driver", no_driver))
 
-        duplicate_driver = copy.deepcopy(request)
-        duplicate_driver["target_gates"].append(
-            copy.deepcopy(duplicate_driver["target_gates"][0])
+        duplicate_task_record = copy.deepcopy(request)
+        duplicate_task_record["target_gates"].append(
+            copy.deepcopy(duplicate_task_record["target_gates"][0])
         )
-        invalid_requests.append(("duplicate_driver", duplicate_driver))
+        invalid_requests.append(("duplicate_task_record", duplicate_task_record))
+
+        unknown_driver_gate = copy.deepcopy(request)
+        unknown_driver_gate["target_gates"][0]["driver_gate_id"] = "missing"
+        invalid_requests.append(("unknown_driver_gate", unknown_driver_gate))
 
         zero_red_code = copy.deepcopy(request)
         zero_red_code["target_gates"][0]["gates"][0][
@@ -1391,13 +1409,16 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         atlas_manifest = self.code_atlas_manifest()
         atlas_plan = helper.decompose(atlas_manifest)
+        atlas_test = atlas_manifest["packet"]["tests"][0]
         verification_request = self.fast_lane_contexts_empty_request(helper)
         verification_request["work_package"] = atlas_manifest
         verification_request["target_gates"] = []
         for unit in atlas_plan["units"]:
             is_verification = unit["unit_kind"] == "verification"
             gate = self.fast_lane_gate(
+                argv=atlas_test["argv"],
                 red_expected_exit_codes=[] if is_verification else [1],
+                green_exit_code=atlas_test["expected_exit_code"],
                 red_failure_ids=[] if is_verification else None,
                 acceptance_constraint_hashes=list(unit["acceptance_constraints"]),
             )
@@ -1408,9 +1429,16 @@ class TeamEfficiencyTests(unittest.TestCase):
                     "gates": [gate],
                 }
             )
+        with self.subTest(case="verification_red_fields_empty_is_valid"):
+            baseline = helper.compile_fast_lane(
+                copy.deepcopy(verification_request), reasoning_effort="ultra"
+            )
+            self.assertEqual("team-efficiency/fast-lane-plan-v1", baseline["schema"])
+
+        invalid_verification_request = copy.deepcopy(verification_request)
         verification_target = next(
             target
-            for target in verification_request["target_gates"]
+            for target in invalid_verification_request["target_gates"]
             if target["driver_gate_id"] is None
         )
         verification_target["gates"][0]["red_expected_exit_codes"] = [1]
@@ -1424,7 +1452,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         with self.subTest(case="verification_red_fields_must_be_empty"):
             with self.assertRaises(ValueError):
-                helper.compile_fast_lane(verification_request, reasoning_effort="ultra")
+                helper.compile_fast_lane(
+                    invalid_verification_request, reasoning_effort="ultra"
+                )
 
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
