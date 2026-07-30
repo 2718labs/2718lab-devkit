@@ -627,6 +627,62 @@ class TeamEfficiencyTests(unittest.TestCase):
     def fast_lane_contexts_empty_request(self, helper) -> dict[str, object]:
         return self.fast_lane_request(helper, include_contexts=False)
 
+    def fast_lane_gate(
+        self,
+        *,
+        gate_id: str = "focused",
+        red_expected_exit_codes: list[int] | None = None,
+        red_failure_ids: list[str] | None = None,
+        acceptance_constraint_hashes: list[str] | None = None,
+    ) -> dict[str, object]:
+        normalized_red_codes = (
+            [1] if red_expected_exit_codes is None else red_expected_exit_codes
+        )
+        normalized_failure_ids = (
+            [
+                "tests.test_team_efficiency.TeamEfficiencyTests."
+                "test_fast_lane_driver"
+            ]
+            if red_failure_ids is None
+            else red_failure_ids
+        )
+        red_failure_fingerprint = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "schema": "team-efficiency/red-failure-identity-v1",
+                        "gate_id": gate_id,
+                        "failure_ids": sorted(normalized_failure_ids),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if normalized_failure_ids
+            else None
+        )
+        return {
+            "gate_id": gate_id,
+            "argv": [
+                "python",
+                "-m",
+                "unittest",
+                "tests.test_team_efficiency",
+            ],
+            "red_expected_exit_codes": normalized_red_codes,
+            "green_expected_exit_code": 0,
+            "timeout_seconds": 300,
+            "red_failure_ids": normalized_failure_ids,
+            "red_failure_fingerprint": red_failure_fingerprint,
+            "acceptance_constraint_hashes": (
+                []
+                if acceptance_constraint_hashes is None
+                else acceptance_constraint_hashes
+            ),
+        }
+
     def run_fast_lane_cli(
         self,
         helper,
@@ -1268,6 +1324,107 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual(2, exit_code)
                 self.assertEqual("", output)
                 self.assertTrue(errors.startswith("error: "))
+
+    def test_fast_lane_validates_exact_target_gates_and_driver_identity(self) -> None:
+        helper = load_efficiency()
+        expected_gate_fields = {
+            "gate_id",
+            "argv",
+            "red_expected_exit_codes",
+            "green_expected_exit_code",
+            "timeout_seconds",
+            "red_failure_ids",
+            "red_failure_fingerprint",
+            "acceptance_constraint_hashes",
+        }
+        expected_target_fields = {"task_id", "driver_gate_id", "gates"}
+        request = self.fast_lane_contexts_empty_request(helper)
+        target = request["target_gates"][0]
+        target["driver_gate_id"] = "focused"
+        target["gates"] = [self.fast_lane_gate()]
+
+        with self.subTest(case="valid_driver_is_normalized"):
+            validated = helper._validated_fast_lane_request(request)
+            normalized_target = validated["target_gates"][0]
+            self.assertEqual(expected_target_fields, set(normalized_target))
+            self.assertEqual(expected_gate_fields, set(normalized_target["gates"][0]))
+            self.assertEqual(
+                request["target_gates"][0]["gates"][0]["red_failure_fingerprint"],
+                normalized_target["gates"][0]["red_failure_fingerprint"],
+            )
+
+        invalid_requests: list[tuple[str, dict[str, object]]] = []
+        missing_key = copy.deepcopy(request)
+        del missing_key["target_gates"][0]["gates"][0]["timeout_seconds"]
+        invalid_requests.append(("missing_gate_key", missing_key))
+
+        extra_key = copy.deepcopy(request)
+        extra_key["target_gates"][0]["gates"][0]["unexpected"] = True
+        invalid_requests.append(("extra_gate_key", extra_key))
+
+        no_driver = copy.deepcopy(request)
+        no_driver["target_gates"][0]["driver_gate_id"] = None
+        invalid_requests.append(("no_driver", no_driver))
+
+        duplicate_driver = copy.deepcopy(request)
+        duplicate_driver["target_gates"].append(
+            copy.deepcopy(duplicate_driver["target_gates"][0])
+        )
+        invalid_requests.append(("duplicate_driver", duplicate_driver))
+
+        zero_red_code = copy.deepcopy(request)
+        zero_red_code["target_gates"][0]["gates"][0][
+            "red_expected_exit_codes"
+        ] = [0]
+        invalid_requests.append(("zero_red_code", zero_red_code))
+
+        mismatched_fingerprint = copy.deepcopy(request)
+        mismatched_fingerprint["target_gates"][0]["gates"][0][
+            "red_failure_fingerprint"
+        ] = "sha256:" + ("0" * 64)
+        invalid_requests.append(("mismatched_fingerprint", mismatched_fingerprint))
+
+        for name, invalid_request in invalid_requests:
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+
+        atlas_manifest = self.code_atlas_manifest()
+        atlas_plan = helper.decompose(atlas_manifest)
+        verification_request = self.fast_lane_contexts_empty_request(helper)
+        verification_request["work_package"] = atlas_manifest
+        verification_request["target_gates"] = []
+        for unit in atlas_plan["units"]:
+            is_verification = unit["unit_kind"] == "verification"
+            gate = self.fast_lane_gate(
+                red_expected_exit_codes=[] if is_verification else [1],
+                red_failure_ids=[] if is_verification else None,
+                acceptance_constraint_hashes=list(unit["acceptance_constraints"]),
+            )
+            verification_request["target_gates"].append(
+                {
+                    "task_id": unit["task_id"],
+                    "driver_gate_id": None if is_verification else "focused",
+                    "gates": [gate],
+                }
+            )
+        verification_target = next(
+            target
+            for target in verification_request["target_gates"]
+            if target["driver_gate_id"] is None
+        )
+        verification_target["gates"][0]["red_expected_exit_codes"] = [1]
+        verification_target["gates"][0]["red_failure_ids"] = [
+            "tests.test_team_efficiency.TeamEfficiencyTests.test_verification"
+        ]
+        verification_target["gates"][0]["red_failure_fingerprint"] = (
+            self.fast_lane_gate(
+                red_failure_ids=verification_target["gates"][0]["red_failure_ids"]
+            )["red_failure_fingerprint"]
+        )
+        with self.subTest(case="verification_red_fields_must_be_empty"):
+            with self.assertRaises(ValueError):
+                helper.compile_fast_lane(verification_request, reasoning_effort="ultra")
 
     def test_legacy_decompose_golden_bytes_are_unchanged(self) -> None:
         helper = load_efficiency()
