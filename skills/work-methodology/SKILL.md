@@ -101,6 +101,8 @@ python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --r
 
 host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后（only after a terminal event）refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。路由下限为：
 
+若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。
+
 ```text
 prewarm: gpt-5.6-terra / medium
 routine implementation and ordinary verification: gpt-5.6-terra / high

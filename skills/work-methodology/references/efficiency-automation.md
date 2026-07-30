@@ -242,6 +242,20 @@ receipts/tokens. The host spawns only `action="start"`; it never respawns a
 retained assignment and refills a free slot only after a terminal event. Neither
 the compiler nor the host polls commentary updates or refills from commentary
 (`no commentary polling`).
+
+Where the declared lifecycle orders `host_spawn_exact_route` before
+`workflow_claim_with_host_target`, that spawn is a `parked endpoint bootstrap`,
+not prewarm: it may create an inert route solely to obtain `host_target`. Until
+the claim succeeds, and `workflow_endpoint_bind` succeeds when its declared
+condition applies, the host MUST NOT deliver a task payload or permit that
+worker to read a worktree, run a target gate, write, checkpoint, sync or query
+project state, or emit a receipt, candidate, or terminal result. The first
+execution or verification authorization must bind the claimed task, owner,
+lease epoch, and exact parked `host_target`. A failed, stale, or rejected claim
+leaves the parked worker inert and creates no durable task transition. This is
+a host invariant; it adds no compiler operation. Prewarm remains its separate
+read-only role and is not a name for this bootstrap.
+
 Prewarm is read-only evidence, not acceptance evidence: a later writer may
 reuse it only after current-basis delta revalidation passes.
 
