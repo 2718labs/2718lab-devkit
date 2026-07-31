@@ -1,4 +1,4 @@
-"""Contract tests for the local Code Atlas SQLite/CAS store."""
+"""Contract tests for the local Atlas SQLite/CAS store."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from code_atlas.models import (
+from devkit_atlas.models import (
     AtlasEdge,
     AtlasNode,
     AtlasStatus,
@@ -31,10 +31,10 @@ from code_atlas.models import (
     DependencySpec,
     TestSpec as AtlasTestSpec,
 )
-from code_atlas.canonical import canonical_hash, canonical_json
-from code_atlas import store as store_module
-from code_atlas.store import AtlasStore, StoreConflictError
-from code_atlas.security import (
+from devkit_atlas.canonical import canonical_hash, canonical_json
+from devkit_atlas import store as store_module
+from devkit_atlas.store import AtlasStore, StoreConflictError
+from devkit_atlas.security import (
     MAX_GRAPH_NODES,
     MAX_PACKET_BYTES,
     MAX_RECIPE_BYTES,
@@ -1115,7 +1115,7 @@ def _verified_packet() -> ImplementationPacket:
         source_hashes=(digest,),
         template_hashes=(digest,),
         receipt_hashes=(digest,),
-        next_action="code_atlas_render",
+        next_action="atlas_render",
     )
     payload = provisional.to_dict()
     del payload["packet_id"]
@@ -1206,8 +1206,8 @@ def test_open_readonly_store_uses_a_scratch_snapshot_without_touching_durable_fi
 ) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     scratch = tmp_path / "readonly-scratch"
     scratch.mkdir()
     writable = AtlasStore(database, cas_root)
@@ -1261,8 +1261,8 @@ def test_open_readonly_posix_cleanup_never_deletes_a_snapshot_replaced_before_qu
     scratch = tmp_path / "readonly-scratch"
     durable.mkdir()
     scratch.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     writable = AtlasStore(database, cas_root)
     writable.close()
     expected_snapshot = database.read_bytes()
@@ -1278,11 +1278,9 @@ def test_open_readonly_posix_cleanup_never_deletes_a_snapshot_replaced_before_qu
         new_name: str,
     ) -> None:
         nonlocal raced
-        if not raced and old_name.startswith(".code-atlas-readonly-"):
+        if not raced and old_name.startswith(".atlas-readonly-"):
             raced = True
-            snapshot = next(scratch.glob(".code-atlas-readonly-*")) / (
-                "code-atlas.sqlite3"
-            )
+            snapshot = next(scratch.glob(".atlas-readonly-*")) / ("atlas.sqlite3")
             os.replace(snapshot, parked)
             snapshot.write_bytes(attacker)
         original_rename(old_directory_fd, old_name, new_directory_fd, new_name)
@@ -1296,7 +1294,7 @@ def test_open_readonly_posix_cleanup_never_deletes_a_snapshot_replaced_before_qu
 
     assert raced is True
     assert parked.read_bytes() == expected_snapshot
-    quarantined = tuple(scratch.rglob("code-atlas.sqlite3"))
+    quarantined = tuple(scratch.rglob("atlas.sqlite3"))
     assert len(quarantined) == 1
     assert quarantined[0].read_bytes() == attacker
 
@@ -1307,8 +1305,8 @@ def test_open_readonly_supports_the_two_path_public_api(
 ) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     task_temp = tmp_path / "task-temp"
     task_temp.mkdir()
     monkeypatch.setenv("CODEX_TASK_TEMP", str(task_temp))
@@ -1331,8 +1329,8 @@ def test_open_readonly_two_path_api_rejects_unsafe_or_missing_default_scratch_pa
 ) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     writable = AtlasStore(database, cas_root)
     writable.close()
     before_files = _durable_file_state(durable)
@@ -1356,7 +1354,7 @@ def test_open_readonly_two_path_api_rejects_unsafe_or_missing_default_scratch_pa
         )
         == before_entries
     )
-    assert not tuple(durable.rglob(".code-atlas-readonly-root-*"))
+    assert not tuple(durable.rglob(".atlas-readonly-root-*"))
     assert unsafe_temp != "missing" or not configured_temp.exists()
 
 
@@ -1368,8 +1366,8 @@ def test_open_readonly_default_scratch_never_probes_temp_before_overlap_validati
 
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     writable = AtlasStore(database, cas_root)
     writable.close()
     before_files = _durable_file_state(durable)
@@ -1416,8 +1414,8 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
     parked = tmp_path / "parked-scratch-parent"
     durable.mkdir()
     scratch_parent.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     writable = AtlasStore(database, cas_root)
     writable.close()
     before_files = _durable_file_state(durable)
@@ -1505,14 +1503,14 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
         )
         == before_entries
     )
-    assert not tuple(durable.rglob(".code-atlas-readonly-*"))
+    assert not tuple(durable.rglob(".atlas-readonly-*"))
 
 
 def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     scratch = tmp_path / "readonly-scratch"
     scratch.mkdir()
     writable = AtlasStore(database, cas_root)
@@ -1542,8 +1540,8 @@ def test_open_readonly_fails_closed_when_the_source_database_is_replaced_mid_sna
 ) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     scratch = tmp_path / "readonly-scratch"
     scratch.mkdir()
     writable = AtlasStore(database, cas_root)
@@ -1572,8 +1570,8 @@ def test_open_readonly_fails_closed_when_the_live_wal_is_replaced_mid_snapshot(
 ) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     scratch = tmp_path / "readonly-scratch"
     scratch.mkdir()
     writable = AtlasStore(database, cas_root)
@@ -1604,8 +1602,8 @@ def test_open_readonly_rejects_a_scratch_root_that_overlaps_durable_data(
 ) -> None:
     durable = tmp_path / "durable"
     durable.mkdir()
-    database = durable / "code-atlas.sqlite3"
-    cas_root = durable / "code-atlas-cas"
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
     writable = AtlasStore(database, cas_root)
     writable.close()
     before = _durable_file_state(durable)

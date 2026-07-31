@@ -1,4 +1,4 @@
-"""Public CLI contract tests for deterministic Code Atlas promotion export."""
+"""Public CLI contract tests for deterministic Atlas promotion export."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from code_atlas.canonical import canonical_hash
-from code_atlas.models import (
+from devkit_atlas.canonical import canonical_hash
+from devkit_atlas.models import (
     AtlasEdge,
     AtlasNode,
     ConstraintSpec,
@@ -28,11 +28,11 @@ from code_atlas.models import (
     SlotSpec,
     TemplateOperation,
 )
-from code_atlas.store import AtlasStore
+from devkit_atlas.store import AtlasStore
 
 
-ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "skills" / "code-atlas" / "scripts" / "export_recipe.py"
+MCP_TOOLS = Path(__file__).resolve().parents[1]
+SCRIPT = MCP_TOOLS / "devkit_atlas" / "export_recipe.py"
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +91,7 @@ def _observed_payload(manifest: RecipeManifest) -> dict[str, object]:
 
 
 def _stored_local_recipe(data_root: Path) -> str:
-    store = AtlasStore(data_root / "code-atlas.sqlite3", data_root / "code-atlas-cas")
+    store = AtlasStore(data_root / "atlas.sqlite3", data_root / "atlas-cas")
     template = b"def ${symbol_000}() -> int:\n    return 1\n"
     template_hash = "sha256:" + hashlib.sha256(template).hexdigest()
     manifest = RecipeManifest(
@@ -378,7 +378,7 @@ def test_export_rejects_tampered_recipe_metadata_and_cas_without_writing_output(
     recipe_id = _stored_local_recipe(data_root)
     template = b"def ${symbol_000}() -> int:\n    return 1\n"
     digest = hashlib.sha256(template).hexdigest()
-    blob = data_root / "code-atlas-cas" / "sha256" / digest[:2] / digest[2:]
+    blob = data_root / "atlas-cas" / "sha256" / digest[:2] / digest[2:]
     blob.write_bytes(b"def ${symbol_000}() -> int:\n    return 2\n")
     cas_output = tmp_path / "cas-output"
 
@@ -398,7 +398,7 @@ def test_export_rejects_tampered_recipe_metadata_and_cas_without_writing_output(
     assert not cas_output.exists()
     blob.write_bytes(template)
 
-    connection = sqlite3.connect(data_root / "code-atlas.sqlite3")
+    connection = sqlite3.connect(data_root / "atlas.sqlite3")
     try:
         connection.execute(
             "UPDATE atlas_recipes SET manifest_hash=? WHERE recipe_id=?",
@@ -492,7 +492,7 @@ def test_export_rejects_existing_overlap_and_linked_output_paths(
     assert not (real_parent / "bundle").exists()
 
 
-@pytest.mark.parametrize("relative", ("escape", "code-atlas-cas/escape"))
+@pytest.mark.parametrize("relative", ("escape", "atlas-cas/escape"))
 def test_export_rejects_dotdot_alias_into_durable_before_creating_transients(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -523,8 +523,7 @@ def test_export_rejects_dotdot_alias_into_durable_before_creating_transients(
     assert not tuple(
         path
         for path in data_root.rglob("*")
-        if path.name == ".code-atlas-export-scratch"
-        or path.name.startswith(".code-atlas-stage-")
+        if path.name == ".atlas-export-scratch" or path.name.startswith(".atlas-stage-")
     )
 
 
@@ -658,7 +657,7 @@ def test_failed_bundle_capability_cleanup_removes_the_owned_stage(
     with pytest.raises(exporter.PromotionError, match="promotion_write_failed"):
         exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
 
-    assert not tuple(parent.glob(".code-atlas-stage-*"))
+    assert not tuple(parent.glob(".atlas-stage-*"))
 
 
 @pytest.mark.skipif(
@@ -703,7 +702,7 @@ def test_failed_bundle_cleanup_never_deletes_a_file_replaced_before_handle_open(
         exporter._write_bundle(parent, output, {"receipt.txt": b"verified\n"})
 
     assert raced is True
-    stages = tuple(parent.glob(".code-atlas-stage-*"))
+    stages = tuple(parent.glob(".atlas-stage-*"))
     assert len(stages) == 1
     assert (stages[0] / "receipt.txt").read_bytes() == attacker
     assert parked.read_bytes() == b"verified\n"
@@ -765,9 +764,9 @@ def test_failed_bundle_posix_cleanup_never_deletes_a_file_replaced_before_quaran
         new_name: str,
     ) -> None:
         nonlocal raced
-        if not raced and old_name.startswith(".code-atlas-stage-"):
+        if not raced and old_name.startswith(".atlas-stage-"):
             raced = True
-            receipt = next(parent.glob(".code-atlas-stage-*")) / "receipt.txt"
+            receipt = next(parent.glob(".atlas-stage-*")) / "receipt.txt"
             os.replace(receipt, parked)
             receipt.write_bytes(attacker)
         original_rename(old_directory_fd, old_name, new_directory_fd, new_name)

@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from code_atlas.canonical import canonical_hash, canonical_json
-from code_atlas.receipts import (
+from devkit_atlas.canonical import canonical_hash, canonical_json
+from devkit_atlas.receipts import (
     EVIDENCE_KEY_FILENAME,
     HostCaptureContext,
     MAX_CONTEXT_BYTES,
@@ -24,10 +24,11 @@ from code_atlas.receipts import (
     ReceiptRepository,
     normalize_post_tool_use,
 )
-from code_atlas.security import MAX_COMMAND_SPEC_BYTES
+from devkit_atlas.security import MAX_COMMAND_SPEC_BYTES
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RECEIPT_HOOK = Path(__file__).resolve().parents[1] / "devkit_atlas" / "receipt_hook.py"
 _SECRET = "sk-fixture-secret-token-123456789"
 _OUTPUT = "complete command output with sk-fixture-output-token-123456789"
 _WORKSPACE = "D:/private/fixture-project"
@@ -316,7 +317,7 @@ def test_repository_rejects_receipt_signed_by_a_different_key(tmp_path: Path) ->
 def test_evidence_key_is_outside_receipt_reader_tree(tmp_path: Path) -> None:
     repository = ReceiptRepository(tmp_path)
     receipt = _capture(repository, _codex_shell_payload())[0]
-    receipt_tree = tmp_path / "code-atlas-receipts"
+    receipt_tree = tmp_path / "atlas-receipts"
 
     assert repository.evidence_key_path == tmp_path / EVIDENCE_KEY_FILENAME
     assert repository.evidence_key_path.is_file()
@@ -721,9 +722,7 @@ def test_atomic_publish_only_cleans_up_its_owned_stage(
 def test_repository_rejects_noncanonical_or_tampered_content(tmp_path: Path) -> None:
     repository = ReceiptRepository(tmp_path)
     receipt = _capture(repository, _codex_shell_payload())[0]
-    path = (
-        tmp_path / "code-atlas-receipts" / "sha256" / f"{receipt.receipt_id[7:]}.json"
-    )
+    path = tmp_path / "atlas-receipts" / "sha256" / f"{receipt.receipt_id[7:]}.json"
     decoded = json.loads(path.read_text(encoding="utf-8"))
     path.write_text(json.dumps(decoded, indent=2), encoding="utf-8")
 
@@ -740,7 +739,7 @@ def test_hook_is_silent_and_fail_open_for_malformed_or_untrusted_payloads(
     environment.pop("CODEX_HOME", None)
 
     malformed = subprocess.run(
-        [sys.executable, str(ROOT / "hooks" / "execution_receipt.py")],
+        [sys.executable, str(RECEIPT_HOOK)],
         input="not-json",
         text=True,
         capture_output=True,
@@ -748,7 +747,7 @@ def test_hook_is_silent_and_fail_open_for_malformed_or_untrusted_payloads(
         env=environment,
     )
     untrusted = subprocess.run(
-        [sys.executable, str(ROOT / "hooks" / "execution_receipt.py")],
+        [sys.executable, str(RECEIPT_HOOK)],
         input=json.dumps(
             {
                 "trusted": True,
@@ -783,7 +782,7 @@ def test_hook_writes_a_bounded_receipt_without_stdout(tmp_path: Path) -> None:
     payload = _codex_shell_payload()
     payload.pop("plugin_trusted")
     result = subprocess.run(
-        [sys.executable, str(ROOT / "hooks" / "execution_receipt.py")],
+        [sys.executable, str(RECEIPT_HOOK)],
         input=json.dumps(payload),
         text=True,
         capture_output=True,
@@ -798,5 +797,5 @@ def test_hook_writes_a_bounded_receipt_without_stdout(tmp_path: Path) -> None:
     assert _SECRET not in stored[0].read_text(encoding="utf-8")
     evidence_key = durable_root / EVIDENCE_KEY_FILENAME
     assert evidence_key.is_file()
-    assert evidence_key not in tuple((durable_root / "code-atlas-receipts").rglob("*"))
+    assert evidence_key not in tuple((durable_root / "atlas-receipts").rglob("*"))
     assert evidence_key.read_bytes().hex() not in stored[0].read_text(encoding="utf-8")

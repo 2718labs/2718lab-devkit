@@ -1,4 +1,4 @@
-"""Focused contract tests for the offline Code Atlas host router."""
+"""Focused contract tests for the offline Atlas host router."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from code_atlas.routing import RoutingStatus, resolve_role
+from devkit_atlas.routing import RoutingStatus, resolve_role
 
 
 def _codex_capabilities() -> dict[str, object]:

@@ -235,14 +235,14 @@ def _snapshot_source_state(
     )
 
 
-_READONLY_ROOT_PREFIX = ".code-atlas-readonly-root-"
-_READONLY_STAGE_PREFIX = ".code-atlas-readonly-"
-_READONLY_QUARANTINE_PREFIX = ".code-atlas-readonly-quarantine-"
+_READONLY_ROOT_PREFIX = ".atlas-readonly-root-"
+_READONLY_STAGE_PREFIX = ".atlas-readonly-"
+_READONLY_QUARANTINE_PREFIX = ".atlas-readonly-quarantine-"
 _SQLITE_SNAPSHOT_FILENAMES = (
-    "code-atlas.sqlite3",
-    "code-atlas.sqlite3-journal",
-    "code-atlas.sqlite3-shm",
-    "code-atlas.sqlite3-wal",
+    "atlas.sqlite3",
+    "atlas.sqlite3-journal",
+    "atlas.sqlite3-shm",
+    "atlas.sqlite3-wal",
 )
 
 
@@ -1482,14 +1482,12 @@ class AtlasStore:
             stage = _create_readonly_directory(
                 lease, _READONLY_STAGE_PREFIX, owned_scratch=False
             )
-            snapshot_database = stage / "code-atlas.sqlite3"
-            _copy_snapshot_file(
-                database, _SnapshotDestination(lease, "code-atlas.sqlite3")
-            )
+            snapshot_database = stage / "atlas.sqlite3"
+            _copy_snapshot_file(database, _SnapshotDestination(lease, "atlas.sqlite3"))
             if source_state[1] is not None:
                 _copy_snapshot_file(
                     Path(str(database) + "-wal"),
-                    _SnapshotDestination(lease, "code-atlas.sqlite3-wal"),
+                    _SnapshotDestination(lease, "atlas.sqlite3-wal"),
                 )
             if _snapshot_source_state(database) != source_state:
                 raise StoreConflictError()

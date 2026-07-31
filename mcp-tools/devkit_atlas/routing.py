@@ -1,4 +1,4 @@
-"""Deterministic, offline host-routing policy for Code Atlas.
+"""Deterministic, offline host-routing policy for Atlas.
 
 The resolver is deliberately not a dispatcher.  It reads only an explicit,
 host-reported capability record and returns a policy decision; it cannot spawn
@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from . import ASSET_ROOT
 
 
 class RoutingStatus(str, Enum):
@@ -75,8 +77,7 @@ class RoutingResult:
         }
 
 
-_ROOT = Path(__file__).resolve().parents[2]
-_PROFILE_PATH = _ROOT / "skills" / "code-atlas" / "assets" / "host-profiles.json"
+_PROFILE_PATH = ASSET_ROOT / "host-profiles.json"
 _REQUEST_FIELDS = frozenset(
     {
         "host",

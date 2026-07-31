@@ -21,7 +21,10 @@ class FrozenArray(tuple[FrozenJson, ...]):
 
 
 def _pairs_are_object(value: tuple[Any, ...]) -> bool:
-    return all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value)
+    return all(
+        isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+        for item in value
+    )
 
 
 def freeze_json(value: Any) -> FrozenJson:
@@ -31,9 +34,19 @@ def freeze_json(value: Any) -> FrozenJson:
     if isinstance(value, FrozenArray):
         return FrozenArray(freeze_json(item) for item in value)
     if isinstance(value, Mapping):
-        return FrozenObject(sorted(((str(key), freeze_json(item)) for key, item in value.items()), key=lambda item: item[0]))
+        return FrozenObject(
+            sorted(
+                ((str(key), freeze_json(item)) for key, item in value.items()),
+                key=lambda item: item[0],
+            )
+        )
     if isinstance(value, tuple) and _pairs_are_object(value):
-        return FrozenObject(sorted(((key, freeze_json(item)) for key, item in value), key=lambda item: item[0]))
+        return FrozenObject(
+            sorted(
+                ((key, freeze_json(item)) for key, item in value),
+                key=lambda item: item[0],
+            )
+        )
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return FrozenArray(freeze_json(item) for item in value)
     return value
@@ -80,15 +93,17 @@ def canonical_id(
     source_hashes: tuple[str, ...] | list[str] = (),
 ) -> str:
     """Hash exactly the immutable node identity fields."""
-    return canonical_hash({
-        "kind": kind,
-        "schema_version": schema_version,
-        "extractor_id": extractor_id,
-        "extractor_version": extractor_version,
-        "provenance": provenance,
-        "payload": payload,
-        "source_hashes": list(source_hashes),
-    })
+    return canonical_hash(
+        {
+            "kind": kind,
+            "schema_version": schema_version,
+            "extractor_id": extractor_id,
+            "extractor_version": extractor_version,
+            "provenance": provenance,
+            "payload": payload,
+            "source_hashes": list(source_hashes),
+        }
+    )
 
 
 _INTENT_SEPARATORS = re.compile(r"[^a-z0-9.]+")

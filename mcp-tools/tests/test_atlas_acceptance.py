@@ -18,7 +18,7 @@ MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
-from code_atlas.receipts import (  # noqa: E402
+from devkit_atlas.receipts import (  # noqa: E402
     HostCaptureContext,
     RawExecutionReceipt,
     ReceiptRepository,
@@ -64,7 +64,7 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
     def setUp(self) -> None:
         self._receipt_read_patcher = None
         self.addCleanup(self._stop_receipt_read_patch)
-        scratch = task_scratch("code-atlas-acceptance")
+        scratch = task_scratch("atlas-acceptance")
         self._temporary_directory = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self._temporary_directory.cleanup)
         self.root = Path(self._temporary_directory.name)

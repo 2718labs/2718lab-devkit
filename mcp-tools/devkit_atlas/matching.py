@@ -1,4 +1,4 @@
-"""Pure deterministic Code Atlas recipe matching."""
+"""Pure deterministic Atlas recipe matching."""
 
 from __future__ import annotations
 

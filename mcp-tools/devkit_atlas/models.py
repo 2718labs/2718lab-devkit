@@ -1,4 +1,4 @@
-"""Frozen public data contracts for Code Atlas."""
+"""Frozen public data contracts for Atlas."""
 
 from __future__ import annotations
 
@@ -64,9 +64,14 @@ def _serialize(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value):
-        return {item.name: _serialize(getattr(value, item.name)) for item in fields(value)}
+        return {
+            item.name: _serialize(getattr(value, item.name)) for item in fields(value)
+        }
     if isinstance(value, tuple):
-        if all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value):
+        if all(
+            isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+            for item in value
+        ):
             return thaw_json(value)
         return [_serialize(item) for item in value]
     return thaw_json(value)
@@ -75,7 +80,9 @@ def _serialize(value: Any) -> Any:
 class _Record:
     def to_dict(self) -> dict[str, Any]:
         """Serialize the public record using ordinary JSON containers."""
-        return {item.name: _serialize(getattr(self, item.name)) for item in fields(self)}
+        return {
+            item.name: _serialize(getattr(self, item.name)) for item in fields(self)
+        }
 
 
 _PROVENANCE_VALUES = frozenset({"observed", "resolved", "declared"})
@@ -122,29 +129,73 @@ class AtlasNode(_Record):
         quarantine_state: str | None = None,
     ) -> "AtlasNode":
         return cls(
-            node_id=canonical_id(kind.value, payload, schema_version=schema_version,
-                                 extractor_id=extractor_id, extractor_version=extractor_version,
-                                 provenance=provenance, source_hashes=source_hashes), kind=kind, payload=payload,
-            schema_version=schema_version, extractor_id=extractor_id,
+            node_id=canonical_id(
+                kind.value,
+                payload,
+                schema_version=schema_version,
+                extractor_id=extractor_id,
+                extractor_version=extractor_version,
+                provenance=provenance,
+                source_hashes=source_hashes,
+            ),
+            kind=kind,
+            payload=payload,
+            schema_version=schema_version,
+            extractor_id=extractor_id,
             extractor_version=extractor_version,
             provenance=provenance,
-            source_hashes=tuple(source_hashes), created_at=created_at,
-            superseded_at=superseded_at, quarantine_state=quarantine_state,
+            source_hashes=tuple(source_hashes),
+            created_at=created_at,
+            superseded_at=superseded_at,
+            quarantine_state=quarantine_state,
         )
 
 
 _ENDPOINTS: dict[EdgeRelation, tuple[frozenset[NodeKind], frozenset[NodeKind]]] = {
-    EdgeRelation.SOLVES: (frozenset({NodeKind.TASK_EPISODE, NodeKind.RECIPE}), frozenset({NodeKind.INTENT})),
-    EdgeRelation.DERIVED_FROM: (frozenset({NodeKind.RECIPE}), frozenset({NodeKind.TASK_EPISODE, NodeKind.SOURCE_EVIDENCE})),
-    EdgeRelation.HAS_IMPLEMENTATION: (frozenset({NodeKind.RECIPE}), frozenset({NodeKind.CODE_TEMPLATE})),
-    EdgeRelation.HAS_SLOT: (frozenset({NodeKind.RECIPE}), frozenset({NodeKind.ADAPTATION_SLOT})),
-    EdgeRelation.CONSTRAINED_BY: (frozenset({NodeKind.RECIPE}), frozenset({NodeKind.CONSTRAINT})),
-    EdgeRelation.REQUIRES: (frozenset({NodeKind.RECIPE}), frozenset({NodeKind.DEPENDENCY, NodeKind.FRAMEWORK, NodeKind.LANGUAGE})),
-    EdgeRelation.VERIFIED_BY: (frozenset({NodeKind.TASK_EPISODE, NodeKind.RECIPE}), frozenset({NodeKind.TEST_SPEC, NodeKind.EXECUTION_RECEIPT})),
-    EdgeRelation.CHANGES: (frozenset({NodeKind.TASK_EPISODE}), frozenset({NodeKind.SOURCE_EVIDENCE})),
-    EdgeRelation.TESTS: (frozenset({NodeKind.TEST_SPEC, NodeKind.SOURCE_EVIDENCE}), frozenset({NodeKind.SOURCE_EVIDENCE})),
-    EdgeRelation.SUPERSEDES: (frozenset({NodeKind.RECIPE}), frozenset({NodeKind.RECIPE})),
-    EdgeRelation.BUNDLED_AS: (frozenset({NodeKind.RECIPE}), frozenset({NodeKind.SOURCE_EVIDENCE})),
+    EdgeRelation.SOLVES: (
+        frozenset({NodeKind.TASK_EPISODE, NodeKind.RECIPE}),
+        frozenset({NodeKind.INTENT}),
+    ),
+    EdgeRelation.DERIVED_FROM: (
+        frozenset({NodeKind.RECIPE}),
+        frozenset({NodeKind.TASK_EPISODE, NodeKind.SOURCE_EVIDENCE}),
+    ),
+    EdgeRelation.HAS_IMPLEMENTATION: (
+        frozenset({NodeKind.RECIPE}),
+        frozenset({NodeKind.CODE_TEMPLATE}),
+    ),
+    EdgeRelation.HAS_SLOT: (
+        frozenset({NodeKind.RECIPE}),
+        frozenset({NodeKind.ADAPTATION_SLOT}),
+    ),
+    EdgeRelation.CONSTRAINED_BY: (
+        frozenset({NodeKind.RECIPE}),
+        frozenset({NodeKind.CONSTRAINT}),
+    ),
+    EdgeRelation.REQUIRES: (
+        frozenset({NodeKind.RECIPE}),
+        frozenset({NodeKind.DEPENDENCY, NodeKind.FRAMEWORK, NodeKind.LANGUAGE}),
+    ),
+    EdgeRelation.VERIFIED_BY: (
+        frozenset({NodeKind.TASK_EPISODE, NodeKind.RECIPE}),
+        frozenset({NodeKind.TEST_SPEC, NodeKind.EXECUTION_RECEIPT}),
+    ),
+    EdgeRelation.CHANGES: (
+        frozenset({NodeKind.TASK_EPISODE}),
+        frozenset({NodeKind.SOURCE_EVIDENCE}),
+    ),
+    EdgeRelation.TESTS: (
+        frozenset({NodeKind.TEST_SPEC, NodeKind.SOURCE_EVIDENCE}),
+        frozenset({NodeKind.SOURCE_EVIDENCE}),
+    ),
+    EdgeRelation.SUPERSEDES: (
+        frozenset({NodeKind.RECIPE}),
+        frozenset({NodeKind.RECIPE}),
+    ),
+    EdgeRelation.BUNDLED_AS: (
+        frozenset({NodeKind.RECIPE}),
+        frozenset({NodeKind.SOURCE_EVIDENCE}),
+    ),
 }
 
 
@@ -167,22 +218,38 @@ class AtlasEdge(_Record):
 
     @classmethod
     def create(
-        cls, relation: EdgeRelation, source: AtlasNode, target: AtlasNode, *, payload: Any = None,
-        schema_version: str = "1", provenance: str = "declared", created_at: str | None = None,
+        cls,
+        relation: EdgeRelation,
+        source: AtlasNode,
+        target: AtlasNode,
+        *,
+        payload: Any = None,
+        schema_version: str = "1",
+        provenance: str = "declared",
+        created_at: str | None = None,
     ) -> "AtlasEdge":
         allowed_source, allowed_target = _ENDPOINTS[relation]
         if source.kind not in allowed_source or target.kind not in allowed_target:
             raise AtlasError("invalid_edge_endpoints", "invalid edge endpoints")
         identity = {
-            "relation": relation.value, "source_id": source.node_id, "target_id": target.node_id,
-            "schema_version": schema_version, "provenance": provenance,
+            "relation": relation.value,
+            "source_id": source.node_id,
+            "target_id": target.node_id,
+            "schema_version": schema_version,
+            "provenance": provenance,
             "payload": {} if payload is None else payload,
         }
         return cls(
-            edge_id=canonical_hash(identity), relation=relation, source_id=source.node_id,
-            target_id=target.node_id, source_kind=source.kind, target_kind=target.kind,
-            payload={} if payload is None else payload, schema_version=schema_version,
-            provenance=provenance, created_at=created_at,
+            edge_id=canonical_hash(identity),
+            relation=relation,
+            source_id=source.node_id,
+            target_id=target.node_id,
+            source_kind=source.kind,
+            target_kind=target.kind,
+            payload={} if payload is None else payload,
+            schema_version=schema_version,
+            provenance=provenance,
+            created_at=created_at,
         )
 
 
@@ -255,7 +322,14 @@ class RecipeManifest(_Record):
     def __post_init__(self) -> None:
         if isinstance(self.version, bool) or not isinstance(self.version, int):
             raise AtlasError("invalid_version", "invalid version")
-        for name in ("slots", "constraints", "dependencies", "tests", "operations", "superseded_ids"):
+        for name in (
+            "slots",
+            "constraints",
+            "dependencies",
+            "tests",
+            "operations",
+            "superseded_ids",
+        ):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
 
@@ -293,8 +367,25 @@ class ImplementationPacket(_Record):
     next_action: str = ""
 
     def __post_init__(self) -> None:
-        for name in ("node_ids", "edge_ids", "evidence_windows", "evidence_hashes", "operations", "slots", "constraints", "dependencies", "tests", "gaps", "source_hashes", "template_hashes", "receipt_hashes"):
-            value = tuple(freeze_json(item) if name == "evidence_windows" else item for item in getattr(self, name))
+        for name in (
+            "node_ids",
+            "edge_ids",
+            "evidence_windows",
+            "evidence_hashes",
+            "operations",
+            "slots",
+            "constraints",
+            "dependencies",
+            "tests",
+            "gaps",
+            "source_hashes",
+            "template_hashes",
+            "receipt_hashes",
+        ):
+            value = tuple(
+                freeze_json(item) if name == "evidence_windows" else item
+                for item in getattr(self, name)
+            )
             object.__setattr__(self, name, value)
 
 
@@ -306,7 +397,9 @@ class PreparationResult(_Record):
     reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "candidate_recipe_ids", tuple(self.candidate_recipe_ids))
+        object.__setattr__(
+            self, "candidate_recipe_ids", tuple(self.candidate_recipe_ids)
+        )
         object.__setattr__(self, "reasons", tuple(self.reasons))
 
 
@@ -344,7 +437,9 @@ class ExtractionResult(_Record):
     episode_id: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "original_bindings", freeze_json(self.original_bindings))
+        object.__setattr__(
+            self, "original_bindings", freeze_json(self.original_bindings)
+        )
         for name in ("gaps", "nodes", "edges", "blobs"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 

@@ -1,4 +1,4 @@
-"""Strict, deterministic loading for bundled Code Atlas recipe assets."""
+"""Strict, deterministic loading for bundled Atlas recipe assets."""
 
 from __future__ import annotations
 

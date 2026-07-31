@@ -1,4 +1,4 @@
-"""Red-first contracts for deterministic accepted-code Atlas projection."""
+"""Red-first contracts for deterministic accepted-task Atlas projection."""
 
 from __future__ import annotations
 
@@ -11,23 +11,23 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from code_atlas.canonical import canonical_hash, canonical_json
-from code_atlas.extractors import BoundExecutionReceipt, ExtractionRequest
-from code_atlas.models import AtlasError, AtlasStatus, EdgeRelation
-from code_atlas.recipes import BundledRecipeLoader
-from code_atlas.service import (
-    AcceptedCodeProjectionEvidence,
-    AcceptedCodeProjectionRequest,
-    CodeAtlasService,
+from devkit_atlas import ASSET_ROOT
+from devkit_atlas.canonical import canonical_hash, canonical_json
+from devkit_atlas.extractors import BoundExecutionReceipt, ExtractionRequest
+from devkit_atlas.models import AtlasError, AtlasStatus, EdgeRelation
+from devkit_atlas.recipes import BundledRecipeLoader
+from devkit_atlas.service import (
+    AcceptedAtlasProjectionEvidence,
+    AcceptedAtlasProjectionRequest,
+    AtlasService,
 )
-from code_atlas.store import AtlasStore, StoreConflictError
+from devkit_atlas.store import AtlasStore, StoreConflictError
 from project_index.checkpoints import CheckpointFile
 from project_index.models import SnapshotFile
 from project_index.service import ProjectIndexService
 
 
-ROOT = Path(__file__).resolve().parents[2]
-ASSETS = ROOT / "skills" / "code-atlas" / "assets"
+ASSETS = ASSET_ROOT
 _GOLDEN_BINDING_HASH = (
     "sha256:571cd221acb42b2b73630e2c1c28ba0abefbe838d9e59019c2e55d294c74f208"
 )
@@ -58,8 +58,8 @@ def _request(
     intent_id: str = "python.acceptance-projection",
     language: str = "python",
     code_task_id: str = "task-1",
-) -> AcceptedCodeProjectionRequest:
-    return AcceptedCodeProjectionRequest.create(
+) -> AcceptedAtlasProjectionRequest:
+    return AcceptedAtlasProjectionRequest.create(
         workflow_id="workflow-1",
         code_task_id=code_task_id,
         code_task_version=3,
@@ -104,7 +104,7 @@ def test_evidence_binding_matches_the_frozen_10d_golden_vector() -> None:
         "verification_artifact_hashes": list(artifact_hashes),
         "workflow_id": "workflow",
     }
-    request = AcceptedCodeProjectionRequest.create(
+    request = AcceptedAtlasProjectionRequest.create(
         workflow_id="workflow",
         code_task_id="code-task",
         code_task_version=3,
@@ -149,11 +149,11 @@ def _binding_hash(
 
 
 def _evidence(
-    request: AcceptedCodeProjectionRequest,
+    request: AcceptedAtlasProjectionRequest,
     *,
     after_path: str = "src/created.py",
     after_body: bytes = b"def created() -> int:\n    return 1\n",
-) -> AcceptedCodeProjectionEvidence:
+) -> AcceptedAtlasProjectionEvidence:
     after = (SnapshotFile(after_path, _hash(after_body), after_body),)
     raw = ExtractionRequest(
         workflow_id=request.workflow_id,
@@ -229,7 +229,7 @@ def _evidence(
     receipts = tuple(
         receipts_by_id[receipt_id] for receipt_id in request.execution_receipt_ids
     )
-    return AcceptedCodeProjectionEvidence(
+    return AcceptedAtlasProjectionEvidence(
         code_task_version=request.code_task_version,
         language=request.language,
         framework=request.framework,
@@ -242,13 +242,13 @@ def _evidence(
 
 
 class _Reader:
-    def __init__(self, evidence: AcceptedCodeProjectionEvidence) -> None:
+    def __init__(self, evidence: AcceptedAtlasProjectionEvidence) -> None:
         self.evidence = evidence
         self.calls = 0
 
     def read(
-        self, request: AcceptedCodeProjectionRequest
-    ) -> AcceptedCodeProjectionEvidence:
+        self, request: AcceptedAtlasProjectionRequest
+    ) -> AcceptedAtlasProjectionEvidence:
         self.calls += 1
         return self.evidence
 
@@ -256,10 +256,10 @@ class _Reader:
 def _service_at(
     tmp_path: Path,
     reader: _Reader | None,
-) -> tuple[CodeAtlasService, AtlasStore, ProjectIndexService]:
+) -> tuple[AtlasService, AtlasStore, ProjectIndexService]:
     store = AtlasStore(tmp_path / "atlas.sqlite", tmp_path / "cas")
     index = ProjectIndexService(tmp_path / "project-index.sqlite")
-    service = CodeAtlasService(
+    service = AtlasService(
         store,
         BundledRecipeLoader(ASSETS),
         index,
@@ -424,7 +424,7 @@ def test_project_acceptance_conflicts_for_same_key_and_changed_payload(
 
     with pytest.raises(StoreConflictError, match="ingestion receipt"):
         service.project_acceptance(changed)
-    changed_binding = AcceptedCodeProjectionRequest.create(
+    changed_binding = AcceptedAtlasProjectionRequest.create(
         workflow_id=request.workflow_id,
         code_task_id=request.code_task_id,
         code_task_version=request.code_task_version,
@@ -485,7 +485,7 @@ def test_project_acceptance_rejects_untrusted_request_or_evidence(
         tmp_path / "unavailable.sqlite", tmp_path / "unavailable-cas"
     )
     unavailable_index = ProjectIndexService(tmp_path / "unavailable-index.sqlite")
-    unavailable = CodeAtlasService(
+    unavailable = AtlasService(
         unavailable_store,
         BundledRecipeLoader(ASSETS),
         unavailable_index,

@@ -31,7 +31,7 @@ MAX_OBSERVED_AT_BYTES = 64
 MAX_NESTED_RECEIPT_DEPTH = 4
 MAX_RECEIPTS_PER_PAYLOAD = 32
 EVIDENCE_KEY_BYTES = 32
-EVIDENCE_KEY_FILENAME = "code-atlas-evidence.key"
+EVIDENCE_KEY_FILENAME = "atlas-evidence.key"
 
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOOL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -376,7 +376,7 @@ class ReceiptRepository:
     def receipt_root(self) -> Path:
         """Return the durable receipt reader tree."""
 
-        return self.data_root / "code-atlas-receipts" / "sha256"
+        return self.data_root / "atlas-receipts" / "sha256"
 
     @property
     def evidence_key_path(self) -> Path:
@@ -957,7 +957,7 @@ def _keyed_hash(evidence_key: bytes, domain: str, value: object) -> str:
         raise ReceiptIntegrityError("evidence_key_invalid")
     message = canonical_json(
         {
-            "domain": f"code-atlas-execution-receipt/{domain}/v1",
+            "domain": f"atlas-execution-receipt/{domain}/v1",
             "value": value,
         }
     ).encode("utf-8")

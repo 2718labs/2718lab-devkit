@@ -1,4 +1,4 @@
-"""Pure, deterministic in-memory rendering for verified Code Atlas recipes."""
+"""Pure, deterministic in-memory rendering for verified Atlas recipes."""
 
 from __future__ import annotations
 

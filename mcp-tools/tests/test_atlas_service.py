@@ -1,4 +1,4 @@
-"""Contract tests for deterministic Code Atlas matching and preparation."""
+"""Contract tests for deterministic Atlas matching and preparation."""
 
 from __future__ import annotations
 
@@ -11,13 +11,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from code_atlas.canonical import canonical_hash, canonical_json
-from code_atlas.matching import (
+from devkit_atlas import ASSET_ROOT
+from devkit_atlas.canonical import canonical_hash, canonical_json
+from devkit_atlas.matching import (
     MatchClass,
     select_recipe,
     structural_repository_signature,
 )
-from code_atlas.models import (
+from devkit_atlas.models import (
     AtlasEdge,
     AtlasError,
     AtlasNode,
@@ -30,20 +31,20 @@ from code_atlas.models import (
     TemplateOperation,
     TestSpec as AtlasTestSpec,
 )
-from code_atlas.recipes import BundledRecipeLoader
-from code_atlas.rendering import render_patch, validate_bindings
-from code_atlas.security import (
+from devkit_atlas.recipes import BundledRecipeLoader
+from devkit_atlas.rendering import render_patch, validate_bindings
+from devkit_atlas.security import (
     MAX_CHANGED_FILES,
     MAX_COMMAND_SPEC_BYTES,
     MAX_GRAPH_EDGES,
     MAX_GRAPH_NODES,
     MAX_PACKET_BYTES,
 )
-from code_atlas.service import (
-    CodeAtlasService,
+from devkit_atlas.service import (
+    AtlasService,
     _placeholder_names as _local_placeholder_names,
 )
-from code_atlas.store import AtlasStore
+from devkit_atlas.store import AtlasStore
 from project_index.models import (
     CoverageGap,
     IndexError,
@@ -56,7 +57,7 @@ from project_index.service import ProjectIndexService
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ASSETS = ROOT / "skills" / "code-atlas" / "assets"
+ASSETS = ASSET_ROOT
 
 
 def _node(
@@ -670,7 +671,7 @@ class AtlasEnvironment:
     database: Path
     store: AtlasStore
     index: ProjectIndexService
-    service: CodeAtlasService
+    service: AtlasService
 
 
 @pytest.fixture
@@ -689,7 +690,7 @@ def atlas_environment(tmp_path: Path):
     database = tmp_path / "atlas.sqlite3"
     store = AtlasStore(database, tmp_path / "atlas-cas")
     index = ProjectIndexService(tmp_path / "index.sqlite3")
-    service = CodeAtlasService(store, BundledRecipeLoader(ASSETS), index)
+    service = AtlasService(store, BundledRecipeLoader(ASSETS), index)
     environment = AtlasEnvironment(root, database, store, index, service)
     try:
         yield environment
@@ -783,7 +784,7 @@ def test_prepare_builds_idempotent_safe_packet_and_reopens(
     assert first == second
     assert first.packet.packet_id == second.packet.packet_id
     assert atlas_environment.store.get_packet(first.packet.packet_id) == first.packet
-    assert first.packet.next_action == "code_atlas_render"
+    assert first.packet.next_action == "atlas_render"
     assert first.packet.evidence_windows
     assert all("text" not in dict(item) for item in first.packet.evidence_windows)
     assert first.packet.receipt_hashes
@@ -1942,7 +1943,7 @@ def test_prepare_packet_budget_query_truncation_and_secret_redaction(
     assert truncated.packet is None
 
     service_source = (
-        (ROOT / "mcp-tools" / "code_atlas" / "service.py")
+        (ROOT / "mcp-tools" / "devkit_atlas" / "service.py")
         .read_text(encoding="utf-8")
         .casefold()
     )

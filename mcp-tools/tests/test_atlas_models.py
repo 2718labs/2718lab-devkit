@@ -1,4 +1,4 @@
-"""Contract tests for the Code Atlas deterministic model boundary."""
+"""Contract tests for the Atlas deterministic model boundary."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from code_atlas import (
+from devkit_atlas import (
     AtlasEdge,
     AtlasError,
     AtlasNode,
@@ -50,17 +50,44 @@ def test_node_id_excludes_mutable_metadata_when_replaced() -> None:
 
 def test_enums_match_locked_contract_values() -> None:
     assert [item.value for item in NodeKind] == [
-        "TaskEpisode", "Intent", "Recipe", "CodeTemplate", "AdaptationSlot", "Constraint",
-        "Dependency", "TestSpec", "ExecutionReceipt", "SourceEvidence", "Language", "Framework",
+        "TaskEpisode",
+        "Intent",
+        "Recipe",
+        "CodeTemplate",
+        "AdaptationSlot",
+        "Constraint",
+        "Dependency",
+        "TestSpec",
+        "ExecutionReceipt",
+        "SourceEvidence",
+        "Language",
+        "Framework",
     ]
     assert [item.value for item in EdgeRelation] == [
-        "SOLVES", "DERIVED_FROM", "HAS_IMPLEMENTATION", "HAS_SLOT", "CONSTRAINED_BY", "REQUIRES",
-        "VERIFIED_BY", "CHANGES", "TESTS", "SUPERSEDES", "BUNDLED_AS",
+        "SOLVES",
+        "DERIVED_FROM",
+        "HAS_IMPLEMENTATION",
+        "HAS_SLOT",
+        "CONSTRAINED_BY",
+        "REQUIRES",
+        "VERIFIED_BY",
+        "CHANGES",
+        "TESTS",
+        "SUPERSEDES",
+        "BUNDLED_AS",
     ]
     assert [item.value for item in AtlasStatus] == [
-        "READY", "NO_VERIFIED_RECIPE", "INDEX_STALE", "AMBIGUOUS_MATCH", "UNSUPPORTED_LANGUAGE",
-        "RENDER_INVALID", "EVIDENCE_INCOMPLETE", "RECIPE_QUARANTINED", "INGEST_PENDING",
-        "ATLAS_UNAVAILABLE", "MODEL_UNAVAILABLE",
+        "READY",
+        "NO_VERIFIED_RECIPE",
+        "INDEX_STALE",
+        "AMBIGUOUS_MATCH",
+        "UNSUPPORTED_LANGUAGE",
+        "RENDER_INVALID",
+        "EVIDENCE_INCOMPLETE",
+        "RECIPE_QUARANTINED",
+        "INGEST_PENDING",
+        "ATLAS_UNAVAILABLE",
+        "MODEL_UNAVAILABLE",
     ]
 
 
@@ -89,7 +116,9 @@ def test_edge_rejects_invalid_endpoint_kinds() -> None:
     ],
 )
 def test_edge_creation_succeeds_for_every_locked_relation(
-    relation: EdgeRelation, source_kind: NodeKind, target_kind: NodeKind,
+    relation: EdgeRelation,
+    source_kind: NodeKind,
+    target_kind: NodeKind,
 ) -> None:
     source = AtlasNode.create(source_kind, {"role": "source"})
     target = AtlasNode.create(target_kind, {"role": "target"})
@@ -110,7 +139,9 @@ def test_normalize_intent_id_is_deterministic(raw: str, expected: str) -> None:
     assert normalize_intent_id(raw) == expected
 
 
-@pytest.mark.parametrize("path", ["../secret.py", "/absolute.py", "vendor/x.py", "src/generated_pb2.py"])
+@pytest.mark.parametrize(
+    "path", ["../secret.py", "/absolute.py", "vendor/x.py", "src/generated_pb2.py"]
+)
 def test_candidate_path_rejects_unsafe_or_generated_paths(path: str) -> None:
     with pytest.raises(AtlasError):
         validate_candidate_path(path)
@@ -137,7 +168,9 @@ def test_tuple_payload_is_immutable_and_serializes_as_json_containers() -> None:
         {"items": [{"name": "x"}, [1, {"nested": True}]]},
     ],
 )
-def test_frozen_json_round_trips_arrays_and_objects_unambiguously(payload: object) -> None:
+def test_frozen_json_round_trips_arrays_and_objects_unambiguously(
+    payload: object,
+) -> None:
     frozen = freeze_json(payload)
     node = AtlasNode.create(NodeKind.RECIPE, payload)
     assert thaw_json(frozen) == payload
@@ -147,7 +180,7 @@ def test_frozen_json_round_trips_arrays_and_objects_unambiguously(payload: objec
 
 @pytest.mark.parametrize(
     "payload",
-    [[['a', 1]], {"pairs": [["a", 1]]}, {"nested": [["a", 1], {"x": []}]}],
+    [[["a", 1]], {"pairs": [["a", 1]]}, {"nested": [["a", 1], {"x": []}]}],
 )
 def test_freeze_json_is_idempotent_for_tagged_containers(payload: object) -> None:
     first = freeze_json(payload)
@@ -206,8 +239,15 @@ def test_schema_default_is_locked_to_one() -> None:
 def test_manifest_version_is_an_integer() -> None:
     with pytest.raises(ValueError, match="version"):
         RecipeManifest(
-            recipe_id="r", recipe_key="key", version=True, intent_id="intent", language_name="python",
-            language_extractor_version="1", repository_signature="repo", layer="layer", manifest_hash="hash",
+            recipe_id="r",
+            recipe_key="key",
+            version=True,
+            intent_id="intent",
+            language_name="python",
+            language_extractor_version="1",
+            repository_signature="repo",
+            layer="layer",
+            manifest_hash="hash",
         )
 
 

@@ -1,4 +1,4 @@
-"""Red-first contract tests for the deterministic Code Atlas extractor."""
+"""Red-first contract tests for the deterministic Atlas extractor."""
 
 from __future__ import annotations
 
@@ -13,28 +13,28 @@ from typing import Any
 
 import pytest
 
-from code_atlas.canonical import canonical_hash, canonical_json, thaw_json
-from code_atlas.extractors import (
+from devkit_atlas.canonical import canonical_hash, canonical_json, thaw_json
+from devkit_atlas.extractors import (
     BoundExecutionReceipt,
     ExtractionRequest,
     PythonRecipeExtractor,
     RecipeExtractor,
     render_operations,
 )
-from code_atlas.models import (
+from devkit_atlas.models import (
     AtlasEdge,
     AtlasError,
     EdgeRelation,
     NodeKind,
     TemplateOperation,
 )
-from code_atlas.security import (
+from devkit_atlas.security import (
     MAX_GRAPH_EDGES,
     MAX_GRAPH_NODES,
     MAX_RECIPE_BYTES,
     MAX_TEMPLATE_BYTES,
 )
-from code_atlas.store import AtlasStore
+from devkit_atlas.store import AtlasStore
 from project_index.checkpoints import CheckpointFile
 from project_index.models import CoverageGap, IndexNode, SnapshotFile
 
@@ -1007,8 +1007,8 @@ def test_fresh_process_renders_from_result_to_dict_canonical_json_envelope(
     mcp_tools = Path(__file__).resolve().parents[1]
     script = (
         "import base64, json, sys\n"
-        "from code_atlas.extractors import render_operations\n"
-        "from code_atlas.models import (ConstraintSpec, DependencySpec, RecipeManifest, SlotSpec, TemplateOperation, TestSpec)\n"
+        "from devkit_atlas.extractors import render_operations\n"
+        "from devkit_atlas.models import (ConstraintSpec, DependencySpec, RecipeManifest, SlotSpec, TemplateOperation, TestSpec)\n"
         "from project_index.checkpoints import CheckpointFile\n"
         "with open(sys.argv[1], encoding='utf-8') as stream:\n"
         "    payload = json.load(stream)\n"

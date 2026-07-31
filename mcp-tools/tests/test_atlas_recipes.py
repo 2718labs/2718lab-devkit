@@ -1,4 +1,4 @@
-"""Contracts for deterministic bundled Code Atlas recipes."""
+"""Contracts for deterministic bundled Atlas recipes."""
 
 from __future__ import annotations
 
@@ -15,14 +15,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from code_atlas.canonical import canonical_json
-from code_atlas.models import AtlasError, EdgeRelation, NodeKind
-from code_atlas.recipes import BundledRecipeLoader, render_pattern_card
-from code_atlas.store import AtlasStore
+from devkit_atlas import ASSET_ROOT
+from devkit_atlas.canonical import canonical_json
+from devkit_atlas.models import AtlasError, EdgeRelation, NodeKind
+from devkit_atlas.recipes import BundledRecipeLoader, render_pattern_card
+from devkit_atlas.store import AtlasStore
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ASSETS = ROOT / "skills" / "code-atlas" / "assets"
+MCP_TOOLS = Path(__file__).resolve().parents[1]
+ASSETS = ASSET_ROOT
+VALIDATOR = MCP_TOOLS / "devkit_atlas" / "validate_recipes.py"
 LOCKED_SEEDS = {
     "python-fastmcp-read-tool.json": (
         "python.fastmcp.read-only-tool",
@@ -489,7 +492,7 @@ def test_safe_read_rejects_symlink_swap_after_safe_child(
 
 
 def test_validator_main_returns_one_without_success_noise(monkeypatch, capsys) -> None:
-    script = ROOT / "skills" / "code-atlas" / "scripts" / "validate_recipes.py"
+    script = VALIDATOR
     spec = importlib.util.spec_from_file_location(
         "validate_recipes_failure_test", script
     )
@@ -542,12 +545,12 @@ def test_loader_rejects_junction_or_reparse_asset_components(
 
 def test_standalone_validator_has_exact_success_stdout() -> None:
     result = subprocess.run(
-        [sys.executable, "skills/code-atlas/scripts/validate_recipes.py"],
+        [sys.executable, str(VALIDATOR)],
         cwd=ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 0
-    assert result.stdout == "Code Atlas recipes valid: 3\n"
+    assert result.stdout == "Atlas recipes valid: 3\n"
     assert result.stderr == ""

@@ -1,4 +1,4 @@
-"""Bounded, deterministic Code Atlas graph and packet service."""
+"""Bounded, deterministic Atlas graph and packet service."""
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ _RECIPE_ONLY_KINDS = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class AcceptedCodeProjectionRequest:
+class AcceptedAtlasProjectionRequest:
     """Opaque, already-accepted identifiers needed for one Atlas projection.
 
     This is deliberately a data-only boundary: source bodies, raw receipts,
@@ -191,7 +191,7 @@ class AcceptedCodeProjectionRequest:
         output_query_trace_id: str,
         verification_artifact_hashes: tuple[str, ...],
         execution_receipt_ids: tuple[str, ...],
-    ) -> "AcceptedCodeProjectionRequest":
+    ) -> "AcceptedAtlasProjectionRequest":
         """Build the canonical core and evidence-binding identifiers."""
 
         payload = _acceptance_projection_core_payload(
@@ -242,7 +242,7 @@ class AcceptedCodeProjectionRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class AcceptedCodeProjectionEvidence:
+class AcceptedAtlasProjectionEvidence:
     """Trusted reader output kept separate from the public projection request."""
 
     code_task_version: int
@@ -259,8 +259,8 @@ class AcceptanceEvidenceReader(Protocol):
     """Read verified checkpoint/index/receipt evidence for one accepted task."""
 
     def read(
-        self, request: AcceptedCodeProjectionRequest
-    ) -> AcceptedCodeProjectionEvidence:
+        self, request: AcceptedAtlasProjectionRequest
+    ) -> AcceptedAtlasProjectionEvidence:
         """Return the typed evidence named by ``request`` without caller data."""
 
 
@@ -621,10 +621,10 @@ def _sorted_records(records: Sequence[Any]) -> tuple[Any, ...]:
 def hydrate_local_manifest(root: AtlasNode) -> RecipeManifest:
     """Strictly hydrate one observed local recipe root without a second codec."""
 
-    return CodeAtlasService._hydrate_manifest(root)
+    return AtlasService._hydrate_manifest(root)
 
 
-class CodeAtlasService:
+class AtlasService:
     """Join immutable bundled records and bounded local Atlas graph records."""
 
     def __init__(
@@ -663,8 +663,8 @@ class CodeAtlasService:
     @staticmethod
     def _validate_accepted_projection_request(
         request: object,
-    ) -> AcceptedCodeProjectionRequest:
-        if type(request) is not AcceptedCodeProjectionRequest:
+    ) -> AcceptedAtlasProjectionRequest:
+        if type(request) is not AcceptedAtlasProjectionRequest:
             raise AtlasError("invalid_acceptance_projection")
         payload = _acceptance_projection_core_payload(
             workflow_id=request.workflow_id,
@@ -701,13 +701,13 @@ class CodeAtlasService:
         return request
 
     @staticmethod
-    def _require_canonical_core_key(request: AcceptedCodeProjectionRequest) -> None:
+    def _require_canonical_core_key(request: AcceptedAtlasProjectionRequest) -> None:
         if request.ingestion_key != request.payload_hash:
             raise AtlasError("invalid_acceptance_projection")
 
     @staticmethod
     def _binding_provenance_node(
-        request: AcceptedCodeProjectionRequest,
+        request: AcceptedAtlasProjectionRequest,
     ) -> AtlasNode:
         return AtlasNode.create(
             NodeKind.SOURCE_EVIDENCE,
@@ -724,7 +724,7 @@ class CodeAtlasService:
 
     @staticmethod
     def _projection_from_receipt(
-        request: AcceptedCodeProjectionRequest,
+        request: AcceptedAtlasProjectionRequest,
         receipt: IngestionReceipt,
     ) -> AcceptanceProjection:
         return AcceptanceProjection(
@@ -739,7 +739,7 @@ class CodeAtlasService:
 
     def _existing_receipt_has_binding(
         self,
-        request: AcceptedCodeProjectionRequest,
+        request: AcceptedAtlasProjectionRequest,
         receipt: IngestionReceipt,
     ) -> bool:
         binding = self._binding_provenance_node(request)
@@ -780,10 +780,10 @@ class CodeAtlasService:
     @classmethod
     def _validate_reader_evidence(
         cls,
-        request: AcceptedCodeProjectionRequest,
+        request: AcceptedAtlasProjectionRequest,
         evidence: object,
     ) -> ExtractionRequest:
-        if type(evidence) is not AcceptedCodeProjectionEvidence:
+        if type(evidence) is not AcceptedAtlasProjectionEvidence:
             raise AtlasError("acceptance_evidence_conflict")
         extraction = evidence.extraction_request
         if type(extraction) is not ExtractionRequest:
@@ -870,7 +870,7 @@ class CodeAtlasService:
         return extraction
 
     def _read_accepted_evidence(
-        self, request: AcceptedCodeProjectionRequest
+        self, request: AcceptedAtlasProjectionRequest
     ) -> ExtractionRequest:
         reader = self._acceptance_evidence_reader
         if reader is None:
@@ -921,7 +921,7 @@ class CodeAtlasService:
 
     def _with_binding_provenance(
         self,
-        request: AcceptedCodeProjectionRequest,
+        request: AcceptedAtlasProjectionRequest,
         *,
         episode_id: str,
         recipe_id: str | None,
@@ -1017,7 +1017,7 @@ class CodeAtlasService:
         return AtlasStatus.EVIDENCE_INCOMPLETE, codes
 
     def project_acceptance(
-        self, request: AcceptedCodeProjectionRequest
+        self, request: AcceptedAtlasProjectionRequest
     ) -> AcceptanceProjection:
         """Project one accepted code task through verified reader evidence only."""
 
@@ -1810,7 +1810,7 @@ class CodeAtlasService:
             source_hashes=source_hashes,
             template_hashes=template_hashes,
             receipt_hashes=(receipt_hash,),
-            next_action="code_atlas_render",
+            next_action="atlas_render",
         )
         packet_data = provisional.to_dict()
         del packet_data["packet_id"]
@@ -2013,7 +2013,7 @@ class CodeAtlasService:
             return self._render_invalid(packet_id, "packet_workspace_mismatch")
         if packet.snapshot_id != snapshot_id:
             return self._render_invalid(packet_id, "packet_snapshot_mismatch")
-        if packet.next_action != "code_atlas_render":
+        if packet.next_action != "atlas_render":
             return self._render_invalid(packet_id, "packet_recipe_mismatch")
         if len(canonical_json(packet.to_dict()).encode("utf-8")) > MAX_PACKET_BYTES:
             return self._render_invalid(packet_id, "packet_integrity_mismatch")
