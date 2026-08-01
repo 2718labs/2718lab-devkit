@@ -562,7 +562,9 @@ def _assert_windows_private_duplex_ipc_handle(handle: int) -> None:
         import _winapi
 
         for standard_handle in (-10, -11, -12):
-            if handle == _winapi.GetStdHandle(standard_handle):
+            if not _windows_handles_are_provably_distinct(
+                handle, _winapi.GetStdHandle(standard_handle)
+            ):
                 raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         if _winapi.GetFileType(handle) != 3:  # FILE_TYPE_PIPE
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
@@ -573,8 +575,30 @@ def _assert_windows_private_duplex_ipc_handle(handle: int) -> None:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
     except HostBridgeError:
         raise
-    except (ImportError, OSError, ValueError) as error:
+    except (
+        AttributeError,
+        ImportError,
+        OSError,
+        OverflowError,
+        TypeError,
+        ValueError,
+    ) as error:
         raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+
+
+def _windows_handles_are_provably_distinct(first: int, second: int) -> bool:
+    """Accept only a verified distinct kernel object, never an ambiguous comparison."""
+
+    import ctypes
+
+    kernelbase = ctypes.WinDLL("kernelbase", use_last_error=True)
+    compare_object_handles = kernelbase.CompareObjectHandles
+    compare_object_handles.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    compare_object_handles.restype = ctypes.c_int
+    ctypes.set_last_error(0)
+    if compare_object_handles(first, second):
+        return False
+    return ctypes.get_last_error() == 1656  # ERROR_NOT_SAME_OBJECT
 
 
 def _windows_named_pipe_info_available(handle: int) -> bool:

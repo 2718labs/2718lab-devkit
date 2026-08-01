@@ -200,9 +200,12 @@ def test_inherited_handle_bridge_rejects_windows_one_way_pipe_handle(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle semantics")
-def test_inherited_handle_bridge_rejects_windows_current_standard_handle_before_probe() -> (
-    None
-):
+@pytest.mark.parametrize(
+    "standard_handle", [-10, -11, -12], ids=["stdin", "stdout", "stderr"]
+)
+def test_inherited_handle_bridge_rejects_windows_standard_handle_object_alias(
+    standard_handle: int,
+) -> None:
     import _winapi
     import ctypes
     from multiprocessing import Pipe
@@ -211,9 +214,9 @@ def test_inherited_handle_bridge_rejects_windows_current_standard_handle_before_
     set_std_handle = kernel32.SetStdHandle
     set_std_handle.argtypes = (ctypes.c_ulong, ctypes.c_void_p)
     set_std_handle.restype = ctypes.c_int
-    std_output_handle = ctypes.c_ulong(-11).value
+    standard_handle_selector = ctypes.c_ulong(standard_handle).value
     peer, inherited = Pipe(duplex=True)
-    aliased_handle = _winapi.DuplicateHandle(
+    standard_alias = _winapi.DuplicateHandle(
         _winapi.GetCurrentProcess(),
         inherited.fileno(),
         _winapi.GetCurrentProcess(),
@@ -221,38 +224,62 @@ def test_inherited_handle_bridge_rejects_windows_current_standard_handle_before_
         False,
         _winapi.DUPLICATE_SAME_ACCESS,
     )
-    original_standard_handle = _winapi.GetStdHandle(-11)
+    candidate_alias = _winapi.DuplicateHandle(
+        _winapi.GetCurrentProcess(),
+        standard_alias,
+        _winapi.GetCurrentProcess(),
+        0,
+        False,
+        _winapi.DUPLICATE_SAME_ACCESS,
+    )
+    original_standard_handle = _winapi.GetStdHandle(standard_handle)
     bridge: InheritedHandleHostBridge | None = None
+    standard_handle_replaced = False
     try:
-        if not set_std_handle(std_output_handle, ctypes.c_void_p(aliased_handle)):
+        assert candidate_alias != standard_alias
+        if not set_std_handle(
+            standard_handle_selector, ctypes.c_void_p(standard_alias)
+        ):
             raise OSError(ctypes.get_last_error(), "SetStdHandle failed")
-        assert _winapi.GetStdHandle(-11) == aliased_handle
+        standard_handle_replaced = True
+        assert _winapi.GetStdHandle(standard_handle) == standard_alias
 
         caught: HostBridgeError | None = None
         try:
             bridge = InheritedHandleHostBridge.from_environment(
-                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(aliased_handle)},
+                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(candidate_alias)},
                 platform="nt",
             )
         except HostBridgeError as error:
             caught = error
 
+        if bridge is not None:
+            bridge.prepare_capability(
+                action_id="standard-alias",
+                endpoint="bridge/standard-alias",
+                capabilities={"heartbeat": "test-private-capability"},
+            )
         assert bridge is None
         assert caught is not None
         assert caught.code == "HOST_BRIDGE_UNAVAILABLE"
         assert peer.poll(0) is False
     finally:
-        if not set_std_handle(
-            std_output_handle, ctypes.c_void_p(original_standard_handle)
-        ):
-            raise OSError(ctypes.get_last_error(), "SetStdHandle restore failed")
+        if standard_handle_replaced:
+            if not set_std_handle(
+                standard_handle_selector, ctypes.c_void_p(original_standard_handle)
+            ):
+                raise OSError(ctypes.get_last_error(), "SetStdHandle restore failed")
         if bridge is not None:
             bridge.close()
         else:
             try:
-                _winapi.CloseHandle(aliased_handle)
+                _winapi.CloseHandle(candidate_alias)
             except OSError:
                 pass
+        try:
+            _winapi.CloseHandle(standard_alias)
+        except OSError:
+            pass
         peer.close()
         inherited.close()
 
