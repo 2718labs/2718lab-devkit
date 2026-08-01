@@ -21,7 +21,7 @@ from project_index import IndexError, ProjectIndexService  # noqa: E402
 import project_index.checkpoints as checkpoints_module  # noqa: E402
 from project_index.checkpoints import (  # noqa: E402
     CheckpointService,
-    WorktreeOwnership,
+    WorkspaceOwnership,
 )
 
 
@@ -33,8 +33,30 @@ class _Snapshot:
 class _FilesystemIndex:
     """Small deterministic index double used to isolate checkpoint behavior."""
 
-    def _snapshot(self, workspace: str | Path) -> _Snapshot:
-        root = Path(workspace).resolve(strict=True)
+    def __init__(self) -> None:
+        self._workspace_ids: dict[Path, str] = {}
+        self._roots: dict[str, Path] = {}
+        self._snapshots: set[tuple[str, str]] = set()
+
+    def project_index_register(self, workspace_root: str | Path) -> str:
+        root = Path(workspace_root).resolve(strict=True)
+        workspace_id = self._workspace_ids.get(root)
+        if workspace_id is None:
+            workspace_id = (
+                "workspace:" + hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+            )
+            self._workspace_ids[root] = workspace_id
+            self._roots[workspace_id] = root
+        return workspace_id
+
+    def _workspace_root(self, workspace_id: str) -> Path:
+        root = self._roots.get(workspace_id)
+        if root is None:
+            raise IndexError("WORKSPACE_UNREGISTERED", "request rejected")
+        return root
+
+    def _snapshot(self, workspace_id: str) -> _Snapshot:
+        root = self._workspace_root(workspace_id)
         entries: list[tuple[str, str]] = []
         for current_root, directory_names, file_names in os.walk(
             root, followlinks=False
@@ -56,26 +78,35 @@ class _FilesystemIndex:
                     entries.append(
                         (relative, hashlib.sha256(path.read_bytes()).hexdigest())
                     )
-        payload = json.dumps(entries, separators=(",", ":")).encode("utf-8")
-        return _Snapshot(f"sha256:{hashlib.sha256(payload).hexdigest()}")
+        payload = json.dumps((workspace_id, entries), separators=(",", ":")).encode(
+            "utf-8"
+        )
+        snapshot = _Snapshot(f"sha256:{hashlib.sha256(payload).hexdigest()}")
+        self._snapshots.add((workspace_id, snapshot.snapshot_id))
+        return snapshot
 
     def sync(
-        self, workspace: str | Path, include_paths: tuple[str, ...] | None = None
+        self, workspace_id: str, include_paths: tuple[str, ...] | None = None
     ) -> _Snapshot:
         del include_paths
-        return self._snapshot(workspace)
+        return self._snapshot(workspace_id)
 
     def assert_current(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str,
         required_paths: tuple[str, ...] | None = None,
     ) -> _Snapshot:
         del required_paths
-        current = self._snapshot(workspace)
+        current = self._snapshot(workspace_id)
         if current.snapshot_id != snapshot_id:
             raise IndexError("INDEX_STALE", "request rejected")
         return current
+
+    def snapshot_facts(self, workspace_id: str, snapshot_id: str) -> None:
+        self._workspace_root(workspace_id)
+        if (workspace_id, snapshot_id) not in self._snapshots:
+            raise IndexError("NOT_FOUND", "request rejected")
 
 
 @dataclass(frozen=True)
@@ -134,6 +165,8 @@ def _make_directory_link(link: Path, target: Path) -> None:
             check=True,
             capture_output=True,
             text=True,
+            encoding="mbcs",
+            errors="replace",
         )
     else:
         link.symlink_to(target, target_is_directory=True)
@@ -175,15 +208,29 @@ def service(tmp_path: Path, index_service: _FilesystemIndex) -> CheckpointServic
     instance.close()
 
 
+def _workspace_id(
+    index_service: _FilesystemIndex | ProjectIndexService, root: Path
+) -> str:
+    return index_service.project_index_register(root)
+
+
+def _snapshot(
+    index_service: _FilesystemIndex | ProjectIndexService, root: Path
+) -> _Snapshot:
+    return index_service.sync(_workspace_id(index_service, root))
+
+
 def _ownership(
-    root: Path, write_scope: tuple[str, ...] = ("scope",)
-) -> WorktreeOwnership:
-    return WorktreeOwnership(
+    index_service: _FilesystemIndex | ProjectIndexService,
+    root: Path,
+    write_scope: tuple[str, ...] = ("scope",),
+) -> WorkspaceOwnership:
+    return WorkspaceOwnership(
         workflow_id="workflow-1",
         task_id="task-1",
         owner="sol-ultra-checkpoint",
         lease_epoch=7,
-        workspace_root=str(root.resolve()),
+        workspace_id=_workspace_id(index_service, root),
         write_scope=write_scope,
     )
 
@@ -220,10 +267,10 @@ def test_create_is_content_addressed_idempotent_and_reopens(
     scope.mkdir()
     (scope / "alpha.bin").write_bytes(b"alpha\x00\r\n")
     (scope / "empty").mkdir()
-    snapshot = index_service.sync(repository.worktree)
+    snapshot = _snapshot(index_service, repository.worktree)
     database = tmp_path / "index.sqlite3"
     cas_root = tmp_path / "checkpoint-cas"
-    ownership = _ownership(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
 
     first_service = CheckpointService(database, cas_root, index_service)
     first = first_service.create(ownership, snapshot.snapshot_id)
@@ -260,19 +307,21 @@ def test_create_accepts_directory_scope_with_real_project_index(
     index = ProjectIndexService(database)
     service = CheckpointService(database, tmp_path / "real-cas", index)
     try:
-        snapshot = index.sync(repository.worktree)
+        snapshot = _snapshot(index, repository.worktree)
 
         checkpoint = service.create(
-            _ownership(repository.worktree), snapshot.snapshot_id
+            _ownership(index, repository.worktree), snapshot.snapshot_id
         )
 
         assert checkpoint.snapshot_id == snapshot.snapshot_id
+        assert checkpoint.workspace_id == _workspace_id(index, repository.worktree)
+        assert checkpoint.workspace_root == ""
         assert checkpoint.write_scope == ("scope",)
         (scope / "tracked.txt").write_bytes(b"changed\n")
-        current = index.sync(repository.worktree)
+        current = _snapshot(index, repository.worktree)
 
         restored = service.restore(
-            _ownership(repository.worktree),
+            _ownership(index, repository.worktree),
             checkpoint.checkpoint_id,
             current.snapshot_id,
         )
@@ -297,16 +346,16 @@ def test_restore_add_change_delete_is_exact_and_creates_rescue_checkpoint(
     deleted.write_bytes(b"restore me\n")
     (scope / "empty-dir").mkdir()
     (repository.worktree / "outside.txt").write_bytes(b"outside\n")
-    ownership = _ownership(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
 
-    target_snapshot = index_service.sync(repository.worktree)
+    target_snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, target_snapshot.snapshot_id)
 
     changed.write_bytes(b"after\n")
     deleted.unlink()
     (scope / "added.txt").write_bytes(b"remove me\n")
     (scope / "new-empty-dir").mkdir()
-    current_snapshot = index_service.sync(repository.worktree)
+    current_snapshot = _snapshot(index_service, repository.worktree)
     changed_state = _workspace_state(repository.worktree)
 
     restored = service.restore(
@@ -342,12 +391,12 @@ def test_restore_rejects_current_tree_drift_without_workspace_writes(
     scope.mkdir()
     tracked = scope / "tracked.txt"
     tracked.write_bytes(b"checkpoint\n")
-    ownership = _ownership(repository.worktree)
-    target_snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
+    target_snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, target_snapshot.snapshot_id)
 
     tracked.write_bytes(b"expected current\n")
-    expected_current = index_service.sync(repository.worktree)
+    expected_current = _snapshot(index_service, repository.worktree)
     tracked.write_bytes(b"unregistered drift\n")
     before = _workspace_state(repository.worktree)
 
@@ -372,13 +421,13 @@ def test_restore_preserves_acknowledged_out_of_scope_changes(
     outside = repository.worktree / "outside.txt"
     tracked.write_bytes(b"checkpoint\n")
     outside.write_bytes(b"outside-before\n")
-    ownership = _ownership(repository.worktree)
-    target_snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
+    target_snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, target_snapshot.snapshot_id)
 
     tracked.write_bytes(b"changed\n")
     outside.write_bytes(b"outside-after\n")
-    expected_current = index_service.sync(repository.worktree)
+    expected_current = _snapshot(index_service, repository.worktree)
 
     restored = service.restore(
         ownership, target.checkpoint_id, expected_current.snapshot_id
@@ -388,7 +437,7 @@ def test_restore_preserves_acknowledged_out_of_scope_changes(
     assert outside.read_bytes() == b"outside-after\n"
     assert (
         restored.restored_snapshot_id
-        == index_service.sync(repository.worktree).snapshot_id
+        == _snapshot(index_service, repository.worktree).snapshot_id
     )
     assert restored.restored_snapshot_id != target_snapshot.snapshot_id
 
@@ -402,13 +451,13 @@ def test_restore_rejects_missing_parent_for_file_scope_without_writes(
     parent.mkdir()
     scoped_file = parent / "scoped.txt"
     scoped_file.write_bytes(b"checkpoint\n")
-    ownership = _ownership(repository.worktree, ("parent/scoped.txt",))
-    target_snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree, ("parent/scoped.txt",))
+    target_snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, target_snapshot.snapshot_id)
 
     scoped_file.unlink()
     parent.rmdir()
-    expected_current = index_service.sync(repository.worktree)
+    expected_current = _snapshot(index_service, repository.worktree)
     before = _workspace_state(repository.worktree)
 
     _assert_error(
@@ -427,8 +476,8 @@ def test_restore_allows_nested_missing_file_scope_as_noop(
     service: CheckpointService,
     index_service: _FilesystemIndex,
 ) -> None:
-    ownership = _ownership(repository.worktree, ("missing/scoped.txt",))
-    snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree, ("missing/scoped.txt",))
+    snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, snapshot.snapshot_id)
 
     restored = service.restore(ownership, target.checkpoint_id, snapshot.snapshot_id)
@@ -442,20 +491,23 @@ def test_create_rejects_original_or_noncanonical_workspaces(
     service: CheckpointService,
     index_service: _FilesystemIndex,
 ) -> None:
-    original_snapshot = index_service.sync(repository.original)
+    original_snapshot = _snapshot(index_service, repository.original)
     _assert_error(
         "WORKTREE_UNOWNED",
         lambda: service.create(
-            _ownership(repository.original), original_snapshot.snapshot_id
+            _ownership(index_service, repository.original),
+            original_snapshot.snapshot_id,
         ),
     )
 
     child = repository.worktree / "child"
     child.mkdir()
-    child_snapshot = index_service.sync(child)
+    child_snapshot = _snapshot(index_service, child)
     _assert_error(
         "WORKTREE_UNOWNED",
-        lambda: service.create(_ownership(child), child_snapshot.snapshot_id),
+        lambda: service.create(
+            _ownership(index_service, child), child_snapshot.snapshot_id
+        ),
     )
 
 
@@ -476,11 +528,11 @@ def test_create_rejects_scope_escape(
     index_service: _FilesystemIndex,
     scope: tuple[str, ...],
 ) -> None:
-    snapshot = index_service.sync(repository.worktree)
+    snapshot = _snapshot(index_service, repository.worktree)
     _assert_error(
         "SCOPE_ESCAPE",
         lambda: service.create(
-            _ownership(repository.worktree, scope), snapshot.snapshot_id
+            _ownership(index_service, repository.worktree, scope), snapshot.snapshot_id
         ),
     )
 
@@ -490,13 +542,13 @@ def test_create_rejects_string_write_scope(
     service: CheckpointService,
     index_service: _FilesystemIndex,
 ) -> None:
-    snapshot = index_service.sync(repository.worktree)
-    ownership = WorktreeOwnership(
+    snapshot = _snapshot(index_service, repository.worktree)
+    ownership = WorkspaceOwnership(
         workflow_id="workflow-1",
         task_id="task-1",
         owner="sol-ultra-checkpoint",
         lease_epoch=7,
-        workspace_root=str(repository.worktree.resolve()),
+        workspace_id=_workspace_id(index_service, repository.worktree),
         write_scope="scope",  # type: ignore[arg-type]
     )
 
@@ -521,10 +573,12 @@ def test_create_rejects_symlink_or_reparse_entries(
     except (OSError, subprocess.CalledProcessError) as exc:
         pytest.skip(f"cannot create a symlink or reparse point: {exc}")
 
-    snapshot = index_service.sync(repository.worktree)
+    snapshot = _snapshot(index_service, repository.worktree)
     _assert_error(
         "UNSAFE_PATH_TYPE",
-        lambda: service.create(_ownership(repository.worktree), snapshot.snapshot_id),
+        lambda: service.create(
+            _ownership(index_service, repository.worktree), snapshot.snapshot_id
+        ),
     )
 
 
@@ -538,12 +592,12 @@ def test_restore_rejects_reparse_drift_before_touching_external_files(
     scope.mkdir()
     tracked = scope / "tracked.txt"
     tracked.write_bytes(b"checkpoint\n")
-    ownership = _ownership(repository.worktree)
-    target_snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
+    target_snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, target_snapshot.snapshot_id)
 
     tracked.write_bytes(b"expected-current\n")
-    expected_current = index_service.sync(repository.worktree)
+    expected_current = _snapshot(index_service, repository.worktree)
     tracked.unlink()
     scope.rmdir()
     external = tmp_path / "external-restore"
@@ -582,14 +636,14 @@ def test_nested_git_metadata_is_never_captured_or_restored(
     tracked.write_bytes(b"checkpoint\n")
     git_config.write_bytes(b"git-before\n")
     cached.write_bytes(b"cache-before\n")
-    ownership = _ownership(repository.worktree)
-    target_snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
+    target_snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, target_snapshot.snapshot_id)
 
     tracked.write_bytes(b"changed\n")
     git_config.write_bytes(b"git-after\n")
     cached.write_bytes(b"cache-after\n")
-    expected_current = index_service.sync(repository.worktree)
+    expected_current = _snapshot(index_service, repository.worktree)
     service.restore(ownership, target.checkpoint_id, expected_current.snapshot_id)
 
     assert tracked.read_bytes() == b"checkpoint\n"
@@ -608,13 +662,13 @@ def test_restore_finalizes_read_only_directory_mode_after_children(
     tracked = scope / "tracked.txt"
     tracked.write_bytes(b"checkpoint\n")
     scope.chmod(0o555)
-    ownership = _ownership(repository.worktree)
-    target_snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
+    target_snapshot = _snapshot(index_service, repository.worktree)
     target = service.create(ownership, target_snapshot.snapshot_id)
 
     scope.chmod(0o755)
     tracked.write_bytes(b"changed\n")
-    expected_current = index_service.sync(repository.worktree)
+    expected_current = _snapshot(index_service, repository.worktree)
     service.restore(ownership, target.checkpoint_id, expected_current.snapshot_id)
 
     assert tracked.read_bytes() == b"checkpoint\n"
@@ -639,12 +693,12 @@ def test_create_rejects_cas_reparse_escape(
     except (OSError, subprocess.CalledProcessError) as exc:
         service.close()
         pytest.skip(f"cannot create a symlink or reparse point: {exc}")
-    snapshot = index_service.sync(repository.worktree)
+    snapshot = _snapshot(index_service, repository.worktree)
     try:
         _assert_error(
             "UNSAFE_PATH_TYPE",
             lambda: service.create(
-                _ownership(repository.worktree), snapshot.snapshot_id
+                _ownership(index_service, repository.worktree), snapshot.snapshot_id
             ),
         )
         assert list(external.iterdir()) == []
@@ -675,8 +729,8 @@ def test_status_rejects_tampered_checkpoint_identity(
     (scope / "tracked.txt").write_bytes(b"checkpoint\n")
     database = tmp_path / "tampered-index.sqlite3"
     cas_root = tmp_path / "tampered-cas"
-    ownership = _ownership(repository.worktree)
-    snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
+    snapshot = _snapshot(index_service, repository.worktree)
     service = CheckpointService(database, cas_root, index_service)
     checkpoint = service.create(ownership, snapshot.snapshot_id)
     service.close()
@@ -702,8 +756,8 @@ def test_idempotent_create_does_not_repair_tampered_checkpoint(
     (scope / "tracked.txt").write_bytes(b"checkpoint\n")
     database = tmp_path / "tampered-create-index.sqlite3"
     cas_root = tmp_path / "tampered-create-cas"
-    ownership = _ownership(repository.worktree)
-    snapshot = index_service.sync(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
+    snapshot = _snapshot(index_service, repository.worktree)
     service = CheckpointService(database, cas_root, index_service)
     service.create(ownership, snapshot.snapshot_id)
     service.close()
@@ -733,8 +787,8 @@ def test_checkpoint_files_require_task_ownership(
     source.parent.mkdir()
     source.write_bytes(b"VALUE = 1\n")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     files = service.read_files_for_task(
         checkpoint.checkpoint_id,
@@ -764,8 +818,8 @@ def test_checkpoint_file_reader_rejects_tampered_cas_body(
     source.parent.mkdir()
     source.write_bytes(b"VALUE = 1\n")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     entry = next(
         entry
@@ -796,8 +850,8 @@ def test_checkpoint_file_reader_verifies_all_cas_payloads(
     (scope / "requested.py").write_bytes(b"requested\n")
     (scope / "other.py").write_bytes(b"other\n")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     other = next(
         entry
@@ -829,8 +883,8 @@ def test_checkpoint_file_reader_rejects_invalid_or_small_budget(
     source.parent.mkdir()
     source.write_bytes(b"xx")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     with pytest.raises(IndexError):
         service.read_files_for_task(
@@ -852,8 +906,8 @@ def test_checkpoint_file_reader_scope_order_ownership_and_missing_cas(
     (scope / "a.py").write_bytes(b"aa")
     (scope / "b.py").write_bytes(b"bb")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     files = service.read_files_for_task(
         checkpoint.checkpoint_id,
@@ -906,8 +960,8 @@ def test_checkpoint_file_reader_rejects_aggregate_directory_and_missing_entries(
     (scope / "a.py").write_bytes(b"aa")
     (scope / "b.py").write_bytes(b"bb")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     for paths, budget in (
         (("scope/a.py", "scope/b.py"), 3),
@@ -933,9 +987,9 @@ def test_checkpoint_file_reader_is_independent_of_expired_lease(
     scope = repository.worktree / "scope"
     scope.mkdir()
     (scope / "module.py").write_bytes(b"lease-independent")
-    ownership = _ownership(repository.worktree)
+    ownership = _ownership(index_service, repository.worktree)
     checkpoint = service.create(
-        ownership, index_service.sync(repository.worktree).snapshot_id
+        ownership, _snapshot(index_service, repository.worktree).snapshot_id
     )
     monkeypatch.setattr(
         service,
@@ -974,8 +1028,8 @@ def test_checkpoint_file_reader_rejects_tampered_record_metadata(
     cas_root = tmp_path / "reader-record-cas"
     service = CheckpointService(database, cas_root, index_service)
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     service.close()
     with sqlite3.connect(database) as connection:
@@ -1007,8 +1061,8 @@ def test_checkpoint_file_reader_does_not_mutate_storage_or_store_marker(
     (scope / "a.py").write_bytes(marker)
     (scope / "b.py").write_bytes(b"late")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     workspace_before = _workspace_state(repository.worktree)
     database_before = service.database_path.read_bytes()
@@ -1062,8 +1116,8 @@ def test_checkpoint_file_reader_rejects_cas_reparse_parent(
     cas_root = tmp_path / "reader-cas-link"
     service = CheckpointService(database, cas_root, index_service)
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     sha_root = cas_root / "sha256"
     external = tmp_path / "external"
@@ -1138,8 +1192,8 @@ def test_checkpoint_file_reader_streams_every_cas_blob_and_retains_requested_onl
     unrequested = scope / "unrequested.bin"
     unrequested.write_bytes(b"x" * (8 * 1024 * 1024 + 1))
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     entries = service._load_entries(checkpoint.checkpoint_id)
     requested_entry = next(
@@ -1220,8 +1274,8 @@ def test_checkpoint_file_reader_checks_every_blob_when_requested_total_exceeds_b
     (scope / "a.py").write_bytes(b"aaa")
     (scope / "b.py").write_bytes(b"bbb")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     entries = service._load_entries(checkpoint.checkpoint_id)
     expected_paths = {
@@ -1295,8 +1349,8 @@ def test_checkpoint_file_reader_rejects_duplicate_paths_before_loading_cas(
     scope.mkdir()
     (scope / "module.py").write_bytes(b"VALUE = 1\n")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
 
     def fail_blob_load(*args: object, **kwargs: object) -> dict[str, bytes]:
@@ -1325,8 +1379,8 @@ def test_checkpoint_file_reader_reports_unrequested_corruption_before_oversize(
     (scope / "b.py").write_bytes(b"bbb")
     (scope / "unrequested.py").write_bytes(b"trusted")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     unrequested = next(
         entry
@@ -1357,8 +1411,8 @@ def test_checkpoint_cas_loader_deduplicates_matching_hashes_and_rejects_size_con
     (scope / "a.py").write_bytes(b"same")
     (scope / "b.py").write_bytes(b"same")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     entries = service._load_entries(checkpoint.checkpoint_id)
     shared = next(entry for entry in entries if entry.path == "scope/a.py")
@@ -1402,8 +1456,8 @@ def test_checkpoint_cas_stream_bounds_post_fstat_growth_probe(
     scope.mkdir()
     (scope / "module.py").write_bytes(b"x")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     entry = next(
         entry
@@ -1474,8 +1528,8 @@ def test_checkpoint_cas_stream_closes_on_success_and_fdopen_failure(
     scope.mkdir()
     (scope / "module.py").write_bytes(b"safe")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     entry = next(
         entry
@@ -1556,8 +1610,8 @@ def test_checkpoint_cas_stream_rejects_same_size_identity_swap(
     scope.mkdir()
     (scope / "module.py").write_bytes(b"safe")
     checkpoint = service.create(
-        _ownership(repository.worktree),
-        index_service.sync(repository.worktree).snapshot_id,
+        _ownership(index_service, repository.worktree),
+        _snapshot(index_service, repository.worktree).snapshot_id,
     )
     entry = next(
         entry
