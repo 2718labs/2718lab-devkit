@@ -52,27 +52,62 @@ def _source(
     workflow_state: str = "running",
     workflow_version: int = 1,
     tasks: list[tuple[str, str, int, str]] | None = None,
+    fastlane: dict | None = None,
 ) -> str:
-    return json.dumps(
-        {
-            "schema": mod.SOURCE_SCHEMA,
-            "workflow": {
-                "id": workflow_id,
-                "state": workflow_state,
-                "version": workflow_version,
-            },
-            "tasks": [
-                {
-                    "id": task_id,
-                    "title": title,
-                    "state": state,
-                    "version": version,
-                }
-                for task_id, state, version, title in tasks or []
-            ],
+    payload = {
+        "schema": mod.SOURCE_SCHEMA if fastlane is None else mod.SOURCE_SCHEMA_V2,
+        "workflow": {
+            "id": workflow_id,
+            "state": workflow_state,
+            "version": workflow_version,
         },
+        "tasks": [
+            {
+                "id": task_id,
+                "title": title,
+                "state": state,
+                "version": version,
+            }
+            for task_id, state, version, title in tasks or []
+        ],
+    }
+    if fastlane is not None:
+        payload["fastlane"] = fastlane
+    return json.dumps(
+        payload,
         ensure_ascii=False,
     )
+
+
+def _fastlane(
+    *,
+    recovery: list[dict] | None = None,
+    routes: list[dict] | None = None,
+) -> dict:
+    return {
+        "schema": mod.FASTLANE_METADATA_SCHEMA,
+        "metrics": {
+            "queue_delay_ms": 0,
+            "useful_slot_occupancy_permille": 0,
+            "prewarm_yield_count": 0,
+            "recovery_count": 0,
+            "rerun_avoidance_count": 0,
+            "cache_pressure_permille": 0,
+        },
+        "routes": routes or [],
+        "recovery": recovery or [],
+    }
+
+
+def _route_metadata(
+    *, fingerprint: str = "a", reason: str = "score_luna_medium"
+) -> dict:
+    return {
+        "task_id": "task-1",
+        "task_fingerprint": "sha256:" + (fingerprint * 64),
+        "route_reason_codes": [reason],
+        "floor_reason_codes": ["floor_role"],
+    }
 
 
 def _accept_delta(
@@ -244,6 +279,114 @@ def test_metadata_only_changes_do_not_emit_delta(tmp_path: Path) -> None:
         now=0.6,
     )
     assert event["kind"] == "noop"
+
+
+def test_v1_source_fingerprint_remains_compatible_when_recovery_is_absent() -> None:
+    snapshot = mod._parse_source(
+        _source(
+            workflow_id="workflow-1",
+            workflow_state="running",
+            tasks=[("task-1", "running", 1, "one")],
+        )
+    )
+    legacy_fingerprint = mod._sha256_hex(
+        mod._canonical_json(
+            {
+                "workflow_id": "workflow-1",
+                "workflow_state": "running",
+                "tasks": [{"id": "task-1", "state": "running"}],
+            }
+        )
+    )
+
+    assert snapshot.fingerprint == legacy_fingerprint
+
+
+def test_v2_route_metadata_is_bounded_redacted_and_never_causes_token_churn(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(0.0)
+    projector = _projector(tmp_path, clock)
+    first = _source(
+        tasks=[("task-1", "running", 1, "one")],
+        fastlane=_fastlane(routes=[_route_metadata(fingerprint="a")]),
+    )
+    _accept_delta(projector, first, clock, first=0.0, second=0.3)
+    pending = projector.recover("workflow-1")
+    assert pending["kind"] == "delta"
+    projector.ack("workflow-1", pending["delta"]["delta_id"])
+
+    changed_metadata = _source(
+        workflow_version=2,
+        tasks=[("task-1", "running", 2, "one")],
+        fastlane=_fastlane(
+            routes=[_route_metadata(fingerprint="b", reason="score_luna_high")]
+        ),
+    )
+
+    event = projector.observe(changed_metadata, now=0.6)
+
+    assert event["kind"] == "noop"
+
+
+def test_v2_recovery_transitions_survive_replay_and_ack_idempotently(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(0.0)
+    projector = _projector(tmp_path, clock)
+    recovery_states = [
+        "transport_degraded",
+        "recovery_probe",
+        "resumed",
+        "fenced_replacement",
+    ]
+    previous = "none"
+    for index, recovery_state in enumerate(recovery_states, start=1):
+        source = _source(
+            workflow_version=index,
+            tasks=[("task-1", "running", index, "one")],
+            fastlane=_fastlane(
+                recovery=[{"task_id": "task-1", "state": recovery_state}],
+                routes=[_route_metadata()],
+            ),
+        )
+        deferred = projector.observe(source, now=clock.value)
+        assert deferred["kind"] == "deferred"
+        clock.value += 0.3
+        event = projector.observe(source, now=clock.value)
+        assert event["kind"] == "delta"
+        transitions = event["delta"]["transitions"]
+        assert {
+            "kind": "recovery",
+            "id": "task-1",
+            "from_state": previous,
+            "to_state": recovery_state,
+        } in transitions
+
+        restarted = _projector(tmp_path, clock)
+        replay = restarted.recover("workflow-1")
+        assert replay == event
+        assert restarted.ack("workflow-1", event["delta"]["delta_id"])["kind"] == "noop"
+        assert restarted.recover("workflow-1")["kind"] == "noop"
+        projector = restarted
+        previous = recovery_state
+
+
+def test_v2_fastlane_metadata_rejects_raw_or_unknown_route_content(
+    tmp_path: Path,
+) -> None:
+    projector = _projector(tmp_path)
+    unsafe_route = _route_metadata()
+    unsafe_route["route_reason_codes"] = [r"C:\secrets\token"]
+    source = _source(
+        tasks=[("task-1", "running", 1, "one")],
+        fastlane=_fastlane(routes=[unsafe_route]),
+    )
+
+    with pytest.raises(mod.FastlaneTodoError) as exc:
+        projector.observe(source)
+
+    assert exc.value.code == "INVALID_SOURCE"
 
 
 def test_plan_has_exact_buckets_and_one_in_progress(tmp_path: Path) -> None:

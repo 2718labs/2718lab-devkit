@@ -226,6 +226,32 @@ completion.
 The host invokes `fast-lane` with an explicit reasoning effort. `ultra` is the
 automatic activation path (`ultra_auto`); lower efforts require explicit
 `--enable` (`explicit_opt_in`) and otherwise return an inactive plan.
+
+### Fast Lane routing-core v3 capability contract
+
+The separate `fastlane_routing.py` core is a pure, zero-model-call policy
+decision function. It does not dispatch work, claim a lease, bind an endpoint,
+or integrate with the scheduler. Its policy registry is an eligible envelope,
+not an assertion that every registered tuple is usable on the current host.
+
+A normal resolved route must be an **exact host-attested model/effort tuple**.
+The core derives the immutable safety floor first, then intersects policy
+candidates with the current host's exact attestations. If the preferred tuple
+is not attested, it deterministically chooses the lowest-cost exact attested
+candidate that satisfies the same floor and all lane, budget, and safety gates;
+the result records `capability_fallback`. If no such candidate exists, the
+result is unavailable with `capability_unavailable`. It never chooses an
+unattested effort. Thus a policy may retain Luna `low`, `medium`, `high`, and
+`xhigh` while a medium-only host safely uses its attested `medium` fallback and
+a multi-effort host continues to select dynamically by score/floor.
+
+Todo source v2 accepts only bounded numeric metrics, exact SHA-256 task
+fingerprints, and closed route/floor reason-code enums. Route metadata and
+metrics are validated then excluded from the token-facing projection
+fingerprint, so their changes are `noop`. Only compact recovery transitions
+(`transport_degraded`, `recovery_probe`, `resumed`, and
+`fenced_replacement`) are persisted and emitted as replayable transitions.
+
 Descriptors always carry explicit model and effort: prewarm is
 `gpt-5.6-terra` / `medium`; routine implementation and
 ordinary verification are `gpt-5.6-terra` / `high`; moderate-or-harder

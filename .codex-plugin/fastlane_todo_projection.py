@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Final
 
 SOURCE_SCHEMA: Final = "2718lab-devkit/workflow-todo-source-v1"
+SOURCE_SCHEMA_V2: Final = "2718lab-devkit/workflow-todo-source-v2"
+FASTLANE_METADATA_SCHEMA: Final = "2718lab-devkit/fastlane-todo-routing-v1"
 STATE_SCHEMA: Final = "2718lab-devkit/fastlane-todo-state-v1"
 DELTA_SCHEMA: Final = "2718lab-devkit/fastlane-todo-delta-v1"
 EVENT_SCHEMA: Final = "2718lab-devkit/fastlane-todo-event-v1"
@@ -38,6 +40,12 @@ TASK_STATES: Final = (
     "blocked",
     "failed",
     "cancelled",
+)
+RECOVERY_STATES: Final = (
+    "transport_degraded",
+    "recovery_probe",
+    "resumed",
+    "fenced_replacement",
 )
 WORKFLOW_REACHABLE: Final = {
     "new": frozenset({"running", "done", "blocked", "failed", "cancelled"}),
@@ -89,10 +97,140 @@ MAX_STEP_TASKS: Final = 8
 MAX_STEP_CHARS: Final = 512
 MAX_TITLE_CHARS: Final = 128
 HASH_PREFIX: Final = 12
+MAX_ROUTE_REASON_CODES: Final = 16
+
+FASTLANE_METRIC_BOUNDS: Final = {
+    "queue_delay_ms": 86_400_000,
+    "useful_slot_occupancy_permille": 1_000,
+    "prewarm_yield_count": 65_535,
+    "recovery_count": 65_535,
+    "rerun_avoidance_count": 65_535,
+    "cache_pressure_permille": 1_000,
+}
+FASTLANE_REASON_CODES: Final = frozenset(
+    {
+        "invalid_schema",
+        "invalid_bounds",
+        "invalid_policy_hash",
+        "unknown_model_effort",
+        "contradictory_profile",
+        "access_scope_contradiction",
+        "legacy_route_conflict",
+        "legacy_profile_incomplete",
+        "dependency_not_ready",
+        "scope_conflict_active",
+        "destructive_authorization_missing",
+        "capability_unavailable",
+        "architecture_conflict_design_probe",
+        "design_ambiguity_probe",
+        "floor_role",
+        "floor_cross_module",
+        "floor_database",
+        "floor_migration",
+        "floor_security",
+        "floor_destructive",
+        "floor_acceptance",
+        "score_luna_low",
+        "score_luna_medium",
+        "score_luna_high",
+        "score_luna_xhigh",
+        "score_terra_medium",
+        "score_terra_high",
+        "score_terra_xhigh",
+        "score_terra_max",
+        "legacy_profile_conservative",
+        "legacy_hint_ignored",
+        "host_override_upward",
+        "spark_static_blocker",
+        "spark_not_severe",
+        "spark_not_critical_path",
+        "spark_not_static_acceptance",
+        "spark_candidate_not_green",
+        "spark_scope_not_narrow",
+        "spark_exit_not_bounded",
+        "spark_competing_writer",
+        "spark_prior_attempt",
+        "spark_role_excluded",
+        "spark_long_regression",
+        "spark_architecture_or_migration",
+        "spark_entitlement_unavailable",
+        "transport_degraded",
+        "recovery_probe",
+        "recovery_retained",
+        "recovery_resumed",
+        "recovery_fenced_replacement",
+        "recovery_evidence_unverified",
+        "recovery_budget_exhausted",
+        "evaluation_budget_exceeded",
+        "scope_write_count",
+        "scope_read_count",
+        "overlap_count",
+        "dependency_depth",
+        "downstream_critical_count",
+        "critical_path",
+        "cross_module",
+        "database_work",
+        "migration",
+        "security_sensitive",
+        "destructive",
+        "external_boundary",
+        "architecture_conflict",
+        "design_ambiguity",
+    }
+    | {
+        f"role_{role}"
+        for role in (
+            "prewarm",
+            "read_analysis",
+            "documentation",
+            "execution",
+            "recovery",
+            "verification",
+            "review",
+            "integration",
+            "design",
+            "acceptance",
+        )
+    }
+    | {
+        f"scope_write_{breadth}"
+        for breadth in (
+            "none",
+            "single_file",
+            "single_module",
+            "multi_module",
+            "repo_wide",
+        )
+    }
+    | {
+        f"scope_read_{breadth}"
+        for breadth in (
+            "none",
+            "single_file",
+            "single_module",
+            "multi_module",
+            "repo_wide",
+        )
+    }
+    | {f"overlap_{risk}" for risk in ("none", "potential", "active")}
+    | {f"criticality_{value}" for value in ("low", "normal", "high", "critical")}
+    | {
+        f"verification_{value}"
+        for value in (
+            "none",
+            "focused",
+            "multi_gate",
+            "full_regression",
+            "long_regression",
+        )
+    }
+    | {f"blocker_{value}" for value in ("none", "minor", "major", "severe")}
+)
 
 
 WORKFLOW_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
 CONTROL_CHAR_PATTERN: Final = re.compile(r"[\x00-\x1f\x7f]")
+SHA256_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class FastlaneTodoError(ValueError):
@@ -111,21 +249,25 @@ def _sha256_hex(value: str) -> str:
     return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
-def _require_nonempty_mapping(value: Any, path: str) -> Mapping[str, Any]:
+def _require_nonempty_mapping(
+    value: Any, path: str, *, code: str = "INVALID_PAYLOAD"
+) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise FastlaneTodoError("INVALID_PAYLOAD", f"{path} is not an object")
+        raise FastlaneTodoError(code, f"{path} is not an object")
     return value
 
 
-def _require_mapping(value: Any, path: str) -> Mapping[str, Any]:
+def _require_mapping(
+    value: Any, path: str, *, code: str = "INVALID_PAYLOAD"
+) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise FastlaneTodoError("INVALID_PAYLOAD", f"{path} is not an object")
+        raise FastlaneTodoError(code, f"{path} is not an object")
     return value
 
 
-def _require_list(value: Any, path: str) -> list[Any]:
+def _require_list(value: Any, path: str, *, code: str = "INVALID_PAYLOAD") -> list[Any]:
     if not isinstance(value, list):
-        raise FastlaneTodoError("INVALID_PAYLOAD", f"{path} is not an array")
+        raise FastlaneTodoError(code, f"{path} is not an array")
     return value
 
 
@@ -160,16 +302,16 @@ def _require_int(
     payload: Mapping[str, Any], key: str, path: str, *, code: str = "INVALID_PAYLOAD"
 ) -> int:
     value = payload.get(key)
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise FastlaneTodoError(code, f"{path}.{key} is not an integer")
     if value < 0:
         raise FastlaneTodoError(code, f"{path}.{key} is negative")
     return value
 
 
-def _require_id(value: str, path: str) -> str:
+def _require_id(value: str, path: str, *, code: str = "INVALID_PAYLOAD") -> str:
     if not WORKFLOW_ID_PATTERN.fullmatch(value):
-        raise FastlaneTodoError("INVALID_PAYLOAD", f"{path} unsafe")
+        raise FastlaneTodoError(code, f"{path} unsafe")
     return value
 
 
@@ -188,6 +330,25 @@ def _require_state(
     return state
 
 
+def _require_recovery_state(
+    value: Any,
+    path: str,
+    *,
+    code: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in RECOVERY_STATES:
+        raise FastlaneTodoError(code, f"{path} has invalid recovery state")
+    return value
+
+
+def _serialize_recovery_state(value: str | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    return {"recovery_state": value}
+
+
 def _sanitize_title(value: str) -> str:
     cleaned = CONTROL_CHAR_PATTERN.sub("", value)
     cleaned = cleaned.replace("\r", "").replace("\n", "")
@@ -200,6 +361,7 @@ class SourceTask:
     title: str
     state: str
     version: int
+    recovery_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +378,7 @@ class AckedTask:
     task_id: str
     state: str
     version: int
+    recovery_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +387,7 @@ class ObservedTask:
     title: str
     state: str
     version: int
+    recovery_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -306,16 +470,139 @@ def _is_reachable(
 
 
 def _fingerprint(
-    workflow_id: str, workflow_state: str, tasks: tuple[tuple[str, str], ...]
+    workflow_id: str,
+    workflow_state: str,
+    tasks: tuple[tuple[str, str, str | None], ...],
 ) -> str:
     payload = {
         "workflow_id": workflow_id,
         "workflow_state": workflow_state,
         "tasks": [
-            {"id": task_id, "state": task_state} for task_id, task_state in tasks
+            {
+                "id": task_id,
+                "state": task_state,
+                **_serialize_recovery_state(recovery_state),
+            }
+            for task_id, task_state, recovery_state in tasks
         ],
     }
     return _sha256_hex(_canonical_json(payload))
+
+
+def _require_reason_codes(
+    payload: Mapping[str, Any], key: str, path: str
+) -> tuple[str, ...]:
+    raw_codes = _require_list(payload.get(key), f"{path}.{key}", code="INVALID_SOURCE")
+    if len(raw_codes) > MAX_ROUTE_REASON_CODES:
+        raise FastlaneTodoError("INVALID_SOURCE", f"{path}.{key} has too many values")
+    codes: list[str] = []
+    for index, value in enumerate(raw_codes):
+        if not isinstance(value, str) or value not in FASTLANE_REASON_CODES:
+            raise FastlaneTodoError(
+                "INVALID_SOURCE", f"{path}.{key}[{index}] is not an allowed reason code"
+            )
+        codes.append(value)
+    if len(codes) != len(set(codes)):
+        raise FastlaneTodoError("INVALID_SOURCE", f"{path}.{key} has duplicates")
+    return tuple(codes)
+
+
+def _parse_fastlane(value: Any, source_task_ids: frozenset[str]) -> dict[str, str]:
+    metadata = _require_nonempty_mapping(
+        value, "source.fastlane", code="INVALID_SOURCE"
+    )
+    _require_exact_fields(
+        metadata,
+        {"schema", "metrics", "routes", "recovery"},
+        "source.fastlane",
+        code="INVALID_SOURCE",
+    )
+    if (
+        _require_str(metadata, "schema", "source.fastlane", code="INVALID_SOURCE")
+        != FASTLANE_METADATA_SCHEMA
+    ):
+        raise FastlaneTodoError("INVALID_SOURCE", "unknown fastlane metadata schema")
+
+    metrics = _require_nonempty_mapping(
+        metadata["metrics"], "source.fastlane.metrics", code="INVALID_SOURCE"
+    )
+    _require_exact_fields(
+        metrics,
+        set(FASTLANE_METRIC_BOUNDS),
+        "source.fastlane.metrics",
+        code="INVALID_SOURCE",
+    )
+    for metric, maximum in FASTLANE_METRIC_BOUNDS.items():
+        metric_value = _require_int(
+            metrics, metric, "source.fastlane.metrics", code="INVALID_SOURCE"
+        )
+        if metric_value > maximum:
+            raise FastlaneTodoError(
+                "INVALID_SOURCE", f"source.fastlane.metrics.{metric} exceeds maximum"
+            )
+
+    routes = _require_list(
+        metadata["routes"], "source.fastlane.routes", code="INVALID_SOURCE"
+    )
+    if len(routes) > MAX_TASKS:
+        raise FastlaneTodoError("INVALID_SOURCE", "too many fastlane route records")
+    route_task_ids: set[str] = set()
+    for index, raw_route in enumerate(routes):
+        path = f"source.fastlane.routes[{index}]"
+        route = _require_nonempty_mapping(raw_route, path, code="INVALID_SOURCE")
+        _require_exact_fields(
+            route,
+            {
+                "task_id",
+                "task_fingerprint",
+                "route_reason_codes",
+                "floor_reason_codes",
+            },
+            path,
+            code="INVALID_SOURCE",
+        )
+        task_id = _require_id(
+            _require_str(route, "task_id", path, code="INVALID_SOURCE"),
+            f"{path}.task_id",
+            code="INVALID_SOURCE",
+        )
+        if task_id not in source_task_ids or task_id in route_task_ids:
+            raise FastlaneTodoError("INVALID_SOURCE", f"{path}.task_id is invalid")
+        route_task_ids.add(task_id)
+        task_fingerprint = _require_str(
+            route, "task_fingerprint", path, code="INVALID_SOURCE"
+        )
+        if not SHA256_PATTERN.fullmatch(task_fingerprint):
+            raise FastlaneTodoError(
+                "INVALID_SOURCE", f"{path}.task_fingerprint invalid"
+            )
+        _require_reason_codes(route, "route_reason_codes", path)
+        _require_reason_codes(route, "floor_reason_codes", path)
+
+    recovery = _require_list(
+        metadata["recovery"], "source.fastlane.recovery", code="INVALID_SOURCE"
+    )
+    if len(recovery) > MAX_TASKS:
+        raise FastlaneTodoError("INVALID_SOURCE", "too many fastlane recovery records")
+    recovery_by_task: dict[str, str] = {}
+    for index, raw_recovery in enumerate(recovery):
+        path = f"source.fastlane.recovery[{index}]"
+        record = _require_nonempty_mapping(raw_recovery, path, code="INVALID_SOURCE")
+        _require_exact_fields(record, {"task_id", "state"}, path, code="INVALID_SOURCE")
+        task_id = _require_id(
+            _require_str(record, "task_id", path, code="INVALID_SOURCE"),
+            f"{path}.task_id",
+            code="INVALID_SOURCE",
+        )
+        if task_id not in source_task_ids or task_id in recovery_by_task:
+            raise FastlaneTodoError("INVALID_SOURCE", f"{path}.task_id is invalid")
+        recovery_state = _require_recovery_state(
+            record.get("state"), f"{path}.state", code="INVALID_SOURCE"
+        )
+        if recovery_state is None:
+            raise FastlaneTodoError("INVALID_SOURCE", f"{path}.state is empty")
+        recovery_by_task[task_id] = recovery_state
+    return recovery_by_task
 
 
 def _parse_source(payload: str) -> SourceSnapshot:
@@ -324,20 +611,20 @@ def _parse_source(payload: str) -> SourceSnapshot:
     except json.JSONDecodeError as error:
         raise FastlaneTodoError("INVALID_SOURCE", "source is not valid JSON") from error
 
-    mapping = _require_nonempty_mapping(raw, "source")
-    _require_exact_fields(
-        mapping, {"schema", "workflow", "tasks"}, "source", code="INVALID_SOURCE"
-    )
-
-    if (
-        _require_str(mapping, "schema", "source", code="INVALID_SOURCE")
-        != SOURCE_SCHEMA
-    ):
+    mapping = _require_nonempty_mapping(raw, "source", code="INVALID_SOURCE")
+    source_schema = _require_str(mapping, "schema", "source", code="INVALID_SOURCE")
+    if source_schema == SOURCE_SCHEMA:
+        source_fields = {"schema", "workflow", "tasks"}
+    elif source_schema == SOURCE_SCHEMA_V2:
+        source_fields = {"schema", "workflow", "tasks", "fastlane"}
+    else:
         raise FastlaneTodoError("INVALID_SOURCE", "unknown source schema")
+    _require_exact_fields(mapping, source_fields, "source", code="INVALID_SOURCE")
 
     workflow = _require_nonempty_mapping(
         mapping["workflow"],
         "source.workflow",
+        code="INVALID_SOURCE",
     )
     _require_exact_fields(
         workflow,
@@ -348,6 +635,7 @@ def _parse_source(payload: str) -> SourceSnapshot:
     workflow_id = _require_id(
         _require_str(workflow, "id", "source.workflow", code="INVALID_SOURCE"),
         "source.workflow.id",
+        code="INVALID_SOURCE",
     )
     workflow_state = _require_state(
         workflow,
@@ -360,13 +648,15 @@ def _parse_source(payload: str) -> SourceSnapshot:
         workflow, "version", "source.workflow", code="INVALID_SOURCE"
     )
 
-    raw_tasks = _require_list(mapping["tasks"], "source.tasks")
+    raw_tasks = _require_list(mapping["tasks"], "source.tasks", code="INVALID_SOURCE")
     if len(raw_tasks) > MAX_TASKS:
         raise FastlaneTodoError("INVALID_SOURCE", "too many tasks")
 
     parsed_tasks = []
     for index, raw_task in enumerate(raw_tasks):
-        task = _require_nonempty_mapping(raw_task, f"source.tasks[{index}]")
+        task = _require_nonempty_mapping(
+            raw_task, f"source.tasks[{index}]", code="INVALID_SOURCE"
+        )
         _require_exact_fields(
             task,
             {"id", "title", "state", "version"},
@@ -378,6 +668,7 @@ def _parse_source(payload: str) -> SourceSnapshot:
                 task, "id", f"source.tasks[{index}].id", code="INVALID_SOURCE"
             ),
             f"source.tasks[{index}].id",
+            code="INVALID_SOURCE",
         )
         parsed_tasks.append(
             SourceTask(
@@ -406,8 +697,24 @@ def _parse_source(payload: str) -> SourceSnapshot:
     task_ids = [task.task_id for task in parsed_tasks]
     if len(task_ids) != len(set(task_ids)):
         raise FastlaneTodoError("INVALID_SOURCE", "duplicate task id")
-    snapshot_tasks = tuple(parsed_tasks)
-    task_pairs = tuple((item.task_id, item.state) for item in snapshot_tasks)
+    recovery_by_task = (
+        _parse_fastlane(mapping["fastlane"], frozenset(task_ids))
+        if source_schema == SOURCE_SCHEMA_V2
+        else {}
+    )
+    snapshot_tasks = tuple(
+        SourceTask(
+            task_id=item.task_id,
+            title=item.title,
+            state=item.state,
+            version=item.version,
+            recovery_state=recovery_by_task.get(item.task_id),
+        )
+        for item in parsed_tasks
+    )
+    task_pairs = tuple(
+        (item.task_id, item.state, item.recovery_state) for item in snapshot_tasks
+    )
     return SourceSnapshot(
         workflow_id=workflow_id,
         workflow_state=workflow_state,
@@ -430,6 +737,7 @@ def _source_to_observed(snapshot: SourceSnapshot) -> FastlaneTodoObservedState:
                 title=task.title,
                 state=task.state,
                 version=task.version,
+                recovery_state=task.recovery_state,
             )
             for task in snapshot.tasks
         ),
@@ -447,9 +755,12 @@ def _parse_acked(payload: Mapping[str, Any], path: str) -> FastlaneTodoAckedStat
     tasks = []
     for index, raw_task in enumerate(raw_tasks):
         task = _require_nonempty_mapping(raw_task, f"{path}.tasks[{index}]")
+        task_fields = {"id", "state", "version"}
+        if "recovery_state" in task:
+            task_fields.add("recovery_state")
         _require_exact_fields(
             task,
-            {"id", "state", "version"},
+            task_fields,
             f"{path}.tasks[{index}]",
             code="FASTLANE_STATE_CORRUPT",
         )
@@ -473,6 +784,11 @@ def _parse_acked(payload: Mapping[str, Any], path: str) -> FastlaneTodoAckedStat
                     task,
                     "version",
                     f"{path}.tasks[{index}]",
+                    code="FASTLANE_STATE_CORRUPT",
+                ),
+                recovery_state=_require_recovery_state(
+                    task.get("recovery_state"),
+                    f"{path}.tasks[{index}].recovery_state",
                     code="FASTLANE_STATE_CORRUPT",
                 ),
             )
@@ -513,9 +829,12 @@ def _parse_observed(payload: Mapping[str, Any], path: str) -> FastlaneTodoObserv
     tasks = []
     for index, raw_task in enumerate(raw_tasks):
         task = _require_nonempty_mapping(raw_task, f"{path}.tasks[{index}]")
+        task_fields = {"id", "title", "state", "version"}
+        if "recovery_state" in task:
+            task_fields.add("recovery_state")
         _require_exact_fields(
             task,
-            {"id", "title", "state", "version"},
+            task_fields,
             f"{path}.tasks[{index}]",
             code="FASTLANE_STATE_CORRUPT",
         )
@@ -547,6 +866,11 @@ def _parse_observed(payload: Mapping[str, Any], path: str) -> FastlaneTodoObserv
                     task,
                     "version",
                     f"{path}.tasks[{index}]",
+                    code="FASTLANE_STATE_CORRUPT",
+                ),
+                recovery_state=_require_recovery_state(
+                    task.get("recovery_state"),
+                    f"{path}.tasks[{index}].recovery_state",
                     code="FASTLANE_STATE_CORRUPT",
                 ),
             )
@@ -653,9 +977,30 @@ def _parse_delta(payload: Mapping[str, Any], path: str) -> FastlaneTodoDelta:
             f"{path}.transitions[{index}]",
             code="FASTLANE_STATE_CORRUPT",
         )
-        if kind not in {"workflow", "task"}:
+        if kind not in {"workflow", "task", "recovery"}:
             raise FastlaneTodoError(
                 "FASTLANE_STATE_CORRUPT", f"{path}.transitions[{index}].kind invalid"
+            )
+        from_state = _require_str(
+            transition,
+            "from_state",
+            f"{path}.transitions[{index}].from_state",
+            code="FASTLANE_STATE_CORRUPT",
+            allow_empty=True,
+        )
+        to_state = _require_str(
+            transition,
+            "to_state",
+            f"{path}.transitions[{index}].to_state",
+            code="FASTLANE_STATE_CORRUPT",
+        )
+        if kind == "recovery" and (
+            from_state not in {*RECOVERY_STATES, "none"}
+            or to_state not in {*RECOVERY_STATES, "none"}
+        ):
+            raise FastlaneTodoError(
+                "FASTLANE_STATE_CORRUPT",
+                f"{path}.transitions[{index}] recovery state invalid",
             )
         transitions.append(
             Transition(
@@ -669,19 +1014,8 @@ def _parse_delta(payload: Mapping[str, Any], path: str) -> FastlaneTodoDelta:
                     ),
                     f"{path}.transitions[{index}].id",
                 ),
-                from_state=_require_str(
-                    transition,
-                    "from_state",
-                    f"{path}.transitions[{index}].from_state",
-                    code="FASTLANE_STATE_CORRUPT",
-                    allow_empty=True,
-                ),
-                to_state=_require_str(
-                    transition,
-                    "to_state",
-                    f"{path}.transitions[{index}].to_state",
-                    code="FASTLANE_STATE_CORRUPT",
-                ),
+                from_state=from_state,
+                to_state=to_state,
             )
         )
     raw_plan = _require_list(payload["plan"], f"{path}.plan")
@@ -829,7 +1163,12 @@ def _serialize_state(state: FastlaneTodoState) -> dict[str, Any]:
             "fingerprint": state.acked.fingerprint,
             "workflow_state": state.acked.workflow_state,
             "tasks": [
-                {"id": task.task_id, "state": task.state, "version": task.version}
+                {
+                    "id": task.task_id,
+                    "state": task.state,
+                    "version": task.version,
+                    **_serialize_recovery_state(task.recovery_state),
+                }
                 for task in state.acked.tasks
             ],
         },
@@ -843,6 +1182,7 @@ def _serialize_state(state: FastlaneTodoState) -> dict[str, Any]:
                     "title": task.title,
                     "state": task.state,
                     "version": task.version,
+                    **_serialize_recovery_state(task.recovery_state),
                 }
                 for task in state.observed.tasks
             ],
@@ -867,6 +1207,7 @@ def _serialize_state(state: FastlaneTodoState) -> dict[str, Any]:
                     "title": task.title,
                     "state": task.state,
                     "version": task.version,
+                    **_serialize_recovery_state(task.recovery_state),
                 }
                 for task in state.staged_observed.tasks
             ],
@@ -1020,14 +1361,23 @@ def _build_delta(
                     to_state=task.state,
                 )
             )
-            continue
-        if before.state != task.state:
+        elif before.state != task.state:
             transitions.append(
                 Transition(
                     kind="task",
                     item_id=task.task_id,
                     from_state=before.state,
                     to_state=task.state,
+                )
+            )
+        before_recovery = before.recovery_state if before is not None else None
+        if before_recovery != task.recovery_state:
+            transitions.append(
+                Transition(
+                    kind="recovery",
+                    item_id=task.task_id,
+                    from_state=before_recovery or "none",
+                    to_state=task.recovery_state or "none",
                 )
             )
 
@@ -1370,6 +1720,7 @@ class FastlaneTodoProjector:
                         task_id=item.task_id,
                         state=item.state,
                         version=item.version,
+                        recovery_state=item.recovery_state,
                     )
                     for item in state.observed.tasks
                 ),
