@@ -31,10 +31,12 @@ from .models import (
     SnapshotFile,
     SourceWindow,
 )
+from .registry import WorkspaceRegistry
 from .store import ProjectIndexStore, StoreError
+from .workspace import is_workspace_id, workspace_identity
 
 
-_SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v2"
+_SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v4"
 _READ_CHUNK_SIZE = 64 * 1024
 _REPARSE_POINT = 0x400
 _IGNORED_DIRECTORIES = frozenset(
@@ -84,6 +86,7 @@ class ProjectIndexService:
         self._database_path = Path(database_path).resolve(strict=False)
         try:
             self._store = ProjectIndexStore(self._database_path)
+            self._registry = WorkspaceRegistry(self._store)
         except sqlite3.DatabaseError as exc:
             raise IndexError(
                 "INDEX_CORRUPT", "project index database is corrupt"
@@ -96,10 +99,62 @@ class ProjectIndexService:
     def close(self) -> None:
         self._store.close()
 
+    def project_index_register(self, workspace_root: str | Path) -> str:
+        """Register the sole accepted filesystem-root input for project indexing."""
+        try:
+            return self._registry.project_index_register(workspace_root)
+        except StoreError as exc:
+            raise IndexError(
+                "INDEX_CORRUPT", "project index workspace registry is corrupt"
+            ) from exc
+
+    def revalidate_snapshot(self, workspace_id: str, snapshot_id: str) -> IndexSnapshot:
+        """Explicitly promote one migrated path snapshot after a full current check."""
+        registered_id, root = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(
+            registered_id, snapshot_id, allow_historical=True
+        )
+        if snapshot.binding_state != "historical_unverified":
+            raise IndexError("INVALID_QUERY", "snapshot is not awaiting revalidation")
+        historical_identity = self._store.historical_binding_identity(
+            registered_id, snapshot_id
+        )
+        try:
+            current_identity = workspace_identity(root)
+        except IndexError as exc:
+            raise IndexError(
+                "WORKSPACE_REBIND", "workspace registration is no longer valid"
+            ) from exc
+        if not historical_identity or historical_identity != current_identity:
+            raise IndexError(
+                "WORKSPACE_REBIND", "workspace registration is no longer valid"
+            )
+        expected = self._store.file_hashes(snapshot_id)
+        current = {
+            source.path: source.content_hash
+            for source in self._collect_files(
+                root,
+                self._store.include_paths(snapshot_id),
+                error_code="INDEX_STALE",
+            )
+        }
+        if current != expected:
+            raise IndexError(
+                "INDEX_STALE", "project index snapshot does not match the workspace"
+            )
+        try:
+            return self._store.activate_historical_snapshot(registered_id, snapshot_id)
+        except (sqlite3.DatabaseError, StoreError) as exc:
+            raise IndexError(
+                "INDEX_CORRUPT", "project index historical binding is corrupt"
+            ) from exc
+
     def sync(
-        self, workspace: str | Path, include_paths: Sequence[str | Path] | None = None
+        self,
+        workspace_id: str,
+        include_paths: Sequence[str | Path] | None = None,
     ) -> IndexSnapshot:
-        root = self._canonical_workspace(workspace)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
         normalized_includes = self._normalize_paths(include_paths)
         files = self._collect_files(root, normalized_includes)
         parsed_by_key: dict[tuple[str, str, str], ParsedExtraction] = {}
@@ -134,14 +189,14 @@ class ProjectIndexService:
         parser_set_hash = _parser_set_hash(parsed_files)
         head = _git_head(root)
         snapshot_id = _snapshot_identifier(
-            root,
+            workspace_id=workspace_id,
             manifest_hash=manifest_hash,
             parser_set_hash=parser_set_hash,
             head=head,
         )
         snapshot = IndexSnapshot(
             snapshot_id=snapshot_id,
-            workspace=_workspace_key(root),
+            workspace=workspace_id,
             state=IndexState.INDEX_PARTIAL
             if extraction.gaps
             else IndexState.INDEX_READY,
@@ -154,6 +209,7 @@ class ProjectIndexService:
             manifest_hash=manifest_hash,
             parser_set_hash=parser_set_hash,
             head=head,
+            workspace_id=workspace_id,
         )
         try:
             return self._store.put_snapshot(
@@ -172,24 +228,31 @@ class ProjectIndexService:
 
     def status(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str | None = None,
         required_paths: Sequence[str | Path] | None = None,
     ) -> IndexStatus:
-        root = self._canonical_workspace(workspace)
-        workspace_key = _workspace_key(root)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
         snapshot = (
-            self._store.get_snapshot(snapshot_id)
+            self._store.get_snapshot_for_workspace(workspace_id, snapshot_id)
             if snapshot_id
-            else self._store.latest_snapshot(workspace_key)
+            else self._store.latest_snapshot(workspace_id)
         )
         required = self._normalize_paths(required_paths)
-        if snapshot is None or snapshot.workspace != workspace_key:
+        if snapshot is None or snapshot.workspace_id != workspace_id:
             return IndexStatus(
-                workspace_key,
+                workspace_id,
                 snapshot_id,
                 IndexState.INDEX_UNAVAILABLE,
                 required_paths=required,
+            )
+        if snapshot.binding_state != "active":
+            return IndexStatus(
+                workspace=workspace_id,
+                snapshot_id=snapshot.snapshot_id,
+                state=IndexState.HISTORICAL_UNVERIFIED,
+                required_paths=required,
+                binding_state=snapshot.binding_state,
             )
 
         expected = self._store.file_hashes(snapshot.snapshot_id)
@@ -233,18 +296,19 @@ class ProjectIndexService:
         else:
             state = snapshot.state
         return IndexStatus(
-            workspace=workspace_key,
+            workspace=workspace_id,
             snapshot_id=snapshot.snapshot_id,
             state=state,
             required_paths=required,
             missing_paths=missing,
             changed_paths=changed,
             gaps=self._store.gaps(snapshot.snapshot_id),
+            binding_state=snapshot.binding_state,
         )
 
     def query(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str,
         query: str,
         mode: str = "lexical",
@@ -256,8 +320,8 @@ class ProjectIndexService:
         byte_budget: int = 32768,
         allow_miss_escape: bool = False,
     ) -> QueryResult:
-        root = self._canonical_workspace(workspace)
-        snapshot = self._require_snapshot(root, snapshot_id)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(workspace_id, snapshot_id)
         normalized_mode = str(mode).casefold()
         if normalized_mode not in {"lexical", "graph", "impact"}:
             raise IndexError("INVALID_QUERY", "query mode is not supported")
@@ -397,11 +461,13 @@ class ProjectIndexService:
         """Compatibility alias for fetching a successful query receipt."""
         return self.get_query_receipt(trace_id)
 
-    def diff(self, from_snapshot_id: str, to_snapshot_id: str) -> SnapshotDiff:
-        before = self._store.get_snapshot(from_snapshot_id)
-        after = self._store.get_snapshot(to_snapshot_id)
-        if before is None or after is None:
-            raise IndexError("NOT_FOUND", "project index snapshot was not found")
+    def diff(
+        self, workspace_id: str, from_snapshot_id: str, to_snapshot_id: str
+    ) -> SnapshotDiff:
+        """Compare two active snapshots belonging to one registered workspace."""
+        workspace_id, _ = self._workspace_for_reference(workspace_id)
+        self._require_snapshot(workspace_id, from_snapshot_id)
+        self._require_snapshot(workspace_id, to_snapshot_id)
         before_files = self._store.file_hashes(from_snapshot_id)
         after_files = self._store.file_hashes(to_snapshot_id)
         before_paths = set(before_files)
@@ -430,36 +496,37 @@ class ProjectIndexService:
 
     def assert_current(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str,
         required_paths: Sequence[str | Path] | None = None,
     ) -> IndexSnapshot:
+        workspace_id, root = self._workspace_for_reference(workspace_id)
         if required_paths is None:
-            root = self._canonical_workspace(workspace)
-            snapshot = self._require_snapshot(root, snapshot_id)
+            snapshot = self._require_snapshot(workspace_id, snapshot_id)
             captured_files = self._collect_files(
                 root,
                 self._store.include_paths(snapshot.snapshot_id),
                 error_code="INDEX_STALE",
             )
-            return self._assert_current_with_files(root, snapshot_id, captured_files)
-        current = self.status(workspace, snapshot_id, required_paths)
+            return self._assert_current_with_files(
+                workspace_id, snapshot_id, captured_files
+            )
+        current = self.status(workspace_id, snapshot_id, required_paths)
         if current.state is IndexState.INDEX_UNAVAILABLE:
             raise IndexError("NOT_FOUND", "project index snapshot was not found")
         if current.state is IndexState.INDEX_STALE or current.missing_paths:
             raise IndexError(
                 "INDEX_STALE", "project index snapshot does not match the workspace"
             )
-        root = self._canonical_workspace(workspace)
-        return self._require_snapshot(root, snapshot_id)
+        return self._require_snapshot(workspace_id, snapshot_id)
 
     def _assert_current_with_files(
         self,
-        root: Path,
+        workspace_id: str,
         snapshot_id: str,
         captured_files: Sequence[SourceFile],
     ) -> IndexSnapshot:
-        snapshot = self._require_snapshot(root, snapshot_id)
+        snapshot = self._require_snapshot(workspace_id, snapshot_id)
         expected = self._store.file_hashes(snapshot.snapshot_id)
         current = {source.path: source.content_hash for source in captured_files}
         if any(
@@ -471,9 +538,11 @@ class ProjectIndexService:
             )
         return snapshot
 
-    def snapshot_facts(self, workspace: str | Path, snapshot_id: str) -> SnapshotFacts:
-        root = self._canonical_workspace(workspace)
-        snapshot = self._require_snapshot(root, snapshot_id)
+    def snapshot_facts(self, workspace_id: str, snapshot_id: str) -> SnapshotFacts:
+        workspace_id, _ = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(
+            workspace_id, snapshot_id, allow_historical=True
+        )
         return SnapshotFacts(
             snapshot=snapshot,
             file_hashes=tuple(sorted(self._store.file_hashes(snapshot_id).items())),
@@ -496,7 +565,7 @@ class ProjectIndexService:
 
     def read_snapshot_files(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str,
         paths: Sequence[str | Path],
         *,
@@ -505,8 +574,8 @@ class ProjectIndexService:
         if type(byte_budget) is not int or byte_budget <= 0:
             raise IndexError("INVALID_QUERY", "byte_budget must be a positive integer")
         normalized_paths = self._normalize_read_paths(paths)
-        root = self._canonical_workspace(workspace)
-        snapshot = self._require_snapshot(root, snapshot_id)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(workspace_id, snapshot_id)
         expected_hashes = self._store.file_hashes(snapshot_id)
         for relative_path in normalized_paths:
             if relative_path not in expected_hashes:
@@ -592,20 +661,27 @@ class ProjectIndexService:
                 hashes[relative] = digest
         return hashes, bodies
 
-    def _require_snapshot(self, root: Path, snapshot_id: str) -> IndexSnapshot:
-        snapshot = self._store.get_snapshot(snapshot_id)
-        if snapshot is None or snapshot.workspace != _workspace_key(root):
+    def _require_snapshot(
+        self, workspace_id: str, snapshot_id: str, *, allow_historical: bool = False
+    ) -> IndexSnapshot:
+        snapshot = self._store.get_snapshot_for_workspace(workspace_id, snapshot_id)
+        if snapshot is None:
             raise IndexError("NOT_FOUND", "project index snapshot was not found")
+        if snapshot.binding_state != "active" and not allow_historical:
+            raise IndexError(
+                "HISTORICAL_UNVERIFIED", "project index snapshot requires revalidation"
+            )
         return snapshot
 
-    def _canonical_workspace(self, workspace: str | Path) -> Path:
-        try:
-            root = Path(workspace).resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise IndexError("INDEX_UNAVAILABLE", "workspace is unavailable") from exc
-        if not root.is_dir():
-            raise IndexError("INDEX_UNAVAILABLE", "workspace is unavailable")
-        return root
+    def _workspace_for_reference(self, workspace_id: str) -> tuple[str, Path]:
+        """Resolve a previously registered opaque workspace identifier only."""
+        if not isinstance(workspace_id, str) or not is_workspace_id(workspace_id):
+            raise IndexError("WORKSPACE_UNREGISTERED", "workspace is not registered")
+        return workspace_id, self._registry.resolve(workspace_id)
+
+    def _workspace_root(self, workspace_id: str) -> Path:
+        """Private cross-service resolver for checkpoint capture and restore."""
+        return self._registry.resolve(workspace_id)
 
     def _normalize_paths(self, paths: Sequence[str | Path] | None) -> tuple[str, ...]:
         if paths is None:
@@ -748,7 +824,11 @@ def _parser_set_hash(parsed: Sequence[ParsedExtraction]) -> str:
 
 
 def _snapshot_identifier(
-    root: Path, *, manifest_hash: str, parser_set_hash: str, head: str | None
+    *,
+    workspace_id: str,
+    manifest_hash: str,
+    parser_set_hash: str,
+    head: str | None,
 ) -> str:
     return _hash_json(
         {
@@ -756,7 +836,7 @@ def _snapshot_identifier(
             "head": head,
             "manifest_hash": manifest_hash,
             "parser_set_hash": parser_set_hash,
-            "workspace": _workspace_key(root),
+            "workspace_id": workspace_id,
         }
     )
 
@@ -816,10 +896,6 @@ def _hash_json(value: object) -> str:
 
 def _content_hash(data: bytes) -> str:
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
-
-
-def _workspace_key(root: Path) -> str:
-    return root.as_posix()
 
 
 def _unsafe_path(path: Path) -> bool:

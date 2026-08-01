@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
@@ -16,11 +17,18 @@ from .extractors import (
 )
 from .models import (
     CoverageGap,
+    IndexError,
     IndexEdge,
     IndexNode,
     IndexSnapshot,
     IndexState,
     QueryReceipt,
+)
+from .workspace import (
+    canonical_workspace_root,
+    is_workspace_id,
+    workspace_id_for_serialized_path,
+    workspace_identity,
 )
 
 
@@ -28,10 +36,18 @@ class StoreError(RuntimeError):
     """Raised when durable index data cannot be read or written."""
 
 
+@dataclass(frozen=True)
+class WorkspaceRegistration:
+    """Private durable data used to resolve an opaque workspace identifier."""
+
+    root_path: str
+    identity: str
+
+
 class ProjectIndexStore:
     """Store immutable snapshots and path-neutral parser artifacts."""
 
-    _SCHEMA_VERSION = 2
+    _SCHEMA_VERSION = 4
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -82,6 +98,122 @@ class ProjectIndexStore:
         ).fetchone()
         return int(row[0])
 
+    def register_workspace(
+        self, workspace_id: str, root_path: str, identity: str
+    ) -> WorkspaceRegistration:
+        """Persist one immutable root binding, returning the first registration."""
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                """
+                SELECT root_path, identity
+                FROM project_index_workspaces
+                WHERE workspace_id = ?
+                """,
+                (workspace_id,),
+            ).fetchone()
+            if row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO project_index_workspaces
+                        (workspace_id, root_path, identity)
+                    VALUES (?, ?, ?)
+                    """,
+                    (workspace_id, root_path, identity),
+                )
+                return WorkspaceRegistration(root_path, identity)
+            return WorkspaceRegistration(str(row["root_path"]), str(row["identity"]))
+
+    def get_workspace_registration(
+        self, workspace_id: str
+    ) -> WorkspaceRegistration | None:
+        row = self._connection.execute(
+            """
+            SELECT root_path, identity
+            FROM project_index_workspaces
+            WHERE workspace_id = ?
+            """,
+            (workspace_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return WorkspaceRegistration(str(row["root_path"]), str(row["identity"]))
+
+    def get_snapshot_for_workspace(
+        self, workspace_id: str, snapshot_id: str
+    ) -> IndexSnapshot | None:
+        """Load a snapshot only through one registered opaque workspace binding."""
+        row = self._connection.execute(
+            """
+            SELECT snapshots.*, bindings.binding_state AS workspace_binding_state
+            FROM project_index_snapshot_bindings AS bindings
+            JOIN project_index_snapshots AS snapshots USING (snapshot_id)
+            WHERE bindings.workspace_id = ? AND bindings.snapshot_id = ?
+            """,
+            (workspace_id, snapshot_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._bound_snapshot_from_row(row, workspace_id)
+
+    def snapshot_has_historical_binding(self, snapshot_id: str) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM project_index_snapshot_bindings
+            WHERE snapshot_id = ? AND binding_state = 'historical_unverified'
+            LIMIT 1
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        return row is not None
+
+    def historical_binding_identity(
+        self, workspace_id: str, snapshot_id: str
+    ) -> str | None:
+        row = self._connection.execute(
+            """
+            SELECT root_identity
+            FROM project_index_snapshot_bindings
+            WHERE workspace_id = ?
+                AND snapshot_id = ?
+                AND binding_state = 'historical_unverified'
+            """,
+            (workspace_id, snapshot_id),
+        ).fetchone()
+        return None if row is None else str(row["root_identity"])
+
+    def activate_historical_snapshot(
+        self, workspace_id: str, snapshot_id: str
+    ) -> IndexSnapshot:
+        """Mark a checked historical path snapshot as safe for normal use."""
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                """
+                SELECT snapshots.*, bindings.binding_state AS workspace_binding_state
+                FROM project_index_snapshot_bindings AS bindings
+                JOIN project_index_snapshots AS snapshots USING (snapshot_id)
+                WHERE bindings.workspace_id = ? AND bindings.snapshot_id = ?
+                """,
+                (workspace_id, snapshot_id),
+            ).fetchone()
+            if row is None:
+                raise StoreError("snapshot not found")
+            snapshot = self._bound_snapshot_from_row(row, workspace_id)
+            if snapshot.binding_state != "historical_unverified":
+                raise StoreError("historical snapshot does not match workspace")
+            cursor.execute(
+                """
+                UPDATE project_index_snapshot_bindings
+                SET binding_state = 'active'
+                WHERE workspace_id = ? AND snapshot_id = ?
+                """,
+                (workspace_id, snapshot_id),
+            )
+        activated = self.get_snapshot_for_workspace(workspace_id, snapshot_id)
+        if activated is None:
+            raise StoreError("snapshot not found")
+        return activated
+
     def get_parse_cache(
         self, content_hash: str, extractor_id: str, extractor_version: str
     ) -> ParsedExtraction | None:
@@ -111,6 +243,9 @@ class ProjectIndexStore:
         parsed_cache_entries: Sequence[tuple[SourceFile, ParsedExtraction]] = (),
     ) -> IndexSnapshot:
         """Insert a complete graph once and append a workspace sync pointer."""
+        workspace_id = snapshot.workspace_id or snapshot.workspace
+        if not is_workspace_id(workspace_id):
+            raise StoreError("snapshot has no registered workspace binding")
         with self._transaction() as cursor:
             cursor.executemany(
                 "INSERT OR IGNORE INTO project_index_blobs (content_hash, size) VALUES (?, ?)",
@@ -140,14 +275,16 @@ class ProjectIndexStore:
                 cursor.execute(
                     """
                     INSERT INTO project_index_snapshots
-                        (snapshot_id, workspace, state, include_paths, file_count, blob_count,
+                        (snapshot_id, workspace, workspace_id, binding_state, state, include_paths, file_count, blob_count,
                          reused_blob_count, node_count, edge_count, gap_count, manifest_hash,
                          parser_set_hash, head)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot.snapshot_id,
-                        snapshot.workspace,
+                        "",
+                        "",
+                        "active",
                         snapshot.state.value,
                         _json(tuple(include_paths)),
                         snapshot.file_count,
@@ -244,15 +381,35 @@ class ProjectIndexStore:
                         for gap in gaps
                     ),
                 )
-                stored = snapshot
             else:
                 stored = self._snapshot_from_row(existing)
-                if stored.workspace != snapshot.workspace:
-                    raise StoreError("snapshot identifier collision across workspaces")
+                if (
+                    stored.state != snapshot.state
+                    or stored.file_count != snapshot.file_count
+                    or stored.blob_count != snapshot.blob_count
+                    or stored.node_count != snapshot.node_count
+                    or stored.edge_count != snapshot.edge_count
+                    or stored.gap_count != snapshot.gap_count
+                    or stored.manifest_hash != snapshot.manifest_hash
+                    or stored.parser_set_hash != snapshot.parser_set_hash
+                    or stored.head != snapshot.head
+                ):
+                    raise StoreError("snapshot identifier collision")
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO project_index_snapshot_bindings
+                    (workspace_id, snapshot_id, binding_state)
+                VALUES (?, ?, 'active')
+                """,
+                (workspace_id, snapshot.snapshot_id),
+            )
             cursor.execute(
                 "INSERT INTO project_index_syncs (workspace, snapshot_id) VALUES (?, ?)",
-                (snapshot.workspace, snapshot.snapshot_id),
+                (workspace_id, snapshot.snapshot_id),
             )
+        stored = self.get_snapshot_for_workspace(workspace_id, snapshot.snapshot_id)
+        if stored is None:
+            raise StoreError("snapshot binding was not stored")
         return stored
 
     def put_query_receipt(self, receipt: QueryReceipt) -> QueryReceipt:
@@ -311,19 +468,22 @@ class ProjectIndexStore:
         ).fetchone()
         return None if row is None else self._snapshot_from_row(row)
 
-    def latest_snapshot(self, workspace: str) -> IndexSnapshot | None:
+    def latest_snapshot(self, workspace_id: str) -> IndexSnapshot | None:
         row = self._connection.execute(
             """
-            SELECT snapshots.*
+            SELECT snapshots.*, bindings.binding_state AS workspace_binding_state
             FROM project_index_syncs AS syncs
             JOIN project_index_snapshots AS snapshots USING (snapshot_id)
+            JOIN project_index_snapshot_bindings AS bindings
+                ON bindings.workspace_id = syncs.workspace
+                AND bindings.snapshot_id = syncs.snapshot_id
             WHERE syncs.workspace = ?
             ORDER BY syncs.sequence DESC
             LIMIT 1
             """,
-            (workspace,),
+            (workspace_id,),
         ).fetchone()
-        return None if row is None else self._snapshot_from_row(row)
+        return None if row is None else self._bound_snapshot_from_row(row, workspace_id)
 
     def include_paths(self, snapshot_id: str) -> tuple[str, ...]:
         row = self._connection.execute(
@@ -484,6 +644,20 @@ class ProjectIndexStore:
                 );
                 CREATE INDEX IF NOT EXISTS project_index_syncs_workspace
                     ON project_index_syncs(workspace, sequence);
+                CREATE TABLE IF NOT EXISTS project_index_workspaces (
+                    workspace_id TEXT PRIMARY KEY,
+                    root_path TEXT NOT NULL,
+                    identity TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS project_index_snapshot_bindings (
+                    workspace_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL REFERENCES project_index_snapshots(snapshot_id),
+                    binding_state TEXT NOT NULL,
+                    root_identity TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (workspace_id, snapshot_id)
+                );
+                CREATE INDEX IF NOT EXISTS project_index_snapshot_bindings_snapshot
+                    ON project_index_snapshot_bindings(snapshot_id, binding_state);
                 CREATE TABLE IF NOT EXISTS project_index_query_receipts (
                     trace_id TEXT PRIMARY KEY,
                     snapshot_id TEXT NOT NULL REFERENCES project_index_snapshots(snapshot_id),
@@ -505,14 +679,24 @@ class ProjectIndexStore:
                 );
                 """
             )
-            self._migrate_v1_columns()
             row = self._connection.execute(
                 "SELECT value FROM project_index_metadata WHERE key = 'schema_version'"
             ).fetchone()
-            if row is not None and int(row["value"]) > self._SCHEMA_VERSION:
+            try:
+                previous_schema_version = 0 if row is None else int(row["value"])
+            except (TypeError, ValueError) as exc:
+                raise sqlite3.DatabaseError(
+                    "project index schema version is corrupt"
+                ) from exc
+            if previous_schema_version > self._SCHEMA_VERSION:
                 raise sqlite3.DatabaseError(
                     "project index schema is newer than this runtime"
                 )
+            self._migrate_v1_columns()
+            self._migrate_workspace_binding_columns()
+            self._migrate_workspace_registry(
+                quarantine_legacy=previous_schema_version < self._SCHEMA_VERSION
+            )
             self._connection.execute(
                 """
                 INSERT INTO project_index_metadata (key, value) VALUES ('schema_version', ?)
@@ -527,6 +711,8 @@ class ProjectIndexStore:
                 ("manifest_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("parser_set_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("head", "TEXT"),
+                ("workspace_id", "TEXT NOT NULL DEFAULT ''"),
+                ("binding_state", "TEXT NOT NULL DEFAULT 'active'"),
             ),
             "project_index_nodes": (
                 ("extractor_id", "TEXT NOT NULL DEFAULT ''"),
@@ -560,6 +746,128 @@ class ProjectIndexStore:
                         f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
                     )
 
+    def _migrate_workspace_binding_columns(self) -> None:
+        existing = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(project_index_snapshot_bindings)"
+            ).fetchall()
+        }
+        if "root_identity" not in existing:
+            self._connection.execute(
+                """
+                ALTER TABLE project_index_snapshot_bindings
+                ADD COLUMN root_identity TEXT NOT NULL DEFAULT ''
+                """
+            )
+
+    def _migrate_workspace_registry(self, *, quarantine_legacy: bool) -> None:
+        """Quarantine snapshots that predate workspace-bound snapshot identifiers."""
+        rows = self._connection.execute(
+            """
+            SELECT snapshot_id, workspace, workspace_id, binding_state
+            FROM project_index_snapshots
+            """
+        ).fetchall()
+        for row in rows:
+            snapshot_id = str(row["snapshot_id"])
+            bindings = self._connection.execute(
+                """
+                SELECT workspace_id, binding_state, root_identity
+                FROM project_index_snapshot_bindings
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchall()
+            if bindings:
+                if quarantine_legacy:
+                    binding_ids = {
+                        str(binding["workspace_id"])
+                        for binding in bindings
+                        if is_workspace_id(str(binding["workspace_id"]))
+                    }
+                    for binding in bindings:
+                        workspace_id = str(binding["workspace_id"])
+                        root_identity = str(binding["root_identity"])
+                        if not root_identity:
+                            registration = self.get_workspace_registration(workspace_id)
+                            root_identity = (
+                                "" if registration is None else registration.identity
+                            )
+                        self._connection.execute(
+                            """
+                            UPDATE project_index_snapshot_bindings
+                            SET binding_state = 'historical_unverified', root_identity = ?
+                            WHERE workspace_id = ? AND snapshot_id = ?
+                            """,
+                            (root_identity, workspace_id, snapshot_id),
+                        )
+                    self._rekey_legacy_syncs(snapshot_id, binding_ids)
+                    self._clear_legacy_snapshot_reference(snapshot_id)
+                continue
+            workspace_id = str(row["workspace_id"])
+            historical_root = str(row["workspace"])
+            if not is_workspace_id(workspace_id):
+                if not historical_root:
+                    self._clear_legacy_snapshot_reference(snapshot_id)
+                    continue
+                workspace_id = workspace_id_for_serialized_path(historical_root)
+            root_identity = _historical_root_identity(historical_root)
+            if not root_identity:
+                registration = self.get_workspace_registration(workspace_id)
+                root_identity = "" if registration is None else registration.identity
+            self._connection.execute(
+                """
+                INSERT INTO project_index_snapshot_bindings
+                    (workspace_id, snapshot_id, binding_state, root_identity)
+                VALUES (?, ?, ?, ?)
+                """,
+                (workspace_id, snapshot_id, "historical_unverified", root_identity),
+            )
+            self._clear_legacy_snapshot_reference(snapshot_id)
+            self._connection.execute(
+                """
+                UPDATE project_index_syncs
+                SET workspace = ?
+                WHERE snapshot_id = ?
+                """,
+                (workspace_id, snapshot_id),
+            )
+
+    def _rekey_legacy_syncs(self, snapshot_id: str, workspace_ids: set[str]) -> None:
+        """Replace only legacy path pointers that prove one existing binding."""
+        if not workspace_ids:
+            return
+        rows = self._connection.execute(
+            """
+            SELECT sequence, workspace
+            FROM project_index_syncs
+            WHERE snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        for row in rows:
+            workspace = str(row["workspace"])
+            if workspace in workspace_ids:
+                continue
+            workspace_id = workspace_id_for_serialized_path(workspace)
+            if workspace_id not in workspace_ids:
+                continue
+            self._connection.execute(
+                "UPDATE project_index_syncs SET workspace = ? WHERE sequence = ?",
+                (workspace_id, int(row["sequence"])),
+            )
+
+    def _clear_legacy_snapshot_reference(self, snapshot_id: str) -> None:
+        self._connection.execute(
+            """
+            UPDATE project_index_snapshots
+            SET workspace = '', workspace_id = '', binding_state = 'active'
+            WHERE snapshot_id = ?
+            """,
+            (snapshot_id,),
+        )
+
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:
         cursor = self._connection.cursor()
@@ -576,7 +884,7 @@ class ProjectIndexStore:
     def _snapshot_from_row(row: sqlite3.Row) -> IndexSnapshot:
         return IndexSnapshot(
             snapshot_id=str(row["snapshot_id"]),
-            workspace=str(row["workspace"]),
+            workspace=str(row["workspace_id"] or row["workspace"]),
             state=IndexState(str(row["state"])),
             file_count=int(row["file_count"]),
             blob_count=int(row["blob_count"]),
@@ -587,6 +895,17 @@ class ProjectIndexStore:
             manifest_hash=str(row["manifest_hash"]),
             parser_set_hash=str(row["parser_set_hash"]),
             head=None if row["head"] is None else str(row["head"]),
+            workspace_id=str(row["workspace_id"] or row["workspace"]),
+            binding_state=str(row["binding_state"]),
+        )
+
+    @staticmethod
+    def _bound_snapshot_from_row(row: sqlite3.Row, workspace_id: str) -> IndexSnapshot:
+        return replace(
+            ProjectIndexStore._snapshot_from_row(row),
+            workspace=workspace_id,
+            workspace_id=workspace_id,
+            binding_state=str(row["workspace_binding_state"]),
         )
 
     @staticmethod
@@ -661,6 +980,13 @@ class ProjectIndexStore:
             ),
             truncated=bool(row["truncated"]),
         )
+
+
+def _historical_root_identity(workspace_root: str) -> str:
+    try:
+        return workspace_identity(canonical_workspace_root(workspace_root))
+    except IndexError:
+        return ""
 
 
 def _json(value: object) -> str:
