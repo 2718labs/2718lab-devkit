@@ -5852,26 +5852,24 @@ class TeamEfficiencyTests(unittest.TestCase):
             "workflow_register_task",
             first["tool"],
         )
-        self.assertEqual(
-            {
-                "workflow_id",
-                "task_id",
-                "title",
-                "owner_role",
-                "card",
-                "dependencies",
-                "write_scope",
-                "direct_contract_hashes",
-                "required_evidence",
-                "input_hash",
-                "strict_index",
-                "workspace_root",
-                "input_snapshot_id",
-                "task_node_ids",
-                "contract_node_ids",
-            },
-            set(first["arguments"]),
-        )
+        register_signature = {
+            "workflow_id",
+            "task_id",
+            "title",
+            "owner_role",
+            "card",
+            "dependencies",
+            "write_scope",
+            "direct_contract_hashes",
+            "required_evidence",
+            "input_hash",
+            "strict_index",
+            "workspace_root",
+            "input_snapshot_id",
+            "task_node_ids",
+            "contract_node_ids",
+        }
+        self.assertEqual(register_signature, set(first["arguments"]))
         self.assertIsInstance(
             first["arguments"]["card"],
             str,
@@ -5879,22 +5877,54 @@ class TeamEfficiencyTests(unittest.TestCase):
         server_tree = ast.parse(
             (ROOT.parents[1] / "mcp-tools" / "server.py").read_text(encoding="utf-8")
         )
-        signatures = {}
-        required = {}
-        for node in server_tree.body:
-            if not isinstance(node, ast.FunctionDef) or node.name not in {
-                "workflow_register_task",
-                "workflow_ready",
-                "workflow_claim",
-                "workflow_endpoint_bind",
-            }:
-                continue
-            names = [argument.arg for argument in node.args.args]
-            signatures[node.name] = set(names)
-            required_count = len(names) - len(node.args.defaults)
-            required[node.name] = set(names[:required_count])
-        self.assertEqual({"workflow_id"}, signatures["workflow_ready"])
-        self.assertEqual({"workflow_id"}, required["workflow_ready"])
+        internal_workflow_signatures = {
+            "workflow_register_task": register_signature,
+            "workflow_ready": {"workflow_id"},
+            "workflow_claim": {
+                "task_id",
+                "owner",
+                "expires_at",
+                "host_target",
+                "now",
+            },
+            "workflow_endpoint_bind": {
+                "workflow_id",
+                "task_id",
+                "owner",
+                "lease_epoch",
+                "host_target",
+                "now",
+            },
+        }
+        internal_workflow_required = {
+            "workflow_register_task": {
+                "workflow_id",
+                "task_id",
+                "title",
+                "owner_role",
+                "card",
+            },
+            "workflow_ready": {"workflow_id"},
+            "workflow_claim": {"task_id", "owner", "expires_at"},
+            "workflow_endpoint_bind": {
+                "workflow_id",
+                "task_id",
+                "owner",
+                "lease_epoch",
+                "host_target",
+            },
+        }
+        public_workflow_functions = {
+            node.name
+            for node in server_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in internal_workflow_signatures
+        }
+        self.assertEqual(set(), public_workflow_functions)
+        self.assertEqual(
+            {"workflow_id"}, internal_workflow_signatures["workflow_ready"]
+        )
+        self.assertEqual({"workflow_id"}, internal_workflow_required["workflow_ready"])
         self.assertEqual(
             {
                 "workflow_id",
@@ -5903,15 +5933,15 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "owner_role",
                 "card",
             },
-            required["workflow_register_task"],
+            internal_workflow_required["workflow_register_task"],
         )
         self.assertEqual(
             {"task_id", "owner", "expires_at"},
-            required["workflow_claim"],
+            internal_workflow_required["workflow_claim"],
         )
         self.assertEqual(
             {"workflow_id", "task_id", "owner", "lease_epoch", "host_target"},
-            required["workflow_endpoint_bind"],
+            internal_workflow_required["workflow_endpoint_bind"],
         )
         unit_by_id = {unit["task_id"]: unit for unit in plan["units"]}
         registered: set[str] = set()
@@ -5921,7 +5951,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             unit = unit_by_id[task_id]
             self.assertEqual("workflow_register_task", register["tool"])
             self.assertEqual(
-                signatures["workflow_register_task"],
+                internal_workflow_signatures["workflow_register_task"],
                 set(arguments),
             )
             self.assertEqual(
@@ -5977,7 +6007,10 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertEqual(sorted(wave["task_ids"]), wave["task_ids"])
             ready = wave["workflow_ready"]
             self.assertEqual("workflow_ready", ready["tool"])
-            self.assertEqual(signatures["workflow_ready"], set(ready["arguments"]))
+            self.assertEqual(
+                internal_workflow_signatures["workflow_ready"],
+                set(ready["arguments"]),
+            )
             self.assertEqual(["workflow_id"], ready["host_bound_fields"])
             self.assertEqual(
                 {
@@ -6015,7 +6048,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                     operation_descriptor = task_step[operation_name]
                     self.assertEqual(operation_name, operation_descriptor["tool"])
                     self.assertEqual(
-                        signatures[operation_name],
+                        internal_workflow_signatures[operation_name],
                         set(operation_descriptor["arguments"]),
                     )
                     self.assertEqual(
