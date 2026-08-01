@@ -29,7 +29,7 @@ EXPECTED_FILES = (
 )
 EXPECTED_TREES = (
     "mcp-tools/bugkiller",
-    "mcp-tools/code_atlas",
+    "mcp-tools/devkit_atlas",
     "mcp-tools/devkit_relay",
     "mcp-tools/orchestrator",
     "mcp-tools/project_index",
