@@ -509,6 +509,40 @@ def test_v3_file_scope_does_not_claim_descendant_paths() -> None:
     assert plan["conflicts"] == []
 
 
+@pytest.mark.parametrize(
+    ("capacity", "accepted"),
+    [
+        (1, True),
+        (2, True),
+        (3, True),
+        (4, False),
+        (8, False),
+        (0, False),
+        (-1, False),
+        (True, False),
+        (1.5, False),
+        ("3", False),
+        (None, False),
+    ],
+)
+def test_v3_enforces_host_child_capacity_boundary(
+    capacity: object, accepted: bool
+) -> None:
+    request = _request()
+    request["capacity"] = capacity
+
+    if accepted:
+        plan = compile_plan(request, registry_resolver=RegistryResolver())
+
+        assert plan["capacity"] == capacity
+        return
+
+    with pytest.raises(RelayPlanError) as caught:
+        compile_plan(request, registry_resolver=RegistryResolver())
+
+    assert caught.value.code == "invalid_capacity"
+
+
 @pytest.mark.parametrize("kind", ["blob", None, ["tree"]])
 def test_v3_rejects_invalid_scope_kind_with_domain_error(kind: object) -> None:
     request = _request()

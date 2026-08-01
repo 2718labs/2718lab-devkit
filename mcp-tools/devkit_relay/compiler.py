@@ -565,7 +565,7 @@ def compile_plan(
     )
     base_commit = _commit_identifier(request["base_commit"])
     capacity = request["capacity"]
-    if type(capacity) is not int or not 1 <= capacity <= 8:
+    if type(capacity) is not int or not 1 <= capacity <= 3:
         raise RelayPlanError("invalid_capacity")
     if type(request["tasks"]) is not list or not request["tasks"]:
         raise RelayPlanError("invalid_tasks")
