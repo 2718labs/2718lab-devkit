@@ -42,6 +42,12 @@ from devkit_atlas.extractors import (  # noqa: E402
     PythonRecipeExtractor,
 )
 from devkit_atlas.store import AtlasStore  # noqa: E402
+from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
+from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from devkit_runtime.project_checkpoint import (  # noqa: E402
+    ProjectCheckpointRuntime,
+    open_project_checkpoint_rw,
+)
 from orchestrator.models import Task, TaskState, Workflow, WorkflowKind  # noqa: E402
 from orchestrator.service import OrchestratorService  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
@@ -212,8 +218,11 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         self._stores: list[SQLiteStore] = []
         self._index_services: list[ProjectIndexService] = []
+        self._project_runtimes: list[ProjectCheckpointRuntime] = []
 
     def tearDown(self) -> None:
+        for runtime in reversed(self._project_runtimes):
+            runtime.close()
         for index_service in reversed(self._index_services):
             index_service.close()
         for store in reversed(self._stores):
@@ -5487,8 +5496,18 @@ class TeamEfficiencyTests(unittest.TestCase):
             _marker_hash("output-primary"),
         ):
             self.assertNotIn(sensitive_identity, registration)
-        index_service = ProjectIndexService(self.temp / "orchestrator-index.sqlite")
-        self._index_services.append(index_service)
+        runtime_config = RuntimeConfig(
+            data_root=self.temp / "orchestrator-runtime",
+            scratch_root=self.temp / "orchestrator-runtime-scratch",
+        )
+        RuntimeBootstrap.run(runtime_config)
+        project_runtime = open_project_checkpoint_rw(
+            runtime_config.project_index_database,
+            runtime_config.checkpoint_cas_root,
+            scratch_root=runtime_config.scratch_root,
+        )
+        self._project_runtimes.append(project_runtime)
+        index_service = project_runtime.project_index
         workspace_id = index_service.project_index_register(workspace_root)
         snapshot = index_service.sync(workspace_id, include_paths=(indexed_path,))
         self.assertEqual(1, snapshot.file_count)
