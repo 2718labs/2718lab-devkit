@@ -147,6 +147,7 @@ def test_compile_is_deterministic_and_exposes_ready_and_prewarm_queues() -> None
     assert first == second
     assert first["schema"] == "2718lab-devkit/relay-plan-v1"
     assert first["plan_hash"].startswith("sha256:")
+    assert first["base_commit"] == "b" * 40
     assert first["queues"]["ready"] == ["atlas", "relay"]
     assert first["queues"]["prepared_prewarms"] == ["prewarm-integration"]
     assert first["capacity"] == 3
