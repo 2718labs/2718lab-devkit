@@ -259,6 +259,63 @@ def bind_worker(relay: RelayService, action: dict[str, object]) -> int:
     return int(task_data["task_version"])
 
 
+def _capacity_plan(capacity: int) -> dict[str, object]:
+    return plan(
+        *(
+            task(
+                f"writer-{index}",
+                priority=100 - index,
+                write_scope=[{"path": f"mcp-tools/writer-{index}.py", "kind": "file"}],
+            )
+            for index in range(capacity)
+        ),
+        capacity=capacity,
+    )
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 3])
+def test_start_accepts_supported_host_child_capacity(
+    tmp_path: Path, capacity: int
+) -> None:
+    relay, _store = service(tmp_path)
+
+    created = relay.start(
+        {
+            "mode": "create",
+            "plan": _capacity_plan(capacity),
+            "idempotency_key": f"accepted-capacity-{capacity}",
+        }
+    )
+
+    actions = created["host_actions"]
+    assert isinstance(actions, list)
+    assert [action["task_id"] for action in actions] == [
+        f"writer-{index}" for index in range(capacity)
+    ]
+
+
+@pytest.mark.parametrize("capacity", [4, 8])
+def test_start_rejects_self_hashed_over_capacity_plan_before_persistence(
+    tmp_path: Path, capacity: int
+) -> None:
+    relay, store = service(tmp_path)
+    submitted = _capacity_plan(capacity)
+    before = store.database_fingerprint()
+
+    with pytest.raises(RelayError) as caught:
+        relay.start(
+            {
+                "mode": "create",
+                "plan": submitted,
+                "idempotency_key": f"rejected-capacity-{capacity}",
+            }
+        )
+
+    assert caught.value.code == "RELAY_PLAN_INVALID"
+    assert str(caught.value) == "RELAY_PLAN_INVALID"
+    assert store.database_fingerprint() == before
+
+
 def test_start_is_idempotent_and_status_is_read_only(tmp_path: Path) -> None:
     relay, store = service(tmp_path)
     compiled = plan(

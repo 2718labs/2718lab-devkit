@@ -422,7 +422,7 @@ class RelayService:
         binding = self._validated_binding(value["workspace_binding"])
         base_commit = self._commit(value["base_commit"], plan=True)
         capacity = value["capacity"]
-        if type(capacity) is not int or not 1 <= capacity <= 8:
+        if type(capacity) is not int or not 1 <= capacity <= 3:
             raise RelayError("RELAY_PLAN_INVALID")
         if value["runtime_policy_id"] != "2718lab-devkit/relay-runtime-policy-v1":
             raise RelayError("RELAY_PLAN_INVALID")
