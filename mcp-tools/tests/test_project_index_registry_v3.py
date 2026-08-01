@@ -11,21 +11,57 @@ from pathlib import Path
 
 import pytest
 
-
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
+from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
+from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from devkit_runtime.project_checkpoint import open_project_checkpoint_rw  # noqa: E402
 from project_index import IndexError, IndexState, ProjectIndexService  # noqa: E402
 from project_index.checkpoints import (  # noqa: E402
     CheckpointService,
-    WorktreeOwnership,
     WorkspaceOwnership,
+    WorktreeOwnership,
 )
 
 
 def _service(tmp_path: Path) -> ProjectIndexService:
-    return ProjectIndexService(tmp_path / "index.sqlite3")
+    config = _runtime_config(tmp_path)
+    return open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    ).project_index
+
+
+def _runtime_config(tmp_path: Path) -> RuntimeConfig:
+    root = tmp_path.parent / f"{tmp_path.name}-runtime-data"
+    scratch = tmp_path.parent / f"{tmp_path.name}-runtime-scratch"
+    scratch.mkdir(exist_ok=True)
+    config = RuntimeConfig.load(
+        environ={"PLUGIN_DATA": str(root), "CODEX_TASK_TEMP": str(scratch)}
+    )
+    RuntimeBootstrap.run(config)
+    return config
+
+
+def _checkpoints(tmp_path: Path, index: ProjectIndexService) -> CheckpointService:
+    config = _runtime_config(tmp_path)
+    runtime = open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    )
+    connection = runtime._connection
+    assert connection is not None
+    return CheckpointService.from_prepared_connection(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        index,
+        index.workspace_authority,
+        connection,
+    )
 
 
 def _workspace(tmp_path: Path, name: str = "workspace") -> Path:
@@ -96,7 +132,7 @@ def test_registered_workspace_id_is_opaque_idempotent_and_drives_index_calls(
     assert str(root.resolve()) not in repr(snapshot)
     assert str(root.resolve()) not in repr(status)
     assert str(root.resolve()) not in str(asdict(snapshot))
-    connection = sqlite3.connect(tmp_path / "index.sqlite3")
+    connection = sqlite3.connect(_runtime_config(tmp_path).project_index_database)
     stored_workspace, stored_workspace_id = connection.execute(
         "SELECT workspace, workspace_id FROM project_index_snapshots"
     ).fetchone()
@@ -242,7 +278,7 @@ def test_repository_identity_rebind_fails_closed_without_mutation(
     with pytest.raises(IndexError) as captured:
         service.sync(workspace_id)
     assert captured.value.code == "WORKSPACE_REBIND"
-    connection = sqlite3.connect(tmp_path / "index.sqlite3")
+    connection = sqlite3.connect(_runtime_config(tmp_path).project_index_database)
     sync_count = connection.execute(
         "SELECT COUNT(*) FROM project_index_syncs"
     ).fetchone()
@@ -255,8 +291,8 @@ def test_historical_path_snapshots_need_explicit_revalidation_before_activation(
     tmp_path: Path,
 ) -> None:
     root = _workspace(tmp_path)
-    database = tmp_path / "index.sqlite3"
-    service = ProjectIndexService(database)
+    database = _runtime_config(tmp_path).project_index_database
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(root)
     snapshot = service.sync(workspace_id)
     service.close()
@@ -277,7 +313,7 @@ def test_historical_path_snapshots_need_explicit_revalidation_before_activation(
     connection.commit()
     connection.close()
 
-    migrated = ProjectIndexService(database)
+    migrated = _service(tmp_path)
     historical = migrated.snapshot_facts(workspace_id, snapshot.snapshot_id).snapshot
     assert historical.workspace == workspace_id
     assert historical.workspace_id == workspace_id
@@ -302,8 +338,8 @@ def test_migration_quarantines_legacy_workspace_ids_without_a_binding(
     tmp_path: Path,
 ) -> None:
     root = _workspace(tmp_path)
-    database = tmp_path / "index.sqlite3"
-    service = ProjectIndexService(database)
+    database = _runtime_config(tmp_path).project_index_database
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(root)
     snapshot = service.sync(workspace_id)
     service.close()
@@ -321,7 +357,7 @@ def test_migration_quarantines_legacy_workspace_ids_without_a_binding(
     connection.commit()
     connection.close()
 
-    migrated = ProjectIndexService(database)
+    migrated = _service(tmp_path)
     historical = migrated.snapshot_facts(workspace_id, snapshot.snapshot_id).snapshot
 
     assert historical.binding_state == "historical_unverified"
@@ -337,8 +373,8 @@ def test_migration_quarantines_legacy_workspace_ids_without_a_binding(
 
 def test_migration_rekeys_existing_binding_sync_pointers(tmp_path: Path) -> None:
     root = _workspace(tmp_path)
-    database = tmp_path / "index.sqlite3"
-    service = ProjectIndexService(database)
+    database = _runtime_config(tmp_path).project_index_database
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(root)
     snapshot = service.sync(workspace_id)
     service.close()
@@ -354,7 +390,7 @@ def test_migration_rekeys_existing_binding_sync_pointers(tmp_path: Path) -> None
     connection.commit()
     connection.close()
 
-    migrated = ProjectIndexService(database)
+    migrated = _service(tmp_path)
 
     status = migrated.status(workspace_id)
     assert status.snapshot_id == snapshot.snapshot_id
@@ -367,8 +403,8 @@ def test_historical_revalidation_rejects_a_same_path_identity_rebind(
     tmp_path: Path,
 ) -> None:
     root = _workspace(tmp_path)
-    database = tmp_path / "index.sqlite3"
-    service = ProjectIndexService(database)
+    database = _runtime_config(tmp_path).project_index_database
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(root)
     snapshot = service.sync(workspace_id)
     service.close()
@@ -390,7 +426,7 @@ def test_historical_revalidation_rejects_a_same_path_identity_rebind(
     connection.commit()
     connection.close()
 
-    migrated = ProjectIndexService(database)
+    migrated = _service(tmp_path)
     moved = tmp_path / "moved-workspace"
     root.rename(moved)
     root.mkdir()
@@ -413,9 +449,7 @@ def test_checkpoint_capture_uses_workspace_id_without_disclosing_the_root(
     index = _service(tmp_path)
     workspace_id = index.project_index_register(root)
     snapshot = index.sync(workspace_id)
-    checkpoints = CheckpointService(
-        tmp_path / "checkpoints.sqlite3", tmp_path / "checkpoint-cas", index
-    )
+    checkpoints = _checkpoints(tmp_path, index)
     ownership = WorkspaceOwnership(
         workflow_id="workflow-1",
         task_id="task-1",
@@ -430,7 +464,7 @@ def test_checkpoint_capture_uses_workspace_id_without_disclosing_the_root(
     assert checkpoint.workspace_id == workspace_id
     assert str(root.resolve()) not in repr(checkpoint)
     assert str(root.resolve()) not in str(asdict(checkpoint))
-    connection = sqlite3.connect(tmp_path / "checkpoints.sqlite3")
+    connection = sqlite3.connect(_runtime_config(tmp_path).project_index_database)
     stored_root, stored_workspace_id = connection.execute(
         "SELECT workspace_root, workspace_id FROM checkpoint_records"
     ).fetchone()
@@ -446,9 +480,7 @@ def test_checkpoint_read_fails_closed_after_workspace_rebind(tmp_path: Path) -> 
     index = _service(tmp_path)
     workspace_id = index.project_index_register(root)
     snapshot = index.sync(workspace_id)
-    checkpoints = CheckpointService(
-        tmp_path / "checkpoints.sqlite3", tmp_path / "checkpoint-cas", index
-    )
+    checkpoints = _checkpoints(tmp_path, index)
     ownership = WorkspaceOwnership(
         workflow_id="workflow-1",
         task_id="task-1",
@@ -484,9 +516,7 @@ def test_checkpoint_rejects_path_ownership_outside_registration(
     index = _service(tmp_path)
     workspace_id = index.project_index_register(root)
     snapshot = index.sync(workspace_id)
-    checkpoints = CheckpointService(
-        tmp_path / "checkpoints.sqlite3", tmp_path / "checkpoint-cas", index
-    )
+    checkpoints = _checkpoints(tmp_path, index)
     ownership = WorktreeOwnership(
         workflow_id="workflow-1",
         task_id="task-1",

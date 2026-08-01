@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import secrets
@@ -136,6 +137,23 @@ class _CheckpointIndexService(Protocol):
     def sync(self, workspace_id: str) -> _SnapshotReference: ...
 
 
+def _called_by_runtime_bootstrap() -> bool:
+    """Allow durable preparation only from RuntimeBootstrap's explicit call."""
+
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            if (
+                frame.f_code.co_name == "_bootstrap_stores"
+                and frame.f_globals.get("__name__") == "devkit_runtime.bootstrap"
+            ):
+                return True
+            frame = frame.f_back
+    finally:
+        del frame
+    return False
+
+
 class CheckpointService:
     """Persist immutable scoped manifests and restore them after a CAS check."""
 
@@ -146,6 +164,29 @@ class CheckpointService:
         index_service: object,
         *,
         workspace_authority: WorkspaceRootAuthority | None = None,
+    ) -> None:
+        if _called_by_runtime_bootstrap():
+            self._bootstrap(
+                database_path,
+                cas_root,
+                index_service,
+                workspace_authority=workspace_authority,
+            )
+            return
+        self._open_prepared(
+            database_path,
+            cas_root,
+            index_service,
+            workspace_authority=workspace_authority,
+        )
+
+    def _bootstrap(
+        self,
+        database_path: str | Path,
+        cas_root: str | Path,
+        index_service: object,
+        *,
+        workspace_authority: WorkspaceRootAuthority | None,
     ) -> None:
         self.database_path = _prepare_storage_file(database_path)
         self.cas_root = _prepare_storage_directory(cas_root)
@@ -164,6 +205,41 @@ class CheckpointService:
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+
+    def _open_prepared(
+        self,
+        database_path: str | Path,
+        cas_root: str | Path,
+        index_service: object,
+        *,
+        workspace_authority: WorkspaceRootAuthority | None,
+    ) -> None:
+        """Open already-prepared state without creating storage or changing WAL."""
+
+        self.database_path = _require_storage_file(database_path)
+        self.cas_root = _require_storage_directory(cas_root)
+        self.index_service = cast(_CheckpointIndexService, index_service)
+        self.workspace_authority = self._resolve_workspace_authority(
+            index_service, workspace_authority
+        )
+        self._owns_connection = True
+        try:
+            connection = sqlite3.connect(
+                self.database_path.as_uri() + "?mode=rw",
+                uri=True,
+                isolation_level=None,
+            )
+        except sqlite3.DatabaseError:
+            raise _error("INDEX_UNAVAILABLE") from None
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            self.validate_prepared_connection(connection)
+        except (IndexError, sqlite3.DatabaseError):
+            connection.close()
+            raise
+        self._connection = connection
 
     @classmethod
     def from_prepared_connection(
@@ -240,9 +316,10 @@ class CheckpointService:
             raise _error("INDEX_STALE") from None
         return self.create(ownership, snapshot_id)
 
-    def status(self, checkpoint_id: str) -> Checkpoint:
-        checkpoint, _ = self._load_verified_checkpoint(checkpoint_id)
-        return checkpoint
+    def status(self, workspace_id: str, checkpoint_id: str) -> Checkpoint:
+        """Load a checkpoint only through its requested workspace boundary."""
+
+        return self.status_for_workspace(workspace_id, checkpoint_id)
 
     def status_for_workspace(self, workspace_id: str, checkpoint_id: str) -> Checkpoint:
         """Load a checkpoint only through its requested workspace boundary."""
@@ -548,7 +625,7 @@ class CheckpointService:
             workspace_id=workspace_id,
         )
         self._persist(checkpoint, entries)
-        return self.status(checkpoint_id)
+        return self.status_for_workspace(workspace_id, checkpoint_id)
 
     def _validate_ownership(
         self, ownership: WorkspaceOwnership
@@ -1492,6 +1569,42 @@ def _file_identity(path_stat: os.stat_result) -> tuple[int, int, int, int]:
 
 def _read_only_open_flags() -> int:
     return os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _require_storage_file(path: str | Path) -> Path:
+    absolute = Path(os.path.abspath(Path(path)))
+    resolved = absolute.resolve(strict=False)
+    if _path_key(absolute) != _path_key(resolved):
+        raise _error("UNSAFE_PATH_TYPE")
+    parent = _require_storage_directory(absolute.parent)
+    candidate = parent / absolute.name
+    try:
+        path_stat = candidate.lstat()
+    except FileNotFoundError:
+        raise _error("INDEX_UNAVAILABLE") from None
+    if _unsafe_stat(path_stat) or not stat.S_ISREG(path_stat.st_mode):
+        raise _error("UNSAFE_PATH_TYPE")
+    return candidate
+
+
+def _require_storage_directory(path: str | Path) -> Path:
+    absolute = Path(os.path.abspath(Path(path)))
+    resolved = absolute.resolve(strict=False)
+    if _path_key(absolute) != _path_key(resolved):
+        raise _error("UNSAFE_PATH_TYPE")
+    try:
+        path_stat = absolute.lstat()
+    except FileNotFoundError:
+        raise _error("INDEX_UNAVAILABLE") from None
+    if _unsafe_stat(path_stat) or not stat.S_ISDIR(path_stat.st_mode):
+        raise _error("UNSAFE_PATH_TYPE")
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError:
+        raise _error("INDEX_UNAVAILABLE") from None
+    if _path_key(absolute) != _path_key(resolved):
+        raise _error("UNSAFE_PATH_TYPE")
+    return absolute
 
 
 def _prepare_storage_file(path: str | Path) -> Path:

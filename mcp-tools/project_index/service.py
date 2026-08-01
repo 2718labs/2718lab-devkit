@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -97,7 +98,9 @@ class _StandaloneWorkspaceRootAuthority:
         self._registry = registry
 
     def resolve(self, workspace_id: str) -> _StandaloneWorkspaceAccess:
-        return _StandaloneWorkspaceAccess(workspace_id, self._registry.resolve(workspace_id))
+        return _StandaloneWorkspaceAccess(
+            workspace_id, self._registry.resolve(workspace_id)
+        )
 
 
 def _workspace_authority_for(registry: WorkspaceRegistry) -> WorkspaceRootAuthority:
@@ -108,8 +111,27 @@ def _workspace_authority_for(registry: WorkspaceRegistry) -> WorkspaceRootAuthor
     except ModuleNotFoundError as exc:
         if exc.name not in {"devkit_runtime", "devkit_runtime.workspace_authority"}:
             raise
-        return cast("WorkspaceRootAuthority", _StandaloneWorkspaceRootAuthority(registry))
+        return cast(
+            "WorkspaceRootAuthority", _StandaloneWorkspaceRootAuthority(registry)
+        )
     return WorkspaceRootAuthority(registry)
+
+
+def _called_by_runtime_bootstrap() -> bool:
+    """Keep the explicit bootstrap call as the only mutating constructor path."""
+
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            if (
+                frame.f_code.co_name == "_bootstrap_stores"
+                and frame.f_globals.get("__name__") == "devkit_runtime.bootstrap"
+            ):
+                return True
+            frame = frame.f_back
+    finally:
+        del frame
+    return False
 
 
 class ProjectIndexService:
@@ -118,12 +140,19 @@ class ProjectIndexService:
     def __init__(self, database_path: str | Path) -> None:
         self._database_path = Path(database_path).resolve(strict=False)
         try:
-            self._store = ProjectIndexStore(self._database_path)
+            if _called_by_runtime_bootstrap():
+                self._store = ProjectIndexStore.bootstrap(self._database_path)
+            else:
+                self._store = ProjectIndexStore.open_prepared(self._database_path)
             self._registry = WorkspaceRegistry(self._store)
             self._workspace_authority = _workspace_authority_for(self._registry)
         except sqlite3.DatabaseError as exc:
             raise IndexError(
                 "INDEX_CORRUPT", "project index database is corrupt"
+            ) from exc
+        except StoreError as exc:
+            raise IndexError(
+                "INDEX_UNAVAILABLE", "project index database is unavailable"
             ) from exc
         except OSError as exc:
             raise IndexError(
@@ -729,10 +758,6 @@ class ProjectIndexService:
         if not isinstance(workspace_id, str) or not is_workspace_id(workspace_id):
             raise IndexError("WORKSPACE_UNREGISTERED", "workspace is not registered")
         return workspace_id, self.workspace_authority.resolve(workspace_id).root
-
-    def _workspace_root(self, workspace_id: str) -> Path:
-        """Deprecated Atlas compatibility shim until the R3 migration."""
-        return self.workspace_authority.resolve(workspace_id).root
 
     def _normalize_paths(self, paths: Sequence[str | Path] | None) -> tuple[str, ...]:
         if paths is None:

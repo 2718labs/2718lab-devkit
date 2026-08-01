@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+import sqlite3
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from devkit_runtime.bootstrap import RuntimeBootstrap
+from devkit_runtime.config import RuntimeConfig
 from devkit_runtime.project_checkpoint import (
     open_project_checkpoint_ro,
     open_project_checkpoint_rw,
@@ -17,6 +22,7 @@ from devkit_runtime.workspace_authority import VerifiedWorkspaceAccess
 from project_index.checkpoints import CheckpointService, WorkspaceOwnership
 from project_index.models import IndexError
 from project_index.service import ProjectIndexService
+from project_index.store import ProjectIndexStore, StoreError
 
 
 def _file_state(path: Path) -> tuple[tuple[str, bytes], ...]:
@@ -49,10 +55,26 @@ def _git(*args: str, cwd: Path) -> None:
 def _prepared_database(
     tmp_path: Path,
 ) -> tuple[Path, Path, str, str, Path, Path]:
-    """Use legacy bootstrap only to prepare state for a zero-write runtime open."""
+    """Explicitly bootstrap state before exercising zero-write runtime opens."""
 
-    database_path = tmp_path / "project-index.sqlite3"
-    cas_root = tmp_path / "checkpoint-cas"
+    bootstrap_scratch = tmp_path.parent / f"{tmp_path.name}-bootstrap-scratch"
+    bootstrap_scratch.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path),
+            "CODEX_TASK_TEMP": str(bootstrap_scratch),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    database_path = config.project_index_database
+    cas_root = config.checkpoint_cas_root
     original = tmp_path / "original"
     workspace = tmp_path / "workspace"
     original.mkdir()
@@ -72,12 +94,16 @@ def _prepared_database(
     _git("worktree", "add", "-b", "runtime-task", str(workspace), cwd=original)
     (workspace / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
 
-    index = ProjectIndexService(database_path)
-    workspace_id = index.project_index_register(workspace)
-    snapshot_id = index.sync(workspace_id).snapshot_id
-    checkpoints = CheckpointService(database_path, cas_root, index)
-    checkpoints.close()
-    index.close()
+    runtime = open_project_checkpoint_rw(
+        database_path,
+        cas_root,
+        scratch_root=bootstrap_scratch,
+    )
+    try:
+        workspace_id = runtime.project_index.project_index_register(workspace)
+        snapshot_id = runtime.project_index.sync(workspace_id).snapshot_id
+    finally:
+        runtime.close()
     return database_path, cas_root, workspace_id, snapshot_id, workspace, original
 
 
@@ -85,6 +111,91 @@ def _assert_error(code: str, operation) -> None:
     with pytest.raises(IndexError) as captured:
         operation()
     assert captured.value.code == code
+
+
+def test_legacy_constructors_reject_missing_storage_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "missing" / "project-index.sqlite3"
+    cas_root = tmp_path / "missing" / "checkpoint-cas"
+    before = _file_state(tmp_path)
+
+    with pytest.raises(StoreError):
+        ProjectIndexStore(database_path)
+    assert _file_state(tmp_path) == before
+
+    _assert_error("INDEX_UNAVAILABLE", lambda: ProjectIndexService(database_path))
+    assert _file_state(tmp_path) == before
+
+    _assert_error(
+        "INDEX_UNAVAILABLE",
+        lambda: CheckpointService(database_path, cas_root, object()),
+    )
+    assert _file_state(tmp_path) == before
+
+
+def test_checkpoint_service_status_requires_a_workspace_boundary() -> None:
+    assert tuple(inspect.signature(CheckpointService.status).parameters) == (
+        "self",
+        "workspace_id",
+        "checkpoint_id",
+    )
+
+
+def test_production_retirement_inventory_keeps_only_bootstrap_constructors() -> None:
+    source_root = Path(__file__).resolve().parents[1]
+    sources = {
+        relative: ast.parse((source_root / relative).read_text(encoding="utf-8"))
+        for relative in (
+            "project_index/service.py",
+            "project_index/store.py",
+            "project_index/checkpoints.py",
+            "devkit_atlas/service.py",
+            "server.py",
+            "devkit_runtime/bootstrap.py",
+        )
+    }
+    constructor_callers: set[str] = set()
+    for relative, tree in sources.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in {
+                    "ProjectIndexStore",
+                    "ProjectIndexService",
+                    "CheckpointService",
+                }:
+                    constructor_callers.add(relative)
+
+    assert constructor_callers == {"devkit_runtime/bootstrap.py"}
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "_workspace_root"
+        for relative, tree in sources.items()
+        if relative != "devkit_runtime/bootstrap.py"
+        for node in ast.walk(tree)
+    )
+
+
+def test_positive_test_callers_use_runtime_openers_not_legacy_constructors() -> None:
+    source_root = Path(__file__).resolve().parents[1]
+    sources = {
+        relative: ast.parse((source_root / relative).read_text(encoding="utf-8"))
+        for relative in (
+            "devkit_runtime/bootstrap.py",
+            "tests/test_atlas_acceptance.py",
+            "tests/test_atlas_service.py",
+            "tests/test_project_index_checkpoints.py",
+            "tests/test_project_index_core.py",
+            "tests/test_project_index_registry_v3.py",
+        )
+    }
+    constructor_callers: set[str] = set()
+    for relative, tree in sources.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in {"ProjectIndexService", "CheckpointService"}:
+                    constructor_callers.add(relative)
+
+    assert constructor_callers == {"devkit_runtime/bootstrap.py"}
 
 
 def test_readonly_bundle_uses_one_r0_snapshot_without_durable_side_effects(
@@ -153,9 +264,16 @@ def test_readwrite_bundle_shares_one_connection_and_persists_query_receipt(
 
     with pytest.raises(Exception):
         connection.execute("SELECT 1")
-    reopened = ProjectIndexService(database_path)
+    reopened = open_project_checkpoint_rw(
+        database_path,
+        cas_root,
+        scratch_root=scratch_root,
+    )
     try:
-        assert reopened.get_query_receipt(result.trace_id).trace_id == result.trace_id
+        assert (
+            reopened.project_index.get_query_receipt(result.trace_id).trace_id
+            == result.trace_id
+        )
     finally:
         reopened.close()
 
@@ -320,9 +438,7 @@ def test_scoped_create_status_and_restore_prioritize_workspace_identity(
         checkpoint = runtime.create(workspace_id, ownership, snapshot_id)
         _assert_error(
             "NOT_FOUND",
-            lambda: runtime.status(
-                second_workspace_id, checkpoint.checkpoint_id
-            ),
+            lambda: runtime.status(second_workspace_id, checkpoint.checkpoint_id),
         )
         _assert_error(
             "WORKTREE_UNOWNED",

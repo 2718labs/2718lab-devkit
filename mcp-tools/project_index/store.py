@@ -50,17 +50,51 @@ class ProjectIndexStore:
     _SCHEMA_VERSION = 4
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        """Open an existing prepared store without changing durable state."""
+
+        self.database_path = Path(database_path).resolve(strict=False)
         self._owns_connection = True
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(
-            str(self.database_path), isolation_level=None
-        )
+        try:
+            connection = sqlite3.connect(
+                self.database_path.as_uri() + "?mode=rw",
+                uri=True,
+                isolation_level=None,
+            )
+        except sqlite3.DatabaseError as exc:
+            raise StoreError("project index store is not prepared") from exc
+        self._connection = connection
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA busy_timeout = 5000")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        try:
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA busy_timeout = 5000")
+            self.validate_prepared_connection(self._connection)
+        except (sqlite3.DatabaseError, StoreError):
+            self.close()
+            raise
+
+    @classmethod
+    def bootstrap(cls, database_path: str | Path) -> ProjectIndexStore:
+        """Create and migrate storage exclusively for RuntimeBootstrap."""
+
+        store = cls.__new__(cls)
+        store.database_path = Path(database_path).resolve(strict=False)
+        store._owns_connection = True
+        store.database_path.parent.mkdir(parents=True, exist_ok=True)
+        store._connection = sqlite3.connect(
+            str(store.database_path), isolation_level=None
+        )
+        store._connection.row_factory = sqlite3.Row
+        store._connection.execute("PRAGMA foreign_keys = ON")
+        store._connection.execute("PRAGMA busy_timeout = 5000")
+        store._connection.execute("PRAGMA journal_mode = WAL")
+        store._create_schema()
+        return store
+
+    @classmethod
+    def open_prepared(cls, database_path: str | Path) -> ProjectIndexStore:
+        """Retain a named zero-write opener for legacy service construction."""
+
+        return cls(database_path)
 
     @classmethod
     def from_prepared_connection(

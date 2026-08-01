@@ -1734,7 +1734,9 @@ class AtlasService:
         try:
             self._project_index.assert_current(workspace_id, snapshot_id)
             facts = self._project_index.snapshot_facts(workspace_id, snapshot_id)
-            workspace_root = self._project_index._workspace_root(workspace_id)
+            workspace_root = self._project_index.workspace_authority.resolve(
+                workspace_id
+            ).root
         except IndexError as exc:
             return self._index_failure(exc)
         target_paths = self._validate_workspace_paths(target_paths, workspace_root)
@@ -2128,7 +2130,9 @@ class AtlasService:
         try:
             self._project_index.assert_current(workspace_id, snapshot_id)
             facts = self._project_index.snapshot_facts(workspace_id, snapshot_id)
-            workspace_root = self._project_index._workspace_root(workspace_id)
+            workspace_root = self._project_index.workspace_authority.resolve(
+                workspace_id
+            ).root
             repository_signature = structural_repository_signature(
                 facts,
                 language=manifest.language_name,

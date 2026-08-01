@@ -17,6 +17,9 @@ if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
 import project_index.checkpoints as checkpoints_module  # noqa: E402
+from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
+from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from devkit_runtime.project_checkpoint import open_project_checkpoint_rw  # noqa: E402
 from devkit_runtime.workspace_authority import WorkspaceRootAuthority  # noqa: E402
 from project_index import IndexError, ProjectIndexService  # noqa: E402
 from project_index.checkpoints import (  # noqa: E402
@@ -119,6 +122,46 @@ class _FilesystemIndex:
             raise IndexError("NOT_FOUND", "request rejected")
 
 
+def _runtime_config(tmp_path: Path) -> RuntimeConfig:
+    root = tmp_path.parent / f"{tmp_path.name}-runtime-data"
+    scratch = tmp_path.parent / f"{tmp_path.name}-runtime-scratch"
+    scratch.mkdir(exist_ok=True)
+    config = RuntimeConfig.load(
+        environ={"PLUGIN_DATA": str(root), "CODEX_TASK_TEMP": str(scratch)}
+    )
+    RuntimeBootstrap.run(config)
+    return config
+
+
+def _checkpoint_service(
+    tmp_path: Path, index_service: _FilesystemIndex | ProjectIndexService
+) -> CheckpointService:
+    config = _runtime_config(tmp_path)
+    runtime = open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    )
+    connection = runtime._connection
+    assert connection is not None
+    return CheckpointService.from_prepared_connection(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        index_service,
+        index_service.workspace_authority,
+        connection,
+    )
+
+
+def _project_index_service(tmp_path: Path) -> ProjectIndexService:
+    config = _runtime_config(tmp_path)
+    return open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    ).project_index
+
+
 @dataclass(frozen=True)
 class _Repository:
     original: Path
@@ -211,12 +254,7 @@ def index_service() -> _FilesystemIndex:
 
 @pytest.fixture
 def service(tmp_path: Path, index_service: _FilesystemIndex) -> CheckpointService:
-    instance = CheckpointService(
-        tmp_path / "index.sqlite3",
-        tmp_path / "checkpoint-cas",
-        index_service,
-        workspace_authority=index_service.workspace_authority,
-    )
+    instance = _checkpoint_service(tmp_path, index_service)
     yield instance
     instance.close()
 
@@ -281,24 +319,24 @@ def test_create_is_content_addressed_idempotent_and_reopens(
     (scope / "alpha.bin").write_bytes(b"alpha\x00\r\n")
     (scope / "empty").mkdir()
     snapshot = _snapshot(index_service, repository.worktree)
-    database = tmp_path / "index.sqlite3"
-    cas_root = tmp_path / "checkpoint-cas"
+    config = _runtime_config(tmp_path)
+    cas_root = config.checkpoint_cas_root
     ownership = _ownership(index_service, repository.worktree)
 
-    first_service = CheckpointService(database, cas_root, index_service)
+    first_service = _checkpoint_service(tmp_path, index_service)
     first = first_service.create(ownership, snapshot.snapshot_id)
     repeated = first_service.create(ownership, snapshot.snapshot_id)
-    first_status = first_service.status(first.checkpoint_id)
+    first_status = first_service.status(ownership.workspace_id, first.checkpoint_id)
     first_service.close()
 
-    reopened = CheckpointService(database, cas_root, index_service)
+    reopened = _checkpoint_service(tmp_path, index_service)
     try:
         assert repeated == first
         assert first_status == first
-        assert reopened.status(first.checkpoint_id) == first
-        assert reopened.status(first.checkpoint_id) == reopened.status(
-            first.checkpoint_id
-        )
+        assert reopened.status(ownership.workspace_id, first.checkpoint_id) == first
+        assert reopened.status(
+            ownership.workspace_id, first.checkpoint_id
+        ) == reopened.status(ownership.workspace_id, first.checkpoint_id)
         assert first.snapshot_id == snapshot.snapshot_id
         assert first.entry_count == 3
         assert first.manifest_hash.startswith("sha256:")
@@ -316,9 +354,8 @@ def test_create_accepts_directory_scope_with_real_project_index(
     scope = repository.worktree / "scope"
     scope.mkdir()
     (scope / "tracked.txt").write_bytes(b"tracked\n")
-    database = tmp_path / "real-index.sqlite3"
-    index = ProjectIndexService(database)
-    service = CheckpointService(database, tmp_path / "real-cas", index)
+    index = _project_index_service(tmp_path)
+    service = _checkpoint_service(tmp_path, index)
     try:
         snapshot = _snapshot(index, repository.worktree)
 
@@ -378,7 +415,7 @@ def test_restore_add_change_delete_is_exact_and_creates_rescue_checkpoint(
     assert restored.checkpoint_id == target.checkpoint_id
     assert restored.restored_snapshot_id == target_snapshot.snapshot_id
     assert restored.rescue_checkpoint_id != target.checkpoint_id
-    rescue = service.status(restored.rescue_checkpoint_id)
+    rescue = service.status(ownership.workspace_id, restored.rescue_checkpoint_id)
     assert rescue.kind == "rescue"
     assert rescue.snapshot_id == current_snapshot.snapshot_id
     assert changed.read_bytes() == b"before\x00\xff\r\n"
@@ -696,9 +733,9 @@ def test_create_rejects_cas_reparse_escape(
     scope = repository.worktree / "scope"
     scope.mkdir()
     (scope / "tracked.txt").write_bytes(b"checkpoint\n")
-    database = tmp_path / "cas-index.sqlite3"
-    cas_root = tmp_path / "cas-root"
-    service = CheckpointService(database, cas_root, index_service)
+    config = _runtime_config(tmp_path)
+    cas_root = config.checkpoint_cas_root
+    service = _checkpoint_service(tmp_path, index_service)
     external = tmp_path / "external-cas"
     external.mkdir()
     try:
@@ -740,20 +777,21 @@ def test_status_rejects_tampered_checkpoint_identity(
     scope = repository.worktree / "scope"
     scope.mkdir()
     (scope / "tracked.txt").write_bytes(b"checkpoint\n")
-    database = tmp_path / "tampered-index.sqlite3"
-    cas_root = tmp_path / "tampered-cas"
+    config = _runtime_config(tmp_path)
+    database = config.project_index_database
     ownership = _ownership(index_service, repository.worktree)
     snapshot = _snapshot(index_service, repository.worktree)
-    service = CheckpointService(database, cas_root, index_service)
+    service = _checkpoint_service(tmp_path, index_service)
     checkpoint = service.create(ownership, snapshot.snapshot_id)
     service.close()
     with sqlite3.connect(database) as connection:
         connection.execute(statement)
 
-    reopened = CheckpointService(database, cas_root, index_service)
+    reopened = _checkpoint_service(tmp_path, index_service)
     try:
         _assert_error(
-            "INDEX_CORRUPT", lambda: reopened.status(checkpoint.checkpoint_id)
+            "INDEX_CORRUPT",
+            lambda: reopened.status(ownership.workspace_id, checkpoint.checkpoint_id),
         )
     finally:
         reopened.close()
@@ -767,17 +805,17 @@ def test_idempotent_create_does_not_repair_tampered_checkpoint(
     scope = repository.worktree / "scope"
     scope.mkdir()
     (scope / "tracked.txt").write_bytes(b"checkpoint\n")
-    database = tmp_path / "tampered-create-index.sqlite3"
-    cas_root = tmp_path / "tampered-create-cas"
+    config = _runtime_config(tmp_path)
+    database = config.project_index_database
     ownership = _ownership(index_service, repository.worktree)
     snapshot = _snapshot(index_service, repository.worktree)
-    service = CheckpointService(database, cas_root, index_service)
+    service = _checkpoint_service(tmp_path, index_service)
     service.create(ownership, snapshot.snapshot_id)
     service.close()
     with sqlite3.connect(database) as connection:
         connection.execute("DELETE FROM checkpoint_entries")
 
-    reopened = CheckpointService(database, cas_root, index_service)
+    reopened = _checkpoint_service(tmp_path, index_service)
     try:
         _assert_error(
             "INDEX_CORRUPT",
@@ -787,8 +825,15 @@ def test_idempotent_create_does_not_repair_tampered_checkpoint(
         reopened.close()
 
 
-def test_status_unknown_checkpoint_is_not_found(service: CheckpointService) -> None:
-    _assert_error("NOT_FOUND", lambda: service.status("sha256:" + "0" * 64))
+def test_status_unknown_checkpoint_is_not_found(
+    repository: _Repository,
+    service: CheckpointService,
+    index_service: _FilesystemIndex,
+) -> None:
+    workspace_id = _workspace_id(index_service, repository.worktree)
+    _assert_error(
+        "NOT_FOUND", lambda: service.status(workspace_id, "sha256:" + "0" * 64)
+    )
 
 
 def test_checkpoint_files_require_task_ownership(
@@ -1037,9 +1082,9 @@ def test_checkpoint_file_reader_rejects_tampered_record_metadata(
     scope = repository.worktree / "scope"
     scope.mkdir()
     (scope / "module.py").write_bytes(b"record-marker")
-    database = tmp_path / "reader-record.sqlite3"
-    cas_root = tmp_path / "reader-record-cas"
-    service = CheckpointService(database, cas_root, index_service)
+    config = _runtime_config(tmp_path)
+    database = config.project_index_database
+    service = _checkpoint_service(tmp_path, index_service)
     checkpoint = service.create(
         _ownership(index_service, repository.worktree),
         _snapshot(index_service, repository.worktree).snapshot_id,
@@ -1047,7 +1092,7 @@ def test_checkpoint_file_reader_rejects_tampered_record_metadata(
     service.close()
     with sqlite3.connect(database) as connection:
         connection.execute(statement)
-    reopened = CheckpointService(database, cas_root, index_service)
+    reopened = _checkpoint_service(tmp_path, index_service)
     try:
         _assert_error(
             "INDEX_CORRUPT",
@@ -1125,9 +1170,9 @@ def test_checkpoint_file_reader_rejects_cas_reparse_parent(
     scope = repository.worktree / "scope"
     scope.mkdir()
     (scope / "module.py").write_bytes(b"safe")
-    database = tmp_path / "reader-cas-link.sqlite3"
-    cas_root = tmp_path / "reader-cas-link"
-    service = CheckpointService(database, cas_root, index_service)
+    config = _runtime_config(tmp_path)
+    cas_root = config.checkpoint_cas_root
+    service = _checkpoint_service(tmp_path, index_service)
     checkpoint = service.create(
         _ownership(index_service, repository.worktree),
         _snapshot(index_service, repository.worktree).snapshot_id,

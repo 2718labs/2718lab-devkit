@@ -31,6 +31,8 @@ from devkit_atlas.models import (
     RecipeManifest,
     SlotSpec,
     TemplateOperation,
+)
+from devkit_atlas.models import (
     TestSpec as AtlasTestSpec,
 )
 from devkit_atlas.recipes import BundledRecipeLoader
@@ -44,9 +46,17 @@ from devkit_atlas.security import (
 )
 from devkit_atlas.service import (
     AtlasService,
+)
+from devkit_atlas.service import (
     _placeholder_names as _local_placeholder_names,
 )
 from devkit_atlas.store import AtlasStore
+from devkit_runtime.bootstrap import RuntimeBootstrap
+from devkit_runtime.config import RuntimeConfig
+from devkit_runtime.project_checkpoint import (
+    ProjectCheckpointRuntime,
+    open_project_checkpoint_rw,
+)
 from project_index.models import (
     CoverageGap,
     IndexError,
@@ -56,7 +66,6 @@ from project_index.models import (
     SnapshotFacts,
 )
 from project_index.service import ProjectIndexService
-
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSETS = ASSET_ROOT
@@ -675,6 +684,18 @@ class AtlasEnvironment:
     store: AtlasStore
     index: ProjectIndexService
     service: AtlasService
+    runtime: ProjectCheckpointRuntime
+
+
+def _runtime_config(tmp_path: Path) -> RuntimeConfig:
+    data_root = tmp_path / "runtime-data"
+    scratch = tmp_path / "runtime-scratch"
+    scratch.mkdir()
+    config = RuntimeConfig.load(
+        environ={"PLUGIN_DATA": str(data_root), "CODEX_TASK_TEMP": str(scratch)}
+    )
+    RuntimeBootstrap.run(config)
+    return config
 
 
 @pytest.fixture
@@ -692,14 +713,22 @@ def atlas_environment(tmp_path: Path):
     )
     database = tmp_path / "atlas.sqlite3"
     store = AtlasStore(database, tmp_path / "atlas-cas")
-    index = ProjectIndexService(tmp_path / "index.sqlite3")
+    config = _runtime_config(tmp_path)
+    runtime = open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    )
+    index = runtime.project_index
     workspace_id = index.project_index_register(root)
     service = AtlasService(store, BundledRecipeLoader(ASSETS), index)
-    environment = AtlasEnvironment(root, workspace_id, database, store, index, service)
+    environment = AtlasEnvironment(
+        root, workspace_id, database, store, index, service, runtime
+    )
     try:
         yield environment
     finally:
-        index.close()
+        runtime.close()
         store.close()
 
 

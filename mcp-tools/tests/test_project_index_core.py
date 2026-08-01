@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
@@ -14,12 +15,63 @@ MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
-from project_index import IndexError, IndexState, ProjectIndexService  # noqa: E402
 import project_index.service as service_module  # noqa: E402
+from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
+from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from devkit_runtime.project_checkpoint import open_project_checkpoint_rw  # noqa: E402
+from project_index import IndexError, IndexState, ProjectIndexService  # noqa: E402
 
 
-def _service(tmp_path: Path) -> ProjectIndexService:
-    return ProjectIndexService(tmp_path / "index.sqlite3")
+@dataclass(frozen=True)
+class _CustomProjectDatabaseConfig(RuntimeConfig):
+    project_database: Path
+
+    @property
+    def project_index_database(self) -> Path:
+        return self.project_database
+
+
+def _runtime_config(
+    tmp_path: Path,
+    *,
+    data_root: Path | None = None,
+    project_database: Path | None = None,
+) -> RuntimeConfig:
+    root = data_root or tmp_path.parent / f"{tmp_path.name}-runtime-data"
+    scratch = tmp_path.parent / f"{tmp_path.name}-runtime-scratch"
+    scratch.mkdir(exist_ok=True)
+    base = RuntimeConfig.load(
+        environ={"PLUGIN_DATA": str(root), "CODEX_TASK_TEMP": str(scratch)}
+    )
+    config = (
+        base
+        if project_database is None
+        else _CustomProjectDatabaseConfig(
+            data_root=base.data_root,
+            scratch_root=base.scratch_root,
+            project_database=project_database,
+        )
+    )
+    RuntimeBootstrap.run(config)
+    return config
+
+
+def _service(
+    tmp_path: Path,
+    *,
+    data_root: Path | None = None,
+    project_database: Path | None = None,
+) -> ProjectIndexService:
+    config = _runtime_config(
+        tmp_path,
+        data_root=data_root,
+        project_database=project_database,
+    )
+    return open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    ).project_index
 
 
 def test_git_head_uses_devnull_for_stdin(
@@ -72,7 +124,7 @@ def test_sync_is_deterministic_and_reuses_unchanged_blobs(tmp_path: Path) -> Non
     assert changed.file_count == 2
 
     service.close()
-    reopened = ProjectIndexService(tmp_path / "index.sqlite3")
+    reopened = _service(tmp_path)
     assert reopened.project_index_register(workspace) == workspace_id
     assert reopened.status(workspace_id).snapshot_id == changed.snapshot_id
     reopened.close()
@@ -685,7 +737,7 @@ def test_snapshot_facts_and_files_are_hash_verified(tmp_path: Path) -> None:
     workspace.mkdir()
     source = workspace / "module.py"
     source.write_bytes(b"VALUE = 1\n")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     facts = service.snapshot_facts(workspace_id, snapshot.snapshot_id)
@@ -712,8 +764,8 @@ def test_snapshot_file_body_is_not_stored_in_the_index_database(tmp_path: Path) 
     workspace.mkdir()
     marker = b"ATLAS05_SOURCE_MARKER_7fddb342\n"
     (workspace / "marker.txt").write_bytes(marker)
-    database = tmp_path / "index.sqlite3"
-    service = ProjectIndexService(database)
+    database = _runtime_config(tmp_path).project_index_database
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     assert (
@@ -733,7 +785,7 @@ def test_snapshot_file_reader_rejects_invalid_budgets(
     workspace = tmp_path / "repo"
     workspace.mkdir()
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     with pytest.raises(IndexError):
@@ -752,7 +804,7 @@ def test_snapshot_file_reader_rejects_stale_foreign_and_unsafe_inputs(
     foreign.mkdir()
     (workspace / "a.py").write_bytes(b"A\n")
     (workspace / "b.py").write_bytes(b"B\n")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     foreign_id = service.project_index_register(foreign)
     snapshot = service.sync(workspace_id)
@@ -796,7 +848,7 @@ def test_snapshot_file_reader_captures_each_target_once(
     workspace = tmp_path / "repo"
     workspace.mkdir()
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     observed: list[str] = []
@@ -824,7 +876,7 @@ def test_snapshot_file_reader_orders_and_bounds_without_partial_output(
     workspace.mkdir()
     (workspace / "a.py").write_bytes(b"aa")
     (workspace / "b.py").write_bytes(b"bb")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     assert tuple(
@@ -853,7 +905,7 @@ def test_snapshot_file_reader_rejects_absolute_drive_and_unc_paths(
     workspace = tmp_path / "repo"
     workspace.mkdir()
     (workspace / "a.py").write_bytes(b"x")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     with pytest.raises(IndexError):
@@ -876,8 +928,8 @@ def test_snapshot_file_reader_rejects_directory_and_preserves_inputs(
     source = workspace / "a.py"
     source.write_bytes(b"marker")
     (workspace / "folder").mkdir()
-    database = tmp_path / "index.sqlite3"
-    service = ProjectIndexService(database)
+    database = _runtime_config(tmp_path).project_index_database
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     workspace_before = tuple(
@@ -911,7 +963,7 @@ def test_snapshot_file_reader_rejects_symlink_probe(tmp_path: Path) -> None:
     workspace.mkdir()
     source = workspace / "source.py"
     source.write_bytes(b"marker")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     link = workspace / "link.py"
@@ -946,7 +998,7 @@ def test_snapshot_file_reader_rejects_same_size_atomic_replacement(
     target.write_bytes(b"safe")
     replacement = workspace / "replacement.py"
     replacement.write_bytes(b"evil")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id, include_paths=("module.py",))
     original_open = service_module.os.open
@@ -982,7 +1034,7 @@ def test_snapshot_file_reader_rejects_directory_junction_parent(
     external = tmp_path / "external"
     external.mkdir()
     (external / "module.py").write_bytes(b"outside")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     (parent / "module.py").unlink()
@@ -1049,7 +1101,7 @@ def test_snapshot_file_reader_prevalidates_aggregate_before_requested_body_reads
     workspace.mkdir()
     (workspace / "a.py").write_bytes(b"aaa")
     (workspace / "b.py").write_bytes(b"bbb")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     original_open = service_module.os.open
@@ -1104,7 +1156,7 @@ def test_snapshot_file_reader_rejects_duplicate_requests_before_any_scan(
     workspace = tmp_path / "repo"
     workspace.mkdir()
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
 
@@ -1136,7 +1188,7 @@ def test_snapshot_file_reader_caps_retained_reads_when_file_grows_after_fstat(
     workspace.mkdir()
     source = workspace / "module.py"
     source.write_bytes(b"x")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     original_fdopen = service_module.os.fdopen
@@ -1178,7 +1230,7 @@ def test_snapshot_file_reader_streams_large_unrequested_file_without_body_retent
     (workspace / "requested.py").write_bytes(b"requested\n")
     unrequested = workspace / "large.bin"
     unrequested.write_bytes(b"x" * (8 * 1024 * 1024))
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     original = service_module._stream_workspace_file
@@ -1311,7 +1363,7 @@ def test_snapshot_file_reader_stops_unrequested_growth_after_size_probe(
     unrequested.write_bytes(b"x")
     requested = workspace / "z-requested.py"
     requested.write_bytes(b"requested\n")
-    service = ProjectIndexService(tmp_path / "index.sqlite3")
+    service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     original_open = service_module.os.open
@@ -1399,7 +1451,7 @@ def test_snapshot_file_reader_ignores_its_custom_database_inside_workspace(
     workspace.mkdir()
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
     database = workspace / "custom-reader-cache.sqlite3"
-    service = ProjectIndexService(database)
+    service = _service(tmp_path, project_database=database)
     workspace_id = service.project_index_register(workspace)
     snapshot = service.sync(workspace_id)
     assert tuple(

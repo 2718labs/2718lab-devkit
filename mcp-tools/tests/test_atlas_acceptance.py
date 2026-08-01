@@ -25,6 +25,9 @@ from devkit_atlas.receipts import (  # noqa: E402
     RawExecutionReceipt,
     ReceiptRepository,
 )
+from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
+from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from devkit_runtime.project_checkpoint import open_project_checkpoint_rw  # noqa: E402
 from orchestrator.models import (  # noqa: E402
     AtlasOutboxState,
     Task,
@@ -41,8 +44,6 @@ from orchestrator.store import (  # noqa: E402
     SQLiteStore,
     StoreError,
 )
-from project_index.checkpoints import CheckpointService  # noqa: E402
-from project_index.service import ProjectIndexService  # noqa: E402
 
 
 class _StaticReceiptRepository:
@@ -126,14 +127,23 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
         )
         self.source = self.workspace / "src" / "app.py"
 
-        self.index = ProjectIndexService(self.root / "project-index.sqlite")
-        self.addCleanup(self.index.close)
-        self.checkpoints = CheckpointService(
-            self.root / "checkpoints.sqlite",
-            self.root / "checkpoint-cas",
-            self.index,
+        runtime_scratch = self.root / "runtime-scratch"
+        runtime_scratch.mkdir()
+        runtime_config = RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(self.root / "runtime-data"),
+                "CODEX_TASK_TEMP": str(runtime_scratch),
+            }
         )
-        self.addCleanup(self.checkpoints.close)
+        RuntimeBootstrap.run(runtime_config)
+        self.project_runtime = open_project_checkpoint_rw(
+            runtime_config.project_index_database,
+            runtime_config.checkpoint_cas_root,
+            scratch_root=runtime_config.scratch_root,
+        )
+        self.addCleanup(self.project_runtime.close)
+        self.index = self.project_runtime.project_index
+        self.checkpoints = self.project_runtime._checkpoints
         self.receipts = ReceiptRepository(self.root / "receipts")
         self.store = SQLiteStore(self.root / "orchestrator.sqlite")
         self.addCleanup(self.store.close)
