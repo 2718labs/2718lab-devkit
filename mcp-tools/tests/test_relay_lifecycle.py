@@ -89,6 +89,118 @@ def _recovery_request(
     }
 
 
+class _NoProofProviderStore:
+    """Lifecycle double that makes proof-provider reachability observable."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def approve_readonly(self, **_: object) -> dict[str, object]:
+        self.calls.append("approve_readonly")
+        return {"action": "approve_readonly"}
+
+    def review_candidate(self, **_: object) -> dict[str, object]:
+        self.calls.append("review")
+        return {"action": "review"}
+
+    def rebase_candidate(self, **_: object) -> dict[str, object]:
+        self.calls.append("rebase")
+        return {"action": "rebase"}
+
+    def reject_candidate(self, **_: object) -> dict[str, object]:
+        self.calls.append("reject")
+        return {"action": "reject"}
+
+    def integration_expectation(self, **_: object) -> object:
+        self.calls.append("integration_expectation")
+        raise AssertionError("missing proof provider must be rejected before store")
+
+
+def _missing_proof_request(
+    relay: RelayService,
+    *,
+    action: str,
+    extra: dict[str, object],
+) -> dict[str, object]:
+    request = {
+        "workflow_id": "relay-runtime-v3",
+        "task_id": "writer-a",
+        "action": action,
+        "epoch": 1,
+        "endpoint": "sol-main",
+        "expected_task_version": 1,
+        "capability": relay.issue_sol_capability(
+            workflow_id="relay-runtime-v3",
+            task_id="writer-a",
+            action=action,
+            epoch=1,
+            endpoint="sol-main",
+        ),
+    }
+    return {**request, **extra}
+
+
+def test_missing_proof_provider_only_blocks_integrate_before_store_access() -> None:
+    store = _NoProofProviderStore()
+    relay = RelayService(
+        store,  # type: ignore[arg-type]
+        capability_secret=b"relay-v3-test-secret",
+        integration_proof_resolver=None,
+    )
+
+    with pytest.raises(RelayError) as caught:
+        relay.integrate(
+            _missing_proof_request(
+                relay,
+                action="integrate",
+                extra={
+                    "candidate_id": "candidate-a",
+                    "integration_proof_id": "sha256:" + "f" * 64,
+                },
+            )
+        )
+
+    assert caught.value.code == "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+    assert store.calls == []
+
+
+@pytest.mark.parametrize(
+    ("action", "extra"),
+    [
+        ("approve_readonly", {}),
+        (
+            "review",
+            {"candidate_id": "candidate-a", "review_digest": "sha256:" + "a" * 64},
+        ),
+        (
+            "rebase",
+            {
+                "candidate_id": "candidate-a",
+                "base_commit": "a" * 40,
+                "head_commit": "b" * 40,
+                "diff_hash": "sha256:" + "c" * 64,
+                "evidence_hashes": ["sha256:" + "d" * 64],
+            },
+        ),
+        ("reject", {"candidate_id": "candidate-a"}),
+    ],
+)
+def test_missing_proof_provider_preserves_nonintegrate_sol_actions(
+    action: str, extra: dict[str, object]
+) -> None:
+    store = _NoProofProviderStore()
+    relay = RelayService(
+        store,  # type: ignore[arg-type]
+        capability_secret=b"relay-v3-test-secret",
+        integration_proof_resolver=None,
+    )
+
+    result = relay.integrate(_missing_proof_request(relay, action=action, extra=extra))
+
+    assert result == {"action": action}
+    assert store.calls == [action]
+
+
 def test_candidate_handoff_releases_worker_slot_and_sol_integration_unblocks_dependency(
     tmp_path: Path,
 ) -> None:

@@ -1,0 +1,605 @@
+"""Framed host-private capability traffic over one inherited OS handle.
+
+The bridge deliberately has no listener, socket bootstrap, file mailbox, or
+environment-provided secret.  A launcher may pass only its dedicated inherited
+descriptor/handle selector; all capability material stays in authenticated
+frames on that private handle.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import struct
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Final
+
+_FRAME_SCHEMA: Final = "2718lab-devkit/host-bridge-v1"
+_FRAME_FIELDS: Final = frozenset(
+    {"schema", "kind", "action_id", "session_nonce", "sequence", "payload", "mac"}
+)
+_MAX_FRAME_BYTES: Final = 65_536
+_IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_ENDPOINT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MAC = re.compile(r"[0-9a-f]{64}\Z")
+_HANDLE_SELECTOR = re.compile(r"[0-9]{1,18}\Z")
+_MESSAGE_KINDS: Final = frozenset(
+    {
+        "session_open",
+        "capability_prepare",
+        "capability_recovery",
+        "capability_ack",
+        "proof_register",
+        "proof_attest",
+        "proof_result",
+    }
+)
+
+
+class HostBridgeError(RuntimeError):
+    """Stable internal failure; messages never echo a selector or bearer."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class CapabilityDeliveryReceipt:
+    """Bearer-free delivery state suitable for internal status bookkeeping."""
+
+    action_id: str
+    endpoint: str
+    state: str
+
+
+@dataclass(frozen=True)
+class PrivateHostMessage:
+    """One authenticated private message; its payload is intentionally redacted."""
+
+    kind: str
+    action_id: str
+    sequence: int
+    payload: dict[str, object] = field(repr=False)
+
+    def __repr__(self) -> str:
+        return (
+            "PrivateHostMessage("
+            f"kind={self.kind!r}, action_id={self.action_id!r}, sequence={self.sequence!r})"
+        )
+
+
+@dataclass
+class _CapabilityDelivery:
+    endpoint: str
+    capabilities: dict[str, str] = field(repr=False)
+    state: str = "prepared"
+
+    def receipt(self, action_id: str) -> CapabilityDeliveryReceipt:
+        return CapabilityDeliveryReceipt(
+            action_id=action_id, endpoint=self.endpoint, state=self.state
+        )
+
+
+class InheritedHandleHostBridge:
+    """Concrete non-listening bridge backed by a dedicated inherited handle.
+
+    ``from_environment`` is the launch-path constructor.  It accepts only the
+    numeric inherited handle selector frozen in the design lock.  The direct
+    descriptor constructor exists for an already-established host session and
+    for process-local harnesses; it does not open any listener.
+    """
+
+    def __init__(
+        self,
+        *,
+        read_fd: int,
+        write_fd: int,
+        session_key: bytes,
+        session_nonce: bytes,
+        owns_descriptors: bool,
+        bootstrap_required: bool,
+    ) -> None:
+        if type(read_fd) is not int or read_fd < 0:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if type(write_fd) is not int or write_fd < 0:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if type(session_key) is not bytes or len(session_key) != 32:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if type(session_nonce) is not bytes or not 16 <= len(session_nonce) <= 64:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        self._read_fd = read_fd
+        self._write_fd = write_fd
+        self._session_key = session_key
+        self._session_nonce = _b64encode(session_nonce)
+        self._owns_descriptors = owns_descriptors
+        self._bootstrap_required = bootstrap_required
+        self._bootstrap_sent = not bootstrap_required
+        self._next_out = 1
+        self._next_in = 1
+        self._deliveries: dict[str, _CapabilityDelivery] = {}
+        self._closed = False
+
+    @classmethod
+    def from_file_descriptors(
+        cls,
+        *,
+        read_fd: int,
+        write_fd: int,
+        session_key: bytes,
+        session_nonce: bytes,
+        owns_descriptors: bool = True,
+    ) -> InheritedHandleHostBridge:
+        """Build a bridge for an already private, authenticated session."""
+
+        return cls(
+            read_fd=read_fd,
+            write_fd=write_fd,
+            session_key=session_key,
+            session_nonce=session_nonce,
+            owns_descriptors=owns_descriptors,
+            bootstrap_required=False,
+        )
+
+    @classmethod
+    def from_environment(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        *,
+        platform: str | None = None,
+    ) -> InheritedHandleHostBridge | None:
+        """Open only the dedicated inherited handle selected by the launcher.
+
+        Absence is intentionally non-fatal so read-only Relay operations remain
+        available.  An invalid selector is fail-closed and is never reflected
+        into an exception, log, result, or environment value.
+        """
+
+        values = os.environ if environ is None else environ
+        target_platform = os.name if platform is None else platform
+        if target_platform == "nt":
+            selector = values.get("CODEX_DEVKIT_HOST_BRIDGE_HANDLE")
+        elif target_platform == "posix":
+            selector = values.get("CODEX_DEVKIT_HOST_BRIDGE_FD")
+        else:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if selector is None or selector == "":
+            return None
+        if type(selector) is not str or _HANDLE_SELECTOR.fullmatch(selector) is None:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        handle = int(selector)
+        try:
+            if target_platform == "nt":
+                import msvcrt
+
+                descriptor = msvcrt.open_osfhandle(handle, os.O_BINARY)
+            else:
+                os.fstat(handle)
+                descriptor = os.dup(handle)
+                os.set_inheritable(descriptor, False)
+        except (ImportError, OSError, OverflowError, ValueError) as error:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+        return cls(
+            read_fd=descriptor,
+            write_fd=descriptor,
+            session_key=os.urandom(32),
+            session_nonce=os.urandom(32),
+            owns_descriptors=True,
+            bootstrap_required=True,
+        )
+
+    @classmethod
+    def accept_from_file_descriptors(
+        cls,
+        *,
+        read_fd: int,
+        write_fd: int,
+        owns_descriptors: bool = True,
+    ) -> InheritedHandleHostBridge:
+        """Accept a session-open frame sent by an inherited-handle peer.
+
+        This is a host-private counterpart, not a public socket/listener.  The
+        initial key is carried only through the possessed inherited handle, and
+        every following frame is MACed with it.
+        """
+
+        raw = cls._read_raw_frame(read_fd)
+        frame = _decode_frame(raw)
+        payload = frame.get("payload")
+        session_nonce_value = frame.get("session_nonce")
+        if (
+            frame.get("schema") != _FRAME_SCHEMA
+            or frame.get("kind") != "session_open"
+            or frame.get("action_id") != "session"
+            or frame.get("sequence") != 0
+            or not isinstance(session_nonce_value, str)
+            or not isinstance(payload, dict)
+            or set(payload) != {"session_key"}
+        ):
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        encoded_key = payload.get("session_key")
+        if not isinstance(encoded_key, str):
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        try:
+            session_key = _b64decode(encoded_key)
+            session_nonce = _b64decode(session_nonce_value)
+        except ValueError as error:
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from error
+        bridge = cls(
+            read_fd=read_fd,
+            write_fd=write_fd,
+            session_key=session_key,
+            session_nonce=session_nonce,
+            owns_descriptors=owns_descriptors,
+            bootstrap_required=False,
+        )
+        bridge._verify_frame(frame, expected_sequence=0)
+        return bridge
+
+    @property
+    def is_available(self) -> bool:
+        return not self._closed
+
+    def prepare_capability(
+        self,
+        *,
+        action_id: str,
+        endpoint: str,
+        capabilities: Mapping[str, str],
+    ) -> CapabilityDeliveryReceipt:
+        """Deliver one action-keyed bearer bundle without persisting it."""
+
+        _validate_action_id(action_id)
+        _validate_endpoint(endpoint)
+        normalized = _validate_capabilities(capabilities)
+        current = self._deliveries.get(action_id)
+        if current is not None:
+            if current.endpoint != endpoint or current.capabilities != normalized:
+                raise HostBridgeError("HOST_BRIDGE_DELIVERY_CONFLICT")
+            return current.receipt(action_id)
+        current = _CapabilityDelivery(endpoint=endpoint, capabilities=normalized)
+        self._deliveries[action_id] = current
+        self.send_private(
+            kind="capability_prepare",
+            action_id=action_id,
+            payload={"endpoint": endpoint, "capabilities": normalized},
+        )
+        return current.receipt(action_id)
+
+    def recover_capability(self, action_id: str) -> CapabilityDeliveryReceipt:
+        """Re-send the same action-keyed private delivery, never a new lease."""
+
+        _validate_action_id(action_id)
+        current = self._deliveries.get(action_id)
+        if current is None:
+            raise HostBridgeError("HOST_BRIDGE_DELIVERY_UNKNOWN")
+        if current.state == "acknowledged":
+            return current.receipt(action_id)
+        current.state = "recovering"
+        self.send_private(
+            kind="capability_recovery",
+            action_id=action_id,
+            payload={
+                "endpoint": current.endpoint,
+                "capabilities": dict(current.capabilities),
+            },
+        )
+        return current.receipt(action_id)
+
+    def delivery_receipt(self, action_id: str) -> CapabilityDeliveryReceipt:
+        """Return only opaque delivery metadata, never a bearer."""
+
+        _validate_action_id(action_id)
+        current = self._deliveries.get(action_id)
+        if current is None:
+            raise HostBridgeError("HOST_BRIDGE_DELIVERY_UNKNOWN")
+        return current.receipt(action_id)
+
+    def send_acknowledgement(self, action_id: str) -> None:
+        """Send an authenticated host acknowledgement for a prepared delivery."""
+
+        _validate_action_id(action_id)
+        self.send_private(kind="capability_ack", action_id=action_id, payload={})
+
+    def register_proof(self, proof_id: str, proof: Mapping[str, object]) -> None:
+        """Forward a full integration proof only over the private bridge."""
+
+        _validate_proof_id(proof_id)
+        self.send_private(
+            kind="proof_register",
+            action_id="proof",
+            payload={"proof_id": proof_id, "proof": _json_object(proof)},
+        )
+
+    def request_proof_attestation(
+        self, proof_id: str, expectation: Mapping[str, object]
+    ) -> None:
+        """Request a host-private proof attestation without exposing its body."""
+
+        _validate_proof_id(proof_id)
+        self.send_private(
+            kind="proof_attest",
+            action_id="proof",
+            payload={"proof_id": proof_id, "expectation": _json_object(expectation)},
+        )
+
+    def send_private(
+        self, *, kind: str, action_id: str, payload: Mapping[str, object]
+    ) -> None:
+        """Write one canonical authenticated frame to the inherited handle."""
+
+        if kind not in _MESSAGE_KINDS or kind == "session_open":
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        _validate_action_id(action_id)
+        encoded_payload = _json_object(payload)
+        self._ensure_open()
+        if not self._bootstrap_sent:
+            self._send_bootstrap()
+        self._write_frame(
+            kind=kind,
+            action_id=action_id,
+            sequence=self._next_out,
+            payload=encoded_payload,
+        )
+        self._next_out += 1
+
+    def receive(self) -> PrivateHostMessage:
+        """Read and validate exactly one authenticated private frame."""
+
+        self._ensure_open()
+        frame = _decode_frame(self._read_raw_frame(self._read_fd))
+        self._verify_frame(frame, expected_sequence=self._next_in)
+        self._next_in += 1
+        kind = frame["kind"]
+        action_id = frame["action_id"]
+        payload = frame["payload"]
+        assert type(kind) is str
+        assert type(action_id) is str
+        assert type(frame["sequence"]) is int
+        assert type(payload) is dict
+        if kind == "capability_ack" and payload == {}:
+            delivery = self._deliveries.get(action_id)
+            if delivery is not None:
+                delivery.state = "acknowledged"
+        return PrivateHostMessage(
+            kind=kind,
+            action_id=action_id,
+            sequence=frame["sequence"],
+            payload=payload,
+        )
+
+    def close(self) -> None:
+        """Close only the descriptor(s) this bridge owns."""
+
+        if self._closed:
+            return
+        self._closed = True
+        if not self._owns_descriptors:
+            return
+        descriptors = {self._read_fd, self._write_fd}
+        self._read_fd = -1
+        self._write_fd = -1
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def _send_bootstrap(self) -> None:
+        self._write_frame(
+            kind="session_open",
+            action_id="session",
+            sequence=0,
+            payload={"session_key": _b64encode(self._session_key)},
+        )
+        self._bootstrap_sent = True
+
+    def _write_frame(
+        self, *, kind: str, action_id: str, sequence: int, payload: dict[str, object]
+    ) -> None:
+        unsigned = {
+            "schema": _FRAME_SCHEMA,
+            "kind": kind,
+            "action_id": action_id,
+            "session_nonce": self._session_nonce,
+            "sequence": sequence,
+            "payload": payload,
+        }
+        encoded = _canonical_bytes(unsigned)
+        frame = {
+            **unsigned,
+            "mac": hmac.new(self._session_key, encoded, hashlib.sha256).hexdigest(),
+        }
+        raw = _canonical_bytes(frame)
+        if len(raw) > _MAX_FRAME_BYTES:
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        self._write_all(struct.pack("!I", len(raw)) + raw)
+
+    def _verify_frame(
+        self, frame: dict[str, object], *, expected_sequence: int
+    ) -> None:
+        if set(frame) != _FRAME_FIELDS:
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        schema = frame["schema"]
+        kind = frame["kind"]
+        action_id = frame["action_id"]
+        session_nonce = frame["session_nonce"]
+        sequence = frame["sequence"]
+        payload = frame["payload"]
+        mac = frame["mac"]
+        if (
+            schema != _FRAME_SCHEMA
+            or type(kind) is not str
+            or kind not in _MESSAGE_KINDS
+            or type(action_id) is not str
+            or _IDENTIFIER.fullmatch(action_id) is None
+            or type(session_nonce) is not str
+            or session_nonce != self._session_nonce
+            or type(sequence) is not int
+            or type(sequence) is bool
+            or type(payload) is not dict
+            or type(mac) is not str
+            or _MAC.fullmatch(mac) is None
+        ):
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        unsigned = {
+            "schema": schema,
+            "kind": kind,
+            "action_id": action_id,
+            "session_nonce": session_nonce,
+            "sequence": sequence,
+            "payload": payload,
+        }
+        expected_mac = hmac.new(
+            self._session_key, _canonical_bytes(unsigned), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(mac, expected_mac):
+            raise HostBridgeError("HOST_BRIDGE_AUTH_FAILED")
+        if sequence != expected_sequence:
+            raise HostBridgeError("HOST_BRIDGE_SEQUENCE_INVALID")
+
+    @staticmethod
+    def _read_raw_frame(descriptor: int) -> bytes:
+        header = _read_exact(descriptor, 4)
+        size = struct.unpack("!I", header)[0]
+        if size == 0 or size > _MAX_FRAME_BYTES:
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        return _read_exact(descriptor, size)
+
+    def _write_all(self, payload: bytes) -> None:
+        remaining = memoryview(payload)
+        while remaining:
+            try:
+                written = os.write(self._write_fd, remaining)
+            except OSError as error:
+                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+            if written <= 0:
+                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+            remaining = remaining[written:]
+
+    def _ensure_open(self) -> None:
+        if self._closed or self._read_fd < 0 or self._write_fd < 0:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+
+
+def _read_exact(descriptor: int, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        try:
+            chunk = os.read(descriptor, remaining)
+        except OSError as error:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+        if not chunk:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _decode_frame(raw: bytes) -> dict[str, object]:
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+        if type(decoded) is not dict or _canonical_bytes(decoded) != raw:
+            raise ValueError
+        return decoded
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, TypeError) as error:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from error
+
+
+def _canonical_bytes(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from error
+
+
+def _json_object(value: Mapping[str, object]) -> dict[str, object]:
+    if type(value) is not dict:
+        value = dict(value)
+    try:
+        encoded = _canonical_bytes(value)
+        decoded = json.loads(encoded.decode("utf-8"))
+    except (HostBridgeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from error
+    if type(decoded) is not dict:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+    _validate_json_value(decoded)
+    return decoded
+
+
+def _validate_json_value(value: object) -> None:
+    if value is None or type(value) in {bool, int, str}:
+        return
+    if type(value) is float:
+        if math.isfinite(value):
+            return
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+    if type(value) is list:
+        for item in value:
+            _validate_json_value(item)
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+            _validate_json_value(item)
+        return
+    raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+
+
+def _validate_action_id(value: str) -> None:
+    if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+
+
+def _validate_endpoint(value: str) -> None:
+    if type(value) is not str or _ENDPOINT.fullmatch(value) is None:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+
+
+def _validate_proof_id(value: str) -> None:
+    if type(value) is not str or _DIGEST.fullmatch(value) is None:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+
+
+def _validate_capabilities(value: Mapping[str, str]) -> dict[str, str]:
+    if type(value) is not dict or not value or len(value) > 16:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+    normalized: dict[str, str] = {}
+    for action, bearer in value.items():
+        if (
+            type(action) is not str
+            or _IDENTIFIER.fullmatch(action) is None
+            or type(bearer) is not str
+            or not bearer
+            or len(bearer) > 8_192
+        ):
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        normalized[action] = bearer
+    return dict(sorted(normalized.items()))
+
+
+def _b64encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(value: str) -> bytes:
+    if type(value) is not str:
+        raise ValueError
+    return base64.b64decode(
+        value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
+    )

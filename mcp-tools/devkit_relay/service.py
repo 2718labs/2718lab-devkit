@@ -118,7 +118,7 @@ class RelayService:
         store: RelayStore,
         *,
         capability_secret: bytes | str,
-        integration_proof_resolver: IntegrationProofResolver,
+        integration_proof_resolver: IntegrationProofResolver | None = None,
     ) -> None:
         self._store = store
         self._capabilities = CapabilitySigner(capability_secret)
@@ -381,6 +381,8 @@ class RelayService:
         )
         candidate_id = self._identifier(request["candidate_id"])
         proof_id = self._proof_id(request["integration_proof_id"])
+        if self._integration_proofs is None:
+            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
         expectation = self._proof_call(
             self._store.integration_expectation,
             candidate_id=candidate_id,

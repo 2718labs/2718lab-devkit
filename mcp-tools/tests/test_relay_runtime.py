@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from devkit_relay.proofs import (
 )
 from devkit_relay.service import RelayError, RelayService
 from devkit_relay.store import RelayStore
+from devkit_runtime.relay_runtime import RelayRuntime
 
 _BASE_COMMIT = "a" * 40
 _INPUT_SNAPSHOT = "sha256:" + "b" * 64
@@ -275,6 +278,51 @@ class _RejectingProofResolver:
         raise IntegrationProofError("RELAY_INTEGRATION_PROOF_UNREGISTERED")
 
 
+class _UnavailableCapabilityBroker:
+    """A broker boundary that proves RelayStore is never touched when absent."""
+
+    @property
+    def is_available(self) -> bool:
+        return False
+
+    def prepare_capability(
+        self,
+        *,
+        action_id: str,
+        endpoint: str,
+        capabilities: Mapping[str, str],
+    ) -> object:
+        del action_id, endpoint, capabilities
+        raise AssertionError("unavailable broker must not receive a capability")
+
+
+class _RecordingCapabilityBroker:
+    """Private delivery double; its records intentionally never enter Relay output."""
+
+    def __init__(self) -> None:
+        self.deliveries: list[dict[str, object]] = []
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def prepare_capability(
+        self,
+        *,
+        action_id: str,
+        endpoint: str,
+        capabilities: Mapping[str, str],
+    ) -> object:
+        self.deliveries.append(
+            {
+                "action_id": action_id,
+                "endpoint": endpoint,
+                "capabilities": dict(capabilities),
+            }
+        )
+        return object()
+
+
 class ProofRegistry:
     """Host-ledger double used by lifecycle and proof-boundary tests."""
 
@@ -421,6 +469,84 @@ def service(
         ),
         store,
     )
+
+
+def test_runtime_requires_private_broker_before_any_relay_store_write(
+    tmp_path: Path,
+) -> None:
+    relay, store = service(tmp_path)
+    before = store.database_fingerprint()
+    runtime = RelayRuntime(relay, capability_broker=_UnavailableCapabilityBroker())
+
+    with pytest.raises(RelayError) as caught:
+        runtime.start(
+            {
+                "mode": "create",
+                "plan": plan(
+                    task(
+                        "writer-a",
+                        write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+                    )
+                ),
+                "idempotency_key": "broker-missing",
+            }
+        )
+
+    assert caught.value.code == "RELAY_CAPABILITY_BROKER_UNAVAILABLE"
+    assert store.database_fingerprint() == before
+
+
+def test_runtime_delivers_bearers_only_to_private_broker_and_never_publicly(
+    tmp_path: Path,
+) -> None:
+    relay, store = service(tmp_path)
+    broker = _RecordingCapabilityBroker()
+    runtime = RelayRuntime(relay, capability_broker=broker)
+    environment_before = dict(os.environ)
+
+    result = runtime.start(
+        {
+            "mode": "create",
+            "plan": plan(
+                task(
+                    "writer-a",
+                    write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+                )
+            ),
+            "idempotency_key": "private-delivery",
+        }
+    )
+
+    assert len(broker.deliveries) == 1
+    private_capabilities = broker.deliveries[0]["capabilities"]
+    assert isinstance(private_capabilities, dict)
+    assert set(private_capabilities) == {
+        "bind_endpoint",
+        "heartbeat",
+        "evidence",
+        "terminal",
+        "candidate_handoff",
+    }
+    bearers = list(private_capabilities.values())
+    assert all(type(bearer) is str for bearer in bearers)
+    assert dict(os.environ) == environment_before
+
+    def contains_bearer(value: object) -> bool:
+        if isinstance(value, str):
+            return value in bearers
+        if isinstance(value, dict):
+            return any(contains_bearer(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_bearer(item) for item in value)
+        return False
+
+    assert not contains_bearer(result)
+    database_parts = [tmp_path / "relay.sqlite3", tmp_path / "relay.sqlite3-wal"]
+    durable_bytes = b"".join(
+        part.read_bytes() for part in database_parts if part.exists()
+    )
+    assert all(bearer.encode("utf-8") not in durable_bytes for bearer in bearers)
+    assert store.database_fingerprint()
 
 
 def issue_worker(
