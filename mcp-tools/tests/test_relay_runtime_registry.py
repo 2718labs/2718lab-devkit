@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from test_relay_runtime import plan, task
 
+import devkit_runtime.host_bridge as host_bridge_module
 from devkit_relay.compiler import RelayPlanError
 from devkit_relay.store import RelayStore
 from devkit_runtime.host_bridge import HostBridgeError, InheritedHandleHostBridge
@@ -83,20 +86,225 @@ def test_inherited_handle_bridge_rejects_missing_or_invalid_selectors() -> None:
     assert "not-a-handle" not in str(caught.value)
 
 
-def test_inherited_handle_bridge_accepts_only_the_inherited_fd_selector() -> None:
-    read_fd, write_fd = os.pipe()
+@pytest.mark.parametrize(
+    ("platform", "selector_name"),
+    [
+        ("posix", "CODEX_DEVKIT_HOST_BRIDGE_FD"),
+        ("nt", "CODEX_DEVKIT_HOST_BRIDGE_HANDLE"),
+    ],
+)
+def test_inherited_handle_bridge_rejects_stdio_selector(
+    platform: str, selector_name: str
+) -> None:
+    with pytest.raises(HostBridgeError) as caught:
+        InheritedHandleHostBridge.from_environment(
+            {selector_name: "1"}, platform=platform
+        )
+
+    assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
+
+
+def test_inherited_handle_bridge_rejects_regular_file_selector(tmp_path: Path) -> None:
+    mailbox = tmp_path / "not-a-private-ipc-handle"
+    descriptor = os.open(mailbox, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with pytest.raises(HostBridgeError) as caught:
+            InheritedHandleHostBridge.from_environment(
+                {"CODEX_DEVKIT_HOST_BRIDGE_FD": str(descriptor)}, platform="posix"
+            )
+    finally:
+        os.close(descriptor)
+
+    assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
+    assert mailbox.read_bytes() == b""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle semantics")
+def test_inherited_handle_bridge_rejects_windows_regular_file_handle(
+    tmp_path: Path,
+) -> None:
+    import _winapi
+    import msvcrt
+
+    mailbox = tmp_path / "not-a-private-windows-ipc-handle"
+    descriptor = os.open(mailbox, os.O_RDWR | os.O_CREAT, 0o600)
+    duplicated_handle: int | None = None
     bridge: InheritedHandleHostBridge | None = None
     try:
-        bridge = InheritedHandleHostBridge.from_environment(
-            {"CODEX_DEVKIT_HOST_BRIDGE_FD": str(write_fd)}, platform="posix"
+        duplicated_handle = _winapi.DuplicateHandle(
+            _winapi.GetCurrentProcess(),
+            msvcrt.get_osfhandle(descriptor),
+            _winapi.GetCurrentProcess(),
+            0,
+            False,
+            _winapi.DUPLICATE_SAME_ACCESS,
         )
+        with pytest.raises(HostBridgeError) as caught:
+            bridge = InheritedHandleHostBridge.from_environment(
+                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(duplicated_handle)},
+                platform="nt",
+            )
+    finally:
+        if bridge is not None:
+            bridge.close()
+        elif duplicated_handle is not None:
+            try:
+                _winapi.CloseHandle(duplicated_handle)
+            except OSError:
+                pass
+        os.close(descriptor)
+
+    assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
+    assert mailbox.read_bytes() == b""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle semantics")
+@pytest.mark.parametrize("endpoint_name", ["read", "write"])
+def test_inherited_handle_bridge_rejects_windows_one_way_pipe_handle(
+    endpoint_name: str,
+) -> None:
+    import _winapi
+    import msvcrt
+
+    read_fd, write_fd = os.pipe()
+    duplicated_handle: int | None = None
+    bridge: InheritedHandleHostBridge | None = None
+    try:
+        duplicated_handle = _winapi.DuplicateHandle(
+            _winapi.GetCurrentProcess(),
+            msvcrt.get_osfhandle(read_fd if endpoint_name == "read" else write_fd),
+            _winapi.GetCurrentProcess(),
+            0,
+            False,
+            _winapi.DUPLICATE_SAME_ACCESS,
+        )
+        with pytest.raises(HostBridgeError) as caught:
+            bridge = InheritedHandleHostBridge.from_environment(
+                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(duplicated_handle)},
+                platform="nt",
+            )
+    finally:
+        if bridge is not None:
+            bridge.close()
+        elif duplicated_handle is not None:
+            try:
+                _winapi.CloseHandle(duplicated_handle)
+            except OSError:
+                pass
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
+
+
+def test_inherited_handle_bridge_accepts_only_duplex_inherited_ipc_selector() -> None:
+    closers: list[Callable[[], None]]
+    if os.name == "nt":
+        import _winapi
+        from multiprocessing import Pipe
+
+        peer, inherited = Pipe(duplex=True)
+        handle = _winapi.DuplicateHandle(
+            _winapi.GetCurrentProcess(),
+            inherited.fileno(),
+            _winapi.GetCurrentProcess(),
+            0,
+            False,
+            _winapi.DUPLICATE_SAME_ACCESS,
+        )
+        environ = {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(handle)}
+        platform = "nt"
+        closers = [peer.close, inherited.close]
+    else:
+        peer, inherited = socket.socketpair()
+        environ = {"CODEX_DEVKIT_HOST_BRIDGE_FD": str(inherited.fileno())}
+        platform = "posix"
+        closers = [peer.close, inherited.close]
+    bridge: InheritedHandleHostBridge | None = None
+    try:
+        bridge = InheritedHandleHostBridge.from_environment(environ, platform=platform)
         assert bridge is not None
         assert bridge.is_available
     finally:
         if bridge is not None:
             bridge.close()
-        os.close(read_fd)
-        os.close(write_fd)
+        for close in closers:
+            close()
+
+
+def test_oversized_private_delivery_never_becomes_prepared_or_retriable() -> None:
+    child, host = _pipe_pair()
+    capabilities = {f"action-{index}": "b" * 8_192 for index in range(8)}
+    try:
+        with pytest.raises(HostBridgeError) as first:
+            child.prepare_capability(
+                action_id="oversized-action",
+                endpoint="bridge/oversized-action",
+                capabilities=capabilities,
+            )
+        assert first.value.code == "HOST_BRIDGE_FRAME_INVALID"
+
+        with pytest.raises(HostBridgeError) as receipt:
+            child.delivery_receipt("oversized-action")
+        assert receipt.value.code == "HOST_BRIDGE_DELIVERY_UNKNOWN"
+
+        with pytest.raises(HostBridgeError) as retry:
+            child.prepare_capability(
+                action_id="oversized-action",
+                endpoint="bridge/oversized-action",
+                capabilities=capabilities,
+            )
+        assert retry.value.code == "HOST_BRIDGE_FRAME_INVALID"
+
+        os.set_blocking(host._read_fd, False)
+        with pytest.raises(BlockingIOError):
+            os.read(host._read_fd, 1)
+    finally:
+        child.close()
+        host.close()
+
+
+def test_partial_private_write_poison_session_without_prepared_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child, host = _pipe_pair()
+    original_write = host_bridge_module.os.write
+    writes = 0
+
+    def partial_then_transport_error(descriptor: int, payload: object) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            assert isinstance(payload, bytes | memoryview)
+            return original_write(descriptor, payload[:1])
+        raise OSError("simulated private transport interruption")
+
+    monkeypatch.setattr(host_bridge_module.os, "write", partial_then_transport_error)
+    try:
+        with pytest.raises(HostBridgeError) as first:
+            child.prepare_capability(
+                action_id="partial-action",
+                endpoint="bridge/partial-action",
+                capabilities={"heartbeat": "private-capability"},
+            )
+        assert first.value.code == "HOST_BRIDGE_UNAVAILABLE"
+        assert child.is_available is False
+
+        with pytest.raises(HostBridgeError) as receipt:
+            child.delivery_receipt("partial-action")
+        assert receipt.value.code == "HOST_BRIDGE_UNAVAILABLE"
+
+        with pytest.raises(HostBridgeError) as retry:
+            child.prepare_capability(
+                action_id="partial-action",
+                endpoint="bridge/partial-action",
+                capabilities={"heartbeat": "private-capability"},
+            )
+        assert retry.value.code == "HOST_BRIDGE_UNAVAILABLE"
+        assert writes == 1
+    finally:
+        child.close()
+        host.close()
 
 
 def test_inherited_handle_bridge_frames_authenticates_sequences_and_recovers_delivery() -> (

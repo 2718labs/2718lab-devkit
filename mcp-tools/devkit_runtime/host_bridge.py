@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import stat
 import struct
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -175,16 +176,33 @@ class InheritedHandleHostBridge:
         if type(selector) is not str or _HANDLE_SELECTOR.fullmatch(selector) is None:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         handle = int(selector)
+        if handle in {0, 1, 2}:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        descriptor = -1
         try:
             if target_platform == "nt":
+                _assert_windows_private_duplex_ipc_handle(handle)
                 import msvcrt
 
-                descriptor = msvcrt.open_osfhandle(handle, os.O_BINARY)
+                descriptor = msvcrt.open_osfhandle(handle, os.O_BINARY | os.O_RDWR)
             else:
-                os.fstat(handle)
                 descriptor = os.dup(handle)
-                os.set_inheritable(descriptor, False)
-        except (ImportError, OSError, OverflowError, ValueError) as error:
+            _assert_private_duplex_ipc_descriptor(descriptor, platform=target_platform)
+            os.set_inheritable(descriptor, False)
+        except (
+            HostBridgeError,
+            ImportError,
+            OSError,
+            OverflowError,
+            ValueError,
+        ) as error:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if isinstance(error, HostBridgeError):
+                raise
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
         return cls(
             read_fd=descriptor,
@@ -259,30 +277,31 @@ class InheritedHandleHostBridge:
         _validate_action_id(action_id)
         _validate_endpoint(endpoint)
         normalized = _validate_capabilities(capabilities)
+        self._ensure_open()
         current = self._deliveries.get(action_id)
         if current is not None:
             if current.endpoint != endpoint or current.capabilities != normalized:
                 raise HostBridgeError("HOST_BRIDGE_DELIVERY_CONFLICT")
             return current.receipt(action_id)
         current = _CapabilityDelivery(endpoint=endpoint, capabilities=normalized)
-        self._deliveries[action_id] = current
         self.send_private(
             kind="capability_prepare",
             action_id=action_id,
             payload={"endpoint": endpoint, "capabilities": normalized},
         )
+        self._deliveries[action_id] = current
         return current.receipt(action_id)
 
     def recover_capability(self, action_id: str) -> CapabilityDeliveryReceipt:
         """Re-send the same action-keyed private delivery, never a new lease."""
 
         _validate_action_id(action_id)
+        self._ensure_open()
         current = self._deliveries.get(action_id)
         if current is None:
             raise HostBridgeError("HOST_BRIDGE_DELIVERY_UNKNOWN")
         if current.state == "acknowledged":
             return current.receipt(action_id)
-        current.state = "recovering"
         self.send_private(
             kind="capability_recovery",
             action_id=action_id,
@@ -291,12 +310,14 @@ class InheritedHandleHostBridge:
                 "capabilities": dict(current.capabilities),
             },
         )
+        current.state = "recovering"
         return current.receipt(action_id)
 
     def delivery_receipt(self, action_id: str) -> CapabilityDeliveryReceipt:
         """Return only opaque delivery metadata, never a bearer."""
 
         _validate_action_id(action_id)
+        self._ensure_open()
         current = self._deliveries.get(action_id)
         if current is None:
             raise HostBridgeError("HOST_BRIDGE_DELIVERY_UNKNOWN")
@@ -340,22 +361,38 @@ class InheritedHandleHostBridge:
         _validate_action_id(action_id)
         encoded_payload = _json_object(payload)
         self._ensure_open()
-        if not self._bootstrap_sent:
-            self._send_bootstrap()
-        self._write_frame(
+        bootstrap = (
+            self._frame_bytes(
+                kind="session_open",
+                action_id="session",
+                sequence=0,
+                payload={"session_key": _b64encode(self._session_key)},
+            )
+            if not self._bootstrap_sent
+            else None
+        )
+        private_frame = self._frame_bytes(
             kind=kind,
             action_id=action_id,
             sequence=self._next_out,
             payload=encoded_payload,
         )
+        if bootstrap is not None:
+            self._write_complete(bootstrap)
+            self._bootstrap_sent = True
+        self._write_complete(private_frame)
         self._next_out += 1
 
     def receive(self) -> PrivateHostMessage:
         """Read and validate exactly one authenticated private frame."""
 
         self._ensure_open()
-        frame = _decode_frame(self._read_raw_frame(self._read_fd))
-        self._verify_frame(frame, expected_sequence=self._next_in)
+        try:
+            frame = _decode_frame(self._read_raw_frame(self._read_fd))
+            self._verify_frame(frame, expected_sequence=self._next_in)
+        except HostBridgeError:
+            self._poison()
+            raise
         self._next_in += 1
         kind = frame["kind"]
         action_id = frame["action_id"]
@@ -392,18 +429,9 @@ class InheritedHandleHostBridge:
             except OSError:
                 pass
 
-    def _send_bootstrap(self) -> None:
-        self._write_frame(
-            kind="session_open",
-            action_id="session",
-            sequence=0,
-            payload={"session_key": _b64encode(self._session_key)},
-        )
-        self._bootstrap_sent = True
-
-    def _write_frame(
+    def _frame_bytes(
         self, *, kind: str, action_id: str, sequence: int, payload: dict[str, object]
-    ) -> None:
+    ) -> bytes:
         unsigned = {
             "schema": _FRAME_SCHEMA,
             "kind": kind,
@@ -420,7 +448,7 @@ class InheritedHandleHostBridge:
         raw = _canonical_bytes(frame)
         if len(raw) > _MAX_FRAME_BYTES:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
-        self._write_all(struct.pack("!I", len(raw)) + raw)
+        return struct.pack("!I", len(raw)) + raw
 
     def _verify_frame(
         self, frame: dict[str, object], *, expected_sequence: int
@@ -473,20 +501,64 @@ class InheritedHandleHostBridge:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
         return _read_exact(descriptor, size)
 
-    def _write_all(self, payload: bytes) -> None:
-        remaining = memoryview(payload)
-        while remaining:
-            try:
-                written = os.write(self._write_fd, remaining)
-            except OSError as error:
-                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
-            if written <= 0:
-                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
-            remaining = remaining[written:]
+    def _write_complete(self, payload: bytes) -> None:
+        try:
+            written = os.write(self._write_fd, payload)
+        except OSError as error:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+        if written != len(payload):
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+
+    def _poison(self) -> None:
+        """Irreversibly fail closed after an untrustworthy transport event."""
+
+        self.close()
 
     def _ensure_open(self) -> None:
         if self._closed or self._read_fd < 0 or self._write_fd < 0:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+
+
+def _assert_private_duplex_ipc_descriptor(descriptor: int, *, platform: str) -> None:
+    """Accept only a non-stdio, bidirectional IPC descriptor for launch use."""
+
+    if descriptor in {0, 1, 2}:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    try:
+        mode = os.fstat(descriptor).st_mode
+        is_private_ipc = (
+            stat.S_ISFIFO(mode) if platform == "nt" else stat.S_ISSOCK(mode)
+        )
+        if not is_private_ipc:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if platform != "nt" and (
+            os.read(descriptor, 0) != b"" or os.write(descriptor, b"") != 0
+        ):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    except HostBridgeError:
+        raise
+    except OSError as error:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+
+
+def _assert_windows_private_duplex_ipc_handle(handle: int) -> None:
+    """Reject console, disk, and one-way Windows handles before CRT adoption."""
+
+    try:
+        import _winapi
+
+        if _winapi.GetFileType(handle) != 3:  # FILE_TYPE_PIPE
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        _winapi.PeekNamedPipe(handle, 0)
+        written, _ = _winapi.WriteFile(handle, b"")
+        if written != 0:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    except HostBridgeError:
+        raise
+    except (ImportError, OSError, ValueError) as error:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
 
 
 def _read_exact(descriptor: int, size: int) -> bytes:
