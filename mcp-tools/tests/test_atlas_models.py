@@ -25,10 +25,10 @@ from devkit_atlas import (
     canonical_json,
     freeze_json,
     normalize_intent_id,
+    thaw_json,
     validate_candidate_path,
     validate_fragment,
     validate_slot_value,
-    thaw_json,
 )
 
 
@@ -214,6 +214,34 @@ def test_freeze_json_is_idempotent_for_tagged_containers(payload: object) -> Non
 def test_fragment_rejects_credentials_without_returning_them(fragment: str) -> None:
     with pytest.raises(ValueError):
         validate_fragment(fragment)
+
+
+@pytest.mark.parametrize("key", ["apiKey", "accessToken", "clientSecret", "privateKey"])
+@pytest.mark.parametrize("syntax", ["assignment", "json", "yaml"])
+def test_fragment_rejects_camel_case_credential_aliases(key: str, syntax: str) -> None:
+    value = "exampleSecret123"
+    fragment = {
+        "assignment": f"{key}={value}",
+        "json": f'{{"{key}":"{value}"}}',
+        "yaml": f"{key}: {value}",
+    }[syntax]
+
+    with pytest.raises(AtlasError, match="credential_detected"):
+        validate_fragment(fragment)
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "The apiKey belongs to the example configuration.",
+        "apiKeyFactory = build_client()",
+        "accessTokenizer = tokenize(value)",
+        "clientSecretary = notify_team()",
+        "privateKeyring = keyring.open()",
+    ],
+)
+def test_fragment_allows_non_credential_alias_substrings(fragment: str) -> None:
+    assert validate_fragment(fragment) == fragment
 
 
 @pytest.mark.parametrize("fragment", ["bad\x01text", b"bad\x1ftext"])

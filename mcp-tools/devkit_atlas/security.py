@@ -64,7 +64,7 @@ def _contains_credential(text: str) -> bool:
     if _RAW_TOKEN.search(text) or _BEARER_OR_PRIVATE_KEY.search(text):
         return True
     for match in _ASSIGNMENT.finditer(text):
-        key = match.group(1).upper()
+        key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", match.group(1)).upper()
         if any(
             key == suffix or key.endswith(f"_{suffix}")
             for suffix in _SENSITIVE_KEY_SUFFIXES
