@@ -228,38 +228,50 @@ class InheritedHandleHostBridge:
         every following frame is MACed with it.
         """
 
-        raw = cls._read_raw_frame(read_fd)
-        frame = _decode_frame(raw)
-        payload = frame.get("payload")
-        session_nonce_value = frame.get("session_nonce")
-        if (
-            frame.get("schema") != _FRAME_SCHEMA
-            or frame.get("kind") != "session_open"
-            or frame.get("action_id") != "session"
-            or frame.get("sequence") != 0
-            or not isinstance(session_nonce_value, str)
-            or not isinstance(payload, dict)
-            or set(payload) != {"session_key"}
-        ):
-            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
-        encoded_key = payload.get("session_key")
-        if not isinstance(encoded_key, str):
-            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        bridge: InheritedHandleHostBridge | None = None
         try:
-            session_key = _b64decode(encoded_key)
-            session_nonce = _b64decode(session_nonce_value)
-        except ValueError as error:
-            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from error
-        bridge = cls(
-            read_fd=read_fd,
-            write_fd=write_fd,
-            session_key=session_key,
-            session_nonce=session_nonce,
-            owns_descriptors=owns_descriptors,
-            bootstrap_required=False,
-        )
-        bridge._verify_frame(frame, expected_sequence=0)
-        return bridge
+            raw = cls._read_raw_frame(read_fd)
+            frame = _decode_frame(raw)
+            payload = frame.get("payload")
+            session_nonce_value = frame.get("session_nonce")
+            if (
+                frame.get("schema") != _FRAME_SCHEMA
+                or frame.get("kind") != "session_open"
+                or frame.get("action_id") != "session"
+                or frame.get("sequence") != 0
+                or not isinstance(session_nonce_value, str)
+                or not isinstance(payload, dict)
+                or set(payload) != {"session_key"}
+            ):
+                raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+            encoded_key = payload.get("session_key")
+            if not isinstance(encoded_key, str):
+                raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+            try:
+                session_key = _b64decode(encoded_key)
+                session_nonce = _b64decode(session_nonce_value)
+            except ValueError as error:
+                raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from error
+            bridge = cls(
+                read_fd=read_fd,
+                write_fd=write_fd,
+                session_key=session_key,
+                session_nonce=session_nonce,
+                owns_descriptors=owns_descriptors,
+                bootstrap_required=False,
+            )
+            bridge._verify_frame(frame, expected_sequence=0)
+            return bridge
+        except Exception:
+            if bridge is not None:
+                bridge.close()
+            elif owns_descriptors:
+                for descriptor in {read_fd, write_fd}:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            raise
 
     @property
     def is_available(self) -> bool:
@@ -549,16 +561,73 @@ def _assert_windows_private_duplex_ipc_handle(handle: int) -> None:
     try:
         import _winapi
 
+        for standard_handle in (-10, -11, -12):
+            if handle == _winapi.GetStdHandle(standard_handle):
+                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         if _winapi.GetFileType(handle) != 3:  # FILE_TYPE_PIPE
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
-        _winapi.PeekNamedPipe(handle, 0)
-        written, _ = _winapi.WriteFile(handle, b"")
-        if written != 0:
+        if not _windows_named_pipe_info_available(handle):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        access_mask = _windows_file_access_mask(handle)
+        if access_mask & 0x0003 != 0x0003:  # FILE_READ_DATA | FILE_WRITE_DATA
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
     except HostBridgeError:
         raise
     except (ImportError, OSError, ValueError) as error:
         raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+
+
+def _windows_named_pipe_info_available(handle: int) -> bool:
+    """Confirm that a pipe handle supports a non-writing named-pipe query."""
+
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_named_pipe_info = kernel32.GetNamedPipeInfo
+    get_named_pipe_info.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong),
+    )
+    get_named_pipe_info.restype = ctypes.c_int
+    flags = ctypes.c_ulong()
+    if not get_named_pipe_info(handle, ctypes.byref(flags), None, None, None):
+        return False
+    return True
+
+
+def _windows_file_access_mask(handle: int) -> int:
+    """Return access rights through NtQueryInformationFile without writing data."""
+
+    import ctypes
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    ntdll = ctypes.WinDLL("ntdll")
+    query_information_file = ntdll.NtQueryInformationFile
+    query_information_file.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+    )
+    query_information_file.restype = ctypes.c_long
+    io_status = _IoStatusBlock()
+    access_mask = ctypes.c_ulong()
+    status = query_information_file(
+        handle,
+        ctypes.byref(io_status),
+        ctypes.byref(access_mask),
+        ctypes.sizeof(access_mask),
+        8,  # FileAccessInformation
+    )
+    if status != 0:
+        raise OSError("NtQueryInformationFile failed")
+    return access_mask.value
 
 
 def _read_exact(descriptor: int, size: int) -> bytes:

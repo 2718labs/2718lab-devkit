@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import socket
+import struct
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -195,6 +197,143 @@ def test_inherited_handle_bridge_rejects_windows_one_way_pipe_handle(
         os.close(write_fd)
 
     assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle semantics")
+def test_inherited_handle_bridge_rejects_windows_current_standard_handle_before_probe() -> (
+    None
+):
+    import _winapi
+    import ctypes
+    from multiprocessing import Pipe
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_std_handle = kernel32.SetStdHandle
+    set_std_handle.argtypes = (ctypes.c_ulong, ctypes.c_void_p)
+    set_std_handle.restype = ctypes.c_int
+    std_output_handle = ctypes.c_ulong(-11).value
+    peer, inherited = Pipe(duplex=True)
+    aliased_handle = _winapi.DuplicateHandle(
+        _winapi.GetCurrentProcess(),
+        inherited.fileno(),
+        _winapi.GetCurrentProcess(),
+        0,
+        False,
+        _winapi.DUPLICATE_SAME_ACCESS,
+    )
+    original_standard_handle = _winapi.GetStdHandle(-11)
+    bridge: InheritedHandleHostBridge | None = None
+    try:
+        if not set_std_handle(std_output_handle, ctypes.c_void_p(aliased_handle)):
+            raise OSError(ctypes.get_last_error(), "SetStdHandle failed")
+        assert _winapi.GetStdHandle(-11) == aliased_handle
+
+        caught: HostBridgeError | None = None
+        try:
+            bridge = InheritedHandleHostBridge.from_environment(
+                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(aliased_handle)},
+                platform="nt",
+            )
+        except HostBridgeError as error:
+            caught = error
+
+        assert bridge is None
+        assert caught is not None
+        assert caught.code == "HOST_BRIDGE_UNAVAILABLE"
+        assert peer.poll(0) is False
+    finally:
+        if not set_std_handle(
+            std_output_handle, ctypes.c_void_p(original_standard_handle)
+        ):
+            raise OSError(ctypes.get_last_error(), "SetStdHandle restore failed")
+        if bridge is not None:
+            bridge.close()
+        else:
+            try:
+                _winapi.CloseHandle(aliased_handle)
+            except OSError:
+                pass
+        peer.close()
+        inherited.close()
+
+
+@pytest.mark.parametrize(
+    ("corruption", "first_error"),
+    [
+        ("parse", "HOST_BRIDGE_FRAME_INVALID"),
+        ("nonce", "HOST_BRIDGE_FRAME_INVALID"),
+        ("mac", "HOST_BRIDGE_AUTH_FAILED"),
+    ],
+)
+def test_bad_bootstrap_closes_owned_transport_before_reaccept(
+    corruption: str, first_error: str
+) -> None:
+    read_fd, write_fd = os.pipe()
+    bootstrap_reply_fd = os.dup(write_fd)
+    sender_read_fd, sender_reply_fd = os.pipe()
+    key = b"b" * 32
+    nonce = b"relay-bootstrap-nonce"
+    sender = InheritedHandleHostBridge(
+        read_fd=sender_read_fd,
+        write_fd=write_fd,
+        session_key=key,
+        session_nonce=nonce,
+        owns_descriptors=False,
+        bootstrap_required=True,
+    )
+    retry_reply_fd = os.dup(write_fd)
+    accepted: InheritedHandleHostBridge | None = None
+    try:
+        bootstrap = sender._frame_bytes(
+            kind="session_open",
+            action_id="session",
+            sequence=0,
+            payload={"session_key": host_bridge_module._b64encode(key)},
+        )
+        if corruption == "parse":
+            bad_payload = b"not-canonical-json"
+        else:
+            bad_frame = json.loads(bootstrap[4:].decode("utf-8"))
+            if corruption == "nonce":
+                bad_frame["session_nonce"] = "!"
+            else:
+                bad_frame["mac"] = "0" * 64
+            bad_payload = host_bridge_module._canonical_bytes(bad_frame)
+        os.write(write_fd, struct.pack("!I", len(bad_payload)) + bad_payload)
+        sender.send_private(
+            kind="capability_ack", action_id="bootstrap-action", payload={}
+        )
+
+        with pytest.raises(HostBridgeError) as first:
+            InheritedHandleHostBridge.accept_from_file_descriptors(
+                read_fd=read_fd, write_fd=bootstrap_reply_fd
+            )
+        assert first.value.code == first_error
+
+        retry_error: HostBridgeError | None = None
+        try:
+            accepted = InheritedHandleHostBridge.accept_from_file_descriptors(
+                read_fd=read_fd, write_fd=retry_reply_fd
+            )
+        except HostBridgeError as error:
+            retry_error = error
+
+        assert accepted is None
+        assert retry_error is not None
+        assert retry_error.code == "HOST_BRIDGE_UNAVAILABLE"
+    finally:
+        if accepted is not None:
+            accepted.close()
+        sender.close()
+        for descriptor in (read_fd, write_fd, bootstrap_reply_fd, retry_reply_fd):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        os.close(sender_read_fd)
+        os.close(sender_reply_fd)
 
 
 def test_inherited_handle_bridge_accepts_only_duplex_inherited_ipc_selector() -> None:
