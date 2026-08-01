@@ -49,7 +49,10 @@ class BugkillerMetadataTests(unittest.TestCase):
         self.assertEqual(server["cwd"], "mcp-tools")
         self.assertEqual(
             server["env_vars"],
-            ["BUGKILLER_HOME", "PLUGIN_DATA", "CODEX_HOME"],
+            [
+                "CODEX_DEVKIT_HOST_BRIDGE_FD",
+                "CODEX_DEVKIT_HOST_BRIDGE_HANDLE",
+            ],
         )
         self.assertNotIn("CLAUDE_PLUGIN_ROOT", json.dumps(metadata))
 
