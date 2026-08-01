@@ -3,22 +3,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass, replace
-from pathlib import Path
 import sqlite3
 import stat
 import subprocess
 import sys
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import pytest
-
 
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
-from project_index import IndexError, ProjectIndexService  # noqa: E402
 import project_index.checkpoints as checkpoints_module  # noqa: E402
+from devkit_runtime.workspace_authority import WorkspaceRootAuthority  # noqa: E402
+from project_index import IndexError, ProjectIndexService  # noqa: E402
 from project_index.checkpoints import (  # noqa: E402
     CheckpointService,
     WorkspaceOwnership,
@@ -30,6 +30,19 @@ class _Snapshot:
     snapshot_id: str
 
 
+class _FilesystemRegistry:
+    """Registry-shaped authority input for the checkpoint service double."""
+
+    def __init__(self, roots: dict[str, Path]) -> None:
+        self._roots = roots
+
+    def resolve(self, workspace_id: str) -> Path:
+        root = self._roots.get(workspace_id)
+        if root is None:
+            raise IndexError("WORKSPACE_UNREGISTERED", "request rejected")
+        return root
+
+
 class _FilesystemIndex:
     """Small deterministic index double used to isolate checkpoint behavior."""
 
@@ -37,6 +50,9 @@ class _FilesystemIndex:
         self._workspace_ids: dict[Path, str] = {}
         self._roots: dict[str, Path] = {}
         self._snapshots: set[tuple[str, str]] = set()
+        self.workspace_authority = WorkspaceRootAuthority(
+            _FilesystemRegistry(self._roots)  # type: ignore[arg-type]
+        )
 
     def project_index_register(self, workspace_root: str | Path) -> str:
         root = Path(workspace_root).resolve(strict=True)
@@ -49,14 +65,8 @@ class _FilesystemIndex:
             self._roots[workspace_id] = root
         return workspace_id
 
-    def _workspace_root(self, workspace_id: str) -> Path:
-        root = self._roots.get(workspace_id)
-        if root is None:
-            raise IndexError("WORKSPACE_UNREGISTERED", "request rejected")
-        return root
-
     def _snapshot(self, workspace_id: str) -> _Snapshot:
-        root = self._workspace_root(workspace_id)
+        root = self.workspace_authority.resolve(workspace_id).root
         entries: list[tuple[str, str]] = []
         for current_root, directory_names, file_names in os.walk(
             root, followlinks=False
@@ -104,7 +114,7 @@ class _FilesystemIndex:
         return current
 
     def snapshot_facts(self, workspace_id: str, snapshot_id: str) -> None:
-        self._workspace_root(workspace_id)
+        self.workspace_authority.resolve(workspace_id)
         if (workspace_id, snapshot_id) not in self._snapshots:
             raise IndexError("NOT_FOUND", "request rejected")
 
@@ -202,7 +212,10 @@ def index_service() -> _FilesystemIndex:
 @pytest.fixture
 def service(tmp_path: Path, index_service: _FilesystemIndex) -> CheckpointService:
     instance = CheckpointService(
-        tmp_path / "index.sqlite3", tmp_path / "checkpoint-cas", index_service
+        tmp_path / "index.sqlite3",
+        tmp_path / "checkpoint-cas",
+        index_service,
+        workspace_authority=index_service.workspace_authority,
     )
     yield instance
     instance.close()

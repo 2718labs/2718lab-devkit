@@ -5,16 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
 import secrets
 import sqlite3
 import stat
 import subprocess
-from typing import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from devkit_runtime.workspace_authority import WorkspaceRootAuthority
 
 from .models import IndexError
-
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _READ_CHUNK_SIZE = 64 * 1024
@@ -117,6 +120,22 @@ class _ManifestEntry:
     mode: int
 
 
+class _SnapshotReference(Protocol):
+    """The snapshot identifier returned by Project Index synchronization."""
+
+    snapshot_id: str
+
+
+class _CheckpointIndexService(Protocol):
+    """Subset of Project Index used by checkpoint integrity operations."""
+
+    def assert_current(self, workspace_id: str, snapshot_id: str) -> object: ...
+
+    def snapshot_facts(self, workspace_id: str, snapshot_id: str) -> object: ...
+
+    def sync(self, workspace_id: str) -> _SnapshotReference: ...
+
+
 class CheckpointService:
     """Persist immutable scoped manifests and restore them after a CAS check."""
 
@@ -125,10 +144,18 @@ class CheckpointService:
         database_path: str | Path,
         cas_root: str | Path,
         index_service: object,
+        *,
+        workspace_authority: WorkspaceRootAuthority | None = None,
     ) -> None:
         self.database_path = _prepare_storage_file(database_path)
         self.cas_root = _prepare_storage_directory(cas_root)
-        self.index_service = index_service
+        self.index_service: _CheckpointIndexService = cast(
+            _CheckpointIndexService, index_service
+        )
+        self.workspace_authority = self._resolve_workspace_authority(
+            index_service, workspace_authority
+        )
+        self._owns_connection = True
         self._connection = sqlite3.connect(
             str(self.database_path), isolation_level=None
         )
@@ -138,8 +165,53 @@ class CheckpointService:
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
 
+    @classmethod
+    def from_prepared_connection(
+        cls,
+        database_path: str | Path,
+        cas_root: str | Path,
+        index_service: object,
+        workspace_authority: WorkspaceRootAuthority,
+        connection: sqlite3.Connection,
+    ) -> CheckpointService:
+        """Bind one validated runtime connection without preparing storage."""
+
+        service = cls.__new__(cls)
+        service.database_path = Path(database_path)
+        service.cas_root = Path(cas_root)
+        service.index_service = cast(_CheckpointIndexService, index_service)
+        service.workspace_authority = service._resolve_workspace_authority(
+            index_service, workspace_authority
+        )
+        service._owns_connection = False
+        service._connection = connection
+        connection.row_factory = sqlite3.Row
+        return service
+
+    @classmethod
+    def validate_prepared_connection(cls, connection: sqlite3.Connection) -> None:
+        """Reject a database that lacks the checkpoint schema before runtime use."""
+
+        connection.row_factory = sqlite3.Row
+        required_tables = {"checkpoint_records", "checkpoint_entries"}
+        try:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(checkpoint_records)")
+            }
+        except sqlite3.DatabaseError as exc:
+            raise _error("INDEX_CORRUPT") from exc
+        if not required_tables.issubset(tables) or "workspace_id" not in columns:
+            raise _error("INDEX_UNAVAILABLE")
+
     def close(self) -> None:
-        if self._connection is not None:
+        if self._owns_connection and self._connection is not None:
             self._connection.close()
             self._connection = None  # type: ignore[assignment]
 
@@ -148,9 +220,119 @@ class CheckpointService:
             ownership, snapshot_id, kind="checkpoint", parent_checkpoint_id=None
         )
 
+    def create_for_workspace(
+        self,
+        workspace_id: str,
+        ownership: WorkspaceOwnership,
+        snapshot_id: str,
+    ) -> Checkpoint:
+        """Create only after workspace identity precedes scope and snapshot checks."""
+
+        self._validate_ownership_shape(ownership)
+        self._resolve_requested_workspace(workspace_id)
+        if ownership.workspace_id != workspace_id:
+            raise _error("WORKTREE_UNOWNED")
+        try:
+            self.index_service.assert_current(workspace_id, snapshot_id)
+        except IndexError as exc:
+            if exc.code in {"WORKSPACE_UNREGISTERED", "WORKSPACE_REBIND"}:
+                raise
+            raise _error("INDEX_STALE") from None
+        return self.create(ownership, snapshot_id)
+
     def status(self, checkpoint_id: str) -> Checkpoint:
         checkpoint, _ = self._load_verified_checkpoint(checkpoint_id)
         return checkpoint
+
+    def status_for_workspace(self, workspace_id: str, checkpoint_id: str) -> Checkpoint:
+        """Load a checkpoint only through its requested workspace boundary."""
+
+        self._resolve_requested_workspace(workspace_id)
+        checkpoint, _ = self._load_verified_checkpoint_for_workspace(
+            workspace_id, checkpoint_id
+        )
+        return checkpoint
+
+    def restore_for_workspace(
+        self,
+        workspace_id: str,
+        ownership: WorkspaceOwnership,
+        checkpoint_id: str,
+        expected_current_snapshot_id: str,
+    ) -> RestoreResult:
+        """Restore through the scoped precedence required by the runtime path."""
+
+        self._validate_ownership_shape(ownership)
+        self._resolve_requested_workspace(workspace_id)
+        if ownership.workspace_id != workspace_id:
+            raise _error("WORKTREE_UNOWNED")
+        target, target_entries = self._load_verified_checkpoint_for_workspace(
+            workspace_id, checkpoint_id
+        )
+        self._require_checkpoint_lease(target, ownership)
+        self._assert_scoped_expected_current(workspace_id, expected_current_snapshot_id)
+        root, scope, resolved_workspace_id = self._validate_ownership(ownership)
+        self._require_checkpoint_owner(target, ownership, scope, resolved_workspace_id)
+        self._validate_stored_entries(root, scope, target_entries)
+        target_blobs = self._load_and_verify_blobs(target_entries)
+        self._preflight_restore_paths(root, target_entries)
+
+        try:
+            rescue = self._create(
+                ownership,
+                expected_current_snapshot_id,
+                kind="rescue",
+                parent_checkpoint_id=target.checkpoint_id,
+            )
+            self._assert_scoped_expected_current(
+                workspace_id, expected_current_snapshot_id
+            )
+        except IndexError as exc:
+            if exc.code in {"INDEX_STALE", "NOT_FOUND"}:
+                raise _error("ROLLBACK_DRIFT") from None
+            raise
+
+        rescue, current_entries = self._load_verified_checkpoint_for_workspace(
+            workspace_id, rescue.checkpoint_id
+        )
+        latest_entries, _ = self._capture_manifest(root, scope)
+        if latest_entries != current_entries:
+            raise _error("ROLLBACK_DRIFT")
+        changed_paths = _changed_paths(current_entries, target_entries)
+        self._apply_manifest(root, scope, current_entries, target_entries, target_blobs)
+
+        restored_entries, _ = self._capture_manifest(root, scope)
+        if restored_entries != target_entries:
+            raise _error("INDEX_STALE")
+        restored = self.index_service.sync(workspace_id)
+        restored_snapshot_id = str(restored.snapshot_id)
+        self.index_service.assert_current(workspace_id, restored_snapshot_id)
+        return RestoreResult(
+            checkpoint_id=target.checkpoint_id,
+            rescue_checkpoint_id=rescue.checkpoint_id,
+            restored_snapshot_id=restored_snapshot_id,
+            changed_paths=changed_paths,
+        )
+
+    @staticmethod
+    def _resolve_workspace_authority(
+        index_service: object,
+        workspace_authority: WorkspaceRootAuthority | None,
+    ) -> WorkspaceRootAuthority:
+        from devkit_runtime.workspace_authority import WorkspaceRootAuthority
+
+        if workspace_authority is not None:
+            if not isinstance(workspace_authority, WorkspaceRootAuthority):
+                raise TypeError("workspace_authority must be a WorkspaceRootAuthority")
+            return workspace_authority
+        from .service import ProjectIndexService
+
+        if isinstance(index_service, ProjectIndexService):
+            return index_service.workspace_authority
+        candidate = getattr(index_service, "workspace_authority", None)
+        if isinstance(candidate, WorkspaceRootAuthority):
+            return candidate
+        raise TypeError("CheckpointService requires a WorkspaceRootAuthority")
 
     def read_files_for_task(
         self,
@@ -203,13 +385,27 @@ class CheckpointService:
     def _load_verified_checkpoint(
         self, checkpoint_id: str
     ) -> tuple[Checkpoint, tuple[_ManifestEntry, ...]]:
+        return self._load_verified_checkpoint_for_workspace(None, checkpoint_id)
+
+    def _load_verified_checkpoint_for_workspace(
+        self, workspace_id: str | None, checkpoint_id: str
+    ) -> tuple[Checkpoint, tuple[_ManifestEntry, ...]]:
         cursor = self._connection.cursor()
         cursor.execute("BEGIN")
         try:
-            row = cursor.execute(
-                "SELECT * FROM checkpoint_records WHERE checkpoint_id = ?",
-                (checkpoint_id,),
-            ).fetchone()
+            if workspace_id is None:
+                row = cursor.execute(
+                    "SELECT * FROM checkpoint_records WHERE checkpoint_id = ?",
+                    (checkpoint_id,),
+                ).fetchone()
+            else:
+                row = cursor.execute(
+                    """
+                    SELECT * FROM checkpoint_records
+                    WHERE workspace_id = ? AND checkpoint_id = ?
+                    """,
+                    (workspace_id, checkpoint_id),
+                ).fetchone()
             if row is None:
                 raise _error("NOT_FOUND")
             checkpoint = _checkpoint_from_row(row)
@@ -217,9 +413,14 @@ class CheckpointService:
                 raise _error("HISTORICAL_UNVERIFIED")
             entries = self._load_entries(checkpoint.checkpoint_id, cursor)
             self._validate_checkpoint_integrity(checkpoint, entries)
-            self.index_service.snapshot_facts(
-                checkpoint.workspace_id, checkpoint.snapshot_id
-            )
+            try:
+                self.index_service.snapshot_facts(
+                    checkpoint.workspace_id, checkpoint.snapshot_id
+                )
+            except IndexError as exc:
+                if exc.code == "NOT_FOUND":
+                    raise _error("INDEX_CORRUPT") from None
+                raise
         except (
             KeyError,
             TypeError,
@@ -352,6 +553,26 @@ class CheckpointService:
     def _validate_ownership(
         self, ownership: WorkspaceOwnership
     ) -> tuple[Path, tuple[str, ...], str]:
+        self._validate_ownership_shape(ownership)
+        workspace_id = ownership.workspace_id
+        root = self._resolve_requested_workspace(workspace_id)
+        if _unsafe_path(root):
+            raise _error("UNSAFE_PATH_TYPE")
+
+        top_level, git_dir, common_dir = _git_worktree_paths(root)
+        if _path_key(top_level) != _path_key(root):
+            raise _error("WORKTREE_UNOWNED")
+        if _path_key(git_dir) == _path_key(common_dir):
+            raise _error("WORKTREE_UNOWNED")
+
+        scope = _normalize_scope(ownership.write_scope)
+        self._reject_internal_storage(root)
+        for relative in scope:
+            self._validate_scope_path(root, relative)
+        return root, scope, workspace_id
+
+    @staticmethod
+    def _validate_ownership_shape(ownership: WorkspaceOwnership) -> None:
         if (
             not isinstance(ownership, WorkspaceOwnership)
             or not isinstance(ownership.workflow_id, str)
@@ -367,30 +588,32 @@ class CheckpointService:
             raise _error("WORKSPACE_UNREGISTERED")
         if not isinstance(ownership.workspace_id, str) or not ownership.workspace_id:
             raise _error("WORKSPACE_UNREGISTERED")
-        resolver = getattr(self.index_service, "_workspace_root", None)
-        if not callable(resolver):
-            raise _error("WORKSPACE_UNREGISTERED")
+
+    def _resolve_requested_workspace(self, workspace_id: str) -> Path:
+        from devkit_runtime.workspace_authority import VerifiedWorkspaceAccess
+
         try:
-            root = resolver(ownership.workspace_id)
+            access = self.workspace_authority.resolve(workspace_id)
         except IndexError:
             raise
         except Exception:
             raise _error("WORKSPACE_UNREGISTERED") from None
-        workspace_id = ownership.workspace_id
-        if _unsafe_path(root):
-            raise _error("UNSAFE_PATH_TYPE")
+        if (
+            not isinstance(access, VerifiedWorkspaceAccess)
+            or access.workspace_id != workspace_id
+        ):
+            raise _error("WORKSPACE_UNREGISTERED")
+        return access.root
 
-        top_level, git_dir, common_dir = _git_worktree_paths(root)
-        if _path_key(top_level) != _path_key(root):
-            raise _error("WORKTREE_UNOWNED")
-        if _path_key(git_dir) == _path_key(common_dir):
-            raise _error("WORKTREE_UNOWNED")
-
-        scope = _normalize_scope(ownership.write_scope)
-        self._reject_internal_storage(root)
-        for relative in scope:
-            self._validate_scope_path(root, relative)
-        return root, scope, workspace_id
+    def _assert_scoped_expected_current(
+        self, workspace_id: str, snapshot_id: str
+    ) -> None:
+        try:
+            self.index_service.assert_current(workspace_id, snapshot_id)
+        except IndexError as exc:
+            if exc.code in {"WORKSPACE_UNREGISTERED", "WORKSPACE_REBIND"}:
+                raise
+            raise _error("ROLLBACK_DRIFT") from None
 
     def _reject_internal_storage(self, root: Path) -> None:
         if _within(root, self.database_path) or _within(root, self.cas_root):
@@ -929,6 +1152,18 @@ class CheckpointService:
             or checkpoint.lease_epoch != ownership.lease_epoch
             or checkpoint.write_scope != scope
             or checkpoint.workspace_id != workspace_id
+        ):
+            raise _error("WORKTREE_UNOWNED")
+
+    @staticmethod
+    def _require_checkpoint_lease(
+        checkpoint: Checkpoint, ownership: WorkspaceOwnership
+    ) -> None:
+        if (
+            checkpoint.workflow_id != ownership.workflow_id
+            or checkpoint.task_id != ownership.task_id
+            or checkpoint.owner != ownership.owner
+            or checkpoint.lease_epoch != ownership.lease_epoch
         ):
             raise _error("WORKTREE_UNOWNED")
 

@@ -10,9 +10,13 @@ import sqlite3
 import stat
 import subprocess
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import BinaryIO, Mapping, Sequence
+from typing import TYPE_CHECKING, BinaryIO, cast
+
+if TYPE_CHECKING:
+    from devkit_runtime.workspace_authority import WorkspaceRootAuthority
 
 from . import extractors
 from .extractors import ParsedExtraction, SourceFile
@@ -34,7 +38,6 @@ from .models import (
 from .registry import WorkspaceRegistry
 from .store import ProjectIndexStore, StoreError
 from .workspace import is_workspace_id, workspace_identity
-
 
 _SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v4"
 _READ_CHUNK_SIZE = 64 * 1024
@@ -79,6 +82,36 @@ class _OpenedWorkspaceFile:
     stream: BinaryIO
 
 
+@dataclass(frozen=True)
+class _StandaloneWorkspaceAccess:
+    """Temporary standalone-package compatibility binding until R9 packaging."""
+
+    workspace_id: str
+    root: Path
+
+
+class _StandaloneWorkspaceRootAuthority:
+    """Keep legacy Project Index-only distributions usable during R1-R8."""
+
+    def __init__(self, registry: WorkspaceRegistry) -> None:
+        self._registry = registry
+
+    def resolve(self, workspace_id: str) -> _StandaloneWorkspaceAccess:
+        return _StandaloneWorkspaceAccess(workspace_id, self._registry.resolve(workspace_id))
+
+
+def _workspace_authority_for(registry: WorkspaceRegistry) -> WorkspaceRootAuthority:
+    """Use the runtime authority, retaining standalone compatibility through R8."""
+
+    try:
+        from devkit_runtime.workspace_authority import WorkspaceRootAuthority
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"devkit_runtime", "devkit_runtime.workspace_authority"}:
+            raise
+        return cast("WorkspaceRootAuthority", _StandaloneWorkspaceRootAuthority(registry))
+    return WorkspaceRootAuthority(registry)
+
+
 class ProjectIndexService:
     """Own a rebuildable graph database and expose bounded deterministic reads."""
 
@@ -87,6 +120,7 @@ class ProjectIndexService:
         try:
             self._store = ProjectIndexStore(self._database_path)
             self._registry = WorkspaceRegistry(self._store)
+            self._workspace_authority = _workspace_authority_for(self._registry)
         except sqlite3.DatabaseError as exc:
             raise IndexError(
                 "INDEX_CORRUPT", "project index database is corrupt"
@@ -95,6 +129,23 @@ class ProjectIndexService:
             raise IndexError(
                 "INDEX_UNAVAILABLE", "project index database is unavailable"
             ) from exc
+
+    @classmethod
+    def from_prepared_store(cls, store: ProjectIndexStore) -> ProjectIndexService:
+        """Create a non-mutating service over one externally prepared store."""
+
+        service = cls.__new__(cls)
+        service._database_path = store.database_path
+        service._store = store
+        service._registry = WorkspaceRegistry(store)
+        service._workspace_authority = _workspace_authority_for(service._registry)
+        return service
+
+    @property
+    def workspace_authority(self) -> WorkspaceRootAuthority:
+        """Return the sole typed authority shared with checkpoint operations."""
+
+        return self._workspace_authority
 
     def close(self) -> None:
         self._store.close()
@@ -677,11 +728,11 @@ class ProjectIndexService:
         """Resolve a previously registered opaque workspace identifier only."""
         if not isinstance(workspace_id, str) or not is_workspace_id(workspace_id):
             raise IndexError("WORKSPACE_UNREGISTERED", "workspace is not registered")
-        return workspace_id, self._registry.resolve(workspace_id)
+        return workspace_id, self.workspace_authority.resolve(workspace_id).root
 
     def _workspace_root(self, workspace_id: str) -> Path:
-        """Private cross-service resolver for checkpoint capture and restore."""
-        return self._registry.resolve(workspace_id)
+        """Deprecated Atlas compatibility shim until the R3 migration."""
+        return self.workspace_authority.resolve(workspace_id).root
 
     def _normalize_paths(self, paths: Sequence[str | Path] | None) -> tuple[str, ...]:
         if paths is None:

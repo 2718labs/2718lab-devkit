@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
 
 from .extractors import (
     ParsedExtraction,
@@ -17,8 +17,8 @@ from .extractors import (
 )
 from .models import (
     CoverageGap,
-    IndexError,
     IndexEdge,
+    IndexError,
     IndexNode,
     IndexSnapshot,
     IndexState,
@@ -51,6 +51,7 @@ class ProjectIndexStore:
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
+        self._owns_connection = True
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(
             str(self.database_path), isolation_level=None
@@ -61,8 +62,56 @@ class ProjectIndexStore:
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
 
+    @classmethod
+    def from_prepared_connection(
+        cls, database_path: str | Path, connection: sqlite3.Connection
+    ) -> ProjectIndexStore:
+        """Bind a runtime-owned connection after an external read-only check."""
+
+        store = cls.__new__(cls)
+        store.database_path = Path(database_path)
+        store._connection = connection
+        store._owns_connection = False
+        connection.row_factory = sqlite3.Row
+        return store
+
+    @classmethod
+    def validate_prepared_connection(cls, connection: sqlite3.Connection) -> None:
+        """Reject a database that is missing the current complete index schema."""
+
+        connection.row_factory = sqlite3.Row
+        required_tables = {
+            "project_index_metadata",
+            "project_index_blobs",
+            "project_index_snapshots",
+            "project_index_snapshot_files",
+            "project_index_parse_cache",
+            "project_index_nodes",
+            "project_index_edges",
+            "project_index_gaps",
+            "project_index_syncs",
+            "project_index_workspaces",
+            "project_index_snapshot_bindings",
+            "project_index_query_receipts",
+        }
+        try:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            version_row = connection.execute(
+                "SELECT value FROM project_index_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            version = None if version_row is None else int(version_row["value"])
+        except (TypeError, ValueError, sqlite3.DatabaseError) as exc:
+            raise StoreError("project index schema is corrupt") from exc
+        if not required_tables.issubset(tables) or version != cls._SCHEMA_VERSION:
+            raise StoreError("project index store is not prepared")
+
     def close(self) -> None:
-        if self._connection is not None:
+        if self._owns_connection and self._connection is not None:
             self._connection.close()
             self._connection = None  # type: ignore[assignment]
 
