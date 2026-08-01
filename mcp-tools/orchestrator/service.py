@@ -1019,7 +1019,9 @@ class OrchestratorService:
         if self._checkpoint_service is None:
             raise ServiceError("INDEX_UNAVAILABLE", "checkpoint service is unavailable")
         try:
-            checkpoint = self._checkpoint_service.status(binding.checkpoint_id)
+            checkpoint = self._checkpoint_service.status(
+                binding.workspace_id, binding.checkpoint_id
+            )
         except Exception as error:
             self._raise_index_error(error)
         if (
