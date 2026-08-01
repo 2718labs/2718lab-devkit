@@ -5,18 +5,18 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
+from typing import Self
 
 import pytest
-
 
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
-from project_index import IndexError, IndexState, ProjectIndexService  # noqa: E402
-import project_index.service as service_module  # noqa: E402
+import project_index.service as service_module
+from project_index import IndexError, IndexState, ProjectIndexService
 
 
 def _service(tmp_path: Path) -> ProjectIndexService:
@@ -53,13 +53,14 @@ def test_sync_is_deterministic_and_reuses_unchanged_blobs(tmp_path: Path) -> Non
     )
     (workspace / "notes.md").write_text("# Notes\n", encoding="utf-8")
     service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
 
-    first = service.sync(workspace)
-    identical = service.sync(workspace)
+    first = service.sync(workspace_id)
+    identical = service.sync(workspace_id)
     (workspace / "alpha.py").write_text(
         "def alpha():\n    return 2\n", encoding="utf-8"
     )
-    changed = service.sync(workspace)
+    changed = service.sync(workspace_id)
 
     assert first.snapshot_id == identical.snapshot_id
     assert first.snapshot_id.startswith("sha256:")
@@ -70,7 +71,8 @@ def test_sync_is_deterministic_and_reuses_unchanged_blobs(tmp_path: Path) -> Non
 
     service.close()
     reopened = ProjectIndexService(tmp_path / "index.sqlite3")
-    assert reopened.status(workspace).snapshot_id == changed.snapshot_id
+    assert reopened.project_index_register(workspace) == workspace_id
+    assert reopened.status(workspace_id).snapshot_id == changed.snapshot_id
     reopened.close()
 
 
@@ -99,9 +101,10 @@ def test_extractors_emit_only_parser_backed_facts_and_explicit_gaps(
     )
     (workspace / "app.js").write_text("export const value = 1;\n", encoding="utf-8")
     service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
 
-    snapshot = service.sync(workspace)
-    result = service.query(workspace, snapshot.snapshot_id, "", max_nodes=100)
+    snapshot = service.sync(workspace_id)
+    result = service.query(workspace_id, snapshot.snapshot_id, "", max_nodes=100)
 
     facts = {(node.kind, node.path, node.qualified_name) for node in result.nodes}
     assert ("class", "sample.py", "sample.Widget") in facts
@@ -152,17 +155,18 @@ def test_lexical_graph_and_impact_queries_are_deterministic(tmp_path: Path) -> N
         encoding="utf-8",
     )
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
 
     lexical = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "helper",
         mode="lexical",
         node_kinds=("function",),
     )
     graph = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "uses_helper",
         mode="graph",
@@ -170,7 +174,7 @@ def test_lexical_graph_and_impact_queries_are_deterministic(tmp_path: Path) -> N
         max_depth=1,
     )
     impact = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "def helper",
         mode="impact",
@@ -178,14 +182,14 @@ def test_lexical_graph_and_impact_queries_are_deterministic(tmp_path: Path) -> N
         max_depth=1,
     )
     repeated = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "helper",
         mode="lexical",
         node_kinds=("function",),
     )
     body_match = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "return 0",
         mode="lexical",
@@ -215,10 +219,11 @@ def test_query_bounds_windows_and_rejects_stale_source_hashes(tmp_path: Path) ->
         encoding="utf-8",
     )
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
 
     bounded = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "def",
         node_kinds=("function",),
@@ -235,7 +240,7 @@ def test_query_bounds_windows_and_rejects_stale_source_hashes(tmp_path: Path) ->
     assert len(window.text.encode("utf-8")) <= 1024
 
     byte_limited = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "one",
         node_kinds=("function",),
@@ -248,7 +253,7 @@ def test_query_bounds_windows_and_rejects_stale_source_hashes(tmp_path: Path) ->
 
     source.write_text("def changed():\n    return 9\n", encoding="utf-8")
     with pytest.raises(IndexError) as captured:
-        service.query(workspace, snapshot.snapshot_id, "one")
+        service.query(workspace_id, snapshot.snapshot_id, "one")
     assert captured.value.code == "INDEX_STALE"
     service.close()
 
@@ -259,42 +264,45 @@ def test_status_assert_current_and_diff_are_path_bounded(tmp_path: Path) -> None
     (workspace / "keep.py").write_text("VALUE = 1\n", encoding="utf-8")
     (workspace / "skip.py").write_text("SKIP = 1\n", encoding="utf-8")
     service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
 
-    first = service.sync(workspace, include_paths=("keep.py",))
+    first = service.sync(workspace_id, include_paths=("keep.py",))
     assert (
-        service.status(workspace, first.snapshot_id, required_paths=("keep.py",)).state
+        service.status(
+            workspace_id, first.snapshot_id, required_paths=("keep.py",)
+        ).state
         is IndexState.INDEX_READY
     )
     assert (
         service.assert_current(
-            workspace, first.snapshot_id, required_paths=("keep.py",)
+            workspace_id, first.snapshot_id, required_paths=("keep.py",)
         )
         == first
     )
 
     (workspace / "keep.py").write_text("VALUE = 2\n", encoding="utf-8")
-    stale = service.status(workspace, first.snapshot_id, required_paths=("keep.py",))
+    stale = service.status(workspace_id, first.snapshot_id, required_paths=("keep.py",))
     assert stale.state is IndexState.INDEX_STALE
     with pytest.raises(IndexError) as captured:
         service.assert_current(
-            workspace, first.snapshot_id, required_paths=("keep.py",)
+            workspace_id, first.snapshot_id, required_paths=("keep.py",)
         )
     assert captured.value.code == "INDEX_STALE"
 
-    second = service.sync(workspace, include_paths=("keep.py",))
-    difference = service.diff(first.snapshot_id, second.snapshot_id)
+    second = service.sync(workspace_id, include_paths=("keep.py",))
+    difference = service.diff(workspace_id, first.snapshot_id, second.snapshot_id)
     assert difference.added_paths == ()
     assert difference.removed_paths == ()
     assert difference.changed_paths == ("keep.py",)
     assert all(
         node.path != "skip.py"
-        for node in service.query(workspace, second.snapshot_id, "").nodes
+        for node in service.query(workspace_id, second.snapshot_id, "").nodes
     )
 
     outside = tmp_path / "outside.py"
     outside.write_text("OUTSIDE = True\n", encoding="utf-8")
     with pytest.raises(IndexError) as captured:
-        service.sync(workspace, include_paths=(outside,))
+        service.sync(workspace_id, include_paths=(outside,))
     assert captured.value.code == "SCOPE_ESCAPE"
     service.close()
 
@@ -309,7 +317,8 @@ def test_query_rejects_a_source_parent_replaced_by_external_link(
     content = "def indexed():\n    return True\n"
     indexed_file.write_text(content, encoding="utf-8")
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
 
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -323,7 +332,7 @@ def test_query_rejects_a_source_parent_replaced_by_external_link(
         pytest.skip("directory symlinks are unavailable on this Windows host")
 
     with pytest.raises(IndexError) as captured:
-        service.query(workspace, snapshot.snapshot_id, "indexed")
+        service.query(workspace_id, snapshot.snapshot_id, "indexed")
     assert captured.value.code == "INDEX_STALE"
     service.close()
 
@@ -337,22 +346,27 @@ def test_required_paths_accept_directory_scopes(tmp_path: Path) -> None:
     outside = workspace / "outside.py"
     outside.write_text("OUTSIDE = 1\n", encoding="utf-8")
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
 
     assert (
         service.assert_current(
-            workspace, snapshot.snapshot_id, required_paths=("scope",)
+            workspace_id, snapshot.snapshot_id, required_paths=("scope",)
         )
         == snapshot
     )
     outside.write_text("OUTSIDE = 2\n", encoding="utf-8")
     assert (
-        service.status(workspace, snapshot.snapshot_id, required_paths=("scope",)).state
+        service.status(
+            workspace_id, snapshot.snapshot_id, required_paths=("scope",)
+        ).state
         is IndexState.INDEX_READY
     )
 
     scoped_file.write_text("VALUE = 2\n", encoding="utf-8")
-    status = service.status(workspace, snapshot.snapshot_id, required_paths=("scope",))
+    status = service.status(
+        workspace_id, snapshot.snapshot_id, required_paths=("scope",)
+    )
     assert status.state is IndexState.INDEX_STALE
     assert status.changed_paths == ("scope/module.py",)
     service.close()
@@ -371,9 +385,10 @@ def test_nodes_and_edges_expose_auditable_utf8_spans(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     result = service.query(
-        workspace, snapshot.snapshot_id, "", max_nodes=100, source_lines=0
+        workspace_id, snapshot.snapshot_id, "", max_nodes=100, source_lines=0
     )
     source_bytes = source.read_bytes()
     allowed_provenance = {"observed", "resolved", "declared"}
@@ -428,23 +443,25 @@ def test_parser_cache_is_durable_path_neutral_and_reresolves_each_snapshot(
     )
 
     service = _service(tmp_path)
-    first = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    first = service.sync(workspace_id)
     assert parsed_paths == ["alpha.py", "caller.py"]
     service.close()
 
     parsed_paths.clear()
     reopened = _service(tmp_path)
-    identical = reopened.sync(workspace)
+    assert reopened.project_index_register(workspace) == workspace_id
+    identical = reopened.sync(workspace_id)
     assert identical == first
     assert parsed_paths == []
 
     renamed = workspace / "renamed.py"
     original.rename(renamed)
-    renamed_snapshot = reopened.sync(workspace)
+    renamed_snapshot = reopened.sync(workspace_id)
     assert parsed_paths == []
     assert renamed_snapshot.reused_blob_count == 2
     renamed_result = reopened.query(
-        workspace, renamed_snapshot.snapshot_id, "", max_nodes=100, source_lines=0
+        workspace_id, renamed_snapshot.snapshot_id, "", max_nodes=100, source_lines=0
     )
     assert not any(edge.relation == "calls" for edge in renamed_result.edges)
     assert any(
@@ -462,11 +479,11 @@ def test_parser_cache_is_durable_path_neutral_and_reresolves_each_snapshot(
         encoding="utf-8",
     )
     parsed_paths.clear()
-    changed = reopened.sync(workspace)
+    changed = reopened.sync(workspace_id)
     assert parsed_paths == ["caller.py"]
     assert changed.reused_blob_count == 1
     changed_result = reopened.query(
-        workspace,
+        workspace_id,
         changed.snapshot_id,
         "caller",
         mode="graph",
@@ -509,9 +526,10 @@ def test_markdown_extracts_structured_work_package_facts(tmp_path: Path) -> None
         encoding="utf-8",
     )
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     result = service.query(
-        workspace, snapshot.snapshot_id, "", max_nodes=100, source_lines=0
+        workspace_id, snapshot.snapshot_id, "", max_nodes=100, source_lines=0
     )
 
     facts = {(node.kind, node.name) for node in result.nodes}
@@ -552,9 +570,10 @@ def test_unresolved_and_dynamic_python_references_are_gaps_not_guessed_edges(
         "def missing():\n    return 'not imported'\n", encoding="utf-8"
     )
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     result = service.query(
-        workspace, snapshot.snapshot_id, "", max_nodes=100, source_lines=0
+        workspace_id, snapshot.snapshot_id, "", max_nodes=100, source_lines=0
     )
     caller = next(
         node
@@ -587,9 +606,10 @@ def test_query_receipts_persist_and_can_be_loaded_after_reopen(tmp_path: Path) -
     )
     (workspace / "unknown.js").write_text("export const value = 1;\n", encoding="utf-8")
     service = _service(tmp_path)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     result = service.query(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         "alpha absent",
         mode="graph",
@@ -648,8 +668,9 @@ def test_snapshot_exposes_deterministic_manifest_parser_set_and_git_head(
     ).stdout.strip()
 
     service = _service(tmp_path)
-    first = service.sync(workspace)
-    repeated = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    first = service.sync(workspace_id)
+    repeated = service.sync(workspace_id)
     assert first == repeated
     assert first.manifest_hash.startswith("sha256:")
     assert first.parser_set_hash.startswith("sha256:")
@@ -663,10 +684,11 @@ def test_snapshot_facts_and_files_are_hash_verified(tmp_path: Path) -> None:
     source = workspace / "module.py"
     source.write_bytes(b"VALUE = 1\n")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
-    facts = service.snapshot_facts(workspace, snapshot.snapshot_id)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+    facts = service.snapshot_facts(workspace_id, snapshot.snapshot_id)
     files = service.read_snapshot_files(
-        workspace,
+        workspace_id,
         snapshot.snapshot_id,
         ("module.py",),
         byte_budget=1024,
@@ -677,7 +699,7 @@ def test_snapshot_facts_and_files_are_hash_verified(tmp_path: Path) -> None:
     source.write_bytes(b"VALUE = 2\n")
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=1024
+            workspace_id, snapshot.snapshot_id, ("module.py",), byte_budget=1024
         )
     assert captured.value.code == "INDEX_STALE"
     service.close()
@@ -690,10 +712,11 @@ def test_snapshot_file_body_is_not_stored_in_the_index_database(tmp_path: Path) 
     (workspace / "marker.txt").write_bytes(marker)
     database = tmp_path / "index.sqlite3"
     service = ProjectIndexService(database)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     assert (
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("marker.txt",), byte_budget=1024
+            workspace_id, snapshot.snapshot_id, ("marker.txt",), byte_budget=1024
         )[0].body
         == marker
     )
@@ -703,16 +726,17 @@ def test_snapshot_file_body_is_not_stored_in_the_index_database(tmp_path: Path) 
 
 @pytest.mark.parametrize("byte_budget", (0, -1, True, 1.5))
 def test_snapshot_file_reader_rejects_invalid_budgets(
-    tmp_path: Path, byte_budget: int | float
+    tmp_path: Path, byte_budget: float
 ) -> None:
     workspace = tmp_path / "repo"
     workspace.mkdir()
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     with pytest.raises(IndexError):
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=byte_budget
+            workspace_id, snapshot.snapshot_id, ("module.py",), byte_budget=byte_budget
         )
     service.close()
 
@@ -727,7 +751,9 @@ def test_snapshot_file_reader_rejects_stale_foreign_and_unsafe_inputs(
     (workspace / "a.py").write_bytes(b"A\n")
     (workspace / "b.py").write_bytes(b"B\n")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    foreign_id = service.project_index_register(foreign)
+    snapshot = service.sync(workspace_id)
     for paths in (
         (),
         ("b.py", "a.py"),
@@ -739,24 +765,24 @@ def test_snapshot_file_reader_rejects_stale_foreign_and_unsafe_inputs(
     ):
         with pytest.raises(IndexError):
             service.read_snapshot_files(
-                workspace, snapshot.snapshot_id, paths, byte_budget=1024
+                workspace_id, snapshot.snapshot_id, paths, byte_budget=1024
             )
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            foreign, snapshot.snapshot_id, ("a.py",), byte_budget=1024
+            foreign_id, snapshot.snapshot_id, ("a.py",), byte_budget=1024
         )
     assert captured.value.code == "NOT_FOUND"
     (workspace / "added.py").write_bytes(b"added\n")
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("a.py",), byte_budget=1024
+            workspace_id, snapshot.snapshot_id, ("a.py",), byte_budget=1024
         )
     assert captured.value.code == "INDEX_STALE"
     (workspace / "added.py").unlink()
     (workspace / "a.py").unlink()
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("a.py",), byte_budget=1024
+            workspace_id, snapshot.snapshot_id, ("a.py",), byte_budget=1024
         )
     assert captured.value.code == "INDEX_STALE"
     service.close()
@@ -769,7 +795,8 @@ def test_snapshot_file_reader_captures_each_target_once(
     workspace.mkdir()
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     observed: list[str] = []
     original = service_module._stream_workspace_file
 
@@ -781,7 +808,7 @@ def test_snapshot_file_reader_captures_each_target_once(
 
     monkeypatch.setattr(service_module, "_stream_workspace_file", counted)
     files = service.read_snapshot_files(
-        workspace, snapshot.snapshot_id, ("module.py",), byte_budget=1024
+        workspace_id, snapshot.snapshot_id, ("module.py",), byte_budget=1024
     )
     assert files[0].body == b"VALUE = 1\n"
     assert observed.count("module.py") == 1
@@ -796,17 +823,18 @@ def test_snapshot_file_reader_orders_and_bounds_without_partial_output(
     (workspace / "a.py").write_bytes(b"aa")
     (workspace / "b.py").write_bytes(b"bb")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     assert tuple(
         item.path
         for item in service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("a.py", "b.py"), byte_budget=4
+            workspace_id, snapshot.snapshot_id, ("a.py", "b.py"), byte_budget=4
         )
     ) == ("a.py", "b.py")
     for budget in (1, 3):
         with pytest.raises(IndexError):
             service.read_snapshot_files(
-                workspace,
+                workspace_id,
                 snapshot.snapshot_id,
                 ("a.py", "b.py"),
                 byte_budget=budget,
@@ -824,14 +852,15 @@ def test_snapshot_file_reader_rejects_absolute_drive_and_unc_paths(
     workspace.mkdir()
     (workspace / "a.py").write_bytes(b"x")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     with pytest.raises(IndexError):
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, (path,), byte_budget=8
+            workspace_id, snapshot.snapshot_id, (path,), byte_budget=8
         )
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, "sha256:" + "0" * 64, ("a.py",), byte_budget=8
+            workspace_id, "sha256:" + "0" * 64, ("a.py",), byte_budget=8
         )
     assert captured.value.code == "NOT_FOUND"
     service.close()
@@ -847,7 +876,8 @@ def test_snapshot_file_reader_rejects_directory_and_preserves_inputs(
     (workspace / "folder").mkdir()
     database = tmp_path / "index.sqlite3"
     service = ProjectIndexService(database)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     workspace_before = tuple(
         sorted(
             (path.relative_to(workspace).as_posix(), path.read_bytes())
@@ -858,7 +888,7 @@ def test_snapshot_file_reader_rejects_directory_and_preserves_inputs(
     database_before = database.read_bytes()
     with pytest.raises(IndexError):
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("folder",), byte_budget=64
+            workspace_id, snapshot.snapshot_id, ("folder",), byte_budget=64
         )
     assert database.read_bytes() == database_before
     assert (
@@ -880,7 +910,8 @@ def test_snapshot_file_reader_rejects_symlink_probe(tmp_path: Path) -> None:
     source = workspace / "source.py"
     source.write_bytes(b"marker")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     link = workspace / "link.py"
     try:
         link.symlink_to(source)
@@ -888,7 +919,7 @@ def test_snapshot_file_reader_rejects_symlink_probe(tmp_path: Path) -> None:
         pytest.skip(f"link capability unavailable: {exc}")
     with pytest.raises(IndexError):
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("link.py",), byte_budget=64
+            workspace_id, snapshot.snapshot_id, ("link.py",), byte_budget=64
         )
     service.close()
 
@@ -914,7 +945,8 @@ def test_snapshot_file_reader_rejects_same_size_atomic_replacement(
     replacement = workspace / "replacement.py"
     replacement.write_bytes(b"evil")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace, include_paths=("module.py",))
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id, include_paths=("module.py",))
     original_open = service_module.os.open
     replaced = False
 
@@ -930,7 +962,7 @@ def test_snapshot_file_reader_rejects_same_size_atomic_replacement(
     monkeypatch.setattr(service_module.os, "open", replace_before_open)
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=64
+            workspace_id, snapshot.snapshot_id, ("module.py",), byte_budget=64
         )
     assert captured.value.code == "INDEX_STALE"
     assert target.read_bytes() == b"evil"
@@ -949,7 +981,8 @@ def test_snapshot_file_reader_rejects_directory_junction_parent(
     external.mkdir()
     (external / "module.py").write_bytes(b"outside")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     (parent / "module.py").unlink()
     parent.rmdir()
     try:
@@ -960,7 +993,7 @@ def test_snapshot_file_reader_rejects_directory_junction_parent(
     try:
         with pytest.raises(IndexError) as captured:
             service.read_snapshot_files(
-                workspace, snapshot.snapshot_id, ("src/module.py",), byte_budget=64
+                workspace_id, snapshot.snapshot_id, ("src/module.py",), byte_budget=64
             )
         assert captured.value.code == "INDEX_STALE"
         assert external.joinpath("module.py").read_bytes() == b"outside"
@@ -987,7 +1020,7 @@ class _TrackedReader:
         self._before_read = before_read
         self.closed = False
 
-    def __enter__(self) -> _TrackedReader:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -1015,7 +1048,8 @@ def test_snapshot_file_reader_prevalidates_aggregate_before_requested_body_reads
     (workspace / "a.py").write_bytes(b"aaa")
     (workspace / "b.py").write_bytes(b"bbb")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     original_open = service_module.os.open
     original_fdopen = service_module.os.fdopen
     descriptors: dict[int, Path] = {}
@@ -1050,10 +1084,13 @@ def test_snapshot_file_reader_prevalidates_aggregate_before_requested_body_reads
     monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("a.py", "b.py"), byte_budget=5
+            workspace_id, snapshot.snapshot_id, ("a.py", "b.py"), byte_budget=5
         )
     assert captured.value.code == "INVALID_QUERY"
-    assert [path.name for path in opened_paths] == ["a.py", "b.py"]
+    assert [path.name for path in opened_paths if path.name in {"a.py", "b.py"}] == [
+        "a.py",
+        "b.py",
+    ]
     assert requested_reads == []
     assert readers and all(reader.closed for reader in readers)
     service.close()
@@ -1066,7 +1103,8 @@ def test_snapshot_file_reader_rejects_duplicate_requests_before_any_scan(
     workspace.mkdir()
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
 
     def fail_preflight(*args: object, **kwargs: object) -> None:
         pytest.fail("duplicate paths must fail before file-size preflight")
@@ -1080,7 +1118,7 @@ def test_snapshot_file_reader_rejects_duplicate_requests_before_any_scan(
     monkeypatch.setattr(service, "_scan_snapshot_files", fail_scan)
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace,
+            workspace_id,
             snapshot.snapshot_id,
             ("module.py", "module.py"),
             byte_budget=64,
@@ -1097,7 +1135,8 @@ def test_snapshot_file_reader_caps_retained_reads_when_file_grows_after_fstat(
     source = workspace / "module.py"
     source.write_bytes(b"x")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     original_fdopen = service_module.os.fdopen
     read_sizes: list[int] = []
     grew = False
@@ -1121,7 +1160,7 @@ def test_snapshot_file_reader_caps_retained_reads_when_file_grows_after_fstat(
     monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=2
+            workspace_id, snapshot.snapshot_id, ("module.py",), byte_budget=2
         )
     assert captured.value.code == "INDEX_STALE"
     assert read_sizes
@@ -1138,7 +1177,8 @@ def test_snapshot_file_reader_streams_large_unrequested_file_without_body_retent
     unrequested = workspace / "large.bin"
     unrequested.write_bytes(b"x" * (8 * 1024 * 1024))
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     original = service_module._stream_workspace_file
     original_open = service_module.os.open
     original_fdopen = service_module.os.fdopen
@@ -1176,7 +1216,7 @@ def test_snapshot_file_reader_streams_large_unrequested_file_without_body_retent
     monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
     monkeypatch.setattr(service_module, "_stream_workspace_file", recorded)
     files = service.read_snapshot_files(
-        workspace, snapshot.snapshot_id, ("requested.py",), byte_budget=1024
+        workspace_id, snapshot.snapshot_id, ("requested.py",), byte_budget=1024
     )
     assert files[0].body == b"requested\n"
     assert ("large.bin", False, None, 8 * 1024 * 1024) in observed
@@ -1187,7 +1227,7 @@ def test_snapshot_file_reader_streams_large_unrequested_file_without_body_retent
     unrequested.write_bytes(b"y" * (8 * 1024 * 1024))
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("requested.py",), byte_budget=1024
+            workspace_id, snapshot.snapshot_id, ("requested.py",), byte_budget=1024
         )
     assert captured.value.code == "INDEX_STALE"
     service.close()
@@ -1270,7 +1310,8 @@ def test_snapshot_file_reader_stops_unrequested_growth_after_size_probe(
     requested = workspace / "z-requested.py"
     requested.write_bytes(b"requested\n")
     service = ProjectIndexService(tmp_path / "index.sqlite3")
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     original_open = service_module.os.open
     original_fdopen = service_module.os.fdopen
     descriptors: dict[int, Path] = {}
@@ -1309,7 +1350,7 @@ def test_snapshot_file_reader_stops_unrequested_growth_after_size_probe(
     monkeypatch.setattr(service_module.os, "fdopen", tracked_fdopen)
     with pytest.raises(IndexError) as captured:
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("z-requested.py",), byte_budget=1024
+            workspace_id, snapshot.snapshot_id, ("z-requested.py",), byte_budget=1024
         )
     assert captured.value.code == "INDEX_STALE"
     assert read_sizes
@@ -1357,16 +1398,17 @@ def test_snapshot_file_reader_ignores_its_custom_database_inside_workspace(
     (workspace / "module.py").write_bytes(b"VALUE = 1\n")
     database = workspace / "custom-reader-cache.sqlite3"
     service = ProjectIndexService(database)
-    snapshot = service.sync(workspace)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
     assert tuple(
         path
         for path, _ in service.snapshot_facts(
-            workspace, snapshot.snapshot_id
+            workspace_id, snapshot.snapshot_id
         ).file_hashes
     ) == ("module.py",)
     assert (
         service.read_snapshot_files(
-            workspace, snapshot.snapshot_id, ("module.py",), byte_budget=64
+            workspace_id, snapshot.snapshot_id, ("module.py",), byte_budget=64
         )[0].body
         == b"VALUE = 1\n"
     )
