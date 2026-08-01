@@ -13,7 +13,12 @@ same-path work queues behind the active owner.
   difficult regressions.
 - Sol High (`gpt-5.6-sol`, `high`) is only for explicit exceptional bounded
   execution or deep investigation. Sol still owns final acceptance.
-- Luna is unavailable: do not spawn Luna and do not name a substitute Luna.
+- Luna (`gpt-5.6-luna`, `low`/`medium`/`high`/`xhigh`) is eligible only when
+  the current Codex host capability report attests the exact requested pair;
+  otherwise the route is unavailable and no model is silently substituted. A
+  request without an effort uses the profile's `medium` default only when that
+  exact pair is attested. This shared Codex host policy does not alter
+  Bugkiller, which remains a separate policy surface.
 - Claude routes are Opus coordinator, Sonnet code worker, Haiku light worker,
   and Fable only as an explicitly reasoned powerful/expensive escalation.
 
@@ -42,7 +47,7 @@ delivery. It never grants task context, write scope, integration, or acceptance.
 ## Dispatch template
 
 ```text
-Role: <Terra High | Terra Max | Sol High>
+Role: <Luna | Terra High | Terra Max | Sol High>
 Task card: <absolute path>/tasks/<id>.md
 Base revision: <commit>
 Write scope: <exact files or directories>

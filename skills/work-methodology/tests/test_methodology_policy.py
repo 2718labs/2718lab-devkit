@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 TEAM_PATTERNS = ROOT / "references" / "team-patterns.md"
 ORCHESTRATION = ROOT / "references" / "orchestration-runtime.md"
@@ -11,7 +10,7 @@ INTEGRATION = ROOT / "references" / "github-parallel-integration.md"
 
 
 class MethodologyPolicyTests(unittest.TestCase):
-    def test_current_host_policy_routes_terra_and_sol_without_luna(self) -> None:
+    def test_current_host_policy_routes_terra_sol_and_attested_luna(self) -> None:
         text = TEAM_PATTERNS.read_text(encoding="utf-8")
 
         for required in (
@@ -20,7 +19,8 @@ class MethodologyPolicyTests(unittest.TestCase):
             "Terra Max",
             "Sol High",
             "gpt-5.6-sol",
-            "Luna is unavailable",
+            "gpt-5.6-luna",
+            "exact requested pair",
             "Opus",
             "Sonnet",
             "Haiku",
@@ -74,7 +74,9 @@ class MethodologyPolicyTests(unittest.TestCase):
         text = ORCHESTRATION.read_text(encoding="utf-8")
 
         self.assertIn("Only Sol may call the acceptance completion gate", text)
-        self.assertIn("Luna is unavailable", text)
+        self.assertIn("gpt-5.6-luna", text)
+        self.assertIn("capability report", text)
+        self.assertIn("Bugkiller remains a separate policy surface", text)
 
     def test_efficiency_amendment_locks_resume_handoff_and_lanes(self) -> None:
         integration = INTEGRATION.read_text(encoding="utf-8")

@@ -7,10 +7,9 @@ from pathlib import Path
 
 import pytest
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from devkit_atlas.routing import RoutingStatus, resolve_role
+from devkit_atlas.routing import HOST_PROFILES, RoutingStatus, resolve_role
 
 
 def _codex_capabilities() -> dict[str, object]:
@@ -73,9 +72,74 @@ def test_luna_is_explicitly_unavailable_without_a_spawn_attempt() -> None:
     result = resolve_role({"host": "codex", "role": "luna"}, _codex_capabilities())
 
     assert result.status is RoutingStatus.UNAVAILABLE
-    assert result.reason == "luna_unavailable"
+    assert result.reason == "capability_unavailable"
+    assert (result.requested_model, result.requested_reasoning) == (
+        "gpt-5.6-luna",
+        "medium",
+    )
     assert result.effective_model is None
     assert result.attempts == ()
+
+
+def test_luna_resolves_only_for_an_attested_exact_capability_pair() -> None:
+    result = resolve_role(
+        {"host": "codex", "role": "luna"},
+        {
+            "host": "codex",
+            "models": {"gpt-5.6-luna": {"reasoning": ["medium"]}},
+        },
+    )
+
+    assert result.status is RoutingStatus.RESOLVED
+    assert (result.effective_model, result.effective_reasoning) == (
+        "gpt-5.6-luna",
+        "medium",
+    )
+    assert result.reason == "policy_route_resolved"
+    assert result.attempts == ()
+
+
+def test_luna_preserves_an_attested_non_default_effort() -> None:
+    result = resolve_role(
+        {"host": "codex", "role": "luna", "reasoning": "high"},
+        {
+            "host": "codex",
+            "models": {
+                "gpt-5.6-luna": {"reasoning": ["low", "medium", "high", "xhigh"]}
+            },
+        },
+    )
+
+    assert result.status is RoutingStatus.RESOLVED
+    assert (result.effective_model, result.effective_reasoning) == (
+        "gpt-5.6-luna",
+        "high",
+    )
+
+
+def test_luna_rejects_an_unattested_effort_without_substitution() -> None:
+    result = resolve_role(
+        {"host": "codex", "role": "luna", "reasoning": "xhigh"},
+        {
+            "host": "codex",
+            "models": {
+                "gpt-5.6-luna": {"reasoning": ["low", "medium", "high"]}
+            },
+        },
+    )
+
+    assert result.status is RoutingStatus.UNAVAILABLE
+    assert result.reason == "capability_unavailable"
+    assert result.effective_model is None
+    assert result.effective_reasoning is None
+    assert result.attempts == ()
+
+
+def test_luna_policy_exposes_an_effort_envelope_separate_from_attestation() -> None:
+    luna_policy = HOST_PROFILES["hosts"]["codex"]["roles"]["luna"]
+
+    assert luna_policy["reasoning"] == ["low", "medium", "high", "xhigh"]
+    assert luna_policy["default_reasoning"] == "medium"
 
 
 def test_router_fails_closed_for_unknown_capability_and_substitution() -> None:

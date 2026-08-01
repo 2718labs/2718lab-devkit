@@ -17,7 +17,7 @@ from typing import Any
 from . import ASSET_ROOT
 
 
-class RoutingStatus(str, Enum):
+class RoutingStatus(str, Enum):  # noqa: UP042 - retain the public enum type
     """Stable outcomes for an offline routing decision."""
 
     RESOLVED = "resolved"
@@ -195,6 +195,22 @@ def _reports_capability(
     )
 
 
+def _route_reasoning_options(route: Mapping[str, object]) -> tuple[str, ...] | None:
+    raw_reasoning = route.get("reasoning")
+    if isinstance(raw_reasoning, str):
+        return (raw_reasoning,) if raw_reasoning else None
+    if not isinstance(raw_reasoning, Sequence) or isinstance(
+        raw_reasoning, (str, bytes)
+    ):
+        return None
+    options = tuple(raw_reasoning)
+    if not options or not all(isinstance(value, str) and value for value in options):
+        return None
+    if len(set(options)) != len(options):
+        return None
+    return options
+
+
 def _profile_route(
     policy: Mapping[str, object],
     host: str,
@@ -320,8 +336,9 @@ def resolve_role(
         )
 
     model = _text(route.get("model"))
-    reasoning = _text(route.get("reasoning"))
-    if model is None or reasoning is None:
+    reasoning_options = _route_reasoning_options(route)
+    default_reasoning = _text(route.get("default_reasoning"))
+    if model is None or reasoning_options is None:
         return _result(
             RoutingStatus.REJECTED,
             requested_host=host,
@@ -330,6 +347,27 @@ def resolve_role(
             requested_reasoning=supplied_reasoning,
             reason="invalid_policy",
         )
+    if default_reasoning is None:
+        default_reasoning = reasoning_options[0]
+    if default_reasoning not in reasoning_options:
+        return _result(
+            RoutingStatus.REJECTED,
+            requested_host=host,
+            requested_role=raw_role,
+            requested_model=supplied_model,
+            requested_reasoning=supplied_reasoning,
+            reason="invalid_policy",
+        )
+    if supplied_reasoning is not None and supplied_reasoning not in reasoning_options:
+        return _result(
+            RoutingStatus.REJECTED,
+            requested_host=host,
+            requested_role=raw_role,
+            requested_model=supplied_model,
+            requested_reasoning=supplied_reasoning,
+            reason="requested_route_conflicts_with_policy",
+        )
+    reasoning = supplied_reasoning or default_reasoning
     if route.get("requires_escalation_reason") is True and escalation_reason is None:
         return _result(
             RoutingStatus.REJECTED,

@@ -26,8 +26,10 @@
           }
         },
         "luna": {
-          "status": "unavailable",
-          "reason": "luna_unavailable"
+          "model": "gpt-5.6-luna",
+          "reasoning": ["low", "medium", "high", "xhigh"],
+          "default_reasoning": "medium",
+          "purpose": "bounded_routine_execution"
         }
       }
     },

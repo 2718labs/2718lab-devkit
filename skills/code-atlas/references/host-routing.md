@@ -21,7 +21,7 @@ stable rejected or unavailable result. Policy assets are not capability claims.
 | Codex | normal code / Terra High | `gpt-5.6-terra` / `high` | Routine, bounded implementation, tests, debugging, docs, and validation. |
 | Codex | complex code / Terra Max | `gpt-5.6-terra` / `max` | Moderate-or-harder implementation, integration, refactoring, security work, and regressions. |
 | Codex | exceptional bounded code / Sol High | `gpt-5.6-sol` / `high` | Explicit exceptional execution or deep investigation only; Sol still owns final acceptance. |
-| Codex | Luna | unavailable | Never attempt a Luna spawn and never label a substitute as Luna. |
+| Codex | Luna | `gpt-5.6-luna` / requested `low`, `medium`, `high`, or `xhigh` with an exact host capability attestation | Missing or mismatched attestation returns `UNAVAILABLE`; an omitted effort uses the profile's `medium` default only when attested. Never substitute another model or alter Bugkiller's separate policy surface. |
 | Claude | coordinator | Opus / coordinator | Coordinator profile. |
 | Claude | code | Sonnet / standard | Code-worker profile. |
 | Claude | light | Haiku / light | Light-worker profile. |

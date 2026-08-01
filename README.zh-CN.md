@@ -87,7 +87,7 @@ Code Atlas **不使用 LLM、嵌入、向量数据库、网络服务或外部 Co
 | Terra High | `gpt-5.6-terra` 的 `high`：负责常规且有边界的编码、测试、调试、文档和辅助验证。 |
 | Terra Max | `gpt-5.6-terra` 的 `max`：负责中等及以上难度的实现、集成、重构、安全敏感执行和困难回归。 |
 | Sol High | `gpt-5.6-sol` 的 `high`，可选且仅用于特别复杂的有边界执行或深度调查；验收仍由 Sol 主对话负责。 |
-| Luna | 当前不可用；不会尝试调用，也不会把替代者标为 Luna。 |
+| Luna | 只有当前 Codex 宿主能力报告证明请求的 `gpt-5.6-luna` / `low`、`medium`、`high` 或 `xhigh` 精确组合时才可用；缺少或不匹配证明时返回不可用，不会静默替换模型。未指定 effort 时，仅在 `medium` 精确组合有证明时使用 profile 默认值。本共享 Codex profile 不迁移 Bugkiller；后者仍是独立的策略面。 |
 
 ## Claude 角色
 

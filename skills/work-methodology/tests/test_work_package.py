@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-
+from typing import cast
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "validate_work_package.py"
 STRICT_READ_ONLY_MARKERS = (
@@ -306,7 +306,7 @@ class WorkPackageValidationTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertTrue(any(marker in error for error in errors), errors)
 
-    def test_strict_package_rejects_luna_for_code_scope(self) -> None:
+    def test_strict_package_rejects_luna_without_an_exact_attested_pair(self) -> None:
         self.write_strict_terra_package()
         card = self.root / "tasks" / "BK-01.md"
         card.write_text(
@@ -319,8 +319,29 @@ class WorkPackageValidationTests(unittest.TestCase):
         errors = self.validate_strict()
 
         self.assertTrue(
-            any("Luna is unavailable" in error and "code" in error for error in errors)
+            any(
+                "Luna code dispatch requires attested gpt-5.6-luna with low, medium, high, or xhigh"
+                for error in errors
+            )
         )
+
+    def test_strict_package_allows_luna_with_an_exact_attested_pair(self) -> None:
+        self.write_strict_terra_package()
+        card = self.root / "tasks" / "BK-01.md"
+        card.write_text(
+            card.read_text(encoding="utf-8")
+            .replace("Owner: terra-high", "Owner: luna-high")
+            .replace(
+                "Dispatch Terra High with `gpt-5.6-terra` and `high`.",
+                "Dispatch Luna only when the host capability report attests the exact "
+                "`gpt-5.6-luna` and `medium` pair.",
+            ),
+            encoding="utf-8",
+        )
+
+        errors = self.validate_strict()
+
+        self.assertEqual([], errors)
 
     def test_strict_package_allows_terra_documentation_only_scope(self) -> None:
         self.write_strict_terra_package()
@@ -395,24 +416,25 @@ class WorkPackageValidationTests(unittest.TestCase):
 
         missing_receipt = {**valid_record}
         missing_receipt.pop("review_receipt")
+        review_receipt = cast(dict[str, object], valid_record["review_receipt"])
         worker_receipt = {
             **valid_record,
             "review_receipt": {
-                **valid_record["review_receipt"],
+                **review_receipt,
                 "reviewer_task_id": valid_record["task_id"],
             },
         }
         wrong_source = {
             **valid_record,
             "review_receipt": {
-                **valid_record["review_receipt"],
+                **review_receipt,
                 "source_branch": "feature/unreviewed-branch",
             },
         }
         invalid_receipt_hash = {
             **valid_record,
             "review_receipt": {
-                **valid_record["review_receipt"],
+                **review_receipt,
                 "receipt_hash": "not-a-receipt-hash",
             },
         }
@@ -568,11 +590,13 @@ class WorkPackageValidationTests(unittest.TestCase):
         self.assertEqual([], validator.validate_mcp_handoff_record(handoff))
 
         unsafe_packet = {**packet, "stdout": "unbounded raw output"}
+        resume_steps = cast(list[str], packet["resume_steps"])
         unordered_packet = {
             **packet,
-            "resume_steps": list(reversed(packet["resume_steps"])),
+            "resume_steps": list(reversed(resume_steps)),
         }
-        unordered_handoff = {**handoff, "steps": list(reversed(handoff["steps"]))}
+        handoff_steps = cast(list[str], handoff["steps"])
+        unordered_handoff = {**handoff, "steps": list(reversed(handoff_steps))}
 
         self.assertTrue(
             any(

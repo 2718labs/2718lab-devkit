@@ -90,7 +90,7 @@ does not silently substitute a model or reasoning level.
 | Terra High | `gpt-5.6-terra` at `high` for routine bounded coding, testing, debugging, documentation, and auxiliary validation. |
 | Terra Max | `gpt-5.6-terra` at `max` for moderate-or-harder implementation, integration, refactoring, security-sensitive execution, and difficult regressions. |
 | Sol High | `gpt-5.6-sol` at `high`, optional only for exceptional bounded execution or deep investigation; Sol main still owns acceptance. |
-| Luna | Currently unavailable; it is not attempted and no substitute is labelled Luna. |
+| Luna | `gpt-5.6-luna` at the requested `low`, `medium`, `high`, or `xhigh` effort only when the current Codex host capability report attests that exact pair; otherwise the route is unavailable and no substitute is labelled Luna. An omitted effort uses the profile's `medium` default only when attested. This shared Codex profile does not migrate Bugkiller, which remains a separate policy surface. |
 
 ## Claude roles
 

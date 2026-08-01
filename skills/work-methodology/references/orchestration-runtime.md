@@ -57,7 +57,7 @@ Durable handoff order is `workflow_artifact_register -> workflow_message_send ->
 
 1. 用 content hash 去重 repository map、task card、contract、测试命令和验证输出；相同输入不重复采集。
 2. `workflow_context` 不返回 sibling task cards、完整聊天历史或不相关日志。
-3. Sol owns architecture, dispatch, review, integration, and final acceptance. Terra High handles routine bounded work; Terra Max handles complex work; Sol High is explicit exceptional escalation only. Luna is unavailable and is never spawned or substituted.
+3. Sol owns architecture, dispatch, review, integration, and final acceptance. Terra High handles routine bounded work; Terra Max handles complex work; Sol High is explicit exceptional escalation only. Luna (`gpt-5.6-luna` / `low`, `medium`, `high`, or `xhigh`) is eligible only when the current Codex host capability report attests the exact requested pair; absent attestation returns unavailable without substitution. A request without an effort uses the profile's `medium` default only when that exact pair is attested. Bugkiller remains a separate policy surface.
 4. 同一 write scope 只允许一个有效租约；只读任务可以并行。
 5. 任务完成只回传结构化摘要、artifact hashes 和阻塞项；长日志保存在证据路径。
 6. 普通低风险流程不创建 reviewer。高风险先问用户，用户允许后再分派危险审查。

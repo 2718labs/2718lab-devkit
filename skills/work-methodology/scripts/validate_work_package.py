@@ -13,7 +13,6 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-
 PRODUCT_BRIEF = "product-brief.md"
 INDEX = "index.md"
 TASKS = "tasks"
@@ -353,7 +352,7 @@ def _validate_resume_text(
     max_length: int,
     pattern: re.Pattern[str] | None = None,
 ) -> None:
-    if not _is_bounded_compact_text(value, max_length):
+    if not isinstance(value, str) or not _is_bounded_compact_text(value, max_length):
         errors.append(f"crash-resume packet has invalid or unbounded {field}")
         return
     if pattern is not None and pattern.fullmatch(value) is None:
@@ -647,7 +646,18 @@ def _validate_strict_task(path: Path, errors: list[str]) -> None:
     owner_match = OWNER_RE.search(text)
     owner = owner_match.group(1).lower() if owner_match else ""
     if "luna" in owner:
-        errors.append(f"{path.name}: Luna is unavailable for a code write scope")
+        normalized = " ".join(text.lower().split())
+        luna_pair = re.compile(
+            r"(?:gpt-5\.6-luna.{0,80}\b(?:low|medium|high|xhigh)\b|"
+            r"\b(?:low|medium|high|xhigh)\b.{0,80}gpt-5\.6-luna)"
+        )
+        if not all(marker in normalized for marker in ("attest", "capability")) or (
+            not luna_pair.search(normalized)
+        ):
+            errors.append(
+                f"{path.name}: Luna code dispatch requires attested "
+                "gpt-5.6-luna with low, medium, high, or xhigh"
+            )
     if "terra" in owner:
         if "gpt-5.6-terra" not in text:
             errors.append(f"{path.name}: Terra code dispatch missing gpt-5.6-terra")
@@ -655,9 +665,8 @@ def _validate_strict_task(path: Path, errors: list[str]) -> None:
             errors.append(
                 f"{path.name}: Terra code dispatch missing high or max reasoning"
             )
-    if "sol" in owner:
-        if "gpt-5.6-sol" not in text or "high" not in text:
-            errors.append(f"{path.name}: Sol High dispatch missing gpt-5.6-sol/high")
+    if "sol" in owner and ("gpt-5.6-sol" not in text or "high" not in text):
+        errors.append(f"{path.name}: Sol High dispatch missing gpt-5.6-sol/high")
 
 
 def validate_work_package(
