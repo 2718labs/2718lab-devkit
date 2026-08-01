@@ -430,6 +430,128 @@ def test_atlas_exact_keys_fail_closed_when_required_values_are_missing() -> None
 
 
 @pytest.mark.parametrize(
+    "status",
+    [
+        AtlasStatus.NO_VERIFIED_RECIPE,
+        AtlasStatus.INDEX_STALE,
+        AtlasStatus.AMBIGUOUS_MATCH,
+        AtlasStatus.UNSUPPORTED_LANGUAGE,
+        AtlasStatus.EVIDENCE_INCOMPLETE,
+        AtlasStatus.RECIPE_QUARANTINED,
+        AtlasStatus.ATLAS_UNAVAILABLE,
+    ],
+)
+def test_atlas_prepare_nonready_omits_packet_and_preserves_exact_keys(
+    status: AtlasStatus,
+) -> None:
+    projected = project_atlas_prepare(
+        PreparationResult(
+            status, candidate_recipe_ids=("recipe-1",), reasons=("reason",)
+        )
+    )
+
+    assert _data(projected) == {
+        "status": status.value,
+        "candidate_recipe_ids": ["recipe-1"],
+        "reasons": ["reason"],
+    }
+    _assert_no_null(projected)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AtlasStatus.NO_VERIFIED_RECIPE,
+        AtlasStatus.INDEX_STALE,
+        AtlasStatus.AMBIGUOUS_MATCH,
+        AtlasStatus.UNSUPPORTED_LANGUAGE,
+        AtlasStatus.EVIDENCE_INCOMPLETE,
+        AtlasStatus.RECIPE_QUARANTINED,
+        AtlasStatus.ATLAS_UNAVAILABLE,
+    ],
+)
+def test_atlas_prepare_nonready_with_packet_is_contradictory(
+    status: AtlasStatus,
+) -> None:
+    packet = ImplementationPacket(
+        "packet-1", "trace-1", "workspace-1", "snapshot-1", "recipe-1"
+    )
+    with pytest.raises(ResultContractError):
+        project_atlas_prepare(PreparationResult(status, packet=packet))
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AtlasStatus.RENDER_INVALID,
+        AtlasStatus.INGEST_PENDING,
+        AtlasStatus.MODEL_UNAVAILABLE,
+    ],
+)
+def test_atlas_prepare_foreign_statuses_are_rejected(status: AtlasStatus) -> None:
+    with pytest.raises(ResultContractError):
+        project_atlas_prepare(PreparationResult(status))
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AtlasStatus.NO_VERIFIED_RECIPE,
+        AtlasStatus.UNSUPPORTED_LANGUAGE,
+        AtlasStatus.EVIDENCE_INCOMPLETE,
+    ],
+)
+def test_atlas_accept_noneligible_omits_recipe_id(status: AtlasStatus) -> None:
+    projected = project_atlas_accept(
+        AcceptanceProjection(
+            "acceptance-1", "task-1", "snapshot-2", status, "episode-1", None
+        )
+    )
+
+    assert _data(projected) == {
+        "acceptance_id": "acceptance-1",
+        "code_task_id": "task-1",
+        "output_snapshot_id": "snapshot-2",
+        "atlas_ingest_state": status.value,
+        "episode_id": "episode-1",
+        "reasons": [],
+    }
+    _assert_no_null(projected)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AtlasStatus.NO_VERIFIED_RECIPE,
+        AtlasStatus.UNSUPPORTED_LANGUAGE,
+        AtlasStatus.EVIDENCE_INCOMPLETE,
+    ],
+)
+def test_atlas_accept_noneligible_with_recipe_is_contradictory(
+    status: AtlasStatus,
+) -> None:
+    with pytest.raises(ResultContractError):
+        project_atlas_accept(
+            AcceptanceProjection(
+                "acceptance-1", "task-1", "snapshot-2", status, "episode-1", "recipe-1"
+            )
+        )
+
+
+def test_atlas_accept_other_statuses_are_rejected() -> None:
+    with pytest.raises(ResultContractError):
+        project_atlas_accept(
+            AcceptanceProjection(
+                "acceptance-1",
+                "task-1",
+                "snapshot-2",
+                AtlasStatus.INDEX_STALE,
+                "episode-1",
+            )
+        )
+
+
+@pytest.mark.parametrize(
     "value",
     [
         {"workspace_root": "C:/host/source"},
@@ -562,6 +684,11 @@ def test_relay_projectors_do_not_return_capabilities_or_host_paths() -> None:
         "refill_directives",
         "queues",
     }
+
+    v2 = dict(status)
+    v2["schema"] = "2718lab-devkit/relay-status-v2"
+    with pytest.raises(ResultContractError):
+        project_relay_status(v2)
 
 
 def test_relay_compile_and_start_projectors_are_bounded() -> None:

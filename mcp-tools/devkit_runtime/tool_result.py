@@ -104,6 +104,25 @@ _RAW_SECRET = re.compile(
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 
+_ATLAS_PREPARE_NONREADY = frozenset(
+    {
+        AtlasStatus.NO_VERIFIED_RECIPE,
+        AtlasStatus.INDEX_STALE,
+        AtlasStatus.AMBIGUOUS_MATCH,
+        AtlasStatus.UNSUPPORTED_LANGUAGE,
+        AtlasStatus.EVIDENCE_INCOMPLETE,
+        AtlasStatus.RECIPE_QUARANTINED,
+        AtlasStatus.ATLAS_UNAVAILABLE,
+    }
+)
+_ATLAS_ACCEPT_NONELIGIBLE = frozenset(
+    {
+        AtlasStatus.NO_VERIFIED_RECIPE,
+        AtlasStatus.UNSUPPORTED_LANGUAGE,
+        AtlasStatus.EVIDENCE_INCOMPLETE,
+    }
+)
+
 _FORBIDDEN_KEYS = frozenset(
     {
         "bearer",
@@ -761,17 +780,22 @@ def _packet(value: object) -> dict[str, object] | None:
 def project_atlas_prepare(result: PreparationResult) -> dict[str, object]:
     if type(result) is not PreparationResult:
         raise _fail("invalid Atlas preparation result")
-    packet = _packet(result.packet)
-    if packet is None:
-        raise _fail("Atlas preparation packet is required")
-    return envelope_success(
-        {
-            "status": _enum_value(result.status, AtlasStatus),
-            "packet": packet,
-            "candidate_recipe_ids": _string_list(result.candidate_recipe_ids),
-            "reasons": _string_list(result.reasons),
-        }
-    )
+    status = result.status
+    status_value = _enum_value(status, AtlasStatus)
+    if status is AtlasStatus.READY:
+        packet = _packet(result.packet)
+        if packet is None:
+            raise _fail("Atlas preparation packet is required")
+        data: dict[str, object] = {"status": status_value, "packet": packet}
+    elif status in _ATLAS_PREPARE_NONREADY:
+        if result.packet is not None:
+            raise _fail("Atlas preparation packet contradicts status")
+        data = {"status": status_value}
+    else:
+        raise _fail("invalid Atlas preparation status")
+    data["candidate_recipe_ids"] = _string_list(result.candidate_recipe_ids)
+    data["reasons"] = _string_list(result.reasons)
+    return envelope_success(data)
 
 
 def project_atlas_render(result: RenderResult) -> dict[str, object]:
@@ -801,22 +825,28 @@ def project_atlas_render(result: RenderResult) -> dict[str, object]:
 def project_atlas_accept(result: AcceptanceProjection) -> dict[str, object]:
     if type(result) is not AcceptanceProjection:
         raise _fail("invalid Atlas acceptance result")
-    recipe_id = _optional_string(result.recipe_id)
-    if recipe_id is None:
-        raise _fail("Atlas acceptance recipe is required")
-    return envelope_success(
-        {
-            "acceptance_id": _safe_string(result.acceptance_id, allow_empty=False),
-            "code_task_id": _safe_string(result.code_task_id, allow_empty=False),
-            "output_snapshot_id": _safe_string(
-                result.output_snapshot_id, allow_empty=False
-            ),
-            "atlas_ingest_state": _enum_value(result.atlas_ingest_state, AtlasStatus),
-            "episode_id": _safe_string(result.episode_id, allow_empty=False),
-            "recipe_id": recipe_id,
-            "reasons": _string_list(result.reasons),
-        }
-    )
+    status = result.atlas_ingest_state
+    status_value = _enum_value(status, AtlasStatus)
+    data: dict[str, object] = {
+        "acceptance_id": _safe_string(result.acceptance_id, allow_empty=False),
+        "code_task_id": _safe_string(result.code_task_id, allow_empty=False),
+        "output_snapshot_id": _safe_string(
+            result.output_snapshot_id, allow_empty=False
+        ),
+        "atlas_ingest_state": status_value,
+        "episode_id": _safe_string(result.episode_id, allow_empty=False),
+    }
+    if status is AtlasStatus.READY:
+        if result.recipe_id is None:
+            raise _fail("Atlas acceptance recipe is required")
+        data["recipe_id"] = _safe_string(result.recipe_id, allow_empty=False)
+    elif status in _ATLAS_ACCEPT_NONELIGIBLE:
+        if result.recipe_id is not None:
+            raise _fail("Atlas acceptance recipe contradicts status")
+    else:
+        raise _fail("invalid Atlas acceptance status")
+    data["reasons"] = _string_list(result.reasons)
+    return envelope_success(data)
 
 
 def _exact_dict(value: object, expected: set[str], detail: str) -> dict[str, object]:
@@ -1224,6 +1254,8 @@ def project_relay_status(status: object) -> dict[str, object]:
         },
         "invalid Relay status",
     )
+    if value["schema"] != "2718lab-devkit/relay-status-v1":
+        raise _fail("unsupported Relay status schema")
     return envelope_success(
         {
             "workflow_id": _identifier(value["workflow_id"]),
