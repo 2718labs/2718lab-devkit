@@ -417,8 +417,6 @@ class ProductionAcceptanceEvidenceReader:
                 workspace_id, request.checkpoint_id
             )
         except IndexError as error:
-            if error.code == "NOT_FOUND":
-                self._classify_checkpoint_absence(request.checkpoint_id)
             self._raise_index_error(error)
         if type(checkpoint) is not Checkpoint:
             _conflict()
@@ -437,17 +435,6 @@ class ProductionAcceptanceEvidenceReader:
         ):
             _conflict()
         return checkpoint
-
-    def _classify_checkpoint_absence(self, checkpoint_id: str) -> NoReturn:
-        """Distinguish a missing checkpoint from one bound to another workspace."""
-
-        try:
-            checkpoint = self._checkpoints.status(checkpoint_id)
-        except IndexError as error:
-            self._raise_index_error(error)
-        if type(checkpoint) is not Checkpoint:
-            _conflict()
-        _conflict()
 
     def _index_facts(
         self,
