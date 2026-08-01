@@ -1,0 +1,154 @@
+"""Pure runtime configuration for the process-lifetime composition root."""
+
+from __future__ import annotations
+
+import os
+import stat
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+
+class RuntimeConfigError(RuntimeError):
+    """Stable configuration failure without host-path disclosure."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Resolved durable paths without creating or opening any resource."""
+
+    data_root: Path
+    scratch_root: Path
+
+    @property
+    def orchestrator_database(self) -> Path:
+        return self.data_root / "orchestrator.sqlite3"
+
+    @property
+    def project_index_database(self) -> Path:
+        return self.data_root / "project-index.sqlite3"
+
+    @property
+    def checkpoint_cas_root(self) -> Path:
+        return self.data_root / "checkpoint-cas"
+
+    @property
+    def atlas_database(self) -> Path:
+        return self.data_root / "atlas.sqlite3"
+
+    @property
+    def relay_database(self) -> Path:
+        return self.data_root / "relay.sqlite3"
+
+    @property
+    def relay_capability_key(self) -> Path:
+        return self.data_root / "relay-capability.key"
+
+    @property
+    def relay_proof_registry_database(self) -> Path:
+        return self.data_root / "relay-proof-registry.sqlite3"
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        environ: Mapping[str, str] | None = None,
+        protected_roots: Iterable[str | Path] = (),
+    ) -> RuntimeConfig:
+        values = os.environ if environ is None else environ
+        plugin_data = values.get("PLUGIN_DATA")
+        if plugin_data:
+            data_root = _absolute_path(plugin_data)
+        else:
+            codex_home = values.get("CODEX_HOME")
+            if codex_home:
+                data_root = _absolute_path(codex_home) / "data" / "2718lab-devkit"
+            else:
+                data_root = Path.home() / ".codex" / "data" / "2718lab-devkit"
+        protected = tuple(_absolute_path(item) for item in protected_roots)
+        if not _safe_directory_path(data_root, require_exists=False) or any(
+            not _safe_directory_path(root, require_exists=False) for root in protected
+        ):
+            raise RuntimeConfigError("DATA_ROOT_INVALID")
+        if any(_paths_overlap(data_root, root) for root in protected):
+            raise RuntimeConfigError("DATA_ROOT_INVALID")
+        return cls(
+            data_root=data_root,
+            scratch_root=_resolve_scratch(values, data_root, protected),
+        )
+
+
+def _absolute_path(value: str | Path) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise RuntimeConfigError("DATA_ROOT_INVALID")
+    return Path(os.path.abspath(path))
+
+
+def _resolve_scratch(
+    values: Mapping[str, str], data_root: Path, protected_roots: tuple[Path, ...]
+) -> Path:
+    for name in ("CODEX_TASK_TEMP", "TMPDIR", "TEMP", "TMP"):
+        configured = values.get(name)
+        if configured:
+            scratch_root = _absolute_path(configured)
+            if not _safe_existing_directory(scratch_root) or any(
+                _paths_overlap(scratch_root, root)
+                for root in (data_root, *protected_roots)
+            ):
+                raise RuntimeConfigError("DATA_ROOT_INVALID")
+            return scratch_root
+    fallback = data_root.parent / ".2718lab-devkit-scratch"
+    if not _safe_directory_path(fallback, require_exists=False) or any(
+        _paths_overlap(fallback, root) for root in (data_root, *protected_roots)
+    ):
+        raise RuntimeConfigError("DATA_ROOT_INVALID")
+    return fallback
+
+
+def _safe_existing_directory(path: Path) -> bool:
+    return _safe_directory_path(path, require_exists=True)
+
+
+def _safe_directory_path(path: Path, *, require_exists: bool) -> bool:
+    """Reject unsafe existing path components without creating missing ones."""
+
+    exists = False
+    for candidate in (path, *path.parents):
+        try:
+            status = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if not stat.S_ISDIR(status.st_mode) or _is_reparse_or_link(candidate, status):
+            return False
+        if candidate == path:
+            exists = True
+    return exists or not require_exists
+
+
+def _is_reparse_or_link(path: Path, status: os.stat_result) -> bool:
+    if stat.S_ISLNK(status.st_mode) or getattr(status, "st_file_attributes", 0) & 0x400:
+        return True
+    is_junction = getattr(os.path, "isjunction", None)
+    if not callable(is_junction):
+        return False
+    try:
+        return bool(is_junction(path))
+    except OSError:
+        return True
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    try:
+        left_value = os.path.normcase(os.fspath(left))
+        right_value = os.path.normcase(os.fspath(right))
+        common = os.path.commonpath((left_value, right_value))
+    except ValueError:
+        return False
+    return common in {left_value, right_value}
