@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from devkit_relay.evidence import CapabilitySigner, RelayCapabilityError
 from devkit_relay.service import RelayError
 
 from test_relay_runtime import (
@@ -187,4 +188,30 @@ def test_malformed_lifecycle_endpoint_and_capability_stay_in_relay_errors(
                 capability={"not": "a-token"},
                 expected_task_version=task_version,
             )
+        )
+
+
+def test_capability_expires_at_its_exact_expiry_second() -> None:
+    signer = CapabilitySigner(b"relay-v3-expiry-secret")
+    expires_at = 2_000_000_000
+    token = signer.issue(
+        workflow_id="relay-runtime-v3",
+        task_id="writer-a",
+        action="heartbeat",
+        epoch=1,
+        endpoint="worker-a",
+        scope="worker",
+        expires_at=expires_at,
+    )
+
+    with pytest.raises(RelayCapabilityError, match="RELAY_CAPABILITY_EXPIRED"):
+        signer.verify(
+            token,
+            workflow_id="relay-runtime-v3",
+            task_id="writer-a",
+            action="heartbeat",
+            epoch=1,
+            endpoint="worker-a",
+            scope="worker",
+            now=expires_at,
         )

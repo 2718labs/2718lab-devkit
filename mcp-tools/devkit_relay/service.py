@@ -100,6 +100,7 @@ class RelayService:
     _SOL_ACTIONS = frozenset(
         {"review", "rebase", "reject", "integrate", "approve_readonly"}
     )
+    _RECOVERY_ACTIONS = frozenset({"stale_recovery", "interruption_recovery"})
     _MAX_TASKS = 64
     _MAX_TEXT = 2_048
 
@@ -220,6 +221,38 @@ class RelayService:
             idempotency_key=idempotency_key,
         )
 
+    def recover(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Reissue a stalled or interrupted lease from its exact predecessor."""
+
+        fields = self._lifecycle_fields(request, expected_scope="sol")
+        action = fields["action"]
+        if action not in self._RECOVERY_ACTIONS:
+            raise RelayError("RELAY_CAPABILITY_SCOPE")
+        base = {
+            "workflow_id",
+            "task_id",
+            "action",
+            "epoch",
+            "endpoint",
+            "expected_task_version",
+            "capability",
+        }
+        self._exact_request_fields(
+            request, base | {"predecessor_action_id", "predecessor_lease_id"}
+        )
+        recovery_fields = {
+            key: value
+            for key, value in fields.items()
+            if key not in {"action", "endpoint"}
+        }
+        return self._call(
+            self._store.recover_lease,
+            recovery_kind=action,
+            predecessor_action_id=self._identifier(request["predecessor_action_id"]),
+            predecessor_lease_id=self._identifier(request["predecessor_lease_id"]),
+            **recovery_fields,
+        )
+
     def status(self, workflow_id: object) -> dict[str, object]:
         """Read status only; it does not create directives, leases, or actions."""
 
@@ -300,13 +333,20 @@ class RelayService:
             self._exact_request_fields(
                 request,
                 base
-                | {"candidate_id", "base_commit", "head_commit", "evidence_hashes"},
+                | {
+                    "candidate_id",
+                    "base_commit",
+                    "head_commit",
+                    "diff_hash",
+                    "evidence_hashes",
+                },
             )
             return self._call(
                 self._store.rebase_candidate,
                 candidate_id=self._identifier(request["candidate_id"]),
                 base_commit=self._commit(request["base_commit"]),
                 head_commit=self._commit(request["head_commit"]),
+                diff_hash=self._digest(request["diff_hash"]),
                 evidence_hashes=self._digest_list(request["evidence_hashes"]),
                 **sol_fields,
             )

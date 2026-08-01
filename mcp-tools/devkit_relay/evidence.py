@@ -169,7 +169,9 @@ class CapabilitySigner:
         ):
             raise RelayCapabilityError("RELAY_CAPABILITY_INVALID")
         current = int(time.time()) if now is None else now
-        if type(decoded["expires_at"]) is not int or decoded["expires_at"] < current:
+        if type(current) is not int or current < 0:
+            raise RelayCapabilityError("RELAY_CAPABILITY_INVALID")
+        if type(decoded["expires_at"]) is not int or decoded["expires_at"] <= current:
             raise RelayCapabilityError("RELAY_CAPABILITY_EXPIRED")
         return CapabilityClaims(
             workflow_id=workflow_id,

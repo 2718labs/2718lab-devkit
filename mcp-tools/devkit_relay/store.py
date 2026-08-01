@@ -276,6 +276,64 @@ class RelayStore:
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
+    def recover_lease(
+        self,
+        workflow_id: str,
+        task_id: str,
+        *,
+        epoch: int,
+        expected_task_version: int,
+        predecessor_action_id: str,
+        predecessor_lease_id: str,
+        recovery_kind: str,
+    ) -> dict[str, object]:
+        """Replace one exact abandoned lease with a predecessor-bound action."""
+
+        if recovery_kind not in {"stale_recovery", "interruption_recovery"}:
+            raise RelayStateStale()
+        now = _utc_now()
+        try:
+            with self._transaction() as cursor:
+                run = self._run_for_workflow(cursor, workflow_id)
+                task, lease = self._active_task_and_lease(
+                    cursor,
+                    run,
+                    task_id,
+                    epoch=epoch,
+                    expected_task_version=expected_task_version,
+                )
+                if (
+                    lease.action_id != predecessor_action_id
+                    or lease.lease_id != predecessor_lease_id
+                ):
+                    raise RelayLeaseConflict()
+                if (recovery_kind == "stale_recovery") != (lease.endpoint is None):
+                    raise RelayStateStale()
+                recovery = self._recovery_context(
+                    cursor, run, task, lease, recovery_kind
+                )
+                self._release_lease(cursor, lease, now=now)
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_tasks
+                    SET state = ?, scope_owner = NULL
+                    WHERE run_id = ? AND task_id = ?
+                    """,
+                    (RelayTaskState.READY.value, run.run_id, task.task_id),
+                )
+                replacement = self._allocate_action(
+                    cursor,
+                    run,
+                    self._task_for_run(cursor, run.run_id, task.task_id),
+                    now=now,
+                    recovery=recovery,
+                )
+                run = self._increment_schedule_version(cursor, run.run_id)
+                self._refresh_directives(cursor, run, now=now)
+                return self._start_result(run, [replacement])
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
     def bind_endpoint(
         self,
         workflow_id: str,
@@ -623,6 +681,7 @@ class RelayStore:
         candidate_id: str,
         base_commit: str,
         head_commit: str,
+        diff_hash: str,
         evidence_hashes: Sequence[str],
     ) -> dict[str, object]:
         """Record a Sol-approved candidate rebase pending a new review."""
@@ -630,6 +689,7 @@ class RelayStore:
         if (
             _COMMIT.fullmatch(base_commit) is None
             or _COMMIT.fullmatch(head_commit) is None
+            or _DIGEST.fullmatch(diff_hash) is None
             or not _valid_digest_list(evidence_hashes)
         ):
             raise RelayCandidateError()
@@ -656,13 +716,15 @@ class RelayStore:
                 cursor.execute(
                     """
                     UPDATE relay_v3_candidates
-                    SET base_commit = ?, head_commit = ?, evidence_hashes_json = ?,
-                        status = 'rebased', review_digest = NULL, updated_at = ?
+                    SET base_commit = ?, head_commit = ?, diff_hash = ?,
+                        evidence_hashes_json = ?, status = 'rebased',
+                        review_digest = NULL, updated_at = ?
                     WHERE candidate_id = ?
                     """,
                     (
                         base_commit,
                         head_commit,
+                        diff_hash,
                         _encode_json(sorted(evidence_hashes)),
                         now,
                         candidate_id,
@@ -896,6 +958,7 @@ class RelayStore:
         task: RelayTask,
         *,
         now: str,
+        recovery: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         if task.state not in {RelayTaskState.READY, RelayTaskState.PREPARED}:
             raise RelayStateStale()
@@ -967,6 +1030,8 @@ class RelayStore:
                 "workspace_id": run.workspace_id,
                 "input_snapshot_id": run.input_snapshot_id,
             }
+        if recovery is not None:
+            action["recovery"] = dict(recovery)
         cursor.execute(
             """
             INSERT INTO relay_v3_actions
@@ -1193,6 +1258,60 @@ class RelayStore:
             raise RelayStateStale()
         return task, lease
 
+    def _recovery_context(
+        self,
+        cursor: sqlite3.Cursor,
+        run: RelayRun,
+        task: RelayTask,
+        lease: RelayLease,
+        recovery_kind: str,
+    ) -> dict[str, object]:
+        row = cursor.execute(
+            """
+            SELECT payload_json FROM relay_v3_actions
+            WHERE action_id = ? AND run_id = ? AND task_id = ? AND lease_id = ?
+              AND state = 'outstanding'
+            """,
+            (lease.action_id, run.run_id, task.task_id, lease.lease_id),
+        ).fetchone()
+        if row is None:
+            raise RelayLeaseConflict()
+        payload = _decode_json_object(str(row["payload_json"]))
+        if (
+            payload.get("action_id") != lease.action_id
+            or payload.get("kind") != "codex.spawn_agent"
+            or payload.get("workflow_id") != run.workflow_id
+            or payload.get("task_id") != task.task_id
+            or payload.get("lease") != lease.to_public_tuple()
+            or payload.get("route") != _task_route(task)
+            or payload.get("task_contract") != task.task_contract()
+        ):
+            raise RelayStorageFailure()
+        context: dict[str, object] = {
+            "route": _task_route(task),
+            "task_contract": task.task_contract(),
+        }
+        if task.kind == "implementation":
+            bootstrap = payload.get("worktree_bootstrap")
+            if type(bootstrap) is not dict:
+                raise RelayStorageFailure()
+            context["worktree_bootstrap"] = bootstrap
+        else:
+            read_contract = {
+                "workspace_id": run.workspace_id,
+                "input_snapshot_id": run.input_snapshot_id,
+            }
+            if payload.get("read_contract") != read_contract:
+                raise RelayStorageFailure()
+            context["read_contract"] = read_contract
+        return {
+            "kind": recovery_kind,
+            "predecessor_action_id": lease.action_id,
+            "predecessor_lease_id": lease.lease_id,
+            "predecessor_epoch": lease.epoch,
+            "predecessor_context_hash": canonical_hash(context),
+        }
+
     def _candidate_for_sol(
         self,
         cursor: sqlite3.Cursor,
@@ -1249,7 +1368,15 @@ class RelayStore:
             (str(item["kind"]), str(item["selector"]))
             for item in _task_required_evidence(task)
         ]
-        if not set(available[key] for key in required) <= set(hashes):
+        provided = set(hashes)
+        recorded = {
+            digest
+            for evidence_hashes in available.values()
+            for digest in evidence_hashes
+        }
+        if provided != recorded or any(
+            key not in available or not (available[key] & provided) for key in required
+        ):
             raise RelayCandidateError()
 
     def _require_required_evidence(
@@ -1273,17 +1400,19 @@ class RelayStore:
         run: RelayRun,
         task: RelayTask,
         epoch: int,
-    ) -> dict[tuple[str, str], str]:
-        return {
-            (str(row["kind"]), str(row["selector"])): str(row["digest"])
-            for row in cursor.execute(
-                """
-                SELECT kind, selector, digest FROM relay_v3_evidence
-                WHERE run_id = ? AND task_id = ? AND epoch = ?
-                """,
-                (run.run_id, task.task_id, epoch),
-            ).fetchall()
-        }
+    ) -> dict[tuple[str, str], frozenset[str]]:
+        available: dict[tuple[str, str], set[str]] = {}
+        for row in cursor.execute(
+            """
+            SELECT kind, selector, digest FROM relay_v3_evidence
+            WHERE run_id = ? AND task_id = ? AND epoch = ?
+            ORDER BY kind, selector, digest
+            """,
+            (run.run_id, task.task_id, epoch),
+        ).fetchall():
+            key = (str(row["kind"]), str(row["selector"]))
+            available.setdefault(key, set()).add(str(row["digest"]))
+        return {key: frozenset(digests) for key, digests in available.items()}
 
     def _normalize_candidate(self, value: Mapping[str, object]) -> dict[str, object]:
         expected = {
