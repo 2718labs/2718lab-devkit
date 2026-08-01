@@ -7,6 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TEAM_PATTERNS = ROOT / "references" / "team-patterns.md"
 ORCHESTRATION = ROOT / "references" / "orchestration-runtime.md"
 INTEGRATION = ROOT / "references" / "github-parallel-integration.md"
+EFFICIENCY = ROOT / "references" / "efficiency-automation.md"
+SKILL = ROOT / "SKILL.md"
 
 
 class MethodologyPolicyTests(unittest.TestCase):
@@ -77,6 +79,27 @@ class MethodologyPolicyTests(unittest.TestCase):
         self.assertIn("gpt-5.6-luna", text)
         self.assertIn("capability report", text)
         self.assertIn("Bugkiller remains a separate policy surface", text)
+
+    def test_fast_lane_docs_lock_the_core_adapter_and_host_boundaries(self) -> None:
+        text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (SKILL, EFFICIENCY, ORCHESTRATION, TEAM_PATTERNS)
+        )
+
+        for required in (
+            "--host-status",
+            "(task_id, scheduler_role)",
+            "routing_context_hash",
+            "routing_result_hash",
+            "NO_SAFE_WORK",
+            "recommended_route",
+            "worker effort 禁止 `ultra`",
+            "Prewarm remains a separate read-only evidence role",
+            "after lane 0 acceptance",
+            "C-drive temporary roots are forbidden",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, text)
 
     def test_efficiency_amendment_locks_resume_handoff_and_lanes(self) -> None:
         integration = INTEGRATION.read_text(encoding="utf-8")

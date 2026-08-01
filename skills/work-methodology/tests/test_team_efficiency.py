@@ -16,13 +16,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "team_efficiency.py"
+ROUTING_SCRIPT = ROOT / "scripts" / "fastlane_routing.py"
 SKILL = ROOT / "SKILL.md"
 sys.path.insert(0, str(ROOT.parents[1] / "mcp-tools"))
 
-from code_atlas import (  # noqa: E402
+from devkit_atlas import (  # noqa: E402
     AtlasEdge,
     AtlasNode,
     ConstraintSpec,
@@ -33,15 +33,17 @@ from code_atlas import (  # noqa: E402
     NodeKind,
     SlotSpec,
     TemplateOperation,
-    TestSpec as AtlasTestSpec,
     canonical_hash,
 )
-from code_atlas.extractors import (  # noqa: E402
+from devkit_atlas import (  # noqa: E402
+    TestSpec as AtlasTestSpec,
+)
+from devkit_atlas.extractors import (  # noqa: E402
     BoundExecutionReceipt,
     ExtractionRequest,
     PythonRecipeExtractor,
 )
-from code_atlas.store import AtlasStore  # noqa: E402
+from devkit_atlas.store import AtlasStore  # noqa: E402
 from orchestrator.models import Task, TaskState, Workflow, WorkflowKind  # noqa: E402
 from orchestrator.service import OrchestratorService  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
@@ -55,6 +57,18 @@ def _content_hash(body: bytes) -> str:
 
 def _marker_hash(marker: str) -> str:
     return _content_hash(marker.encode("utf-8"))
+
+
+def load_fastlane_routing():
+    """Load the pure routing core exactly as the scheduler adapter does."""
+
+    spec = importlib.util.spec_from_file_location("fastlane_routing", ROUTING_SCRIPT)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fastlane_routing"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _receipt_binding_hash(
@@ -251,16 +265,19 @@ class TeamEfficiencyTests(unittest.TestCase):
         store: SQLiteStore,
         service: OrchestratorService,
         workflow_id: str,
-        workspace_root: Path | None = None,
+        workspace_id: str | None = None,
         input_snapshot_id: str = "snapshot-lifecycle",
         index_service: ProjectIndexService | None = None,
     ) -> list[list[str]]:
         lifecycle = plan["registration_plan"]
+        effective_workspace_id = (
+            workspace_id
+            if workspace_id is not None
+            else canonical_hash({"kind": "lifecycle_workspace"})
+        )
         base_bindings: dict[str, object] = {
             "workflow_id": workflow_id,
-            "workspace_root": str(
-                self.repo if workspace_root is None else workspace_root
-            ),
+            "workspace_root": effective_workspace_id,
             "input_snapshot_id": input_snapshot_id,
         }
         for descriptor in lifecycle["register_steps"]:
@@ -279,7 +296,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 required_evidence=tuple(arguments["required_evidence"]),
                 input_hash=arguments["input_hash"],
                 strict_index=arguments["strict_index"],
-                workspace_root=arguments["workspace_root"],
+                workspace_id=arguments["workspace_root"],
                 input_snapshot_id=arguments["input_snapshot_id"],
                 task_node_ids=tuple(arguments["task_node_ids"]),
                 contract_node_ids=tuple(arguments["contract_node_ids"]),
@@ -332,7 +349,8 @@ class TeamEfficiencyTests(unittest.TestCase):
                 strict_binding = store.get_index_binding(task_id)
                 if strict_binding is not None:
                     self.assertIsNotNone(index_service)
-                    self.assertIsNotNone(workspace_root)
+                    self.assertIsNotNone(workspace_id)
+                    assert workspace_id is not None
                     if running.write_scope:
                         service.record_checkpoint(
                             task_id,
@@ -354,7 +372,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                             now=task_bindings["now"],
                         )
                     query = index_service.query(
-                        workspace_root,
+                        workspace_id,
                         strict_binding.input_snapshot_id,
                         f"lifecycle {task_id}",
                         max_nodes=1,
@@ -740,6 +758,251 @@ class TeamEfficiencyTests(unittest.TestCase):
     def fast_lane_execution_snapshot_id(self, helper, task_id: str) -> str:
         return helper._sha256_json({"snapshot": task_id, "role": "execution"})
 
+    def fast_lane_host_status(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        capabilities: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Build the bounded, attested core-input mapping for one scheduler event."""
+
+        core = load_fastlane_routing()
+        state = request["scheduler_state"]
+        source_plan = helper.decompose(request["work_package"])
+        source_plan_hash = helper._sha256_json(source_plan)
+        remediation = helper._validated_fast_lane_remediation_request(
+            request["remediation_request"],
+            source_plan=source_plan,
+            source_plan_hash=source_plan_hash,
+            integration_state=helper._fast_lane_integration_state(state),
+        )
+        if remediation is not None and not remediation.get("_automation_stopped"):
+            source_plan = helper._fast_lane_source_with_remediation(
+                source_plan, remediation
+            )
+        completed = {
+            str(record["task_id"])
+            for record in state["completed_tasks"]
+        }
+        running = {
+            (str(assignment["task_id"]), str(assignment["role"])): assignment
+            for assignment in state["running_assignments"]
+        }
+        capability_report = copy.deepcopy(
+            {
+                "schema": "2718lab-devkit/host-capabilities-v1",
+                "host_id_hash": _marker_hash("fast-lane-host"),
+                "capability_epoch": 1,
+                "total_slots": 8,
+                "model_slot_limits": {
+                    "luna": 4,
+                    "terra": 4,
+                    "sol": 4,
+                    "spark": 1,
+                },
+                "models": [
+                    {
+                        "model_id": "gpt-5.3-codex-spark",
+                        "status": "available",
+                        "efforts": ["medium"],
+                    },
+                    {
+                        "model_id": "gpt-5.6-luna",
+                        "status": "available",
+                        "efforts": ["low", "medium", "high", "xhigh"],
+                    },
+                    {
+                        "model_id": "gpt-5.6-sol",
+                        "status": "available",
+                        "efforts": ["high", "xhigh", "max"],
+                    },
+                    {
+                        "model_id": "gpt-5.6-terra",
+                        "status": "available",
+                        "efforts": ["medium", "high", "xhigh", "max"],
+                    },
+                ],
+                "entitlements": ["spark_preview"],
+            }
+            if capabilities is None
+            else capabilities
+        )
+        policy = core.load_policy()
+        policy_hash = core.policy_hash(policy)
+        routes: list[dict[str, object]] = []
+        core_roles = {
+            "execution": "execution",
+            "verification": "verification",
+            "prewarm": "prewarm",
+            "review": "review",
+            "design_probe": "design",
+        }
+        for unit in source_plan["units"]:
+            task_id = str(unit["task_id"])
+            legacy = {
+                "schema": "2718lab-devkit/legacy-route-input-v1",
+                "compatibility_version": 1,
+                "complexity": None,
+                "recommended_route": unit["recommended_route"],
+            }
+            adaptation = core.adapt_legacy_profile(legacy, task_id=task_id)
+            for scheduler_role, core_role in core_roles.items():
+                dependency_ids = (
+                    []
+                    if scheduler_role in {"prewarm", "design_probe"}
+                    else list(unit["depends_on"])
+                )
+                dependency_without_hash = {
+                    "schema": "2718lab-devkit/dependency-state-v1",
+                    "graph_epoch": 1,
+                    "direct_dependency_ids": dependency_ids,
+                    "completed_dependency_ids": sorted(
+                        set(dependency_ids).intersection(completed)
+                    ),
+                }
+                dependency_state = {
+                    **dependency_without_hash,
+                    "dependency_state_hash": helper._sha256_json(
+                        dependency_without_hash
+                    ),
+                }
+                task = copy.deepcopy(adaptation.profile)
+                read_only = scheduler_role != "execution"
+                task.update(
+                    {
+                        "role": core_role,
+                        "access": "read_only" if read_only else "workspace_write",
+                        "write_scope_count": 0 if read_only else 1,
+                        "write_scope_breadth": "none" if read_only else "single_file",
+                        "profile_evidence_hash": helper._sha256_json(
+                            {
+                                "task_id": task_id,
+                                "scheduler_role": scheduler_role,
+                                "kind": "routing-profile",
+                            }
+                        ),
+                    }
+                )
+                assignment = running.get((task_id, scheduler_role))
+                lease_epoch = (
+                    0
+                    if assignment is None
+                    else int(assignment["assignment_epoch"])
+                )
+                scheduler_facts = {
+                    "event_seq": max(1, 1 + sum(state["slot_epochs"].values())),
+                    "route_epoch": 1,
+                    "override_epoch": 0,
+                    "recovery_epoch": 0,
+                    "ready_event_seq": max(
+                        1, 1 + sum(state["slot_epochs"].values())
+                    ),
+                    "dispatch_cause": "task_ready",
+                    "transport_state": "connected",
+                    "execution_state": (
+                        "active" if assignment is not None else "unknown"
+                    ),
+                    "lease_state": (
+                        "active" if assignment is not None else "unclaimed"
+                    ),
+                    "evidence_state": "none",
+                    "lease_epoch": lease_epoch,
+                    "recovery_probe_count_epoch": 0,
+                    "fence_count_epoch": 0,
+                    "fenced_replacement_count_task": 0,
+                }
+                routes.append(
+                    {
+                        "task_id": task_id,
+                        "scheduler_role": scheduler_role,
+                        "request": {
+                            "schema": "2718lab-devkit/fastlane-routing-request-v3",
+                            "policy_hash": policy_hash,
+                            "task": task,
+                            "dependency_state": dependency_state,
+                            "scope_state": {
+                                "schema": "2718lab-devkit/scope-state-v1",
+                                "scope_epoch": 1,
+                                "owned_scope_hash": _marker_hash(
+                                    f"scope:{task_id}"
+                                ),
+                                "conflicting_task_ids": [],
+                                "active_writer_task_ids": [],
+                            },
+                            "scheduler_facts": scheduler_facts,
+                            "host_capabilities": copy.deepcopy(capability_report),
+                            "override_receipt": None,
+                            "legacy": legacy,
+                        },
+                        "trusted_authorization_evidence_hashes": [],
+                        "trusted_override_receipt_hashes": [],
+                        "trusted_evidence_hashes": [],
+                        "coordinator_endpoint_hash": None,
+                        "compatibility_floor": adaptation.floor_rank,
+                    }
+                )
+        workflow_id = "fast-lane-workflow"
+        leases: list[dict[str, object]] = []
+        bindings: list[dict[str, object]] = []
+        for assignment in state["running_assignments"]:
+            task_id = str(assignment["task_id"])
+            endpoint = f"/fast-lane/{task_id.lower()}"
+            leases.append(
+                {
+                    "task_id": task_id,
+                    "lease_epoch": assignment["assignment_epoch"],
+                    "endpoint": endpoint,
+                    "state": "running",
+                }
+            )
+            bindings.append(
+                {
+                    "workflow_id": workflow_id,
+                    "task_id": task_id,
+                    "slot_id": assignment["slot_id"],
+                    "assignment_epoch": assignment["assignment_epoch"],
+                    "assignment_token": assignment["assignment_token"],
+                    "context_hash": assignment["context_hash"],
+                    "lease_epoch": assignment["assignment_epoch"],
+                    "endpoint": endpoint,
+                    "state": "running",
+                }
+            )
+        return {
+            "workflow_id": workflow_id,
+            "current_leases": leases,
+            "host_bindings": bindings,
+            "routing_context": {
+                "schema": "team-efficiency/fast-lane-routing-context-v1",
+                "routes": routes,
+            },
+        }
+
+    def compile_fast_lane(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        reasoning_effort: str,
+        enable: bool = False,
+        host_status: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        default_status = self.fast_lane_host_status(helper, request)
+        if host_status is None:
+            effective_status = default_status
+        else:
+            effective_status = copy.deepcopy(host_status)
+            effective_status.setdefault(
+                "routing_context", default_status["routing_context"]
+            )
+        return helper.compile_fast_lane(
+            request,
+            reasoning_effort=reasoning_effort,
+            enable=enable,
+            host_status=effective_status,
+        )
+
     def fully_bound_fast_lane_manual_request(self, helper) -> dict[str, object]:
         request = self.fast_lane_contexts_empty_request(helper)
         source_plan = helper.decompose(request["work_package"])
@@ -915,89 +1178,13 @@ class TeamEfficiencyTests(unittest.TestCase):
     def fast_lane_running_request(self, helper) -> dict[str, object]:
         request = self.fully_bound_fast_lane_manual_request(helper)
         source_plan = helper.decompose(request["work_package"])
-        source_plan_hash = helper._sha256_json(source_plan)
         unit = source_plan["units"][0]
-        task_id = unit["task_id"]
-        execution_context = request["execution_contexts"][0]
-        bootstrap_plan = execution_context["bootstrap_plan"]
-        execution_context_hash = helper._sha256_json(execution_context)
-        bootstrap_plan_hash = helper._sha256_json(bootstrap_plan)
-        write_scope_hash = helper._sha256_json(bootstrap_plan["write_scope"])
-        target = next(
-            target
-            for target in request["target_gates"]
-            if target["task_id"] == task_id
+        assignment, dispatch_context, validated = self.fast_lane_assignment_for(
+            helper, request, task_id=unit["task_id"]
         )
-        target_gates_hash = helper._sha256_json(
-            {
-                "driver_gate_id": target["driver_gate_id"],
-                "target_gates": target["gates"],
-            }
-        )
-        context_without_hash = {
-            "task_id": task_id,
-            "role": "execution",
-            "source_plan_hash": source_plan_hash,
-            "integration_commit": request["scheduler_state"]["integration_state"][
-                "commit"
-            ],
-            "integration_tree": request["scheduler_state"]["integration_state"][
-                "tree"
-            ],
-            "workspace_input_snapshot_id": execution_context[
-                "workspace_input_snapshot_id"
-            ],
-            "direct_dependency_result_hashes": [],
-            "direct_contract_hashes": unit["direct_contract_hashes"],
-            "required_evidence": unit["required_evidence"],
-            "task_node_ids": unit["task_node_ids"],
-            "contract_node_ids": unit["contract_node_ids"],
-            "acceptance_constraints": [],
-            "execution_context_hash": execution_context_hash,
-            "bootstrap_plan_hash": bootstrap_plan_hash,
-            "base_commit": bootstrap_plan["base_commit"],
-            "branch": bootstrap_plan["branch"],
-            "write_scope_hash": write_scope_hash,
-            "read_context_hash": None,
-            "target_gates_hash": target_gates_hash,
-            "candidate_commit": None,
-            "red_evidence_hashes": [],
-            "green_evidence_hashes": [],
-            "basis_hash": None,
-            "prewarm_evidence_hash": None,
-            "prewarm_revalidation_evidence_hash": None,
-        }
-        dispatch_context = {
-            "context_hash": helper._sha256_json(context_without_hash),
-            **context_without_hash,
-        }
-        receipt = {
-            "schema": "team-efficiency/fast-lane-dispatch-receipt-v1",
-            "source_plan_hash": source_plan_hash,
-            "task_id": task_id,
-            "role": "execution",
-            "slot_id": "slot-1",
-            "assignment_epoch": 1,
-            "model": "gpt-5.6-terra",
-            "reasoning_effort": "high",
-            "dispatch_context_hash": dispatch_context["context_hash"],
-            "target_gates_hash": target_gates_hash,
-            "execution_context_hash": execution_context_hash,
-            "read_context_hash": None,
-            "recovery_of_assignment_token": None,
-        }
-        assignment = {
-            "slot_id": "slot-1",
-            "task_id": task_id,
-            "role": "execution",
-            "assignment_epoch": 1,
-            "assignment_token": helper._sha256_json(receipt),
-            "context_hash": dispatch_context["context_hash"],
-            "model": "gpt-5.6-terra",
-            "reasoning_effort": "high",
-            "dispatch_receipt": receipt,
-        }
-        request["scheduler_state"]["source_plan_hash"] = source_plan_hash
+        request["scheduler_state"]["source_plan_hash"] = validated[
+            "source_plan_hash"
+        ]
         request["scheduler_state"]["slot_epochs"]["slot-1"] = 1
         request["scheduler_state"]["running_assignments"] = [assignment]
         request["scheduler_state"]["dispatch_contexts"] = [dispatch_context]
@@ -1011,10 +1198,27 @@ class TeamEfficiencyTests(unittest.TestCase):
         task_id: str,
         role: str = "execution",
         slot_id: str = "slot-1",
-        route: tuple[str, str] | None = None,
     ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        host_status = self.fast_lane_host_status(helper, request)
+        route_entry = next(
+            entry
+            for entry in host_status["routing_context"]["routes"]
+            if entry["task_id"] == task_id and entry["scheduler_role"] == role
+        )
+        dependency_state = route_entry["request"]["dependency_state"]
+        dependency_state["completed_dependency_ids"] = list(
+            dependency_state["direct_dependency_ids"]
+        )
+        dependency_state_without_hash = dict(dependency_state)
+        dependency_state_without_hash.pop("dependency_state_hash")
+        dependency_state["dependency_state_hash"] = helper._sha256_json(
+            dependency_state_without_hash
+        )
         try:
-            validated = helper._validated_fast_lane_request(copy.deepcopy(request))
+            validated = helper._validated_fast_lane_request(
+                copy.deepcopy(request),
+                host_routing_context=host_status["routing_context"],
+            )
         except ValueError as error:
             self.fail(f"fast-lane assignment fixture must validate: {error}")
         unit = next(
@@ -1022,8 +1226,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             for item in validated["source_plan"]["units"]
             if item["task_id"] == task_id
         )
-        resolved_route = (
-            helper._fast_lane_route(unit, role) if route is None else route
+        resolved_route = helper._fast_lane_route(
+            validated["routing_context"], unit, role
         )
         self.assertIsNotNone(resolved_route)
         assignment = helper._fast_lane_assignment(
@@ -1237,7 +1441,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         provisional = ImplementationPacket(
             packet_id="",
             trace_id=digest("1"),
-            workspace="2718-devkit",
+            workspace_id=digest("f"),
             snapshot_id=digest("0"),
             recipe_id=digest("2"),
             node_ids=(digest("b"),),
@@ -1267,7 +1471,16 @@ class TeamEfficiencyTests(unittest.TestCase):
                 sorted({operation.template_hash for operation in operations})
             ),
             receipt_hashes=(digest("e"),),
-            next_action="code_atlas_render",
+            next_action="atlas_render",
+            request_hash=digest("a"),
+            matcher_version="atlas-matcher/v1",
+            target_paths=(
+                "docs/service.md",
+                "src/schema.py",
+                "src/service.py",
+                "tests/test_service.py",
+            ),
+            target_symbols=(),
         )
         packet_payload = provisional.to_dict()
         del packet_payload["packet_id"]
@@ -1423,7 +1636,7 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_fast_lane_ultra_emits_lane_zero_and_three_useful_slots(self) -> None:
         helper = load_efficiency()
 
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             self.fast_lane_schedule_request(helper), reasoning_effort="ultra"
         )
 
@@ -1449,7 +1662,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             {
                 ("FAST-LANE-ROUTINE", "gpt-5.6-terra", "high"),
                 ("FAST-LANE-MODERATE", "gpt-5.6-terra", "max"),
-                ("FAST-LANE-FUTURE", "gpt-5.6-terra", "medium"),
+                ("FAST-LANE-FUTURE", "gpt-5.6-terra", "high"),
             },
             {
                 (item["task_id"], item["model"], item["reasoning_effort"])
@@ -1462,7 +1675,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         helper = load_efficiency()
         for effort in ("medium", "high", "max"):
             with self.subTest(effort=effort):
-                result = helper.compile_fast_lane(
+                result = self.compile_fast_lane(helper,
                     self.fast_lane_schedule_request(helper),
                     reasoning_effort=effort,
                     enable=True,
@@ -1475,10 +1688,10 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual("active", result["status"])
                 self.assertEqual(effort, result["main_lane"]["reasoning_effort"])
 
-    def test_fast_lane_routes_are_explicit_and_legacy_route_is_unchanged(self) -> None:
+    def test_fast_lane_routes_are_core_attested_and_legacy_display_is_unchanged(self) -> None:
         helper = load_efficiency()
         request = self.fast_lane_schedule_request(helper)
-        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
         assignments = {
             item["task_id"]: item for item in result["assignments"]
         }
@@ -1492,18 +1705,29 @@ class TeamEfficiencyTests(unittest.TestCase):
             ("gpt-5.6-terra", "max"),
             (assignments["FAST-LANE-MODERATE"]["model"], assignments["FAST-LANE-MODERATE"]["reasoning_effort"]),
         )
-        self.assertEqual(
-            ("gpt-5.6-terra", "high"),
-            helper._fast_lane_route({"recommended_route": "Terra Max"}, "review"),
-        )
-        self.assertEqual(
-            ("gpt-5.6-terra", "medium"),
-            helper._fast_lane_route({"recommended_route": "Sol High"}, "prewarm"),
-        )
-        self.assertEqual(
-            ("gpt-5.6-sol", "ultra"),
-            helper._fast_lane_route({"recommended_route": "Terra High"}, "design_probe"),
-        )
+        for assignment in assignments.values():
+            with self.subTest(task_id=assignment["task_id"]):
+                receipt = assignment["dispatch_receipt"]
+                self.assertNotEqual("ultra", assignment["reasoning_effort"])
+                self.assertEqual(
+                    assignment["model"], receipt["model"]
+                )
+                self.assertEqual(
+                    assignment["reasoning_effort"],
+                    receipt["reasoning_effort"],
+                )
+                self.assertEqual(
+                    assignment["routing_result_hash"],
+                    receipt["routing_result_hash"],
+                )
+                self.assertEqual(
+                    assignment["task_id"],
+                    receipt["routing_input"]["task_id"],
+                )
+                self.assertEqual(
+                    assignment["role"],
+                    receipt["routing_input"]["scheduler_role"],
+                )
 
         exceptional_package = self.decomposition_manifest()
         exceptional_package["artifacts"] = [
@@ -1518,20 +1742,170 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "execution_contracts": ["contracts/fast-lane"],
             }
         ]
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             self.fast_lane_request(helper, work_package=exceptional_package),
             reasoning_effort="ultra",
         )
         self.assertEqual("active", result["status"])
-        self.assertIn(
-            result["decision_code"],
-            {"FAST_LANE_ACTIVE", "TERMINAL_PROTOCOL_OWNED_BY_LANE0"},
+        exceptional = next(
+            item
+            for item in result["assignments"]
+            if item["task_id"] == "FAST-LANE-EXCEPTIONAL"
         )
+        self.assertEqual("execution", exceptional["role"])
+        self.assertEqual("gpt-5.6-sol", exceptional["model"])
+        self.assertEqual("high", exceptional["reasoning_effort"])
+        self.assertNotEqual("ultra", exceptional["reasoning_effort"])
+
+    def test_fast_lane_consumes_attested_core_routes_and_fails_closed(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        routes = host_status["routing_context"]["routes"]
+        luna_entry = next(
+            entry
+            for entry in routes
+            if entry["task_id"] == "FAST-LANE-ROUTINE"
+            and entry["scheduler_role"] == "execution"
+        )
+        luna_entry["request"]["legacy"] = None
+        luna_entry["compatibility_floor"] = None
+
+        result = self.compile_fast_lane(helper,
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+        )
+
+        routine = next(
+            assignment
+            for assignment in result["assignments"]
+            if assignment["task_id"] == "FAST-LANE-ROUTINE"
+        )
+        self.assertEqual("gpt-5.6-luna", routine["model"])
+        self.assertNotEqual("ultra", routine["reasoning_effort"])
+        self.assertIn("routing_result_hash", routine["dispatch_receipt"])
+        self.assertIn("routing_context_hash", routine["dispatch_receipt"])
+        self.assertIn("task_fingerprint", routine["dispatch_receipt"])
+        self.assertTrue(routine["routing_reason_codes"])
+
+        unavailable_status = copy.deepcopy(host_status)
+        for entry in unavailable_status["routing_context"]["routes"]:
+            entry["request"]["host_capabilities"]["models"] = []
+        unavailable = self.compile_fast_lane(helper,
+            request,
+            reasoning_effort="ultra",
+            host_status=unavailable_status,
+        )
+        self.assertEqual("blocked", unavailable["status"])
+        self.assertEqual("NO_SAFE_WORK", unavailable["decision_code"])
+        self.assertEqual([], unavailable["assignments"])
+        self.assertTrue(
+            all(
+                slot["reason_code"] == "CAPABILITY_UNAVAILABLE"
+                for slot in unavailable["idle_slots"]
+            )
+        )
+
+        missing_context = copy.deepcopy(host_status)
+        missing_context["routing_context"] = None
+        duplicate_context = copy.deepcopy(host_status)
+        duplicate_context["routing_context"]["routes"].extend(
+            copy.deepcopy(duplicate_context["routing_context"]["routes"])
+        )
+        unknown_context = copy.deepcopy(host_status)
+        for entry in unknown_context["routing_context"]["routes"]:
+            entry["task_id"] = "FAST-LANE-UNKNOWN"
+        mismatched_context = copy.deepcopy(host_status)
+        for entry in mismatched_context["routing_context"]["routes"]:
+            entry["request"]["task"]["role"] = "integration"
+
+        for name, invalid_status in (
+            ("missing", missing_context),
+            ("duplicate", duplicate_context),
+            ("unknown", unknown_context),
+            ("task_role_mismatch", mismatched_context),
+        ):
+            with self.subTest(name=name):
+                failed_closed = self.compile_fast_lane(
+                    helper,
+                    request,
+                    reasoning_effort="ultra",
+                    host_status=invalid_status,
+                )
+                self.assertEqual("blocked", failed_closed["status"])
+                self.assertEqual("NO_SAFE_WORK", failed_closed["decision_code"])
+                self.assertEqual([], failed_closed["assignments"])
+
+    def test_fast_lane_fails_closed_for_an_unroutable_verification_action(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_code_atlas_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        validated = helper._validated_fast_lane_request(
+            copy.deepcopy(request),
+            host_routing_context=host_status["routing_context"],
+        )
+        verification = next(
+            unit
+            for unit in validated["source_plan"]["units"]
+            if unit["unit_kind"] == "verification"
+        )
+        routing_context = copy.deepcopy(validated["routing_context"])
+        route_key = (verification["task_id"], "verification")
+        routing_context["decisions"][route_key] = None
+        routing_context["reasons"][route_key] = "capability_unavailable"
+        scheduler_state = {
+            **validated["scheduler_state"],
+            "phase": "integration_regression",
+            "completed_tasks": [
+                {"task_id": task_id}
+                for task_id in verification["depends_on"]
+            ],
+        }
+
+        result = helper._render_fast_lane_plan(
+            {
+                **validated,
+                "scheduler_state": scheduler_state,
+                "routing_context": routing_context,
+            },
+            helper._fast_lane_activation("ultra", False),
+        )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
         self.assertEqual([], result["assignments"])
-        self.assertEqual(
-            [{"slot_id": slot, "reason_code": "LANE0_REQUIRED"} for slot in ("slot-1", "slot-2", "slot-3")],
-            result["idle_slots"],
+        self.assertTrue(
+            all(
+                slot["reason_code"] == "CAPABILITY_UNAVAILABLE"
+                for slot in result["idle_slots"]
+            )
         )
+
+    def test_fast_lane_routing_context_allows_the_bounded_remediation_unit(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        host_status = self.fast_lane_host_status(
+            helper, self.fast_lane_schedule_request(helper)
+        )
+        routing_context = host_status["routing_context"]
+        maximum_routes = (helper.MAX_MANIFEST_UNITS + 1) * len(
+            helper._FAST_LANE_ROLES
+        )
+        routing_context["routes"] = [
+            copy.deepcopy(routing_context["routes"][0])
+            for _ in range(maximum_routes)
+        ]
+
+        normalized = helper._validated_fast_lane_routing_context(routing_context)
+        self.assertEqual(maximum_routes, len(normalized["routes"]))
+
+        routing_context["routes"].append(
+            copy.deepcopy(routing_context["routes"][0])
+        )
+        with self.assertRaises(ValueError):
+            helper._validated_fast_lane_routing_context(routing_context)
 
     def test_fast_lane_blocks_lane_zero_and_scope_conflicts(self) -> None:
         helper = load_efficiency()
@@ -1544,7 +1918,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.decompose(lane0_request["work_package"])
         )
         lane0_request["read_contexts"] = []
-        lane0_result = helper.compile_fast_lane(
+        lane0_result = self.compile_fast_lane(helper,
             lane0_request, reasoning_effort="ultra"
         )
         self.assertEqual([], lane0_result["assignments"])
@@ -1579,7 +1953,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "execution_contracts": ["contracts/fast-lane"],
             },
         ]
-        conflict_result = helper.compile_fast_lane(
+        conflict_result = self.compile_fast_lane(helper,
             self.fast_lane_request(helper, work_package=conflict_package),
             reasoning_effort="ultra",
         )
@@ -1614,16 +1988,24 @@ class TeamEfficiencyTests(unittest.TestCase):
             )
         ]
         request = self.fast_lane_request(helper, work_package=work_package)
-        validated = helper._validated_fast_lane_request(copy.deepcopy(request))
+        host_status = self.fast_lane_host_status(helper, request)
+        validated = helper._validated_fast_lane_request(
+            copy.deepcopy(request),
+            host_routing_context=host_status["routing_context"],
+        )
         units = {unit["task_id"]: unit for unit in validated["source_plan"]["units"]}
 
         def running_assignment(task_id: str, slot_id: str) -> tuple[dict[str, object], dict[str, object]]:
+            route = helper._fast_lane_route(
+                validated["routing_context"], units[task_id], "execution"
+            )
+            self.assertIsNotNone(route)
             assignment = helper._fast_lane_assignment(
                 validated,
                 units[task_id],
                 "execution",
                 slot_id,
-                ("gpt-5.6-terra", "high"),
+                route,
             )
             context = assignment.pop("_context")
             assignment.pop("action")
@@ -1645,7 +2027,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             }
         )
 
-        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
         retained = [
             item for item in result["assignments"] if item["task_id"] == "FAST-LANE-A"
@@ -1832,7 +2214,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             ],
         }
 
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             request, reasoning_effort="ultra", host_status=host_status
         )
 
@@ -1959,7 +2341,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             )
             for task_id in ("FAST-LANE-C", "FAST-LANE-D")
         ]
-        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
         prewarms = [
             item for item in result["assignments"] if item["role"] == "prewarm"
         ]
@@ -1978,7 +2360,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             for unit in atlas_source_plan["units"]
             if unit["unit_kind"] == "verification"
         )
-        atlas_result = helper.compile_fast_lane(atlas_request, reasoning_effort="ultra")
+        atlas_result = self.compile_fast_lane(helper, atlas_request, reasoning_effort="ultra")
         atlas_prewarms = [
             item for item in atlas_result["assignments"] if item["role"] == "prewarm"
         ]
@@ -2001,7 +2383,7 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_fast_lane_ultra_context_ineligible_is_blocked(self) -> None:
         helper = load_efficiency()
 
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             self.fast_lane_contexts_empty_request(helper),
             reasoning_effort="ultra",
         )
@@ -2014,7 +2396,7 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_fast_lane_lower_effort_without_enable_is_exactly_inactive(self) -> None:
         helper = load_efficiency()
 
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             self.fast_lane_contexts_empty_request(helper),
             reasoning_effort="max",
             enable=False,
@@ -2115,6 +2497,62 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual("blocked", result["status"])
         self.assertEqual("NO_SAFE_WORK", result["decision_code"])
 
+    def test_fast_lane_cli_consumes_complete_bounded_host_status(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        request_path = self.temp / "fast-lane-attested-request.json"
+        host_status_path = self.temp / "fast-lane-host-status.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        host_status_text = json.dumps(host_status)
+        self.assertGreater(len(host_status_text.encode("utf-8")), 32 * 1024)
+        host_status_path.write_text(host_status_text, encoding="utf-8")
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--host-status",
+                str(host_status_path),
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        result = json.loads(output)
+        self.assertEqual("active", result["status"])
+        self.assertTrue(result["assignments"])
+        self.assertTrue(
+            all(
+                assignment["reasoning_effort"] != "ultra"
+                for assignment in result["assignments"]
+            )
+        )
+
+        malformed_status = copy.deepcopy(host_status)
+        malformed_status.pop("routing_context")
+        malformed_path = self.temp / "fast-lane-malformed-host-status.json"
+        malformed_path.write_text(json.dumps(malformed_status), encoding="utf-8")
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--host-status",
+                str(malformed_path),
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+        self.assertEqual(2, exit_code)
+        self.assertEqual("", output)
+        self.assertTrue(errors.startswith("error: "))
+
     def test_fast_lane_top_level_fields_are_exact(self) -> None:
         helper = load_efficiency()
         expected_fields = {
@@ -2149,7 +2587,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         cases = (
             (
                 "inactive",
-                helper.compile_fast_lane(
+                self.compile_fast_lane(helper,
                     self.fast_lane_contexts_empty_request(helper),
                     reasoning_effort="max",
                     enable=False,
@@ -2162,7 +2600,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             ),
             (
                 "blocked",
-                helper.compile_fast_lane(
+                self.compile_fast_lane(helper,
                     self.fast_lane_contexts_empty_request(helper),
                     reasoning_effort="ultra",
                 ),
@@ -2174,7 +2612,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             ),
             (
                 "needs_design",
-                helper.compile_fast_lane(
+                self.compile_fast_lane(helper,
                     needs_design_request,
                     reasoning_effort="ultra",
                 ),
@@ -2243,7 +2681,40 @@ class TeamEfficiencyTests(unittest.TestCase):
                         ],
                         "polling": False,
                     },
-                    result["refill_plan"],
+                    {
+                        field: result["refill_plan"][field]
+                        for field in (
+                            "trigger",
+                            "dispatch_at",
+                            "priority",
+                            "polling",
+                        )
+                    },
+                )
+                self.assertEqual(
+                    {
+                        "trigger",
+                        "dispatch_at",
+                        "priority",
+                        "polling",
+                        "occupancy_audit",
+                    },
+                    set(result["refill_plan"]),
+                )
+                occupancy = result["refill_plan"]["occupancy_audit"]
+                self.assertEqual(
+                    {
+                        "active_slot_ids",
+                        "vacant_slot_ids",
+                        "refill_trigger",
+                        "refill_trigger_hash",
+                    },
+                    set(occupancy),
+                )
+                self.assertEqual([], occupancy["active_slot_ids"])
+                self.assertEqual(
+                    ["slot-1", "slot-2", "slot-3"],
+                    occupancy["vacant_slot_ids"],
                 )
                 self.assertEqual(
                     {
@@ -2369,7 +2840,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         for invalid_enable in (1, 0, None, "true"):
             with self.subTest(enable=repr(invalid_enable)):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(
+                    self.compile_fast_lane(helper,
                         self.fast_lane_contexts_empty_request(helper),
                         reasoning_effort="max",
                         enable=invalid_enable,
@@ -2393,7 +2864,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
     def test_fast_lane_request_shell_requires_exact_top_level_fields(self) -> None:
         helper = load_efficiency()
@@ -2408,7 +2879,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_nontext_phase_in_api_and_cli(self) -> None:
         helper = load_efficiency()
@@ -2418,7 +2889,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             request["scheduler_state"]["phase"] = invalid_phase
             with self.subTest(api=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
             request_path = self.temp / f"fast-lane-invalid-phase-{name}.json"
             request_path.write_text(json.dumps(request), encoding="utf-8")
@@ -2511,7 +2982,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         for name, invalid_request in invalid_requests:
             with self.subTest(case=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, invalid_request, reasoning_effort="ultra")
 
         atlas_manifest = self.code_atlas_manifest()
         atlas_plan = helper.decompose(atlas_manifest)
@@ -2536,7 +3007,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 }
             )
         with self.subTest(case="verification_red_fields_empty_is_valid"):
-            baseline = helper.compile_fast_lane(
+            baseline = self.compile_fast_lane(helper,
                 copy.deepcopy(verification_request), reasoning_effort="ultra"
             )
             self.assertEqual("team-efficiency/fast-lane-plan-v1", baseline["schema"])
@@ -2558,7 +3029,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         with self.subTest(case="verification_red_fields_must_be_empty"):
             with self.assertRaises(ValueError):
-                helper.compile_fast_lane(
+                self.compile_fast_lane(helper,
                     invalid_verification_request, reasoning_effort="ultra"
                 )
 
@@ -2584,7 +3055,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         with self.subTest(case="argv_embedded_posix_absolute"):
             with self.assertRaises(ValueError):
-                helper.compile_fast_lane(absolute_option, reasoning_effort="ultra")
+                self.compile_fast_lane(helper, absolute_option, reasoning_effort="ultra")
 
         for name, failure_id in (
             ("secret", "secret=token"),
@@ -2599,7 +3070,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                     gate["gate_id"], gate["red_failure_ids"]
                 )
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_ambiguous_packet_gate_coverage(self) -> None:
         helper = load_efficiency()
@@ -2662,7 +3133,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             )
 
         with self.subTest(case="two_test_specs_have_exact_two_gate_baseline"):
-            result = helper.compile_fast_lane(
+            result = self.compile_fast_lane(helper,
                 copy.deepcopy(request), reasoning_effort="ultra"
             )
             self.assertEqual("blocked", result["status"])
@@ -2691,7 +3162,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         ):
             with self.subTest(case=name):
                 with self.assertRaisesRegex(ValueError, r"^ATLAS_GATE_UNVERIFIED$"):
-                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, invalid_request, reasoning_effort="ultra")
 
         request_path = self.temp / "fast-lane-atlas-gate-regression.json"
         request_path.write_text(json.dumps(overclaimed), encoding="utf-8")
@@ -2721,7 +3192,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.fast_lane_execution_snapshot_id(helper, context["task_id"]),
                 context["workspace_input_snapshot_id"],
             )
-        baseline_result = helper.compile_fast_lane(
+        baseline_result = self.compile_fast_lane(helper,
             copy.deepcopy(baseline), reasoning_effort="ultra"
         )
         self.assertEqual("team-efficiency/fast-lane-plan-v1", baseline_result["schema"])
@@ -2744,7 +3215,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 request = copy.deepcopy(baseline)
                 request["target_gates"][0]["gates"][0]["argv"] = argv
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
         source_plan = helper.decompose(baseline["work_package"])
         first_unit, second_unit = source_plan["units"][:2]
@@ -2817,7 +3288,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         for name, invalid_request in context_cases:
             with self.subTest(case=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, invalid_request, reasoning_effort="ultra")
 
     def test_fast_lane_context_anchor_uniqueness_and_path_redaction(self) -> None:
         helper = load_efficiency()
@@ -2825,7 +3296,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         read_context = self.fast_lane_read_context(helper)
         baseline["read_contexts"] = [read_context]
 
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             copy.deepcopy(baseline), reasoning_effort="ultra"
         )
         rendered = json.dumps(result, sort_keys=True)
@@ -2955,7 +3426,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         for name, invalid_request in invalid_cases:
             with self.subTest(case=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, invalid_request, reasoning_effort="ultra")
 
     def test_fast_lane_has_no_external_side_effect(self) -> None:
         helper = load_efficiency()
@@ -2978,7 +3449,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 side_effect=AssertionError("compile must not create directories"),
             ),
         ):
-            result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+            result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
         self.assertEqual("active", result["status"])
 
@@ -2986,7 +3457,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         helper = load_efficiency()
         request = self.fast_lane_running_request(helper)
 
-        result = helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        result = self.compile_fast_lane(helper, copy.deepcopy(request), reasoning_effort="ultra")
         self.assertEqual("active", result["status"])
         self.assertEqual("FAST_LANE_ACTIVE", result["decision_code"])
         self.assertEqual(2, len(result["assignments"]))
@@ -3044,7 +3515,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         for name, invalid_request in invalid_requests:
             with self.subTest(case=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(invalid_request, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, invalid_request, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_malformed_remediation_request(self) -> None:
         helper = load_efficiency()
@@ -3052,7 +3523,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         request["remediation_request"] = {}
 
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(request, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_invalid_or_overlapping_scheduler_state(self) -> None:
         helper = load_efficiency()
@@ -3060,7 +3531,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         with self.subTest("initial_null_source_hash_uses_derived_hash_for_host_audit"):
             pristine = self.fully_bound_fast_lane_manual_request(helper)
             try:
-                result = helper.compile_fast_lane(
+                result = self.compile_fast_lane(helper,
                     pristine,
                     reasoning_effort="ultra",
                     host_status={
@@ -3101,7 +3572,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         with self.subTest("lane_zero_cannot_reopen_completed_work"):
             with self.assertRaises(ValueError):
-                helper.compile_fast_lane(request, reasoning_effort="ultra")
+                self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
     def test_fast_lane_candidate_never_unlocks_before_lane_zero_completion(self) -> None:
         helper = load_efficiency()
@@ -3127,7 +3598,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
             }
         )
-        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
         self.assertNotIn(
             "FAST-LANE-FUTURE",
             [
@@ -3150,7 +3621,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "terminal_result_hash"
         ] = helper._sha256_json(cross_role_terminal)
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(cross_role, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, cross_role, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_forged_stale_duplicate_or_cross_role_tokens(self) -> None:
         helper = load_efficiency()
@@ -3256,7 +3727,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(invalid, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, invalid, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_resigned_terminal_receipt_with_wrong_route(self) -> None:
         helper = load_efficiency()
@@ -3283,7 +3754,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
             }
         )
-        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        self.compile_fast_lane(helper, copy.deepcopy(request), reasoning_effort="ultra")
 
         forged = copy.deepcopy(request)
         forged_terminal = forged["scheduler_state"]["review_ready_candidates"][0][
@@ -3297,12 +3768,12 @@ class TeamEfficiencyTests(unittest.TestCase):
         ] = helper._sha256_json(forged_terminal)
 
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_resigned_running_receipt_with_wrong_route(self) -> None:
         helper = load_efficiency()
         request = self.fast_lane_running_request(helper)
-        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        self.compile_fast_lane(helper, copy.deepcopy(request), reasoning_effort="ultra")
 
         forged = copy.deepcopy(request)
         assignment = forged["scheduler_state"]["running_assignments"][0]
@@ -3312,7 +3783,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         assignment["assignment_token"] = helper._sha256_json(receipt)
 
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_completion_snapshot_not_bound_to_dispatch_context(
         self,
@@ -3333,7 +3804,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
             }
         )
-        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        self.compile_fast_lane(helper, copy.deepcopy(request), reasoning_effort="ultra")
 
         forged = copy.deepcopy(request)
         completed = forged["scheduler_state"]["completed_tasks"][0]
@@ -3346,7 +3817,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         completed["result_hash"] = receipt_hash
 
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_verification_completion_not_bound_to_read_context(
         self,
@@ -3379,7 +3850,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
             }
         )
-        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        self.compile_fast_lane(helper, copy.deepcopy(request), reasoning_effort="ultra")
 
         for name, updates in (
             (
@@ -3411,7 +3882,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                     completed["integration_commit"] = receipt["integration_commit"]
                     completed["integration_tree"] = receipt["integration_tree"]
                 with self.assertRaises(ValueError):
-                    helper.compile_fast_lane(forged, reasoning_effort="ultra")
+                    self.compile_fast_lane(helper, forged, reasoning_effort="ultra")
 
     def test_fast_lane_rejects_forged_prewarm_dispatch_bindings(self) -> None:
         helper = load_efficiency()
@@ -3437,7 +3908,6 @@ class TeamEfficiencyTests(unittest.TestCase):
             request,
             task_id=future["task_id"],
             role="prewarm",
-            route=("gpt-5.6-terra", "medium"),
         )
         prewarm_terminal = self.fast_lane_terminal_result(helper, prewarm_assignment)
         prewarm_record = {
@@ -3476,7 +3946,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "slot-2": 1,
             "slot-3": 0,
         }
-        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        self.compile_fast_lane(helper, copy.deepcopy(request), reasoning_effort="ultra")
 
         forged = copy.deepcopy(request)
         forged_context = next(
@@ -3491,7 +3961,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         context_without_hash.pop("context_hash")
         forged_context["context_hash"] = helper._sha256_json(context_without_hash)
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged, reasoning_effort="ultra")
 
     def test_fast_lane_review_must_bind_the_candidate_context(self) -> None:
         helper = load_efficiency()
@@ -3556,7 +4026,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "slot_epochs": {"slot-1": 1, "slot-2": 1, "slot-3": 0},
             }
         )
-        helper.compile_fast_lane(request, reasoning_effort="ultra")
+        self.compile_fast_lane(helper, request, reasoning_effort="ultra")
 
         forged = copy.deepcopy(request)
         forged_context = forged["scheduler_state"]["dispatch_contexts"][1]
@@ -3581,7 +4051,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "review_terminal_result_hash"
         ] = helper._sha256_json(forged_terminal)
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged, reasoning_effort="ultra")
 
     def test_fast_lane_packet_and_episode_verification_is_declared(self) -> None:
         helper = load_efficiency()
@@ -3612,7 +4082,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             }
         )
         try:
-            packet_result = helper.compile_fast_lane(packet, reasoning_effort="ultra")
+            packet_result = self.compile_fast_lane(helper, packet, reasoning_effort="ultra")
         except ValueError as error:
             self.fail(f"declared packet verification must compile: {error}")
         self.assertEqual("integration_regression", packet_result["phase"])
@@ -3632,7 +4102,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         queued_execution = self.fast_lane_code_atlas_request(helper)
         queued_execution["scheduler_state"]["phase"] = "integration_regression"
-        queued_result = helper.compile_fast_lane(
+        queued_result = self.compile_fast_lane(helper,
             queued_execution, reasoning_effort="ultra"
         )
         self.assertEqual([], queued_result["assignments"])
@@ -3715,7 +4185,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             }
         )
         try:
-            result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+            result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
         except ValueError as error:
             self.fail(f"narrow remediation must compile once: {error}")
         self.assertEqual("active", result["status"])
@@ -3726,14 +4196,14 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         broad = copy.deepcopy(request)
         broad["remediation_request"]["write_scope"] = ["src"]
-        broad_result = helper.compile_fast_lane(broad, reasoning_effort="ultra")
+        broad_result = self.compile_fast_lane(helper, broad, reasoning_effort="ultra")
         self.assertEqual("stopped", broad_result["status"])
         self.assertEqual("AUTOMATION_STOPPED", broad_result["decision_code"])
         self.assertEqual([], broad_result["assignments"])
 
         round_two = copy.deepcopy(request)
         round_two["remediation_request"]["round"] = 2
-        round_two_result = helper.compile_fast_lane(round_two, reasoning_effort="ultra")
+        round_two_result = self.compile_fast_lane(helper, round_two, reasoning_effort="ultra")
         self.assertEqual("stopped", round_two_result["status"])
         self.assertEqual([], round_two_result["assignments"])
 
@@ -3777,7 +4247,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 },
             }
         )
-        helper.compile_fast_lane(copy.deepcopy(request), reasoning_effort="ultra")
+        self.compile_fast_lane(helper, copy.deepcopy(request), reasoning_effort="ultra")
 
         remediation_assignment, remediation_dispatch_context, _ = (
             self.fast_lane_assignment_for(
@@ -3801,14 +4271,14 @@ class TeamEfficiencyTests(unittest.TestCase):
         running_global["dispatch_receipt"] = copy.deepcopy(
             remediation_assignment["dispatch_receipt"]
         )
-        helper.compile_fast_lane(copy.deepcopy(running), reasoning_effort="ultra")
+        self.compile_fast_lane(helper, copy.deepcopy(running), reasoning_effort="ultra")
 
         forged_running = copy.deepcopy(running)
         forged_running["scheduler_state"]["global_remediation"][
             "dispatch_receipt"
         ] = {"forged": "receipt"}
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged_running, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged_running, reasoning_effort="ultra")
 
         remediation_terminal = self.fast_lane_terminal_result(
             helper, remediation_assignment
@@ -3832,7 +4302,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         completed_global["completion_receipt_hash"] = remediation_completed[
             "completion_receipt_hash"
         ]
-        helper.compile_fast_lane(
+        self.compile_fast_lane(helper,
             copy.deepcopy(completed_request), reasoning_effort="ultra"
         )
 
@@ -3841,7 +4311,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "completion_receipt_hash"
         ] = "sha256:" + "0" * 64
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged_completed, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged_completed, reasoning_effort="ultra")
 
     def test_fast_lane_terminal_protocol_is_bounded(self) -> None:
         helper = load_efficiency()
@@ -3849,7 +4319,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             request = self.fully_bound_fast_lane_manual_request(helper)
             request["scheduler_state"]["phase"] = phase
             with self.subTest(phase=phase):
-                result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+                result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
                 self.assertEqual("active", result["status"])
                 self.assertEqual(
                     "TERMINAL_PROTOCOL_OWNED_BY_LANE0", result["decision_code"]
@@ -3892,7 +4362,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         recovered["assignment_token"] = helper._sha256_json(recovered_receipt)
         request["scheduler_state"]["running_assignments"] = [recovered]
         request["scheduler_state"]["slot_epochs"]["slot-1"] = 2
-        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+        result = self.compile_fast_lane(helper, request, reasoning_effort="ultra")
         self.assertEqual(recovered["assignment_token"], result["assignments"][0]["assignment_token"])
 
         forged_predecessor = copy.deepcopy(request)
@@ -3904,16 +4374,16 @@ class TeamEfficiencyTests(unittest.TestCase):
             "assignment_token"
         ] = helper._sha256_json(forged_receipt)
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(forged_predecessor, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, forged_predecessor, reasoning_effort="ultra")
 
         wrong_phase = copy.deepcopy(request)
         wrong_phase["scheduler_state"]["phase"] = "integration_regression"
         with self.assertRaises(ValueError):
-            helper.compile_fast_lane(wrong_phase, reasoning_effort="ultra")
+            self.compile_fast_lane(helper, wrong_phase, reasoning_effort="ultra")
 
     def test_fast_lane_workflow_policy_is_exact_and_ordered(self) -> None:
         helper = load_efficiency()
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             self.fully_bound_fast_lane_manual_request(helper),
             reasoning_effort="ultra",
         )
@@ -4014,7 +4484,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def test_fast_lane_phase_and_role_shapes_are_exact(self) -> None:
         helper = load_efficiency()
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(helper,
             self.fast_lane_schedule_request(helper), reasoning_effort="ultra"
         )
         expected_assignment_fields = {
@@ -4032,6 +4502,11 @@ class TeamEfficiencyTests(unittest.TestCase):
             "role",
             "model",
             "reasoning_effort",
+            "routing_context_hash",
+            "routing_result_hash",
+            "task_fingerprint",
+            "routing_reason_codes",
+            "routing_safety_floor_rank",
             "access",
             "context_hash",
             "execution_context_hash",
@@ -4093,7 +4568,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                 stale_prewarm,
                 task_id="FAST-LANE-FUTURE",
                 role="prewarm",
-                route=("gpt-5.6-terra", "medium"),
             )
         )
         parent_assignment, parent_context, _ = self.fast_lane_assignment_for(
@@ -4127,7 +4601,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "slot_epochs": {"slot-1": 1, "slot-2": 0, "slot-3": 0},
             }
         )
-        stale_prewarm_result = helper.compile_fast_lane(
+        stale_prewarm_result = self.compile_fast_lane(helper,
             stale_prewarm, reasoning_effort="ultra"
         )
         self.assertEqual(
@@ -4137,7 +4611,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         terminal = self.fully_bound_fast_lane_manual_request(helper)
         terminal["scheduler_state"]["phase"] = "acceptance"
-        terminal_result = helper.compile_fast_lane(terminal, reasoning_effort="ultra")
+        terminal_result = self.compile_fast_lane(helper, terminal, reasoning_effort="ultra")
         self.assertEqual("active", terminal_result["status"])
         self.assertEqual(
             "TERMINAL_PROTOCOL_OWNED_BY_LANE0", terminal_result["decision_code"]
@@ -4146,7 +4620,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         stopped = self.fully_bound_fast_lane_manual_request(helper)
         stopped["scheduler_state"]["phase"] = "stopped"
-        stopped_result = helper.compile_fast_lane(stopped, reasoning_effort="ultra")
+        stopped_result = self.compile_fast_lane(helper, stopped, reasoning_effort="ultra")
         self.assertEqual("stopped", stopped_result["status"])
         self.assertEqual("AUTOMATION_STOPPED", stopped_result["decision_code"])
         self.assertEqual([], stopped_result["assignments"])
@@ -4168,7 +4642,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         document = SKILL.read_text(encoding="utf-8")
 
         for expected in (
-            "python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra",
+            "--host-status <fast-lane-host-status.json>",
             "Ultra automatic activation",
             "--enable",
             "main Sol",
@@ -4178,11 +4652,13 @@ class TeamEfficiencyTests(unittest.TestCase):
             "only after a terminal event",
             "no commentary polling",
             "no safe useful work",
-            "prewarm: gpt-5.6-terra / medium",
-            "routine implementation and ordinary verification: gpt-5.6-terra / high",
-            "moderate-or-harder implementation and verification: gpt-5.6-terra / max",
-            "review: gpt-5.6-terra / high",
-            "bounded design probe: gpt-5.6-sol / ultra",
+            "routing_context_hash",
+            "routing_result_hash",
+            "NO_SAFE_WORK",
+            "worker effort 禁止 `ultra`",
+            "prewarm 始终是独立的只读证据角色",
+            "归档不是 adapter 操作",
+            "D:\\bun\\tmp\\codex\\<project-or-thread>",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, document)
@@ -4197,8 +4673,14 @@ class TeamEfficiencyTests(unittest.TestCase):
             "team-efficiency/fast-lane-plan-v1",
             "ultra_auto",
             "explicit_opt_in",
-            "python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra",
-            "python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort max --enable",
+            "--host-status <fast-lane-host-status.json>",
+            "Scheduler adapter boundary",
+            "routing_context_hash",
+            "routing_result_hash",
+            "NO_SAFE_WORK",
+            "non-`ultra` effort",
+            "after lane 0 acceptance",
+            "C-drive temporary roots are forbidden",
             "target gates",
             "canonical repo anchor",
             "trusted shared integration worktree",
@@ -4888,13 +5370,14 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertNotIn(sensitive_identity, registration)
         index_service = ProjectIndexService(self.temp / "orchestrator-index.sqlite")
         self._index_services.append(index_service)
-        snapshot = index_service.sync(workspace_root, include_paths=(indexed_path,))
+        workspace_id = index_service.project_index_register(workspace_root)
+        snapshot = index_service.sync(workspace_id, include_paths=(indexed_path,))
         self.assertEqual(1, snapshot.file_count)
         snapshot_facts = index_service.snapshot_facts(
-            workspace_root, snapshot.snapshot_id
+            workspace_id, snapshot.snapshot_id
         )
         (indexed_file,) = index_service.read_snapshot_files(
-            workspace_root,
+            workspace_id,
             snapshot.snapshot_id,
             (indexed_path,),
             byte_budget=64 * 1024,
@@ -4925,7 +5408,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             store=durable_store,
             service=service,
             workflow_id=workflow_id,
-            workspace_root=workspace_root,
+            workspace_id=workspace_id,
             input_snapshot_id=snapshot.snapshot_id,
             index_service=index_service,
         )
@@ -5412,7 +5895,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         rendered = json.dumps(registration, sort_keys=True)
         self.assertNotIn(manifest["packet"]["trace_id"], rendered)
         self.assertNotIn(manifest["packet"]["snapshot_id"], rendered)
-        self.assertNotIn(manifest["packet"]["workspace"], rendered)
+        self.assertNotIn(manifest["packet"]["workspace_id"], rendered)
         self.assertNotIn(str(self.repo), rendered)
 
     def test_task_episode_mode_needs_design_or_fails_closed_without_graph_proof(

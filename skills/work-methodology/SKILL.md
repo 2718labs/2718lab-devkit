@@ -94,22 +94,32 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 对实质性的 Ultra 任务，host 调用：
 
 ```text
-python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
 `ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不运行 gate、不改写 Git、不领取或完成 workflow。lane 0/main Sol 始终负责设计、集成、风险决策和最终验收。
 
-host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后（only after a terminal event）refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。路由下限为：
+host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
+`routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整
+（每个不超过 32 KiB 的）`2718lab-devkit/fastlane-routing-request-v3` 和可信证据 hash；scheduler 只调用
+`fastlane_routing.py`，不得从 `recommended_route`、profile 或 capability 猜测/重建
+score、floor、fallback。每个 start receipt 绑定 `routing_context_hash`、
+`routing_result_hash`、`task_fingerprint`、reason codes、safety-floor rank 以及该次有界
+routing input；生命周期校验重放该历史 core input，不以较晚的 host event 改写旧 receipt。
+该 envelope 最多容纳原 16 个 unit 和一个已批准 remediation unit 的 85 个 task/role entries。
+
+缺少、重复、未知 task、task/role 不一致或 core unavailable（包括 capability 未 attested）
+都必须 fail closed 到 `NO_SAFE_WORK`，绝不回落到固定 `recommended_route`。`ultra` 只激活
+lane；worker model/effort 逐任务由 core 和 host attestation 决定，worker effort 禁止 `ultra`。
+prewarm 始终是独立的只读证据角色，不能变为 execution。
+
+host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后（only after a terminal event）refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。
 
 若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。
 
-```text
-prewarm: gpt-5.6-terra / medium
-routine implementation and ordinary verification: gpt-5.6-terra / high
-moderate-or-harder implementation and verification: gpt-5.6-terra / max
-review: gpt-5.6-terra / high
-bounded design probe: gpt-5.6-sol / ultra
-```
+归档不是 adapter 操作：只能在 lane 0 已完成 acceptance、最终证据已绑定之后由 host 执行。
+所有 scratch、worktree、cache、测试证据都位于 `D:\bun\tmp\codex\<project-or-thread>`；禁止把
+`TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。
 
 ### 6. 验证与交付
 

@@ -252,13 +252,37 @@ fingerprint, so their changes are `noop`. Only compact recovery transitions
 (`transport_degraded`, `recovery_probe`, `resumed`, and
 `fenced_replacement`) are persisted and emitted as replayable transitions.
 
-Descriptors always carry explicit model and effort: prewarm is
-`gpt-5.6-terra` / `medium`; routine implementation and
-ordinary verification are `gpt-5.6-terra` / `high`; moderate-or-harder
-implementation and verification are `gpt-5.6-terra` / `max`; review is
-`gpt-5.6-terra` / `high`; and a bounded design probe is `gpt-5.6-sol` /
-`ultra`. Main Sol lane 0 owns design, integration, risk decisions, and final
-acceptance.
+### Scheduler adapter boundary
+
+The scheduler does not carry a fixed role-to-model table. The host supplies a
+bounded (at most 3 MiB), exact-key `--host-status` object with `workflow_id`,
+`current_leases`, `host_bindings`, and `routing_context`. Each
+`routing_context.routes` entry uniquely names `(task_id, scheduler_role)` and
+carries one complete (at most 32 KiB) `2718lab-devkit/fastlane-routing-request-v3`, its bounded
+trusted-evidence inputs, and any compatibility floor. The adapter cross-binds
+the entry key to the source unit and core task role/access, then calls only the
+pure routing core. It must not infer a score, safety floor, capability fallback,
+or worker route from `recommended_route`, a legacy profile, or raw capability
+data.
+The envelope permits up to 85 entries: the 16-unit source plan plus one approved
+global-remediation unit for each of the five scheduler roles.
+
+For every start descriptor, the dispatch receipt and assignment token bind the
+core-derived model/effort plus `routing_context_hash`, `routing_result_hash`,
+`task_fingerprint`, `routing_reason_codes`, and
+`routing_safety_floor_rank`, together with the dispatch context, slot epoch,
+and historical bounded routing input. Lifecycle validation replays that archived
+input through the pure core so a later event, lease change, or capability report
+cannot rewrite the route that was actually dispatched. Missing, duplicate,
+unknown, task/role-mismatched, invalid, or core-unavailable routes—including a
+missing exact capability attestation—have no guessed fallback: the scheduler
+returns its existing `NO_SAFE_WORK` outcome for affected unschedulable work.
+
+`ultra` activates Fast Lane and lane 0 only; it never becomes a worker route.
+Every worker route is selected per task from the host-attested core result and
+must use a non-`ultra` effort. Main Sol lane 0 owns design, integration, risk
+decisions, and final acceptance. Prewarm remains a separate read-only evidence role;
+it is never execution or acceptance evidence.
 
 The request supplies bounded work-package, target-gate, execution-context,
 read-context, remediation, and scheduler-state data. The plan binds a source
@@ -304,6 +328,11 @@ Rendered plans contain redacted bounded metadata only: no absolute
 repo/worktree/temp paths, prompts, raw command output, secrets, or raw
 external receipt bodies.
 
+The adapter never archives work. The host may archive only after lane 0 acceptance
+and final evidence binding have completed. Scratch files, worktrees,
+caches, and test evidence must remain under
+`D:\bun\tmp\codex\<project-or-thread>`; C-drive temporary roots are forbidden.
+
 ## CLI
 
 ```text
@@ -313,6 +342,6 @@ python scripts/team_efficiency.py contract-check --producer <producer.json> --co
 python scripts/team_efficiency.py cache-key --input <cache-inputs.json>
 python scripts/team_efficiency.py decompose --input <work-package.json>
 python scripts/team_efficiency.py plan-waves --input <work-package.json>
-python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
-python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort max --enable
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort max --enable
 ```

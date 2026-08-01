@@ -22,6 +22,24 @@ same-path work queues behind the active owner.
 - Claude routes are Opus coordinator, Sonnet code worker, Haiku light worker,
   and Fable only as an explicitly reasoned powerful/expensive escalation.
 
+## Fast Lane v3 worker selection
+
+Fast Lane does not promote the host policy above into a fixed scheduler table.
+For each `(task_id, scheduler_role)`, the host attests a complete routing-core
+request; the adapter may emit only the core-resolved, exact model/effort pair
+and its bounded route receipt. A missing, duplicate, unknown, mismatched, or
+capability-unavailable entry has no `recommended_route` fallback and becomes
+`NO_SAFE_WORK`. This permits an exactly attested Luna pair where appropriate
+while preserving Terra and Sol safety floors without scheduler-side guessing.
+
+`ultra` is lane-0 activation, never a worker effort. Sol High remains the
+exceptional worker ceiling at `high`; prewarm is a read-only evidence role, not
+an execution role. Route receipts bind the dispatch event and historical core
+input so later lease/capability facts cannot rewrite an already-issued task.
+The host archives only after Sol acceptance and final evidence binding, and all
+task temporary roots stay below `D:\bun\tmp\codex\<project-or-thread>` rather
+than a C-drive temporary directory.
+
 No execution worker merges another task, changes a sibling scope, or accepts
 its own task. A candidate commit and evidence always return to Sol.
 

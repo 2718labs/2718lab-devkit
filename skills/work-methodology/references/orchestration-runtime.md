@@ -63,6 +63,26 @@ Durable handoff order is `workflow_artifact_register -> workflow_message_send ->
 6. 普通低风险流程不创建 reviewer。高风险先问用户，用户允许后再分派危险审查。
 7. 协调器仅协调 peer capability、delivery id 和 artifact hash；不得将消息正文作为 status、context 或 agent-to-agent relay 的一部分。
 
+## Fast Lane v3 scheduler boundary
+
+Fast Lane is not a second routing policy. The host gives the inert scheduler a
+bounded exact-key status object and complete per-`(task_id, scheduler_role)`
+core requests. The adapter validates the key against the source unit, invokes
+the pure routing core, and emits only its bounded decision and receipt fields.
+It must never reconstruct score/floor/capability fallback from a legacy
+`recommended_route` or profile. Missing, duplicate, unknown, role-mismatched,
+or unavailable core context fails closed as `NO_SAFE_WORK`; no fixed worker
+route is substituted.
+
+The receipt/token bind context/result hashes, task fingerprint, reason codes,
+safety floor, dispatch context, slot epoch, and the bounded historical core
+input. A terminal or retained assignment replays that historical input instead
+of reinterpreting it using a later scheduler event or lease. `ultra` activates
+lane 0; no worker may receive `ultra`. Prewarm stays read-only. Archive is a
+host action only after lane-0 acceptance and final evidence binding. All task
+temporary roots remain below `D:\bun\tmp\codex\<project-or-thread>`; C-drive
+temporary roots are forbidden.
+
 ## 恢复
 
 每次 claim 产生单调递增 fencing token。旧 worker 在租约过期后恢复时，`complete` 必须因 token 过期而拒绝。协调器根据事件日志和任务哈希重建 ready wave，不重放已确认完成的任务。

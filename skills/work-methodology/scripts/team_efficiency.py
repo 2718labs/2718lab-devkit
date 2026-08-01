@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
@@ -13,7 +14,6 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-
 
 MAX_PACKET_BYTES = 16 * 1024
 MAX_STATUS_BYTES = 32 * 1024
@@ -27,6 +27,11 @@ MAX_GRAPH_NODES = 64
 MAX_GRAPH_EDGES = 128
 MAX_REGISTRATION_CARD_BYTES = 4 * 1024
 MAX_GATE_TIMEOUT_SECONDS = 3600
+# A host may attest one bounded core request for every task/role pair.  Keep
+# the CLI envelope finite while allowing the 16-task plan plus one approved
+# global-remediation unit.
+MAX_FAST_LANE_ROUTE_REQUEST_BYTES = 32 * 1024
+MAX_FAST_LANE_HOST_STATUS_BYTES = 3 * 1024 * 1024
 FAST_LANE_SLOT_IDS = ("slot-1", "slot-2", "slot-3")
 FAST_LANE_REASONING_EFFORTS = frozenset(
     {"low", "medium", "high", "xhigh", "max", "ultra"}
@@ -205,6 +210,11 @@ _FAST_LANE_ASSIGNMENT_FIELDS = frozenset(
         "context_hash",
         "model",
         "reasoning_effort",
+        "routing_context_hash",
+        "routing_result_hash",
+        "task_fingerprint",
+        "routing_reason_codes",
+        "routing_safety_floor_rank",
         "dispatch_receipt",
     }
 )
@@ -237,6 +247,12 @@ _FAST_LANE_DISPATCH_RECEIPT_FIELDS = frozenset(
         "assignment_epoch",
         "model",
         "reasoning_effort",
+        "routing_context_hash",
+        "routing_result_hash",
+        "task_fingerprint",
+        "routing_reason_codes",
+        "routing_safety_floor_rank",
+        "routing_input",
         "dispatch_context_hash",
         "target_gates_hash",
         "execution_context_hash",
@@ -283,6 +299,30 @@ _FAST_LANE_COMPLETION_RECEIPT_FIELDS = frozenset(
 )
 _FAST_LANE_ROLES = frozenset(
     {"execution", "verification", "prewarm", "review", "design_probe"}
+)
+MAX_FAST_LANE_ROUTING_ENTRIES = (MAX_MANIFEST_UNITS + 1) * len(_FAST_LANE_ROLES)
+_FAST_LANE_CORE_ROLE_BY_SCHEDULER_ROLE = {
+    "execution": "execution",
+    "verification": "verification",
+    "prewarm": "prewarm",
+    "review": "review",
+    "design_probe": "design",
+}
+_FAST_LANE_HOST_STATUS_FIELDS = frozenset(
+    {"workflow_id", "current_leases", "host_bindings", "routing_context"}
+)
+_FAST_LANE_ROUTING_CONTEXT_FIELDS = frozenset({"schema", "routes"})
+_FAST_LANE_ROUTING_ENTRY_FIELDS = frozenset(
+    {
+        "task_id",
+        "scheduler_role",
+        "request",
+        "trusted_authorization_evidence_hashes",
+        "trusted_override_receipt_hashes",
+        "trusted_evidence_hashes",
+        "coordinator_endpoint_hash",
+        "compatibility_floor",
+    }
 )
 _FAST_LANE_REMEDIATION_FIELDS = frozenset(
     {
@@ -427,7 +467,7 @@ _ATLAS_PACKET_FIELDS = frozenset(
     {
         "packet_id",
         "trace_id",
-        "workspace",
+        "workspace_id",
         "snapshot_id",
         "recipe_id",
         "node_ids",
@@ -444,6 +484,10 @@ _ATLAS_PACKET_FIELDS = frozenset(
         "template_hashes",
         "receipt_hashes",
         "next_action",
+        "request_hash",
+        "matcher_version",
+        "target_paths",
+        "target_symbols",
     }
 )
 _ATLAS_GRAPH_FIELDS = frozenset({"nodes", "edges", "truncated"})
@@ -1525,8 +1569,8 @@ def _atlas_packet(value: object) -> dict[str, Any]:
     return {
         "packet_id": packet_id,
         "trace_id": _hash(source["trace_id"], "ImplementationPacket trace_id"),
-        "workspace": _atlas_text(
-            source["workspace"], "ImplementationPacket workspace", maximum=512
+        "workspace_id": _hash(
+            source["workspace_id"], "ImplementationPacket workspace_id"
         ),
         "snapshot_id": _hash(source["snapshot_id"], "ImplementationPacket snapshot_id"),
         "recipe_id": _hash(source["recipe_id"], "ImplementationPacket recipe_id"),
@@ -1557,6 +1601,22 @@ def _atlas_packet(value: object) -> dict[str, Any]:
         ),
         "next_action": _atlas_text(
             source["next_action"], "ImplementationPacket next_action", maximum=128
+        ),
+        "request_hash": _hash(
+            source["request_hash"], "ImplementationPacket request_hash"
+        ),
+        "matcher_version": _atlas_text(
+            source["matcher_version"], "ImplementationPacket matcher_version", maximum=64
+        ),
+        "target_paths": _normalised_list(
+            source["target_paths"],
+            "ImplementationPacket target_paths",
+            _relative_scope,
+        ),
+        "target_symbols": _normalised_list(
+            source["target_symbols"],
+            "ImplementationPacket target_symbols",
+            _atlas_text,
         ),
     }
 
@@ -1591,7 +1651,7 @@ def _packet_units(
     packet = _atlas_packet(packet_value)
     if (
         packet["gaps"]
-        or packet["next_action"] != "code_atlas_render"
+        or packet["next_action"] != "atlas_render"
         or not packet["operations"]
         or not packet["tests"]
         or not packet["node_ids"]
@@ -2580,7 +2640,7 @@ def _fast_lane_select_verification_actions(
             or (task_id, "verification") not in read_contexts
         ):
             continue
-        route = _fast_lane_route(unit, "verification")
+        route = _fast_lane_route(validated["routing_context"], unit, "verification")
         if route is None:
             continue
         actions.append(
@@ -2628,7 +2688,7 @@ def _fast_lane_select_remediation_actions(
             or not _fast_lane_dependency_ready(unit, completed)
         ):
             continue
-        route = _fast_lane_route(unit, "execution")
+        route = _fast_lane_route(validated["routing_context"], unit, "execution")
         if route is None:
             continue
         actions.append(
@@ -2691,7 +2751,7 @@ def _fast_lane_select_actions(
             break
         if any(_scope_conflicts(unit.get("write_scope", []), scope) for scope in selected_scopes):
             continue
-        route = _fast_lane_route(unit, "execution")
+        route = _fast_lane_route(validated["routing_context"], unit, "execution")
         if route is None:
             continue
         slot_id = free_slots.pop(0)
@@ -2708,13 +2768,14 @@ def _fast_lane_select_actions(
             task_id = record["task_id"]
             if (task_id, "review") not in read_contexts or task_id not in units:
                 continue
+            route = _fast_lane_route(
+                validated["routing_context"], units[task_id], "review"
+            )
+            if route is None:
+                continue
             slot_id = free_slots.pop(0)
             assignment = _fast_lane_assignment(
-                validated,
-                units[task_id],
-                "review",
-                slot_id,
-                ("gpt-5.6-terra", "high"),
+                validated, units[task_id], "review", slot_id, route
             )
             actions.append(assignment)
             break
@@ -2723,13 +2784,14 @@ def _fast_lane_select_actions(
         for task_id in design_ids:
             if (task_id, "design_probe") not in read_contexts or task_id not in units:
                 continue
+            route = _fast_lane_route(
+                validated["routing_context"], units[task_id], "design_probe"
+            )
+            if route is None:
+                continue
             slot_id = free_slots.pop(0)
             assignment = _fast_lane_assignment(
-                validated,
-                units[task_id],
-                "design_probe",
-                slot_id,
-                ("gpt-5.6-sol", "ultra"),
+                validated, units[task_id], "design_probe", slot_id, route
             )
             actions.append(assignment)
             break
@@ -2747,16 +2809,22 @@ def _fast_lane_select_actions(
     if free_slots and prewarm_ids:
         task_id = prewarm_ids[0]
         unit = units[task_id]
-        slot_id = free_slots.pop(0)
-        assignment = _fast_lane_assignment(validated, unit, "prewarm", slot_id, ("gpt-5.6-terra", "medium"))
-        actions.append(assignment)
+        route = _fast_lane_route(validated["routing_context"], unit, "prewarm")
+        if route is not None:
+            slot_id = free_slots.pop(0)
+            assignment = _fast_lane_assignment(
+                validated, unit, "prewarm", slot_id, route
+            )
+            actions.append(assignment)
     if free_slots and writers < capacity:
         for unit in ready:
             if not free_slots or str(unit["task_id"]) in ready_ids and any(item.get("task_id") == unit["task_id"] for item in actions):
                 continue
             if any(_scope_conflicts(unit.get("write_scope", []), scope) for scope in selected_scopes):
                 continue
-            route = _fast_lane_route(unit, "execution")
+            route = _fast_lane_route(
+                validated["routing_context"], unit, "execution"
+            )
             if route is None:
                 continue
             slot_id = free_slots.pop(0)
@@ -2768,12 +2836,19 @@ def _fast_lane_select_actions(
     remaining_ids = set(units) - completed - blocked - {
         str(item["task_id"]) for item in actions
     }
-    if any(
-        _fast_lane_route(units[task_id], "execution") is None
-        for task_id in remaining_ids
-        if units[task_id].get("unit_kind") != "verification"
-    ):
-        idle_reason = "LANE0_REQUIRED"
+    unroutable = [
+        unit
+        for task_id, unit in units.items()
+        if task_id in remaining_ids
+        and unit.get("unit_kind") != "verification"
+        and _fast_lane_dependency_ready(unit, completed)
+        and _fast_lane_route(validated["routing_context"], unit, "execution")
+        is None
+    ]
+    if unroutable:
+        idle_reason = _fast_lane_route_reason(
+            validated["routing_context"], unroutable[0], "execution"
+        )
     elif any(
         not _fast_lane_dependency_ready(units[task_id], completed)
         for task_id in remaining_ids
@@ -2805,7 +2880,7 @@ def _fast_lane_assignment(
     unit: Mapping[str, Any],
     role: str,
     slot_id: str,
-    route: tuple[str, str],
+    route: Mapping[str, Any],
 ) -> dict[str, Any]:
     state = validated["scheduler_state"]
     epoch = int(state.get("slot_epochs", {}).get(slot_id, 0)) + 1
@@ -2818,8 +2893,14 @@ def _fast_lane_assignment(
         "role": role,
         "slot_id": slot_id,
         "assignment_epoch": epoch,
-        "model": route[0],
-        "reasoning_effort": route[1],
+        "model": route["model"],
+        "reasoning_effort": route["reasoning_effort"],
+        "routing_context_hash": route["routing_context_hash"],
+        "routing_result_hash": route["routing_result_hash"],
+        "task_fingerprint": route["task_fingerprint"],
+        "routing_reason_codes": list(route["routing_reason_codes"]),
+        "routing_safety_floor_rank": route["routing_safety_floor_rank"],
+        "routing_input": route["routing_input"],
         "dispatch_context_hash": context["context_hash"],
         "target_gates_hash": context["target_gates_hash"],
         "execution_context_hash": context["execution_context_hash"],
@@ -2835,8 +2916,13 @@ def _fast_lane_assignment(
         "assignment_epoch": epoch,
         "assignment_token": token,
         "context_hash": context["context_hash"],
-        "model": route[0],
-        "reasoning_effort": route[1],
+        "model": route["model"],
+        "reasoning_effort": route["reasoning_effort"],
+        "routing_context_hash": route["routing_context_hash"],
+        "routing_result_hash": route["routing_result_hash"],
+        "task_fingerprint": route["task_fingerprint"],
+        "routing_reason_codes": list(route["routing_reason_codes"]),
+        "routing_safety_floor_rank": route["routing_safety_floor_rank"],
         "dispatch_receipt": receipt,
         "_context": context,
     }
@@ -2885,13 +2971,17 @@ def _fast_lane_build_dispatch_context(
         )
     )
     write_scope = [] if role == "verification" else list(unit.get("write_scope", []))
+    work_context = execution if execution is not None else read
+    review_candidate = candidate if role == "review" else None
     normalized = {
         "task_id": task_id,
         "role": role,
         "source_plan_hash": validated["source_plan_hash"],
         "integration_commit": validated["scheduler_state"]["integration_state"]["commit"],
         "integration_tree": validated["scheduler_state"]["integration_state"]["tree"],
-        "workspace_input_snapshot_id": None if (execution is None and read is None) else (execution or read)["workspace_input_snapshot_id"],
+        "workspace_input_snapshot_id": (
+            None if work_context is None else work_context["workspace_input_snapshot_id"]
+        ),
         "direct_dependency_result_hashes": [],
         "direct_contract_hashes": list(unit.get("direct_contract_hashes", [])),
         "required_evidence": list(unit.get("required_evidence", [])),
@@ -2905,12 +2995,30 @@ def _fast_lane_build_dispatch_context(
         "write_scope_hash": _sha256_json(write_scope),
         "read_context_hash": None if read is None else _sha256_json(read),
         "target_gates_hash": None if target is None else _sha256_json({"driver_gate_id": target["driver_gate_id"], "target_gates": target["gates"]}),
-        "candidate_commit": None if candidate is None or role != "review" else candidate["candidate_commit"],
-        "red_evidence_hashes": [] if candidate is None or role != "review" else list(candidate["red_evidence_hashes"]),
-        "green_evidence_hashes": [] if candidate is None or role != "review" else list(candidate["green_evidence_hashes"]),
+        "candidate_commit": (
+            None if review_candidate is None else review_candidate["candidate_commit"]
+        ),
+        "red_evidence_hashes": (
+            []
+            if review_candidate is None
+            else list(review_candidate["red_evidence_hashes"])
+        ),
+        "green_evidence_hashes": (
+            []
+            if review_candidate is None
+            else list(review_candidate["green_evidence_hashes"])
+        ),
         "basis_hash": _sha256_json(read) if role in {"prewarm", "design_probe"} and read is not None else None,
-        "prewarm_evidence_hash": None if role != "execution" or not prewarm_is_revalidated else prewarm["evidence_hash"],
-        "prewarm_revalidation_evidence_hash": None if role != "execution" or not prewarm_is_revalidated else prewarm["revalidation_evidence_hash"],
+        "prewarm_evidence_hash": (
+            None
+            if role != "execution" or prewarm is None or not prewarm_is_revalidated
+            else prewarm["evidence_hash"]
+        ),
+        "prewarm_revalidation_evidence_hash": (
+            None
+            if role != "execution" or prewarm is None or not prewarm_is_revalidated
+            else prewarm["revalidation_evidence_hash"]
+        ),
     }
     return {"context_hash": _sha256_json(normalized), **normalized}
 
@@ -3376,24 +3484,362 @@ def _fast_lane_activation(
     return {"reasoning_effort": effort, "reason": reason}
 
 
-def _fast_lane_route(
-    unit: Mapping[str, Any], role: str
-) -> tuple[str, str] | None:
-    """Resolve executable fast-lane routing without mutating legacy labels."""
-    if role == "design_probe":
-        return ("gpt-5.6-sol", "ultra")
-    if role == "prewarm":
-        return ("gpt-5.6-terra", "medium")
-    if role == "review":
-        return ("gpt-5.6-terra", "high")
-    route = unit.get("recommended_route")
-    if route == "Terra High":
-        return ("gpt-5.6-terra", "high")
-    if route == "Terra Max":
-        return ("gpt-5.6-terra", "max")
-    if route == "Sol High":
+def _fast_lane_routing_core() -> Any | None:
+    """Load the pure local routing core without giving the scheduler an executor."""
+
+    module_name = "_team_efficiency_fastlane_routing"
+    core_path = Path(__file__).with_name("fastlane_routing.py").resolve()
+    loaded = sys.modules.get(module_name)
+    if loaded is not None and Path(str(getattr(loaded, "__file__", ""))).resolve() == core_path:
+        return loaded
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, core_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    except (ImportError, OSError, AttributeError, TypeError, ValueError):
+        sys.modules.pop(module_name, None)
         return None
-    raise ValueError("unit route is invalid")
+
+
+def _fast_lane_failure_reason(value: object) -> str:
+    """Project only bounded core failures into the scheduler's idle vocabulary."""
+
+    if value == "capability_unavailable":
+        return "CAPABILITY_UNAVAILABLE"
+    if value == "routing_context_missing":
+        return "ROUTING_CONTEXT_MISSING"
+    if value in {
+        "routing_context_duplicate",
+        "routing_context_invalid",
+        "routing_context_mismatch",
+    }:
+        return "ROUTING_CONTEXT_INVALID"
+    return "ROUTING_REJECTED"
+
+
+def _fast_lane_reason_codes(value: object) -> list[str] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    if not value or len(value) > 16:
+        return None
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        try:
+            code = _label(item, f"routing reason_codes[{index}]")
+        except ValueError:
+            return None
+        if code in normalized:
+            return None
+        normalized.append(code)
+    return normalized
+
+
+def _fast_lane_core_decision(
+    entry: Mapping[str, Any],
+    *,
+    source_plan_hash: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Run one full host-attested request through the owned pure core only."""
+
+    task_id = entry["task_id"]
+    scheduler_role = entry["scheduler_role"]
+    expected_core_role = _FAST_LANE_CORE_ROLE_BY_SCHEDULER_ROLE[scheduler_role]
+    expected_access = "workspace_write" if scheduler_role == "execution" else "read_only"
+    raw_request = entry["request"]
+    try:
+        request = _mapping(raw_request, "routing request")
+        task = _mapping(request.get("task"), "routing request.task")
+        if task.get("task_id") != task_id or task.get("role") != expected_core_role:
+            return None, "routing_context_mismatch"
+        core = _fast_lane_routing_core()
+        if core is None:
+            return None, "routing_context_invalid"
+        result = core.route(
+            request,
+            trusted_authorization_evidence_hashes=entry[
+                "trusted_authorization_evidence_hashes"
+            ],
+            trusted_override_receipt_hashes=entry[
+                "trusted_override_receipt_hashes"
+            ],
+            trusted_evidence_hashes=entry["trusted_evidence_hashes"],
+            coordinator_endpoint_hash=entry["coordinator_endpoint_hash"],
+            compatibility_floor=entry["compatibility_floor"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return None, "routing_context_invalid"
+    if not isinstance(result, Mapping):
+        return None, "routing_context_invalid"
+    reason_codes = _fast_lane_reason_codes(result.get("reason_codes"))
+    if result.get("status") != "resolved":
+        return None, (
+            "routing_context_invalid"
+            if reason_codes is None
+            else str(reason_codes[0])
+        )
+    route = result.get("route")
+    safety_floor = result.get("safety_floor")
+    try:
+        route_value = _mapping(route, "core route")
+        model = _text(route_value["model"], "core route.model", maximum=64)
+        effort = _text(route_value["effort"], "core route.effort", maximum=16)
+        if effort == "ultra" or effort not in FAST_LANE_REASONING_EFFORTS:
+            return None, "routing_context_invalid"
+        floor = _mapping(safety_floor, "core safety_floor")
+        floor_rank = floor["rank"]
+        if type(floor_rank) is not int or not 10 <= floor_rank <= 110:
+            return None, "routing_context_invalid"
+        task_fingerprint = _hash(
+            result["task_fingerprint"], "core task_fingerprint"
+        )
+        render_hash = _hash(result["render_hash"], "core render_hash")
+        scheduler_facts = _mapping(
+            request["scheduler_facts"], "routing request.scheduler_facts"
+        )
+    except (KeyError, TypeError, ValueError):
+        return None, "routing_context_invalid"
+    if (
+        result.get("task_id") != task_id
+        or result.get("effective_role") != expected_core_role
+        or result.get("access") != expected_access
+        or reason_codes is None
+    ):
+        return None, "routing_context_mismatch"
+    context_hash = _sha256_json(
+        {
+            "schema": "team-efficiency/fast-lane-routing-context-binding-v1",
+            "source_plan_hash": source_plan_hash,
+            "task_id": task_id,
+            "scheduler_role": scheduler_role,
+            "routing_request_hash": _sha256_json(request),
+            "scheduler_facts_hash": _sha256_json(scheduler_facts),
+        }
+    )
+    return (
+        {
+            "model": model,
+            "reasoning_effort": effort,
+            "routing_context_hash": context_hash,
+            "routing_result_hash": _sha256_json(dict(result)),
+            "task_fingerprint": task_fingerprint,
+            "routing_reason_codes": reason_codes,
+            "routing_safety_floor_rank": floor_rank,
+            "routing_render_hash": render_hash,
+            # Preserve the bounded, host-attested core input in the durable
+            # receipt.  Lifecycle validation replays this historical input,
+            # rather than re-evaluating a later scheduler event as if it had
+            # been the original dispatch decision.
+            "routing_input": json.loads(_canonical_json(entry)),
+        },
+        "",
+    )
+
+
+def _fast_lane_historical_receipt_route(
+    receipt: Mapping[str, Any], *, source_plan_hash: str
+) -> dict[str, Any]:
+    """Replay the immutable core input that produced a durable receipt.
+
+    A lifecycle pass necessarily has newer scheduler facts than the dispatch
+    event.  Replaying the receipt's bounded input preserves that event binding
+    while still making every persisted model/effort/hash claim answer to the
+    pure routing core.
+    """
+
+    routing_input = receipt["routing_input"]
+    if (
+        routing_input["task_id"] != receipt["task_id"]
+        or routing_input["scheduler_role"] != receipt["role"]
+    ):
+        raise ValueError("dispatch receipt routing key is invalid")
+    decision, _reason = _fast_lane_core_decision(
+        routing_input, source_plan_hash=source_plan_hash
+    )
+    if decision is None or any(
+        receipt[field] != decision[field]
+        for field in (
+            "model",
+            "reasoning_effort",
+            "routing_context_hash",
+            "routing_result_hash",
+            "task_fingerprint",
+            "routing_reason_codes",
+            "routing_safety_floor_rank",
+        )
+    ):
+        raise ValueError("dispatch receipt historical route is invalid")
+    return decision
+
+
+def _fast_lane_routing_context(
+    value: Mapping[str, Any] | None,
+    *,
+    source_plan: Mapping[str, Any],
+    source_plan_hash: str,
+) -> dict[str, Any]:
+    """Bind complete core requests to known scheduler task/role keys once."""
+
+    if value is None:
+        return {"decisions": {}, "reasons": {}, "default_reason": "routing_context_missing"}
+    units = _fast_lane_unit_index(source_plan)
+    decisions: dict[tuple[str, str], dict[str, Any] | None] = {}
+    reasons: dict[tuple[str, str], str] = {}
+    for entry in value["routes"]:
+        task_id = entry["task_id"]
+        scheduler_role = entry["scheduler_role"]
+        key = (task_id, scheduler_role)
+        if key in decisions:
+            decisions[key] = None
+            reasons[key] = "routing_context_duplicate"
+            continue
+        if task_id not in units:
+            decisions[key] = None
+            reasons[key] = "routing_context_mismatch"
+            continue
+        decision, reason = _fast_lane_core_decision(
+            entry, source_plan_hash=source_plan_hash
+        )
+        decisions[key] = decision
+        if decision is None:
+            reasons[key] = reason
+    return {
+        "decisions": decisions,
+        "reasons": reasons,
+        "default_reason": "routing_context_missing",
+    }
+
+
+def _fast_lane_route(
+    routing_context: Mapping[str, Any], unit: Mapping[str, Any], role: str
+) -> dict[str, Any] | None:
+    """Return only a core-resolved, exact host-attested worker route."""
+
+    decision = routing_context["decisions"].get((unit["task_id"], role))
+    return dict(decision) if isinstance(decision, Mapping) else None
+
+
+def _fast_lane_route_reason(
+    routing_context: Mapping[str, Any], unit: Mapping[str, Any], role: str
+) -> str:
+    return _fast_lane_failure_reason(
+        routing_context["reasons"].get(
+            (unit["task_id"], role), routing_context["default_reason"]
+        )
+    )
+
+
+def _fast_lane_unroutable_action(
+    validated: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], str] | None:
+    """Return an eligible action whose exact core route is unavailable.
+
+    The selector deliberately leaves an unresolved route out of its action
+    list.  When that leaves every slot idle, this companion check converts the
+    absence into the established ``NO_SAFE_WORK`` outcome for every scheduler
+    role, rather than quietly emitting an empty active plan.
+    """
+
+    source_plan = validated["source_plan"]
+    units = _fast_lane_unit_index(source_plan)
+    state = validated["scheduler_state"]
+    completed = _fast_lane_completed_ids(state)
+    blocked = frozenset(state.get("blocked_task_ids", []))
+    running = {
+        assignment["task_id"]
+        for assignment in state.get("running_assignments", [])
+    }
+    routing_context = validated["routing_context"]
+    phase = state["phase"]
+    read_contexts = {
+        (context["task_id"], context["role"])
+        for context in validated.get("read_contexts", [])
+    }
+
+    if phase == "integration_regression":
+        for task_id, unit in sorted(units.items()):
+            if (
+                unit.get("unit_kind") == "verification"
+                and task_id not in completed | blocked | running
+                and _fast_lane_dependency_ready(unit, completed)
+                and (task_id, "verification") in read_contexts
+                and _fast_lane_route(routing_context, unit, "verification") is None
+            ):
+                return unit, "verification"
+        return None
+
+    if phase == "remediation":
+        for task_id, unit in sorted(units.items()):
+            if (
+                unit.get("unit_kind") == "remediation"
+                and task_id not in completed | blocked | running
+                and _fast_lane_dependency_ready(unit, completed)
+                and _fast_lane_route(routing_context, unit, "execution") is None
+            ):
+                return unit, "execution"
+        return None
+
+    if phase != "execution":
+        return None
+
+    candidates = {
+        record["task_id"] for record in state.get("review_ready_candidates", [])
+    }
+    reviewed = {
+        record["task_id"] for record in state.get("reviewed_candidates", [])
+    }
+    graph = _fast_lane_conflict_graph(
+        units,
+        lane0_scopes=state["lane0_state"]["owned_write_scopes"],
+        running=state.get("running_assignments", []),
+    )
+    for unit in _fast_lane_ready_items(
+        units,
+        completed,
+        blocked,
+        frozenset(running),
+        frozenset(candidates),
+        frozenset(reviewed),
+        conflict_graph=graph,
+    ):
+        if _fast_lane_route(routing_context, unit, "execution") is None:
+            return unit, "execution"
+
+    for record in state.get("review_ready_candidates", []):
+        task_id = record["task_id"]
+        if (
+            task_id in units
+            and (task_id, "review") in read_contexts
+            and _fast_lane_route(routing_context, units[task_id], "review") is None
+        ):
+            return units[task_id], "review"
+
+    for task_id in state.get("pending_design_probe_task_ids", []):
+        if (
+            task_id in units
+            and (task_id, "design_probe") in read_contexts
+            and _fast_lane_route(routing_context, units[task_id], "design_probe")
+            is None
+        ):
+            return units[task_id], "design_probe"
+
+    prewarm_ids = _fast_lane_preferred_prewarms(
+        units=units,
+        completed=completed,
+        running=frozenset(running),
+        candidate=frozenset(candidates),
+        reviewed=frozenset(reviewed),
+        read_contexts=read_contexts,
+        source_plan=source_plan,
+        blocked=blocked,
+    )
+    for task_id in prewarm_ids:
+        if _fast_lane_route(routing_context, units[task_id], "prewarm") is None:
+            return units[task_id], "prewarm"
+    return None
 
 
 def _fast_lane_red_failure_fingerprint(
@@ -4077,6 +4523,22 @@ def _validated_fast_lane_dispatch_receipt(value: object) -> dict[str, Any]:
         "reasoning_effort": _text(
             receipt["reasoning_effort"], "dispatch receipt.reasoning_effort", maximum=16
         ),
+        "routing_context_hash": _hash(
+            receipt["routing_context_hash"], "dispatch receipt.routing_context_hash"
+        ),
+        "routing_result_hash": _hash(
+            receipt["routing_result_hash"], "dispatch receipt.routing_result_hash"
+        ),
+        "task_fingerprint": _hash(
+            receipt["task_fingerprint"], "dispatch receipt.task_fingerprint"
+        ),
+        "routing_reason_codes": _fast_lane_reason_codes(
+            receipt["routing_reason_codes"]
+        ),
+        "routing_safety_floor_rank": receipt["routing_safety_floor_rank"],
+        "routing_input": _validated_fast_lane_routing_entry(
+            receipt["routing_input"], "dispatch receipt.routing_input"
+        ),
         "dispatch_context_hash": _hash(
             receipt["dispatch_context_hash"],
             "dispatch receipt.dispatch_context_hash",
@@ -4098,6 +4560,15 @@ def _validated_fast_lane_dispatch_receipt(value: object) -> dict[str, Any]:
     }
     if normalized["reasoning_effort"] not in FAST_LANE_REASONING_EFFORTS:
         raise ValueError("dispatch receipt reasoning effort is invalid")
+    if normalized["reasoning_effort"] == "ultra":
+        raise ValueError("dispatch receipt cannot route ultra")
+    if normalized["routing_reason_codes"] is None:
+        raise ValueError("dispatch receipt routing reasons are invalid")
+    if (
+        type(normalized["routing_safety_floor_rank"]) is not int
+        or not 10 <= normalized["routing_safety_floor_rank"] <= 110
+    ):
+        raise ValueError("dispatch receipt routing floor is invalid")
     return normalized
 
 
@@ -4113,6 +4584,7 @@ def _validated_fast_lane_terminal_result(
     units_by_task_id: Mapping[str, Mapping[str, Any]],
     context_by_key: Mapping[tuple[str, str], Mapping[str, Any]],
     slot_epochs: Mapping[str, int],
+    routing_context: Mapping[str, Any],
 ) -> dict[str, Any]:
     result = _mapping(value, "terminal result")
     _exact_keys(result, _FAST_LANE_TERMINAL_RESULT_FIELDS, "terminal result")
@@ -4121,8 +4593,7 @@ def _validated_fast_lane_terminal_result(
     task_id = _task_id(result["task_id"], "terminal result.task_id")
     if task_id not in task_ids:
         raise ValueError("terminal result task is unknown")
-    unit = units_by_task_id.get(task_id)
-    if unit is None:
+    if task_id not in units_by_task_id:
         raise ValueError("terminal result source unit is unknown")
     role = _text(result["role"], "terminal result.role", maximum=32)
     if role not in _FAST_LANE_ROLES:
@@ -4158,11 +4629,9 @@ def _validated_fast_lane_terminal_result(
         or receipt["read_context_hash"] != context["read_context_hash"]
     ):
         raise ValueError("terminal result receipt is not bound to its context")
-    expected_route = _fast_lane_route(unit, role)
-    if expected_route is None or (
-        receipt["model"], receipt["reasoning_effort"]
-    ) != expected_route:
-        raise ValueError("terminal result route is invalid")
+    _fast_lane_historical_receipt_route(
+        receipt, source_plan_hash=source_plan_hash
+    )
 
     outcome = _text(result["outcome"], "terminal result.outcome", maximum=32)
     candidate_commit = _fast_lane_optional_git_id(
@@ -4416,6 +4885,7 @@ def _validated_fast_lane_lifecycle_records(
     context_by_key: Mapping[tuple[str, str], Mapping[str, Any]],
     read_context_by_key: Mapping[tuple[str, str], Mapping[str, Any]],
     slot_epochs: Mapping[str, int],
+    routing_context: Mapping[str, Any],
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -4433,6 +4903,7 @@ def _validated_fast_lane_lifecycle_records(
             units_by_task_id=units_by_task_id,
             context_by_key=context_by_key,
             slot_epochs=slot_epochs,
+            routing_context=routing_context,
         )
         token = normalized["assignment_token"]
         if token in used_tokens:
@@ -4880,6 +5351,7 @@ def _validated_fast_lane_scheduler_state(
     read_contexts: Sequence[Mapping[str, Any]],
     target_gates: Sequence[Mapping[str, Any]],
     remediation_request_value: object,
+    routing_context: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     state = _mapping(value, "scheduler_state")
     _exact_keys(state, _FAST_LANE_SCHEDULER_FIELDS, "scheduler_state")
@@ -5054,10 +5526,8 @@ def _validated_fast_lane_scheduler_state(
             raise ValueError("running assignment receipt does not bind assignment")
         if role not in _FAST_LANE_ROLES:
             raise ValueError("running assignment role is invalid")
-        unit = units_by_task_id.get(task_id)
-        if unit is None:
+        if task_id not in units_by_task_id:
             raise ValueError("running assignment source unit is unknown")
-        expected_route = _fast_lane_route(unit, role)
         if (
             phase == "integration_regression"
             and role != "verification"
@@ -5094,21 +5564,45 @@ def _validated_fast_lane_scheduler_state(
             f"running_assignments[{index}].reasoning_effort",
             maximum=16,
         )
+        routing_context_hash = _hash(
+            assignment["routing_context_hash"],
+            f"running_assignments[{index}].routing_context_hash",
+        )
+        routing_result_hash = _hash(
+            assignment["routing_result_hash"],
+            f"running_assignments[{index}].routing_result_hash",
+        )
+        task_fingerprint = _hash(
+            assignment["task_fingerprint"],
+            f"running_assignments[{index}].task_fingerprint",
+        )
+        routing_reason_codes = _fast_lane_reason_codes(
+            assignment["routing_reason_codes"]
+        )
+        routing_safety_floor_rank = assignment["routing_safety_floor_rank"]
+        if (
+            routing_reason_codes is None
+            or type(routing_safety_floor_rank) is not int
+            or not 10 <= routing_safety_floor_rank <= 110
+        ):
+            raise ValueError("running assignment routing fields are invalid")
         if (
             receipt["source_plan_hash"] != source_plan_hash
             or receipt["model"] != model
             or receipt["reasoning_effort"] != effort
+            or receipt["routing_context_hash"] != routing_context_hash
+            or receipt["routing_result_hash"] != routing_result_hash
+            or receipt["task_fingerprint"] != task_fingerprint
+            or receipt["routing_reason_codes"] != routing_reason_codes
+            or receipt["routing_safety_floor_rank"] != routing_safety_floor_rank
             or receipt["target_gates_hash"] != context["target_gates_hash"]
             or receipt["execution_context_hash"] != context["execution_context_hash"]
             or receipt["read_context_hash"] != context["read_context_hash"]
         ):
             raise ValueError("running assignment receipt fields disagree")
-        if (
-            expected_route is None
-            or (model, effort) != expected_route
-            or (receipt["model"], receipt["reasoning_effort"]) != expected_route
-        ):
-            raise ValueError("running assignment route is invalid")
+        _fast_lane_historical_receipt_route(
+            receipt, source_plan_hash=source_plan_hash
+        )
         normalized_assignment = dict(assignment)
         normalized_assignment.update(
             {
@@ -5120,6 +5614,13 @@ def _validated_fast_lane_scheduler_state(
                 "context_hash": context["context_hash"],
                 "model": model,
                 "reasoning_effort": effort,
+                "routing_context_hash": receipt["routing_context_hash"],
+                "routing_result_hash": receipt["routing_result_hash"],
+                "task_fingerprint": receipt["task_fingerprint"],
+                "routing_reason_codes": list(receipt["routing_reason_codes"]),
+                "routing_safety_floor_rank": receipt[
+                    "routing_safety_floor_rank"
+                ],
                 "dispatch_receipt": receipt,
             }
         )
@@ -5148,6 +5649,7 @@ def _validated_fast_lane_scheduler_state(
         context_by_key=context_by_key,
         read_context_by_key=read_by_key,
         slot_epochs=slot_epochs,
+        routing_context=routing_context,
     )
 
     blocked_task_ids = _normalised_list(
@@ -5314,7 +5816,9 @@ def _validated_fast_lane_scheduler_state(
     return normalized, remediation
 
 
-def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
+def _validated_fast_lane_request(
+    request: Mapping[str, Any], *, host_routing_context: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     candidate = _mapping(request, "fast-lane request")
     _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
     if candidate["schema"] != "team-efficiency/fast-lane-request-v1":
@@ -5334,6 +5838,11 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
         integration_state=integration_state,
     )
     if remediation is not None and remediation.get("_automation_stopped"):
+        routing_context = _fast_lane_routing_context(
+            host_routing_context,
+            source_plan=source_plan,
+            source_plan_hash=source_plan_hash,
+        )
         raw_state = _mapping(candidate["scheduler_state"], "scheduler_state")
         stopped_state = {
             "source_plan_hash": source_plan_hash,
@@ -5369,6 +5878,7 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
             read_contexts=[],
             target_gates=target_gates,
             remediation_request_value=None,
+            routing_context=routing_context,
         )
         return {
             "source_plan": source_plan,
@@ -5378,6 +5888,7 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
             "read_contexts": [],
             "remediation_request": None,
             "scheduler_state": scheduler_state,
+            "routing_context": routing_context,
             "automation_stopped": True,
         }
 
@@ -5394,6 +5905,11 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
                 "gates": remediation["target_gates"],
             },
         ]
+    routing_context = _fast_lane_routing_context(
+        host_routing_context,
+        source_plan=effective_source_plan,
+        source_plan_hash=source_plan_hash,
+    )
     execution_contexts, read_contexts = _validated_fast_lane_contexts(
         candidate["execution_contexts"],
         candidate["read_contexts"],
@@ -5408,6 +5924,7 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
         read_contexts=read_contexts,
         target_gates=target_gates,
         remediation_request_value=candidate["remediation_request"],
+        routing_context=routing_context,
     )
     return {
         "source_plan": effective_source_plan,
@@ -5417,6 +5934,7 @@ def _validated_fast_lane_request(request: Mapping[str, Any]) -> dict[str, Any]:
         "read_contexts": read_contexts,
         "remediation_request": remediation_request,
         "scheduler_state": scheduler_state,
+        "routing_context": routing_context,
         "automation_stopped": False,
     }
 
@@ -5649,11 +6167,81 @@ def _fast_lane_host_slot_occupancy_audit(
     }
 
 
+def _validated_fast_lane_routing_entry(value: object, field: str) -> dict[str, Any]:
+    """Normalize one bounded complete core request for a scheduler key."""
+
+    entry = _mapping(value, field)
+    _exact_keys(entry, _FAST_LANE_ROUTING_ENTRY_FIELDS, field)
+    task_id = _task_id(entry["task_id"], f"{field}.task_id")
+    scheduler_role = _text(
+        entry["scheduler_role"], f"{field}.scheduler_role", maximum=32
+    )
+    if scheduler_role not in _FAST_LANE_ROLES:
+        raise ValueError(f"{field}.scheduler_role is invalid")
+    request = _mapping(entry["request"], f"{field}.request")
+    if len(_json_bytes(request)) > MAX_FAST_LANE_ROUTE_REQUEST_BYTES:
+        raise ValueError(f"{field}.request exceeds its byte budget")
+    request_text = _canonical_json(request)
+    _reject_sensitive_or_absolute_text(request_text, f"{field}.request")
+    compatibility_floor = entry["compatibility_floor"]
+    if compatibility_floor is not None and (
+        type(compatibility_floor) is not int
+        or not 10 <= compatibility_floor <= 110
+    ):
+        raise ValueError(f"{field}.compatibility_floor is invalid")
+    return {
+        "task_id": task_id,
+        "scheduler_role": scheduler_role,
+        "request": json.loads(request_text),
+        "trusted_authorization_evidence_hashes": _fast_lane_hash_list(
+            entry["trusted_authorization_evidence_hashes"],
+            f"{field}.trusted_authorization_evidence_hashes",
+        ),
+        "trusted_override_receipt_hashes": _fast_lane_hash_list(
+            entry["trusted_override_receipt_hashes"],
+            f"{field}.trusted_override_receipt_hashes",
+        ),
+        "trusted_evidence_hashes": _fast_lane_hash_list(
+            entry["trusted_evidence_hashes"],
+            f"{field}.trusted_evidence_hashes",
+        ),
+        "coordinator_endpoint_hash": _fast_lane_optional_hash(
+            entry["coordinator_endpoint_hash"],
+            f"{field}.coordinator_endpoint_hash",
+        ),
+        "compatibility_floor": compatibility_floor,
+    }
+
+
+def _validated_fast_lane_routing_context(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    context = _mapping(value, "host routing context")
+    _exact_keys(context, _FAST_LANE_ROUTING_CONTEXT_FIELDS, "host routing context")
+    if context["schema"] != "team-efficiency/fast-lane-routing-context-v1":
+        raise ValueError("host routing context schema is invalid")
+    routes_value = context["routes"]
+    if not isinstance(routes_value, Sequence) or isinstance(
+        routes_value, (str, bytes, bytearray)
+    ):
+        raise ValueError("host routing context.routes must be a list")
+    if len(routes_value) > MAX_FAST_LANE_ROUTING_ENTRIES:
+        raise ValueError("host routing context.routes exceeds its bound")
+    routes: list[dict[str, Any]] = []
+    for index, raw_entry in enumerate(routes_value):
+        routes.append(
+            _validated_fast_lane_routing_entry(
+                raw_entry, f"host routing context.routes[{index}]"
+            )
+        )
+    return {"routes": routes}
+
+
 def _validated_fast_lane_host_status(value: Mapping[str, Any]) -> dict[str, Any]:
     source = _mapping(value, "host status")
     _exact_keys(
         source,
-        frozenset({"workflow_id", "current_leases", "host_bindings"}),
+        _FAST_LANE_HOST_STATUS_FIELDS,
         "host status",
     )
     workflow_id = _label(source["workflow_id"], "host status.workflow_id")
@@ -5673,6 +6261,9 @@ def _validated_fast_lane_host_status(value: Mapping[str, Any]) -> dict[str, Any]
         "workflow_id": workflow_id,
         "current_leases": list(current_leases),
         "host_bindings": list(host_bindings),
+        "routing_context": _validated_fast_lane_routing_context(
+            source["routing_context"]
+        ),
     }
 
 
@@ -5848,6 +6439,11 @@ def _fast_lane_assignment_output(
         "role": role,
         "model": assignment["model"],
         "reasoning_effort": assignment["reasoning_effort"],
+        "routing_context_hash": assignment["routing_context_hash"],
+        "routing_result_hash": assignment["routing_result_hash"],
+        "task_fingerprint": assignment["task_fingerprint"],
+        "routing_reason_codes": list(assignment["routing_reason_codes"]),
+        "routing_safety_floor_rank": assignment["routing_safety_floor_rank"],
         "access": "exclusive_write" if role == "execution" else "read_only",
         "context_hash": assignment["context_hash"],
         "execution_context_hash": execution_context_hash,
@@ -5877,9 +6473,6 @@ def _fast_lane_assignment_output(
         "candidate_commit": context["candidate_commit"],
         "basis_hash": context["basis_hash"],
     }
-    if role == "prewarm":
-        output["model"] = "gpt-5.6-terra"
-        output["reasoning_effort"] = "medium"
     return output
 
 
@@ -5887,7 +6480,7 @@ def _fast_lane_queue_item(
     validated: Mapping[str, Any],
     unit: Mapping[str, Any],
     role: str,
-    route: tuple[str, str],
+    route: Mapping[str, Any],
 ) -> dict[str, Any]:
     assignment = _fast_lane_assignment(validated, unit, role, "slot-1", route)
     output = _fast_lane_assignment_output(validated, assignment)
@@ -5929,7 +6522,12 @@ def _fast_lane_queues(
             and task_id not in completed | blocked | frozenset(running) | assigned_task_ids
             and _fast_lane_dependency_ready(unit, completed)
             and (task_id, "verification") in read_contexts
-            and (route := _fast_lane_route(unit, "verification")) is not None
+            and (
+                route := _fast_lane_route(
+                    validated["routing_context"], unit, "verification"
+                )
+            )
+            is not None
         ]
         return ready_queue, [], [], []
     if phase == "remediation":
@@ -5939,7 +6537,12 @@ def _fast_lane_queues(
             if unit.get("unit_kind") == "remediation"
             and task_id not in completed | blocked | frozenset(running) | assigned_task_ids
             and _fast_lane_dependency_ready(unit, completed)
-            and (route := _fast_lane_route(unit, "execution")) is not None
+            and (
+                route := _fast_lane_route(
+                    validated["routing_context"], unit, "execution"
+                )
+            )
+            is not None
         ]
         return ready_queue, [], [], []
     if phase != "execution":
@@ -5960,7 +6563,12 @@ def _fast_lane_queues(
             frozenset(reviewed),
             conflict_graph=graph,
         )
-        if (route := _fast_lane_route(unit, "execution")) is not None
+        if (
+            route := _fast_lane_route(
+                validated["routing_context"], unit, "execution"
+            )
+        )
+        is not None
         and unit["task_id"] not in assigned_task_ids
     ]
     review_queue = [
@@ -5968,12 +6576,18 @@ def _fast_lane_queues(
             validated,
             units[record["task_id"]],
             "review",
-            ("gpt-5.6-terra", "high"),
+            route,
         )
         for record in state.get("review_ready_candidates", [])
         if record["task_id"] in units
         and (record["task_id"], "review") in read_contexts
         and (record["task_id"], "review") not in assigned_keys
+        and (
+            route := _fast_lane_route(
+                validated["routing_context"], units[record["task_id"]], "review"
+            )
+        )
+        is not None
     ]
     occupied = frozenset(running | {task_id for task_id, _ in assigned_keys})
     prewarm_queue = [
@@ -5981,7 +6595,7 @@ def _fast_lane_queues(
             validated,
             units[task_id],
             "prewarm",
-            ("gpt-5.6-terra", "medium"),
+            route,
         )
         for task_id in _fast_lane_preferred_prewarms(
             units=units,
@@ -5994,18 +6608,30 @@ def _fast_lane_queues(
             blocked=blocked,
         )
         if (task_id, "prewarm") not in assigned_keys
+        and (
+            route := _fast_lane_route(
+                validated["routing_context"], units[task_id], "prewarm"
+            )
+        )
+        is not None
     ]
     design_queue = [
         _fast_lane_queue_item(
             validated,
             units[task_id],
             "design_probe",
-            ("gpt-5.6-sol", "ultra"),
+            route,
         )
         for task_id in sorted(state.get("pending_design_probe_task_ids", []))
         if task_id in units
         and (task_id, "design_probe") in read_contexts
         and (task_id, "design_probe") not in assigned_keys
+        and (
+            route := _fast_lane_route(
+                validated["routing_context"], units[task_id], "design_probe"
+            )
+        )
+        is not None
     ]
     return ready_queue, review_queue, prewarm_queue, design_queue
 
@@ -6184,7 +6810,7 @@ def _render_fast_lane_plan(
                 next_action="adjudicate_and_integrate",
                 planned_assignments=actions,
                 idle_slots=idle_slots,
-            )
+        )
         lane0_scopes = validated["scheduler_state"]["lane0_state"]["owned_write_scopes"]
         source_units = validated["source_plan"].get("units", [])
         if lane0_scopes and any(
@@ -6200,9 +6826,21 @@ def _render_fast_lane_plan(
             if left.get("write_scope") and right.get("write_scope")
         ):
             reason = "WRITE_SCOPE_CONFLICT"
-        elif any(_fast_lane_route(unit, "execution") is None for unit in source_units if unit.get("unit_kind") != "verification"):
-            reason = "LANE0_REQUIRED"
         else:
+            unroutable = _fast_lane_unroutable_action(validated)
+            if unroutable is not None:
+                unit, role = unroutable
+                return _render_fast_lane_status(
+                    validated,
+                    activation,
+                    status="blocked",
+                    decision_code="NO_SAFE_WORK",
+                    idle_reason=_fast_lane_route_reason(
+                        validated["routing_context"], unit, role
+                    ),
+                    next_action=None,
+                    planned_assignments=[],
+                )
             reason = "NO_SAFE_INDEPENDENT_WORK"
         return _render_fast_lane_status(
             validated,
@@ -6240,10 +6878,19 @@ def compile_fast_lane(
     host_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     activation = _fast_lane_activation(reasoning_effort, enable)
-    validated = _validated_fast_lane_request(request)
+    status = (
+        None
+        if host_status is None
+        else _validated_fast_lane_host_status(host_status)
+    )
+    validated = _validated_fast_lane_request(
+        request,
+        host_routing_context=(
+            None if status is None else status["routing_context"]
+        ),
+    )
     occupancy: dict[str, Any] | None = None
-    if host_status is not None:
-        status = _validated_fast_lane_host_status(host_status)
+    if status is not None:
         scheduler_state = validated["scheduler_state"]
         occupancy = _fast_lane_host_slot_occupancy_audit(
             workflow_id=status["workflow_id"],
@@ -6320,6 +6967,7 @@ def _parser() -> argparse.ArgumentParser:
 
     fast_lane = commands.add_parser("fast-lane")
     fast_lane.add_argument("--input", required=True)
+    fast_lane.add_argument("--host-status")
     fast_lane.add_argument("--reasoning-effort", action="append", default=[])
     fast_lane.add_argument("--enable", action="store_true")
 
@@ -6359,10 +7007,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_json(make_cache_metadata(inputs))
         elif args.command == "fast-lane":
             request = _read_json(args.input, maximum=MAX_MANIFEST_INPUT_BYTES)
+            host_status = (
+                None
+                if args.host_status is None
+                else _mapping(
+                    _read_json(
+                        args.host_status,
+                        maximum=MAX_FAST_LANE_HOST_STATUS_BYTES,
+                    ),
+                    "host status",
+                )
+            )
             result = compile_fast_lane(
                 _mapping(request, "fast-lane request"),
                 reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),
                 enable=args.enable,
+                host_status=host_status,
             )
             _print_json(result)
         else:
