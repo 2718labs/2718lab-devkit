@@ -22,10 +22,14 @@ from devkit_atlas.service import (
     AtlasService,
 )
 from devkit_atlas.store import AtlasStore, StoreConflictError
+from devkit_runtime.bootstrap import RuntimeBootstrap
+from devkit_runtime.config import RuntimeConfig
+from devkit_runtime.project_checkpoint import (
+    ProjectCheckpointRuntime,
+    open_project_checkpoint_rw,
+)
 from project_index.checkpoints import CheckpointFile
 from project_index.models import SnapshotFile
-from project_index.service import ProjectIndexService
-
 
 ASSETS = ASSET_ROOT
 _GOLDEN_BINDING_HASH = (
@@ -242,9 +246,30 @@ def _evidence(
 
 
 class _Reader:
-    def __init__(self, evidence: AcceptedAtlasProjectionEvidence) -> None:
+    def __init__(
+        self,
+        request: AcceptedAtlasProjectionRequest,
+        evidence: AcceptedAtlasProjectionEvidence,
+    ) -> None:
+        self.request = request
         self.evidence = evidence
         self.calls = 0
+
+    def rebuild(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> AcceptedAtlasProjectionRequest:
+        if (workflow_id, code_task_id, acceptance_id, ingestion_key) != (
+            self.request.workflow_id,
+            self.request.code_task_id,
+            self.request.acceptance_id,
+            self.request.ingestion_key,
+        ):
+            raise AtlasError("acceptance_evidence_unavailable")
+        return self.request
 
     def read(
         self, request: AcceptedAtlasProjectionRequest
@@ -256,28 +281,41 @@ class _Reader:
 def _service_at(
     tmp_path: Path,
     reader: _Reader | None,
-) -> tuple[AtlasService, AtlasStore, ProjectIndexService]:
-    store = AtlasStore(tmp_path / "atlas.sqlite", tmp_path / "cas")
-    index = ProjectIndexService(tmp_path / "project-index.sqlite")
+) -> tuple[AtlasService, AtlasStore, ProjectCheckpointRuntime]:
+    scratch_root = tmp_path.parent / f"{tmp_path.name}-atlas-scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+    RuntimeBootstrap.run(config)
+    runtime = open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    )
+    store = AtlasStore(config.atlas_database)
     service = AtlasService(
         store,
         BundledRecipeLoader(ASSETS),
-        index,
+        runtime.project_index,
         acceptance_evidence_reader=reader,
     )
-    return service, store, index
+    return service, store, runtime
 
 
 def _counts(store: AtlasStore) -> tuple[int, int, int, int, int]:
-    return tuple(
-        int(store._conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-        for table in (
-            "atlas_nodes",
-            "atlas_edges",
-            "atlas_recipes",
-            "atlas_blobs",
-            "atlas_ingestion_receipts",
-        )
+    def count(table: str) -> int:
+        return int(store._conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+
+    return (
+        count("atlas_nodes"),
+        count("atlas_edges"),
+        count("atlas_recipes"),
+        count("atlas_blobs"),
+        count("atlas_ingestion_receipts"),
     )
 
 
@@ -285,8 +323,8 @@ def test_project_acceptance_persists_a_recipe_once_and_redacts_output(
     tmp_path: Path,
 ) -> None:
     request = _request()
-    reader = _Reader(_evidence(request))
-    service, store, index = _service_at(tmp_path, reader)
+    reader = _Reader(request, _evidence(request))
+    service, store, runtime = _service_at(tmp_path, reader)
 
     projection = service.project_acceptance(request)
 
@@ -339,20 +377,20 @@ def test_project_acceptance_persists_a_recipe_once_and_redacts_output(
     assert reader.calls == 2
     assert _counts(store)[2:] == (1, 1, 1)
     store.close()
-    index.close()
+    runtime.close()
 
 
 def test_project_acceptance_revalidates_evidence_for_an_existing_receipt(
     tmp_path: Path,
 ) -> None:
     request = _request()
-    reader = _Reader(_evidence(request))
-    service, store, index = _service_at(tmp_path, reader)
+    reader = _Reader(request, _evidence(request))
+    service, store, runtime = _service_at(tmp_path, reader)
     projection = service.project_acceptance(request)
     before = _counts(store)
 
     service._acceptance_evidence_reader = _Reader(
-        replace(reader.evidence, checkpoint_hash=_hash("changed-checkpoint"))
+        request, replace(reader.evidence, checkpoint_hash=_hash("changed-checkpoint"))
     )
     with pytest.raises(AtlasError, match="acceptance_evidence_conflict"):
         service.project_acceptance(request)
@@ -371,7 +409,7 @@ def test_project_acceptance_revalidates_evidence_for_an_existing_receipt(
         projection.reasons,
     )
     store.close()
-    index.close()
+    runtime.close()
 
 
 def test_project_acceptance_reuses_recipe_for_distinct_accepted_episodes(
@@ -379,26 +417,26 @@ def test_project_acceptance_reuses_recipe_for_distinct_accepted_episodes(
 ) -> None:
     first = _request()
     second = _request(code_task_id="task-2")
-    first_reader = _Reader(_evidence(first))
-    service, store, index = _service_at(tmp_path, first_reader)
+    first_reader = _Reader(first, _evidence(first))
+    service, store, runtime = _service_at(tmp_path, first_reader)
 
     first_projection = service.project_acceptance(first)
-    service._acceptance_evidence_reader = _Reader(_evidence(second))
+    service._acceptance_evidence_reader = _Reader(second, _evidence(second))
     second_projection = service.project_acceptance(second)
 
     assert first_projection.recipe_id == second_projection.recipe_id
     assert first_projection.episode_id != second_projection.episode_id
     assert _counts(store)[2:] == (1, 1, 2)
     store.close()
-    index.close()
+    runtime.close()
 
 
 def test_project_acceptance_records_episode_only_for_unsupported_language(
     tmp_path: Path,
 ) -> None:
     request = _request(language="typescript")
-    reader = _Reader(_evidence(request))
-    service, store, index = _service_at(tmp_path, reader)
+    reader = _Reader(request, _evidence(request))
+    service, store, runtime = _service_at(tmp_path, reader)
 
     projection = service.project_acceptance(request)
 
@@ -407,15 +445,15 @@ def test_project_acceptance_records_episode_only_for_unsupported_language(
     assert projection.reasons == ("UNSUPPORTED_LANGUAGE",)
     assert _counts(store)[2:] == (0, 0, 1)
     store.close()
-    index.close()
+    runtime.close()
 
 
 def test_project_acceptance_conflicts_for_same_key_and_changed_payload(
     tmp_path: Path,
 ) -> None:
     request = _request()
-    reader = _Reader(_evidence(request))
-    service, store, index = _service_at(tmp_path, reader)
+    reader = _Reader(request, _evidence(request))
+    service, store, runtime = _service_at(tmp_path, reader)
     service.project_acceptance(request)
     before = _counts(store)
     changed = replace(
@@ -440,21 +478,23 @@ def test_project_acceptance_conflicts_for_same_key_and_changed_payload(
         verification_artifact_hashes=request.verification_artifact_hashes,
         execution_receipt_ids=request.execution_receipt_ids,
     )
-    service._acceptance_evidence_reader = _Reader(_evidence(changed_binding))
+    service._acceptance_evidence_reader = _Reader(
+        changed_binding, _evidence(changed_binding)
+    )
     with pytest.raises(StoreConflictError, match="evidence binding"):
         service.project_acceptance(changed_binding)
     assert reader.calls == 1
     assert _counts(store) == before
     store.close()
-    index.close()
+    runtime.close()
 
 
 def test_project_acceptance_rejects_untrusted_request_or_evidence(
     tmp_path: Path,
 ) -> None:
     request = _request()
-    reader = _Reader(_evidence(request))
-    service, store, index = _service_at(tmp_path, reader)
+    reader = _Reader(request, _evidence(request))
+    service, store, runtime = _service_at(tmp_path, reader)
 
     with pytest.raises(AtlasError, match="invalid_acceptance_projection"):
         service.project_acceptance({"request": "raw-source-body"})  # type: ignore[arg-type]
@@ -466,7 +506,7 @@ def test_project_acceptance_rejects_untrusted_request_or_evidence(
             )
         )
     bad = replace(reader.evidence, checkpoint_hash=_hash("other-checkpoint"))
-    service._acceptance_evidence_reader = _Reader(bad)
+    service._acceptance_evidence_reader = _Reader(request, bad)
     with pytest.raises(AtlasError, match="acceptance_evidence_conflict"):
         service.project_acceptance(request)
     for evidence in (
@@ -474,26 +514,38 @@ def test_project_acceptance_rejects_untrusted_request_or_evidence(
         replace(reader.evidence, language="typescript"),
         replace(reader.evidence, framework="fastapi"),
     ):
-        service._acceptance_evidence_reader = _Reader(evidence)
+        service._acceptance_evidence_reader = _Reader(request, evidence)
         with pytest.raises(AtlasError, match="acceptance_evidence_conflict"):
             service.project_acceptance(request)
     assert _counts(store) == (0, 0, 0, 0, 0)
     store.close()
-    index.close()
+    runtime.close()
 
-    unavailable_store = AtlasStore(
-        tmp_path / "unavailable.sqlite", tmp_path / "unavailable-cas"
+    unavailable_root = tmp_path / "unavailable"
+    unavailable_scratch = tmp_path / "unavailable-atlas-scratch"
+    unavailable_scratch.mkdir()
+    unavailable_config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(unavailable_root),
+            "CODEX_TASK_TEMP": str(unavailable_scratch),
+        }
     )
-    unavailable_index = ProjectIndexService(tmp_path / "unavailable-index.sqlite")
+    RuntimeBootstrap.run(unavailable_config)
+    unavailable_runtime = open_project_checkpoint_rw(
+        unavailable_config.project_index_database,
+        unavailable_config.checkpoint_cas_root,
+        scratch_root=unavailable_config.scratch_root,
+    )
+    unavailable_store = AtlasStore(unavailable_config.atlas_database)
     unavailable = AtlasService(
         unavailable_store,
         BundledRecipeLoader(ASSETS),
-        unavailable_index,
+        unavailable_runtime.project_index,
     )
     with pytest.raises(AtlasError, match="acceptance_evidence_unavailable"):
         unavailable.project_acceptance(request)
     unavailable_store.close()
-    unavailable_index.close()
+    unavailable_runtime.close()
 
 
 def test_project_acceptance_rolls_back_the_bundle_on_interrupted_write(
@@ -501,8 +553,8 @@ def test_project_acceptance_rolls_back_the_bundle_on_interrupted_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request()
-    reader = _Reader(_evidence(request))
-    service, store, index = _service_at(tmp_path, reader)
+    reader = _Reader(request, _evidence(request))
+    service, store, runtime = _service_at(tmp_path, reader)
 
     def fail(*_args: object, **_kwargs: object) -> None:
         raise StoreConflictError("forced projection failure")
@@ -513,4 +565,4 @@ def test_project_acceptance_rolls_back_the_bundle_on_interrupted_write(
     assert _counts(store) == (0, 0, 0, 0, 0)
     assert not tuple((tmp_path / "cas").rglob("*.tmp"))
     store.close()
-    index.close()
+    runtime.close()

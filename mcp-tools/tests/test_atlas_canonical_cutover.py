@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -48,8 +47,14 @@ def test_atlas_runtime_is_self_contained_without_a_skills_tree(tmp_path: Path) -
     source_root = Path(__file__).resolve().parents[1]
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
-    shutil.copytree(source_root / "devkit_atlas", runtime_root / "devkit_atlas")
-    shutil.copytree(source_root / "project_index", runtime_root / "project_index")
+    for package in (
+        "devkit_atlas",
+        "devkit_relay",
+        "devkit_runtime",
+        "orchestrator",
+        "project_index",
+    ):
+        shutil.copytree(source_root / package, runtime_root / package)
 
     assert not (runtime_root / "skills").exists()
     expected_assets = {
@@ -82,7 +87,9 @@ from devkit_atlas.recipes import BundledRecipeLoader
 from devkit_atlas.routing import HOST_PROFILES
 from devkit_atlas.service import AtlasService
 from devkit_atlas.store import AtlasStore
-from project_index.service import ProjectIndexService
+from devkit_runtime.bootstrap import RuntimeBootstrap
+from devkit_runtime.config import RuntimeConfig
+from devkit_runtime.project_checkpoint import open_project_checkpoint_rw
 
 loader = BundledRecipeLoader(devkit_atlas.ASSET_ROOT)
 recipes = loader.load()
@@ -91,12 +98,22 @@ assert len(loader.materialize().nodes) > 3
 assert set(HOST_PROFILES) == {{"schema_version", "hosts"}}
 state = Path({str(runtime_root)!r}) / "state"
 state.mkdir()
-store = AtlasStore(state / "atlas.sqlite", state / "cas")
-index = ProjectIndexService(state / "index.sqlite")
+scratch = Path({str(runtime_root)!r}) / "scratch"
+scratch.mkdir()
+config = RuntimeConfig.load(
+    environ={{"PLUGIN_DATA": str(state), "CODEX_TASK_TEMP": str(scratch)}}
+)
+RuntimeBootstrap.run(config)
+store = AtlasStore(config.atlas_database)
+runtime = open_project_checkpoint_rw(
+    config.project_index_database,
+    config.checkpoint_cas_root,
+    scratch_root=config.scratch_root,
+)
 try:
-    AtlasService(store, loader, index)
+    AtlasService(store, loader, runtime.project_index)
 finally:
-    index.close()
+    runtime.close()
     store.close()
 """
     completed = subprocess.run(
