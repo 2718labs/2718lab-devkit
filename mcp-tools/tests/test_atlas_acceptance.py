@@ -450,6 +450,18 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
 class CodeTaskAcceptanceServiceTests(CodeTaskAcceptanceFixture):
     _COMPLETE_IN_SETUP = True
 
+    def test_lookup_requires_the_exact_workflow_and_code_task_pair(self) -> None:
+        acceptance, _ = self._accept()
+
+        assert (
+            self.store.acceptance_for_workflow_task("workflow", "code-task")
+            == acceptance
+        )
+        assert (
+            self.store.acceptance_for_workflow_task("other-workflow", "code-task")
+            is None
+        )
+
     def test_accepts_current_receipt_bound_code_task_once(self) -> None:
         self.assertNotEqual(
             self.execution_receipts[0].output_hash,

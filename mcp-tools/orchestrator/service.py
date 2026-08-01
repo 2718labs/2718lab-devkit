@@ -20,7 +20,7 @@ from typing import Any
 from devkit_atlas.receipts import RawExecutionReceipt, ReceiptRepository
 
 from .models import Task, TaskKind, TaskState, Workflow
-from .store import Artifact, Lease, SQLiteStore, StoreError
+from .store import AcceptedCodeTaskEvidence, Artifact, Lease, SQLiteStore, StoreError
 
 
 class ServiceError(RuntimeError):
@@ -446,6 +446,23 @@ class OrchestratorService:
             evidence_binding=evidence_binding,
             created_at=accepted_at,
             now=accepted_at,
+        )
+
+    def accepted_code_task_evidence(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> AcceptedCodeTaskEvidence | None:
+        """Return the immutable evidence behind one exact Atlas acceptance."""
+
+        return self._call(
+            self._store.accepted_code_task_evidence,
+            workflow_id,
+            code_task_id,
+            acceptance_id,
+            ingestion_key,
         )
 
     def write_scope_conflicts(

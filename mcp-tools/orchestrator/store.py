@@ -266,6 +266,18 @@ class CodeTaskReceiptAttestation:
     attestation_hash: str
 
 
+@dataclass(frozen=True)
+class AcceptedCodeTaskEvidence:
+    """Immutable facts needed to rebuild one accepted Atlas projection."""
+
+    acceptance: CodeTaskAcceptance
+    task: Task
+    index_binding: IndexBinding
+    task_evidence: TaskAcceptanceEvidence
+    evidence_binding: CodeTaskEvidenceBinding
+    receipt_attestation: CodeTaskReceiptAttestation
+
+
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
@@ -1127,6 +1139,22 @@ class SQLiteStore:
         ).fetchone()
         return None if row is None else self._acceptance_from_row(row)
 
+    def acceptance_for_workflow_task(
+        self, workflow_id: str, code_task_id: str
+    ) -> CodeTaskAcceptance | None:
+        """Look up one acceptance through its exact immutable task identity."""
+
+        self._safe_acceptance_identifier("workflow_id", workflow_id)
+        self._safe_acceptance_identifier("code_task_id", code_task_id)
+        row = self._connection.execute(
+            """
+            SELECT * FROM code_task_acceptances
+            WHERE workflow_id = ? AND code_task_id = ?
+            """,
+            (workflow_id, code_task_id),
+        ).fetchone()
+        return None if row is None else self._acceptance_from_row(row)
+
     def list_code_task_acceptances(
         self, workflow_id: str, *, limit: int
     ) -> tuple[CodeTaskAcceptance, ...]:
@@ -1293,6 +1321,240 @@ class SQLiteStore:
             return None
         return self._code_task_evidence_binding_for_acceptance(
             self._acceptance_from_row(row)
+        )
+
+    def accepted_code_task_evidence(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> AcceptedCodeTaskEvidence | None:
+        """Read one exact acceptance without trusting its mutable outbox payload.
+
+        The returned values are reconstructed from durable acceptance, binding,
+        task, receipt-attestation, and artifact records. Outbox state and
+        ``payload_json`` deliberately remain outside this boundary.
+        """
+
+        for field_name, value in (
+            ("workflow_id", workflow_id),
+            ("code_task_id", code_task_id),
+            ("acceptance_id", acceptance_id),
+            ("ingestion_key", ingestion_key),
+        ):
+            self._safe_acceptance_identifier(field_name, value)
+
+        connection = self._connection
+        if connection is None:
+            raise AcceptanceEvidenceError("accepted code task store is unavailable")
+        acceptance = self.acceptance_for_workflow_task(workflow_id, code_task_id)
+        if acceptance is None:
+            known_acceptance = connection.execute(
+                "SELECT 1 FROM code_task_acceptances WHERE acceptance_id = ?",
+                (acceptance_id,),
+            ).fetchone()
+            known_ingestion = connection.execute(
+                "SELECT 1 FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+                (ingestion_key,),
+            ).fetchone()
+            if known_acceptance is not None or known_ingestion is not None:
+                raise AcceptanceConflictError(
+                    "accepted code task identity does not match its public pair"
+                )
+            return None
+        expected_payload = self._canonical_code_task_acceptance_payload(
+            workflow_id=acceptance.workflow_id,
+            task_id=acceptance.code_task_id,
+            task_version=acceptance.code_task_version,
+            input_snapshot_id=acceptance.input_snapshot_id,
+            output_snapshot_id=acceptance.output_snapshot_id,
+            indexed_diff_hash=acceptance.indexed_diff_hash,
+            intent_id=acceptance.intent_id,
+            language=acceptance.language,
+            framework=acceptance.framework,
+        )
+        expected_payload_hash = _payload_hash(expected_payload)
+        if (
+            acceptance.acceptance_id != expected_payload_hash
+            or acceptance.payload_hash != expected_payload_hash
+            or acceptance_id != expected_payload_hash
+        ):
+            raise AcceptanceConflictError("accepted code task identity is inconsistent")
+
+        outbox = connection.execute(
+            """
+            SELECT ingestion_key, acceptance_id, payload_hash
+            FROM atlas_ingestion_outbox
+            WHERE acceptance_id = ?
+            """,
+            (acceptance.acceptance_id,),
+        ).fetchone()
+        if outbox is None:
+            raise AcceptanceEvidenceError("accepted code task outbox is unavailable")
+        if (
+            str(outbox["acceptance_id"]) != acceptance.acceptance_id
+            or str(outbox["ingestion_key"]) != expected_payload_hash
+            or str(outbox["payload_hash"]) != expected_payload_hash
+            or ingestion_key != expected_payload_hash
+        ):
+            raise AcceptanceConflictError(
+                "accepted code task ingestion identity changed"
+            )
+
+        try:
+            task = self.get_task(code_task_id)
+        except KeyError as error:
+            raise AcceptanceEvidenceError(
+                "accepted code task is unavailable"
+            ) from error
+        if (
+            task.workflow_id != workflow_id
+            or task.task_kind is not TaskKind.CODE
+            or task.state is not TaskState.DONE
+            or task.version != acceptance.code_task_version
+            or task.intent_id != acceptance.intent_id
+            or task.language != acceptance.language
+            or task.framework != acceptance.framework
+            or not task.write_scope
+        ):
+            raise AcceptanceConflictError("accepted code task metadata changed")
+
+        index_binding = self.get_index_binding(code_task_id)
+        if index_binding is None:
+            raise AcceptanceEvidenceError(
+                "accepted code task index binding is unavailable"
+            )
+        if (
+            index_binding.input_snapshot_id != acceptance.input_snapshot_id
+            or index_binding.output_snapshot_id != acceptance.output_snapshot_id
+            or index_binding.indexed_diff_hash != acceptance.indexed_diff_hash
+            or not index_binding.checkpoint_id
+        ):
+            raise AcceptanceConflictError("accepted code task index binding changed")
+
+        binding_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM events
+            WHERE workflow_id = ? AND task_id = ? AND event_type = ?
+            """,
+            (
+                workflow_id,
+                code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+            ),
+        ).fetchone()[0]
+        if int(binding_count) == 0:
+            raise AcceptanceEvidenceError(
+                "accepted code task evidence binding is unavailable"
+            )
+        if int(binding_count) != 1:
+            raise AcceptanceConflictError("accepted code task evidence binding changed")
+        evidence_binding = self.evidence_binding_for_acceptance(
+            acceptance.acceptance_id
+        )
+        if evidence_binding is None:
+            raise AcceptanceEvidenceError(
+                "accepted code task evidence binding is unavailable"
+            )
+        if (
+            evidence_binding.workflow_id != workflow_id
+            or evidence_binding.code_task_id != code_task_id
+            or evidence_binding.code_task_version != acceptance.code_task_version
+            or evidence_binding.input_snapshot_id != acceptance.input_snapshot_id
+            or evidence_binding.output_snapshot_id != acceptance.output_snapshot_id
+            or evidence_binding.indexed_diff_hash != acceptance.indexed_diff_hash
+            or evidence_binding.checkpoint_id != index_binding.checkpoint_id
+        ):
+            raise AcceptanceConflictError("accepted code task evidence binding changed")
+
+        try:
+            task_evidence = self.task_acceptance_evidence(
+                code_task_id, acceptance.output_snapshot_id
+            )
+        except StrictIndexError as error:
+            raise AcceptanceEvidenceError(
+                "accepted code task output evidence is unavailable"
+            ) from error
+        if (
+            task_evidence.output_query_trace_id
+            != evidence_binding.output_query_trace_id
+        ):
+            raise AcceptanceConflictError("accepted code task output evidence changed")
+        if (
+            task_evidence.verification_artifact_hashes
+            != evidence_binding.verification_artifact_hashes
+        ):
+            if set(task_evidence.verification_artifact_hashes).issubset(
+                evidence_binding.verification_artifact_hashes
+            ):
+                raise AcceptanceEvidenceError(
+                    "accepted code task verification evidence is unavailable"
+                )
+            raise AcceptanceConflictError("accepted code task output evidence changed")
+
+        attestation_count = connection.execute(
+            "SELECT COUNT(*) FROM code_task_receipt_attestations WHERE task_id = ?",
+            (code_task_id,),
+        ).fetchone()[0]
+        if int(attestation_count) == 0:
+            raise AcceptanceEvidenceError(
+                "accepted code task receipt attestation is unavailable"
+            )
+        if int(attestation_count) != 1:
+            raise AcceptanceConflictError(
+                "accepted code task receipt attestation changed"
+            )
+        receipt_attestation = self.code_task_receipt_attestation_for_acceptance(
+            acceptance.acceptance_id
+        )
+        if receipt_attestation is None:
+            raise AcceptanceEvidenceError(
+                "accepted code task receipt attestation is unavailable"
+            )
+        if (
+            receipt_attestation.workflow_id != workflow_id
+            or receipt_attestation.code_task_id != code_task_id
+            or receipt_attestation.code_task_version != acceptance.code_task_version
+            or receipt_attestation.input_snapshot_id != acceptance.input_snapshot_id
+            or receipt_attestation.output_snapshot_id != acceptance.output_snapshot_id
+            or receipt_attestation.execution_receipt_ids
+            != evidence_binding.execution_receipt_ids
+            or receipt_attestation.attestation_hash
+            not in evidence_binding.verification_artifact_hashes
+        ):
+            raise AcceptanceConflictError(
+                "accepted code task receipt attestation changed"
+            )
+        if not task.result_hash:
+            raise AcceptanceEvidenceError(
+                "accepted code task result evidence is unavailable"
+            )
+        if task.result_hash not in evidence_binding.verification_artifact_hashes:
+            raise AcceptanceConflictError("accepted code task result evidence changed")
+        for artifact_hash in evidence_binding.verification_artifact_hashes:
+            if (
+                artifact_hash == receipt_attestation.attestation_hash
+                and artifact_hash != task.result_hash
+            ):
+                continue
+            artifact = self.get_artifact(artifact_hash)
+            if artifact is None:
+                raise AcceptanceEvidenceError(
+                    "accepted code task verification evidence is unavailable"
+                )
+            if artifact.kind != "verification":
+                raise AcceptanceConflictError(
+                    "accepted code task verification evidence changed"
+                )
+
+        return AcceptedCodeTaskEvidence(
+            acceptance=acceptance,
+            task=task,
+            index_binding=index_binding,
+            task_evidence=task_evidence,
+            evidence_binding=evidence_binding,
+            receipt_attestation=receipt_attestation,
         )
 
     def pending_atlas_outbox(self, *, limit: int) -> tuple[AtlasOutboxItem, ...]:

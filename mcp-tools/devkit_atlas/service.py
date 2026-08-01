@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from project_index.models import IndexError, SnapshotFacts
 from project_index.service import ProjectIndexService
@@ -18,16 +18,16 @@ from .extractors import BoundExecutionReceipt, ExtractionRequest, PythonRecipeEx
 from .matching import (
     MatchCandidate,
     normalize_framework,
-    structural_repository_signature,
     select_recipe,
+    structural_repository_signature,
 )
 from .models import (
     ATLAS_MATCHER_VERSION,
+    AcceptanceProjection,
     AtlasEdge,
     AtlasError,
     AtlasNode,
     AtlasStatus,
-    AcceptanceProjection,
     ConstraintSpec,
     DependencySpec,
     EdgeRelation,
@@ -60,7 +60,6 @@ from .security import (
     validate_slot_value,
 )
 from .store import AtlasStore, StoreConflictError
-
 
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PREPARE_REQUEST_SCHEMA = "atlas-prepare-request/v1"
@@ -194,7 +193,7 @@ class AcceptedAtlasProjectionRequest:
         output_query_trace_id: str,
         verification_artifact_hashes: tuple[str, ...],
         execution_receipt_ids: tuple[str, ...],
-    ) -> "AcceptedAtlasProjectionRequest":
+    ) -> AcceptedAtlasProjectionRequest:
         """Build the canonical core and evidence-binding identifiers."""
 
         payload = _acceptance_projection_core_payload(
@@ -261,10 +260,23 @@ class AcceptedAtlasProjectionEvidence:
 class AcceptanceEvidenceReader(Protocol):
     """Read verified checkpoint/index/receipt evidence for one accepted task."""
 
+    def rebuild(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> AcceptedAtlasProjectionRequest:
+        """Rebuild the internal request from the four public identifiers."""
+
+        ...
+
     def read(
         self, request: AcceptedAtlasProjectionRequest
     ) -> AcceptedAtlasProjectionEvidence:
         """Return the typed evidence named by ``request`` without caller data."""
+
+        ...
 
 
 def _is_hash(value: object) -> bool:
@@ -1018,6 +1030,38 @@ class AtlasService:
         if codes == ("UNSUPPORTED_LANGUAGE",):
             return AtlasStatus.UNSUPPORTED_LANGUAGE, codes
         return AtlasStatus.EVIDENCE_INCOMPLETE, codes
+
+    def accept(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> AcceptanceProjection:
+        """Project exactly one public Atlas acceptance through immutable evidence."""
+
+        reader = self._acceptance_evidence_reader
+        if reader is None:
+            raise AtlasError("ATLAS_EVIDENCE_UNAVAILABLE")
+        try:
+            request = reader.rebuild(
+                workflow_id,
+                code_task_id,
+                acceptance_id,
+                ingestion_key,
+            )
+            return self.project_acceptance(request)
+        except AtlasError as error:
+            if error.code in {
+                "ATLAS_EVIDENCE_UNAVAILABLE",
+                "ATLAS_EVIDENCE_CONFLICT",
+            }:
+                raise
+            if error.code == "acceptance_evidence_unavailable":
+                raise AtlasError("ATLAS_EVIDENCE_UNAVAILABLE") from error
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
+        except StoreConflictError as error:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
 
     def project_acceptance(
         self, request: AcceptedAtlasProjectionRequest
