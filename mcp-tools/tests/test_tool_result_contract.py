@@ -15,8 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_atlas.models import (  # noqa: E402
     AcceptanceProjection,
+    AtlasNode,
     AtlasStatus,
     GraphQueryResult,
+    ImplementationPacket,
+    NodeKind,
     PreparationResult,
     RenderResult,
 )
@@ -64,6 +67,17 @@ def _data(result: dict[str, object]) -> dict[str, object]:
     return cast(dict[str, object], result["data"])
 
 
+def _assert_no_null(value: object) -> None:
+    assert value is not None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert key is not None
+            _assert_no_null(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_no_null(item)
+
+
 def test_success_and_failure_envelopes_have_exact_top_level_keys() -> None:
     success = envelope_success({})
     failure = envelope_failure("INVALID_REQUEST")
@@ -80,6 +94,49 @@ def test_success_and_failure_envelopes_have_exact_top_level_keys() -> None:
 
 @pytest.mark.parametrize("value", [None, [], "text", 1, True])
 def test_success_requires_an_object_data_value(value: object) -> None:
+    with pytest.raises(ResultContractError):
+        envelope_success(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"value": None},
+        {"nested": {"value": None}},
+        {"nested": [{"value": None}]},
+        {"nested": [None]},
+    ],
+)
+def test_success_rejects_null_values_at_any_recursive_depth(value: object) -> None:
+    with pytest.raises(ResultContractError):
+        envelope_success(value)
+
+
+def test_success_rejects_deep_nesting_before_recursion_failure() -> None:
+    value: object = "leaf"
+    for _ in range(40):
+        value = {"child": value}
+
+    with pytest.raises(ResultContractError):
+        envelope_success({"root": value})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"items": list(range(513))},
+        {"items": {str(index): index for index in range(513)}},
+    ],
+)
+def test_success_rejects_oversized_list_and_map_cardinality(value: object) -> None:
+    with pytest.raises(ResultContractError):
+        envelope_success(value)
+
+
+def test_success_rejects_cyclic_containers() -> None:
+    value: dict[str, object] = {}
+    value["self"] = value
+
     with pytest.raises(ResultContractError):
         envelope_success(value)
 
@@ -180,6 +237,9 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
     sync_data = _data(project_index_sync(snapshot))
     status_data = _data(project_index_status(status))
     query_data = _data(project_index_query(query))
+    _assert_no_null(sync_data)
+    _assert_no_null(status_data)
+    _assert_no_null(query_data)
 
     assert set(sync_data) == {
         "workspace_id",
@@ -193,7 +253,6 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
         "gap_count",
         "manifest_hash",
         "parser_set_hash",
-        "head",
         "binding_state",
     }
     assert set(status_data) == {
@@ -268,7 +327,14 @@ def test_checkpoint_projectors_expose_only_bounded_metadata() -> None:
     )
     restored = RestoreResult("checkpoint-1", "rescue-1", "snapshot-2", ("src/a.py",))
 
-    assert set(_data(project_checkpoint_create(checkpoint))) == {
+    create_data = _data(project_checkpoint_create(checkpoint))
+    status_data = _data(project_checkpoint_status(checkpoint))
+    restore_data = _data(project_checkpoint_restore(restored))
+    _assert_no_null(create_data)
+    _assert_no_null(status_data)
+    _assert_no_null(restore_data)
+
+    assert set(create_data) == {
         "checkpoint_id",
         "workflow_id",
         "task_id",
@@ -282,9 +348,8 @@ def test_checkpoint_projectors_expose_only_bounded_metadata() -> None:
         "cas_root_hash",
         "entry_count",
         "kind",
-        "parent_checkpoint_id",
     }
-    assert set(_data(project_checkpoint_restore(restored))) == {
+    assert set(restore_data) == {
         "checkpoint_id",
         "rescue_checkpoint_id",
         "restored_snapshot_id",
@@ -293,8 +358,19 @@ def test_checkpoint_projectors_expose_only_bounded_metadata() -> None:
 
 
 def test_atlas_projectors_use_locked_data_keys_and_omit_raw_payloads() -> None:
-    query = project_atlas_query(GraphQueryResult())
-    prepare = project_atlas_prepare(PreparationResult(AtlasStatus.READY))
+    query = project_atlas_query(
+        GraphQueryResult(
+            nodes=(AtlasNode("node-1", NodeKind.RECIPE, {"private": "payload"}),)
+        )
+    )
+    prepare = project_atlas_prepare(
+        PreparationResult(
+            AtlasStatus.READY,
+            packet=ImplementationPacket(
+                "packet-1", "trace-1", "workspace-1", "snapshot-1", "recipe-1"
+            ),
+        )
+    )
     render = project_atlas_render(RenderResult(AtlasStatus.READY, "packet-1"))
     accept = project_atlas_accept(
         AcceptanceProjection(
@@ -303,8 +379,13 @@ def test_atlas_projectors_use_locked_data_keys_and_omit_raw_payloads() -> None:
             "snapshot-2",
             AtlasStatus.READY,
             "episode-1",
+            "recipe-1",
         )
     )
+    _assert_no_null(query)
+    _assert_no_null(prepare)
+    _assert_no_null(render)
+    _assert_no_null(accept)
 
     assert set(_data(query)) == {"nodes", "edges", "truncated"}
     assert set(_data(prepare)) == {
@@ -331,6 +412,21 @@ def test_atlas_projectors_use_locked_data_keys_and_omit_raw_payloads() -> None:
         "recipe_id",
         "reasons",
     }
+
+
+def test_atlas_exact_keys_fail_closed_when_required_values_are_missing() -> None:
+    with pytest.raises(ResultContractError):
+        project_atlas_prepare(PreparationResult(AtlasStatus.READY))
+    with pytest.raises(ResultContractError):
+        project_atlas_accept(
+            AcceptanceProjection(
+                "acceptance-1",
+                "task-1",
+                "snapshot-2",
+                AtlasStatus.READY,
+                "episode-1",
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -400,9 +496,47 @@ def test_relay_projectors_do_not_return_capabilities_or_host_paths() -> None:
             "schedule_version": 1,
         },
         "schedule_version": 1,
-        "tasks": [],
-        "leases": [],
-        "candidates": [],
+        "tasks": [
+            {
+                "task_id": "task-1",
+                "kind": "verification",
+                "priority": 1,
+                "state": "completed",
+                "task_version": 1,
+                "scope_owner": None,
+                "candidate_id": None,
+                "last_lease_epoch": 1,
+            }
+        ],
+        "leases": [
+            {
+                "lease_id": "lease-1",
+                "task_id": "task-1",
+                "action_id": "action-1",
+                "epoch": 1,
+                "task_version": 1,
+                "lease_kind": "worker",
+                "endpoint": None,
+                "state": "released",
+                "released_at": None,
+            }
+        ],
+        "candidates": [
+            {
+                "candidate_id": "candidate-1",
+                "task_id": "task-1",
+                "originating_epoch": 1,
+                "branch": "branch-1",
+                "base_commit": "a" * 40,
+                "head_commit": "b" * 40,
+                "diff_hash": "sha256:" + "c" * 64,
+                "evidence_hashes": [],
+                "pr_reference": None,
+                "status": "prepared",
+                "review_digest": None,
+                "integration_commit": None,
+            }
+        ],
         "outstanding_action_ids": [],
         "refill_directives": [],
         "queues": {
@@ -414,6 +548,7 @@ def test_relay_projectors_do_not_return_capabilities_or_host_paths() -> None:
         },
     }
     projected = project_relay_status(status)
+    _assert_no_null(projected)
     assert "capability" not in str(projected).casefold()
     assert "host_actions" not in _data(projected)
     assert set(_data(projected)) == {
@@ -494,13 +629,20 @@ def test_relay_compile_and_start_projectors_are_bounded() -> None:
         ],
     }
 
-    assert set(_data(project_relay_compile(plan))) == set(plan)
-    assert set(_data(project_relay_start(start))) == {
+    compile_result = project_relay_compile(plan)
+    start_result = project_relay_start(start)
+    _assert_no_null(compile_result)
+    _assert_no_null(start_result)
+
+    assert set(_data(compile_result)) == set(plan)
+    assert set(_data(start_result)) == {
         "workflow_id",
         "run_id",
         "schedule_version",
         "actions",
     }
+    compile_tasks = cast(list[object], _data(compile_result)["tasks"])
+    assert "prewarm_for_task_id" not in cast(dict[str, object], compile_tasks[0])
 
 
 def test_relay_mutation_projectors_have_closed_result_keys() -> None:
@@ -520,6 +662,10 @@ def test_relay_mutation_projectors_have_closed_result_keys() -> None:
     }
     for projector in (project_relay_handoff, project_relay_integrate):
         result = projector(mutation)
+        _assert_no_null(result)
+        task_data = cast(dict[str, object], _data(result)["task"])
+        assert "scope_owner" not in task_data
+        assert "candidate_id" not in task_data
         assert set(_data(result)) <= {
             "workflow_id",
             "run_id",
@@ -532,6 +678,7 @@ def test_relay_mutation_projectors_have_closed_result_keys() -> None:
 
 def test_register_projector_returns_only_opaque_workspace_id() -> None:
     result = project_index_register("workspace-1")
+    _assert_no_null(result)
     assert result == {
         "schema": RESULT_SCHEMA,
         "ok": True,

@@ -48,6 +48,7 @@ RESULT_SCHEMA: Final = "2718lab-devkit/tool-result-v1"
 MAX_RESULT_BYTES: Final = 524_288
 MAX_STRING_BYTES: Final = 65_536
 MAX_LIST_ITEMS: Final = 512
+MAX_PUBLIC_DEPTH: Final = 32
 
 SUCCESS_KEYS: Final = frozenset({"schema", "ok", "data"})
 FAILURE_KEYS: Final = frozenset({"schema", "ok", "error"})
@@ -261,9 +262,15 @@ def _safe_string(
     return value
 
 
-def _json_value(value: object, *, key: str | None = None) -> _JSONValue:
+def _json_value(
+    value: object,
+    *,
+    key: str | None = None,
+    depth: int = 0,
+    active: set[int] | None = None,
+) -> _JSONValue:
     if value is None:
-        return None
+        raise _fail("null public value")
     if type(value) is bool:
         return value
     if type(value) is int:
@@ -277,16 +284,46 @@ def _json_value(value: object, *, key: str | None = None) -> _JSONValue:
     if isinstance(value, (Path, bytes, bytearray, memoryview, Enum)):
         raise _fail("unsupported public value")
     if type(value) is list:
-        return [_json_value(item) for item in cast(list[object], value)]
+        if depth >= MAX_PUBLIC_DEPTH:
+            raise _fail("public value nesting exceeds bound")
+        items = cast(list[object], value)
+        if len(items) > MAX_LIST_ITEMS:
+            raise _fail("public container exceeds item bound")
+        container_id = id(value)
+        active_ids = set() if active is None else active
+        if container_id in active_ids:
+            raise _fail("cyclic public value")
+        active_ids.add(container_id)
+        try:
+            return [
+                _json_value(item, depth=depth + 1, active=active_ids) for item in items
+            ]
+        finally:
+            active_ids.remove(container_id)
     if type(value) is dict:
+        if depth >= MAX_PUBLIC_DEPTH:
+            raise _fail("public value nesting exceeds bound")
+        mapping = cast(dict[object, object], value)
+        if len(mapping) > MAX_LIST_ITEMS:
+            raise _fail("public container exceeds item bound")
+        container_id = id(value)
+        active_ids = set() if active is None else active
+        if container_id in active_ids:
+            raise _fail("cyclic public value")
+        active_ids.add(container_id)
         output: dict[str, _JSONValue] = {}
-        for raw_key, item in cast(dict[object, object], value).items():
-            if type(raw_key) is not str:
-                raise _fail("non-string public key")
-            if _forbidden_key(raw_key):
-                raise _fail("sensitive public field")
-            output[raw_key] = _json_value(item, key=raw_key)
-        return output
+        try:
+            for raw_key, item in mapping.items():
+                if type(raw_key) is not str:
+                    raise _fail("non-string public key")
+                if _forbidden_key(raw_key):
+                    raise _fail("sensitive public field")
+                output[raw_key] = _json_value(
+                    item, key=raw_key, depth=depth + 1, active=active_ids
+                )
+            return output
+        finally:
+            active_ids.remove(container_id)
     raise _fail("unsupported public value")
 
 
@@ -493,7 +530,7 @@ def _snapshot_workspace(snapshot: IndexSnapshot) -> str:
 def _index_snapshot_data(snapshot: IndexSnapshot) -> dict[str, object]:
     if type(snapshot) is not IndexSnapshot:
         raise _fail("invalid project-index snapshot")
-    return {
+    data: dict[str, object] = {
         "workspace_id": _snapshot_workspace(snapshot),
         "snapshot_id": _identifier(snapshot.snapshot_id),
         "state": _enum_value(snapshot.state, IndexState),
@@ -505,19 +542,19 @@ def _index_snapshot_data(snapshot: IndexSnapshot) -> dict[str, object]:
         "gap_count": _nonnegative_int(snapshot.gap_count),
         "manifest_hash": _hash(snapshot.manifest_hash, allow_empty=True),
         "parser_set_hash": _hash(snapshot.parser_set_hash, allow_empty=True),
-        "head": _optional_string(snapshot.head),
         "binding_state": _identifier(snapshot.binding_state),
     }
+    head = _optional_string(snapshot.head)
+    if head is not None:
+        data["head"] = head
+    return data
 
 
 def _index_status_data(status: IndexStatus) -> dict[str, object]:
     if type(status) is not IndexStatus:
         raise _fail("invalid project-index status")
-    return {
+    data: dict[str, object] = {
         "workspace_id": _workspace_id(status.workspace),
-        "snapshot_id": (
-            None if status.snapshot_id is None else _identifier(status.snapshot_id)
-        ),
         "state": _enum_value(status.state, IndexState),
         "required_paths": [
             _relative_path(item) for item in _bounded_list(status.required_paths)
@@ -531,6 +568,9 @@ def _index_status_data(status: IndexStatus) -> dict[str, object]:
         "gaps": [_gap(item) for item in _bounded_list(status.gaps)],
         "binding_state": _identifier(status.binding_state),
     }
+    if status.snapshot_id is not None:
+        data["snapshot_id"] = _identifier(status.snapshot_id)
+    return data
 
 
 def _query_data(result: QueryResult) -> dict[str, object]:
@@ -571,7 +611,7 @@ def _checkpoint_data(checkpoint: Checkpoint) -> dict[str, object]:
         raise _fail("invalid checkpoint")
     if checkpoint.workspace_root:
         raise _fail("legacy workspace root is not public")
-    return {
+    data: dict[str, object] = {
         "checkpoint_id": _identifier(checkpoint.checkpoint_id),
         "workflow_id": _identifier(checkpoint.workflow_id),
         "task_id": _identifier(checkpoint.task_id),
@@ -589,12 +629,10 @@ def _checkpoint_data(checkpoint: Checkpoint) -> dict[str, object]:
         "cas_root_hash": _hash(checkpoint.cas_root_hash),
         "entry_count": _nonnegative_int(checkpoint.entry_count),
         "kind": _identifier(checkpoint.kind),
-        "parent_checkpoint_id": (
-            None
-            if checkpoint.parent_checkpoint_id is None
-            else _identifier(checkpoint.parent_checkpoint_id)
-        ),
     }
+    if checkpoint.parent_checkpoint_id is not None:
+        data["parent_checkpoint_id"] = _identifier(checkpoint.parent_checkpoint_id)
+    return data
 
 
 def project_checkpoint_create(checkpoint: Checkpoint) -> dict[str, object]:
@@ -623,7 +661,7 @@ def project_checkpoint_restore(result: RestoreResult) -> dict[str, object]:
 def _atlas_node(value: object) -> dict[str, object]:
     if type(value) is not AtlasNode:
         raise _fail("invalid Atlas node")
-    return {
+    data: dict[str, object] = {
         "node_id": _safe_string(value.node_id, allow_empty=False),
         "kind": _enum_value(value.kind, type(value.kind)),
         "schema_version": _safe_string(value.schema_version, allow_empty=False),
@@ -631,16 +669,22 @@ def _atlas_node(value: object) -> dict[str, object]:
         "extractor_version": _safe_string(value.extractor_version),
         "provenance": _safe_string(value.provenance, allow_empty=False),
         "source_hashes": [_hash(item) for item in _bounded_list(value.source_hashes)],
-        "created_at": _optional_string(value.created_at),
-        "superseded_at": _optional_string(value.superseded_at),
-        "quarantine_state": _optional_string(value.quarantine_state),
     }
+    for key, raw_value in (
+        ("created_at", value.created_at),
+        ("superseded_at", value.superseded_at),
+        ("quarantine_state", value.quarantine_state),
+    ):
+        optional_value = _optional_string(raw_value)
+        if optional_value is not None:
+            data[key] = optional_value
+    return data
 
 
 def _atlas_edge(value: object) -> dict[str, object]:
     if type(value) is not AtlasEdge:
         raise _fail("invalid Atlas edge")
-    return {
+    data: dict[str, object] = {
         "edge_id": _safe_string(value.edge_id, allow_empty=False),
         "relation": _enum_value(value.relation, type(value.relation)),
         "source_id": _safe_string(value.source_id, allow_empty=False),
@@ -649,8 +693,11 @@ def _atlas_edge(value: object) -> dict[str, object]:
         "target_kind": _enum_value(value.target_kind, type(value.target_kind)),
         "schema_version": _safe_string(value.schema_version, allow_empty=False),
         "provenance": _safe_string(value.provenance, allow_empty=False),
-        "created_at": _optional_string(value.created_at),
     }
+    created_at = _optional_string(value.created_at)
+    if created_at is not None:
+        data["created_at"] = created_at
+    return data
 
 
 def project_atlas_query(result: GraphQueryResult) -> dict[str, object]:
@@ -714,10 +761,13 @@ def _packet(value: object) -> dict[str, object] | None:
 def project_atlas_prepare(result: PreparationResult) -> dict[str, object]:
     if type(result) is not PreparationResult:
         raise _fail("invalid Atlas preparation result")
+    packet = _packet(result.packet)
+    if packet is None:
+        raise _fail("Atlas preparation packet is required")
     return envelope_success(
         {
             "status": _enum_value(result.status, AtlasStatus),
-            "packet": _packet(result.packet),
+            "packet": packet,
             "candidate_recipe_ids": _string_list(result.candidate_recipe_ids),
             "reasons": _string_list(result.reasons),
         }
@@ -751,6 +801,9 @@ def project_atlas_render(result: RenderResult) -> dict[str, object]:
 def project_atlas_accept(result: AcceptanceProjection) -> dict[str, object]:
     if type(result) is not AcceptanceProjection:
         raise _fail("invalid Atlas acceptance result")
+    recipe_id = _optional_string(result.recipe_id)
+    if recipe_id is None:
+        raise _fail("Atlas acceptance recipe is required")
     return envelope_success(
         {
             "acceptance_id": _safe_string(result.acceptance_id, allow_empty=False),
@@ -760,7 +813,7 @@ def project_atlas_accept(result: AcceptanceProjection) -> dict[str, object]:
             ),
             "atlas_ingest_state": _enum_value(result.atlas_ingest_state, AtlasStatus),
             "episode_id": _safe_string(result.episode_id, allow_empty=False),
-            "recipe_id": _optional_string(result.recipe_id),
+            "recipe_id": recipe_id,
             "reasons": _string_list(result.reasons),
         }
     )
@@ -839,7 +892,7 @@ def _relay_task(value: object) -> dict[str, object]:
     attempts = retry["max_attempts"]
     if type(attempts) is not int or not 1 <= attempts <= 3:
         raise _fail("invalid Relay retry policy")
-    return {
+    result: dict[str, object] = {
         "task_id": _identifier(task["task_id"]),
         "kind": _identifier(task["kind"]),
         "title": _safe_string(task["title"], maximum=256),
@@ -860,11 +913,6 @@ def _relay_task(value: object) -> dict[str, object]:
         "required_evidence": _relay_pair_list(
             task["required_evidence"], ("kind", "selector")
         ),
-        "prewarm_for_task_id": (
-            None
-            if task["prewarm_for_task_id"] is None
-            else _identifier(task["prewarm_for_task_id"])
-        ),
         "retry_policy": {
             "max_attempts": attempts,
             "retryable_codes": [
@@ -872,6 +920,9 @@ def _relay_task(value: object) -> dict[str, object]:
             ],
         },
     }
+    if task["prewarm_for_task_id"] is not None:
+        result["prewarm_for_task_id"] = _identifier(task["prewarm_for_task_id"])
+    return result
 
 
 def _relay_edges(value: object) -> list[dict[str, str]]:
@@ -1018,20 +1069,19 @@ def _relay_status_task(value: object) -> dict[str, object]:
         },
         "invalid Relay status task",
     )
-    return {
+    result: dict[str, object] = {
         "task_id": _identifier(task["task_id"]),
         "kind": _identifier(task["kind"]),
         "priority": _nonnegative_int(task["priority"]),
         "state": _identifier(task["state"]),
         "task_version": _nonnegative_int(task["task_version"]),
-        "scope_owner": None
-        if task["scope_owner"] is None
-        else _identifier(task["scope_owner"]),
-        "candidate_id": None
-        if task["candidate_id"] is None
-        else _identifier(task["candidate_id"]),
         "last_lease_epoch": _nonnegative_int(task["last_lease_epoch"]),
     }
+    if task["scope_owner"] is not None:
+        result["scope_owner"] = _identifier(task["scope_owner"])
+    if task["candidate_id"] is not None:
+        result["candidate_id"] = _identifier(task["candidate_id"])
+    return result
 
 
 def _relay_status_lease(value: object) -> dict[str, object]:
@@ -1050,7 +1100,7 @@ def _relay_status_lease(value: object) -> dict[str, object]:
         },
         "invalid Relay lease",
     )
-    return {
+    result: dict[str, object] = {
         "lease_id": _identifier(lease["lease_id"]),
         "task_id": _identifier(lease["task_id"]),
         "action_id": _identifier(lease["action_id"]),
@@ -1058,8 +1108,14 @@ def _relay_status_lease(value: object) -> dict[str, object]:
         "task_version": _nonnegative_int(lease["task_version"]),
         "lease_kind": _identifier(lease["lease_kind"]),
         "state": _identifier(lease["state"]),
-        "released_at": _optional_string(lease["released_at"]),
     }
+    endpoint = _optional_string(lease["endpoint"])
+    if endpoint is not None:
+        result["endpoint"] = endpoint
+    released_at = _optional_string(lease["released_at"])
+    if released_at is not None:
+        result["released_at"] = released_at
+    return result
 
 
 def _relay_candidate(value: object) -> dict[str, object]:
@@ -1081,7 +1137,7 @@ def _relay_candidate(value: object) -> dict[str, object]:
         },
         "invalid Relay candidate",
     )
-    return {
+    result: dict[str, object] = {
         "candidate_id": _identifier(candidate["candidate_id"]),
         "task_id": _identifier(candidate["task_id"]),
         "originating_epoch": _nonnegative_int(candidate["originating_epoch"]),
@@ -1092,11 +1148,13 @@ def _relay_candidate(value: object) -> dict[str, object]:
         "evidence_hashes": [
             _hash(item) for item in _bounded_list(candidate["evidence_hashes"])
         ],
-        "pr_reference": _optional_string(candidate["pr_reference"]),
         "status": _identifier(candidate["status"]),
-        "review_digest": _optional_string(candidate["review_digest"]),
-        "integration_commit": _optional_string(candidate["integration_commit"]),
     }
+    for key in ("pr_reference", "review_digest", "integration_commit"):
+        optional_value = _optional_string(candidate[key])
+        if optional_value is not None:
+            result[key] = optional_value
+    return result
 
 
 def _relay_directive(value: object) -> dict[str, object]:
