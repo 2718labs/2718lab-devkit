@@ -1600,6 +1600,9 @@ class RelayStore:
 
     @staticmethod
     def _run_from_row(row: sqlite3.Row) -> RelayRun:
+        capacity = row["capacity"]
+        if type(capacity) is not int or not 1 <= capacity <= 3:
+            raise RelayStorageFailure()
         return RelayRun(
             run_id=str(row["run_id"]),
             workflow_id=str(row["workflow_id"]),
@@ -1607,7 +1610,7 @@ class RelayStore:
             workspace_id=str(row["workspace_id"]),
             input_snapshot_id=str(row["input_snapshot_id"]),
             base_commit=str(row["base_commit"]),
-            capacity=int(row["capacity"]),
+            capacity=capacity,
             schedule_version=int(row["schedule_version"]),
             created_at=str(row["created_at"]),
         )
@@ -1724,7 +1727,9 @@ class RelayStore:
                     workspace_id TEXT NOT NULL,
                     input_snapshot_id TEXT NOT NULL,
                     base_commit TEXT NOT NULL,
-                    capacity INTEGER NOT NULL CHECK (capacity >= 1),
+                    capacity INTEGER NOT NULL
+                        CHECK (typeof(capacity) = 'integer')
+                        CHECK (capacity BETWEEN 1 AND 3),
                     schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
                     created_at TEXT NOT NULL
                 );

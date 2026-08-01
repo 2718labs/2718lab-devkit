@@ -509,6 +509,69 @@ def test_v3_file_scope_does_not_claim_descendant_paths() -> None:
     assert plan["conflicts"] == []
 
 
+@pytest.mark.parametrize("line_break", ["\r", "\n"])
+@pytest.mark.parametrize(
+    ("field", "member", "code"),
+    [
+        ("title", None, "invalid_task_title"),
+        ("objective", None, "invalid_objective"),
+        ("constraints", "detail", "invalid_constraints"),
+        (
+            "acceptance_criteria",
+            "description",
+            "invalid_acceptance_criteria",
+        ),
+        ("required_evidence", "selector", "invalid_required_evidence"),
+    ],
+)
+def test_v3_rejects_line_breaks_in_bounded_task_text_with_exact_error(
+    line_break: str, field: str, member: str | None, code: str
+) -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    writer = next(task for task in tasks if task["task_id"] == "writer-root")
+    if member is None:
+        writer[field] = f"safe{line_break}forged"
+    else:
+        entries = writer[field]
+        assert isinstance(entries, list)
+        entry = entries[0]
+        assert isinstance(entry, dict)
+        entry[member] = f"safe{line_break}forged"
+
+    with pytest.raises(RelayPlanError) as caught:
+        compile_plan(request, registry_resolver=RegistryResolver())
+
+    assert caught.value.code == code
+
+
+def test_v3_preserves_outer_horizontal_whitespace_normalization() -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    writer = next(task for task in tasks if task["task_id"] == "writer-root")
+    writer["title"] = " \t writer title \t "
+    writer["objective"] = " \t writer objective \t "
+    writer["constraints"][0]["detail"] = " \t constraint detail \t "
+    writer["acceptance_criteria"][0]["description"] = " \t criterion description \t "
+    writer["required_evidence"][0]["selector"] = " \t evidence selector \t "
+
+    compiled = compile_plan(request, registry_resolver=RegistryResolver())
+
+    compiled_writer = next(
+        task for task in compiled["tasks"] if task["task_id"] == "writer-root"
+    )
+    assert compiled_writer["title"] == "writer title"
+    assert compiled_writer["objective"] == "writer objective"
+    assert compiled_writer["constraints"][0]["detail"] == "constraint detail"
+    assert (
+        compiled_writer["acceptance_criteria"][0]["description"]
+        == "criterion description"
+    )
+    assert compiled_writer["required_evidence"][0]["selector"] == "evidence selector"
+
+
 @pytest.mark.parametrize(
     ("capacity", "accepted"),
     [

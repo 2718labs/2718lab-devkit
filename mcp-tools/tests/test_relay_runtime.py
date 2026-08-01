@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_relay.canonical import canonical_hash
+from devkit_relay.compiler import compile_plan
 from devkit_relay.service import RelayError, RelayService
 from devkit_relay.store import RelayStore
 
@@ -20,6 +22,26 @@ _BASE_COMMIT = "a" * 40
 _INPUT_SNAPSHOT = "sha256:" + "b" * 64
 _ATLAS_PACKET = "sha256:" + "c" * 64
 _WORKSPACE_ID = "sha256:" + "d" * 64
+
+
+class CompilerRegistryResolver:
+    """Read-only compiler binding used by compiler-to-runtime closure tests."""
+
+    def resolve(
+        self,
+        *,
+        workflow_id: str,
+        workspace_id: str,
+        input_snapshot_id: str,
+        atlas_packet_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        return {
+            "workflow_id": workflow_id,
+            "workspace_id": workspace_id,
+            "input_snapshot_id": input_snapshot_id,
+            "atlas_packet_ids": list(atlas_packet_ids),
+            "current": True,
+        }
 
 
 def task(
@@ -197,6 +219,48 @@ def plan(*raw_tasks: dict[str, object], capacity: int = 2) -> dict[str, object]:
     return {**body, "plan_hash": canonical_hash(body)}
 
 
+def _compiled_plan(raw_tasks: list[dict[str, object]]) -> dict[str, object]:
+    return compile_plan(
+        {
+            "schema": "2718lab-devkit/relay-compile-request-v1",
+            "workflow_id": "relay-runtime-v3",
+            "workspace_id": _WORKSPACE_ID,
+            "input_snapshot_id": _INPUT_SNAPSHOT,
+            "base_commit": _BASE_COMMIT,
+            "capacity": 3,
+            "tasks": raw_tasks,
+        },
+        registry_resolver=CompilerRegistryResolver(),
+    )
+
+
+def _maximum_graph_plan(graph_kind: str) -> dict[str, object]:
+    raw_tasks = []
+    for index in range(64):
+        task_id = f"graph-{index:02d}"
+        dependencies = (
+            [
+                f"graph-{dependency:02d}"
+                for dependency in range(max(0, index - 32), index)
+            ]
+            if graph_kind == "dependencies"
+            else []
+        )
+        scope_path = (
+            f"mcp-tools/graph-{index:02d}.py"
+            if graph_kind == "dependencies"
+            else "mcp-tools/shared.py"
+        )
+        raw_tasks.append(
+            task(
+                task_id,
+                dependencies=dependencies,
+                write_scope=[{"path": scope_path, "kind": "file"}],
+            )
+        )
+    return _compiled_plan(raw_tasks)
+
+
 def service(tmp_path: Path) -> tuple[RelayService, RelayStore]:
     store = RelayStore(tmp_path / "relay.sqlite3")
     return RelayService(store, capability_secret=b"relay-v3-test-secret"), store
@@ -314,6 +378,168 @@ def test_start_rejects_self_hashed_over_capacity_plan_before_persistence(
     assert caught.value.code == "RELAY_PLAN_INVALID"
     assert str(caught.value) == "RELAY_PLAN_INVALID"
     assert store.database_fingerprint() == before
+
+
+@pytest.mark.parametrize("line_break", ["\r", "\n"])
+@pytest.mark.parametrize(
+    ("field", "member"),
+    [
+        ("title", None),
+        ("objective", None),
+        ("constraints", "detail"),
+        ("acceptance_criteria", "description"),
+        ("required_evidence", "selector"),
+    ],
+)
+def test_start_rejects_self_hashed_line_break_text_before_persistence(
+    tmp_path: Path, line_break: str, field: str, member: str | None
+) -> None:
+    relay, store = service(tmp_path)
+    submitted = plan(
+        task(
+            "writer-text",
+            write_scope=[{"path": "mcp-tools/writer-text.py", "kind": "file"}],
+        ),
+        capacity=1,
+    )
+    tasks = submitted["tasks"]
+    assert isinstance(tasks, list)
+    writer = tasks[0]
+    assert isinstance(writer, dict)
+    if member is None:
+        writer[field] = f"safe{line_break}forged"
+    else:
+        entries = writer[field]
+        assert isinstance(entries, list)
+        entry = entries[0]
+        assert isinstance(entry, dict)
+        entry[member] = f"safe{line_break}forged"
+    _rehash(submitted)
+    before = store.database_fingerprint()
+
+    with pytest.raises(RelayError) as caught:
+        relay.start(
+            {
+                "mode": "create",
+                "plan": submitted,
+                "idempotency_key": f"line-break-{field}-{ord(line_break)}",
+            }
+        )
+
+    assert caught.value.code == "RELAY_PLAN_INVALID"
+    assert str(caught.value) == "RELAY_PLAN_INVALID"
+    assert store.database_fingerprint() == before
+
+
+@pytest.mark.parametrize(
+    ("graph_kind", "edge_field", "edge_count"),
+    [
+        ("dependencies", "dependencies", 1_520),
+        ("conflicts", "conflicts", 2_016),
+    ],
+)
+def test_start_accepts_compiler_maximum_legal_graph(
+    tmp_path: Path, graph_kind: str, edge_field: str, edge_count: int
+) -> None:
+    relay, _store = service(tmp_path)
+    compiled = _maximum_graph_plan(graph_kind)
+    edges = compiled[edge_field]
+    assert isinstance(edges, list)
+    assert len(edges) == edge_count
+
+    created = relay.start(
+        {
+            "mode": "create",
+            "plan": compiled,
+            "idempotency_key": f"maximum-{graph_kind}",
+        }
+    )
+
+    actions = created["host_actions"]
+    assert isinstance(actions, list)
+    assert [action["task_id"] for action in actions] == ["graph-00"]
+
+
+@pytest.mark.parametrize(
+    ("graph_kind", "edge_field", "edge_count"),
+    [
+        ("dependencies", "dependencies", 1_521),
+        ("conflicts", "conflicts", 2_017),
+    ],
+)
+def test_start_rejects_self_hashed_one_over_maximum_graph_before_persistence(
+    tmp_path: Path, graph_kind: str, edge_field: str, edge_count: int
+) -> None:
+    relay, store = service(tmp_path)
+    forged = deepcopy(_maximum_graph_plan(graph_kind))
+    edges = forged[edge_field]
+    assert isinstance(edges, list)
+    edges.append(deepcopy(edges[-1]))
+    assert len(edges) == edge_count
+    _rehash(forged)
+    before = store.database_fingerprint()
+
+    with pytest.raises(RelayError) as caught:
+        relay.start(
+            {
+                "mode": "create",
+                "plan": forged,
+                "idempotency_key": f"one-over-{graph_kind}",
+            }
+        )
+
+    assert caught.value.code == "RELAY_PLAN_INVALID"
+    assert store.database_fingerprint() == before
+
+
+@pytest.mark.parametrize("invalid_capacity", [0, 4, 1.5, "invalid"])
+def test_store_schema_rejects_noninteger_or_out_of_range_capacity(
+    tmp_path: Path, invalid_capacity: object
+) -> None:
+    database = tmp_path / "relay.sqlite3"
+    relay, store = service(tmp_path)
+    relay.start(
+        {
+            "mode": "create",
+            "plan": _capacity_plan(1),
+            "idempotency_key": "capacity-schema",
+        }
+    )
+    before = store.database_fingerprint()
+
+    with sqlite3.connect(database) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE relay_v3_runs SET capacity = ?", (invalid_capacity,)
+            )
+
+    assert store.database_fingerprint() == before
+
+
+@pytest.mark.parametrize("invalid_capacity", [0, 4, 1.5, "invalid"])
+def test_status_rejects_invalid_stored_capacity_as_storage_error(
+    tmp_path: Path, invalid_capacity: object
+) -> None:
+    database = tmp_path / "relay.sqlite3"
+    relay, store = service(tmp_path)
+    relay.start(
+        {
+            "mode": "create",
+            "plan": _capacity_plan(1),
+            "idempotency_key": "capacity-tamper",
+        }
+    )
+    store.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute("UPDATE relay_v3_runs SET capacity = ?", (invalid_capacity,))
+
+    tampered_relay, _tampered_store = service(tmp_path)
+    with pytest.raises(RelayError) as caught:
+        tampered_relay.status("relay-runtime-v3")
+
+    assert caught.value.code == "RELAY_STORAGE_ERROR"
+    assert str(caught.value) == "RELAY_STORAGE_ERROR"
 
 
 def test_start_is_idempotent_and_status_is_read_only(tmp_path: Path) -> None:

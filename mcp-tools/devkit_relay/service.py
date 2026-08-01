@@ -102,6 +102,8 @@ class RelayService:
     )
     _RECOVERY_ACTIONS = frozenset({"stale_recovery", "interruption_recovery"})
     _MAX_TASKS = 64
+    _MAX_DEPENDENCY_EDGES = 1_520
+    _MAX_CONFLICT_EDGES = 2_016
     _MAX_TEXT = 2_048
 
     def __init__(self, store: RelayStore, *, capability_secret: bytes | str) -> None:
@@ -432,7 +434,10 @@ class RelayService:
             raise RelayError("RELAY_PLAN_INVALID")
         self._validate_task_relations(tasks)
         dependency_edges = self._validated_edges(
-            value["dependencies"], task_ids, "depends_on"
+            value["dependencies"],
+            task_ids,
+            "depends_on",
+            maximum=self._MAX_DEPENDENCY_EDGES,
         )
         expected_dependencies = [
             {
@@ -446,7 +451,10 @@ class RelayService:
         if dependency_edges != expected_dependencies:
             raise RelayError("RELAY_PLAN_INVALID")
         conflict_edges = self._validated_edges(
-            value["conflicts"], task_ids, "write_scope_conflict"
+            value["conflicts"],
+            task_ids,
+            "write_scope_conflict",
+            maximum=self._MAX_CONFLICT_EDGES,
         )
         expected_conflicts = self._compiler_conflicts(tasks)
         if conflict_edges != expected_conflicts:
@@ -623,9 +631,14 @@ class RelayService:
         return pairs
 
     def _validated_edges(
-        self, value: object, task_ids: list[str], required_kind: str
+        self,
+        value: object,
+        task_ids: list[str],
+        required_kind: str,
+        *,
+        maximum: int,
     ) -> list[dict[str, str]]:
-        if type(value) is not list or len(value) > self._MAX_TASKS * 4:
+        if type(value) is not list or len(value) > maximum:
             raise RelayError("RELAY_PLAN_INVALID")
         entries: list[dict[str, str]] = []
         known = set(task_ids)

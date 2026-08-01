@@ -132,7 +132,7 @@ def _commit_identifier(value: object) -> str:
 
 
 def _bounded_text(value: object, code: str, *, maximum: int = _MAX_TEXT_LENGTH) -> str:
-    if type(value) is not str:
+    if type(value) is not str or "\r" in value or "\n" in value:
         raise RelayPlanError(code)
     normalized = value.strip()
     if not normalized or len(normalized) > maximum:
