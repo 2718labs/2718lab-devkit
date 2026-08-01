@@ -5,9 +5,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
-from typing import Self
+from typing import Callable
 
 import pytest
 
@@ -15,8 +14,8 @@ MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
-import project_index.service as service_module
-from project_index import IndexError, IndexState, ProjectIndexService
+from project_index import IndexError, IndexState, ProjectIndexService  # noqa: E402
+import project_index.service as service_module  # noqa: E402
 
 
 def _service(tmp_path: Path) -> ProjectIndexService:
@@ -54,6 +53,9 @@ def test_sync_is_deterministic_and_reuses_unchanged_blobs(tmp_path: Path) -> Non
     (workspace / "notes.md").write_text("# Notes\n", encoding="utf-8")
     service = _service(tmp_path)
     workspace_id = service.project_index_register(workspace)
+    assert workspace_id.startswith("sha256:")
+    assert len(workspace_id) == len("sha256:") + 64
+    assert all(character in "0123456789abcdef" for character in workspace_id[7:])
 
     first = service.sync(workspace_id)
     identical = service.sync(workspace_id)
@@ -1020,7 +1022,7 @@ class _TrackedReader:
         self._before_read = before_read
         self.closed = False
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> _TrackedReader:
         return self
 
     def __exit__(self, *args: object) -> None:
