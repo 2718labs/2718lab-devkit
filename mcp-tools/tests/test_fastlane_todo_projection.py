@@ -96,6 +96,16 @@ def _state_file(tmp_root: Path, workflow_id: str = "workflow-1") -> Path:
     return tmp_root / "fastlane-data" / "fastlane-todo-v1" / workflow_id / "state.json"
 
 
+def _pending_delta_file(tmp_root: Path, workflow_id: str = "workflow-1") -> Path:
+    return (
+        tmp_root
+        / "fastlane-data"
+        / "fastlane-todo-v1"
+        / workflow_id
+        / "pending-delta.json"
+    )
+
+
 def test_reject_unknown_source_fields(tmp_path: Path) -> None:
     projector = _projector(tmp_path)
     payload = json.loads(_source(tasks=[("task-1", "new", 1, "a")]))
@@ -282,7 +292,7 @@ def test_plan_has_exact_buckets_and_one_in_progress(tmp_path: Path) -> None:
     assert any(step["step"].startswith("queued:") for step in steps)
     assert any(step["step"].startswith("done:") for step in steps)
     assert any(step["step"].startswith("closed:") for step in steps)
-    assert "+2 omitted [sha256:" in steps[3]["step"]
+    assert "+1 omitted [sha256:" in steps[3]["step"]
 
 
 def test_debounce_trailing_250ms_and_1s_cap(tmp_path: Path) -> None:
@@ -329,6 +339,82 @@ def test_recover_replays_pending_and_emits_observed_vs_acked(tmp_path: Path) -> 
         now=0.6,
     )
     assert projector.recover("workflow-1")["kind"] == "delta"
+
+
+def test_unacked_pending_preserves_newest_observed_and_recover_follows_up(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(0.0)
+    projector = _projector(tmp_path, clock)
+
+    first = _accept_delta(
+        projector,
+        _source(workflow_state="running", tasks=[("task-1", "new", 1, "x")]),
+        clock,
+        first=0.0,
+        second=0.3,
+    )
+    pending_id = first["delta_id"]
+    assert pending_id.startswith("sha256:")
+
+    state_after_a = json.loads(_state_file(tmp_path).read_text(encoding="utf-8"))
+    observed_fingerprint_a = state_after_a["observed"]["fingerprint"]
+    pending_delta_to_fingerprint = state_after_a["pending_delta"]["to_fingerprint"]
+
+    newer = projector.observe(
+        _source(
+            workflow_state="running",
+            workflow_version=2,
+            tasks=[("task-1", "running", 2, "y")],
+        ),
+        now=0.6,
+    )
+    assert newer["kind"] == "deferred"
+
+    state_after_b = json.loads(_state_file(tmp_path).read_text(encoding="utf-8"))
+    assert state_after_b["observed"]["fingerprint"] == observed_fingerprint_a
+    assert "staged_observed" in state_after_b
+    assert state_after_b["staged_observed"]["fingerprint"] != observed_fingerprint_a
+    assert state_after_b["observed"]["workflow_version"] == 1
+    assert state_after_b["staged_observed"]["workflow_version"] == 2
+    assert state_after_b["pending_delta"]["delta_id"] == pending_id
+    assert (
+        state_after_b["pending_delta"]["to_fingerprint"] == pending_delta_to_fingerprint
+    )
+    assert state_after_b["pending_delta"]["from_fingerprint"] == ""
+
+    pending_file = json.loads(_pending_delta_file(tmp_path).read_text(encoding="utf-8"))
+    assert pending_file["delta_id"] == pending_id
+
+    restarted = _projector(tmp_path, clock)
+    recovered_a = restarted.recover("workflow-1")
+    assert recovered_a["kind"] == "delta"
+    assert recovered_a["delta"]["delta_id"] == pending_id
+
+    assert restarted.ack("workflow-1", pending_id)["kind"] == "noop"
+
+    follow = restarted.recover("workflow-1")
+    assert follow["kind"] == "delta"
+    follow_id = follow["delta"]["delta_id"]
+    assert follow["delta"]["from_fingerprint"] == pending_delta_to_fingerprint
+    assert (
+        follow["delta"]["to_fingerprint"]
+        == state_after_b["staged_observed"]["fingerprint"]
+    )
+
+    with pytest.raises(mod.FastlaneTodoError) as exc:
+        restarted.ack("workflow-1", pending_id)
+    assert exc.value.code == "ACK_UNKNOWN"
+
+    assert restarted.ack("workflow-1", follow_id)["kind"] == "noop"
+    pending_file_after_follow = _pending_delta_file(tmp_path)
+    assert not pending_file_after_follow.exists()
+
+    state_path_ids = {
+        state_payload["pending_delta"]["delta_id"]
+        for state_payload in [state_after_a, state_after_b]
+    }
+    assert len(state_path_ids) == 1
 
 
 def test_ack_stale_and_unknown_ids(tmp_path: Path) -> None:

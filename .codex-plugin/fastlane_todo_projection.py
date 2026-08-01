@@ -85,7 +85,7 @@ DEBOUNCE_DELAY: Final = 0.250
 DEBOUNCE_CAP: Final = 1.0
 MAX_TRANSITIONS: Final = 65
 MAX_PLAN_ITEMS: Final = 6
-MAX_STEP_TASKS: Final = 7
+MAX_STEP_TASKS: Final = 8
 MAX_STEP_CHARS: Final = 512
 MAX_TITLE_CHARS: Final = 128
 HASH_PREFIX: Final = 12
@@ -283,6 +283,7 @@ class FastlaneTodoState:
     observed: FastlaneTodoObservedState
     pending_delta: FastlaneTodoDelta | None = None
     debounce: FastlaneTodoDebounceState | None = None
+    staged_observed: FastlaneTodoObservedState | None = None
 
 
 def _is_reachable(
@@ -746,7 +747,7 @@ def _parse_delta(payload: Mapping[str, Any], path: str) -> FastlaneTodoDelta:
 def _parse_state(payload: Any, workflow_id: str) -> FastlaneTodoState:
     raw = _require_nonempty_mapping(payload, "state")
     allowed = {"schema", "workflow_id", "generation", "acked", "observed"}
-    optional = {"pending_delta", "debounce"}
+    optional = {"pending_delta", "debounce", "staged_observed"}
     if set(raw) - allowed - optional:
         raise FastlaneTodoError("FASTLANE_STATE_CORRUPT", "state has unexpected fields")
     if not allowed.issubset(raw):
@@ -776,6 +777,12 @@ def _parse_state(payload: Any, workflow_id: str) -> FastlaneTodoState:
             _require_mapping(raw["pending_delta"], "state.pending_delta"),
             "state.pending_delta",
         )
+    staged = None
+    if raw.get("staged_observed") is not None:
+        staged = _parse_observed(
+            _require_mapping(raw["staged_observed"], "state.staged_observed"),
+            "state.staged_observed",
+        )
     debounce = None
     if raw.get("debounce") is not None:
         debounce = _parse_debounce(
@@ -791,6 +798,7 @@ def _parse_state(payload: Any, workflow_id: str) -> FastlaneTodoState:
         observed=observed,
         pending_delta=pending,
         debounce=debounce,
+        staged_observed=staged,
     )
 
 
@@ -808,6 +816,7 @@ def _default_state(workflow_id: str) -> FastlaneTodoState:
         ),
         pending_delta=None,
         debounce=None,
+        staged_observed=None,
     )
 
 
@@ -846,6 +855,21 @@ def _serialize_state(state: FastlaneTodoState) -> dict[str, Any]:
             "epoch": state.debounce.epoch,
             "first_seen_at": state.debounce.first_seen_at,
             "due_at": state.debounce.due_at,
+        }
+    if state.staged_observed is not None:
+        payload["staged_observed"] = {
+            "fingerprint": state.staged_observed.fingerprint,
+            "workflow_state": state.staged_observed.workflow_state,
+            "workflow_version": state.staged_observed.workflow_version,
+            "tasks": [
+                {
+                    "id": task.task_id,
+                    "title": task.title,
+                    "state": task.state,
+                    "version": task.version,
+                }
+                for task in state.staged_observed.tasks
+            ],
         }
     return payload
 
@@ -1217,10 +1241,8 @@ class FastlaneTodoProjector:
                     acked=state.acked,
                     observed=state.observed,
                     pending_delta=state.pending_delta,
-                    debounce=_advance_debounce(
-                        state.debounce if state.debounce is not None else None,
-                        now_value,
-                    ),
+                    debounce=_advance_debounce(state.debounce, now_value),
+                    staged_observed=observed,
                 )
                 self._write(snapshot.workflow_id, state, state.pending_delta)
                 return _serialize_event("deferred", snapshot.workflow_id, None)
@@ -1234,6 +1256,7 @@ class FastlaneTodoProjector:
                     observed=observed,
                     pending_delta=None,
                     debounce=None,
+                    staged_observed=None,
                 )
                 self._write(snapshot.workflow_id, state, None)
                 return _serialize_event("noop", snapshot.workflow_id, None)
@@ -1258,6 +1281,7 @@ class FastlaneTodoProjector:
                     observed=observed,
                     pending_delta=delta,
                     debounce=None,
+                    staged_observed=None,
                 )
                 self._write(snapshot.workflow_id, state, delta)
                 return _serialize_event(
@@ -1277,6 +1301,7 @@ class FastlaneTodoProjector:
                         first_seen_at=debounce.first_seen_at,
                         due_at=debounce.due_at,
                     ),
+                    staged_observed=None,
                 )
                 self._write(snapshot.workflow_id, state, None)
                 return _serialize_event("deferred", snapshot.workflow_id, None)
@@ -1290,6 +1315,7 @@ class FastlaneTodoProjector:
                 observed=observed,
                 pending_delta=delta,
                 debounce=None,
+                staged_observed=None,
             )
             self._write(snapshot.workflow_id, state, delta)
             return _serialize_event(
@@ -1318,6 +1344,7 @@ class FastlaneTodoProjector:
                 observed=state.observed,
                 pending_delta=delta,
                 debounce=None,
+                staged_observed=state.staged_observed,
             )
             self._write(workflow_id, state, delta)
             return _serialize_event("delta", workflow_id, _serialize_delta(delta))
@@ -1352,9 +1379,10 @@ class FastlaneTodoProjector:
                 workflow_id=state.workflow_id,
                 generation=state.generation + 1,
                 acked=acked,
-                observed=state.observed,
+                observed=state.staged_observed or state.observed,
                 pending_delta=None,
                 debounce=None,
+                staged_observed=None,
             )
             self._write(workflow_id, state, None)
             return _serialize_event("noop", workflow_id, None)
