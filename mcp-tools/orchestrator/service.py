@@ -1122,7 +1122,9 @@ class OrchestratorService:
         if index_service is None:
             raise self._receipt_evidence_incomplete()
         try:
-            workspace_root = index_service.workspace_authority.resolve(workspace_id).root
+            workspace_root = index_service.workspace_authority.resolve(
+                workspace_id
+            ).root
             expected_workspace_hash = ReceiptRepository.workspace_hash_for(
                 repository, str(workspace_root)
             )
