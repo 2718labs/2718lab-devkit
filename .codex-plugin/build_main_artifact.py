@@ -7,27 +7,32 @@ import argparse
 import json
 import os
 import stat
+import sys
 import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
+
+# ``spec_from_file_location`` users do not automatically receive this script's
+# directory on sys.path. The adjacent stdlib-only security backend is part of
+# the standalone builder, so bind exactly that directory before importing it.
+_BUILDER_DIRECTORY = str(Path(__file__).resolve().parent)
+if _BUILDER_DIRECTORY not in sys.path:
+    sys.path.insert(0, _BUILDER_DIRECTORY)
+
+from artifact_secure_io import (
+    ARTIFACT_IO_FAILED,
+    ARTIFACT_OUTPUT_UNSAFE,
+    ArtifactSecureIOError,
+    FrozenMember,
+    copy_frozen_member,
+    get_secure_backend,
+)
 
 ALLOWLIST_NAME = "main-artifact-allowlist.json"
 ALLOWLIST_SCHEMA = "2718lab-devkit/main-artifact-allowlist-v1"
 ARCHIVE_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 ARCHIVE_MODE = stat.S_IFREG | 0o644
-REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-IGNORED_DIRECTORIES = frozenset(
-    {
-        ".mypy_cache",
-        ".pytest_cache",
-        ".pyright",
-        ".ruff_cache",
-        ".venv",
-        "__pycache__",
-        "venv",
-    }
-)
-IGNORED_SUFFIXES = frozenset({".pyc", ".pyo"})
 
 
 class ArtifactBuildError(ValueError):
@@ -102,17 +107,17 @@ def _read_paths(payload: dict[str, object], field: str) -> tuple[PurePosixPath, 
 
 
 def load_allowlist(
-    path: Path,
+    payload_bytes: bytes,
 ) -> tuple[tuple[PurePosixPath, ...], tuple[PurePosixPath, ...]]:
-    """Load one closed-schema allowlist without accepting aliases or globs."""
+    """Parse one closed-schema allowlist read from its verified source handle."""
 
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload_bytes.decode("utf-8", errors="strict"),
             object_pairs_hook=_reject_duplicate_json_keys,
         )
-    except OSError as error:
-        raise ArtifactBuildError(f"cannot read artifact allowlist: {path}") from error
+    except UnicodeDecodeError as error:
+        raise ArtifactBuildError("artifact allowlist is not valid UTF-8") from error
     except json.JSONDecodeError as error:
         raise ArtifactBuildError("artifact allowlist is not valid JSON") from error
     if not isinstance(payload, dict) or set(payload) != {"schema", "files", "trees"}:
@@ -128,41 +133,20 @@ def load_allowlist(
 
 
 def _is_within(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
-
-
-def _safe_lstat(path: Path) -> os.stat_result:
     try:
-        metadata = path.lstat()
-    except OSError as error:
-        raise ArtifactBuildError(
-            f"selected artifact path is unavailable: {path}"
-        ) from error
-    attributes = int(getattr(metadata, "st_file_attributes", 0))
-    if stat.S_ISLNK(metadata.st_mode) or attributes & REPARSE_POINT:
-        raise ArtifactBuildError(f"selected artifact path is a reparse point: {path}")
-    return metadata
+        return os.path.commonpath((path, root)) == str(root)
+    except ValueError:
+        return False
 
 
-def _selected_path(root: Path, relative: PurePosixPath) -> tuple[Path, os.stat_result]:
-    current = root
-    metadata: os.stat_result | None = None
-    for part in relative.parts:
-        current /= part
-        metadata = _safe_lstat(current)
-    if metadata is None:
-        raise ArtifactBuildError("selected artifact path is empty")
-    try:
-        resolved = current.resolve(strict=True)
-    except OSError as error:
-        raise ArtifactBuildError(
-            f"selected artifact path is unavailable: {current}"
-        ) from error
-    if not _is_within(resolved, root):
-        raise ArtifactBuildError(
-            f"selected artifact path escapes plugin root: {current}"
-        )
-    return current, metadata
+def _relative_parts_inside_root(
+    root: Path, candidate: Path, *, label: str
+) -> tuple[str, ...]:
+    absolute = Path(os.path.abspath(candidate))
+    if not _is_within(absolute, root) or absolute == root:
+        raise ArtifactBuildError(f"{label} must be inside the plugin root")
+    relative = PurePosixPath(absolute.relative_to(root).as_posix())
+    return tuple(_safe_relative_path(relative.as_posix(), field=label).parts)
 
 
 def _add_file(
@@ -171,6 +155,8 @@ def _add_file(
     root: Path,
     path: Path,
 ) -> None:
+    """Retain the locked NFC/case-fold archive-name collision contract."""
+
     archive_name = path.relative_to(root).as_posix()
     folded = unicodedata.normalize("NFC", archive_name).casefold()
     if folded in aliases:
@@ -179,85 +165,35 @@ def _add_file(
     aliases[folded] = archive_name
 
 
-def _enumerate_tree(
-    selected: dict[str, Path],
-    aliases: dict[str, str],
-    root: Path,
-    directory: Path,
-) -> None:
-    try:
-        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-    except OSError as error:
-        raise ArtifactBuildError(
-            f"cannot enumerate selected tree: {directory}"
-        ) from error
-    for entry in entries:
-        path = Path(entry.path)
-        metadata = _safe_lstat(path)
-        try:
-            resolved = path.resolve(strict=True)
-        except OSError as error:
-            raise ArtifactBuildError(
-                f"selected artifact path is unavailable: {path}"
-            ) from error
-        if not _is_within(resolved, root):
-            raise ArtifactBuildError(
-                f"selected artifact path escapes plugin root: {path}"
-            )
-        if stat.S_ISDIR(metadata.st_mode):
-            if path.name in IGNORED_DIRECTORIES:
-                continue
-            _enumerate_tree(selected, aliases, root, path)
-        elif stat.S_ISREG(metadata.st_mode):
-            if path.suffix.casefold() in IGNORED_SUFFIXES:
-                continue
-            _add_file(selected, aliases, root, path)
-        else:
-            raise ArtifactBuildError(
-                f"selected artifact path is not a regular file: {path}"
-            )
-
-
-def artifact_paths(root: Path, allowlist_path: Path) -> list[tuple[str, Path]]:
-    """Return closed, validated archive-name/source-path pairs."""
-
-    files, trees = load_allowlist(allowlist_path)
-    selected: dict[str, Path] = {}
+def _validate_member_aliases(members: list[FrozenMember]) -> list[FrozenMember]:
     aliases: dict[str, str] = {}
-    for relative in files:
-        path, metadata = _selected_path(root, relative)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ArtifactBuildError(f"allowlisted file is not regular: {relative}")
-        _add_file(selected, aliases, root, path)
-    for relative in trees:
-        path, metadata = _selected_path(root, relative)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ArtifactBuildError(f"allowlisted tree is not a directory: {relative}")
-        _enumerate_tree(selected, aliases, root, path)
-    return sorted(selected.items())
+    for member in members:
+        folded = unicodedata.normalize("NFC", member.archive_name).casefold()
+        previous = aliases.get(folded)
+        if previous is not None:
+            raise ArtifactBuildError(f"duplicate archive name: {member.archive_name}")
+        aliases[folded] = member.archive_name
+    return sorted(members, key=lambda member: member.archive_name)
 
 
-def _root_path(plugin_root: Path) -> Path:
-    metadata = _safe_lstat(plugin_root)
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise ArtifactBuildError(f"plugin root is not a directory: {plugin_root}")
-    try:
-        return plugin_root.resolve(strict=True)
-    except OSError as error:
-        raise ArtifactBuildError(
-            f"plugin root is unavailable: {plugin_root}"
-        ) from error
-
-
-def _inside_root_path(root: Path, candidate: Path, *, label: str) -> Path:
-    absolute = Path(os.path.abspath(candidate))
-    if not _is_within(absolute, root):
-        raise ArtifactBuildError(f"{label} must be inside the plugin root")
-    relative = PurePosixPath(absolute.relative_to(root).as_posix())
-    path, metadata = _selected_path(root, relative)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ArtifactBuildError(f"{label} is not a regular file")
-    return path
+def _write_deterministic_zip(
+    archive_file: BinaryIO,
+    spool: BinaryIO,
+    members: list[FrozenMember],
+) -> None:
+    with zipfile.ZipFile(
+        archive_file,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as archive:
+        for member in members:
+            info = zipfile.ZipInfo(member.archive_name, date_time=ARCHIVE_TIMESTAMP)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = ARCHIVE_MODE << 16
+            with archive.open(info, "w", force_zip64=True) as destination:
+                copy_frozen_member(spool, member, destination)
 
 
 def build_main_artifact(
@@ -266,36 +202,71 @@ def build_main_artifact(
     *,
     allowlist_path: Path | None = None,
 ) -> list[str]:
-    """Build one deterministic ZIP after validating every selected path."""
+    """Freeze selected sources, build privately, and atomically replace a name."""
 
-    root = _root_path(plugin_root)
+    root_path = Path(os.path.abspath(plugin_root))
     output_absolute = Path(os.path.abspath(output))
-    output_resolved = output_absolute.resolve(strict=False)
-    if _is_within(output_absolute, root) or _is_within(output_resolved, root):
-        raise ArtifactBuildError("artifact output must be outside the plugin root")
-    if output_absolute.exists():
-        _safe_lstat(output_absolute)
-
-    allowlist = _inside_root_path(
-        root,
-        allowlist_path or root / ".codex-plugin" / ALLOWLIST_NAME,
+    if output_absolute.parent == output_absolute:
+        raise ArtifactBuildError(
+            f"{ARTIFACT_OUTPUT_UNSAFE}: output has no safe destination name"
+        )
+    if _is_within(output_absolute, root_path):
+        raise ArtifactBuildError(
+            f"{ARTIFACT_OUTPUT_UNSAFE}: artifact output must be outside the plugin root"
+        )
+    allowlist_parts = _relative_parts_inside_root(
+        root_path,
+        allowlist_path or root_path / ".codex-plugin" / ALLOWLIST_NAME,
         label="artifact allowlist",
     )
-    files = artifact_paths(root, allowlist)
-    output_absolute.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(
-        output_absolute,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=9,
-    ) as archive:
-        for archive_name, source in files:
-            info = zipfile.ZipInfo(archive_name, date_time=ARCHIVE_TIMESTAMP)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.create_system = 3
-            info.external_attr = ARCHIVE_MODE << 16
-            archive.writestr(info, source.read_bytes(), compresslevel=9)
-    return [archive_name for archive_name, _source in files]
+
+    try:
+        backend = get_secure_backend()
+        with (
+            backend.open_root(root_path) as source_root,
+            backend.open_output_parent(
+                output_absolute.parent,
+                source_root=source_root,
+            ) as publisher,
+        ):
+            allowlist_payload = source_root.read_control(allowlist_parts)
+            files, trees = load_allowlist(allowlist_payload)
+            spool = publisher.create_private_spool()
+            selected_names: set[str] = set()
+            members: list[FrozenMember] = []
+            for relative in files:
+                archive_name = relative.as_posix()
+                if archive_name in selected_names:
+                    raise ArtifactBuildError(f"duplicate archive name: {archive_name}")
+                selected_names.add(archive_name)
+                members.append(
+                    source_root.freeze_file(
+                        relative.parts,
+                        archive_name,
+                        spool,
+                    )
+                )
+            for relative in trees:
+                members.extend(
+                    source_root.freeze_tree(
+                        relative.parts,
+                        selected_names,
+                        spool,
+                    )
+                )
+            members = _validate_member_aliases(members)
+            zip_temp = publisher.create_zip_temp()
+            _write_deterministic_zip(zip_temp, spool, members)
+            publisher.publish(output_absolute.name)
+            return [member.archive_name for member in members]
+    except ArtifactBuildError:
+        raise
+    except ArtifactSecureIOError as error:
+        raise ArtifactBuildError(str(error)) from error
+    except (OSError, zipfile.BadZipFile) as error:
+        raise ArtifactBuildError(
+            f"{ARTIFACT_IO_FAILED}: private artifact build failed"
+        ) from error
 
 
 def main() -> None:
@@ -308,7 +279,7 @@ def main() -> None:
             args.output,
             allowlist_path=args.allowlist,
         )
-    except (ArtifactBuildError, OSError) as error:
+    except ArtifactBuildError as error:
         raise SystemExit(f"artifact build rejected: {error}") from error
     print(f"Wrote {len(paths)} files to {args.output}")
 
