@@ -26,8 +26,14 @@ from devkit_relay.proofs import (
     IntegrationExpectation,
     IntegrationProofError,
     IntegrationProofReceipt,
-    IntegrationProofReservation,
     IntegrationProofResolver,
+    ProofFinalizationEvidence,
+    ProofFinalizationFence,
+    RelayFinalizationAuthority,
+    RelayProofReservation,
+    Settlement,
+    validate_finalization_evidence,
+    validate_finalization_fence,
     validate_integration_proof,
 )
 
@@ -35,18 +41,29 @@ _DIGEST: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _REF: Final = re.compile(r"refs/[A-Za-z0-9][A-Za-z0-9._/-]{0,510}\Z")
 _TOKEN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,127}\Z")
 _OID: Final = re.compile(r"[0-9a-f]+\Z")
-_RESERVATION_TOKEN: Final = re.compile(r"[0-9a-f]{32}\Z")
 _DELTA_SCHEMA: Final = "2718lab-devkit/relay-integration-tree-delta-v1"
 _TARGET_SCHEMA: Final = "2718lab-devkit/relay-proof-target-v1"
 _MAX_GIT_SECONDS: Final = 15
-_REGISTRY_SCHEMA_VERSION: Final = 1
+_REGISTRY_SCHEMA_VERSION: Final = 2
 _REGISTRY_COLUMNS: Final = (
     "proof_id",
     "expectation_hash",
     "target_key",
     "receipt_json",
     "state",
-    "reservation_token",
+    "reservation_epoch",
+    "finalization_id",
+    "fence_json",
+    "fence_hash",
+    "settlement_result_hash",
+)
+_REGISTRY_EVENT_COLUMNS: Final = (
+    "event_id",
+    "proof_id",
+    "reservation_epoch",
+    "event_kind",
+    "fence_hash",
+    "result_hash",
 )
 _REGISTRY_TABLE_SQL: Final = """
 CREATE TABLE relay_host_integration_proofs (
@@ -67,15 +84,37 @@ CREATE TABLE relay_host_integration_proofs (
     ),
     receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),
     state TEXT NOT NULL CHECK (state IN ('registered', 'reserved', 'consumed')),
-    reservation_token TEXT CHECK (
-        reservation_token IS NULL OR (
-            length(reservation_token) = 32
-            AND reservation_token NOT GLOB '*[^0-9a-f]*'
+    reservation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (reservation_epoch >= 0),
+    finalization_id TEXT CHECK (
+        finalization_id IS NULL OR (
+            length(finalization_id) = 32
+            AND finalization_id NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    fence_json TEXT CHECK (fence_json IS NULL OR json_valid(fence_json)),
+    fence_hash TEXT CHECK (
+        fence_hash IS NULL OR (
+            length(fence_hash) = 71
+            AND substr(fence_hash, 1, 7) = 'sha256:'
+            AND substr(fence_hash, 8) NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    settlement_result_hash TEXT CHECK (
+        settlement_result_hash IS NULL OR (
+            length(settlement_result_hash) = 71
+            AND substr(settlement_result_hash, 1, 7) = 'sha256:'
+            AND substr(settlement_result_hash, 8) NOT GLOB '*[^0-9a-f]*'
         )
     ),
     CHECK (
-        (state = 'reserved' AND reservation_token IS NOT NULL)
-        OR (state IN ('registered', 'consumed') AND reservation_token IS NULL)
+        (state = 'registered' AND finalization_id IS NULL AND fence_json IS NULL
+         AND fence_hash IS NULL AND settlement_result_hash IS NULL)
+        OR (state = 'reserved' AND reservation_epoch > 0
+            AND finalization_id IS NOT NULL AND fence_json IS NOT NULL
+            AND fence_hash IS NOT NULL AND settlement_result_hash IS NULL)
+        OR (state = 'consumed' AND reservation_epoch > 0
+            AND finalization_id IS NOT NULL AND fence_json IS NOT NULL
+            AND fence_hash IS NOT NULL AND settlement_result_hash IS NOT NULL)
     )
 ) STRICT
 """
@@ -96,6 +135,53 @@ WHERE state IN ('registered', 'reserved')
 """
 _REGISTRY_ACTIVE_INDEX_CREATE_SQL: Final = _REGISTRY_ACTIVE_INDEX_SQL.replace(
     "CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX IF NOT EXISTS ", 1
+)
+_REGISTRY_PENDING_INDEX_SQL: Final = """
+CREATE INDEX relay_host_proof_pending
+ON relay_host_integration_proofs(state, proof_id)
+"""
+_REGISTRY_PENDING_INDEX_CREATE_SQL: Final = _REGISTRY_PENDING_INDEX_SQL.replace(
+    "CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1
+)
+_REGISTRY_EVENTS_TABLE_SQL: Final = """
+CREATE TABLE relay_host_proof_events (
+    event_id INTEGER PRIMARY KEY,
+    proof_id TEXT NOT NULL CHECK (
+        length(proof_id) = 71
+        AND substr(proof_id, 1, 7) = 'sha256:'
+        AND substr(proof_id, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    reservation_epoch INTEGER NOT NULL CHECK (reservation_epoch > 0),
+    event_kind TEXT NOT NULL CHECK (event_kind IN (
+        'reserved', 'git_apply_intent', 'git_applied_observed',
+        'settle_committed', 'consumed', 'settle_aborted',
+        'git_reverted_observed', 'released'
+    )),
+    fence_hash TEXT CHECK (
+        fence_hash IS NULL OR (
+            length(fence_hash) = 71
+            AND substr(fence_hash, 1, 7) = 'sha256:'
+            AND substr(fence_hash, 8) NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    result_hash TEXT CHECK (
+        result_hash IS NULL OR (
+            length(result_hash) = 71
+            AND substr(result_hash, 1, 7) = 'sha256:'
+            AND substr(result_hash, 8) NOT GLOB '*[^0-9a-f]*'
+        )
+    )
+) STRICT
+"""
+_REGISTRY_EVENTS_TABLE_CREATE_SQL: Final = _REGISTRY_EVENTS_TABLE_SQL.replace(
+    "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1
+)
+_REGISTRY_EVENT_INDEX_SQL: Final = """
+CREATE INDEX relay_host_proof_event_epoch
+ON relay_host_proof_events(proof_id, reservation_epoch, event_id)
+"""
+_REGISTRY_EVENT_INDEX_CREATE_SQL: Final = _REGISTRY_EVENT_INDEX_SQL.replace(
+    "CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1
 )
 
 
@@ -193,6 +279,9 @@ def bootstrap_relay_proof_registry(database_path: str | Path) -> None:
             connection.execute(_REGISTRY_TABLE_CREATE_SQL)
             connection.execute(_REGISTRY_INDEX_CREATE_SQL)
             connection.execute(_REGISTRY_ACTIVE_INDEX_CREATE_SQL)
+            connection.execute(_REGISTRY_PENDING_INDEX_CREATE_SQL)
+            connection.execute(_REGISTRY_EVENTS_TABLE_CREATE_SQL)
+            connection.execute(_REGISTRY_EVENT_INDEX_CREATE_SQL)
             connection.execute(f"PRAGMA user_version = {_REGISTRY_SCHEMA_VERSION}")
             _assert_registry_schema(connection)
             connection.execute("COMMIT")
@@ -215,11 +304,13 @@ class _StoredProof:
     target_key: str
     receipt: IntegrationProofReceipt
     state: str
-    reservation_token: str | None
+    reservation_epoch: int
+    fence: ProofFinalizationFence | None
+    settlement_result_hash: str | None
 
 
-class _RegistryReservation(IntegrationProofReservation):
-    """One SQLite write transaction held across the Relay commit boundary."""
+class _RegistryReservation(RelayProofReservation):
+    """A durable, fenced reservation with evidence-only terminal settlement."""
 
     def __init__(
         self,
@@ -227,48 +318,35 @@ class _RegistryReservation(IntegrationProofReservation):
         *,
         proof_id: str,
         receipt: IntegrationProofReceipt,
-        token: str,
-        connection: sqlite3.Connection,
+        fence: ProofFinalizationFence,
     ) -> None:
         self._registry = registry
         self._proof_id = proof_id
         self._receipt = receipt
-        self._token = token
-        self._connection: sqlite3.Connection | None = connection
-        self._finished = False
+        self._fence = fence
+        self._terminal_evidence: ProofFinalizationEvidence | None = None
+        self._settlement: Settlement | None = None
 
     @property
     def receipt(self) -> IntegrationProofReceipt:
         return self._receipt
 
-    def consume(self) -> None:
-        if self._finished:
-            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
-        self._registry._consume(self)
+    @property
+    def fence(self) -> ProofFinalizationFence:
+        return self._fence
 
-    def release(self) -> None:
-        if self._finished:
-            return
-        self._registry._release(self)
-
-    def _finish(self) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        connection = self._connection
-        self._connection = None
-        if connection is not None:
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
-        self._registry._forget(self)
-
-    def __del__(self) -> None:
-        try:
-            self.release()
-        except Exception:
-            pass
+    def settle(self, *, evidence: ProofFinalizationEvidence) -> Settlement:
+        self._registry._validate_terminal_evidence(self._fence, evidence)
+        if self._terminal_evidence is not None:
+            if evidence != self._terminal_evidence or self._settlement is None:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            if self._settlement == "consumed":
+                return "already_consumed"
+            return "already_released"
+        settlement = self._registry._settle(self, evidence)
+        self._terminal_evidence = evidence
+        self._settlement = settlement
+        return settlement
 
 
 class RelayProofRegistry(IntegrationProofResolver):
@@ -303,10 +381,6 @@ class RelayProofRegistry(IntegrationProofResolver):
         return "RelayProofRegistry()"
 
     def close(self) -> None:
-        with self._active_lock:
-            reservations = tuple(self._active.values())
-        for reservation in reservations:
-            reservation.release()
         self._closed = True
 
     def attest_and_register(self, expectation: IntegrationExpectation) -> str:
@@ -319,7 +393,7 @@ class RelayProofRegistry(IntegrationProofResolver):
         existing = self._find_by_expectation(expectation.expectation_hash)
         if existing is not None:
             self._assert_record_matches_target(existing, expectation, target, target_key)
-            self._verify_live_receipt(target, existing.receipt)
+            self._verify_receipt(target, existing.receipt)
             return existing.proof_id
         if self._find_active_target(target_key) is not None:
             raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
@@ -327,13 +401,13 @@ class RelayProofRegistry(IntegrationProofResolver):
         receipt = self._build_receipt(expectation, target)
         proof_id = receipt.proof_id
         self._insert_registered(proof_id, expectation.expectation_hash, target_key, receipt)
-        self._verify_live_receipt(target, receipt)
+        self._verify_receipt(target, receipt)
         return proof_id
 
     def reserve(
         self, proof_id: str, expectation: IntegrationExpectation
-    ) -> IntegrationProofReservation:
-        """Reserve an exact proof exclusively until Relay commits or rolls back."""
+    ) -> RelayProofReservation:
+        """Persist a complete fence before the exact Git base-to-final CAS."""
 
         self._ensure_open()
         if not _valid_digest(proof_id):
@@ -347,23 +421,57 @@ class RelayProofRegistry(IntegrationProofResolver):
         target = self._resolve_target(expectation.workspace_id)
         target_key = _target_key(expectation.workspace_id, target)
         self._assert_record_matches_target(initial, expectation, target, target_key)
+        self._verify_receipt(target, initial.receipt)
+        reservation = self._persist_reservation(
+            proof_id, expectation, target, target_key
+        )
+        try:
+            self._apply_fence_ref(target, reservation.fence, forward=True)
+            self._record_event(
+                reservation.fence,
+                "git_applied_observed",
+                result_hash=None,
+            )
+        except IntegrationProofError:
+            self._forget(reservation)
+            raise
+        return reservation
+
+    def recover_finalizations(self, authority: RelayFinalizationAuthority) -> None:
+        """Reconcile every persisted reservation only from Relay terminal evidence."""
+
+        self._ensure_open()
+        for record in self._pending_reservations():
+            fence = record.fence
+            if fence is None:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            evidence = authority.resolve_or_abort_finalization(fence=fence)
+            if type(evidence) is not ProofFinalizationEvidence:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            reservation = _RegistryReservation(
+                self,
+                proof_id=record.proof_id,
+                receipt=record.receipt,
+                fence=fence,
+            )
+            settlement = reservation.settle(evidence=evidence)
+            if settlement not in {"consumed", "released"}:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+
+    def _persist_reservation(
+        self,
+        proof_id: str,
+        expectation: IntegrationExpectation,
+        target: GitProofTarget,
+        target_key: str,
+    ) -> _RegistryReservation:
         connection = self._connect()
-        transferred = False
         try:
             try:
                 connection.execute("BEGIN IMMEDIATE")
             except sqlite3.Error as error:
                 raise _reservation_database_error(error) from None
-            row = connection.execute(
-                """
-                SELECT proof_id, expectation_hash, target_key, receipt_json,
-                       state, reservation_token
-                FROM relay_host_integration_proofs
-                WHERE proof_id = ?
-                """,
-                (proof_id,),
-            ).fetchone()
-            record = None if row is None else self._decode_record(row)
+            record = self._record_by_proof(connection, proof_id)
             if record is None:
                 raise IntegrationProofError("RELAY_INTEGRATION_PROOF_UNREGISTERED")
             if record.receipt.expectation != expectation:
@@ -371,95 +479,394 @@ class RelayProofRegistry(IntegrationProofResolver):
             self._assert_record_matches_target(record, expectation, target, target_key)
             if record.state == "consumed":
                 raise IntegrationProofError("RELAY_INTEGRATION_PROOF_REPLAY")
+            if record.state == "reserved":
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
             if record.state != "registered":
                 raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
-            self._verify_live_receipt(target, record.receipt)
-            token = uuid.uuid4().hex
+            fence = self._new_fence(
+                proof_id,
+                expectation,
+                target,
+                record.receipt,
+                record.reservation_epoch + 1,
+            )
+            fence_json = _canonical_json(fence.to_dict())
             cursor = connection.execute(
                 """
                 UPDATE relay_host_integration_proofs
-                SET state = 'reserved', reservation_token = ?
+                SET state = 'reserved', reservation_epoch = ?, finalization_id = ?,
+                    fence_json = ?, fence_hash = ?, settlement_result_hash = NULL
                 WHERE proof_id = ? AND state = 'registered'
+                  AND reservation_epoch = ? AND finalization_id IS NULL
                 """,
-                (token, proof_id),
+                (
+                    fence.reservation_epoch,
+                    fence.finalization_id,
+                    fence_json,
+                    fence.fence_hash,
+                    proof_id,
+                    record.reservation_epoch,
+                ),
             )
             if cursor.rowcount != 1:
                 raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
-            reservation = _RegistryReservation(
-                self,
-                proof_id=proof_id,
-                receipt=record.receipt,
-                token=token,
-                connection=connection,
+            self._append_event(
+                connection,
+                fence,
+                "reserved",
+                result_hash=None,
             )
-            with self._active_lock:
-                self._active[proof_id] = reservation
-            transferred = True
-            return reservation
+            self._append_event(
+                connection,
+                fence,
+                "git_apply_intent",
+                result_hash=None,
+            )
+            connection.execute("COMMIT")
         except IntegrationProofError:
+            self._rollback(connection)
             raise
         except sqlite3.Error as error:
+            self._rollback(connection)
             raise _reservation_database_error(error) from None
         finally:
-            if not transferred:
-                try:
-                    connection.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-                connection.close()
+            connection.close()
+        reservation = _RegistryReservation(
+            self,
+            proof_id=proof_id,
+            receipt=record.receipt,
+            fence=fence,
+        )
+        with self._active_lock:
+            self._active[proof_id] = reservation
+        return reservation
 
-    def _consume(self, reservation: _RegistryReservation) -> None:
-        connection = reservation._connection
-        if connection is None:
-            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+    def _settle(
+        self,
+        reservation: _RegistryReservation,
+        evidence: ProofFinalizationEvidence,
+    ) -> Settlement:
+        fence = reservation.fence
+        connection = self._connect()
         try:
-            row = connection.execute(
-                """
-                SELECT state, reservation_token
-                FROM relay_host_integration_proofs
-                WHERE proof_id = ?
-                """,
-                (reservation._proof_id,),
-            ).fetchone()
-            if (
-                row is None
-                or row["state"] != "reserved"
-                or row["reservation_token"] != reservation._token
-            ):
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as error:
+                raise _reservation_database_error(error) from None
+            record = self._record_by_proof(connection, reservation._proof_id)
+            if record is None:
                 raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            if record.state == "consumed":
+                if (
+                    evidence.state != "committed"
+                    or record.fence != fence
+                    or record.settlement_result_hash != evidence.result_hash
+                ):
+                    raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+                connection.execute("COMMIT")
+                return "already_consumed"
+            if record.state == "registered":
+                if (
+                    evidence.state != "aborted"
+                    or not self._released_event(connection, fence)
+                ):
+                    raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+                connection.execute("COMMIT")
+                return "already_released"
+            if record.state != "reserved" or record.fence != fence:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            target = self._resolve_target(fence.workspace_id)
+            self._assert_fence_target(fence, target, record)
+            self._verify_receipt(target, record.receipt)
+            if evidence.state == "committed":
+                self._apply_fence_ref(target, fence, forward=True)
+                self._append_event(
+                    connection,
+                    fence,
+                    "settle_committed",
+                    result_hash=evidence.result_hash,
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE relay_host_integration_proofs
+                    SET state = 'consumed', settlement_result_hash = ?
+                    WHERE proof_id = ? AND state = 'reserved'
+                      AND reservation_epoch = ? AND fence_hash = ?
+                    """,
+                    (
+                        evidence.result_hash,
+                        reservation._proof_id,
+                        fence.reservation_epoch,
+                        fence.fence_hash,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+                self._append_event(
+                    connection,
+                    fence,
+                    "consumed",
+                    result_hash=evidence.result_hash,
+                )
+                connection.execute("COMMIT")
+                self._forget(reservation)
+                return "consumed"
+            self._apply_fence_ref(target, fence, forward=False)
+            self._append_event(
+                connection,
+                fence,
+                "settle_aborted",
+                result_hash=None,
+            )
+            self._append_event(
+                connection,
+                fence,
+                "git_reverted_observed",
+                result_hash=None,
+            )
             cursor = connection.execute(
                 """
                 UPDATE relay_host_integration_proofs
-                SET state = 'consumed', reservation_token = NULL
-                WHERE proof_id = ? AND state = 'reserved' AND reservation_token = ?
+                SET state = 'registered', finalization_id = NULL, fence_json = NULL,
+                    fence_hash = NULL, settlement_result_hash = NULL
+                WHERE proof_id = ? AND state = 'reserved'
+                  AND reservation_epoch = ? AND fence_hash = ?
                 """,
-                (reservation._proof_id, reservation._token),
+                (reservation._proof_id, fence.reservation_epoch, fence.fence_hash),
             )
             if cursor.rowcount != 1:
                 raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            self._append_event(
+                connection,
+                fence,
+                "released",
+                result_hash=None,
+            )
             connection.execute("COMMIT")
+            self._forget(reservation)
+            return "released"
         except IntegrationProofError:
+            self._rollback(connection)
             raise
-        except sqlite3.Error:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
-        else:
-            reservation._finish()
+        except sqlite3.Error as error:
+            self._rollback(connection)
+            raise _reservation_database_error(error) from None
+        finally:
+            connection.close()
 
-    def _release(self, reservation: _RegistryReservation) -> None:
-        connection = reservation._connection
+    @staticmethod
+    def _validate_terminal_evidence(
+        fence: ProofFinalizationFence, evidence: ProofFinalizationEvidence
+    ) -> None:
         try:
-            if connection is not None:
-                connection.execute("ROLLBACK")
+            validate_finalization_evidence(evidence)
+        except ValueError as error:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT") from error
+        if (
+            evidence.state not in {"committed", "aborted"}
+            or evidence.finalization_id != fence.finalization_id
+            or evidence.fence_hash != fence.fence_hash
+        ):
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+
+    def _new_fence(
+        self,
+        proof_id: str,
+        expectation: IntegrationExpectation,
+        target: GitProofTarget,
+        receipt: IntegrationProofReceipt,
+        reservation_epoch: int,
+    ) -> ProofFinalizationFence:
+        fence = ProofFinalizationFence(
+            finalization_id=uuid.uuid4().hex,
+            reservation_epoch=reservation_epoch,
+            integration_proof_id=proof_id,
+            workspace_id=expectation.workspace_id,
+            expectation_key=expectation.candidate_id,
+            expectation_version=expectation.task_version,
+            expectation_hash=expectation.expectation_hash,
+            target_ref=target.integration_ref,
+            base_oid=receipt.predecessor_commit,
+            final_oid=receipt.final_commit,
+        )
+        try:
+            validate_finalization_fence(fence)
+        except ValueError as error:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT") from error
+        return fence
+
+    def _apply_fence_ref(
+        self, target: GitProofTarget, fence: ProofFinalizationFence, *, forward: bool
+    ) -> None:
+        self._assert_fence_target(fence, target, None)
+        source, destination = (
+            (fence.base_oid, fence.final_oid)
+            if forward
+            else (fence.final_oid, fence.base_oid)
+        )
+        current = self._fence_ref_oid(target, fence)
+        if current == destination:
+            return
+        if current != source:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+        self._git(
+            target,
+            "update-ref",
+            fence.target_ref,
+            destination,
+            source,
+            code="RELAY_INTEGRATION_PROOF_CORRUPT",
+        )
+        if self._fence_ref_oid(target, fence) != destination:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+
+    def _fence_ref_oid(
+        self, target: GitProofTarget, fence: ProofFinalizationFence
+    ) -> str:
+        symbolic = self._git(
+            target,
+            "for-each-ref",
+            "--format=%(symref)",
+            fence.target_ref,
+            code="RELAY_INTEGRATION_PROOF_CORRUPT",
+        )
+        if symbolic.strip():
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+        return self._ref_oid(
+            target,
+            fence.target_ref,
+            code="RELAY_INTEGRATION_PROOF_CORRUPT",
+        )
+
+    @staticmethod
+    def _rollback(connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("ROLLBACK")
         except sqlite3.Error:
             pass
-        finally:
-            reservation._finish()
 
     def _forget(self, reservation: _RegistryReservation) -> None:
         with self._active_lock:
             current = self._active.get(reservation._proof_id)
             if current is reservation:
                 self._active.pop(reservation._proof_id, None)
+
+    def _record_by_proof(
+        self, connection: sqlite3.Connection, proof_id: str
+    ) -> _StoredProof | None:
+        row = connection.execute(
+            """
+            SELECT proof_id, expectation_hash, target_key, receipt_json, state,
+                   reservation_epoch, finalization_id, fence_json, fence_hash,
+                   settlement_result_hash
+            FROM relay_host_integration_proofs
+            WHERE proof_id = ?
+            """,
+            (proof_id,),
+        ).fetchone()
+        return None if row is None else self._decode_record(row)
+
+    def _pending_reservations(self) -> tuple[_StoredProof, ...]:
+        try:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT proof_id, expectation_hash, target_key, receipt_json, state,
+                           reservation_epoch, finalization_id, fence_json, fence_hash,
+                           settlement_result_hash
+                    FROM relay_host_integration_proofs
+                    WHERE state = 'reserved'
+                    ORDER BY proof_id
+                    """
+                ).fetchall()
+            finally:
+                connection.close()
+        except IntegrationProofError:
+            raise
+        except sqlite3.Error:
+            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+        return tuple(self._decode_record(row) for row in rows)
+
+    @staticmethod
+    def _append_event(
+        connection: sqlite3.Connection,
+        fence: ProofFinalizationFence,
+        event_kind: str,
+        *,
+        result_hash: str | None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO relay_host_proof_events
+                (proof_id, reservation_epoch, event_kind, fence_hash, result_hash)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                fence.integration_proof_id,
+                fence.reservation_epoch,
+                event_kind,
+                fence.fence_hash,
+                result_hash,
+            ),
+        )
+
+    def _record_event(
+        self,
+        fence: ProofFinalizationFence,
+        event_kind: str,
+        *,
+        result_hash: str | None,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            record = self._record_by_proof(connection, fence.integration_proof_id)
+            if record is None or record.fence != fence:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            self._append_event(connection, fence, event_kind, result_hash=result_hash)
+            connection.execute("COMMIT")
+        except IntegrationProofError:
+            self._rollback(connection)
+            raise
+        except sqlite3.Error as error:
+            self._rollback(connection)
+            raise _reservation_database_error(error) from None
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _released_event(
+        connection: sqlite3.Connection, fence: ProofFinalizationFence
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT 1 FROM relay_host_proof_events
+            WHERE proof_id = ? AND reservation_epoch = ? AND fence_hash = ?
+              AND event_kind = 'released'
+            """,
+            (
+                fence.integration_proof_id,
+                fence.reservation_epoch,
+                fence.fence_hash,
+            ),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _assert_fence_target(
+        fence: ProofFinalizationFence,
+        target: GitProofTarget,
+        record: _StoredProof | None,
+    ) -> None:
+        if (
+            fence.target_ref != target.integration_ref
+            or (record is not None and record.target_key != _target_key(fence.workspace_id, target))
+            or (record is not None and record.receipt.integration_ref != fence.target_ref)
+            or (record is not None and record.receipt.predecessor_commit != fence.base_oid)
+            or (record is not None and record.receipt.final_commit != fence.final_oid)
+        ):
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
 
     def _assert_schema(self) -> None:
         try:
@@ -509,8 +916,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             try:
                 row = connection.execute(
                     """
-                    SELECT proof_id, expectation_hash, target_key, receipt_json,
-                           state, reservation_token
+                    SELECT proof_id, expectation_hash, target_key, receipt_json, state,
+                           reservation_epoch, finalization_id, fence_json, fence_hash,
+                           settlement_result_hash
                     FROM relay_host_integration_proofs
                     WHERE proof_id = ?
                     """,
@@ -530,8 +938,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             try:
                 row = connection.execute(
                     """
-                    SELECT proof_id, expectation_hash, target_key, receipt_json,
-                           state, reservation_token
+                    SELECT proof_id, expectation_hash, target_key, receipt_json, state,
+                           reservation_epoch, finalization_id, fence_json, fence_hash,
+                           settlement_result_hash
                     FROM relay_host_integration_proofs
                     WHERE expectation_hash = ?
                     """,
@@ -551,8 +960,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             try:
                 row = connection.execute(
                     """
-                    SELECT proof_id, expectation_hash, target_key, receipt_json,
-                           state, reservation_token
+                    SELECT proof_id, expectation_hash, target_key, receipt_json, state,
+                           reservation_epoch, finalization_id, fence_json, fence_hash,
+                           settlement_result_hash
                     FROM relay_host_integration_proofs
                     WHERE target_key = ? AND state IN ('registered', 'reserved')
                     LIMIT 1
@@ -573,14 +983,18 @@ class RelayProofRegistry(IntegrationProofResolver):
             expectation_hash = row["expectation_hash"]
             target_key = row["target_key"]
             state = row["state"]
-            token = row["reservation_token"]
+            reservation_epoch = row["reservation_epoch"]
+            finalization_id = row["finalization_id"]
+            fence_json = row["fence_json"]
+            fence_hash = row["fence_hash"]
+            settlement_result_hash = row["settlement_result_hash"]
             if (
                 not _valid_digest(proof_id)
                 or not _valid_digest(expectation_hash)
                 or not _valid_digest(target_key)
                 or state not in {"registered", "reserved", "consumed"}
-                or (token is not None and _RESERVATION_TOKEN.fullmatch(token) is None)
-                or (state == "reserved") != (token is not None)
+                or type(reservation_epoch) is not int
+                or reservation_epoch < 0
             ):
                 raise ValueError
             receipt_json = row["receipt_json"]
@@ -595,15 +1009,62 @@ class RelayProofRegistry(IntegrationProofResolver):
             validate_integration_proof(proof_id, receipt.expectation, receipt)
             if receipt.expectation.expectation_hash != expectation_hash:
                 raise ValueError
+            fence: ProofFinalizationFence | None = None
+            if state == "registered":
+                if any(
+                    value is not None
+                    for value in (
+                        finalization_id,
+                        fence_json,
+                        fence_hash,
+                        settlement_result_hash,
+                    )
+                ):
+                    raise ValueError
+            else:
+                if (
+                    reservation_epoch < 1
+                    or type(finalization_id) is not str
+                    or type(fence_json) is not str
+                    or type(fence_hash) is not str
+                ):
+                    raise ValueError
+                raw_fence = json.loads(
+                    fence_json, object_pairs_hook=_json_object_without_duplicates
+                )
+                if not isinstance(raw_fence, dict) or _canonical_json(raw_fence) != fence_json:
+                    raise ValueError
+                fence = ProofFinalizationFence(**raw_fence)
+                validate_finalization_fence(fence)
+                if (
+                    fence.finalization_id != finalization_id
+                    or fence.reservation_epoch != reservation_epoch
+                    or fence.integration_proof_id != proof_id
+                    or fence.fence_hash != fence_hash
+                ):
+                    raise ValueError
+                if state == "consumed":
+                    if not _valid_digest(settlement_result_hash):
+                        raise ValueError
+                elif settlement_result_hash is not None:
+                    raise ValueError
             return _StoredProof(
                 proof_id=proof_id,
                 expectation_hash=expectation_hash,
                 target_key=target_key,
                 receipt=receipt,
                 state=state,
-                reservation_token=token,
+                reservation_epoch=reservation_epoch,
+                fence=fence,
+                settlement_result_hash=settlement_result_hash,
             )
-        except (IntegrationProofError, KeyError, TypeError, ValueError, UnicodeError):
+        except (
+            IntegrationProofError,
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeError,
+        ):
             raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT") from None
 
     def _assert_record_matches_target(
@@ -639,9 +1100,8 @@ class RelayProofRegistry(IntegrationProofResolver):
                 connection.execute(
                     """
                     INSERT INTO relay_host_integration_proofs
-                    (proof_id, expectation_hash, target_key, receipt_json, state,
-                     reservation_token)
-                    VALUES (?, ?, ?, ?, 'registered', NULL)
+                    (proof_id, expectation_hash, target_key, receipt_json, state)
+                    VALUES (?, ?, ?, ?, 'registered')
                     """,
                     (proof_id, expectation_hash, target_key, receipt_json),
                 )
@@ -717,7 +1177,7 @@ class RelayProofRegistry(IntegrationProofResolver):
         validate_integration_proof(receipt.proof_id, expectation, receipt)
         return receipt
 
-    def _verify_live_receipt(
+    def _verify_receipt(
         self, target: GitProofTarget, receipt: IntegrationProofReceipt
     ) -> None:
         try:
@@ -781,22 +1241,6 @@ class RelayProofRegistry(IntegrationProofResolver):
             or receipt.expectation.candidate_diff_hash != _delta_hash(candidate_delta)
         ):
             raise IntegrationProofError("RELAY_INTEGRATION_TREE_MISMATCH")
-        current = self._ref_oid(target, target.integration_ref)
-        if current == receipt.final_commit:
-            return
-        if current != receipt.predecessor_commit:
-            raise IntegrationProofError("RELAY_INTEGRATION_HEAD_STALE")
-        self._git(
-            target,
-            "update-ref",
-            target.integration_ref,
-            receipt.final_commit,
-            receipt.predecessor_commit,
-            code="RELAY_INTEGRATION_HEAD_STALE",
-        )
-        if self._ref_oid(target, target.integration_ref) != receipt.final_commit:
-            raise IntegrationProofError("RELAY_INTEGRATION_HEAD_STALE")
-
     def _object_format(self, target: GitProofTarget) -> str:
         try:
             value = self._git(
@@ -840,20 +1284,30 @@ class RelayProofRegistry(IntegrationProofResolver):
         if shallow != "false":
             raise IntegrationProofError("RELAY_INTEGRATION_ANCESTRY_INVALID")
 
-    def _ref_oid(self, target: GitProofTarget, reference: str) -> str:
+    def _ref_oid(
+        self,
+        target: GitProofTarget,
+        reference: str,
+        *,
+        code: str = "RELAY_INTEGRATION_HEAD_STALE",
+    ) -> str:
         try:
             value = self._git(
                 target,
                 "rev-parse",
                 "--verify",
                 f"{reference}^{{commit}}",
-                code="RELAY_INTEGRATION_HEAD_STALE",
+                code=code,
             ).decode("ascii").strip()
         except UnicodeError:
-            raise IntegrationProofError("RELAY_INTEGRATION_HEAD_STALE") from None
+            raise IntegrationProofError(code) from None
         object_length = _object_length(self._object_format(target))
         if object_length is None or not _valid_oid(value, object_length):
-            raise IntegrationProofError("RELAY_INTEGRATION_OBJECT_INVALID")
+            raise IntegrationProofError(
+                code
+                if code == "RELAY_INTEGRATION_PROOF_CORRUPT"
+                else "RELAY_INTEGRATION_OBJECT_INVALID"
+            )
         return value
 
     def _tree_oid(self, target: GitProofTarget, commit: str, object_length: int) -> str:
@@ -1176,11 +1630,31 @@ def _assert_registry_schema(connection: sqlite3.Connection) -> None:
     )
     if columns != _REGISTRY_COLUMNS:
         raise sqlite3.DatabaseError
+    events_table = connection.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'relay_host_proof_events'
+        """
+    ).fetchone()
+    if events_table is None or _normalized_sql(events_table[0]) != _normalized_sql(
+        _REGISTRY_EVENTS_TABLE_SQL
+    ):
+        raise sqlite3.DatabaseError
+    event_columns = tuple(
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(relay_host_proof_events)"
+        ).fetchall()
+    )
+    if event_columns != _REGISTRY_EVENT_COLUMNS:
+        raise sqlite3.DatabaseError
     if connection.execute("PRAGMA user_version").fetchone()[0] != _REGISTRY_SCHEMA_VERSION:
         raise sqlite3.DatabaseError
     for name, expected_sql in (
         ("relay_host_proof_target_state", _REGISTRY_INDEX_SQL),
         ("relay_host_proof_active_target", _REGISTRY_ACTIVE_INDEX_SQL),
+        ("relay_host_proof_pending", _REGISTRY_PENDING_INDEX_SQL),
+        ("relay_host_proof_event_epoch", _REGISTRY_EVENT_INDEX_SQL),
     ):
         index = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",

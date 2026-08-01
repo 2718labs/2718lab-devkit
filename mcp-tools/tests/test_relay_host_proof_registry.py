@@ -42,8 +42,10 @@ from devkit_relay.proofs import (
     IntegrationExpectation,
     IntegrationProofError,
     IntegrationProofReceipt,
-    IntegrationProofReservation,
     IntegrationScopeEntry,
+    ProofFinalizationEvidence,
+    ProofFinalizationFence,
+    RelayProofReservation,
 )
 from devkit_relay.service import RelayError, RelayService
 from devkit_relay.store import RelayStore
@@ -133,6 +135,56 @@ def _registry(
     )
 
 
+def _committed_evidence(
+    fence: ProofFinalizationFence,
+) -> ProofFinalizationEvidence:
+    return ProofFinalizationEvidence(
+        finalization_id=fence.finalization_id,
+        state="committed",
+        fence_hash=fence.fence_hash,
+        result_hash="sha256:" + "c" * 64,
+        journal_version=1,
+    )
+
+
+def _aborted_evidence(fence: ProofFinalizationFence) -> ProofFinalizationEvidence:
+    return ProofFinalizationEvidence(
+        finalization_id=fence.finalization_id,
+        state="aborted",
+        fence_hash=fence.fence_hash,
+        result_hash=None,
+        journal_version=1,
+    )
+
+
+class _TerminalFinalizationAuthority:
+    """Deterministic terminal-journal stand-in for registry crash recovery."""
+
+    def __init__(self, *, committed: bool) -> None:
+        self._committed = committed
+
+    def prepare_finalization(
+        self, *, fence: ProofFinalizationFence
+    ) -> ProofFinalizationEvidence:
+        raise AssertionError(f"unexpected prepare for {fence.finalization_id}")
+
+    def resolve_or_abort_finalization(
+        self, *, fence: ProofFinalizationFence
+    ) -> ProofFinalizationEvidence:
+        if self._committed:
+            return _committed_evidence(fence)
+        return _aborted_evidence(fence)
+
+    def find_committed_finalization(
+        self,
+        *,
+        integration_proof_id: str,
+        expectation_hash: str,
+    ) -> ProofFinalizationEvidence | None:
+        del integration_proof_id, expectation_hash
+        return None
+
+
 def _expectation_for(
     *,
     base_commit: str,
@@ -179,7 +231,7 @@ def test_attests_registers_reserves_and_consumes_real_git_proof(tmp_path: Path) 
     with pytest.raises(IntegrationProofError) as busy:
         registry.reserve(proof_id, expectation)
     assert busy.value.code == "RELAY_INTEGRATION_PROOF_BUSY"
-    reservation.consume()
+    assert reservation.settle(evidence=_committed_evidence(reservation.fence)) == "consumed"
 
 
 def test_attestor_rejects_shallow_repository_before_ref_cas(tmp_path: Path) -> None:
@@ -234,7 +286,7 @@ def test_attests_real_sha256_repository_delta(tmp_path: Path) -> None:
         expectation.candidate_base_commit,
         expectation.candidate_head_commit,
     )
-    reservation.consume()
+    assert reservation.settle(evidence=_committed_evidence(reservation.fence)) == "consumed"
 
 
 def test_attestor_rejects_real_tree_object_as_candidate_commit(tmp_path: Path) -> None:
@@ -430,7 +482,7 @@ def test_rejects_every_full_expectation_binding_swap_without_private_leakage(
     assert private_bearer not in repr(registry)
 
 
-def test_concurrent_reservation_is_exclusive_and_release_reopens_same_proof(
+def test_concurrent_reservation_is_exclusive_and_terminal_abort_reopens_same_proof(
     tmp_path: Path,
 ) -> None:
     expectation, repository = _real_git_expectation(tmp_path)
@@ -466,14 +518,14 @@ def test_concurrent_reservation_is_exclusive_and_release_reopens_same_proof(
     assert len(reservations) == 1
     assert errors == ["RELAY_INTEGRATION_PROOF_BUSY"]
     held = reservations[0]
-    assert isinstance(held, IntegrationProofReservation)
-    held.release()
+    assert isinstance(held, RelayProofReservation)
+    assert held.settle(evidence=_aborted_evidence(held.fence)) == "released"
 
     reopened = registry.reserve(proof_id, expectation)
-    reopened.consume()
+    assert reopened.settle(evidence=_committed_evidence(reopened.fence)) == "consumed"
 
 
-def test_stale_reservation_consume_cannot_mutate_successor_token(
+def test_stale_reservation_settlement_cannot_mutate_successor_epoch(
     tmp_path: Path,
 ) -> None:
     expectation, repository = _real_git_expectation(tmp_path)
@@ -481,19 +533,20 @@ def test_stale_reservation_consume_cannot_mutate_successor_token(
     registry = _registry(tmp_path / "relay-proof-registry.sqlite3", target)
     proof_id = registry.attest_and_register(expectation)
     stale = registry.reserve(proof_id, expectation)
-    stale.release()
+    stale_fence = stale.fence
+    assert stale.settle(evidence=_aborted_evidence(stale_fence)) == "released"
     successor = registry.reserve(proof_id, expectation)
 
-    with pytest.raises(IntegrationProofError) as stale_consume:
-        stale.consume()
-    assert stale_consume.value.code == "RELAY_INTEGRATION_PROOF_CORRUPT"
+    with pytest.raises(IntegrationProofError) as stale_settle:
+        successor.settle(evidence=_committed_evidence(stale_fence))
+    assert stale_settle.value.code == "RELAY_INTEGRATION_PROOF_CORRUPT"
     with pytest.raises(IntegrationProofError) as successor_busy:
         registry.reserve(proof_id, expectation)
     assert successor_busy.value.code == "RELAY_INTEGRATION_PROOF_BUSY"
-    successor.consume()
+    assert successor.settle(evidence=_committed_evidence(successor.fence)) == "consumed"
 
 
-def test_orphaned_reservation_recovers_without_late_release_overwriting_new_token(
+def test_orphaned_reservation_recovers_from_terminal_abort_without_late_mutation(
     tmp_path: Path,
 ) -> None:
     expectation, repository = _real_git_expectation(tmp_path)
@@ -502,27 +555,26 @@ def test_orphaned_reservation_recovers_without_late_release_overwriting_new_toke
     registry = _registry(database_path, target)
     proof_id = registry.attest_and_register(expectation)
     crashed = registry.reserve(proof_id, expectation)
-
-    # A process crash closes its SQLite connection without committing the held
-    # reservation transaction.  Closing it here is the deterministic equivalent.
-    connection = getattr(crashed, "_connection", None)
-    assert isinstance(connection, sqlite3.Connection)
-    connection.close()
     recovered_registry = _registry(database_path, target)
+    recovered_registry.recover_finalizations(
+        _TerminalFinalizationAuthority(committed=False)
+    )
     recovered = recovered_registry.reserve(proof_id, expectation)
-    crashed.release()
 
     with pytest.raises(IntegrationProofError) as busy:
         registry.reserve(proof_id, expectation)
     assert busy.value.code == "RELAY_INTEGRATION_PROOF_BUSY"
-    recovered.consume()
+    with pytest.raises(IntegrationProofError) as stale:
+        crashed.settle(evidence=_committed_evidence(crashed.fence))
+    assert stale.value.code == "RELAY_INTEGRATION_PROOF_CORRUPT"
+    assert recovered.settle(evidence=_committed_evidence(recovered.fence)) == "consumed"
 
     with pytest.raises(IntegrationProofError) as replay:
         registry.reserve(proof_id, expectation)
     assert replay.value.code == "RELAY_INTEGRATION_PROOF_REPLAY"
 
 
-def test_rejects_stale_ref_and_corrupt_private_receipt_without_path_disclosure(
+def test_rejects_corrupt_private_receipt_without_path_disclosure(
     tmp_path: Path,
 ) -> None:
     expectation, repository = _real_git_expectation(tmp_path)
@@ -531,20 +583,7 @@ def test_rejects_stale_ref_and_corrupt_private_receipt_without_path_disclosure(
     registry = _registry(database_path, target)
     proof_id = registry.attest_and_register(expectation)
     reservation = registry.reserve(proof_id, expectation)
-    receipt = reservation.receipt
-    reservation.release()
-    _git(
-        repository,
-        "update-ref",
-        target.integration_ref,
-        expectation.candidate_head_commit,
-        receipt.final_commit,
-    )
-
-    with pytest.raises(IntegrationProofError) as stale:
-        registry.reserve(proof_id, expectation)
-    assert stale.value.code == "RELAY_INTEGRATION_HEAD_STALE"
-    assert str(repository) not in str(stale.value)
+    assert reservation.settle(evidence=_aborted_evidence(reservation.fence)) == "released"
 
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -554,6 +593,7 @@ def test_rejects_stale_ref_and_corrupt_private_receipt_without_path_disclosure(
     with pytest.raises(IntegrationProofError) as corrupt:
         registry.reserve(proof_id, expectation)
     assert corrupt.value.code == "RELAY_INTEGRATION_PROOF_CORRUPT"
+    assert str(repository) not in str(corrupt.value)
 
 
 def _full_delta_expectation(
@@ -645,7 +685,7 @@ def test_attestor_covers_full_git_delta_before_cas_ref_update(tmp_path: Path) ->
     assert by_path["mcp-tools/script.sh"].new_mode == "100755"
     assert by_path["mcp-tools/link"].new_mode == "120000"
     assert by_path["mcp-tools/link"].new_type == "blob"
-    reservation.release()
+    assert reservation.settle(evidence=_aborted_evidence(reservation.fence)) == "released"
 
 
 @pytest.mark.parametrize(
@@ -769,7 +809,7 @@ def test_bootstrap_pins_registry_schema_constraints_indexes_and_version(
     digest = "sha256:" + "a" * 64
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
         index_rows = {
             row[1]: (bool(row[2]), bool(row[4]))
             for row in connection.execute(
@@ -778,13 +818,33 @@ def test_bootstrap_pins_registry_schema_constraints_indexes_and_version(
         }
         assert index_rows["relay_host_proof_target_state"] == (False, False)
         assert index_rows["relay_host_proof_active_target"] == (True, True)
+        assert index_rows["relay_host_proof_pending"] == (False, False)
+        assert tuple(
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(relay_host_proof_events)"
+            ).fetchall()
+        ) == (
+            "event_id",
+            "proof_id",
+            "reservation_epoch",
+            "event_kind",
+            "fence_hash",
+            "result_hash",
+        )
+        event_index_rows = {
+            row[1]: (bool(row[2]), bool(row[4]))
+            for row in connection.execute(
+                "PRAGMA index_list(relay_host_proof_events)"
+            ).fetchall()
+        }
+        assert event_index_rows["relay_host_proof_event_epoch"] == (False, False)
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
                 INSERT INTO relay_host_integration_proofs
-                (proof_id, expectation_hash, target_key, receipt_json, state,
-                 reservation_token)
-                VALUES (?, ?, ?, '{}', 'reserved', NULL)
+                (proof_id, expectation_hash, target_key, receipt_json, state)
+                VALUES (?, ?, ?, '{}', 'reserved')
                 """,
                 (digest, digest, digest),
             )
@@ -856,8 +916,8 @@ def test_existing_registry_open_has_zero_database_wal_and_shm_mutation(
     try:
         assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
         connection.execute("BEGIN IMMEDIATE")
+        connection.execute("PRAGMA user_version = 3")
         connection.execute("PRAGMA user_version = 2")
-        connection.execute("PRAGMA user_version = 1")
         connection.execute("COMMIT")
         before = _sqlite_artifact_state(database_path)
         assert all(exists for exists, _, _ in before)
@@ -1036,62 +1096,49 @@ def _reviewed_real_relay_candidate(
     return relay, store, registry, action, candidate_task, proof_id
 
 
-def test_reservation_spans_relay_commit_and_recovers_consume_failure_once(
+def test_reservation_spans_relay_commit_and_recovers_settlement_failure_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     relay, store, registry, action, candidate_task, proof_id = _reviewed_real_relay_candidate(
         tmp_path
     )
     request = _integration_request(relay, action, candidate_task, proof_id)
-    original_integrate = store.integrate_candidate
-    original_consume = registry._consume  # pyright: ignore[reportPrivateUsage]
-    observed_busy: list[str] = []
-    consume_attempts = 0
 
-    def probe_store_commit(
-        workflow_id: str,
-        task_id: str,
-        *,
-        epoch: int,
-        expected_task_version: int,
-        candidate_id: str,
-        proof_id: str,
-        expectation: IntegrationExpectation,
-        receipt: IntegrationProofReceipt,
-    ) -> dict[str, object]:
-        with pytest.raises(IntegrationProofError) as busy:
-            registry.reserve(proof_id, expectation)
-        observed_busy.append(busy.value.code)
-        return original_integrate(
-            workflow_id,
-            task_id,
-            epoch=epoch,
-            expected_task_version=expected_task_version,
-            candidate_id=candidate_id,
-            proof_id=proof_id,
-            expectation=expectation,
-            receipt=receipt,
+    class FailingSettlementReservation:
+        def __init__(self, delegate: RelayProofReservation) -> None:
+            self._delegate = delegate
+
+        @property
+        def receipt(self) -> IntegrationProofReceipt:
+            return self._delegate.receipt
+
+        @property
+        def fence(self) -> ProofFinalizationFence:
+            return self._delegate.fence
+
+        def settle(self, *, evidence: ProofFinalizationEvidence) -> str:
+            del evidence
+            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
+
+    original_reserve = registry.reserve
+
+    def fail_settlement(
+        registered_proof_id: str, expectation: IntegrationExpectation
+    ) -> FailingSettlementReservation:
+        return FailingSettlementReservation(
+            original_reserve(registered_proof_id, expectation)
         )
 
-    def fail_first_consume(reservation: object) -> None:
-        nonlocal consume_attempts
-        consume_attempts += 1
-        if consume_attempts == 1:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
-        assert isinstance(reservation, object)
-        original_consume(reservation)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(store, "integrate_candidate", probe_store_commit)
-    monkeypatch.setattr(registry, "_consume", fail_first_consume)
+    monkeypatch.setattr(registry, "reserve", fail_settlement)
     with pytest.raises(RelayError) as first:
         relay.integrate(request)
-    assert first.value.code == "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+    assert first.value.code == "RELAY_FINALIZATION_PENDING"
     first_status = store.status("relay-runtime-v3")
     first_run = first_status["run"]
     assert isinstance(first_run, dict)
     assert first_run["integration_version"] == 1
-    assert observed_busy == ["RELAY_INTEGRATION_PROOF_BUSY"]
 
+    monkeypatch.setattr(registry, "reserve", original_reserve)
     retried = relay.integrate(request)
     retried_task = retried["task"]
     assert isinstance(retried_task, dict)
@@ -1100,10 +1147,151 @@ def test_reservation_spans_relay_commit_and_recovers_consume_failure_once(
     retry_run = retry_status["run"]
     assert isinstance(retry_run, dict)
     assert retry_run["integration_version"] == 1
-    assert observed_busy == [
-        "RELAY_INTEGRATION_PROOF_BUSY",
-        "RELAY_INTEGRATION_PROOF_BUSY",
-    ]
-    with pytest.raises(RelayError) as replay:
-        relay.integrate(request)
+    replayed = relay.integrate(request)
+    replayed_task = replayed["task"]
+    assert isinstance(replayed_task, dict)
+    assert replayed_task["state"] == "integrated"
+
+
+def test_r4_committed_recovery_rolls_forward_and_consumes_once(
+    tmp_path: Path,
+) -> None:
+    expectation, repository = _real_git_expectation(tmp_path)
+    target = _target(repository)
+    database_path = tmp_path / "relay-proof-registry.sqlite3"
+    registry = _registry(database_path, target)
+    proof_id = registry.attest_and_register(expectation)
+    reservation = registry.reserve(proof_id, expectation)
+    fence = reservation.fence
+
+    assert _git_oid(repository, target.integration_ref) == fence.final_oid
+    _git(
+        repository,
+        "update-ref",
+        target.integration_ref,
+        fence.base_oid,
+        fence.final_oid,
+    )
+
+    restarted = _registry(database_path, target)
+    authority = _TerminalFinalizationAuthority(committed=True)
+    restarted.recover_finalizations(authority)
+    restarted.recover_finalizations(authority)
+
+    assert _git_oid(repository, target.integration_ref) == fence.final_oid
+    with pytest.raises(IntegrationProofError) as replay:
+        restarted.reserve(proof_id, expectation)
     assert replay.value.code == "RELAY_INTEGRATION_PROOF_REPLAY"
+
+
+@pytest.mark.parametrize(
+    ("committed", "ref_before_recovery", "expected_state", "expected_ref"),
+    (
+        (True, "base", "consumed", "final"),
+        (True, "final", "consumed", "final"),
+        (False, "base", "registered", "base"),
+        (False, "final", "registered", "base"),
+    ),
+)
+def test_r5_recovery_reaches_only_terminal_git_and_proof_pairs(
+    tmp_path: Path,
+    committed: bool,
+    ref_before_recovery: str,
+    expected_state: str,
+    expected_ref: str,
+) -> None:
+    expectation, repository = _real_git_expectation(tmp_path)
+    target = _target(repository)
+    database_path = tmp_path / "relay-proof-registry.sqlite3"
+    registry = _registry(database_path, target)
+    proof_id = registry.attest_and_register(expectation)
+    reservation = registry.reserve(proof_id, expectation)
+    fence = reservation.fence
+
+    if ref_before_recovery == "base":
+        _git(
+            repository,
+            "update-ref",
+            target.integration_ref,
+            fence.base_oid,
+            fence.final_oid,
+        )
+
+    restarted = _registry(database_path, target)
+    restarted.recover_finalizations(
+        _TerminalFinalizationAuthority(committed=committed)
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        state = connection.execute(
+            "SELECT state FROM relay_host_integration_proofs WHERE proof_id = ?",
+            (proof_id,),
+        ).fetchone()
+    assert state == (expected_state,)
+    expected_oid = fence.final_oid if expected_ref == "final" else fence.base_oid
+    assert _git_oid(repository, target.integration_ref) == expected_oid
+
+    if expected_state == "registered":
+        successor = restarted.reserve(proof_id, expectation)
+        assert successor.fence.reservation_epoch == fence.reservation_epoch + 1
+        assert successor.settle(evidence=_aborted_evidence(successor.fence)) == "released"
+
+
+def test_r6_stale_epoch_cannot_settle_or_replace_successor_reservation(
+    tmp_path: Path,
+) -> None:
+    expectation, repository = _real_git_expectation(tmp_path)
+    target = _target(repository)
+    registry = _registry(tmp_path / "relay-proof-registry.sqlite3", target)
+    proof_id = registry.attest_and_register(expectation)
+
+    stale = registry.reserve(proof_id, expectation)
+    stale_fence = stale.fence
+    assert stale.settle(evidence=_aborted_evidence(stale_fence)) == "released"
+
+    successor = registry.reserve(proof_id, expectation)
+    assert successor.fence.reservation_epoch == stale_fence.reservation_epoch + 1
+    with pytest.raises(IntegrationProofError) as stale_settle:
+        successor.settle(evidence=_committed_evidence(stale_fence))
+    assert stale_settle.value.code == "RELAY_INTEGRATION_PROOF_CORRUPT"
+    assert _git_oid(repository, target.integration_ref) == successor.fence.final_oid
+    with pytest.raises(IntegrationProofError) as busy:
+        registry.reserve(proof_id, expectation)
+    assert busy.value.code == "RELAY_INTEGRATION_PROOF_BUSY"
+    assert successor.settle(evidence=_aborted_evidence(successor.fence)) == "released"
+
+
+@pytest.mark.parametrize("fault", ("wrong-fence", "third-oid", "symbolic", "missing"))
+def test_r7_rejects_corrupt_evidence_and_ref_without_private_leakage(
+    tmp_path: Path, fault: str
+) -> None:
+    expectation, repository = _real_git_expectation(tmp_path)
+    target = _target(repository)
+    registry = _registry(tmp_path / "relay-proof-registry.sqlite3", target)
+    proof_id = registry.attest_and_register(expectation)
+    reservation = registry.reserve(proof_id, expectation)
+    fence = reservation.fence
+    evidence = _committed_evidence(fence)
+
+    if fault == "wrong-fence":
+        evidence = replace(evidence, fence_hash="sha256:" + "f" * 64)
+    elif fault == "third-oid":
+        _git(
+            repository,
+            "update-ref",
+            target.integration_ref,
+            expectation.candidate_head_commit,
+            fence.final_oid,
+        )
+    elif fault == "symbolic":
+        _git(repository, "symbolic-ref", target.integration_ref, "refs/heads/main")
+    else:
+        _git(repository, "update-ref", "-d", target.integration_ref, fence.final_oid)
+
+    with pytest.raises(IntegrationProofError) as rejected:
+        reservation.settle(evidence=evidence)
+    assert rejected.value.code == "RELAY_INTEGRATION_PROOF_CORRUPT"
+    rendered = str(rejected.value)
+    assert str(repository) not in rendered
+    assert fence.base_oid not in rendered
+    assert fence.final_oid not in rendered
