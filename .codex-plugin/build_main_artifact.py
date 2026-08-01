@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import stat
+import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -76,6 +77,17 @@ def _safe_relative_path(value: object, *, field: str) -> PurePosixPath:
     return relative
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    seen: set[str] = set()
+    values: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ArtifactBuildError(f"artifact allowlist has duplicate key: {key}")
+        seen.add(key)
+        values[key] = value
+    return values
+
+
 def _read_paths(payload: dict[str, object], field: str) -> tuple[PurePosixPath, ...]:
     raw_paths = payload.get(field)
     if not isinstance(raw_paths, list) or not raw_paths:
@@ -95,7 +107,10 @@ def load_allowlist(
     """Load one closed-schema allowlist without accepting aliases or globs."""
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
     except OSError as error:
         raise ArtifactBuildError(f"cannot read artifact allowlist: {path}") from error
     except json.JSONDecodeError as error:
@@ -150,15 +165,26 @@ def _selected_path(root: Path, relative: PurePosixPath) -> tuple[Path, os.stat_r
     return current, metadata
 
 
-def _add_file(selected: dict[str, Path], root: Path, path: Path) -> None:
+def _add_file(
+    selected: dict[str, Path],
+    aliases: dict[str, str],
+    root: Path,
+    path: Path,
+) -> None:
     archive_name = path.relative_to(root).as_posix()
-    folded = archive_name.casefold()
-    if any(existing.casefold() == folded for existing in selected):
+    folded = unicodedata.normalize("NFC", archive_name).casefold()
+    if folded in aliases:
         raise ArtifactBuildError(f"duplicate archive name: {archive_name}")
     selected[archive_name] = path
+    aliases[folded] = archive_name
 
 
-def _enumerate_tree(selected: dict[str, Path], root: Path, directory: Path) -> None:
+def _enumerate_tree(
+    selected: dict[str, Path],
+    aliases: dict[str, str],
+    root: Path,
+    directory: Path,
+) -> None:
     try:
         entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
     except OSError as error:
@@ -181,11 +207,11 @@ def _enumerate_tree(selected: dict[str, Path], root: Path, directory: Path) -> N
         if stat.S_ISDIR(metadata.st_mode):
             if path.name in IGNORED_DIRECTORIES:
                 continue
-            _enumerate_tree(selected, root, path)
+            _enumerate_tree(selected, aliases, root, path)
         elif stat.S_ISREG(metadata.st_mode):
             if path.suffix.casefold() in IGNORED_SUFFIXES:
                 continue
-            _add_file(selected, root, path)
+            _add_file(selected, aliases, root, path)
         else:
             raise ArtifactBuildError(
                 f"selected artifact path is not a regular file: {path}"
@@ -197,16 +223,17 @@ def artifact_paths(root: Path, allowlist_path: Path) -> list[tuple[str, Path]]:
 
     files, trees = load_allowlist(allowlist_path)
     selected: dict[str, Path] = {}
+    aliases: dict[str, str] = {}
     for relative in files:
         path, metadata = _selected_path(root, relative)
         if not stat.S_ISREG(metadata.st_mode):
             raise ArtifactBuildError(f"allowlisted file is not regular: {relative}")
-        _add_file(selected, root, path)
+        _add_file(selected, aliases, root, path)
     for relative in trees:
         path, metadata = _selected_path(root, relative)
         if not stat.S_ISDIR(metadata.st_mode):
             raise ArtifactBuildError(f"allowlisted tree is not a directory: {relative}")
-        _enumerate_tree(selected, root, path)
+        _enumerate_tree(selected, aliases, root, path)
     return sorted(selected.items())
 
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tomllib
+import unicodedata
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -100,6 +102,15 @@ def _run_builder(
         str(output),
     ]
     return subprocess.run(command, text=True, capture_output=True, check=False)
+
+
+def _load_builder_module() -> Any:
+    spec = importlib.util.spec_from_file_location("_artifact_builder", BUILDER)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _expected_names(plugin_root: Path) -> list[str]:
@@ -245,3 +256,51 @@ def test_builder_rejects_junction_or_symlink_escape(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert not output.exists()
+
+
+def test_builder_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    plugin_root = _copy_fixture(tmp_path)
+    allowlist = _load_allowlist(plugin_root / ".codex-plugin" / ALLOWLIST.name)
+    payload = (
+        f"{{"
+        f'"schema":"{allowlist["schema"]}",'
+        f'"files":{json.dumps(allowlist["files"], ensure_ascii=False)},'
+        f'"trees":{json.dumps(allowlist["trees"], ensure_ascii=False)},'
+        f'"schema":"{allowlist["schema"]}"'
+        f"}}"
+    )
+    malicious = (
+        plugin_root / ".codex-plugin" / "malicious-allowlist-duplicate-keys.json"
+    )
+    malicious.write_text(payload, encoding="utf-8")
+    output = tmp_path / "duplicate-json-keys.zip"
+
+    result = _run_builder(plugin_root, output, allowlist=malicious)
+
+    assert result.returncode != 0
+    assert "duplicate" in result.stderr.casefold()
+    assert not output.exists()
+
+
+def test_builder_rejects_nfc_casefold_archive_aliases(tmp_path: Path) -> None:
+    builder = _load_builder_module()
+    root = tmp_path
+    first = root / "nfc-alias-a\u0300.txt"
+    second = root / "nfc-alias-à.txt"
+    first.write_text("decomposed\n", encoding="utf-8")
+    second.write_text("composed\n", encoding="utf-8")
+    assert first.name != second.name
+    assert (
+        unicodedata.normalize("NFC", first.name).casefold()
+        == unicodedata.normalize(
+            "NFC",
+            second.name,
+        ).casefold()
+    )
+    assert first.name.casefold() != second.name.casefold()
+
+    selected: dict[str, Path] = {}
+    aliases: dict[str, str] = {}
+    builder._add_file(selected, aliases, root, first)
+    with pytest.raises(builder.ArtifactBuildError, match="duplicate"):
+        builder._add_file(selected, aliases, root, second)
