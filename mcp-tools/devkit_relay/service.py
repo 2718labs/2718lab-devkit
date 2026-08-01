@@ -12,11 +12,13 @@ from .evidence import CapabilitySigner, RelayCapabilityError
 from .proofs import (
     IntegrationExpectation,
     IntegrationProofError,
-    IntegrationProofReservation,
     IntegrationProofResolver,
+    ProofFinalizationEvidence,
+    RelayProofReservation,
+    validate_finalization_evidence,
     validate_integration_proof,
 )
-from .store import RelayStore, RelayStoreError
+from .store import RelayStorageFailure, RelayStore, RelayStoreError
 
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
@@ -374,7 +376,7 @@ class RelayService:
                 **sol_fields,
             )
         if "integration_proof_id" not in request:
-            raise RelayError("RELAY_INTEGRATION_PROOF_REQUIRED")
+            raise RelayError("RELAY_CANDIDATE_INVALID")
         self._exact_request_fields(
             request,
             base | {"candidate_id", "integration_proof_id"},
@@ -382,49 +384,61 @@ class RelayService:
         candidate_id = self._identifier(request["candidate_id"])
         proof_id = self._proof_id(request["integration_proof_id"])
         if self._integration_proofs is None:
-            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
+            raise RelayError("RELAY_FINALIZATION_PENDING")
+        self._recover_finalizations()
         expectation = self._proof_call(
             self._store.integration_expectation,
             candidate_id=candidate_id,
             proof_id=proof_id,
             **sol_fields,
         )
+        committed = self._finalization_call(
+            self._store.find_committed_finalization,
+            integration_proof_id=proof_id,
+            expectation_hash=expectation.expectation_hash,
+        )
+        if committed is not None:
+            result = self._finalization_call(
+                self._store.committed_finalization_result,
+                integration_proof_id=proof_id,
+                expectation_hash=expectation.expectation_hash,
+            )
+            if result is None:
+                raise RelayError("RELAY_FINALIZATION_CONFLICT")
+            return result
         try:
             reservation = self._integration_proofs.reserve(proof_id, expectation)
         except IntegrationProofError as error:
-            raise RelayError(error.code) from None
+            raise RelayError(self._proof_error_code(error)) from None
         except Exception:
-            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise RelayError("RELAY_FINALIZATION_PENDING") from None
 
         try:
             receipt = reservation.receipt
             validate_integration_proof(proof_id, expectation, receipt)
-            result = self._call(
+            prepared = self._finalization_call(
+                self._store.prepare_finalization,
+                fence=reservation.fence,
+            )
+            if prepared.state != "prepared":
+                raise RelayError("RELAY_FINALIZATION_PENDING")
+            result, committed_evidence = self._finalization_call(
                 self._store.integrate_candidate,
                 candidate_id=candidate_id,
                 proof_id=proof_id,
                 expectation=expectation,
                 receipt=receipt,
+                finalization_fence=reservation.fence,
                 **sol_fields,
             )
-        except IntegrationProofError as error:
-            self._release_proof_reservation(reservation)
-            raise RelayError(error.code) from None
-        except RelayError:
-            self._release_proof_reservation(reservation)
-            raise
-        except Exception:
-            self._release_proof_reservation(reservation)
-            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
-        try:
-            reservation.consume()
-        except IntegrationProofError as error:
-            self._release_proof_reservation(reservation)
-            raise RelayError(error.code) from None
-        except Exception:
-            self._release_proof_reservation(reservation)
-            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
-        return result
+            self._settle_terminal(reservation, committed_evidence)
+            return result
+        except Exception as error:
+            terminal = self._resolve_terminal(reservation)
+            self._settle_terminal(reservation, terminal)
+            if terminal.state == "committed":
+                raise RelayError("RELAY_FINALIZATION_PENDING") from None
+            raise self._finalization_failure(error) from None
 
     def _lifecycle_fields(
         self, request: Mapping[str, Any], *, expected_scope: str
@@ -950,24 +964,132 @@ class RelayService:
         try:
             result = operation(*args, **kwargs)
         except RelayStoreError as error:
-            raise RelayError(error.code) from error
+            raise RelayError(RelayService._store_error_code(error)) from error
         except KeyError as error:
             raise RelayError("RELAY_REQUEST_INVALID") from error
         if type(result) is not IntegrationExpectation:
-            raise RelayError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            raise RelayError("RELAY_FINALIZATION_CONFLICT")
         return result
 
+    def _recover_finalizations(self) -> None:
+        """Run host-private settlement recovery before accepting an integration write."""
+
+        if self._integration_proofs is None:
+            raise RelayError("RELAY_FINALIZATION_PENDING")
+        try:
+            self._integration_proofs.recover_finalizations(self._store)
+        except RelayStoreError as error:
+            raise RelayError(self._store_error_code(error)) from None
+        except IntegrationProofError as error:
+            raise RelayError(self._proof_error_code(error)) from None
+        except Exception:
+            raise RelayError("RELAY_FINALIZATION_PENDING") from None
+
     @staticmethod
-    def _release_proof_reservation(
-        reservation: IntegrationProofReservation,
+    def _finalization_call(operation: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("action", None)
+        try:
+            return operation(*args, **kwargs)
+        except RelayStoreError as error:
+            raise RelayError(RelayService._store_error_code(error)) from error
+        except KeyError as error:
+            raise RelayError("RELAY_FINALIZATION_CONFLICT") from error
+
+    def _resolve_terminal(
+        self, reservation: RelayProofReservation
+    ) -> ProofFinalizationEvidence:
+        evidence = self._finalization_call(
+            self._store.resolve_or_abort_finalization,
+            fence=reservation.fence,
+        )
+        if type(evidence) is not ProofFinalizationEvidence:
+            raise RelayError("RELAY_FINALIZATION_CONFLICT")
+        self._validate_terminal_evidence(reservation, evidence)
+        if evidence.state not in {"committed", "aborted"}:
+            raise RelayError("RELAY_FINALIZATION_PENDING")
+        return evidence
+
+    def _settle_terminal(
+        self,
+        reservation: RelayProofReservation,
+        evidence: ProofFinalizationEvidence,
+    ) -> None:
+        self._validate_terminal_evidence(reservation, evidence)
+        if evidence.state not in {"committed", "aborted"}:
+            raise RelayError("RELAY_FINALIZATION_PENDING")
+        try:
+            settlement = reservation.settle(evidence=evidence)
+        except Exception:
+            recovered = self._resolve_terminal(reservation)
+            try:
+                settlement = reservation.settle(evidence=recovered)
+            except Exception:
+                raise RelayError("RELAY_FINALIZATION_PENDING") from None
+        if settlement not in {
+            "consumed",
+            "released",
+            "already_consumed",
+            "already_released",
+        }:
+            raise RelayError("RELAY_FINALIZATION_CONFLICT")
+
+    @staticmethod
+    def _validate_terminal_evidence(
+        reservation: RelayProofReservation,
+        evidence: ProofFinalizationEvidence,
     ) -> None:
         try:
-            reservation.release()
-        except Exception:
-            pass
+            validate_finalization_evidence(evidence)
+        except ValueError as error:
+            raise RelayError("RELAY_FINALIZATION_CONFLICT") from error
+        if (
+            evidence.finalization_id != reservation.fence.finalization_id
+            or evidence.fence_hash != reservation.fence.fence_hash
+        ):
+            raise RelayError("RELAY_FINALIZATION_CONFLICT")
+
+    @staticmethod
+    def _store_error_code(error: RelayStoreError) -> str:
+        if isinstance(error, RelayStorageFailure) or error.code == "RELAY_STORAGE_ERROR":
+            return "RELAY_STORE_UNAVAILABLE"
+        if error.code in {
+            "RELAY_STATE_STALE",
+            "RELAY_INTEGRATION_HEAD_STALE",
+            "RELAY_INTEGRATION_BINDING_MISMATCH",
+            "RELAY_EXPECTATION_STALE",
+        }:
+            return "RELAY_EXPECTATION_STALE"
+        if error.code in {
+            "RELAY_INTEGRATION_PROOF_INVALID",
+            "RELAY_INTEGRATION_PROOF_UNREGISTERED",
+            "RELAY_INTEGRATION_PROOF_REPLAY",
+        }:
+            return "RELAY_CANDIDATE_INVALID"
+        return "RELAY_FINALIZATION_CONFLICT"
+
+    @staticmethod
+    def _proof_error_code(error: IntegrationProofError) -> str:
+        if error.code in {
+            "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE",
+            "RELAY_INTEGRATION_PROOF_BUSY",
+        }:
+            return "RELAY_FINALIZATION_PENDING"
+        if error.code == "RELAY_INTEGRATION_PROOF_CORRUPT":
+            return "RELAY_FINALIZATION_CONFLICT"
+        return "RELAY_CANDIDATE_INVALID"
+
+    @classmethod
+    def _finalization_failure(cls, error: Exception) -> RelayError:
+        if isinstance(error, RelayError):
+            return RelayError(error.code)
+        if isinstance(error, RelayStoreError):
+            return RelayError(cls._store_error_code(error))
+        if isinstance(error, IntegrationProofError):
+            return RelayError(cls._proof_error_code(error))
+        return RelayError("RELAY_FINALIZATION_PENDING")
 
     @staticmethod
     def _proof_id(value: object) -> str:
         if type(value) is not str or _DIGEST.fullmatch(value) is None:
-            raise RelayError("RELAY_INTEGRATION_PROOF_INVALID")
+            raise RelayError("RELAY_CANDIDATE_INVALID")
         return value

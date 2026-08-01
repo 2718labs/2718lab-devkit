@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from .canonical import canonical_hash
 
@@ -54,35 +54,110 @@ class IntegrationProofError(RuntimeError):
         super().__init__(code)
 
 
+FinalizationState = Literal["prepared", "committed", "aborted"]
+Settlement = Literal[
+    "consumed",
+    "released",
+    "already_consumed",
+    "already_released",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ProofFinalizationFence:
+    """Host-private identity bound to one proof reservation and Git CAS."""
+
+    finalization_id: str
+    reservation_epoch: int
+    integration_proof_id: str
+    workspace_id: str
+    expectation_key: str
+    expectation_version: int
+    expectation_hash: str
+    target_ref: str
+    base_oid: str
+    final_oid: str
+
+    def to_dict(self) -> dict[str, str | int]:
+        return {
+            "finalization_id": self.finalization_id,
+            "reservation_epoch": self.reservation_epoch,
+            "integration_proof_id": self.integration_proof_id,
+            "workspace_id": self.workspace_id,
+            "expectation_key": self.expectation_key,
+            "expectation_version": self.expectation_version,
+            "expectation_hash": self.expectation_hash,
+            "target_ref": self.target_ref,
+            "base_oid": self.base_oid,
+            "final_oid": self.final_oid,
+        }
+
+    @property
+    def fence_hash(self) -> str:
+        """Return the canonical, lowercase hash used by every terminal receipt."""
+
+        return canonical_hash(self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class ProofFinalizationEvidence:
+    """One durable terminal (or prepared) Relay journal observation."""
+
+    finalization_id: str
+    state: FinalizationState
+    fence_hash: str
+    result_hash: str | None
+    journal_version: int
+
+
+class RelayFinalizationAuthority(Protocol):
+    """Durable Relay authority consulted before any Git/proof settlement."""
+
+    def prepare_finalization(
+        self, *, fence: ProofFinalizationFence
+    ) -> ProofFinalizationEvidence: ...
+
+    def resolve_or_abort_finalization(
+        self, *, fence: ProofFinalizationFence
+    ) -> ProofFinalizationEvidence: ...
+
+    def find_committed_finalization(
+        self,
+        *,
+        integration_proof_id: str,
+        expectation_hash: str,
+    ) -> ProofFinalizationEvidence | None: ...
+
+
 @runtime_checkable
-class IntegrationProofReservation(Protocol):
-    """Exclusive registry reservation held across Relay's SQLite commit."""
+class RelayProofReservation(Protocol):
+    """Host reservation whose only terminal operation requires Relay evidence."""
 
     @property
     def receipt(self) -> IntegrationProofReceipt:
-        """Return the immutable receipt registered for the reserved proof."""
+        """Return the private receipt needed for the existing proof validation."""
 
         ...
 
-    def consume(self) -> None:
-        """Mark a successfully persisted proof consumed in the host ledger."""
+    @property
+    def fence(self) -> ProofFinalizationFence: ...
 
-        ...
-
-    def release(self) -> None:
-        """Release a reservation after a failed Relay transaction."""
-
-        ...
+    def settle(self, *, evidence: ProofFinalizationEvidence) -> Settlement: ...
 
 
 @runtime_checkable
 class IntegrationProofResolver(Protocol):
-    """Host-private proof registry and Git-attestation boundary."""
+    """Host-private proof registry, Git-attestation, and recovery boundary."""
 
     def reserve(
         self, proof_id: str, expectation: IntegrationExpectation
-    ) -> IntegrationProofReservation:
+    ) -> RelayProofReservation:
         """Exclusively reserve one registered proof for an exact expectation."""
+
+        ...
+
+    def recover_finalizations(self, authority: RelayFinalizationAuthority) -> None:
+        """Settle every host-private reserved proof from durable Relay evidence."""
 
         ...
 
@@ -421,6 +496,51 @@ class IntegrationProofReceipt:
             attestor_id=_string(data["attestor_id"]),
             attestor_version=_string(data["attestor_version"]),
         )
+
+
+def validate_finalization_fence(fence: ProofFinalizationFence) -> None:
+    """Reject a malformed fence before it can affect durable Relay state."""
+
+    if type(fence) is not ProofFinalizationFence:
+        raise ValueError("invalid finalization fence")
+    if (
+        not _valid_identifier(fence.finalization_id)
+        or type(fence.reservation_epoch) is not int
+        or fence.reservation_epoch < 1
+        or not _valid_digest(fence.integration_proof_id)
+        or not _valid_digest(fence.workspace_id)
+        or not _valid_identifier(fence.expectation_key)
+        or type(fence.expectation_version) is not int
+        or fence.expectation_version < 1
+        or not _valid_digest(fence.expectation_hash)
+        or not _valid_ref(fence.target_ref)
+        or len(fence.base_oid) not in {40, 64}
+        or len(fence.final_oid) not in {40, 64}
+        or not _valid_oid(fence.base_oid, len(fence.base_oid))
+        or not _valid_oid(fence.final_oid, len(fence.final_oid))
+        or len(fence.base_oid) != len(fence.final_oid)
+        or fence.base_oid == fence.final_oid
+    ):
+        raise ValueError("invalid finalization fence")
+
+
+def validate_finalization_evidence(evidence: ProofFinalizationEvidence) -> None:
+    """Reject evidence that cannot authorize a terminal registry mutation."""
+
+    if (
+        type(evidence) is not ProofFinalizationEvidence
+        or not _valid_identifier(evidence.finalization_id)
+        or evidence.state not in {"prepared", "committed", "aborted"}
+        or not _valid_digest(evidence.fence_hash)
+        or type(evidence.journal_version) is not int
+        or evidence.journal_version < 1
+    ):
+        raise ValueError("invalid finalization evidence")
+    if evidence.state == "committed":
+        if not _valid_digest(evidence.result_hash):
+            raise ValueError("invalid committed finalization evidence")
+    elif evidence.result_hash is not None:
+        raise ValueError("invalid nonterminal result hash")
 
 
 def validate_integration_proof(

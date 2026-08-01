@@ -13,7 +13,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .canonical import canonical_bytes, canonical_hash
 from .evidence import validate_evidence
@@ -26,10 +26,15 @@ from .models import (
     RelayTaskState,
 )
 from .proofs import (
+    FinalizationState,
     IntegrationExpectation,
     IntegrationProofError,
     IntegrationProofReceipt,
     IntegrationScopeEntry,
+    ProofFinalizationEvidence,
+    ProofFinalizationFence,
+    validate_finalization_evidence,
+    validate_finalization_fence,
     validate_integration_proof,
 )
 
@@ -88,15 +93,24 @@ class RelayIntegrationHeadStale(RelayStoreError):
     code = "RELAY_INTEGRATION_HEAD_STALE"
 
 
+class RelayExpectationStale(RelayStoreError):
+    code = "RELAY_EXPECTATION_STALE"
+
+
+class RelayFinalizationConflict(RelayStoreError):
+    code = "RELAY_FINALIZATION_CONFLICT"
+
+
 class RelayStore:
     """Own the atomic durable state behind Relay's five public tools."""
 
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
     def __init__(self, database: str | Path) -> None:
+        self._database = str(database)
         self._connection: sqlite3.Connection | None = sqlite3.connect(
-            str(database), isolation_level=None
+            self._database, isolation_level=None
         )
         self._connection.row_factory = sqlite3.Row
         try:
@@ -132,6 +146,8 @@ class RelayStore:
             "relay_v3_evidence",
             "relay_v3_candidates",
             "relay_v3_integration_proofs",
+            "relay_v3_finalization_journal",
+            "relay_v3_finalization_outcomes",
         )
         return canonical_hash(
             {
@@ -879,6 +895,175 @@ class RelayStore:
             return receipt.expectation
         raise RelayStateStale()
 
+    def prepare_finalization(
+        self, *, fence: ProofFinalizationFence
+    ) -> ProofFinalizationEvidence:
+        """Durably create or re-observe a fenced prepared finalization row."""
+
+        self._validate_finalization_fence(fence)
+        now = _utc_now()
+        try:
+            with self._transaction() as cursor:
+                journal = self._finalization_journal(cursor, fence.finalization_id)
+                outcome = self._finalization_outcome(cursor, fence.finalization_id)
+                proof = self._integration_proof(cursor, fence.integration_proof_id)
+                if journal is None:
+                    if outcome is not None or proof is not None:
+                        raise RelayFinalizationConflict()
+                    self._require_current_finalization_expectation(cursor, fence)
+                    cursor.execute(
+                        """
+                        INSERT INTO relay_v3_finalization_journal
+                            (finalization_id, reservation_epoch, integration_proof_id,
+                             workspace_id, expectation_key, expectation_version,
+                             expectation_hash, target_ref, base_oid, final_oid,
+                             fence_hash, state, result_hash, journal_version,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, 1, ?, ?)
+                        """,
+                        (*self._fence_values(fence), now, now),
+                    )
+                    return self._finalization_evidence(
+                        fence, "prepared", None, journal_version=1
+                    )
+
+                self._require_matching_finalization_fence(journal, fence)
+                evidence = self._evidence_from_journal(journal)
+                if evidence.state == "prepared":
+                    if outcome is not None or proof is not None:
+                        raise RelayFinalizationConflict()
+                    self._require_current_finalization_expectation(cursor, fence)
+                    return evidence
+                if evidence.state == "committed":
+                    self._require_committed_finalization(cursor, fence, journal, outcome)
+                    return evidence
+                if outcome is not None or proof is not None:
+                    raise RelayFinalizationConflict()
+                return evidence
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def resolve_or_abort_finalization(
+        self, *, fence: ProofFinalizationFence
+    ) -> ProofFinalizationEvidence:
+        """Serialize the only safe terminal decision after uncertain execution."""
+
+        self._validate_finalization_fence(fence)
+        now = _utc_now()
+        try:
+            with self._recovery_transaction() as cursor:
+                journal = self._finalization_journal(cursor, fence.finalization_id)
+                outcome = self._finalization_outcome(cursor, fence.finalization_id)
+                proof = self._integration_proof(cursor, fence.integration_proof_id)
+                if journal is None:
+                    if outcome is not None or proof is not None:
+                        raise RelayFinalizationConflict()
+                    cursor.execute(
+                        """
+                        INSERT INTO relay_v3_finalization_journal
+                            (finalization_id, reservation_epoch, integration_proof_id,
+                             workspace_id, expectation_key, expectation_version,
+                             expectation_hash, target_ref, base_oid, final_oid,
+                             fence_hash, state, result_hash, journal_version,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aborted', NULL, 1, ?, ?)
+                        """,
+                        (*self._fence_values(fence), now, now),
+                    )
+                    return self._finalization_evidence(
+                        fence, "aborted", None, journal_version=1
+                    )
+
+                self._require_matching_finalization_fence(journal, fence)
+                evidence = self._evidence_from_journal(journal)
+                if evidence.state == "committed":
+                    self._require_committed_finalization(cursor, fence, journal, outcome)
+                    return evidence
+                if evidence.state == "aborted":
+                    if outcome is not None or proof is not None:
+                        raise RelayFinalizationConflict()
+                    return evidence
+                if outcome is not None or proof is not None:
+                    raise RelayFinalizationConflict()
+                journal_version = evidence.journal_version + 1
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_finalization_journal
+                    SET state = 'aborted', result_hash = NULL, journal_version = ?,
+                        updated_at = ?
+                    WHERE finalization_id = ? AND fence_hash = ? AND state = 'prepared'
+                    """,
+                    (journal_version, now, fence.finalization_id, fence.fence_hash),
+                )
+                if cursor.rowcount != 1:
+                    raise RelayFinalizationConflict()
+                return self._finalization_evidence(
+                    fence, "aborted", None, journal_version=journal_version
+                )
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def find_committed_finalization(
+        self,
+        *,
+        integration_proof_id: str,
+        expectation_hash: str,
+    ) -> ProofFinalizationEvidence | None:
+        """Find one exact committed journal decision without exposing its outcome."""
+
+        if _DIGEST.fullmatch(integration_proof_id) is None or _DIGEST.fullmatch(
+            expectation_hash
+        ) is None:
+            raise RelayFinalizationConflict()
+        connection = self._require_connection()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM relay_v3_finalization_journal
+                WHERE integration_proof_id = ? AND expectation_hash = ?
+                  AND state = 'committed'
+                ORDER BY journal_version DESC
+                """,
+                (integration_proof_id, expectation_hash),
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise RelayFinalizationConflict()
+            journal = rows[0]
+            fence = self._fence_from_journal(journal)
+            outcome = self._finalization_outcome(connection, fence.finalization_id)
+            self._require_committed_finalization(connection, fence, journal, outcome)
+            return self._evidence_from_journal(journal)
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def committed_finalization_result(
+        self,
+        *,
+        integration_proof_id: str,
+        expectation_hash: str,
+    ) -> dict[str, object] | None:
+        """Return the bounded pre-existing public result for an exact commit."""
+
+        evidence = self.find_committed_finalization(
+            integration_proof_id=integration_proof_id,
+            expectation_hash=expectation_hash,
+        )
+        if evidence is None:
+            return None
+        connection = self._require_connection()
+        try:
+            outcome = self._finalization_outcome(connection, evidence.finalization_id)
+            if outcome is None:
+                raise RelayFinalizationConflict()
+            result = _decode_json_object(str(outcome["result_json"]))
+            if canonical_hash(result) != outcome["result_hash"]:
+                raise RelayFinalizationConflict()
+            return result
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
     def integrate_candidate(
         self,
         workflow_id: str,
@@ -890,13 +1075,17 @@ class RelayStore:
         proof_id: str,
         expectation: IntegrationExpectation,
         receipt: IntegrationProofReceipt,
-    ) -> dict[str, object]:
-        """Atomically persist a proof, integration, CAS head, and promotions."""
+        finalization_fence: ProofFinalizationFence,
+    ) -> tuple[dict[str, object], ProofFinalizationEvidence]:
+        """Atomically persist the integration outcome and committed journal evidence."""
 
         try:
             validate_integration_proof(proof_id, expectation, receipt)
+            validate_finalization_fence(finalization_fence)
         except IntegrationProofError as error:
             raise RelayStoreError(error.code) from error
+        except ValueError as error:
+            raise RelayFinalizationConflict() from error
         now = _utc_now()
         try:
             with self._transaction() as cursor:
@@ -954,9 +1143,29 @@ class RelayStore:
                         or str(candidate["status"]) != "integrated"
                     ):
                         raise RelayIntegrationProofCorrupt()
-                    return self._mutation_result(
-                        cursor, run, task.task_id, candidate_id=candidate_id
+                    self._require_finalization_integration_fence(
+                        finalization_fence,
+                        proof_id=proof_id,
+                        expectation=persisted.expectation,
+                        receipt=persisted,
                     )
+                    journal = self._finalization_journal(
+                        cursor, finalization_fence.finalization_id
+                    )
+                    outcome = self._finalization_outcome(
+                        cursor, finalization_fence.finalization_id
+                    )
+                    if journal is None:
+                        raise RelayFinalizationConflict()
+                    self._require_matching_finalization_fence(
+                        journal, finalization_fence
+                    )
+                    evidence = self._evidence_from_journal(journal)
+                    self._require_committed_finalization(
+                        cursor, finalization_fence, journal, outcome
+                    )
+                    result = self._outcome_result(outcome)
+                    return result, evidence
 
                 if not fresh:
                     raise RelayStateStale()
@@ -975,6 +1184,24 @@ class RelayStore:
                     validate_integration_proof(proof_id, current, receipt)
                 except IntegrationProofError as error:
                     raise RelayStoreError(error.code) from error
+                self._require_finalization_integration_fence(
+                    finalization_fence,
+                    proof_id=proof_id,
+                    expectation=current,
+                    receipt=receipt,
+                )
+                journal = self._finalization_journal(
+                    cursor, finalization_fence.finalization_id
+                )
+                outcome = self._finalization_outcome(
+                    cursor, finalization_fence.finalization_id
+                )
+                if journal is None:
+                    raise RelayFinalizationConflict()
+                self._require_matching_finalization_fence(journal, finalization_fence)
+                prepared = self._evidence_from_journal(journal)
+                if prepared.state != "prepared" or outcome is not None:
+                    raise RelayFinalizationConflict()
 
                 cursor.execute(
                     """
@@ -1049,9 +1276,55 @@ class RelayStore:
                 self._promote_dependency_safe_tasks(cursor, run.run_id)
                 run = self._increment_schedule_version(cursor, run.run_id)
                 self._refresh_directives(cursor, run, now=now)
-                return self._mutation_result(
+                result = self._mutation_result(
                     cursor, run, task.task_id, candidate_id=candidate_id
                 )
+                result_hash = canonical_hash(result)
+                journal_version = prepared.journal_version + 1
+                cursor.execute(
+                    """
+                    INSERT INTO relay_v3_finalization_outcomes
+                        (finalization_id, fence_hash, integration_proof_id,
+                         expectation_key, expectation_version, expectation_hash,
+                         result_hash, result_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        finalization_fence.finalization_id,
+                        finalization_fence.fence_hash,
+                        finalization_fence.integration_proof_id,
+                        finalization_fence.expectation_key,
+                        finalization_fence.expectation_version,
+                        finalization_fence.expectation_hash,
+                        result_hash,
+                        _encode_json(result),
+                        now,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_finalization_journal
+                    SET state = 'committed', result_hash = ?, journal_version = ?,
+                        updated_at = ?
+                    WHERE finalization_id = ? AND fence_hash = ? AND state = 'prepared'
+                    """,
+                    (
+                        result_hash,
+                        journal_version,
+                        now,
+                        finalization_fence.finalization_id,
+                        finalization_fence.fence_hash,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RelayFinalizationConflict()
+                evidence = self._finalization_evidence(
+                    finalization_fence,
+                    "committed",
+                    result_hash,
+                    journal_version=journal_version,
+                )
+                return result, evidence
         except IntegrationProofError as error:
             raise RelayStoreError(error.code) from error
         except sqlite3.Error as error:
@@ -1658,6 +1931,242 @@ class RelayStore:
             predecessor_integration_version=run.integration_version,
             write_scope=write_scope,
         )
+
+    @staticmethod
+    def _validate_finalization_fence(fence: ProofFinalizationFence) -> None:
+        try:
+            validate_finalization_fence(fence)
+        except ValueError as error:
+            raise RelayFinalizationConflict() from error
+
+    @staticmethod
+    def _fence_values(fence: ProofFinalizationFence) -> tuple[object, ...]:
+        return (
+            fence.finalization_id,
+            fence.reservation_epoch,
+            fence.integration_proof_id,
+            fence.workspace_id,
+            fence.expectation_key,
+            fence.expectation_version,
+            fence.expectation_hash,
+            fence.target_ref,
+            fence.base_oid,
+            fence.final_oid,
+            fence.fence_hash,
+        )
+
+    @staticmethod
+    def _finalization_journal(
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        finalization_id: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM relay_v3_finalization_journal WHERE finalization_id = ?",
+            (finalization_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _finalization_outcome(
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        finalization_id: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM relay_v3_finalization_outcomes WHERE finalization_id = ?",
+            (finalization_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _integration_proof(
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        proof_id: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM relay_v3_integration_proofs WHERE proof_id = ?",
+            (proof_id,),
+        ).fetchone()
+
+    @classmethod
+    def _fence_from_journal(cls, row: sqlite3.Row) -> ProofFinalizationFence:
+        try:
+            fence = ProofFinalizationFence(
+                finalization_id=str(row["finalization_id"]),
+                reservation_epoch=int(row["reservation_epoch"]),
+                integration_proof_id=str(row["integration_proof_id"]),
+                workspace_id=str(row["workspace_id"]),
+                expectation_key=str(row["expectation_key"]),
+                expectation_version=int(row["expectation_version"]),
+                expectation_hash=str(row["expectation_hash"]),
+                target_ref=str(row["target_ref"]),
+                base_oid=str(row["base_oid"]),
+                final_oid=str(row["final_oid"]),
+            )
+            cls._validate_finalization_fence(fence)
+            if row["fence_hash"] != fence.fence_hash:
+                raise RelayFinalizationConflict()
+            return fence
+        except (KeyError, TypeError, ValueError) as error:
+            raise RelayFinalizationConflict() from error
+
+    @classmethod
+    def _require_matching_finalization_fence(
+        cls, row: sqlite3.Row, fence: ProofFinalizationFence
+    ) -> None:
+        if cls._fence_from_journal(row) != fence:
+            raise RelayFinalizationConflict()
+
+    @staticmethod
+    def _finalization_evidence(
+        fence: ProofFinalizationFence,
+        state: FinalizationState,
+        result_hash: str | None,
+        *,
+        journal_version: int,
+    ) -> ProofFinalizationEvidence:
+        evidence = ProofFinalizationEvidence(
+            finalization_id=fence.finalization_id,
+            state=state,
+            fence_hash=fence.fence_hash,
+            result_hash=result_hash,
+            journal_version=journal_version,
+        )
+        try:
+            validate_finalization_evidence(evidence)
+        except ValueError as error:
+            raise RelayFinalizationConflict() from error
+        return evidence
+
+    @classmethod
+    def _evidence_from_journal(
+        cls, row: sqlite3.Row
+    ) -> ProofFinalizationEvidence:
+        fence = cls._fence_from_journal(row)
+        state_value = row["state"]
+        result_hash = row["result_hash"]
+        journal_version = row["journal_version"]
+        if (
+            type(state_value) is not str
+            or state_value not in {"prepared", "committed", "aborted"}
+            or (result_hash is not None and type(result_hash) is not str)
+            or type(journal_version) is not int
+        ):
+            raise RelayFinalizationConflict()
+        return cls._finalization_evidence(
+            fence,
+            cast(FinalizationState, state_value),
+            cast(str | None, result_hash),
+            journal_version=journal_version,
+        )
+
+    @staticmethod
+    def _integration_proof_matches_fence(
+        proof: sqlite3.Row, fence: ProofFinalizationFence
+    ) -> bool:
+        return (
+            proof["proof_id"] == fence.integration_proof_id
+            and proof["candidate_id"] == fence.expectation_key
+            and proof["expectation_hash"] == fence.expectation_hash
+            and proof["integration_ref"] == fence.target_ref
+            and proof["predecessor_commit"] == fence.base_oid
+            and proof["final_commit"] == fence.final_oid
+        )
+
+    @staticmethod
+    def _outcome_result(outcome: sqlite3.Row | None) -> dict[str, object]:
+        if outcome is None or type(outcome["result_hash"]) is not str:
+            raise RelayFinalizationConflict()
+        try:
+            result = _decode_json_object(str(outcome["result_json"]))
+        except (TypeError, ValueError):
+            raise RelayFinalizationConflict() from None
+        if canonical_hash(result) != outcome["result_hash"]:
+            raise RelayFinalizationConflict()
+        return result
+
+    @classmethod
+    def _require_committed_finalization(
+        cls,
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        fence: ProofFinalizationFence,
+        journal: sqlite3.Row,
+        outcome: sqlite3.Row | None,
+    ) -> None:
+        evidence = cls._evidence_from_journal(journal)
+        proof = cls._integration_proof(connection, fence.integration_proof_id)
+        if (
+            evidence.state != "committed"
+            or evidence.result_hash is None
+            or outcome is None
+            or proof is None
+            or not cls._integration_proof_matches_fence(proof, fence)
+            or outcome["finalization_id"] != fence.finalization_id
+            or outcome["fence_hash"] != fence.fence_hash
+            or outcome["integration_proof_id"] != fence.integration_proof_id
+            or outcome["expectation_key"] != fence.expectation_key
+            or outcome["expectation_version"] != fence.expectation_version
+            or outcome["expectation_hash"] != fence.expectation_hash
+            or outcome["result_hash"] != evidence.result_hash
+        ):
+            raise RelayFinalizationConflict()
+        cls._outcome_result(outcome)
+
+    def _require_current_finalization_expectation(
+        self,
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        fence: ProofFinalizationFence,
+    ) -> None:
+        candidate = connection.execute(
+            "SELECT * FROM relay_v3_candidates WHERE candidate_id = ?",
+            (fence.expectation_key,),
+        ).fetchone()
+        if candidate is None:
+            raise RelayExpectationStale()
+        run_row = connection.execute(
+            "SELECT * FROM relay_v3_runs WHERE run_id = ?", (candidate["run_id"],)
+        ).fetchone()
+        task_row = connection.execute(
+            """
+            SELECT * FROM relay_v3_tasks WHERE run_id = ? AND task_id = ?
+            """,
+            (candidate["run_id"], candidate["task_id"]),
+        ).fetchone()
+        if run_row is None or task_row is None:
+            raise RelayFinalizationConflict()
+        run = self._run_from_row(run_row)
+        task = self._task_from_row(task_row)
+        if (
+            task.kind != "implementation"
+            or task.state is not RelayTaskState.REVIEW_INTEGRATION
+            or task.candidate_id != fence.expectation_key
+            or str(candidate["status"]) != "reviewed"
+        ):
+            raise RelayExpectationStale()
+        current = self._integration_expectation(run, task, candidate)
+        if (
+            fence.workspace_id != run.workspace_id
+            or fence.expectation_version != current.task_version
+            or fence.expectation_hash != current.expectation_hash
+        ):
+            raise RelayExpectationStale()
+
+    @staticmethod
+    def _require_finalization_integration_fence(
+        fence: ProofFinalizationFence,
+        *,
+        proof_id: str,
+        expectation: IntegrationExpectation,
+        receipt: IntegrationProofReceipt,
+    ) -> None:
+        if (
+            fence.integration_proof_id != proof_id
+            or fence.workspace_id != expectation.workspace_id
+            or fence.expectation_key != expectation.candidate_id
+            or fence.expectation_version != expectation.task_version
+            or fence.expectation_hash != expectation.expectation_hash
+            or fence.target_ref != receipt.integration_ref
+            or fence.base_oid != receipt.ref_before_commit
+            or fence.final_oid != receipt.ref_after_commit
+        ):
+            raise RelayFinalizationConflict()
 
     def _validated_proof_row(
         self,
@@ -2328,12 +2837,54 @@ class RelayStore:
                     FOREIGN KEY (candidate_id)
                         REFERENCES relay_v3_candidates(candidate_id) ON DELETE RESTRICT
                 );
+                CREATE TABLE IF NOT EXISTS relay_v3_finalization_journal (
+                    finalization_id TEXT PRIMARY KEY,
+                    reservation_epoch INTEGER NOT NULL
+                        CHECK (reservation_epoch >= 1),
+                    integration_proof_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    expectation_key TEXT NOT NULL,
+                    expectation_version INTEGER NOT NULL
+                        CHECK (expectation_version >= 1),
+                    expectation_hash TEXT NOT NULL,
+                    target_ref TEXT NOT NULL,
+                    base_oid TEXT NOT NULL,
+                    final_oid TEXT NOT NULL,
+                    fence_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('prepared', 'committed', 'aborted')),
+                    result_hash TEXT,
+                    journal_version INTEGER NOT NULL CHECK (journal_version >= 1),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (
+                        (state = 'committed' AND result_hash IS NOT NULL)
+                        OR (state IN ('prepared', 'aborted') AND result_hash IS NULL)
+                    ),
+                    UNIQUE (integration_proof_id, reservation_epoch)
+                );
+                CREATE TABLE IF NOT EXISTS relay_v3_finalization_outcomes (
+                    finalization_id TEXT PRIMARY KEY,
+                    fence_hash TEXT NOT NULL UNIQUE,
+                    integration_proof_id TEXT NOT NULL,
+                    expectation_key TEXT NOT NULL,
+                    expectation_version INTEGER NOT NULL
+                        CHECK (expectation_version >= 1),
+                    expectation_hash TEXT NOT NULL,
+                    result_hash TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS relay_v3_tasks_by_state
                     ON relay_v3_tasks(run_id, state, priority DESC, ordinal, task_id);
                 CREATE INDEX IF NOT EXISTS relay_v3_directives_by_state
                     ON relay_v3_directives(run_id, state, expected_schedule_version);
                 CREATE INDEX IF NOT EXISTS relay_v3_proofs_by_run
                     ON relay_v3_integration_proofs(run_id, integration_version);
+                CREATE INDEX IF NOT EXISTS relay_v3_finalizations_by_proof
+                    ON relay_v3_finalization_journal(
+                        integration_proof_id, expectation_hash, state
+                    );
                 """
             )
             connection.execute(
@@ -2365,6 +2916,19 @@ class RelayStore:
                 "expectation_json",
                 "receipt_json",
             },
+            "relay_v3_finalization_journal": {
+                "finalization_id",
+                "fence_hash",
+                "state",
+                "result_hash",
+                "journal_version",
+            },
+            "relay_v3_finalization_outcomes": {
+                "finalization_id",
+                "fence_hash",
+                "result_hash",
+                "result_json",
+            },
         }
         try:
             for table, columns in required.items():
@@ -2393,6 +2957,38 @@ class RelayStore:
             connection.commit()
         finally:
             cursor.close()
+
+    @contextmanager
+    def _recovery_transaction(self) -> Iterator[sqlite3.Cursor]:
+        """Probe recovery evidence from a fresh SQLite connection when possible."""
+
+        connection = self._fresh_recovery_connection()
+        close_connection = connection is not self._connection
+        cursor = connection.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            yield cursor
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            cursor.close()
+            if close_connection:
+                connection.close()
+
+    def _fresh_recovery_connection(self) -> sqlite3.Connection:
+        if self._database == ":memory:":
+            return self._require_connection()
+        try:
+            connection = sqlite3.connect(self._database, isolation_level=None)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            return connection
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
 
     def _require_connection(self) -> sqlite3.Connection:
         if self._connection is None:

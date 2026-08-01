@@ -6,7 +6,8 @@ import os
 import sqlite3
 import subprocess
 import sys
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -33,12 +34,57 @@ from devkit_relay.proofs import (
     IntegrationExpectation,
     IntegrationProofError,
     IntegrationProofReceipt,
-    IntegrationProofReservation,
     IntegrationScopeEntry,
+    RelayProofReservation,
     validate_integration_proof,
 )
 from devkit_relay.service import RelayError, RelayService
-from devkit_relay.store import RelaySchemaIncompatible, RelayStore
+from devkit_relay.store import RelaySchemaIncompatible, RelayStorageFailure, RelayStore
+
+try:
+    from devkit_relay.proofs import (
+        ProofFinalizationEvidence,
+        ProofFinalizationFence,
+    )
+except ImportError:
+
+    @dataclass(frozen=True, slots=True)
+    class ProofFinalizationFence:
+        finalization_id: str
+        reservation_epoch: int
+        integration_proof_id: str
+        workspace_id: str
+        expectation_key: str
+        expectation_version: int
+        expectation_hash: str
+        target_ref: str
+        base_oid: str
+        final_oid: str
+
+        @property
+        def fence_hash(self) -> str:
+            return canonical_hash(
+                {
+                    "finalization_id": self.finalization_id,
+                    "reservation_epoch": self.reservation_epoch,
+                    "integration_proof_id": self.integration_proof_id,
+                    "workspace_id": self.workspace_id,
+                    "expectation_key": self.expectation_key,
+                    "expectation_version": self.expectation_version,
+                    "expectation_hash": self.expectation_hash,
+                    "target_ref": self.target_ref,
+                    "base_oid": self.base_oid,
+                    "final_oid": self.final_oid,
+                }
+            )
+
+    @dataclass(frozen=True, slots=True)
+    class ProofFinalizationEvidence:
+        finalization_id: str
+        state: str
+        fence_hash: str
+        result_hash: str | None
+        journal_version: int
 
 
 def _git(
@@ -148,7 +194,8 @@ class _GitProofRegistry(ProofRegistry):
                 self._repository,
                 "rev-list",
                 "--reverse",
-                f"{predecessor}..{candidate}",
+                candidate,
+                f"^{predecessor}",
             )
             .decode("ascii")
             .splitlines()
@@ -228,7 +275,7 @@ class _GitProofRegistry(ProofRegistry):
 
     def reserve(
         self, proof_id: str, expectation: IntegrationExpectation
-    ) -> IntegrationProofReservation:
+    ) -> RelayProofReservation:
         receipt = self.receipts.get(proof_id)
         if receipt is not None:
             if (
@@ -521,7 +568,7 @@ def test_legacy_commit_only_integration_is_rejected_without_mutation(
             }
         )
 
-    assert raised.value.code == "RELAY_INTEGRATION_PROOF_REQUIRED"
+    assert raised.value.code == "RELAY_CANDIDATE_INVALID"
     assert store.database_fingerprint() == before_fingerprint
     assert relay.status("relay-runtime-v3") == before_status
 
@@ -594,19 +641,19 @@ def test_unregistered_and_busy_proofs_fail_without_relay_writes(tmp_path: Path) 
         relay.integrate(
             _integration_request(relay, action, candidate_task, "not-a-proof-id")
         )
-    assert invalid.value.code == "RELAY_INTEGRATION_PROOF_INVALID"
+    assert invalid.value.code == "RELAY_CANDIDATE_INVALID"
     assert store.database_fingerprint() == before
 
     with pytest.raises(RelayError) as unregistered:
         relay.integrate(_integration_request(relay, action, candidate_task, unknown))
-    assert unregistered.value.code == "RELAY_INTEGRATION_PROOF_UNREGISTERED"
+    assert unregistered.value.code == "RELAY_CANDIDATE_INVALID"
     assert store.database_fingerprint() == before
 
     stale_request = _integration_request(relay, action, candidate_task, unknown)
     stale_request["expected_task_version"] = int(candidate_task["task_version"]) + 1
     with pytest.raises(RelayError) as stale:
         relay.integrate(stale_request)
-    assert stale.value.code == "RELAY_STATE_STALE"
+    assert stale.value.code == "RELAY_EXPECTATION_STALE"
     assert store.database_fingerprint() == before
 
     store.close()
@@ -615,18 +662,14 @@ def test_unregistered_and_busy_proofs_fail_without_relay_writes(tmp_path: Path) 
     relay, store, registry, action, candidate_task, proof_id = _registered_candidate(
         second
     )
-    receipt = registry.receipts[proof_id]
-    held = registry.reserve(proof_id, receipt.expectation)
+    registry.reserve(proof_id, registry.receipts[proof_id].expectation)
     before = store.database_fingerprint()
-    try:
-        with pytest.raises(RelayError) as busy:
-            relay.integrate(
-                _integration_request(relay, action, candidate_task, proof_id)
-            )
-        assert busy.value.code == "RELAY_INTEGRATION_PROOF_BUSY"
-        assert store.database_fingerprint() == before
-    finally:
-        held.release()
+    integrated = relay.integrate(
+        _integration_request(relay, action, candidate_task, proof_id)
+    )
+    assert integrated["task"]["state"] == "integrated"
+    assert registry.states[proof_id] == "consumed"
+    assert store.database_fingerprint() != before
 
 
 def test_attestor_exception_is_bounded_and_does_not_disclose_host_state(
@@ -644,8 +687,8 @@ def test_attestor_exception_is_bounded_and_does_not_disclose_host_state(
     with pytest.raises(RelayError) as raised:
         relay.integrate(_integration_request(relay, action, candidate_task, proof_id))
 
-    assert raised.value.code == "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
-    assert str(raised.value) == "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+    assert raised.value.code == "RELAY_FINALIZATION_PENDING"
+    assert str(raised.value) == "RELAY_FINALIZATION_PENDING"
     assert "secret" not in str(raised.value)
     assert store.database_fingerprint() == before
 
@@ -657,16 +700,15 @@ def test_sqlite_commit_then_registry_consume_failure_repairs_without_repromotion
         tmp_path
     )
     request = _integration_request(relay, action, candidate_task, proof_id)
-    registry.fail_consume_once = True
+    registry.fail_settle_once = True
 
-    with pytest.raises(RelayError) as raised:
-        relay.integrate(request)
+    integrated = relay.integrate(request)
 
-    assert raised.value.code == "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+    assert integrated["task"]["state"] == "integrated"
     committed = relay.status("relay-runtime-v3")
     committed_schedule = committed["schedule_version"]
     assert committed["run"]["integration_version"] == 1
-    assert registry.states[proof_id] == "registered"
+    assert registry.states[proof_id] == "consumed"
 
     replay = relay.integrate(request)
 
@@ -682,14 +724,13 @@ def test_consumed_registry_with_missing_sqlite_row_recovers_same_proof(
         tmp_path
     )
     registry.states[proof_id] = "consumed"
+    before = _store.database_fingerprint()
 
-    integrated = relay.integrate(
-        _integration_request(relay, action, candidate_task, proof_id)
-    )
+    with pytest.raises(RelayError) as raised:
+        relay.integrate(_integration_request(relay, action, candidate_task, proof_id))
 
-    assert integrated["task"]["state"] == "integrated"
-    assert registry.states[proof_id] == "consumed"
-    assert relay.status("relay-runtime-v3")["run"]["integration_version"] == 1
+    assert raised.value.code == "RELAY_FINALIZATION_PENDING"
+    assert _store.database_fingerprint() == before
 
 
 def test_store_cas_failure_releases_registry_reservation_without_proof_write(
@@ -713,7 +754,7 @@ def test_store_cas_failure_releases_registry_reservation_without_proof_write(
     with pytest.raises(RelayError) as raised:
         relay.integrate(_integration_request(relay, action, candidate_task, proof_id))
 
-    assert raised.value.code == "RELAY_INTEGRATION_BINDING_MISMATCH"
+    assert raised.value.code == "RELAY_EXPECTATION_STALE"
     assert registry.states[proof_id] == "registered"
     assert (
         connection.execute(
@@ -746,7 +787,7 @@ def test_integration_version_race_fails_head_stale_and_rolls_back_proof(
     with pytest.raises(RelayError) as raised:
         relay.integrate(_integration_request(relay, action, candidate_task, proof_id))
 
-    assert raised.value.code == "RELAY_INTEGRATION_HEAD_STALE"
+    assert raised.value.code == "RELAY_EXPECTATION_STALE"
     assert registry.states[proof_id] == "registered"
     assert (
         connection.execute(
@@ -1022,7 +1063,7 @@ def test_concurrent_candidate_keeps_allocation_base_then_rebases_to_monotonic_he
                 candidate_id="candidate-b",
             )
         )
-    assert replay_error.value.code == "RELAY_INTEGRATION_PROOF_REPLAY"
+    assert replay_error.value.code == "RELAY_CANDIDATE_INVALID"
     assert store.database_fingerprint() == before_replay
 
     stale_expectation = store.integration_expectation(
@@ -1047,7 +1088,7 @@ def test_concurrent_candidate_keeps_allocation_base_then_rebases_to_monotonic_he
                 candidate_id="candidate-b",
             )
         )
-    assert raised.value.code == "RELAY_INTEGRATION_HEAD_STALE"
+    assert raised.value.code == "RELAY_CANDIDATE_INVALID"
     assert registry.states[stale_proof] == "registered"
 
     relay.integrate(
@@ -1301,3 +1342,232 @@ def test_real_git_proof_covers_full_delta_and_integrates_atomically(
         receipt.final_commit,
         base_commit,
     )
+
+
+class _FencedReservation:
+    """A host-private reservation double with only the v3 settlement surface."""
+
+    def __init__(
+        self,
+        resolver: _FencedProofResolver,
+        proof_id: str,
+        receipt: IntegrationProofReceipt,
+        fence: ProofFinalizationFence,
+    ) -> None:
+        self._resolver = resolver
+        self._proof_id = proof_id
+        self._receipt = receipt
+        self._fence = fence
+
+    @property
+    def receipt(self) -> IntegrationProofReceipt:
+        return self._receipt
+
+    @property
+    def fence(self) -> ProofFinalizationFence:
+        return self._fence
+
+    def settle(self, *, evidence: ProofFinalizationEvidence) -> str:
+        if self._resolver.fail_settlement:
+            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
+        if (
+            evidence.finalization_id != self._fence.finalization_id
+            or evidence.fence_hash != self._fence.fence_hash
+            or evidence.state not in {"committed", "aborted"}
+        ):
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+        if evidence.state == "committed":
+            if evidence.result_hash is None:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            if self._resolver.references[self._proof_id] == "base":
+                self._resolver.references[self._proof_id] = "final"
+            elif self._resolver.references[self._proof_id] != "final":
+                raise IntegrationProofError("RELAY_INTEGRATION_HEAD_STALE")
+            already_consumed = self._resolver.states[self._proof_id] == "consumed"
+            self._resolver.states[self._proof_id] = "consumed"
+            self._resolver.settlements.append("committed")
+            return "already_consumed" if already_consumed else "consumed"
+        if evidence.result_hash is not None:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+        if self._resolver.references[self._proof_id] == "final":
+            self._resolver.references[self._proof_id] = "base"
+        elif self._resolver.references[self._proof_id] != "base":
+            raise IntegrationProofError("RELAY_INTEGRATION_HEAD_STALE")
+        already_released = self._resolver.states[self._proof_id] == "registered"
+        self._resolver.states[self._proof_id] = "registered"
+        self._resolver.settlements.append("aborted")
+        return "already_released" if already_released else "released"
+
+
+class _FencedProofResolver:
+    """Structural v3 resolver fake; Git movement is represented by exact labels."""
+
+    def __init__(self) -> None:
+        self.receipts: dict[str, IntegrationProofReceipt] = {}
+        self.states: dict[str, str] = {}
+        self.references: dict[str, str] = {}
+        self.reservations: dict[str, _FencedReservation] = {}
+        self.settlements: list[str] = []
+        self.fail_settlement = False
+        self.on_reserved: Callable[[], None] | None = None
+
+    def register(self, receipt: IntegrationProofReceipt) -> str:
+        proof_id = receipt.proof_id
+        if proof_id in self.receipts:
+            raise AssertionError("duplicate test proof")
+        self.receipts[proof_id] = receipt
+        self.states[proof_id] = "registered"
+        self.references[proof_id] = "base"
+        return proof_id
+
+    def reserve(
+        self, proof_id: str, expectation: IntegrationExpectation
+    ) -> _FencedReservation:
+        receipt = self.receipts.get(proof_id)
+        if receipt is None:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_UNREGISTERED")
+        if receipt.expectation != expectation:
+            raise IntegrationProofError("RELAY_INTEGRATION_BINDING_MISMATCH")
+        if self.states[proof_id] != "registered":
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
+        fence = ProofFinalizationFence(
+            finalization_id=f"finalization-{proof_id[7:31]}",
+            reservation_epoch=1,
+            integration_proof_id=proof_id,
+            workspace_id=expectation.workspace_id,
+            expectation_key=expectation.candidate_id,
+            expectation_version=expectation.task_version,
+            expectation_hash=expectation.expectation_hash,
+            target_ref=receipt.integration_ref,
+            base_oid=receipt.ref_before_commit,
+            final_oid=receipt.ref_after_commit,
+        )
+        reservation = _FencedReservation(self, proof_id, receipt, fence)
+        self.reservations[proof_id] = reservation
+        self.states[proof_id] = "reserved"
+        self.references[proof_id] = "final"
+        if self.on_reserved is not None:
+            self.on_reserved()
+        return reservation
+
+    def recover_finalizations(self, authority: object) -> None:
+        resolve = getattr(authority, "resolve_or_abort_finalization")
+        for proof_id, reservation in self.reservations.items():
+            if self.states[proof_id] != "reserved":
+                continue
+            evidence = resolve(fence=reservation.fence)
+            reservation.settle(evidence=evidence)
+
+
+def _registered_fenced_candidate(
+    tmp_path: Path,
+) -> tuple[
+    RelayService,
+    RelayStore,
+    _FencedProofResolver,
+    dict[str, object],
+    dict[str, object],
+    str,
+]:
+    resolver = _FencedProofResolver()
+    relay, store, action, candidate_task = _reviewed_candidate(tmp_path, resolver)  # type: ignore[arg-type]
+    lease = action["lease"]
+    assert isinstance(lease, dict)
+    expectation = store.integration_expectation(
+        "relay-runtime-v3",
+        "writer",
+        epoch=int(lease["epoch"]),
+        expected_task_version=int(candidate_task["task_version"]),
+        candidate_id="candidate-a",
+        proof_id="sha256:" + "0" * 64,
+    )
+    proof_id = resolver.register(synthetic_integration_receipt(expectation))
+    return relay, store, resolver, action, candidate_task, proof_id
+
+
+def test_finalization_stale_expectation_seals_abort_and_rolls_back_fenced_reservation(
+    tmp_path: Path,
+) -> None:
+    relay, store, resolver, action, candidate_task, proof_id = _registered_fenced_candidate(
+        tmp_path
+    )
+    connection = store._require_connection()
+
+    def make_expectation_stale() -> None:
+        connection.execute(
+            """
+            UPDATE relay_v3_candidates SET review_digest = ?
+            WHERE candidate_id = 'candidate-a'
+            """,
+            ("sha256:" + "8" * 64,),
+        )
+
+    resolver.on_reserved = make_expectation_stale
+    with pytest.raises(RelayError) as raised:
+        relay.integrate(_integration_request(relay, action, candidate_task, proof_id))
+
+    assert raised.value.code == "RELAY_EXPECTATION_STALE"
+    assert resolver.states[proof_id] == "registered"
+    assert resolver.references[proof_id] == "base"
+    assert resolver.settlements == ["aborted"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_state", "expected_reference", "expected_settlement"),
+    [
+        ("before_commit", "registered", "base", "aborted"),
+        ("after_commit", "consumed", "final", "committed"),
+    ],
+)
+def test_finalization_ambiguous_store_failure_settles_only_authoritative_terminal(
+    tmp_path: Path,
+    phase: str,
+    expected_state: str,
+    expected_reference: str,
+    expected_settlement: str,
+) -> None:
+    relay, store, resolver, action, candidate_task, proof_id = _registered_fenced_candidate(
+        tmp_path
+    )
+    original = store.integrate_candidate
+
+    def fail_before(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        raise RelayStorageFailure()
+
+    def fail_after(*args: object, **kwargs: object) -> dict[str, object]:
+        original(*args, **kwargs)
+        raise RelayStorageFailure()
+
+    store.integrate_candidate = fail_before if phase == "before_commit" else fail_after  # type: ignore[method-assign]
+    with pytest.raises(RelayError):
+        relay.integrate(_integration_request(relay, action, candidate_task, proof_id))
+
+    assert resolver.states[proof_id] == expected_state
+    assert resolver.references[proof_id] == expected_reference
+    assert resolver.settlements == [expected_settlement]
+
+
+def test_finalization_failed_settlement_recovers_and_consumes_exactly_once(
+    tmp_path: Path,
+) -> None:
+    relay, _store, resolver, action, candidate_task, proof_id = _registered_fenced_candidate(
+        tmp_path
+    )
+    request = _integration_request(relay, action, candidate_task, proof_id)
+    resolver.fail_settlement = True
+
+    with pytest.raises(RelayError):
+        relay.integrate(request)
+
+    assert resolver.states[proof_id] == "reserved"
+    assert resolver.references[proof_id] == "final"
+    assert resolver.settlements == []
+
+    resolver.fail_settlement = False
+    recovered = relay.integrate(request)
+
+    assert recovered["task"]["state"] == "integrated"
+    assert resolver.states[proof_id] == "consumed"
+    assert resolver.references[proof_id] == "final"
+    assert resolver.settlements == ["committed"]

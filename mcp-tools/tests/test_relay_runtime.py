@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from pathlib import Path
 
@@ -20,8 +20,10 @@ from devkit_relay.proofs import (
     IntegrationExpectation,
     IntegrationProofError,
     IntegrationProofReceipt,
-    IntegrationProofReservation,
     IntegrationProofResolver,
+    ProofFinalizationEvidence,
+    ProofFinalizationFence,
+    RelayProofReservation,
 )
 from devkit_relay.service import RelayError, RelayService
 from devkit_relay.store import RelayStore
@@ -273,9 +275,12 @@ def _maximum_graph_plan(graph_kind: str) -> dict[str, object]:
 class _RejectingProofResolver:
     def reserve(
         self, proof_id: str, expectation: IntegrationExpectation
-    ) -> IntegrationProofReservation:
+    ) -> RelayProofReservation:
         del proof_id, expectation
         raise IntegrationProofError("RELAY_INTEGRATION_PROOF_UNREGISTERED")
+
+    def recover_finalizations(self, authority: object) -> None:
+        del authority
 
 
 class _UnavailableCapabilityBroker:
@@ -330,8 +335,10 @@ class ProofRegistry:
         self.receipts: dict[str, IntegrationProofReceipt] = {}
         self.states: dict[str, str] = {}
         self._held: dict[tuple[str, str, str], str] = {}
-        self.fail_consume_once = False
-        self.on_reserve: object = None
+        self._epochs: dict[str, int] = {}
+        self._reservations: dict[str, _ProofReservation] = {}
+        self.fail_settle_once = False
+        self.on_reserve: Callable[[], None] | None = None
 
     def register(self, receipt: IntegrationProofReceipt) -> str:
         proof_id = receipt.proof_id
@@ -343,16 +350,15 @@ class ProofRegistry:
 
     def reserve(
         self, proof_id: str, expectation: IntegrationExpectation
-    ) -> IntegrationProofReservation:
+    ) -> RelayProofReservation:
         receipt = self.receipts.get(proof_id)
         if receipt is None:
             raise IntegrationProofError("RELAY_INTEGRATION_PROOF_UNREGISTERED")
         if receipt.expectation != expectation:
             raise IntegrationProofError("RELAY_INTEGRATION_BINDING_MISMATCH")
         state = self.states[proof_id]
-        if state == "reserved":
+        if state != "registered":
             raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
-        recovery = state == "consumed"
         key = (
             expectation.workspace_id,
             receipt.repository_id,
@@ -361,13 +367,38 @@ class ProofRegistry:
         owner = self._held.get(key)
         if owner is not None and owner != proof_id:
             raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
-        if not recovery:
-            self.states[proof_id] = "reserved"
-            self._held[key] = proof_id
-        callback = self.on_reserve
-        if callable(callback):
-            callback()
-        return _ProofReservation(self, proof_id, key, recovery)
+        epoch = self._epochs.get(proof_id, 0) + 1
+        self._epochs[proof_id] = epoch
+        reservation = _ProofReservation(
+            self,
+            proof_id,
+            key,
+            ProofFinalizationFence(
+                finalization_id=f"finalization-{proof_id[7:23]}-{epoch}",
+                reservation_epoch=epoch,
+                integration_proof_id=proof_id,
+                workspace_id=expectation.workspace_id,
+                expectation_key=expectation.candidate_id,
+                expectation_version=expectation.task_version,
+                expectation_hash=expectation.expectation_hash,
+                target_ref=receipt.integration_ref,
+                base_oid=receipt.ref_before_commit,
+                final_oid=receipt.ref_after_commit,
+            ),
+        )
+        self.states[proof_id] = "reserved"
+        self._held[key] = proof_id
+        self._reservations[proof_id] = reservation
+        if self.on_reserve is not None:
+            self.on_reserve()
+        return reservation
+
+    def recover_finalizations(self, authority: object) -> None:
+        resolve = getattr(authority, "resolve_or_abort_finalization")
+        for proof_id, reservation in self._reservations.items():
+            if self.states[proof_id] != "reserved":
+                continue
+            reservation.settle(evidence=resolve(fence=reservation.fence))
 
 
 class _ProofReservation:
@@ -376,32 +407,45 @@ class _ProofReservation:
         registry: ProofRegistry,
         proof_id: str,
         key: tuple[str, str, str],
-        recovery: bool,
+        fence: ProofFinalizationFence,
     ) -> None:
         self._registry = registry
         self._proof_id = proof_id
         self._key = key
-        self._recovery = recovery
+        self._fence = fence
 
     @property
     def receipt(self) -> IntegrationProofReceipt:
         return self._registry.receipts[self._proof_id]
 
-    def consume(self) -> None:
-        if self._recovery:
-            return
-        if self._registry.fail_consume_once:
-            self._registry.fail_consume_once = False
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
-        self._registry.states[self._proof_id] = "consumed"
-        self._registry._held.pop(self._key, None)
+    @property
+    def fence(self) -> ProofFinalizationFence:
+        return self._fence
 
-    def release(self) -> None:
-        if self._recovery:
-            return
-        if self._registry.states.get(self._proof_id) == "reserved":
+    def settle(self, *, evidence: ProofFinalizationEvidence) -> str:
+        if self._registry.fail_settle_once:
+            self._registry.fail_settle_once = False
+            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
+        if (
+            evidence.finalization_id != self._fence.finalization_id
+            or evidence.fence_hash != self._fence.fence_hash
+            or evidence.state not in {"committed", "aborted"}
+        ):
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+        if evidence.state == "committed":
+            if evidence.result_hash is None:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            already_consumed = self._registry.states[self._proof_id] == "consumed"
+            self._registry.states[self._proof_id] = "consumed"
+            self._registry._held.pop(self._key, None)
+            return "already_consumed" if already_consumed else "consumed"
+        if evidence.result_hash is not None:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+        already_released = self._registry.states[self._proof_id] == "registered"
+        if not already_released:
             self._registry.states[self._proof_id] = "registered"
         self._registry._held.pop(self._key, None)
+        return "already_released" if already_released else "released"
 
 
 def synthetic_integration_receipt(
