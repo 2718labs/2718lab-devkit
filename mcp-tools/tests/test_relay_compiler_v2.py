@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
