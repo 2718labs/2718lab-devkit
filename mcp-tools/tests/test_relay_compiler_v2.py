@@ -1,4 +1,4 @@
-"""Relay compiler v2's pure, deterministic planning contract."""
+"""Relay compiler's pure, deterministic planning contract."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def _task(
     kind: str = "implementation",
     priority: int = 50,
     dependencies: list[str] | None = None,
-    write_scope: list[str] | None = None,
+    write_scope: list[dict[str, str]] | None = None,
     prewarm_for_task_id: str | None = None,
 ) -> dict[str, object]:
     return {
@@ -64,13 +64,28 @@ def _task(
         "priority": priority,
         "dependencies": [] if dependencies is None else dependencies,
         "write_scope": [] if write_scope is None else write_scope,
-        "constraints": ["no_unbounded_side_effects"],
-        "acceptance_criteria": [f"{task_id} acceptance"],
+        "constraints": [
+            {
+                "code": "no_unbounded_side_effects",
+                "detail": "Do not perform unbounded side effects.",
+            }
+        ],
+        "acceptance_criteria": [
+            {
+                "criterion_id": f"{task_id}-acceptance",
+                "description": f"Complete the bounded {task_id} contract.",
+            }
+        ],
         "atlas_packet_ids": ["sha256:" + "c" * 64],
-        "required_evidence": [f"pytest:mcp-tools/tests/test_{task_id}.py"],
+        "required_evidence": [
+            {
+                "kind": "pytest",
+                "selector": f"mcp-tools/tests/test_{task_id}.py",
+            }
+        ],
         "route": _route(),
         "prewarm_for_task_id": prewarm_for_task_id,
-        "retry_policy": {"max_attempts": 1, "retryable_reasons": []},
+        "retry_policy": {"max_attempts": 1, "retryable_codes": []},
     }
 
 
@@ -80,6 +95,7 @@ def _request() -> dict[str, object]:
         "workflow_id": "relay-v2-contract",
         "workspace_id": "workspace-main",
         "input_snapshot_id": "sha256:" + "b" * 64,
+        "base_commit": "a" * 40,
         "capacity": 3,
         "tasks": [
             _task(
@@ -91,17 +107,19 @@ def _request() -> dict[str, object]:
             _task(
                 "writer-root",
                 priority=100,
-                write_scope=["mcp-tools/devkit_relay/"],
+                write_scope=[{"path": "mcp-tools/devkit_relay", "kind": "tree"}],
             ),
             _task(
                 "writer-child",
                 priority=10,
-                write_scope=["mcp-tools/devkit_relay/compiler.py"],
+                write_scope=[
+                    {"path": "mcp-tools/devkit_relay/compiler.py", "kind": "file"}
+                ],
             ),
             _task(
                 "writer-safe",
                 priority=50,
-                write_scope=["mcp-tools/code_atlas/"],
+                write_scope=[{"path": "mcp-tools/devkit_atlas", "kind": "tree"}],
             ),
             _task(
                 "verify",
@@ -121,6 +139,7 @@ def test_v2_compiles_registered_workspace_into_five_deterministic_queues() -> No
         "schema",
         "workflow_id",
         "workspace_binding",
+        "base_commit",
         "capacity",
         "runtime_policy_id",
         "tasks",
@@ -139,6 +158,7 @@ def test_v2_compiles_registered_workspace_into_five_deterministic_queues() -> No
         "input_snapshot_id": "sha256:" + "b" * 64,
         "atlas_packet_ids": ["sha256:" + "c" * 64],
     }
+    assert plan["base_commit"] == "a" * 40
     assert plan["runtime_policy_id"] == "2718lab-devkit/relay-runtime-policy-v1"
     assert set(plan["queues"]) == {
         "prepared_prewarms",
@@ -181,8 +201,26 @@ def test_v2_compiles_registered_workspace_into_five_deterministic_queues() -> No
 
 def test_v2_is_canonical_under_allowed_task_and_list_reordering() -> None:
     resolver = RegistryResolver()
-    first = compile_plan(_request(), registry_resolver=resolver)
-    reordered = deepcopy(_request())
+    canonical = _request()
+    canonical_tasks = canonical["tasks"]
+    assert isinstance(canonical_tasks, list)
+    writer = next(task for task in canonical_tasks if task["task_id"] == "writer-root")
+    writer["constraints"].append(
+        {"code": "bounded_output", "detail": "Keep output bounded."}
+    )
+    writer["acceptance_criteria"].append(
+        {
+            "criterion_id": "writer-root-evidence",
+            "description": "Produce deterministic evidence.",
+        }
+    )
+    writer["required_evidence"].append(
+        {"kind": "ruff", "selector": "mcp-tools/devkit_relay/compiler.py"}
+    )
+    writer["retry_policy"]["retryable_codes"] = ["stale_lease", "timeout"]
+
+    first = compile_plan(canonical, registry_resolver=resolver)
+    reordered = deepcopy(canonical)
     tasks = reordered["tasks"]
     assert isinstance(tasks, list)
     tasks.reverse()
@@ -190,30 +228,27 @@ def test_v2_is_canonical_under_allowed_task_and_list_reordering() -> None:
         assert isinstance(task, dict)
         task["dependencies"].reverse()
         task["write_scope"].reverse()
+        task["constraints"].reverse()
         task["acceptance_criteria"].reverse()
         task["required_evidence"].reverse()
         task["atlas_packet_ids"].reverse()
+        task["retry_policy"]["retryable_codes"].reverse()
 
     second = compile_plan(reordered, registry_resolver=resolver)
 
     assert first == second
 
 
-def test_v2_rejects_unregistered_or_noncurrent_binding_as_domain_result() -> None:
+def test_v3_rejects_unregistered_binding_as_domain_error() -> None:
     class MissingRegistry:
         def resolve(self, **_: object) -> None:
             return None
 
-    result = compile_plan(_request(), registry_resolver=MissingRegistry())
-
-    assert result == {
-        "schema": "2718lab-devkit/relay-compile-result-v1",
-        "status": "rejected",
-        "reasons": ["registry_binding_unavailable"],
-    }
+    with pytest.raises(RelayPlanError, match="registry_binding_unavailable"):
+        compile_plan(_request(), registry_resolver=MissingRegistry())
 
 
-def test_v2_turns_malformed_registry_data_into_a_domain_rejection() -> None:
+def test_v3_rejects_malformed_registry_data_as_corrupt() -> None:
     class MalformedRegistry:
         def resolve(self, **_: object) -> dict[str, object]:
             return {
@@ -224,23 +259,57 @@ def test_v2_turns_malformed_registry_data_into_a_domain_rejection() -> None:
                 "current": True,
             }
 
-    assert compile_plan(_request(), registry_resolver=MalformedRegistry()) == {
-        "schema": "2718lab-devkit/relay-compile-result-v1",
-        "status": "rejected",
-        "reasons": ["registry_binding_unavailable"],
-    }
+    with pytest.raises(RelayPlanError, match="registry_binding_corrupt"):
+        compile_plan(_request(), registry_resolver=MalformedRegistry())
 
 
-def test_v2_turns_registry_failures_into_a_domain_rejection() -> None:
+def test_v3_rejects_registry_failures_as_unavailable() -> None:
     class FailingRegistry:
         def resolve(self, **_: object) -> None:
             raise RuntimeError("registry offline")
 
-    assert compile_plan(_request(), registry_resolver=FailingRegistry()) == {
-        "schema": "2718lab-devkit/relay-compile-result-v1",
-        "status": "rejected",
-        "reasons": ["registry_binding_unavailable"],
-    }
+    with pytest.raises(RelayPlanError, match="registry_binding_unavailable"):
+        compile_plan(_request(), registry_resolver=FailingRegistry())
+
+
+def test_v3_rejects_registry_resolver_lookup_failure_as_unavailable() -> None:
+    class FailingRegistry:
+        @property
+        def resolve(self) -> object:
+            raise RuntimeError("registry resolver unavailable")
+
+    with pytest.raises(RelayPlanError, match="registry_binding_unavailable"):
+        compile_plan(_request(), registry_resolver=FailingRegistry())
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "registry_binding_unavailable",
+        "registry_binding_stale",
+        "registry_binding_corrupt",
+    ],
+)
+def test_v3_propagates_stable_registry_domain_errors(code: str) -> None:
+    class DomainRegistry:
+        def resolve(self, **_: object) -> None:
+            raise RelayPlanError(code)
+
+    with pytest.raises(RelayPlanError) as caught:
+        compile_plan(_request(), registry_resolver=DomainRegistry())
+
+    assert caught.value.code == code
+
+
+def test_v3_rejects_noncurrent_registry_binding_as_stale() -> None:
+    class StaleRegistry(RegistryResolver):
+        def resolve(self, **kwargs: object) -> dict[str, object]:
+            binding = super().resolve(**kwargs)
+            binding["current"] = False
+            return binding
+
+    with pytest.raises(RelayPlanError, match="registry_binding_stale"):
+        compile_plan(_request(), registry_resolver=StaleRegistry())
 
 
 def test_v2_treats_ancestor_writer_overlap_as_safe_ordering() -> None:
@@ -258,7 +327,12 @@ def test_v2_treats_ancestor_writer_overlap_as_safe_ordering() -> None:
 @pytest.mark.parametrize(
     ("task_id", "field", "value", "code"),
     [
-        ("writer-safe", "write_scope", ["D:/outside"], "invalid_write_scope"),
+        (
+            "writer-safe",
+            "write_scope",
+            [{"path": "D:/outside", "kind": "tree"}],
+            "invalid_write_scope",
+        ),
         ("writer-safe", "priority", float("nan"), "invalid_priority"),
         ("verify", "dependencies", ["prewarm-atlas"], "prewarm_cannot_be_dependency"),
     ],
@@ -296,7 +370,7 @@ def test_v2_rejects_prewarm_writer_scope_and_unclosed_route_triple() -> None:
     invalid_prewarm = _request()
     tasks = invalid_prewarm["tasks"]
     assert isinstance(tasks, list)
-    tasks[0]["write_scope"] = ["mcp-tools/code_atlas/"]
+    tasks[0]["write_scope"] = [{"path": "mcp-tools/devkit_atlas", "kind": "tree"}]
 
     with pytest.raises(RelayPlanError, match="prewarm_has_write_scope"):
         compile_plan(invalid_prewarm, registry_resolver=RegistryResolver())
@@ -310,3 +384,169 @@ def test_v2_rejects_prewarm_writer_scope_and_unclosed_route_triple() -> None:
 
     with pytest.raises(RelayPlanError, match="invalid_route"):
         compile_plan(invalid_route, registry_resolver=RegistryResolver())
+
+
+@pytest.mark.parametrize(
+    ("route_class", "model", "reasoning_effort"),
+    [
+        ("terra_high", "gpt-5.6-terra", "high"),
+        ("terra_max", "gpt-5.6-terra", "max"),
+        ("sol_high", "gpt-5.6-sol", "high"),
+        ("sol_ultra", "gpt-5.6-sol", "ultra"),
+    ],
+)
+def test_v3_accepts_closed_routes(
+    route_class: str, model: str, reasoning_effort: str
+) -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    route = tasks[1]["route"]
+    assert isinstance(route, dict)
+    route.update(
+        {
+            "route_class": route_class,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+        }
+    )
+
+    plan = compile_plan(request, registry_resolver=RegistryResolver())
+
+    writer = next(task for task in plan["tasks"] if task["task_id"] == "writer-root")
+    assert writer["route"] == route
+
+
+@pytest.mark.parametrize("base_commit", ["a" * 39, "a" * 41, "g" * 40])
+def test_v3_rejects_invalid_base_commit(base_commit: str) -> None:
+    request = _request()
+    request["base_commit"] = base_commit
+
+    with pytest.raises(RelayPlanError, match="invalid_base_commit"):
+        compile_plan(request, registry_resolver=RegistryResolver())
+
+
+def test_v3_accepts_sha256_base_commit() -> None:
+    request = _request()
+    request["base_commit"] = "d" * 64
+
+    plan = compile_plan(request, registry_resolver=RegistryResolver())
+
+    assert plan["base_commit"] == "d" * 64
+
+
+@pytest.mark.parametrize(
+    ("field", "extra", "code"),
+    [
+        ("write_scope", {"owner": "worker"}, "invalid_write_scope"),
+        ("constraints", {"owner": "worker"}, "invalid_constraints"),
+        (
+            "acceptance_criteria",
+            {"owner": "worker"},
+            "invalid_acceptance_criteria",
+        ),
+        (
+            "required_evidence",
+            {"owner": "worker"},
+            "invalid_required_evidence",
+        ),
+    ],
+)
+def test_v3_rejects_unknown_fields_in_rich_contract_objects(
+    field: str, extra: dict[str, str], code: str
+) -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    entry = tasks[1][field][0]
+    assert isinstance(entry, dict)
+    entry.update(extra)
+
+    with pytest.raises(RelayPlanError, match=code):
+        compile_plan(request, registry_resolver=RegistryResolver())
+
+
+def test_v3_file_scopes_with_shared_text_prefix_do_not_overlap() -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    tasks[1]["write_scope"] = [
+        {"path": "mcp-tools/devkit_relay/service.py", "kind": "file"}
+    ]
+    tasks[2]["write_scope"] = [
+        {"path": "mcp-tools/devkit_relay/service.py.bak", "kind": "file"}
+    ]
+
+    plan = compile_plan(request, registry_resolver=RegistryResolver())
+
+    assert plan["conflicts"] == []
+
+
+def test_v3_file_scope_does_not_claim_descendant_paths() -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    tasks[1]["write_scope"] = [
+        {"path": "mcp-tools/devkit_relay/service.py", "kind": "file"}
+    ]
+    tasks[2]["write_scope"] = [
+        {"path": "mcp-tools/devkit_relay/service.py/generated", "kind": "file"}
+    ]
+
+    plan = compile_plan(request, registry_resolver=RegistryResolver())
+
+    assert plan["conflicts"] == []
+
+
+@pytest.mark.parametrize("kind", ["blob", None, ["tree"]])
+def test_v3_rejects_invalid_scope_kind_with_domain_error(kind: object) -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    tasks[1]["write_scope"] = [{"path": "mcp-tools/devkit_relay", "kind": kind}]
+
+    with pytest.raises(RelayPlanError, match="invalid_write_scope"):
+        compile_plan(request, registry_resolver=RegistryResolver())
+
+
+@pytest.mark.parametrize(
+    ("field", "code"),
+    [
+        ("write_scope", "invalid_write_scope"),
+        ("constraints", "invalid_constraints"),
+        ("acceptance_criteria", "invalid_acceptance_criteria"),
+        ("required_evidence", "invalid_required_evidence"),
+    ],
+)
+def test_v3_rejects_unbounded_rich_contract_lists(field: str, code: str) -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    task = tasks[1]
+    if field == "write_scope":
+        value = [
+            {"path": f"mcp-tools/devkit_relay/file-{index}.py", "kind": "file"}
+            for index in range(33)
+        ]
+    elif field == "constraints":
+        value = [
+            {"code": f"constraint-{index}", "detail": f"Constraint {index}."}
+            for index in range(33)
+        ]
+    elif field == "acceptance_criteria":
+        value = [
+            {
+                "criterion_id": f"criterion-{index}",
+                "description": f"Criterion {index}.",
+            }
+            for index in range(33)
+        ]
+    else:
+        value = [
+            {"kind": "pytest", "selector": f"tests/test_case_{index}.py"}
+            for index in range(33)
+        ]
+    task[field] = value
+
+    with pytest.raises(RelayPlanError, match=code):
+        compile_plan(request, registry_resolver=RegistryResolver())

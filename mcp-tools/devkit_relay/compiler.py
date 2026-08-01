@@ -17,7 +17,6 @@ from .canonical import canonical_hash
 
 _REQUEST_SCHEMA = "2718lab-devkit/relay-compile-request-v1"
 _PLAN_SCHEMA = "2718lab-devkit/relay-plan-v1"
-_RESULT_SCHEMA = "2718lab-devkit/relay-compile-result-v1"
 _RUNTIME_POLICY_ID = "2718lab-devkit/relay-runtime-policy-v1"
 
 _REQUEST_FIELDS = frozenset(
@@ -26,6 +25,7 @@ _REQUEST_FIELDS = frozenset(
         "workflow_id",
         "workspace_id",
         "input_snapshot_id",
+        "base_commit",
         "capacity",
         "tasks",
     }
@@ -49,7 +49,11 @@ _TASK_FIELDS = frozenset(
     }
 )
 _ROUTE_FIELDS = frozenset({"route_class", "model", "reasoning_effort"})
-_RETRY_POLICY_FIELDS = frozenset({"max_attempts", "retryable_reasons"})
+_RETRY_POLICY_FIELDS = frozenset({"max_attempts", "retryable_codes"})
+_SCOPE_FIELDS = frozenset({"path", "kind"})
+_CONSTRAINT_FIELDS = frozenset({"code", "detail"})
+_CRITERION_FIELDS = frozenset({"criterion_id", "description"})
+_EVIDENCE_FIELDS = frozenset({"kind", "selector"})
 _BINDING_FIELDS = frozenset(
     {
         "workflow_id",
@@ -62,11 +66,13 @@ _BINDING_FIELDS = frozenset(
 
 _ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _HASH = re.compile(r"sha256:[0-9a-f]{64}")
+_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _KINDS = frozenset({"implementation", "verification", "review", "prewarm"})
 _ROUTES = {
     "terra_high": ("gpt-5.6-terra", "high"),
     "terra_max": ("gpt-5.6-terra", "max"),
     "sol_high": ("gpt-5.6-sol", "high"),
+    "sol_ultra": ("gpt-5.6-sol", "ultra"),
 }
 
 _MAX_TASKS = 64
@@ -116,6 +122,12 @@ def _identifier(value: object, code: str) -> str:
 def _hash_identifier(value: object, code: str) -> str:
     if type(value) is not str or _HASH.fullmatch(value) is None:
         raise RelayPlanError(code)
+    return value
+
+
+def _commit_identifier(value: object) -> str:
+    if type(value) is not str or _COMMIT.fullmatch(value) is None:
+        raise RelayPlanError("invalid_base_commit")
     return value
 
 
@@ -178,26 +190,97 @@ def _scope_path(value: object) -> str:
         or any(part in {".", ".."} for part in path.parts)
     ):
         raise RelayPlanError("invalid_write_scope")
-    return path.as_posix().rstrip("/") + ("/" if normalized.endswith("/") else "")
+    return path.as_posix().rstrip("/")
 
 
-def _scope_list(value: object) -> list[str]:
+def _scope_list(value: object) -> list[dict[str, str]]:
     if type(value) is not list or len(value) > _MAX_LIST_ITEMS:
         raise RelayPlanError("invalid_write_scope")
-    normalized = [_scope_path(item) for item in value]
-    if len(normalized) != len(set(normalized)):
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        scope = _exact_fields(item, _SCOPE_FIELDS, "invalid_write_scope")
+        kind = scope["kind"]
+        if type(kind) is not str or kind not in {"file", "tree"}:
+            raise RelayPlanError("invalid_write_scope")
+        normalized.append({"path": _scope_path(scope["path"]), "kind": kind})
+    keys = {(scope["path"], scope["kind"]) for scope in normalized}
+    if len(normalized) != len(keys):
         raise RelayPlanError("invalid_write_scope")
-    return sorted(normalized)
+    return sorted(normalized, key=lambda scope: (scope["path"], scope["kind"]))
 
 
-def _scopes_overlap(left: str, right: str) -> bool:
-    left_base = left.rstrip("/")
-    right_base = right.rstrip("/")
-    return (
-        left_base == right_base
-        or right_base.startswith(left_base + "/")
-        or left_base.startswith(right_base + "/")
+def _scopes_overlap(left: Mapping[str, str], right: Mapping[str, str]) -> bool:
+    left_path = left["path"]
+    right_path = right["path"]
+    if left_path == right_path:
+        return True
+    if left["kind"] == "tree" and right_path.startswith(left_path + "/"):
+        return True
+    return right["kind"] == "tree" and left_path.startswith(right_path + "/")
+
+
+def _constraint_list(value: object) -> list[dict[str, str]]:
+    if type(value) is not list or len(value) > _MAX_LIST_ITEMS:
+        raise RelayPlanError("invalid_constraints")
+    normalized = []
+    for item in value:
+        constraint = _exact_fields(item, _CONSTRAINT_FIELDS, "invalid_constraints")
+        normalized.append(
+            {
+                "code": _identifier(constraint["code"], "invalid_constraints"),
+                "detail": _bounded_text(constraint["detail"], "invalid_constraints"),
+            }
+        )
+    keys = {(item["code"], item["detail"]) for item in normalized}
+    if len(keys) != len(normalized):
+        raise RelayPlanError("invalid_constraints")
+    return sorted(normalized, key=lambda item: (item["code"], item["detail"]))
+
+
+def _criterion_list(value: object) -> list[dict[str, str]]:
+    if type(value) is not list or len(value) > _MAX_LIST_ITEMS:
+        raise RelayPlanError("invalid_acceptance_criteria")
+    normalized = []
+    for item in value:
+        criterion = _exact_fields(
+            item, _CRITERION_FIELDS, "invalid_acceptance_criteria"
+        )
+        normalized.append(
+            {
+                "criterion_id": _identifier(
+                    criterion["criterion_id"], "invalid_acceptance_criteria"
+                ),
+                "description": _bounded_text(
+                    criterion["description"], "invalid_acceptance_criteria"
+                ),
+            }
+        )
+    keys = {(item["criterion_id"], item["description"]) for item in normalized}
+    if len(keys) != len(normalized):
+        raise RelayPlanError("invalid_acceptance_criteria")
+    return sorted(
+        normalized, key=lambda item: (item["criterion_id"], item["description"])
     )
+
+
+def _evidence_list(value: object) -> list[dict[str, str]]:
+    if type(value) is not list or len(value) > _MAX_LIST_ITEMS:
+        raise RelayPlanError("invalid_required_evidence")
+    normalized = []
+    for item in value:
+        evidence = _exact_fields(item, _EVIDENCE_FIELDS, "invalid_required_evidence")
+        normalized.append(
+            {
+                "kind": _identifier(evidence["kind"], "invalid_required_evidence"),
+                "selector": _bounded_text(
+                    evidence["selector"], "invalid_required_evidence"
+                ),
+            }
+        )
+    keys = {(item["kind"], item["selector"]) for item in normalized}
+    if len(keys) != len(normalized):
+        raise RelayPlanError("invalid_required_evidence")
+    return sorted(normalized, key=lambda item: (item["kind"], item["selector"]))
 
 
 def _normalize_route(value: object) -> dict[str, str]:
@@ -222,8 +305,8 @@ def _normalize_retry_policy(value: object) -> dict[str, object]:
         raise RelayPlanError("invalid_retry_policy")
     return {
         "max_attempts": max_attempts,
-        "retryable_reasons": _text_list(
-            policy["retryable_reasons"], "invalid_retry_policy", maximum=8
+        "retryable_codes": _identifier_list(
+            policy["retryable_codes"], "invalid_retry_policy", maximum=8
         ),
     }
 
@@ -266,16 +349,12 @@ def _normalize_task(raw: object) -> dict[str, Any]:
         "dependencies": dependencies,
         "write_scope": write_scope,
         "route": _normalize_route(task["route"]),
-        "constraints": _text_list(task["constraints"], "invalid_constraints"),
-        "acceptance_criteria": _text_list(
-            task["acceptance_criteria"], "invalid_acceptance_criteria"
-        ),
+        "constraints": _constraint_list(task["constraints"]),
+        "acceptance_criteria": _criterion_list(task["acceptance_criteria"]),
         "atlas_packet_ids": _hash_list(
             task["atlas_packet_ids"], "invalid_atlas_packet_ids", maximum=16
         ),
-        "required_evidence": _text_list(
-            task["required_evidence"], "invalid_required_evidence"
-        ),
+        "required_evidence": _evidence_list(task["required_evidence"]),
         "prewarm_for_task_id": target,
         "retry_policy": _normalize_retry_policy(task["retry_policy"]),
     }
@@ -414,12 +493,17 @@ def _registry_binding(
     workspace_id: str,
     input_snapshot_id: str,
     atlas_packet_ids: tuple[str, ...],
-) -> dict[str, object] | None:
+) -> dict[str, object]:
     if resolver is None:
-        return None
-    resolve = getattr(resolver, "resolve", resolver)
+        raise RelayPlanError("registry_binding_unavailable")
+    try:
+        resolve = getattr(resolver, "resolve", resolver)
+    except RelayPlanError:
+        raise
+    except Exception as exc:
+        raise RelayPlanError("registry_binding_unavailable") from exc
     if not callable(resolve):
-        return None
+        raise RelayPlanError("registry_binding_unavailable")
     try:
         binding = resolve(
             workflow_id=workflow_id,
@@ -427,25 +511,29 @@ def _registry_binding(
             input_snapshot_id=input_snapshot_id,
             atlas_packet_ids=atlas_packet_ids,
         )
-    except Exception:
-        return None
+    except RelayPlanError:
+        raise
+    except Exception as exc:
+        raise RelayPlanError("registry_binding_unavailable") from exc
+    if binding is None:
+        raise RelayPlanError("registry_binding_unavailable")
     if type(binding) is not dict or set(binding) != _BINDING_FIELDS:
-        return None
+        raise RelayPlanError("registry_binding_corrupt")
     if (
         binding["current"] is not True
         or binding["workflow_id"] != workflow_id
         or binding["workspace_id"] != workspace_id
         or binding["input_snapshot_id"] != input_snapshot_id
     ):
-        return None
+        raise RelayPlanError("registry_binding_stale")
     try:
         registered_packets = _hash_list(
             binding["atlas_packet_ids"], "invalid_registry_binding"
         )
-    except RelayPlanError:
-        return None
+    except RelayPlanError as exc:
+        raise RelayPlanError("registry_binding_corrupt") from exc
     if not set(atlas_packet_ids) <= set(registered_packets):
-        return None
+        raise RelayPlanError("registry_binding_stale")
     return {
         "workspace_id": workspace_id,
         "input_snapshot_id": input_snapshot_id,
@@ -453,24 +541,16 @@ def _registry_binding(
     }
 
 
-def _rejected(*reasons: str) -> dict[str, object]:
-    return {
-        "schema": _RESULT_SCHEMA,
-        "status": "rejected",
-        "reasons": sorted(set(reasons)),
-    }
-
-
 def compile_plan(
     request: Mapping[str, Any],
     registry_resolver: RegistryResolver | RegistryCallback | object | None = None,
 ) -> dict[str, Any]:
-    """Validate and canonically compile one explicit Relay v2 work package.
+    """Validate and canonically compile one explicit Relay v3 work package.
 
-    Malformed caller input raises :class:`RelayPlanError`.  A missing or stale
-    registry binding is an expected domain outcome and returns a small rejected
-    result envelope.  The function only invokes the injected resolver's read
-    method and never opens a database, creates a worktree, or reserves a lease.
+    Malformed caller input and missing, stale, or corrupt registry bindings
+    raise :class:`RelayPlanError`.  Only the MCP adapter wraps those domain
+    errors.  The compiler invokes only the injected resolver's read method and
+    never opens a database, creates a worktree, or reserves a lease.
     """
 
     if type(request) is not dict:
@@ -483,6 +563,7 @@ def compile_plan(
     input_snapshot_id = _hash_identifier(
         request["input_snapshot_id"], "invalid_snapshot_id"
     )
+    base_commit = _commit_identifier(request["base_commit"])
     capacity = request["capacity"]
     if type(capacity) is not int or not 1 <= capacity <= 8:
         raise RelayPlanError("invalid_capacity")
@@ -507,14 +588,12 @@ def compile_plan(
         input_snapshot_id=input_snapshot_id,
         atlas_packet_ids=atlas_packet_ids,
     )
-    if workspace_binding is None:
-        return _rejected("registry_binding_unavailable")
-
     conflicts = _conflict_edges(tasks)
     plan = {
         "schema": _PLAN_SCHEMA,
         "workflow_id": workflow_id,
         "workspace_binding": workspace_binding,
+        "base_commit": base_commit,
         "capacity": capacity,
         "runtime_policy_id": _RUNTIME_POLICY_ID,
         "tasks": tasks,
