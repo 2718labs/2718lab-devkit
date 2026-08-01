@@ -211,7 +211,9 @@ class OrchestratorService:
                     "INDEX_UNAVAILABLE", "code task has no strict index binding"
                 )
             receipt_ids = self._validate_execution_receipt_ids(execution_receipt_ids)
-            workspace_hash = self._validate_receipt_evidence(receipt_ids)
+            workspace_hash = self._validate_receipt_evidence(
+                receipt_ids, workspace_id=binding.workspace_id
+            )
             receipt_attestation = self._call(
                 self._store.build_code_task_receipt_attestation,
                 workflow_id=task.workflow_id,
@@ -394,7 +396,9 @@ class OrchestratorService:
                 "EVIDENCE_INCOMPLETE",
                 "execution receipts do not match code task completion",
             )
-        workspace_hash = self._validate_receipt_evidence(receipt_ids)
+        workspace_hash = self._validate_receipt_evidence(
+            receipt_ids, workspace_id=binding.workspace_id
+        )
         receipt_attestation = self._call(
             self._store.build_code_task_receipt_attestation,
             workflow_id=workflow_id,
@@ -1073,7 +1077,9 @@ class OrchestratorService:
                     "EVIDENCE_INCOMPLETE", "verification evidence is unavailable"
                 )
 
-    def _validate_receipt_evidence(self, receipt_ids: tuple[str, ...]) -> str:
+    def _validate_receipt_evidence(
+        self, receipt_ids: tuple[str, ...], *, workspace_id: str
+    ) -> str:
         repository = self._receipt_repository
         if type(repository) is not ReceiptRepository:
             raise self._receipt_evidence_incomplete()
@@ -1109,7 +1115,20 @@ class OrchestratorService:
         tools = {receipt.canonical_tool for receipt in receipts}
         if len(workspace_hashes) != 1 or tools != {"patch", "shell"}:
             raise self._receipt_evidence_incomplete()
-        return next(iter(workspace_hashes))
+        workspace_hash = next(iter(workspace_hashes))
+        index_service = self._index_service
+        if index_service is None:
+            raise self._receipt_evidence_incomplete()
+        try:
+            workspace_root = index_service.workspace_authority.resolve(workspace_id).root
+            expected_workspace_hash = ReceiptRepository.workspace_hash_for(
+                repository, str(workspace_root)
+            )
+        except Exception:
+            raise self._receipt_evidence_incomplete() from None
+        if not compare_digest(workspace_hash, expected_workspace_hash):
+            raise self._receipt_evidence_incomplete()
+        return workspace_hash
 
     @staticmethod
     def _receipt_evidence_incomplete() -> ServiceError:

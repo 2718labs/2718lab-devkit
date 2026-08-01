@@ -220,14 +220,13 @@ class ProductionAcceptanceEvidenceReaderTests(CodeTaskAcceptanceFixture):
 
         assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
 
-    def test_cross_workspace_binding_is_an_evidence_conflict(self) -> None:
+    def test_cross_workspace_receipt_attestation_is_an_evidence_conflict(self) -> None:
         acceptance, outbox = self._accepted_identifiers()
         foreign_workspace_id = self.index.project_index_register(self.repository)
         self.store._connection.execute(  # noqa: SLF001 - adversarial durability test
             "UPDATE task_index_bindings SET workspace_id = ? WHERE task_id = ?",
             (foreign_workspace_id, "code-task"),
         )
-
         with pytest.raises(AtlasError) as raised:
             self._reader().rebuild(
                 workflow_id="workflow",
@@ -235,8 +234,127 @@ class ProductionAcceptanceEvidenceReaderTests(CodeTaskAcceptanceFixture):
                 acceptance_id=acceptance.acceptance_id,
                 ingestion_key=outbox.ingestion_key,
             )
-
         assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+        self.store._connection.execute(  # noqa: SLF001 - adversarial durability test
+            "UPDATE task_index_bindings SET workspace_id = ? WHERE task_id = ?",
+            (self.workspace_id, "code-task"),
+        )
+
+        foreign_receipts = self._capture_receipts(
+            suffix="foreign-receipt-pair", workspace=str(self.repository)
+        )
+        foreign_receipt_ids = tuple(
+            sorted(receipt.receipt_id for receipt in foreign_receipts)
+        )
+        foreign_workspace_hashes = {
+            receipt.workspace_hash for receipt in foreign_receipts
+        }
+        assert len(foreign_workspace_hashes) == 1
+        foreign_workspace_hash = next(iter(foreign_workspace_hashes))
+        expected_workspace_hash = self.receipts.workspace_hash_for(
+            str(self.index.workspace_authority.resolve(self.workspace_id).root)
+        )
+        assert foreign_workspace_hash != expected_workspace_hash
+
+        foreign_attestation = SQLiteStore.build_code_task_receipt_attestation(
+            workflow_id="workflow",
+            code_task_id="code-task",
+            code_task_version=self.completed_task.version,
+            input_snapshot_id=self.input_snapshot.snapshot_id,
+            output_snapshot_id=self.output_snapshot.snapshot_id,
+            workspace_hash=foreign_workspace_hash,
+            execution_receipt_ids=foreign_receipt_ids,
+        )
+        existing_binding = self.store.evidence_binding_for_acceptance(
+            acceptance.acceptance_id
+        )
+        assert existing_binding is not None
+        foreign_binding = SQLiteStore.build_code_task_evidence_binding(
+            workflow_id=existing_binding.workflow_id,
+            task_id=existing_binding.code_task_id,
+            task_version=existing_binding.code_task_version,
+            input_snapshot_id=existing_binding.input_snapshot_id,
+            output_snapshot_id=existing_binding.output_snapshot_id,
+            indexed_diff_hash=existing_binding.indexed_diff_hash,
+            checkpoint_id=existing_binding.checkpoint_id,
+            checkpoint_hash=existing_binding.checkpoint_hash,
+            output_query_trace_id=existing_binding.output_query_trace_id,
+            verification_artifact_hashes=tuple(
+                sorted({self.verification_hash, foreign_attestation.attestation_hash})
+            ),
+            execution_receipt_ids=foreign_receipt_ids,
+        )
+
+        self.store._connection.execute(  # noqa: SLF001 - adversarial durability test
+            "DELETE FROM code_task_receipt_owners WHERE task_id = ?",
+            ("code-task",),
+        )
+        self.store._connection.execute(  # noqa: SLF001 - adversarial durability test
+            """
+            UPDATE code_task_receipt_attestations
+            SET workspace_hash = ?, execution_receipt_ids = ?, attestation_hash = ?
+            WHERE task_id = ?
+            """,
+            (
+                foreign_attestation.workspace_hash,
+                json.dumps(
+                    foreign_attestation.execution_receipt_ids, separators=(",", ":")
+                ),
+                foreign_attestation.attestation_hash,
+                "code-task",
+            ),
+        )
+        self.store._connection.executemany(  # noqa: SLF001 - adversarial durability test
+            """
+            INSERT INTO code_task_receipt_owners
+                (receipt_id, task_id, code_task_version, attestation_hash)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    receipt_id,
+                    "code-task",
+                    self.completed_task.version,
+                    foreign_attestation.attestation_hash,
+                )
+                for receipt_id in foreign_receipt_ids
+            ],
+        )
+        self.store._connection.execute(  # noqa: SLF001 - adversarial durability test
+            """
+            UPDATE events
+            SET redacted_payload = ?, payload_hash = ?
+            WHERE workflow_id = ? AND task_id = ? AND event_type = ?
+            """,
+            (
+                SQLiteStore._code_task_evidence_binding_json(foreign_binding),
+                foreign_binding.evidence_binding_hash,
+                "workflow",
+                "code-task",
+                SQLiteStore._EVIDENCE_BINDING_EVENT_TYPE,
+            ),
+        )
+
+        reader = self._reader()
+        atlas = self._atlas(reader)
+        for rebuild in (
+            lambda: reader.rebuild(
+                workflow_id="workflow",
+                code_task_id="code-task",
+                acceptance_id=acceptance.acceptance_id,
+                ingestion_key=outbox.ingestion_key,
+            ),
+            lambda: atlas.accept(
+                workflow_id="workflow",
+                code_task_id="code-task",
+                acceptance_id=acceptance.acceptance_id,
+                ingestion_key=outbox.ingestion_key,
+            ),
+        ):
+            with pytest.raises(AtlasError) as raised:
+                rebuild()
+
+            assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
 
     def test_cross_snapshot_binding_is_an_evidence_conflict(self) -> None:
         acceptance, outbox = self._accepted_identifiers()

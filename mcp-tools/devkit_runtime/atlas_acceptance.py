@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict
+from hmac import compare_digest
 from pathlib import PurePosixPath
 from typing import NoReturn
 
@@ -305,6 +306,9 @@ class ProductionAcceptanceEvidenceReader:
         ):
             _conflict()
         workspace_id = _require_identifier(binding.workspace_id, hashed=True)
+        expected_workspace_hash = self._receipt_workspace_hash(workspace_id)
+        if not compare_digest(attestation.workspace_hash, expected_workspace_hash):
+            _conflict()
 
         checkpoint = self._checkpoint(workspace_id, request, write_scope)
         facts, indexed_diff = self._index_facts(workspace_id, request, write_scope)
@@ -380,6 +384,27 @@ class ProductionAcceptanceEvidenceReader:
             coverage_gaps=raw.coverage_gaps,
             execution_receipts=receipts,
         )
+
+    def _receipt_workspace_hash(self, workspace_id: str) -> str:
+        try:
+            workspace_root = self._project_index.workspace_authority.resolve(
+                workspace_id
+            ).root
+        except IndexError as error:
+            self._raise_index_error(error)
+        except (AttributeError, TypeError, ValueError):
+            _conflict()
+        try:
+            workspace_hash = ReceiptRepository.workspace_hash_for(
+                self._receipts, str(workspace_root)
+            )
+        except ReceiptIntegrityError as error:
+            if str(error) in {"evidence_key_missing", "evidence_key_read_invalid"}:
+                _unavailable()
+            _conflict()
+        if not _is_hash(workspace_hash):
+            _conflict()
+        return workspace_hash
 
     def _checkpoint(
         self,

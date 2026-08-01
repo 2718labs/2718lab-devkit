@@ -1424,6 +1424,9 @@ class CodeTaskCompletionAttestationTests(CodeTaskAcceptanceFixture):
             suffix="completion-foreign", workspace=str(other_workspace)
         )
         self._assert_completion_evidence_rejected(
+            [receipt.receipt_id for receipt in foreign]
+        )
+        self._assert_completion_evidence_rejected(
             [
                 self.execution_receipts[0].receipt_id,
                 foreign[1].receipt_id,
