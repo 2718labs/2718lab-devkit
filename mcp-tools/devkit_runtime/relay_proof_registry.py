@@ -235,9 +235,8 @@ class ControlledGitTargetResolver:
             physical = (target.repository, target.integration_ref)
             previous_physical = repository_id_to_physical.get(target.repository_id)
             previous_target = physical_to_target.get(physical)
-            if (
-                (previous_physical is not None and previous_physical != physical)
-                or (previous_target is not None and previous_target != target)
+            if (previous_physical is not None and previous_physical != physical) or (
+                previous_target is not None and previous_target != target
             ):
                 raise ValueError("invalid controlled Git target")
             repository_id_to_physical[target.repository_id] = physical
@@ -368,7 +367,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             if not path.is_file():
                 raise OSError
         except (OSError, TypeError, ValueError):
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
         self._database_path = path
         self._target_resolver = target_resolver
         self._git_executable = git_executable
@@ -392,7 +393,9 @@ class RelayProofRegistry(IntegrationProofResolver):
         target_key = _target_key(expectation.workspace_id, target)
         existing = self._find_by_expectation(expectation.expectation_hash)
         if existing is not None:
-            self._assert_record_matches_target(existing, expectation, target, target_key)
+            self._assert_record_matches_target(
+                existing, expectation, target, target_key
+            )
             self._verify_receipt(target, existing.receipt)
             return existing.proof_id
         if self._find_active_target(target_key) is not None:
@@ -400,7 +403,9 @@ class RelayProofRegistry(IntegrationProofResolver):
 
         receipt = self._build_receipt(expectation, target)
         proof_id = receipt.proof_id
-        self._insert_registered(proof_id, expectation.expectation_hash, target_key, receipt)
+        self._insert_registered(
+            proof_id, expectation.expectation_hash, target_key, receipt
+        )
         self._verify_receipt(target, receipt)
         return proof_id
 
@@ -566,9 +571,8 @@ class RelayProofRegistry(IntegrationProofResolver):
                 connection.execute("COMMIT")
                 return "already_consumed"
             if record.state == "registered":
-                if (
-                    evidence.state != "aborted"
-                    or not self._released_event(connection, fence)
+                if evidence.state != "aborted" or not self._released_event(
+                    connection, fence
                 ):
                     raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
                 connection.execute("COMMIT")
@@ -785,7 +789,9 @@ class RelayProofRegistry(IntegrationProofResolver):
         except IntegrationProofError:
             raise
         except sqlite3.Error:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
         return tuple(self._decode_record(row) for row in rows)
 
     @staticmethod
@@ -861,9 +867,18 @@ class RelayProofRegistry(IntegrationProofResolver):
     ) -> None:
         if (
             fence.target_ref != target.integration_ref
-            or (record is not None and record.target_key != _target_key(fence.workspace_id, target))
-            or (record is not None and record.receipt.integration_ref != fence.target_ref)
-            or (record is not None and record.receipt.predecessor_commit != fence.base_oid)
+            or (
+                record is not None
+                and record.target_key != _target_key(fence.workspace_id, target)
+            )
+            or (
+                record is not None
+                and record.receipt.integration_ref != fence.target_ref
+            )
+            or (
+                record is not None
+                and record.receipt.predecessor_commit != fence.base_oid
+            )
             or (record is not None and record.receipt.final_commit != fence.final_oid)
         ):
             raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
@@ -876,7 +891,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             finally:
                 connection.close()
         except sqlite3.Error:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
 
     def _connect(self) -> sqlite3.Connection:
         try:
@@ -891,7 +908,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             connection.execute("PRAGMA busy_timeout = 1000")
             return connection
         except (OSError, sqlite3.Error, TypeError, ValueError):
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -908,7 +927,9 @@ class RelayProofRegistry(IntegrationProofResolver):
         except IntegrationProofError:
             raise
         except Exception:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
 
     def _find_by_proof_id(self, proof_id: str) -> _StoredProof | None:
         try:
@@ -929,7 +950,9 @@ class RelayProofRegistry(IntegrationProofResolver):
         except IntegrationProofError:
             raise
         except sqlite3.Error:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
         return None if row is None else self._decode_record(row)
 
     def _find_by_expectation(self, expectation_hash: str) -> _StoredProof | None:
@@ -951,7 +974,9 @@ class RelayProofRegistry(IntegrationProofResolver):
         except IntegrationProofError:
             raise
         except sqlite3.Error:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
         return None if row is None else self._decode_record(row)
 
     def _find_active_target(self, target_key: str) -> _StoredProof | None:
@@ -974,7 +999,9 @@ class RelayProofRegistry(IntegrationProofResolver):
         except IntegrationProofError:
             raise
         except sqlite3.Error:
-            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+            raise IntegrationProofError(
+                "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+            ) from None
         return None if row is None else self._decode_record(row)
 
     def _decode_record(self, row: sqlite3.Row) -> _StoredProof:
@@ -1032,7 +1059,10 @@ class RelayProofRegistry(IntegrationProofResolver):
                 raw_fence = json.loads(
                     fence_json, object_pairs_hook=_json_object_without_duplicates
                 )
-                if not isinstance(raw_fence, dict) or _canonical_json(raw_fence) != fence_json:
+                if (
+                    not isinstance(raw_fence, dict)
+                    or _canonical_json(raw_fence) != fence_json
+                ):
                     raise ValueError
                 fence = ProofFinalizationFence(**raw_fence)
                 validate_finalization_fence(fence)
@@ -1148,7 +1178,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             raise IntegrationProofError("RELAY_INTEGRATION_TREE_MISMATCH")
         if expectation.candidate_diff_hash != _delta_hash(candidate_delta):
             raise IntegrationProofError("RELAY_INTEGRATION_BINDING_MISMATCH")
-        final_commit = self._commit_tree(target, candidate_tree, predecessor, object_length)
+        final_commit = self._commit_tree(
+            target, candidate_tree, predecessor, object_length
+        )
         self._require_object_type(target, final_commit, "commit")
         final_tree = self._tree_oid(target, final_commit, object_length)
         final_delta = self._delta(target, predecessor, final_commit, object_length)
@@ -1214,11 +1246,20 @@ class RelayProofRegistry(IntegrationProofResolver):
         )
         if commits != receipt.candidate_commits:
             raise IntegrationProofError("RELAY_INTEGRATION_ANCESTRY_INVALID")
-        if self._tree_oid(target, receipt.predecessor_commit, object_length) != receipt.predecessor_tree:
+        if (
+            self._tree_oid(target, receipt.predecessor_commit, object_length)
+            != receipt.predecessor_tree
+        ):
             raise IntegrationProofError("RELAY_INTEGRATION_TREE_MISMATCH")
-        if self._tree_oid(target, receipt.candidate_head_commit, object_length) != receipt.candidate_tree:
+        if (
+            self._tree_oid(target, receipt.candidate_head_commit, object_length)
+            != receipt.candidate_tree
+        ):
             raise IntegrationProofError("RELAY_INTEGRATION_TREE_MISMATCH")
-        if self._tree_oid(target, receipt.final_commit, object_length) != receipt.final_tree:
+        if (
+            self._tree_oid(target, receipt.final_commit, object_length)
+            != receipt.final_tree
+        ):
             raise IntegrationProofError("RELAY_INTEGRATION_TREE_MISMATCH")
         parent = self._parents(target, receipt.final_commit, object_length)
         if parent != (receipt.final_commit, receipt.predecessor_commit):
@@ -1241,14 +1282,19 @@ class RelayProofRegistry(IntegrationProofResolver):
             or receipt.expectation.candidate_diff_hash != _delta_hash(candidate_delta)
         ):
             raise IntegrationProofError("RELAY_INTEGRATION_TREE_MISMATCH")
+
     def _object_format(self, target: GitProofTarget) -> str:
         try:
-            value = self._git(
-                target,
-                "rev-parse",
-                "--show-object-format",
-                code="RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE",
-            ).decode("ascii").strip()
+            value = (
+                self._git(
+                    target,
+                    "rev-parse",
+                    "--show-object-format",
+                    code="RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE",
+                )
+                .decode("ascii")
+                .strip()
+            )
         except UnicodeError:
             raise IntegrationProofError("RELAY_INTEGRATION_OBJECT_INVALID") from None
         return value
@@ -1273,12 +1319,16 @@ class RelayProofRegistry(IntegrationProofResolver):
 
     def _require_complete_history(self, target: GitProofTarget) -> None:
         try:
-            shallow = self._git(
-                target,
-                "rev-parse",
-                "--is-shallow-repository",
-                code="RELAY_INTEGRATION_ANCESTRY_INVALID",
-            ).decode("ascii").strip()
+            shallow = (
+                self._git(
+                    target,
+                    "rev-parse",
+                    "--is-shallow-repository",
+                    code="RELAY_INTEGRATION_ANCESTRY_INVALID",
+                )
+                .decode("ascii")
+                .strip()
+            )
         except UnicodeError:
             raise IntegrationProofError("RELAY_INTEGRATION_ANCESTRY_INVALID") from None
         if shallow != "false":
@@ -1292,13 +1342,17 @@ class RelayProofRegistry(IntegrationProofResolver):
         code: str = "RELAY_INTEGRATION_HEAD_STALE",
     ) -> str:
         try:
-            value = self._git(
-                target,
-                "rev-parse",
-                "--verify",
-                f"{reference}^{{commit}}",
-                code=code,
-            ).decode("ascii").strip()
+            value = (
+                self._git(
+                    target,
+                    "rev-parse",
+                    "--verify",
+                    f"{reference}^{{commit}}",
+                    code=code,
+                )
+                .decode("ascii")
+                .strip()
+            )
         except UnicodeError:
             raise IntegrationProofError(code) from None
         object_length = _object_length(self._object_format(target))
@@ -1312,13 +1366,17 @@ class RelayProofRegistry(IntegrationProofResolver):
 
     def _tree_oid(self, target: GitProofTarget, commit: str, object_length: int) -> str:
         try:
-            value = self._git(
-                target,
-                "rev-parse",
-                "--verify",
-                f"{commit}^{{tree}}",
-                code="RELAY_INTEGRATION_OBJECT_INVALID",
-            ).decode("ascii").strip()
+            value = (
+                self._git(
+                    target,
+                    "rev-parse",
+                    "--verify",
+                    f"{commit}^{{tree}}",
+                    code="RELAY_INTEGRATION_OBJECT_INVALID",
+                )
+                .decode("ascii")
+                .strip()
+            )
         except UnicodeError:
             raise IntegrationProofError("RELAY_INTEGRATION_OBJECT_INVALID") from None
         if not _valid_oid(value, object_length):
@@ -1330,13 +1388,17 @@ class RelayProofRegistry(IntegrationProofResolver):
         self, target: GitProofTarget, object_id: str, expected_type: str
     ) -> None:
         try:
-            actual_type = self._git(
-                target,
-                "cat-file",
-                "-t",
-                object_id,
-                code="RELAY_INTEGRATION_OBJECT_INVALID",
-            ).decode("ascii").strip()
+            actual_type = (
+                self._git(
+                    target,
+                    "cat-file",
+                    "-t",
+                    object_id,
+                    code="RELAY_INTEGRATION_OBJECT_INVALID",
+                )
+                .decode("ascii")
+                .strip()
+            )
         except UnicodeError:
             raise IntegrationProofError("RELAY_INTEGRATION_OBJECT_INVALID") from None
         if actual_type != expected_type:
@@ -1392,7 +1454,9 @@ class RelayProofRegistry(IntegrationProofResolver):
             try:
                 parent = line[7:].decode("ascii")
             except UnicodeError:
-                raise IntegrationProofError("RELAY_INTEGRATION_ANCESTRY_INVALID") from None
+                raise IntegrationProofError(
+                    "RELAY_INTEGRATION_ANCESTRY_INVALID"
+                ) from None
             if not _valid_oid(parent, object_length):
                 raise IntegrationProofError("RELAY_INTEGRATION_ANCESTRY_INVALID")
             parents.append(parent)
@@ -1435,7 +1499,9 @@ class RelayProofRegistry(IntegrationProofResolver):
                 new_mode, old_oid, new_oid = header[1:4]
                 path = fields[offset + 1].decode("utf-8", errors="strict")
             except (UnicodeError, ValueError):
-                raise IntegrationProofError("RELAY_INTEGRATION_SCOPE_MISMATCH") from None
+                raise IntegrationProofError(
+                    "RELAY_INTEGRATION_SCOPE_MISMATCH"
+                ) from None
             old_values = self._delta_side(target, old_oid, old_mode, object_length)
             new_values = self._delta_side(target, new_oid, new_mode, object_length)
             entries.append(
@@ -1468,13 +1534,17 @@ class RelayProofRegistry(IntegrationProofResolver):
         if not _valid_oid(object_id, object_length):
             raise IntegrationProofError("RELAY_INTEGRATION_OBJECT_INVALID")
         try:
-            object_type = self._git(
-                target,
-                "cat-file",
-                "-t",
-                object_id,
-                code="RELAY_INTEGRATION_OBJECT_INVALID",
-            ).decode("ascii").strip()
+            object_type = (
+                self._git(
+                    target,
+                    "cat-file",
+                    "-t",
+                    object_id,
+                    code="RELAY_INTEGRATION_OBJECT_INVALID",
+                )
+                .decode("ascii")
+                .strip()
+            )
         except UnicodeError:
             raise IntegrationProofError("RELAY_INTEGRATION_OBJECT_INVALID") from None
         return object_id, mode, object_type
@@ -1487,16 +1557,20 @@ class RelayProofRegistry(IntegrationProofResolver):
         object_length: int,
     ) -> str:
         try:
-            value = self._git(
-                target,
-                "commit-tree",
-                tree,
-                "-p",
-                parent,
-                "-m",
-                "Relay host proof integration",
-                code="RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE",
-            ).decode("ascii").strip()
+            value = (
+                self._git(
+                    target,
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    parent,
+                    "-m",
+                    "Relay host proof integration",
+                    code="RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE",
+                )
+                .decode("ascii")
+                .strip()
+            )
         except UnicodeError:
             raise IntegrationProofError("RELAY_INTEGRATION_OBJECT_INVALID") from None
         if not _valid_oid(value, object_length):
@@ -1620,7 +1694,9 @@ def _assert_registry_schema(connection: sqlite3.Connection) -> None:
         WHERE type = 'table' AND name = 'relay_host_integration_proofs'
         """
     ).fetchone()
-    if table is None or _normalized_sql(table[0]) != _normalized_sql(_REGISTRY_TABLE_SQL):
+    if table is None or _normalized_sql(table[0]) != _normalized_sql(
+        _REGISTRY_TABLE_SQL
+    ):
         raise sqlite3.DatabaseError
     columns = tuple(
         str(row[1])
@@ -1648,7 +1724,10 @@ def _assert_registry_schema(connection: sqlite3.Connection) -> None:
     )
     if event_columns != _REGISTRY_EVENT_COLUMNS:
         raise sqlite3.DatabaseError
-    if connection.execute("PRAGMA user_version").fetchone()[0] != _REGISTRY_SCHEMA_VERSION:
+    if (
+        connection.execute("PRAGMA user_version").fetchone()[0]
+        != _REGISTRY_SCHEMA_VERSION
+    ):
         raise sqlite3.DatabaseError
     for name, expected_sql in (
         ("relay_host_proof_target_state", _REGISTRY_INDEX_SQL),
@@ -1673,9 +1752,13 @@ def _normalized_sql(value: object) -> str:
 def _reservation_database_error(error: sqlite3.Error) -> IntegrationProofError:
     code = getattr(error, "sqlite_errorcode", None)
     if (
-        type(code) is int
-        and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
-    ) or "busy" in str(error).casefold() or "locked" in str(error).casefold():
+        (
+            type(code) is int
+            and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+        )
+        or "busy" in str(error).casefold()
+        or "locked" in str(error).casefold()
+    ):
         return IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
     return IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
 

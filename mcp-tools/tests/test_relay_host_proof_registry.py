@@ -227,11 +227,16 @@ def test_attests_registers_reserves_and_consumes_real_git_proof(tmp_path: Path) 
     reservation = registry.reserve(proof_id, expectation)
 
     assert reservation.receipt.proof_id == proof_id
-    assert _git_oid(repository, target.integration_ref) == reservation.receipt.final_commit
+    assert (
+        _git_oid(repository, target.integration_ref) == reservation.receipt.final_commit
+    )
     with pytest.raises(IntegrationProofError) as busy:
         registry.reserve(proof_id, expectation)
     assert busy.value.code == "RELAY_INTEGRATION_PROOF_BUSY"
-    assert reservation.settle(evidence=_committed_evidence(reservation.fence)) == "consumed"
+    assert (
+        reservation.settle(evidence=_committed_evidence(reservation.fence))
+        == "consumed"
+    )
 
 
 def test_attestor_rejects_shallow_repository_before_ref_cas(tmp_path: Path) -> None:
@@ -268,7 +273,10 @@ def test_attestor_rejects_shallow_repository_before_ref_cas(tmp_path: Path) -> N
     with pytest.raises(IntegrationProofError) as shallow:
         registry.attest_and_register(expectation)
     assert shallow.value.code == "RELAY_INTEGRATION_ANCESTRY_INVALID"
-    assert _git_oid(shallow_repository, target.integration_ref) == expectation.candidate_base_commit
+    assert (
+        _git_oid(shallow_repository, target.integration_ref)
+        == expectation.candidate_base_commit
+    )
 
 
 def test_attests_real_sha256_repository_delta(tmp_path: Path) -> None:
@@ -286,17 +294,24 @@ def test_attests_real_sha256_repository_delta(tmp_path: Path) -> None:
         expectation.candidate_base_commit,
         expectation.candidate_head_commit,
     )
-    assert reservation.settle(evidence=_committed_evidence(reservation.fence)) == "consumed"
+    assert (
+        reservation.settle(evidence=_committed_evidence(reservation.fence))
+        == "consumed"
+    )
 
 
 def test_attestor_rejects_real_tree_object_as_candidate_commit(tmp_path: Path) -> None:
     expectation, repository = _real_git_expectation(tmp_path)
-    tree_object = _git(
-        repository,
-        "rev-parse",
-        "--verify",
-        f"{expectation.candidate_head_commit}^{{tree}}",
-    ).decode("ascii").strip()
+    tree_object = (
+        _git(
+            repository,
+            "rev-parse",
+            "--verify",
+            f"{expectation.candidate_head_commit}^{{tree}}",
+        )
+        .decode("ascii")
+        .strip()
+    )
     target = _target(repository)
     registry = _registry(tmp_path / "relay-proof-registry.sqlite3", target)
 
@@ -305,7 +320,10 @@ def test_attestor_rejects_real_tree_object_as_candidate_commit(tmp_path: Path) -
             replace(expectation, candidate_head_commit=tree_object)
         )
     assert noncommit.value.code == "RELAY_INTEGRATION_OBJECT_INVALID"
-    assert _git_oid(repository, target.integration_ref) == expectation.candidate_base_commit
+    assert (
+        _git_oid(repository, target.integration_ref)
+        == expectation.candidate_base_commit
+    )
 
 
 def test_attestor_ignores_git_replace_when_validating_merge_ancestry(
@@ -430,9 +448,9 @@ def test_attestor_neutralizes_replace_and_config_environment_overrides(
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.useReplaceRefs")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
-    assert _git(
-        repository, "rev-list", "--parents", "-n", "1", merge_commit
-    ).decode("ascii").split() == [merge_commit, base_commit]
+    assert _git(repository, "rev-list", "--parents", "-n", "1", merge_commit).decode(
+        "ascii"
+    ).split() == [merge_commit, base_commit]
     forged = _expectation_for(
         base_commit=base_commit,
         candidate_commit=merge_commit,
@@ -583,7 +601,9 @@ def test_rejects_corrupt_private_receipt_without_path_disclosure(
     registry = _registry(database_path, target)
     proof_id = registry.attest_and_register(expectation)
     reservation = registry.reserve(proof_id, expectation)
-    assert reservation.settle(evidence=_aborted_evidence(reservation.fence)) == "released"
+    assert (
+        reservation.settle(evidence=_aborted_evidence(reservation.fence)) == "released"
+    )
 
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -673,7 +693,10 @@ def test_attestor_covers_full_git_delta_before_cas_ref_update(tmp_path: Path) ->
     with pytest.raises(IntegrationProofError) as scope_error:
         registry.attest_and_register(invalid_scope)
     assert scope_error.value.code == "RELAY_INTEGRATION_SCOPE_MISMATCH"
-    assert _git_oid(repository, target.integration_ref) == expectation.candidate_base_commit
+    assert (
+        _git_oid(repository, target.integration_ref)
+        == expectation.candidate_base_commit
+    )
 
     proof_id = registry.attest_and_register(expectation)
     reservation = registry.reserve(proof_id, expectation)
@@ -685,13 +708,18 @@ def test_attestor_covers_full_git_delta_before_cas_ref_update(tmp_path: Path) ->
     assert by_path["mcp-tools/script.sh"].new_mode == "100755"
     assert by_path["mcp-tools/link"].new_mode == "120000"
     assert by_path["mcp-tools/link"].new_type == "blob"
-    assert reservation.settle(evidence=_aborted_evidence(reservation.fence)) == "released"
+    assert (
+        reservation.settle(evidence=_aborted_evidence(reservation.fence)) == "released"
+    )
 
 
 @pytest.mark.parametrize(
     ("changed_path", "scope"),
     [
-        ("mcp-tools/writer.py.evil", IntegrationScopeEntry("mcp-tools/writer.py", "tree")),
+        (
+            "mcp-tools/writer.py.evil",
+            IntegrationScopeEntry("mcp-tools/writer.py", "tree"),
+        ),
         ("mcp-tools/Writer.py", IntegrationScopeEntry("mcp-tools/writer.py", "file")),
     ],
 )
@@ -944,7 +972,9 @@ def test_registry_uses_no_durable_file_lock_artifacts(tmp_path: Path) -> None:
     assert not tuple(tmp_path.glob("*.lock"))
 
 
-def test_repo_ref_lock_is_shared_across_opaque_workspace_aliases(tmp_path: Path) -> None:
+def test_repo_ref_lock_is_shared_across_opaque_workspace_aliases(
+    tmp_path: Path,
+) -> None:
     expectation, repository = _real_git_expectation(tmp_path)
     alias_workspace_id = "sha256:" + "7" * 64
     target = _target(repository)
@@ -1048,7 +1078,9 @@ def _reviewed_real_relay_candidate(
         worker_request(
             action,
             lifecycle_action="candidate_handoff",
-            capability=issue_worker(relay, action, lifecycle_action="candidate_handoff"),
+            capability=issue_worker(
+                relay, action, lifecycle_action="candidate_handoff"
+            ),
             expected_task_version=task_version,
             candidate={
                 "candidate_id": "candidate-a",
@@ -1099,8 +1131,8 @@ def _reviewed_real_relay_candidate(
 def test_reservation_spans_relay_commit_and_recovers_settlement_failure_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    relay, store, registry, action, candidate_task, proof_id = _reviewed_real_relay_candidate(
-        tmp_path
+    relay, store, registry, action, candidate_task, proof_id = (
+        _reviewed_real_relay_candidate(tmp_path)
     )
     request = _integration_request(relay, action, candidate_task, proof_id)
 
@@ -1218,9 +1250,7 @@ def test_r5_recovery_reaches_only_terminal_git_and_proof_pairs(
         )
 
     restarted = _registry(database_path, target)
-    restarted.recover_finalizations(
-        _TerminalFinalizationAuthority(committed=committed)
-    )
+    restarted.recover_finalizations(_TerminalFinalizationAuthority(committed=committed))
 
     with sqlite3.connect(database_path) as connection:
         state = connection.execute(
@@ -1234,7 +1264,9 @@ def test_r5_recovery_reaches_only_terminal_git_and_proof_pairs(
     if expected_state == "registered":
         successor = restarted.reserve(proof_id, expectation)
         assert successor.fence.reservation_epoch == fence.reservation_epoch + 1
-        assert successor.settle(evidence=_aborted_evidence(successor.fence)) == "released"
+        assert (
+            successor.settle(evidence=_aborted_evidence(successor.fence)) == "released"
+        )
 
 
 def test_r6_stale_epoch_cannot_settle_or_replace_successor_reservation(
