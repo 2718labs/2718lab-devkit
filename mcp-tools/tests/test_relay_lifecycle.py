@@ -160,7 +160,7 @@ def test_missing_proof_provider_only_blocks_integrate_before_store_access() -> N
             )
         )
 
-    assert caught.value.code == "RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE"
+    assert caught.value.code == "RELAY_FINALIZATION_PENDING"
     assert store.calls == []
 
 
