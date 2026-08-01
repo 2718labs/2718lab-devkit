@@ -1,0 +1,653 @@
+"""Relay v3 application service and capability authority boundary."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from typing import Any
+
+from .canonical import canonical_hash
+from .evidence import CapabilitySigner, RelayCapabilityError
+from .store import RelayStore, RelayStoreError
+
+
+_IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SCOPE_PATH = re.compile(r"^[A-Za-z]:")
+
+
+class RelayError(RuntimeError):
+    """Stable Relay domain failure for the MCP adapter to envelope."""
+
+    def __init__(self, code: str, message: str = "relay request rejected") -> None:
+        self.code = code
+        super().__init__(code if message == "relay request rejected" else message)
+
+
+class RelayService:
+    """Validate Relay inputs and authorize all lifecycle state transitions.
+
+    The service owns no host integration.  `relay_start` returns inert host
+    actions, `relay_status` reads durable state, workers use `relay_handoff`,
+    and Sol alone uses `relay_integrate` with a separate HMAC scope.
+    """
+
+    _PLAN_FIELDS = frozenset(
+        {
+            "schema",
+            "workflow_id",
+            "workspace_binding",
+            "base_commit",
+            "capacity",
+            "runtime_policy_id",
+            "tasks",
+            "dependencies",
+            "conflicts",
+            "queues",
+            "plan_hash",
+        }
+    )
+    _BINDING_FIELDS = frozenset(
+        {"workspace_id", "input_snapshot_id", "atlas_packet_ids"}
+    )
+    _TASK_FIELDS = frozenset(
+        {
+            "task_id",
+            "kind",
+            "title",
+            "objective",
+            "priority",
+            "dependencies",
+            "write_scope",
+            "route",
+            "constraints",
+            "acceptance_criteria",
+            "atlas_packet_ids",
+            "required_evidence",
+            "prewarm_for_task_id",
+            "retry_policy",
+        }
+    )
+    _ROUTE_FIELDS = frozenset({"route_class", "model", "reasoning_effort"})
+    _SCOPE_FIELDS = frozenset({"path", "kind"})
+    _CONSTRAINT_FIELDS = frozenset({"code", "detail"})
+    _CRITERION_FIELDS = frozenset({"criterion_id", "description"})
+    _EVIDENCE_FIELDS = frozenset({"kind", "selector"})
+    _RETRY_FIELDS = frozenset({"max_attempts", "retryable_codes"})
+    _DEPENDENCY_FIELDS = frozenset({"from_task_id", "kind", "to_task_id"})
+    _CONFLICT_FIELDS = frozenset({"from_task_id", "kind", "to_task_id"})
+    _QUEUE_FIELDS = frozenset(
+        {
+            "prepared_prewarms",
+            "ready",
+            "running_slots",
+            "review_integration",
+            "terminal",
+        }
+    )
+    _ROUTES = {
+        "terra_high": ("gpt-5.6-terra", "high"),
+        "terra_max": ("gpt-5.6-terra", "max"),
+        "sol_high": ("gpt-5.6-sol", "high"),
+        "sol_ultra": ("gpt-5.6-sol", "ultra"),
+    }
+    _KINDS = frozenset({"implementation", "verification", "review", "prewarm"})
+    _WORKER_ACTIONS = frozenset(
+        {"bind_endpoint", "heartbeat", "evidence", "terminal", "candidate_handoff"}
+    )
+    _SOL_ACTIONS = frozenset(
+        {"review", "rebase", "reject", "integrate", "approve_readonly"}
+    )
+    _MAX_TASKS = 64
+    _MAX_TEXT = 2_048
+
+    def __init__(self, store: RelayStore, *, capability_secret: bytes | str) -> None:
+        self._store = store
+        self._capabilities = CapabilitySigner(capability_secret)
+
+    def issue_worker_capability(
+        self,
+        *,
+        workflow_id: str,
+        task_id: str,
+        action: str,
+        epoch: int,
+        endpoint: str,
+    ) -> str:
+        """Issue a host-delivered worker token; it is never stored or returned by status."""
+
+        return self._capabilities.issue(
+            workflow_id=workflow_id,
+            task_id=task_id,
+            action=action,
+            epoch=epoch,
+            endpoint=endpoint,
+            scope="worker",
+        )
+
+    def issue_sol_capability(
+        self,
+        *,
+        workflow_id: str,
+        task_id: str,
+        action: str,
+        epoch: int,
+        endpoint: str,
+    ) -> str:
+        """Issue a separate Sol-only token for review and integration decisions."""
+
+        return self._capabilities.issue(
+            workflow_id=workflow_id,
+            task_id=task_id,
+            action=action,
+            epoch=epoch,
+            endpoint=endpoint,
+            scope="sol",
+        )
+
+    def start(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Apply one exact `relay_start` create or refill request."""
+
+        if type(request) is not dict or type(request.get("mode")) is not str:
+            raise RelayError("RELAY_REQUEST_INVALID")
+        if request["mode"] == "create":
+            if set(request) != {"mode", "plan", "idempotency_key"}:
+                raise RelayError("RELAY_REQUEST_INVALID")
+            return self.start_create(
+                request["plan"], idempotency_key=request["idempotency_key"]
+            )
+        if request["mode"] == "refill":
+            if set(request) != {
+                "mode",
+                "workflow_id",
+                "refill_directive_id",
+                "expected_schedule_version",
+                "idempotency_key",
+            }:
+                raise RelayError("RELAY_REQUEST_INVALID")
+            return self.start_refill(
+                request["workflow_id"],
+                request["refill_directive_id"],
+                expected_schedule_version=request["expected_schedule_version"],
+                idempotency_key=request["idempotency_key"],
+            )
+        raise RelayError("RELAY_REQUEST_INVALID")
+
+    def start_create(
+        self, plan: object, *, idempotency_key: object
+    ) -> dict[str, object]:
+        """Persist one canonical compiler result and return host actions."""
+
+        if type(idempotency_key) is not str:
+            raise RelayError("RELAY_REQUEST_INVALID")
+        return self._call(
+            self._store.start_create,
+            self._validated_plan(plan),
+            idempotency_key=idempotency_key,
+        )
+
+    def start_refill(
+        self,
+        workflow_id: object,
+        directive_id: object,
+        *,
+        expected_schedule_version: object,
+        idempotency_key: object,
+    ) -> dict[str, object]:
+        """Consume only a status-issued current refill directive."""
+
+        workflow = self._identifier(workflow_id)
+        directive = self._identifier(directive_id)
+        if (
+            type(expected_schedule_version) is not int
+            or expected_schedule_version < 0
+            or type(idempotency_key) is not str
+        ):
+            raise RelayError("RELAY_REQUEST_INVALID")
+        return self._call(
+            self._store.start_refill,
+            workflow,
+            directive,
+            expected_schedule_version=expected_schedule_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def status(self, workflow_id: object) -> dict[str, object]:
+        """Read status only; it does not create directives, leases, or actions."""
+
+        return self._call(self._store.status, self._identifier(workflow_id))
+
+    def handoff(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Apply only a worker-scoped endpoint, heartbeat, evidence, or handoff event."""
+
+        fields = self._lifecycle_fields(request, expected_scope="worker")
+        action = fields["action"]
+        if action not in self._WORKER_ACTIONS:
+            raise RelayError("RELAY_CAPABILITY_SCOPE")
+        base = {
+            "workflow_id",
+            "task_id",
+            "action",
+            "epoch",
+            "endpoint",
+            "expected_task_version",
+            "capability",
+        }
+        if action in {"bind_endpoint", "heartbeat"}:
+            self._exact_request_fields(request, base)
+            operation = (
+                self._store.bind_endpoint
+                if action == "bind_endpoint"
+                else self._store.heartbeat
+            )
+            return self._call(operation, **fields)
+        if action == "evidence":
+            self._exact_request_fields(request, base | {"evidence"})
+            return self._call(
+                self._store.record_evidence, evidence=request["evidence"], **fields
+            )
+        if action == "terminal":
+            self._exact_request_fields(request, base | {"outcome"})
+            if type(request["outcome"]) is not str:
+                raise RelayError("RELAY_REQUEST_INVALID")
+            return self._call(
+                self._store.worker_terminal, outcome=request["outcome"], **fields
+            )
+        self._exact_request_fields(request, base | {"candidate"})
+        return self._call(
+            self._store.candidate_handoff, candidate=request["candidate"], **fields
+        )
+
+    def integrate(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Apply one Sol-scoped review, rebase, rejection, or integration mutation."""
+
+        fields = self._lifecycle_fields(request, expected_scope="sol")
+        sol_fields = {key: value for key, value in fields.items() if key != "endpoint"}
+        action = fields["action"]
+        if action not in self._SOL_ACTIONS:
+            raise RelayError("RELAY_CAPABILITY_SCOPE")
+        base = {
+            "workflow_id",
+            "task_id",
+            "action",
+            "epoch",
+            "endpoint",
+            "expected_task_version",
+            "capability",
+        }
+        if action == "approve_readonly":
+            self._exact_request_fields(request, base)
+            return self._call(self._store.approve_readonly, **sol_fields)
+        if action == "review":
+            self._exact_request_fields(
+                request, base | {"candidate_id", "review_digest"}
+            )
+            return self._call(
+                self._store.review_candidate,
+                candidate_id=self._identifier(request["candidate_id"]),
+                review_digest=self._digest(request["review_digest"]),
+                **sol_fields,
+            )
+        if action == "rebase":
+            self._exact_request_fields(
+                request,
+                base
+                | {"candidate_id", "base_commit", "head_commit", "evidence_hashes"},
+            )
+            return self._call(
+                self._store.rebase_candidate,
+                candidate_id=self._identifier(request["candidate_id"]),
+                base_commit=self._commit(request["base_commit"]),
+                head_commit=self._commit(request["head_commit"]),
+                evidence_hashes=self._digest_list(request["evidence_hashes"]),
+                **sol_fields,
+            )
+        if action == "reject":
+            self._exact_request_fields(request, base | {"candidate_id"})
+            return self._call(
+                self._store.reject_candidate,
+                candidate_id=self._identifier(request["candidate_id"]),
+                **sol_fields,
+            )
+        self._exact_request_fields(
+            request,
+            base | {"candidate_id", "integration_head", "integration_commit"},
+        )
+        return self._call(
+            self._store.integrate_candidate,
+            candidate_id=self._identifier(request["candidate_id"]),
+            integration_head=self._commit(request["integration_head"]),
+            integration_commit=self._commit(request["integration_commit"]),
+            **sol_fields,
+        )
+
+    def _lifecycle_fields(
+        self, request: Mapping[str, Any], *, expected_scope: str
+    ) -> dict[str, object]:
+        if type(request) is not dict:
+            raise RelayError("RELAY_REQUEST_INVALID")
+        try:
+            workflow_id = self._identifier(request.get("workflow_id"))
+            task_id = self._identifier(request.get("task_id"))
+            action = self._identifier(request.get("action"))
+            epoch = request.get("epoch")
+            endpoint = request.get("endpoint")
+            expected_task_version = request.get("expected_task_version")
+            if (
+                type(epoch) is not int
+                or epoch < 1
+                or type(endpoint) is not str
+                or not endpoint
+                or len(endpoint) > 256
+                or type(expected_task_version) is not int
+                or expected_task_version < 1
+            ):
+                raise RelayError("RELAY_REQUEST_INVALID")
+            self._capabilities.verify(
+                request.get("capability"),
+                workflow_id=workflow_id,
+                task_id=task_id,
+                action=action,
+                epoch=epoch,
+                endpoint=endpoint,
+                scope=expected_scope,
+            )
+            return {
+                "workflow_id": workflow_id,
+                "task_id": task_id,
+                "epoch": epoch,
+                "endpoint": endpoint,
+                "expected_task_version": expected_task_version,
+                "action": action,
+            }
+        except RelayCapabilityError as error:
+            raise RelayError(error.code) from error
+
+    def _validated_plan(self, value: object) -> dict[str, Any]:
+        if type(value) is not dict or set(value) != self._PLAN_FIELDS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        if value["schema"] != "2718lab-devkit/relay-plan-v1":
+            raise RelayError("RELAY_PLAN_INVALID")
+        workflow_id = self._identifier(value["workflow_id"], plan=True)
+        binding = self._validated_binding(value["workspace_binding"])
+        base_commit = self._commit(value["base_commit"], plan=True)
+        capacity = value["capacity"]
+        if type(capacity) is not int or not 1 <= capacity <= 8:
+            raise RelayError("RELAY_PLAN_INVALID")
+        if value["runtime_policy_id"] != "2718lab-devkit/relay-runtime-policy-v1":
+            raise RelayError("RELAY_PLAN_INVALID")
+        tasks = self._validated_tasks(value["tasks"])
+        task_ids = [task["task_id"] for task in tasks]
+        if task_ids != sorted(task_ids) or len(task_ids) != len(set(task_ids)):
+            raise RelayError("RELAY_PLAN_INVALID")
+        self._validated_edges(value["dependencies"], task_ids, "depends_on")
+        self._validated_edges(value["conflicts"], task_ids, "write_scope_conflict")
+        self._validated_queues(value["queues"], tasks)
+        body = {key: value[key] for key in self._PLAN_FIELDS if key != "plan_hash"}
+        if value["plan_hash"] != canonical_hash(body):
+            raise RelayError("RELAY_PLAN_INVALID")
+        return {
+            **body,
+            "workflow_id": workflow_id,
+            "workspace_binding": binding,
+            "base_commit": base_commit,
+            "tasks": tasks,
+            "plan_hash": value["plan_hash"],
+        }
+
+    def _validated_binding(self, value: object) -> dict[str, object]:
+        if type(value) is not dict or set(value) != self._BINDING_FIELDS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        workspace_id = self._identifier(value["workspace_id"], plan=True)
+        snapshot = self._digest(value["input_snapshot_id"], plan=True)
+        packets = self._digest_list(value["atlas_packet_ids"], plan=True)
+        return {
+            "workspace_id": workspace_id,
+            "input_snapshot_id": snapshot,
+            "atlas_packet_ids": packets,
+        }
+
+    def _validated_tasks(self, value: object) -> list[dict[str, Any]]:
+        if type(value) is not list or not 1 <= len(value) <= self._MAX_TASKS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        return [self._validated_task(item) for item in value]
+
+    def _validated_task(self, value: object) -> dict[str, Any]:
+        if type(value) is not dict or set(value) != self._TASK_FIELDS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        task_id = self._identifier(value["task_id"], plan=True)
+        kind = value["kind"]
+        priority = value["priority"]
+        if (
+            type(kind) is not str
+            or kind not in self._KINDS
+            or type(priority) is not int
+            or not 1 <= priority <= 100
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        title = self._text(value["title"], plan=True, maximum=256)
+        objective = self._text(value["objective"], plan=True)
+        dependencies = self._identifier_list(value["dependencies"], plan=True)
+        scopes = self._validated_scopes(value["write_scope"])
+        if kind == "implementation" and not scopes:
+            raise RelayError("RELAY_PLAN_INVALID")
+        if kind != "implementation" and scopes:
+            raise RelayError("RELAY_PLAN_INVALID")
+        route = self._validated_route(value["route"])
+        constraints = self._validated_pairs(
+            value["constraints"], self._CONSTRAINT_FIELDS, "code", "detail"
+        )
+        criteria = self._validated_pairs(
+            value["acceptance_criteria"],
+            self._CRITERION_FIELDS,
+            "criterion_id",
+            "description",
+        )
+        packets = self._digest_list(value["atlas_packet_ids"], plan=True)
+        evidence = self._validated_pairs(
+            value["required_evidence"], self._EVIDENCE_FIELDS, "kind", "selector"
+        )
+        target = value["prewarm_for_task_id"]
+        if kind == "prewarm":
+            if dependencies or target is None:
+                raise RelayError("RELAY_PLAN_INVALID")
+            target = self._identifier(target, plan=True)
+        elif target is not None:
+            raise RelayError("RELAY_PLAN_INVALID")
+        retry = value["retry_policy"]
+        if type(retry) is not dict or set(retry) != self._RETRY_FIELDS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        max_attempts = retry["max_attempts"]
+        if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
+            raise RelayError("RELAY_PLAN_INVALID")
+        retry_codes = self._identifier_list(retry["retryable_codes"], plan=True)
+        return {
+            "task_id": task_id,
+            "kind": kind,
+            "title": title,
+            "objective": objective,
+            "priority": priority,
+            "dependencies": dependencies,
+            "write_scope": scopes,
+            "route": route,
+            "constraints": constraints,
+            "acceptance_criteria": criteria,
+            "atlas_packet_ids": packets,
+            "required_evidence": evidence,
+            "prewarm_for_task_id": target,
+            "retry_policy": {
+                "max_attempts": max_attempts,
+                "retryable_codes": retry_codes,
+            },
+        }
+
+    def _validated_scopes(self, value: object) -> list[dict[str, str]]:
+        if type(value) is not list or len(value) > 32:
+            raise RelayError("RELAY_PLAN_INVALID")
+        scopes: list[dict[str, str]] = []
+        for item in value:
+            if type(item) is not dict or set(item) != self._SCOPE_FIELDS:
+                raise RelayError("RELAY_PLAN_INVALID")
+            path = item["path"]
+            kind = item["kind"]
+            if (
+                type(path) is not str
+                or not path
+                or len(path) > self._MAX_TEXT
+                or path.startswith(("/", "~"))
+                or _SCOPE_PATH.match(path) is not None
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or type(kind) is not str
+                or kind not in {"file", "tree"}
+            ):
+                raise RelayError("RELAY_PLAN_INVALID")
+            scopes.append({"path": path, "kind": kind})
+        if scopes != sorted(scopes, key=lambda item: (item["path"], item["kind"])):
+            raise RelayError("RELAY_PLAN_INVALID")
+        if len({(item["path"], item["kind"]) for item in scopes}) != len(scopes):
+            raise RelayError("RELAY_PLAN_INVALID")
+        return scopes
+
+    def _validated_route(self, value: object) -> dict[str, str]:
+        if type(value) is not dict or set(value) != self._ROUTE_FIELDS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        route_class = value["route_class"]
+        if type(route_class) is not str or route_class not in self._ROUTES:
+            raise RelayError("RELAY_PLAN_INVALID")
+        model, effort = self._ROUTES[route_class]
+        if value["model"] != model or value["reasoning_effort"] != effort:
+            raise RelayError("RELAY_PLAN_INVALID")
+        return {"route_class": route_class, "model": model, "reasoning_effort": effort}
+
+    def _validated_pairs(
+        self,
+        value: object,
+        fields: frozenset[str],
+        identifier_key: str,
+        text_key: str,
+    ) -> list[dict[str, str]]:
+        if type(value) is not list or len(value) > 32:
+            raise RelayError("RELAY_PLAN_INVALID")
+        pairs: list[dict[str, str]] = []
+        for item in value:
+            if type(item) is not dict or set(item) != fields:
+                raise RelayError("RELAY_PLAN_INVALID")
+            pairs.append(
+                {
+                    identifier_key: self._identifier(item[identifier_key], plan=True),
+                    text_key: self._text(item[text_key], plan=True),
+                }
+            )
+        if pairs != sorted(
+            pairs, key=lambda item: (item[identifier_key], item[text_key])
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        if len({(item[identifier_key], item[text_key]) for item in pairs}) != len(
+            pairs
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        return pairs
+
+    def _validated_edges(
+        self, value: object, task_ids: list[str], required_kind: str
+    ) -> None:
+        if type(value) is not list or len(value) > self._MAX_TASKS * 4:
+            raise RelayError("RELAY_PLAN_INVALID")
+        entries: list[tuple[str, str]] = []
+        known = set(task_ids)
+        for item in value:
+            if type(item) is not dict or set(item) != self._DEPENDENCY_FIELDS:
+                raise RelayError("RELAY_PLAN_INVALID")
+            source = self._identifier(item["from_task_id"], plan=True)
+            target = self._identifier(item["to_task_id"], plan=True)
+            if (
+                item["kind"] != required_kind
+                or source not in known
+                or target not in known
+            ):
+                raise RelayError("RELAY_PLAN_INVALID")
+            entries.append((source, target))
+        if entries != sorted(entries) or len(entries) != len(set(entries)):
+            raise RelayError("RELAY_PLAN_INVALID")
+
+    def _validated_queues(self, value: object, tasks: list[dict[str, Any]]) -> None:
+        if type(value) is not dict or set(value) != self._QUEUE_FIELDS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        known = {task["task_id"] for task in tasks}
+        listed: list[str] = []
+        for name in self._QUEUE_FIELDS:
+            queue = value[name]
+            if type(queue) is not list or any(type(item) is not str for item in queue):
+                raise RelayError("RELAY_PLAN_INVALID")
+            if name in {"running_slots", "review_integration", "terminal"} and queue:
+                raise RelayError("RELAY_PLAN_INVALID")
+            listed.extend(queue)
+        if len(listed) != len(set(listed)) or not set(listed) <= known:
+            raise RelayError("RELAY_PLAN_INVALID")
+        for item in value["ready"]:
+            task = next(task for task in tasks if task["task_id"] == item)
+            if task["kind"] == "prewarm" or task["dependencies"]:
+                raise RelayError("RELAY_PLAN_INVALID")
+
+    def _identifier(self, value: object, *, plan: bool = False) -> str:
+        if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        return value
+
+    def _commit(self, value: object, *, plan: bool = False) -> str:
+        if type(value) is not str or _COMMIT.fullmatch(value) is None:
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        return value
+
+    def _digest(self, value: object, *, plan: bool = False) -> str:
+        if type(value) is not str or _DIGEST.fullmatch(value) is None:
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        return value
+
+    def _digest_list(self, value: object, *, plan: bool = False) -> list[str]:
+        if type(value) is not list or len(value) > 32:
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        values = [self._digest(item, plan=plan) for item in value]
+        if values != sorted(values) or len(values) != len(set(values)):
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        return values
+
+    def _identifier_list(self, value: object, *, plan: bool = False) -> list[str]:
+        if type(value) is not list or len(value) > 32:
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        values = [self._identifier(item, plan=plan) for item in value]
+        if values != sorted(values) or len(values) != len(set(values)):
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        return values
+
+    def _text(
+        self, value: object, *, plan: bool = False, maximum: int | None = None
+    ) -> str:
+        limit = self._MAX_TEXT if maximum is None else maximum
+        if (
+            type(value) is not str
+            or not value
+            or value != value.strip()
+            or len(value) > limit
+            or "\r" in value
+            or "\n" in value
+        ):
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        return value
+
+    @staticmethod
+    def _exact_request_fields(request: Mapping[str, Any], expected: set[str]) -> None:
+        if set(request) != expected:
+            raise RelayError("RELAY_REQUEST_INVALID")
+
+    @staticmethod
+    def _call(operation: Any, *args: Any, **kwargs: Any) -> dict[str, object]:
+        kwargs.pop("action", None)
+        try:
+            return operation(*args, **kwargs)
+        except RelayStoreError as error:
+            raise RelayError(error.code) from error
+        except KeyError as error:
+            raise RelayError("RELAY_REQUEST_INVALID") from error
