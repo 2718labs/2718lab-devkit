@@ -109,7 +109,8 @@ routing input；生命周期校验重放该历史 core input，不以较晚的 h
 该 envelope 最多容纳原 16 个 unit 和一个已批准 remediation unit 的 85 个 task/role entries。
 
 缺少、重复、未知 task、task/role 不一致或 core unavailable（包括 capability 未 attested）
-都必须 fail closed 到 `NO_SAFE_WORK`，绝不回落到固定 `recommended_route`。`ultra` 只激活
+任一此类条目都必须让整个 dispatch plan fail closed 到 `NO_SAFE_WORK`（零 worker、零队列），绝不回落到固定 `recommended_route`。
+`ultra` 只激活
 lane；worker model/effort 逐任务由 core 和 host attestation 决定，worker effort 禁止 `ultra`。
 prewarm 始终是独立的只读证据角色，不能变为 execution。
 

@@ -276,7 +276,8 @@ input through the pure core so a later event, lease change, or capability report
 cannot rewrite the route that was actually dispatched. Missing, duplicate,
 unknown, task/role-mismatched, invalid, or core-unavailable routes—including a
 missing exact capability attestation—have no guessed fallback: the scheduler
-returns its existing `NO_SAFE_WORK` outcome for affected unschedulable work.
+invalidates the entire dispatch matrix: it returns `NO_SAFE_WORK` with no
+assignments or queues, even if another route is otherwise valid.
 
 `ultra` activates Fast Lane and lane 0 only; it never becomes a worker route.
 Every worker route is selected per task from the host-attested core result and

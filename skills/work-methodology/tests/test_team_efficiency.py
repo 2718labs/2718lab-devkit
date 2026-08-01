@@ -33,10 +33,8 @@ from devkit_atlas import (  # noqa: E402
     NodeKind,
     SlotSpec,
     TemplateOperation,
+    TestSpec,
     canonical_hash,
-)
-from devkit_atlas import (  # noqa: E402
-    TestSpec as AtlasTestSpec,
 )
 from devkit_atlas.extractors import (  # noqa: E402
     BoundExecutionReceipt,
@@ -49,6 +47,9 @@ from orchestrator.service import OrchestratorService  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
 from project_index.models import SnapshotFile  # noqa: E402
 from project_index.service import ProjectIndexService  # noqa: E402
+
+AtlasTestSpec = TestSpec
+del TestSpec
 
 
 def _content_hash(body: bytes) -> str:
@@ -1837,6 +1838,72 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual("NO_SAFE_WORK", failed_closed["decision_code"])
                 self.assertEqual([], failed_closed["assignments"])
 
+    def test_fast_lane_rejects_any_partial_invalid_routing_context_globally(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        route = next(
+            entry
+            for entry in host_status["routing_context"]["routes"]
+            if entry["task_id"] == "FAST-LANE-ROUTINE"
+            and entry["scheduler_role"] == "execution"
+        )
+
+        missing = copy.deepcopy(host_status)
+        missing["routing_context"]["routes"] = [
+            entry
+            for entry in missing["routing_context"]["routes"]
+            if not (
+                entry["task_id"] == route["task_id"]
+                and entry["scheduler_role"] == route["scheduler_role"]
+            )
+        ]
+        duplicate = copy.deepcopy(host_status)
+        duplicate["routing_context"]["routes"].append(copy.deepcopy(route))
+        task_role_mismatch = copy.deepcopy(host_status)
+        next(
+            entry
+            for entry in task_role_mismatch["routing_context"]["routes"]
+            if entry["task_id"] == route["task_id"]
+            and entry["scheduler_role"] == route["scheduler_role"]
+        )["request"]["task"]["role"] = "integration"
+        capability_unavailable = copy.deepcopy(host_status)
+        next(
+            entry
+            for entry in capability_unavailable["routing_context"]["routes"]
+            if entry["task_id"] == route["task_id"]
+            and entry["scheduler_role"] == route["scheduler_role"]
+        )["request"]["host_capabilities"]["models"] = []
+        extra_unknown = copy.deepcopy(host_status)
+        unknown_entry = copy.deepcopy(route)
+        unknown_entry["task_id"] = "FAST-LANE-UNKNOWN"
+        unknown_entry["request"]["task"]["task_id"] = "FAST-LANE-UNKNOWN"
+        extra_unknown["routing_context"]["routes"].append(unknown_entry)
+
+        for name, invalid_status in (
+            ("missing", missing),
+            ("duplicate", duplicate),
+            ("task_role_mismatch", task_role_mismatch),
+            ("capability_unavailable", capability_unavailable),
+            ("extra_unknown", extra_unknown),
+        ):
+            with self.subTest(name=name):
+                result = self.compile_fast_lane(
+                    helper,
+                    request,
+                    reasoning_effort="ultra",
+                    host_status=invalid_status,
+                )
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+                self.assertEqual([], result["assignments"])
+                self.assertEqual([], result["ready_queue"])
+                self.assertEqual([], result["review_queue"])
+                self.assertEqual([], result["prewarm_queue"])
+                self.assertEqual([], result["design_queue"])
+
     def test_fast_lane_fails_closed_for_an_unroutable_verification_action(self) -> None:
         helper = load_efficiency()
         request = self.fast_lane_code_atlas_request(helper)
@@ -2552,6 +2619,58 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertEqual("", output)
         self.assertTrue(errors.startswith("error: "))
+
+    def test_fast_lane_cli_fails_closed_for_partial_or_unknown_routes(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        request_path = self.temp / "fast-lane-global-fail-closed-request.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        route = next(
+            entry
+            for entry in host_status["routing_context"]["routes"]
+            if entry["task_id"] == "FAST-LANE-ROUTINE"
+            and entry["scheduler_role"] == "execution"
+        )
+
+        partial = copy.deepcopy(host_status)
+        partial["routing_context"]["routes"] = [
+            entry
+            for entry in partial["routing_context"]["routes"]
+            if not (
+                entry["task_id"] == route["task_id"]
+                and entry["scheduler_role"] == route["scheduler_role"]
+            )
+        ]
+        unknown = copy.deepcopy(host_status)
+        unknown_entry = copy.deepcopy(route)
+        unknown_entry["task_id"] = "FAST-LANE-UNKNOWN"
+        unknown_entry["request"]["task"]["task_id"] = "FAST-LANE-UNKNOWN"
+        unknown["routing_context"]["routes"].append(unknown_entry)
+
+        for name, invalid_status in (("partial", partial), ("unknown", unknown)):
+            with self.subTest(name=name):
+                status_path = self.temp / f"fast-lane-{name}-host-status.json"
+                status_path.write_text(json.dumps(invalid_status), encoding="utf-8")
+                exit_code, output, errors = self.run_fast_lane_cli(
+                    helper,
+                    [
+                        "fast-lane",
+                        "--input",
+                        str(request_path),
+                        "--host-status",
+                        str(status_path),
+                        "--reasoning-effort",
+                        "ultra",
+                    ],
+                )
+
+                self.assertEqual(0, exit_code)
+                self.assertEqual("", errors)
+                result = json.loads(output)
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+                self.assertEqual([], result["assignments"])
 
     def test_fast_lane_top_level_fields_are_exact(self) -> None:
         helper = load_efficiency()

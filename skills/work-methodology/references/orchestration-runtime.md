@@ -71,8 +71,9 @@ core requests. The adapter validates the key against the source unit, invokes
 the pure routing core, and emits only its bounded decision and receipt fields.
 It must never reconstruct score/floor/capability fallback from a legacy
 `recommended_route` or profile. Missing, duplicate, unknown, role-mismatched,
-or unavailable core context fails closed as `NO_SAFE_WORK`; no fixed worker
-route is substituted.
+or unavailable core context invalidates the whole dispatch matrix as
+`NO_SAFE_WORK`, with no worker assignment or queue; no fixed worker route is
+substituted.
 
 The receipt/token bind context/result hashes, task fingerprint, reason codes,
 safety floor, dispatch context, slot epoch, and the bounded historical core

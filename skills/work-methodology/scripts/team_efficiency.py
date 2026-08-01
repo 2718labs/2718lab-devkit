@@ -36,6 +36,11 @@ FAST_LANE_SLOT_IDS = ("slot-1", "slot-2", "slot-3")
 FAST_LANE_REASONING_EFFORTS = frozenset(
     {"low", "medium", "high", "xhigh", "max", "ultra"}
 )
+# These are valid snapshots of the scheduler state, not rejected host route
+# attestations.  They defer only the affected task/role until the next plan.
+_FAST_LANE_DEFERRED_ROUTE_REASONS = frozenset(
+    {"dependency_not_ready", "scope_conflict_active"}
+)
 
 _TASK_ID = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|FLR1-[0-9a-f]{24})$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -3681,24 +3686,31 @@ def _fast_lane_routing_context(
     source_plan: Mapping[str, Any],
     source_plan_hash: str,
 ) -> dict[str, Any]:
-    """Bind complete core requests to known scheduler task/role keys once."""
+    """Bind one complete, globally fail-closed core route matrix."""
 
-    if value is None:
-        return {"decisions": {}, "reasons": {}, "default_reason": "routing_context_missing"}
     units = _fast_lane_unit_index(source_plan)
+    expected_keys = {
+        (task_id, scheduler_role)
+        for task_id in units
+        for scheduler_role in _FAST_LANE_ROLES
+    }
     decisions: dict[tuple[str, str], dict[str, Any] | None] = {}
     reasons: dict[tuple[str, str], str] = {}
-    for entry in value["routes"]:
+    failure_reasons: list[str] = []
+    routes = () if value is None else value["routes"]
+    for entry in routes:
         task_id = entry["task_id"]
         scheduler_role = entry["scheduler_role"]
         key = (task_id, scheduler_role)
         if key in decisions:
             decisions[key] = None
             reasons[key] = "routing_context_duplicate"
+            failure_reasons.append("routing_context_duplicate")
             continue
-        if task_id not in units:
+        if key not in expected_keys:
             decisions[key] = None
             reasons[key] = "routing_context_mismatch"
+            failure_reasons.append("routing_context_mismatch")
             continue
         decision, reason = _fast_lane_core_decision(
             entry, source_plan_hash=source_plan_hash
@@ -3706,10 +3718,19 @@ def _fast_lane_routing_context(
         decisions[key] = decision
         if decision is None:
             reasons[key] = reason
+            if reason not in _FAST_LANE_DEFERRED_ROUTE_REASONS:
+                failure_reasons.append(reason)
+    for key in sorted(expected_keys - set(decisions)):
+        decisions[key] = None
+        reasons[key] = "routing_context_missing"
+        failure_reasons.append("routing_context_missing")
     return {
         "decisions": decisions,
         "reasons": reasons,
         "default_reason": "routing_context_missing",
+        "global_failure_reason": (
+            None if not failure_reasons else failure_reasons[0]
+        ),
     }
 
 
@@ -6224,7 +6245,7 @@ def _validated_fast_lane_routing_context(value: object) -> dict[str, Any] | None
     if not isinstance(routes_value, Sequence) or isinstance(
         routes_value, (str, bytes, bytearray)
     ):
-        raise ValueError("host routing context.routes must be a list")
+        raise TypeError("host routing context.routes must be a list")
     if len(routes_value) > MAX_FAST_LANE_ROUTING_ENTRIES:
         raise ValueError("host routing context.routes exceeds its bound")
     routes: list[dict[str, Any]] = []
@@ -6254,7 +6275,7 @@ def _validated_fast_lane_host_status(value: Mapping[str, Any]) -> dict[str, Any]
         if not isinstance(entries, Sequence) or isinstance(
             entries, (str, bytes, bytearray)
         ):
-            raise ValueError(f"host status.{field} must be a list")
+            raise TypeError(f"host status.{field} must be a list")
         if len(entries) > len(FAST_LANE_SLOT_IDS):
             raise ValueError(f"host status.{field} exceeds slot capacity")
     return {
@@ -6783,6 +6804,19 @@ def _render_fast_lane_plan(
             decision_code="EXPLICIT_OPT_IN_REQUIRED",
             idle_reason="OPT_IN_REQUIRED",
             next_action=None,
+        )
+    routing_failure = validated["routing_context"].get("global_failure_reason")
+    if routing_failure is not None:
+        idle_reason = _fast_lane_failure_reason(routing_failure)
+        return _render_fast_lane_status(
+            validated,
+            activation,
+            status="blocked",
+            decision_code="NO_SAFE_WORK",
+            idle_reason=idle_reason,
+            next_action=None,
+            planned_assignments=[],
+            idle_slots=_fast_lane_idle_slots(idle_reason),
         )
     if _fast_lane_phase(validated["scheduler_state"]) in {
         "blocker_review",

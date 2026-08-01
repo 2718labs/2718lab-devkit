@@ -28,8 +28,8 @@ Fast Lane does not promote the host policy above into a fixed scheduler table.
 For each `(task_id, scheduler_role)`, the host attests a complete routing-core
 request; the adapter may emit only the core-resolved, exact model/effort pair
 and its bounded route receipt. A missing, duplicate, unknown, mismatched, or
-capability-unavailable entry has no `recommended_route` fallback and becomes
-`NO_SAFE_WORK`. This permits an exactly attested Luna pair where appropriate
+capability-unavailable entry has no `recommended_route` fallback and makes the
+entire dispatch matrix `NO_SAFE_WORK`, with no worker assignment or queue. This permits an exactly attested Luna pair where appropriate
 while preserving Terra and Sol safety floors without scheduler-side guessing.
 
 `ultra` is lane-0 activation, never a worker effort. Sol High remains the
