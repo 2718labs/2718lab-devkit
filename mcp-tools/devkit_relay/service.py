@@ -14,6 +14,7 @@ from .store import RelayStore, RelayStoreError
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_WORKSPACE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SCOPE_PATH = re.compile(r"^[A-Za-z]:")
 
 
@@ -117,14 +118,17 @@ class RelayService:
     ) -> str:
         """Issue a host-delivered worker token; it is never stored or returned by status."""
 
-        return self._capabilities.issue(
-            workflow_id=workflow_id,
-            task_id=task_id,
-            action=action,
-            epoch=epoch,
-            endpoint=endpoint,
-            scope="worker",
-        )
+        try:
+            return self._capabilities.issue(
+                workflow_id=workflow_id,
+                task_id=task_id,
+                action=action,
+                epoch=epoch,
+                endpoint=endpoint,
+                scope="worker",
+            )
+        except ValueError as error:
+            raise RelayError("RELAY_REQUEST_INVALID") from error
 
     def issue_sol_capability(
         self,
@@ -137,14 +141,17 @@ class RelayService:
     ) -> str:
         """Issue a separate Sol-only token for review and integration decisions."""
 
-        return self._capabilities.issue(
-            workflow_id=workflow_id,
-            task_id=task_id,
-            action=action,
-            epoch=epoch,
-            endpoint=endpoint,
-            scope="sol",
-        )
+        try:
+            return self._capabilities.issue(
+                workflow_id=workflow_id,
+                task_id=task_id,
+                action=action,
+                epoch=epoch,
+                endpoint=endpoint,
+                scope="sol",
+            )
+        except ValueError as error:
+            raise RelayError("RELAY_REQUEST_INVALID") from error
 
     def start(self, request: Mapping[str, Any]) -> dict[str, object]:
         """Apply one exact `relay_start` create or refill request."""
@@ -363,6 +370,8 @@ class RelayService:
             }
         except RelayCapabilityError as error:
             raise RelayError(error.code) from error
+        except (TypeError, ValueError) as error:
+            raise RelayError("RELAY_REQUEST_INVALID") from error
 
     def _validated_plan(self, value: object) -> dict[str, Any]:
         if type(value) is not dict or set(value) != self._PLAN_FIELDS:
@@ -381,9 +390,32 @@ class RelayService:
         task_ids = [task["task_id"] for task in tasks]
         if task_ids != sorted(task_ids) or len(task_ids) != len(set(task_ids)):
             raise RelayError("RELAY_PLAN_INVALID")
-        self._validated_edges(value["dependencies"], task_ids, "depends_on")
-        self._validated_edges(value["conflicts"], task_ids, "write_scope_conflict")
-        self._validated_queues(value["queues"], tasks)
+        self._validate_task_relations(tasks)
+        dependency_edges = self._validated_edges(
+            value["dependencies"], task_ids, "depends_on"
+        )
+        expected_dependencies = [
+            {
+                "from_task_id": task["task_id"],
+                "kind": "depends_on",
+                "to_task_id": dependency,
+            }
+            for task in tasks
+            for dependency in task["dependencies"]
+        ]
+        if dependency_edges != expected_dependencies:
+            raise RelayError("RELAY_PLAN_INVALID")
+        conflict_edges = self._validated_edges(
+            value["conflicts"], task_ids, "write_scope_conflict"
+        )
+        expected_conflicts = self._compiler_conflicts(tasks)
+        if conflict_edges != expected_conflicts:
+            raise RelayError("RELAY_PLAN_INVALID")
+        if binding["atlas_packet_ids"] != sorted(
+            {packet for task in tasks for packet in task["atlas_packet_ids"]}
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        self._validated_queues(value["queues"], tasks, expected_conflicts)
         body = {key: value[key] for key in self._PLAN_FIELDS if key != "plan_hash"}
         if value["plan_hash"] != canonical_hash(body):
             raise RelayError("RELAY_PLAN_INVALID")
@@ -399,7 +431,7 @@ class RelayService:
     def _validated_binding(self, value: object) -> dict[str, object]:
         if type(value) is not dict or set(value) != self._BINDING_FIELDS:
             raise RelayError("RELAY_PLAN_INVALID")
-        workspace_id = self._identifier(value["workspace_id"], plan=True)
+        workspace_id = self._workspace_id(value["workspace_id"], plan=True)
         snapshot = self._digest(value["input_snapshot_id"], plan=True)
         packets = self._digest_list(value["atlas_packet_ids"], plan=True)
         return {
@@ -552,10 +584,10 @@ class RelayService:
 
     def _validated_edges(
         self, value: object, task_ids: list[str], required_kind: str
-    ) -> None:
+    ) -> list[dict[str, str]]:
         if type(value) is not list or len(value) > self._MAX_TASKS * 4:
             raise RelayError("RELAY_PLAN_INVALID")
-        entries: list[tuple[str, str]] = []
+        entries: list[dict[str, str]] = []
         known = set(task_ids)
         for item in value:
             if type(item) is not dict or set(item) != self._DEPENDENCY_FIELDS:
@@ -568,31 +600,169 @@ class RelayService:
                 or target not in known
             ):
                 raise RelayError("RELAY_PLAN_INVALID")
-            entries.append((source, target))
-        if entries != sorted(entries) or len(entries) != len(set(entries)):
+            entries.append(
+                {
+                    "from_task_id": source,
+                    "kind": required_kind,
+                    "to_task_id": target,
+                }
+            )
+        if entries != sorted(
+            entries,
+            key=lambda item: (item["from_task_id"], item["to_task_id"]),
+        ) or len(
+            {(item["from_task_id"], item["to_task_id"]) for item in entries}
+        ) != len(entries):
             raise RelayError("RELAY_PLAN_INVALID")
+        return entries
 
-    def _validated_queues(self, value: object, tasks: list[dict[str, Any]]) -> None:
+    def _validated_queues(
+        self,
+        value: object,
+        tasks: list[dict[str, Any]],
+        conflicts: list[dict[str, str]],
+    ) -> None:
         if type(value) is not dict or set(value) != self._QUEUE_FIELDS:
             raise RelayError("RELAY_PLAN_INVALID")
-        known = {task["task_id"] for task in tasks}
-        listed: list[str] = []
         for name in self._QUEUE_FIELDS:
             queue = value[name]
             if type(queue) is not list or any(type(item) is not str for item in queue):
                 raise RelayError("RELAY_PLAN_INVALID")
             if name in {"running_slots", "review_integration", "terminal"} and queue:
                 raise RelayError("RELAY_PLAN_INVALID")
-            listed.extend(queue)
-        if len(listed) != len(set(listed)) or not set(listed) <= known:
+        prewarms = sorted(
+            (task for task in tasks if task["kind"] == "prewarm"),
+            key=lambda task: (-task["priority"], task["task_id"]),
+        )
+        candidates = [
+            task
+            for task in tasks
+            if task["kind"] != "prewarm" and not task["dependencies"]
+        ]
+        candidate_ids = {task["task_id"] for task in candidates}
+        withheld = {
+            edge["to_task_id"]
+            for edge in conflicts
+            if edge["from_task_id"] in candidate_ids
+            and edge["to_task_id"] in candidate_ids
+        }
+        ready = sorted(
+            (task for task in candidates if task["task_id"] not in withheld),
+            key=lambda task: (-task["priority"], task["task_id"]),
+        )
+        expected = {
+            "prepared_prewarms": [task["task_id"] for task in prewarms],
+            "ready": [task["task_id"] for task in ready],
+            "running_slots": [],
+            "review_integration": [],
+            "terminal": [],
+        }
+        if value != expected:
             raise RelayError("RELAY_PLAN_INVALID")
-        for item in value["ready"]:
-            task = next(task for task in tasks if task["task_id"] == item)
-            if task["kind"] == "prewarm" or task["dependencies"]:
+
+    def _validate_task_relations(self, tasks: list[dict[str, Any]]) -> None:
+        task_by_id = {task["task_id"]: task for task in tasks}
+        prewarm_ids = {task["task_id"] for task in tasks if task["kind"] == "prewarm"}
+        for task in tasks:
+            task_id = task["task_id"]
+            dependencies = task["dependencies"]
+            if (
+                task_id in dependencies
+                or not set(dependencies) <= set(task_by_id)
+                or set(dependencies) & prewarm_ids
+            ):
                 raise RelayError("RELAY_PLAN_INVALID")
+            target = task["prewarm_for_task_id"]
+            if target is not None and (
+                target not in task_by_id or task_by_id[target]["kind"] == "prewarm"
+            ):
+                raise RelayError("RELAY_PLAN_INVALID")
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(task_id: str) -> None:
+            if task_id in visiting:
+                raise RelayError("RELAY_PLAN_INVALID")
+            if task_id in visited:
+                return
+            visiting.add(task_id)
+            for dependency in task_by_id[task_id]["dependencies"]:
+                visit(dependency)
+            visiting.remove(task_id)
+            visited.add(task_id)
+
+        for task_id in task_by_id:
+            visit(task_id)
+
+    def _compiler_conflicts(self, tasks: list[dict[str, Any]]) -> list[dict[str, str]]:
+        dependencies = {task["task_id"]: task["dependencies"] for task in tasks}
+        ancestor_cache: dict[str, frozenset[str]] = {}
+
+        def ancestors(task_id: str) -> frozenset[str]:
+            if task_id not in ancestor_cache:
+                direct = dependencies[task_id]
+                ancestor_cache[task_id] = frozenset(
+                    {
+                        *direct,
+                        *(ancestor for item in direct for ancestor in ancestors(item)),
+                    }
+                )
+            return ancestor_cache[task_id]
+
+        writers = [task for task in tasks if task["kind"] == "implementation"]
+        conflicts: list[dict[str, str]] = []
+        for index, left in enumerate(writers):
+            for right in writers[index + 1 :]:
+                if (
+                    left["task_id"] in ancestors(right["task_id"])
+                    or right["task_id"] in ancestors(left["task_id"])
+                    or not any(
+                        self._scopes_overlap(left_scope, right_scope)
+                        for left_scope in left["write_scope"]
+                        for right_scope in right["write_scope"]
+                    )
+                ):
+                    continue
+                if left["priority"] != right["priority"]:
+                    blocker, blocked = (
+                        (left, right)
+                        if left["priority"] > right["priority"]
+                        else (right, left)
+                    )
+                else:
+                    blocker, blocked = (
+                        (left, right)
+                        if left["task_id"] < right["task_id"]
+                        else (right, left)
+                    )
+                conflicts.append(
+                    {
+                        "from_task_id": blocker["task_id"],
+                        "kind": "write_scope_conflict",
+                        "to_task_id": blocked["task_id"],
+                    }
+                )
+        return sorted(
+            conflicts,
+            key=lambda item: (item["from_task_id"], item["to_task_id"]),
+        )
+
+    @staticmethod
+    def _scopes_overlap(left: Mapping[str, str], right: Mapping[str, str]) -> bool:
+        if left["path"] == right["path"]:
+            return True
+        if left["kind"] == "tree" and right["path"].startswith(left["path"] + "/"):
+            return True
+        return right["kind"] == "tree" and left["path"].startswith(right["path"] + "/")
 
     def _identifier(self, value: object, *, plan: bool = False) -> str:
         if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
+            raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
+        return value
+
+    def _workspace_id(self, value: object, *, plan: bool = False) -> str:
+        if type(value) is not str or _WORKSPACE_ID.fullmatch(value) is None:
             raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
         return value
 

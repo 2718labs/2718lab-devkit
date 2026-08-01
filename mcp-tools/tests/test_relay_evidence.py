@@ -148,3 +148,43 @@ def test_capabilities_bind_worker_action_epoch_endpoint_and_scope(
         )
     )
     assert saved["evidence"]["kind"] == "pytest"
+
+
+def test_malformed_lifecycle_endpoint_and_capability_stay_in_relay_errors(
+    tmp_path: Path,
+) -> None:
+    relay, _store = service(tmp_path)
+    created = relay.start_create(
+        plan(
+            task(
+                "writer-a",
+                write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+            )
+        ),
+        idempotency_key="malformed-lifecycle",
+    )
+    action = created["host_actions"][0]
+    assert isinstance(action, dict)
+    task_version = bind_worker(relay, action)
+    token = issue_worker(relay, action, lifecycle_action="heartbeat")
+
+    with pytest.raises(RelayError, match="RELAY_REQUEST_INVALID"):
+        relay.handoff(
+            worker_request(
+                action,
+                lifecycle_action="heartbeat",
+                capability=token,
+                expected_task_version=task_version,
+                endpoint="invalid\nendpoint",
+            )
+        )
+
+    with pytest.raises(RelayError, match="RELAY_CAPABILITY_INVALID"):
+        relay.handoff(
+            worker_request(
+                action,
+                lifecycle_action="heartbeat",
+                capability={"not": "a-token"},
+                expected_task_version=task_version,
+            )
+        )
