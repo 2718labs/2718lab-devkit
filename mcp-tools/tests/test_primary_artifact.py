@@ -22,11 +22,13 @@ ROOT = Path(__file__).resolve().parents[2]
 BUILDER = ROOT / ".codex-plugin" / "build_main_artifact.py"
 SECURE_IO = ROOT / ".codex-plugin" / "artifact_secure_io.py"
 ALLOWLIST = ROOT / ".codex-plugin" / "main-artifact-allowlist.json"
+MCP_CONFIG = ROOT / ".mcp.json"
 SOURCE_MTIME = 347_155_200  # 1981-01-01T00:00:00Z, representable by ZIP.
 EXPECTED_FILES = (
     ".codex-plugin/plugin.json",
     ".mcp.json",
     "LICENSE",
+    ".codex-plugin/fastlane_todo_projection.py",
     "mcp-tools/pyproject.toml",
     "mcp-tools/server.py",
     "mcp-tools/uv.lock",
@@ -35,8 +37,13 @@ EXPECTED_TREES = (
     "mcp-tools/bugkiller",
     "mcp-tools/devkit_atlas",
     "mcp-tools/devkit_relay",
+    "mcp-tools/devkit_runtime",
     "mcp-tools/orchestrator",
     "mcp-tools/project_index",
+)
+EXPECTED_BRIDGE_SELECTORS = (
+    "CODEX_DEVKIT_HOST_BRIDGE_FD",
+    "CODEX_DEVKIT_HOST_BRIDGE_HANDLE",
 )
 
 
@@ -148,8 +155,33 @@ def test_primary_allowlist_is_explicit_and_runtime_only() -> None:
         "hooks",
         "skills",
         "extensions",
+        "code_atlas",
+        "cache",
+        "evidence",
     ):
         assert excluded not in serialized
+
+
+def test_primary_mcp_config_exports_only_locked_bridge_selectors() -> None:
+    configuration = json.loads(MCP_CONFIG.read_text(encoding="utf-8"))
+
+    assert set(configuration) == {"mcpServers"}
+    servers = configuration["mcpServers"]
+    assert set(servers) == {"2718lab-devkit"}
+    server = servers["2718lab-devkit"]
+    assert set(server) == {"command", "args", "cwd", "env_vars"}
+    assert tuple(server["env_vars"]) == EXPECTED_BRIDGE_SELECTORS
+    serialized = json.dumps(configuration, ensure_ascii=False).casefold()
+    for forbidden in (
+        "bugkiller_home",
+        "plugin_data",
+        "codex_home",
+        "bearer",
+        "proof",
+        "secret",
+        "token",
+    ):
+        assert forbidden not in serialized
 
 
 def test_python_project_and_lock_use_pep440_rc1_metadata() -> None:
@@ -163,6 +195,7 @@ def test_python_project_and_lock_use_pep440_rc1_metadata() -> None:
     assert project["project"]["version"] == "1.0.0rc1"
     assert project["project"]["dependencies"] == ["mcp[cli]>=1,<2"]
     assert "devkit_atlas" in project["tool"]["pyright"]["include"]
+    assert "devkit_runtime" in project["tool"]["pyright"]["include"]
     assert "code_atlas" not in project["tool"]["pyright"]["include"]
     lock_text = lock_path.read_text(encoding="utf-8")
     assert 'name = "2718lab-devkit-mcp"' in lock_text

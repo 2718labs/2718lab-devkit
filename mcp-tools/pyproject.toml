@@ -33,6 +33,7 @@ include = [
     "bugkiller",
     "devkit_atlas",
     "devkit_relay",
+    "devkit_runtime",
     "orchestrator",
     "project_index",
     "server.py",
