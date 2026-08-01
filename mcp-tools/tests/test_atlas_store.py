@@ -11,34 +11,38 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from devkit_atlas import store as store_module
+from devkit_atlas.canonical import canonical_hash, canonical_json
 from devkit_atlas.models import (
     AtlasEdge,
     AtlasNode,
     AtlasStatus,
+    ConstraintSpec,
     EdgeRelation,
     ImplementationPacket,
     IngestionReceipt,
     NodeKind,
     RecipeManifest,
-    TemplateOperation,
     SlotSpec,
-    ConstraintSpec,
+    TemplateOperation,
+)
+from devkit_atlas.models import (
     TestSpec as AtlasTestSpec,
 )
-from devkit_atlas.canonical import canonical_hash, canonical_json
-from devkit_atlas import store as store_module
-from devkit_atlas.store import AtlasStore, StoreConflictError
 from devkit_atlas.security import (
     MAX_GRAPH_NODES,
     MAX_PACKET_BYTES,
     MAX_RECIPE_BYTES,
     MAX_TEMPLATE_BYTES,
 )
+from devkit_atlas.store import AtlasStore, StoreConflictError
+from devkit_runtime import sqlite_snapshot as snapshot_module
 
 
 def store_at(tmp_path: Path) -> AtlasStore:
@@ -1184,6 +1188,155 @@ def _durable_file_state(
     }
 
 
+def test_open_readonly_delegates_to_the_shared_verified_snapshot_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from devkit_runtime.sqlite_snapshot import open_verified_sqlite_snapshot
+
+    durable = tmp_path / "durable"
+    scratch = tmp_path / "readonly-scratch"
+    durable.mkdir()
+    scratch.mkdir()
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    calls: list[tuple[Path, Path, tuple[Path, ...]]] = []
+
+    def observed_factory(
+        database_path: str | Path,
+        *,
+        scratch_root: str | Path | None = None,
+        protected_roots: tuple[str | Path, ...] = (),
+    ) -> object:
+        assert scratch_root is not None
+        calls.append(
+            (
+                Path(database_path),
+                Path(scratch_root),
+                tuple(Path(root) for root in protected_roots),
+            )
+        )
+        return open_verified_sqlite_snapshot(
+            database_path,
+            scratch_root=scratch_root,
+            protected_roots=protected_roots,
+        )
+
+    monkeypatch.setattr(
+        store_module,
+        "open_verified_sqlite_snapshot",
+        observed_factory,
+        raising=False,
+    )
+
+    readonly = AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
+    try:
+        assert readonly.schema_version() == 1
+    finally:
+        readonly.close()
+
+    assert calls == [(database, scratch, (cas_root,))]
+
+
+def test_open_readonly_preserves_schema_validation_and_snapshot_error_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from devkit_runtime.sqlite_snapshot import SqliteSnapshotError
+
+    durable = tmp_path / "durable"
+    scratch = tmp_path / "readonly-scratch"
+    durable.mkdir()
+    scratch.mkdir()
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE atlas_metadata SET value='2' WHERE key='schema_version'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    before = _durable_file_state(durable)
+
+    with pytest.raises(StoreConflictError):
+        AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
+
+    assert not tuple(scratch.iterdir())
+    assert _durable_file_state(durable) == before
+
+    def unavailable_snapshot(*args: object, **kwargs: object) -> object:
+        raise SqliteSnapshotError()
+
+    monkeypatch.setattr(
+        store_module,
+        "open_verified_sqlite_snapshot",
+        unavailable_snapshot,
+    )
+    with pytest.raises(StoreConflictError) as raised:
+        AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
+    assert raised.value.__cause__ is None
+
+
+def test_open_readonly_preserves_cas_identity_across_snapshot_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from devkit_runtime.sqlite_snapshot import open_verified_sqlite_snapshot
+
+    durable = tmp_path / "durable"
+    scratch = tmp_path / "readonly-scratch"
+    durable.mkdir()
+    scratch.mkdir()
+    database = durable / "atlas.sqlite3"
+    cas_root = durable / "atlas-cas"
+    writable = AtlasStore(database, cas_root)
+    writable.close()
+    parked = tmp_path / "parked-cas"
+    replacement = tmp_path / "replacement-cas"
+    replacement.mkdir()
+    swapped = False
+
+    def swap_cas_after_snapshot(
+        database_path: str | Path,
+        *,
+        scratch_root: str | Path | None = None,
+        protected_roots: tuple[str | Path, ...] = (),
+    ) -> object:
+        nonlocal swapped
+        snapshot = open_verified_sqlite_snapshot(
+            database_path,
+            scratch_root=scratch_root,
+            protected_roots=protected_roots,
+        )
+        os.replace(cas_root, parked)
+        os.replace(replacement, cas_root)
+        swapped = True
+        return snapshot
+
+    monkeypatch.setattr(
+        store_module,
+        "open_verified_sqlite_snapshot",
+        swap_cas_after_snapshot,
+    )
+    try:
+        with pytest.raises(StoreConflictError):
+            AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
+    finally:
+        if swapped:
+            os.replace(cas_root, replacement)
+            os.replace(parked, cas_root)
+
+    assert swapped is True
+    assert not tuple(scratch.iterdir())
+
+
 def test_open_readonly_store_uses_a_scratch_snapshot_without_touching_durable_files(
     tmp_path: Path,
 ) -> None:
@@ -1207,79 +1360,6 @@ def test_open_readonly_store_uses_a_scratch_snapshot_without_touching_durable_fi
     after = _durable_file_state(durable)
     assert after == before
     assert not tuple(scratch.iterdir())
-
-
-@pytest.mark.skipif(os.name == "posix", reason="POSIX uses its real quarantine path")
-def test_readonly_scratch_lease_dispatches_cleanup_to_the_posix_quarantine_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep the POSIX cleanup dispatch covered while this suite runs on Windows."""
-
-    calls: list[str] = []
-
-    class ProbeLease:
-        _stage_descriptor = 1
-        _owns_scratch = False
-
-        def _cleanup_stage_posix_quarantined(self) -> bool:
-            calls.append("stage")
-            return True
-
-    monkeypatch.setattr(store_module.os, "name", "posix")
-
-    assert store_module._ReadonlyScratchLease.cleanup(ProbeLease()) is None
-    assert calls == ["stage"]
-
-
-@pytest.mark.skipif(
-    os.name != "posix", reason="POSIX atomic quarantine is platform-specific"
-)
-def test_open_readonly_posix_cleanup_never_deletes_a_snapshot_replaced_before_quarantine(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A snapshot-file swap is retained in quarantine instead of being deleted."""
-
-    durable = tmp_path / "durable"
-    scratch = tmp_path / "readonly-scratch"
-    durable.mkdir()
-    scratch.mkdir()
-    database = durable / "atlas.sqlite3"
-    cas_root = durable / "atlas-cas"
-    writable = AtlasStore(database, cas_root)
-    writable.close()
-    expected_snapshot = database.read_bytes()
-    parked = tmp_path / "parked-snapshot.sqlite3"
-    attacker = b"attacker-owned\n"
-    original_rename = store_module._posix_rename_noreplace
-    raced = False
-
-    def replace_before_quarantine(
-        old_directory_fd: int,
-        old_name: str,
-        new_directory_fd: int,
-        new_name: str,
-    ) -> None:
-        nonlocal raced
-        if not raced and old_name.startswith(".atlas-readonly-"):
-            raced = True
-            snapshot = next(scratch.glob(".atlas-readonly-*")) / ("atlas.sqlite3")
-            os.replace(snapshot, parked)
-            snapshot.write_bytes(attacker)
-        original_rename(old_directory_fd, old_name, new_directory_fd, new_name)
-
-    monkeypatch.setattr(
-        store_module, "_posix_rename_noreplace", replace_before_quarantine
-    )
-
-    readonly = AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
-    readonly.close()
-
-    assert raced is True
-    assert parked.read_bytes() == expected_snapshot
-    quarantined = tuple(scratch.rglob("atlas.sqlite3"))
-    assert len(quarantined) == 1
-    assert quarantined[0].read_bytes() == attacker
 
 
 def test_open_readonly_supports_the_two_path_public_api(
@@ -1337,7 +1417,7 @@ def test_open_readonly_two_path_api_rejects_unsafe_or_missing_default_scratch_pa
         )
         == before_entries
     )
-    assert not tuple(durable.rglob(".atlas-readonly-root-*"))
+    assert not tuple(durable.rglob(".sqlite-snapshot-root-*"))
     assert unsafe_temp != "missing" or not configured_temp.exists()
 
 
@@ -1410,6 +1490,7 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
         "blocked": False,
         "capability_create_called": False,
         "swapped": False,
+        "unsafe_capability_create": False,
         "unsafe_mkdtemp": False,
     }
 
@@ -1430,7 +1511,7 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
 
     original_mkdtemp = tempfile.mkdtemp
 
-    def swap_then_mkdtemp(*args: object, **kwargs: object) -> str:
+    def swap_then_mkdtemp(*args: Any, **kwargs: Any) -> str:
         directory = kwargs.get("dir")
         if directory is not None and Path(os.fspath(directory)) == scratch_parent:
             swap_parent_once()
@@ -1438,20 +1519,21 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
                 state["unsafe_mkdtemp"] = True
         return original_mkdtemp(*args, **kwargs)
 
-    original_create = getattr(store_module, "_create_readonly_directory", None)
+    original_create = snapshot_module._create_readonly_directory
 
-    def swap_then_capability_create(*args: object, **kwargs: object) -> Path:
+    def swap_then_capability_create(*args: Any, **kwargs: Any) -> Path:
         state["capability_create_called"] = True
         swap_parent_once()
-        assert original_create is not None
-        return original_create(*args, **kwargs)
+        created = original_create(*args, **kwargs)
+        if state["swapped"] and created.exists():
+            state["unsafe_capability_create"] = True
+        return created
 
     monkeypatch.setattr(tempfile, "mkdtemp", swap_then_mkdtemp)
     monkeypatch.setattr(
-        store_module,
+        snapshot_module,
         "_create_readonly_directory",
         swap_then_capability_create,
-        raising=False,
     )
     if use_default_scratch:
         monkeypatch.setenv("CODEX_TASK_TEMP", str(scratch_parent))
@@ -1477,6 +1559,7 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
                 os.replace(parked, scratch_parent)
 
     assert state["attempted"] is True
+    assert state["unsafe_capability_create"] is False
     assert state["unsafe_mkdtemp"] is False
     assert state["capability_create_called"] is True
     assert _durable_file_state(durable) == before_files
@@ -1486,7 +1569,7 @@ def test_open_readonly_never_creates_under_a_parent_replaced_before_scratch_crea
         )
         == before_entries
     )
-    assert not tuple(durable.rglob(".atlas-readonly-*"))
+    assert not tuple(durable.rglob(".sqlite-snapshot-*"))
 
 
 def test_open_readonly_store_sees_committed_wal_state(tmp_path: Path) -> None:
@@ -1531,17 +1614,17 @@ def test_open_readonly_fails_closed_when_the_source_database_is_replaced_mid_sna
     writable.close()
     replacement = tmp_path / "replacement.sqlite3"
     replacement.write_bytes(database.read_bytes())
-    original_copy = store_module._copy_snapshot_file
+    original_copy = snapshot_module._copy_snapshot_file
 
     def replace_after_copy(
-        source: Path, destination: Path
+        source: Path, destination: snapshot_module._SnapshotDestination
     ) -> tuple[int, int, int, int, int]:
         copied = original_copy(source, destination)
         if source == database:
             os.replace(replacement, database)
         return copied
 
-    monkeypatch.setattr(store_module, "_copy_snapshot_file", replace_after_copy)
+    monkeypatch.setattr(snapshot_module, "_copy_snapshot_file", replace_after_copy)
 
     with pytest.raises(StoreConflictError):
         AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
@@ -1562,17 +1645,17 @@ def test_open_readonly_fails_closed_when_the_live_wal_is_replaced_mid_snapshot(
     wal = Path(str(database) + "-wal")
     replacement = tmp_path / "replacement-wal"
     replacement.write_bytes(wal.read_bytes())
-    original_copy = store_module._copy_snapshot_file
+    original_copy = snapshot_module._copy_snapshot_file
 
     def replace_after_copy(
-        source: Path, destination: Path
+        source: Path, destination: snapshot_module._SnapshotDestination
     ) -> tuple[int, int, int, int, int]:
         copied = original_copy(source, destination)
         if source == wal:
             os.replace(replacement, wal)
         return copied
 
-    monkeypatch.setattr(store_module, "_copy_snapshot_file", replace_after_copy)
+    monkeypatch.setattr(snapshot_module, "_copy_snapshot_file", replace_after_copy)
     try:
         with pytest.raises(StoreConflictError):
             AtlasStore.open_readonly(database, cas_root, scratch_root=scratch)
