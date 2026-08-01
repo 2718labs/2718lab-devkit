@@ -252,8 +252,13 @@ def test_manifest_version_is_an_integer() -> None:
 
 
 def test_locked_public_field_names_and_exports() -> None:
-    assert "workspace" in ImplementationPacket.__dataclass_fields__
-    assert "workspace_id" not in ImplementationPacket.__dataclass_fields__
+    assert "workspace_id" in ImplementationPacket.__dataclass_fields__
+    assert "workspace" not in ImplementationPacket.__dataclass_fields__
+    assert "workspace_root" not in ImplementationPacket.__dataclass_fields__
+    assert "request_hash" in ImplementationPacket.__dataclass_fields__
+    assert "matcher_version" in ImplementationPacket.__dataclass_fields__
+    assert "target_paths" in ImplementationPacket.__dataclass_fields__
+    assert "target_symbols" in ImplementationPacket.__dataclass_fields__
     assert "original_bindings" in ExtractionResult.__dataclass_fields__
     assert "bindings" not in ExtractionResult.__dataclass_fields__
     assert callable(canonical_json)

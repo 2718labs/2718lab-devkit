@@ -11,6 +11,7 @@ from .canonical import (
     thaw_json,
 )
 from .models import (
+    ATLAS_MATCHER_VERSION,
     AcceptanceProjection,
     AtlasEdge,
     AtlasError,
@@ -53,6 +54,7 @@ ASSET_ROOT = Path(__file__).resolve().parent / "assets"
 
 __all__ = [
     "ASSET_ROOT",
+    "ATLAS_MATCHER_VERSION",
     "AcceptanceProjection",
     "AtlasEdge",
     "AtlasError",

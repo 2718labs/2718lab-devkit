@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -668,6 +670,7 @@ def test_structural_signature_is_path_neutral_and_fact_only() -> None:
 @dataclass
 class AtlasEnvironment:
     root: Path
+    workspace_id: str
     database: Path
     store: AtlasStore
     index: ProjectIndexService
@@ -690,8 +693,9 @@ def atlas_environment(tmp_path: Path):
     database = tmp_path / "atlas.sqlite3"
     store = AtlasStore(database, tmp_path / "atlas-cas")
     index = ProjectIndexService(tmp_path / "index.sqlite3")
+    workspace_id = index.project_index_register(root)
     service = AtlasService(store, BundledRecipeLoader(ASSETS), index)
-    environment = AtlasEnvironment(root, database, store, index, service)
+    environment = AtlasEnvironment(root, workspace_id, database, store, index, service)
     try:
         yield environment
     finally:
@@ -706,7 +710,7 @@ def _prepare_pytest(
     byte_budget: int = 131_072,
 ):
     return environment.service.prepare(
-        workspace=str(environment.root),
+        workspace_id=environment.workspace_id,
         snapshot_id=snapshot_id,
         intent_id="python.pytest-regression",
         language="python",
@@ -730,12 +734,214 @@ def _packet_receipt_count(database: Path) -> int:
         connection.close()
 
 
+def _copy_workspace(source: Path, destination: Path) -> None:
+    for path in source.rglob("*"):
+        relative = path.relative_to(source)
+        if path.is_dir():
+            (destination / relative).mkdir(parents=True, exist_ok=True)
+        elif path.is_file():
+            (destination / relative).parent.mkdir(parents=True, exist_ok=True)
+            (destination / relative).write_bytes(path.read_bytes())
+
+
+def test_prepare_persists_only_opaque_workspace_identity_and_normalized_request(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    other_target = atlas_environment.root / "tests" / "test_other.py"
+    other_target.write_text(
+        "def test_other() -> None:\n    assert True\n", encoding="utf-8"
+    )
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
+
+    first = _prepare_pytest(atlas_environment, snapshot_id=snapshot.snapshot_id)
+    second = atlas_environment.service.prepare(
+        workspace_id=atlas_environment.workspace_id,
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.pytest-regression",
+        language=" PYTHON ",
+        framework="PyTest@7.0",
+        target_paths=("tests\\test_other.py",),
+        target_symbols=(),
+        max_candidates=20,
+        byte_budget=131_072,
+    )
+
+    assert first.status is AtlasStatus.READY
+    assert second.status is AtlasStatus.READY
+    assert first.packet is not None
+    assert second.packet is not None
+    assert first.packet.workspace_id == atlas_environment.workspace_id
+    assert first.packet.matcher_version == "atlas-matcher/v1"
+    assert first.packet.target_paths == ("tests/test_feature.py",)
+    assert first.packet.target_symbols == ()
+    assert first.packet.request_hash.startswith("sha256:")
+    assert first.packet.request_hash != second.packet.request_hash
+    assert first.packet.packet_id != second.packet.packet_id
+    rendered = canonical_json(first.packet.to_dict())
+    assert str(atlas_environment.root) not in rendered
+    assert "workspace_root" not in rendered
+    assert '"workspace"' not in rendered
+
+
+def test_same_content_in_distinct_workspaces_has_distinct_packet_identity(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    first_snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
+    first = _prepare_pytest(atlas_environment, snapshot_id=first_snapshot.snapshot_id)
+    foreign_root = atlas_environment.root.parent / "same-content-workspace"
+    foreign_root.mkdir()
+    _copy_workspace(atlas_environment.root, foreign_root)
+    foreign_workspace_id = atlas_environment.index.project_index_register(foreign_root)
+    foreign_snapshot = atlas_environment.index.sync(foreign_workspace_id)
+    second = atlas_environment.service.prepare(
+        workspace_id=foreign_workspace_id,
+        snapshot_id=foreign_snapshot.snapshot_id,
+        intent_id="python.pytest-regression",
+        language="python",
+        framework="pytest",
+        target_paths=("tests/test_feature.py",),
+    )
+
+    assert first.status is AtlasStatus.READY
+    assert second.status is AtlasStatus.READY
+    assert first.packet is not None
+    assert second.packet is not None
+    assert first.packet.workspace_id != second.packet.workspace_id
+    assert first.packet.packet_id != second.packet.packet_id
+    assert first_snapshot.manifest_hash == foreign_snapshot.manifest_hash
+
+
+def test_prepare_fails_closed_for_path_like_id_aliases_and_link_targets(
+    atlas_environment: AtlasEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
+    before = _packet_receipt_count(atlas_environment.database)
+
+    with pytest.raises(AtlasError) as path_id:
+        atlas_environment.service.prepare(
+            workspace_id=str(atlas_environment.root),
+            snapshot_id=snapshot.snapshot_id,
+            intent_id="python.pytest-regression",
+            language="python",
+            framework="pytest",
+            target_paths=("tests/test_feature.py",),
+        )
+    assert path_id.value.code == "invalid_request"
+    assert str(atlas_environment.root) not in str(path_id.value)
+
+    def unexpected_register(_workspace_root: object) -> str:
+        raise AssertionError("Atlas must not auto-register a workspace")
+
+    monkeypatch.setattr(
+        atlas_environment.index,
+        "project_index_register",
+        unexpected_register,
+    )
+    absent = atlas_environment.service.prepare(
+        workspace_id="sha256:" + "f" * 64,
+        snapshot_id=snapshot.snapshot_id,
+        intent_id="python.pytest-regression",
+        language="python",
+        framework="pytest",
+        target_paths=("tests/test_feature.py",),
+    )
+    assert absent.status is AtlasStatus.EVIDENCE_INCOMPLETE
+    assert absent.reasons == ("workspace_unregistered",)
+    assert str(atlas_environment.root) not in canonical_json(absent.to_dict())
+
+    for aliases, code in (
+        (("tests/test_feature.py", "tests\\test_feature.py"), "duplicate_target_path"),
+        (("tests/test_feature.py", "TESTS/test_feature.py"), "path_case_collision"),
+    ):
+        with pytest.raises(AtlasError) as collision:
+            atlas_environment.service.prepare(
+                workspace_id=atlas_environment.workspace_id,
+                snapshot_id=snapshot.snapshot_id,
+                intent_id="python.pytest-regression",
+                language="python",
+                framework="pytest",
+                target_paths=aliases,
+            )
+        assert collision.value.code == code
+
+    outside = atlas_environment.root.parent / "outside-link-target"
+    outside.mkdir()
+    (outside / "secret.py").write_text("VALUE = 1\n", encoding="utf-8")
+    linked = atlas_environment.root / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            pytest.skip("this host cannot create a directory link")
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked), str(outside)],
+            check=False,
+            capture_output=True,
+        )
+        if created.returncode != 0:
+            pytest.skip("this host cannot create a junction")
+    with pytest.raises(AtlasError) as linked_target:
+        atlas_environment.service.prepare(
+            workspace_id=atlas_environment.workspace_id,
+            snapshot_id=snapshot.snapshot_id,
+            intent_id="python.pytest-regression",
+            language="python",
+            framework="pytest",
+            target_paths=("linked/secret.py",),
+        )
+    assert linked_target.value.code in {"unsafe_path", "symlink_path", "reparse_path"}
+    assert _packet_receipt_count(atlas_environment.database) == before
+
+
+def test_cross_workspace_stale_binding_and_packet_use_fail_closed(
+    atlas_environment: AtlasEnvironment,
+) -> None:
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
+    prepared = _prepare_pytest(atlas_environment, snapshot_id=snapshot.snapshot_id)
+    assert prepared.packet is not None
+
+    foreign_root = atlas_environment.root.parent / "foreign-render-workspace"
+    foreign_root.mkdir()
+    _copy_workspace(atlas_environment.root, foreign_root)
+    foreign_workspace_id = atlas_environment.index.project_index_register(foreign_root)
+    foreign_snapshot = atlas_environment.index.sync(foreign_workspace_id)
+    rendered = atlas_environment.service.render(
+        foreign_workspace_id,
+        foreign_snapshot.snapshot_id,
+        prepared.packet.packet_id,
+        {},
+    )
+    assert rendered.status is AtlasStatus.RENDER_INVALID
+    assert rendered.reasons == ("packet_workspace_mismatch",)
+    assert str(foreign_root) not in canonical_json(rendered.to_dict())
+
+    replacement = atlas_environment.root.parent / "foreign-render-replaced"
+    foreign_root.rename(replacement)
+    foreign_root.mkdir()
+    _copy_workspace(replacement, foreign_root)
+    before = _packet_receipt_count(atlas_environment.database)
+    rebound = atlas_environment.service.prepare(
+        workspace_id=foreign_workspace_id,
+        snapshot_id=foreign_snapshot.snapshot_id,
+        intent_id="python.pytest-regression",
+        language="python",
+        framework="pytest",
+        target_paths=("tests/test_feature.py",),
+    )
+    assert rebound.status is AtlasStatus.EVIDENCE_INCOMPLETE
+    assert rebound.packet is None
+    assert rebound.reasons == ("workspace_rebind",)
+    assert str(foreign_root) not in canonical_json(rebound.to_dict())
+    assert _packet_receipt_count(atlas_environment.database) == before
+
+
 def test_prepare_normalizes_equivalent_numeric_framework_versions(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     common = {
-        "workspace": str(atlas_environment.root),
+        "workspace_id": atlas_environment.workspace_id,
         "snapshot_id": snapshot.snapshot_id,
         "intent_id": "python.pytest-regression",
         "language": "python",
@@ -756,7 +962,7 @@ def test_prepare_builds_idempotent_safe_packet_and_reopens(
     atlas_environment: AtlasEnvironment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     before_assets = {
         path.relative_to(ASSETS).as_posix(): path.read_bytes()
         for path in ASSETS.rglob("*")
@@ -818,9 +1024,9 @@ def test_prepare_builds_idempotent_safe_packet_and_reopens(
 def test_prepare_statuses_validate_inputs_evidence_and_staleness(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     unsupported = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.pytest-regression",
         language="javascript",
@@ -831,7 +1037,7 @@ def test_prepare_statuses_validate_inputs_evidence_and_staleness(
 
     with pytest.raises(AtlasError) as invalid_framework:
         atlas_environment.service.prepare(
-            workspace=str(atlas_environment.root),
+            workspace_id=atlas_environment.workspace_id,
             snapshot_id=snapshot.snapshot_id,
             intent_id="python.pytest-regression",
             language="python",
@@ -847,7 +1053,7 @@ def test_prepare_statuses_validate_inputs_evidence_and_staleness(
     ):
         with pytest.raises(AtlasError):
             atlas_environment.service.prepare(
-                workspace=str(atlas_environment.root),
+                workspace_id=atlas_environment.workspace_id,
                 snapshot_id=snapshot.snapshot_id,
                 intent_id="python.pytest-regression",
                 language="python",
@@ -856,7 +1062,7 @@ def test_prepare_statuses_validate_inputs_evidence_and_staleness(
             )
 
     missing = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.pytest-regression",
         language="python",
@@ -865,7 +1071,7 @@ def test_prepare_statuses_validate_inputs_evidence_and_staleness(
     )
     assert missing.status is AtlasStatus.EVIDENCE_INCOMPLETE
     symbol = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.pytest-regression",
         language="python",
@@ -876,7 +1082,7 @@ def test_prepare_statuses_validate_inputs_evidence_and_staleness(
     assert symbol.status is AtlasStatus.EVIDENCE_INCOMPLETE
     with pytest.raises(AtlasError):
         atlas_environment.service.prepare(
-            workspace=str(atlas_environment.root),
+            workspace_id=atlas_environment.workspace_id,
             snapshot_id=snapshot.snapshot_id,
             intent_id="python.pytest-regression",
             language="python",
@@ -899,11 +1105,12 @@ def test_prepare_foreign_and_second_freshness_failure_never_persist(
     atlas_environment: AtlasEnvironment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     foreign = atlas_environment.root.parent / "foreign"
     foreign.mkdir()
     (foreign / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
-    foreign_snapshot = atlas_environment.index.sync(foreign)
+    foreign_workspace_id = atlas_environment.index.project_index_register(foreign)
+    foreign_snapshot = atlas_environment.index.sync(foreign_workspace_id)
     before = _packet_receipt_count(atlas_environment.database)
     foreign_result = _prepare_pytest(
         atlas_environment, snapshot_id=foreign_snapshot.snapshot_id
@@ -932,9 +1139,9 @@ def test_prepare_foreign_and_second_freshness_failure_never_persist(
 def test_prepare_uses_local_repository_priority_and_preserves_ties(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -948,7 +1155,7 @@ def test_prepare_uses_local_repository_priority_and_preserves_ties(
         ),
     )
     request = {
-        "workspace": str(atlas_environment.root),
+        "workspace_id": atlas_environment.workspace_id,
         "snapshot_id": snapshot.snapshot_id,
         "intent_id": "python.validation-guard",
         "language": "python",
@@ -989,9 +1196,9 @@ def test_prepare_uses_local_repository_priority_and_preserves_ties(
 def test_observed_local_compatibility_metadata_selects_explicit_superseder(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1018,7 +1225,7 @@ def test_observed_local_compatibility_metadata_selects_explicit_superseder(
 
     assert newer.manifest_hash == older.manifest_hash
     result = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id=intent_id,
         language="python",
@@ -1034,9 +1241,9 @@ def test_observed_local_compatibility_metadata_selects_explicit_superseder(
 def test_quarantined_observed_superseder_suppresses_older_local_recipe(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1062,7 +1269,7 @@ def test_quarantined_observed_superseder_suppresses_older_local_recipe(
     )
 
     result = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id=intent_id,
         language="python",
@@ -1077,9 +1284,9 @@ def test_quarantined_observed_superseder_suppresses_older_local_recipe(
 def test_observed_local_compatibility_metadata_rejects_invalid_values(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1123,7 +1330,7 @@ def test_observed_local_compatibility_metadata_rejects_invalid_values(
     for manifest in invalid_manifests:
         _put_local_recipe(atlas_environment.store, manifest)
         result = atlas_environment.service.prepare(
-            workspace=str(atlas_environment.root),
+            workspace_id=atlas_environment.workspace_id,
             snapshot_id=snapshot.snapshot_id,
             intent_id=manifest.intent_id,
             language="python",
@@ -1137,9 +1344,9 @@ def test_observed_local_compatibility_metadata_rejects_invalid_values(
 def test_observed_local_quarantine_payload_must_match_root_metadata(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1165,7 +1372,7 @@ def test_observed_local_quarantine_payload_must_match_root_metadata(
         atlas_environment.store.put_nodes((root,))
         atlas_environment.store.put_recipe(replace(manifest, recipe_id=root.node_id))
         result = atlas_environment.service.prepare(
-            workspace=str(atlas_environment.root),
+            workspace_id=atlas_environment.workspace_id,
             snapshot_id=snapshot.snapshot_id,
             intent_id=intent_id,
             language="python",
@@ -1179,9 +1386,9 @@ def test_observed_local_quarantine_payload_must_match_root_metadata(
 def test_observed_local_root_superseded_timestamp_is_rejected(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1204,7 +1411,7 @@ def test_observed_local_root_superseded_timestamp_is_rejected(
     atlas_environment.store.put_recipe(replace(manifest, recipe_id=root.node_id))
 
     result = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id=manifest.intent_id,
         language="python",
@@ -1219,9 +1426,9 @@ def test_observed_local_root_superseded_timestamp_is_rejected(
 def test_local_hydration_rejects_loader_invalid_semantics(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1325,7 +1532,7 @@ def test_local_hydration_rejects_loader_invalid_semantics(
     for manifest in invalid_manifests:
         _put_local_recipe(atlas_environment.store, manifest)
         result = atlas_environment.service.prepare(
-            workspace=str(atlas_environment.root),
+            workspace_id=atlas_environment.workspace_id,
             snapshot_id=snapshot.snapshot_id,
             intent_id=manifest.intent_id,
             language="python",
@@ -1339,9 +1546,9 @@ def test_local_hydration_rejects_loader_invalid_semantics(
 def test_local_observed_manifest_requires_extractor_shape_and_source_hash(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1355,7 +1562,7 @@ def test_local_observed_manifest_requires_extractor_shape_and_source_hash(
         ),
     )
     ready = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.observed-local",
         language="python",
@@ -1375,7 +1582,7 @@ def test_local_observed_manifest_requires_extractor_shape_and_source_hash(
     )
     _put_local_recipe(atlas_environment.store, tampered)
     rejected = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.tampered-local-hash",
         language="python",
@@ -1403,7 +1610,7 @@ def test_local_observed_manifest_requires_extractor_shape_and_source_hash(
         replace(metadata_tampered, recipe_id=metadata_root.node_id)
     )
     metadata_rejected = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.tampered-local-metadata",
         language="python",
@@ -1432,7 +1639,7 @@ def test_local_observed_manifest_requires_extractor_shape_and_source_hash(
         replace(created_at_tampered, recipe_id=created_at_root.node_id)
     )
     created_at_rejected = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.tampered-local-created-at",
         language="python",
@@ -1471,7 +1678,7 @@ def test_prepare_stops_before_hydrating_unbounded_local_discovery(
     atlas_environment: AtlasEnvironment,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     identifiers = tuple(f"sha256:{index:064x}" for index in range(MAX_GRAPH_NODES + 1))
     limits: list[int] = []
 
@@ -1486,7 +1693,7 @@ def test_prepare_stops_before_hydrating_unbounded_local_discovery(
 
     monkeypatch.setattr(atlas_environment.store, "graph_query", fail_if_hydrated)
     result = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.discovery-limit",
         language="python",
@@ -1503,9 +1710,9 @@ def test_prepare_stops_before_hydrating_unbounded_local_discovery(
 def test_local_payload_and_template_body_are_fail_closed(
     atlas_environment: AtlasEnvironment,
 ) -> None:
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     facts = atlas_environment.index.snapshot_facts(
-        atlas_environment.root, snapshot.snapshot_id
+        atlas_environment.workspace_id, snapshot.snapshot_id
     )
     repository_signature = structural_repository_signature(
         facts, language="python", framework=None
@@ -1536,7 +1743,7 @@ def test_local_payload_and_template_body_are_fail_closed(
     atlas_environment.store.put_nodes((unknown,))
     atlas_environment.store.put_recipe(replace(malformed, recipe_id=unknown.node_id))
     malformed_result = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.malformed",
         language="python",
@@ -1574,7 +1781,7 @@ def test_local_payload_and_template_body_are_fail_closed(
         replace(malformed, recipe_id=schema_recipe.node_id)
     )
     hardened_malformed = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.malformed",
         language="python",
@@ -1621,7 +1828,7 @@ def test_local_payload_and_template_body_are_fail_closed(
     assert graph.truncated is True
     assert marker not in canonical_json(graph.to_dict())
     rejected = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.unsafe-template",
         language="python",
@@ -1656,7 +1863,7 @@ def test_local_payload_and_template_body_are_fail_closed(
     assert evidence_graph.truncated is True
     assert evidence_marker not in canonical_json(evidence_graph.to_dict())
     evidence_packet = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.unsafe-evidence",
         language="python",
@@ -1857,9 +2064,9 @@ def test_prepare_packet_budget_query_truncation_and_secret_redaction(
         "    assert marker\n",
         encoding="utf-8",
     )
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     prepared = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.pytest-regression",
         language="python",
@@ -1891,7 +2098,7 @@ def test_prepare_packet_budget_query_truncation_and_secret_redaction(
 
     exact_budget = len(packet_json.encode("utf-8"))
     exact = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.pytest-regression",
         language="python",
@@ -1902,7 +2109,7 @@ def test_prepare_packet_budget_query_truncation_and_secret_redaction(
     assert exact.status is AtlasStatus.READY
     assert exact.packet is not None
     too_small = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.pytest-regression",
         language="python",
@@ -1957,7 +2164,7 @@ def test_render_is_deterministic_and_never_writes_the_workspace(
     (atlas_environment.root / "tests" / "test_feature.py").write_bytes(
         b"import json\n\n\ndef test_feature() -> None:\n    assert json.loads('1') == 1\n"
     )
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     prepared = _prepare_pytest(
         atlas_environment,
         snapshot_id=snapshot.snapshot_id,
@@ -1976,13 +2183,13 @@ def test_render_is_deterministic_and_never_writes_the_workspace(
     }
 
     first = atlas_environment.service.render(
-        str(atlas_environment.root),
+        atlas_environment.workspace_id,
         snapshot.snapshot_id,
         prepared.packet.packet_id,
         bindings,
     )
     second = atlas_environment.service.render(
-        str(atlas_environment.root),
+        atlas_environment.workspace_id,
         snapshot.snapshot_id,
         prepared.packet.packet_id,
         bindings,
@@ -2031,7 +2238,7 @@ def test_render_invalid_request_never_echoes_a_secret_like_packet_id(
     atlas_environment: AtlasEnvironment,
 ) -> None:
     result = atlas_environment.service.render(
-        str(atlas_environment.root),
+        atlas_environment.workspace_id,
         "not-a-snapshot",
         "sk-atlas-secret-token",
         {},
@@ -2101,9 +2308,9 @@ def test_render_supports_a_bundled_prepend_with_docstring_target(
     (atlas_environment.root / "tests" / "test_feature.py").write_bytes(
         b"def test_feature() -> None:\n    assert True\n"
     )
-    snapshot = atlas_environment.index.sync(atlas_environment.root)
+    snapshot = atlas_environment.index.sync(atlas_environment.workspace_id)
     prepared = atlas_environment.service.prepare(
-        workspace=str(atlas_environment.root),
+        workspace_id=atlas_environment.workspace_id,
         snapshot_id=snapshot.snapshot_id,
         intent_id="python.validation-guard",
         language="python",
@@ -2114,7 +2321,7 @@ def test_render_supports_a_bundled_prepend_with_docstring_target(
     assert prepared.packet is not None
 
     result = atlas_environment.service.render(
-        str(atlas_environment.root),
+        atlas_environment.workspace_id,
         snapshot.snapshot_id,
         prepared.packet.packet_id,
         {

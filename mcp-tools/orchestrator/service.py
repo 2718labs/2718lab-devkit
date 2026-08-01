@@ -16,7 +16,7 @@ from hmac import compare_digest
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
-from code_atlas.receipts import RawExecutionReceipt, ReceiptRepository
+from devkit_atlas.receipts import RawExecutionReceipt, ReceiptRepository
 
 from .models import Task, TaskKind, TaskState, Workflow
 from .store import Artifact, Lease, SQLiteStore, StoreError

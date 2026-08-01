@@ -28,7 +28,6 @@ from devkit_atlas.models import (
     TemplateOperation,
     SlotSpec,
     ConstraintSpec,
-    DependencySpec,
     TestSpec as AtlasTestSpec,
 )
 from devkit_atlas.canonical import canonical_hash, canonical_json
@@ -306,27 +305,7 @@ def test_verified_cas_and_receipts_are_idempotent_or_conflicting(
     blob_path.unlink()
     with pytest.raises(StoreConflictError):
         store.read_blob(valid)
-    packet = ImplementationPacket(
-        "packet",
-        "trace",
-        "workspace",
-        "snap",
-        "recipe",
-        ("node",),
-        ("edge",),
-        ({"path": "x"},),
-        ("eh",),
-        (TemplateOperation("replace", "path", "th"),),
-        (SlotSpec("name", "single_line_text"),),
-        (ConstraintSpec("kind", "subject", {"a": 1}),),
-        (DependencySpec("pytest", "python", ">=8"),),
-        (AtlasTestSpec(("python", "-m", "pytest")),),
-        ("gap",),
-        ("source",),
-        ("template",),
-        ("receipt",),
-        "next",
-    )
+    packet = _verified_packet()
     store.put_packet(packet)
     store.put_packet(packet)
     with pytest.raises(StoreConflictError):
@@ -346,7 +325,7 @@ def test_verified_cas_and_receipts_are_idempotent_or_conflicting(
         store.put_ingestion_receipt(replace(receipt, episode_id="other"))
     store.close()
     store = store_at(tmp_path)
-    assert store.get_packet("packet") == packet
+    assert store.get_packet(packet.packet_id) == packet
     assert store.get_ingestion_receipt("key") == receipt
     store.close()
 
@@ -1099,7 +1078,7 @@ def _verified_packet() -> ImplementationPacket:
     provisional = ImplementationPacket(
         packet_id="",
         trace_id=digest,
-        workspace="workspace",
+        workspace_id="sha256:" + "b" * 64,
         snapshot_id=digest,
         recipe_id=digest,
         node_ids=(digest,),
@@ -1116,6 +1095,10 @@ def _verified_packet() -> ImplementationPacket:
         template_hashes=(digest,),
         receipt_hashes=(digest,),
         next_action="atlas_render",
+        request_hash="sha256:" + "c" * 64,
+        matcher_version="atlas-matcher/v1",
+        target_paths=("src/example.py",),
+        target_symbols=(),
     )
     payload = provisional.to_dict()
     del payload["packet_id"]

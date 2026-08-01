@@ -9,6 +9,9 @@ from typing import Any
 from .canonical import canonical_hash, canonical_id, freeze_json, thaw_json
 
 
+ATLAS_MATCHER_VERSION = "atlas-matcher/v1"
+
+
 class AtlasError(ValueError):
     """A safe Atlas failure whose rendered message is its stable code."""
 
@@ -348,7 +351,7 @@ class GraphQueryResult(_Record):
 class ImplementationPacket(_Record):
     packet_id: str
     trace_id: str
-    workspace: str
+    workspace_id: str
     snapshot_id: str
     recipe_id: str
     node_ids: tuple[str, ...] = ()
@@ -365,6 +368,10 @@ class ImplementationPacket(_Record):
     template_hashes: tuple[str, ...] = ()
     receipt_hashes: tuple[str, ...] = ()
     next_action: str = ""
+    request_hash: str = ""
+    matcher_version: str = ""
+    target_paths: tuple[str, ...] = ()
+    target_symbols: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -381,6 +388,8 @@ class ImplementationPacket(_Record):
             "source_hashes",
             "template_hashes",
             "receipt_hashes",
+            "target_paths",
+            "target_symbols",
         ):
             value = tuple(
                 freeze_json(item) if name == "evidence_windows" else item

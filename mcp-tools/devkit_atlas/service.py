@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 
 from project_index.models import IndexError, SnapshotFacts
 from project_index.service import ProjectIndexService
+from project_index.workspace import is_workspace_id
 
 from .canonical import canonical_hash, canonical_json, normalize_intent_id, thaw_json
 from .extractors import BoundExecutionReceipt, ExtractionRequest, PythonRecipeExtractor
@@ -21,6 +22,7 @@ from .matching import (
     select_recipe,
 )
 from .models import (
+    ATLAS_MATCHER_VERSION,
     AtlasEdge,
     AtlasError,
     AtlasNode,
@@ -61,6 +63,7 @@ from .store import AtlasStore, StoreConflictError
 
 
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PREPARE_REQUEST_SCHEMA = "atlas-prepare-request/v1"
 _MANIFEST_FIELDS = frozenset(
     field.name for field in fields(RecipeManifest) if field.name != "recipe_id"
 )
@@ -1529,9 +1532,7 @@ class AtlasService:
         )
 
     @staticmethod
-    def _prepare_paths(
-        value: Sequence[str] | None, workspace: str | PurePosixPath
-    ) -> tuple[str, ...]:
+    def _prepare_paths(value: Sequence[str] | None) -> tuple[str, ...]:
         if value is None:
             return ()
         if isinstance(value, (str, bytes)):
@@ -1542,12 +1543,19 @@ class AtlasService:
             raise AtlasError("invalid_target_path") from exc
         if len(raw_paths) > MAX_CHANGED_FILES:
             raise AtlasError("too_many_target_paths")
-        normalized = tuple(
-            validate_candidate_path(path, workspace) for path in raw_paths
-        )
+        normalized = tuple(validate_candidate_path(path) for path in raw_paths)
         if len(set(normalized)) != len(normalized):
             raise AtlasError("duplicate_target_path")
+        collision_keys = tuple(path_collision_key(path) for path in normalized)
+        if len(set(collision_keys)) != len(collision_keys):
+            raise AtlasError("path_case_collision")
         return tuple(sorted(normalized))
+
+    @staticmethod
+    def _validate_workspace_paths(
+        paths: tuple[str, ...], workspace_root: Path
+    ) -> tuple[str, ...]:
+        return tuple(validate_candidate_path(path, workspace_root) for path in paths)
 
     @staticmethod
     def _prepare_symbols(value: Sequence[str] | None) -> tuple[str, ...]:
@@ -1613,6 +1621,30 @@ class AtlasService:
         return " ".join((*target_symbols, *path_stems, *intent_terms))
 
     @staticmethod
+    def _prepare_request_hash(
+        *,
+        intent_id: str,
+        language: str,
+        framework: str | None,
+        target_paths: tuple[str, ...],
+        target_symbols: tuple[str, ...],
+        max_candidates: int,
+        byte_budget: int,
+    ) -> str:
+        return canonical_hash(
+            {
+                "schema": _PREPARE_REQUEST_SCHEMA,
+                "intent_id": intent_id,
+                "language": language,
+                "framework": "" if framework is None else framework,
+                "target_paths": target_paths,
+                "target_symbols": target_symbols,
+                "max_candidates": max_candidates,
+                "byte_budget": byte_budget,
+            }
+        )
+
+    @staticmethod
     def _gap_codes(facts: SnapshotFacts, query: Any) -> tuple[str, ...]:
         codes = {
             gap.code.strip().upper()
@@ -1625,7 +1657,7 @@ class AtlasService:
     def prepare(
         self,
         *,
-        workspace: str,
+        workspace_id: str,
         snapshot_id: str,
         intent_id: str,
         language: str,
@@ -1642,7 +1674,7 @@ class AtlasService:
         byte_budget = self._validate_budget(
             byte_budget, MAX_PACKET_BYTES, "invalid_byte_budget"
         )
-        if not isinstance(workspace, str) or not isinstance(snapshot_id, str):
+        if not is_workspace_id(workspace_id) or not _is_hash(snapshot_id):
             raise AtlasError("invalid_request")
         if not isinstance(intent_id, str):
             raise AtlasError("invalid_intent_id")
@@ -1653,18 +1685,20 @@ class AtlasService:
             raise AtlasError("invalid_language")
         normalized_language = language.strip().casefold()
         normalized_framework = normalize_framework(framework)
-        target_paths = self._prepare_paths(target_paths, workspace)
+        target_paths = self._prepare_paths(target_paths)
         target_symbols = self._prepare_symbols(target_symbols)
+        try:
+            self._project_index.assert_current(workspace_id, snapshot_id)
+            facts = self._project_index.snapshot_facts(workspace_id, snapshot_id)
+            workspace_root = self._project_index._workspace_root(workspace_id)
+        except IndexError as exc:
+            return self._index_failure(exc)
+        target_paths = self._validate_workspace_paths(target_paths, workspace_root)
         if normalized_language != "python":
             return PreparationResult(
                 AtlasStatus.UNSUPPORTED_LANGUAGE,
                 reasons=("unsupported_language",),
             )
-        try:
-            self._project_index.assert_current(workspace, snapshot_id)
-            facts = self._project_index.snapshot_facts(workspace, snapshot_id)
-        except IndexError as exc:
-            return self._index_failure(exc)
         file_hashes = dict(facts.file_hashes)
         if any(path not in file_hashes for path in target_paths):
             return PreparationResult(
@@ -1711,7 +1745,7 @@ class AtlasService:
         winner: MatchCandidate = matching.winner
         try:
             query = self._project_index.query(
-                workspace,
+                workspace_id,
                 snapshot_id,
                 self._query_text(normalized_intent, target_paths, target_symbols),
                 mode="lexical",
@@ -1769,8 +1803,18 @@ class AtlasService:
         constraints = _sorted_records(winner.manifest.constraints)
         dependencies = _sorted_records(winner.manifest.dependencies)
         tests = _sorted_records(winner.manifest.tests)
+        request_hash = self._prepare_request_hash(
+            intent_id=normalized_intent,
+            language=normalized_language,
+            framework=normalized_framework,
+            target_paths=target_paths,
+            target_symbols=target_symbols,
+            max_candidates=max_candidates,
+            byte_budget=byte_budget,
+        )
         trace_id = canonical_hash(
             {
+                "workspace_id": workspace_id,
                 "intent_id": normalized_intent,
                 "language": normalized_language,
                 "framework": ""
@@ -1789,12 +1833,14 @@ class AtlasService:
                 "edge_ids": tuple(edge.edge_id for edge in graph.edges),
                 "max_candidates": max_candidates,
                 "byte_budget": byte_budget,
+                "matcher_version": ATLAS_MATCHER_VERSION,
+                "request_hash": request_hash,
             }
         )
         provisional = ImplementationPacket(
             packet_id="",
             trace_id=trace_id,
-            workspace=facts.snapshot.workspace,
+            workspace_id=workspace_id,
             snapshot_id=snapshot_id,
             recipe_id=winner.manifest.recipe_id,
             node_ids=tuple(node.node_id for node in graph.nodes),
@@ -1811,12 +1857,16 @@ class AtlasService:
             template_hashes=template_hashes,
             receipt_hashes=(receipt_hash,),
             next_action="atlas_render",
+            request_hash=request_hash,
+            matcher_version=ATLAS_MATCHER_VERSION,
+            target_paths=target_paths,
+            target_symbols=target_symbols,
         )
         packet_data = provisional.to_dict()
         del packet_data["packet_id"]
         packet = replace(provisional, packet_id=canonical_hash(packet_data))
         try:
-            self._project_index.assert_current(workspace, snapshot_id)
+            self._project_index.assert_current(workspace_id, snapshot_id)
         except IndexError as exc:
             return self._index_failure(exc)
         if len(canonical_json(packet.to_dict()).encode("utf-8")) > byte_budget:
@@ -1981,7 +2031,7 @@ class AtlasService:
 
     def render(
         self,
-        workspace: str,
+        workspace_id: str,
         snapshot_id: str,
         packet_id: str,
         bindings: Mapping[str, str],
@@ -1989,8 +2039,7 @@ class AtlasService:
         """Return one deterministic patch candidate and inert test specifications."""
 
         if (
-            type(workspace) is not str
-            or not workspace
+            not is_workspace_id(workspace_id)
             or type(snapshot_id) is not str
             or not _is_hash(snapshot_id)
             or type(packet_id) is not str
@@ -2000,21 +2049,29 @@ class AtlasService:
         ):
             return self._render_invalid(packet_id, "request_invalid")
         try:
-            request_workspace = Path(workspace).resolve().as_posix()
-        except OSError:
-            return self._render_invalid(packet_id, "request_invalid")
-        try:
             packet = self._store.get_packet_verified(packet_id)
         except StoreConflictError:
             return self._render_invalid(packet_id, "packet_integrity_mismatch")
         if packet is None:
             return self._render_invalid(packet_id, "packet_not_found")
-        if packet.workspace != request_workspace:
+        if packet.workspace_id != workspace_id:
             return self._render_invalid(packet_id, "packet_workspace_mismatch")
         if packet.snapshot_id != snapshot_id:
             return self._render_invalid(packet_id, "packet_snapshot_mismatch")
         if packet.next_action != "atlas_render":
             return self._render_invalid(packet_id, "packet_recipe_mismatch")
+        try:
+            packet_paths = self._prepare_paths(packet.target_paths)
+            packet_symbols = self._prepare_symbols(packet.target_symbols)
+        except AtlasError:
+            return self._render_invalid(packet_id, "packet_integrity_mismatch")
+        if (
+            packet.matcher_version != ATLAS_MATCHER_VERSION
+            or not _is_hash(packet.request_hash)
+            or packet.target_paths != packet_paths
+            or packet.target_symbols != packet_symbols
+        ):
+            return self._render_invalid(packet_id, "packet_integrity_mismatch")
         if len(canonical_json(packet.to_dict()).encode("utf-8")) > MAX_PACKET_BYTES:
             return self._render_invalid(packet_id, "packet_integrity_mismatch")
         try:
@@ -2025,8 +2082,9 @@ class AtlasService:
         except AtlasError as error:
             return self._render_invalid(packet_id, error.code)
         try:
-            self._project_index.assert_current(request_workspace, snapshot_id)
-            facts = self._project_index.snapshot_facts(request_workspace, snapshot_id)
+            self._project_index.assert_current(workspace_id, snapshot_id)
+            facts = self._project_index.snapshot_facts(workspace_id, snapshot_id)
+            workspace_root = self._project_index._workspace_root(workspace_id)
             repository_signature = structural_repository_signature(
                 facts,
                 language=manifest.language_name,
@@ -2056,7 +2114,7 @@ class AtlasService:
                 if path is None:
                     raise AtlasError("binding_schema_invalid")
                 try:
-                    path = validate_candidate_path(path, request_workspace)
+                    path = validate_candidate_path(path, workspace_root)
                 except AtlasError as exc:
                     raise AtlasError("source_path_unsafe") from exc
                 key = path_collision_key(path)
@@ -2067,7 +2125,7 @@ class AtlasService:
                     if existing is not None:
                         raise AtlasError("operation_path_collision")
                     try:
-                        validate_absent_workspace_path(request_workspace, path)
+                        validate_absent_workspace_path(workspace_root, path)
                     except AtlasError as exc:
                         raise AtlasError("source_path_unsafe") from exc
                     continue
@@ -2086,7 +2144,7 @@ class AtlasService:
                 raise AtlasError("source_hash_mismatch")
             files = (
                 self._project_index.read_snapshot_files(
-                    request_workspace,
+                    workspace_id,
                     snapshot_id,
                     tuple(sorted(source_paths, key=path_collision_key)),
                     byte_budget=MAX_PACKET_BYTES,
@@ -2116,7 +2174,7 @@ class AtlasService:
                 snapshot_paths=tuple(path for path, _hash in facts.file_hashes),
                 template_reader=self._render_template_reader(manifest),
             )
-            self._project_index.assert_current(request_workspace, snapshot_id)
+            self._project_index.assert_current(workspace_id, snapshot_id)
             result = RenderResult(
                 AtlasStatus.READY,
                 packet_id,

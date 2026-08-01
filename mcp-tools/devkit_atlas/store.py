@@ -16,9 +16,13 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Iterable
 
+from project_index.workspace import is_workspace_id
+
 from .canonical import canonical_hash, canonical_id, canonical_json
 from .models import (
+    ATLAS_MATCHER_VERSION,
     AtlasEdge,
+    AtlasError,
     AtlasNode,
     AtlasStatus,
     ConstraintSpec,
@@ -40,6 +44,8 @@ from .security import (
     MAX_PACKET_BYTES,
     MAX_RECIPE_BYTES,
     MAX_TEMPLATE_BYTES,
+    path_collision_key,
+    validate_candidate_path,
     validate_fragment,
 )
 
@@ -1921,8 +1927,31 @@ class AtlasStore:
             raise StoreConflictError("blob conflict") from exc
 
     def put_packet(self, packet: ImplementationPacket, *, created_at: str = "") -> str:
-        payload = canonical_json(packet.to_dict())
-        digest = canonical_hash(packet.to_dict())
+        packet_value = packet.to_dict()
+        identity_value = dict(packet_value)
+        identity_value.pop("packet_id", None)
+        if (
+            _HASH.fullmatch(packet.packet_id) is None
+            or canonical_hash(identity_value) != packet.packet_id
+            or not is_workspace_id(packet.workspace_id)
+            or _HASH.fullmatch(packet.snapshot_id) is None
+            or _HASH.fullmatch(packet.request_hash) is None
+            or packet.matcher_version != ATLAS_MATCHER_VERSION
+        ):
+            raise StoreConflictError("packet receipt conflict")
+        try:
+            normalized_targets = tuple(
+                sorted(validate_candidate_path(path) for path in packet.target_paths)
+            )
+        except (AtlasError, TypeError, ValueError) as exc:
+            raise StoreConflictError("packet receipt conflict") from exc
+        collision_keys = tuple(path_collision_key(path) for path in normalized_targets)
+        if normalized_targets != packet.target_paths or len(set(collision_keys)) != len(
+            collision_keys
+        ):
+            raise StoreConflictError("packet receipt conflict")
+        payload = canonical_json(packet_value)
+        digest = canonical_hash(packet_value)
         with self._conn:
             row = self._conn.execute(
                 "SELECT snapshot_id,packet_json,packet_hash FROM atlas_packet_receipts WHERE packet_id=?",
@@ -1948,10 +1977,12 @@ class AtlasStore:
         text_fields = {
             "packet_id",
             "trace_id",
-            "workspace",
+            "workspace_id",
             "snapshot_id",
             "recipe_id",
             "next_action",
+            "request_hash",
+            "matcher_version",
         }
         if any(not isinstance(value[name], str) for name in text_fields):
             raise StoreConflictError()
@@ -1969,6 +2000,8 @@ class AtlasStore:
             "source_hashes",
             "template_hashes",
             "receipt_hashes",
+            "target_paths",
+            "target_symbols",
         }
         if any(type(value[name]) is not list for name in sequence_fields):
             raise StoreConflictError()
@@ -1980,6 +2013,8 @@ class AtlasStore:
             "source_hashes",
             "template_hashes",
             "receipt_hashes",
+            "target_paths",
+            "target_symbols",
         }
         if any(
             any(not isinstance(item, str) for item in value[name])
@@ -2036,7 +2071,7 @@ class AtlasStore:
             return ImplementationPacket(
                 packet_id=value["packet_id"],
                 trace_id=value["trace_id"],
-                workspace=value["workspace"],
+                workspace_id=value["workspace_id"],
                 snapshot_id=value["snapshot_id"],
                 recipe_id=value["recipe_id"],
                 node_ids=tuple(value["node_ids"]),
@@ -2056,6 +2091,10 @@ class AtlasStore:
                 template_hashes=tuple(value["template_hashes"]),
                 receipt_hashes=tuple(value["receipt_hashes"]),
                 next_action=value["next_action"],
+                request_hash=value["request_hash"],
+                matcher_version=value["matcher_version"],
+                target_paths=tuple(value["target_paths"]),
+                target_symbols=tuple(value["target_symbols"]),
             )
         except (TypeError, ValueError) as exc:
             raise StoreConflictError() from exc
