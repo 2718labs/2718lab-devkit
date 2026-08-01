@@ -11,7 +11,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -6904,12 +6904,153 @@ def _render_fast_lane_plan(
     )
 
 
+def _fast_lane_quota_module() -> Any:
+    script = Path(__file__).with_name("fastlane_quota_balance.py")
+    spec = importlib.util.spec_from_file_location("fastlane_quota_balance", script)
+    if spec is None or spec.loader is None:
+        raise ValueError("quota balance module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fastlane_quota_balance"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fast_lane_quota_unknown() -> dict[str, Any]:
+    decision = {
+        "schema": "2718lab-devkit/fastlane-quota-balance-result-v1",
+        "status": "usage_unknown",
+        "snapshot_hash": None,
+        "ledger_epoch": None,
+        "main_pressure": "unknown",
+        "global_main_target": 6,
+        "main_proposal_ids": [],
+        "spark_proposal_ids": [],
+        "admitted_candidate_ids": [],
+        "held_candidate_ids": [],
+        "route_lock_hashes": [],
+        "reason_codes": ["quota_usage_unknown"],
+        "audit_event_hash": "",
+    }
+    decision["decision_hash"] = _sha256_json(decision)
+    decision["audit_event_hash"] = _sha256_json(
+        {key: value for key, value in decision.items() if key != "audit_event_hash"}
+    )
+    return decision
+
+
+def _fast_lane_quota_decision(
+    quota_request: Mapping[str, Any],
+    *,
+    trusted_key_resolver: Callable[[str], bytes | None] | None,
+    evaluation_time_utc_z: str | None,
+    verified_route_result_hashes: Iterable[str],
+    verified_lease_scope_bindings: Iterable[str],
+) -> dict[str, Any]:
+    if trusted_key_resolver is None or not callable(trusted_key_resolver):
+        return _fast_lane_quota_unknown()
+    if not isinstance(evaluation_time_utc_z, str):
+        return _fast_lane_quota_unknown()
+    try:
+        module = _fast_lane_quota_module()
+        value = module.compile_quota_balance(
+            quota_request,
+            trusted_key_resolver=trusted_key_resolver,
+            evaluation_time_utc_z=evaluation_time_utc_z,
+            verified_route_result_hashes=verified_route_result_hashes,
+            verified_lease_scope_bindings=verified_lease_scope_bindings,
+        )
+    except (OSError, TypeError, ValueError):
+        return _fast_lane_quota_unknown()
+    if not isinstance(value, Mapping):
+        return _fast_lane_quota_unknown()
+    return dict(value)
+
+
+def _fast_lane_quota_start_allowed(
+    assignment: Mapping[str, Any],
+    quota_request: Mapping[str, Any],
+    quota_decision: Mapping[str, Any],
+) -> bool:
+    if assignment.get("action") != "start":
+        return True
+    admitted = quota_decision.get("admitted_candidate_ids")
+    candidates = quota_request.get("candidates")
+    if not isinstance(admitted, Sequence) or isinstance(
+        admitted, (str, bytes, bytearray)
+    ):
+        return False
+    if not isinstance(candidates, Sequence) or isinstance(
+        candidates, (str, bytes, bytearray)
+    ):
+        return False
+    admitted_ids = {item for item in admitted if isinstance(item, str)}
+    for raw_candidate in candidates:
+        if not isinstance(raw_candidate, Mapping):
+            continue
+        if raw_candidate.get("candidate_id") not in admitted_ids:
+            continue
+        route = raw_candidate.get("route_lock")
+        if not isinstance(route, Mapping):
+            continue
+        if (
+            route.get("result_hash") == assignment.get("routing_result_hash")
+            and raw_candidate.get("assignment_epoch")
+            == assignment.get("assignment_epoch")
+            and raw_candidate.get("assignment_token")
+            == assignment.get("assignment_token")
+            and raw_candidate.get("local_slot_id") == assignment.get("slot_id")
+            and raw_candidate.get("write_scope_hash")
+            == assignment.get("write_scope_hash")
+            and raw_candidate.get("input_snapshot_id")
+            == assignment.get("workspace_input_snapshot_id")
+        ):
+            return True
+    return False
+
+
+def _apply_fast_lane_quota_balance(
+    result: Mapping[str, Any],
+    *,
+    quota_request: Mapping[str, Any],
+    quota_decision: Mapping[str, Any],
+) -> dict[str, Any]:
+    assignments = result.get("assignments")
+    if not isinstance(assignments, Sequence) or isinstance(
+        assignments, (str, bytes, bytearray)
+    ):
+        raise TypeError("fast-lane assignments are invalid")
+    filtered_assignments = [
+        dict(assignment)
+        for assignment in assignments
+        if isinstance(assignment, Mapping)
+        and _fast_lane_quota_start_allowed(assignment, quota_request, quota_decision)
+    ]
+    refill_plan = _mapping(result["refill_plan"], "fast-lane refill plan")
+    updated = {
+        **result,
+        "assignments": filtered_assignments,
+        "refill_plan": {**refill_plan, "quota_balance": dict(quota_decision)},
+    }
+    updated["plan_hash"] = _sha256_json(
+        {key: value for key, value in updated.items() if key != "plan_hash"}
+    )
+    _exact_keys(updated, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    if len(_json_bytes(updated)) > MAX_MANIFEST_BYTES:
+        raise ValueError("fast-lane plan exceeds its byte budget")
+    return updated
+
+
 def compile_fast_lane(
     request: Mapping[str, Any],
     *,
     reasoning_effort: str,
     enable: bool = False,
     host_status: Mapping[str, Any] | None = None,
+    quota_request: Mapping[str, Any] | None = None,
+    quota_trusted_key_resolver: Callable[[str], bytes | None] | None = None,
+    quota_evaluation_time_utc_z: str | None = None,
+    quota_verified_route_result_hashes: Iterable[str] = (),
+    quota_verified_lease_scope_bindings: Iterable[str] = (),
 ) -> dict[str, Any]:
     activation = _fast_lane_activation(reasoning_effort, enable)
     status = (
@@ -6949,19 +7090,31 @@ def compile_fast_lane(
                 },
             }
     result = _render_fast_lane_plan(validated, activation)
-    if occupancy is None:
-        return result
-    refill_plan = {
-        **result["refill_plan"],
-        "occupancy_audit": occupancy,
-    }
-    result = {**result, "refill_plan": refill_plan}
-    result["plan_hash"] = _sha256_json(
-        {key: value for key, value in result.items() if key != "plan_hash"}
-    )
-    _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
-    if len(_json_bytes(result)) > MAX_MANIFEST_BYTES:
-        raise ValueError("fast-lane plan exceeds its byte budget")
+    if occupancy is not None:
+        refill_plan = {
+            **result["refill_plan"],
+            "occupancy_audit": occupancy,
+        }
+        result = {**result, "refill_plan": refill_plan}
+        result["plan_hash"] = _sha256_json(
+            {key: value for key, value in result.items() if key != "plan_hash"}
+        )
+        _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+        if len(_json_bytes(result)) > MAX_MANIFEST_BYTES:
+            raise ValueError("fast-lane plan exceeds its byte budget")
+    if quota_request is not None:
+        decision = _fast_lane_quota_decision(
+            quota_request,
+            trusted_key_resolver=quota_trusted_key_resolver,
+            evaluation_time_utc_z=quota_evaluation_time_utc_z,
+            verified_route_result_hashes=quota_verified_route_result_hashes,
+            verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+        )
+        return _apply_fast_lane_quota_balance(
+            result,
+            quota_request=quota_request,
+            quota_decision=decision,
+        )
     return result
 
 
@@ -7002,6 +7155,8 @@ def _parser() -> argparse.ArgumentParser:
     fast_lane = commands.add_parser("fast-lane")
     fast_lane.add_argument("--input", required=True)
     fast_lane.add_argument("--host-status")
+    fast_lane.add_argument("--quota-input")
+    fast_lane.add_argument("--quota-evaluation-time")
     fast_lane.add_argument("--reasoning-effort", action="append", default=[])
     fast_lane.add_argument("--enable", action="store_true")
 
@@ -7052,11 +7207,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "host status",
                 )
             )
+            if args.quota_input is None and args.quota_evaluation_time is not None:
+                raise ValueError("quota evaluation time requires quota input")
+            if args.quota_input is not None and args.quota_evaluation_time is None:
+                raise ValueError("quota input requires an evaluation time")
+            quota_request = (
+                None
+                if args.quota_input is None
+                else _mapping(
+                    _read_json(
+                        args.quota_input,
+                        maximum=MAX_FAST_LANE_HOST_STATUS_BYTES,
+                    ),
+                    "quota request",
+                )
+            )
             result = compile_fast_lane(
                 _mapping(request, "fast-lane request"),
                 reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),
                 enable=args.enable,
                 host_status=host_status,
+                quota_request=quota_request,
+                quota_trusted_key_resolver=(
+                    None
+                    if quota_request is None
+                    else (lambda _key_id: None)
+                ),
+                quota_evaluation_time_utc_z=args.quota_evaluation_time,
             )
             _print_json(result)
         else:

@@ -6149,6 +6149,81 @@ class TeamEfficiencyTests(unittest.TestCase):
                     helper.decompose(manifest), json.loads(output.getvalue())
                 )
 
+    def test_fast_lane_quota_context_fails_closed_before_any_new_start(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        legacy = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+        )
+        self.assertTrue(
+            any(item["action"] == "start" for item in legacy["assignments"])
+        )
+
+        enforced = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+            quota_request={},
+            quota_trusted_key_resolver=lambda _key_id: None,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=(),
+            quota_verified_lease_scope_bindings=(),
+        )
+
+        self.assertIn("quota_balance", enforced["refill_plan"])
+        self.assertFalse(
+            any(item["action"] == "start" for item in enforced["assignments"])
+        )
+        self.assertEqual("usage_unknown", enforced["refill_plan"]["quota_balance"]["status"])
+
+    def test_fast_lane_quota_adapter_rejects_non_sequence_assignments(self) -> None:
+        helper = load_efficiency()
+        with self.assertRaises(TypeError):
+            helper._apply_fast_lane_quota_balance(
+                {"assignments": None},
+                quota_request={},
+                quota_decision={},
+            )
+
+    def test_fast_lane_cli_parses_quota_context_as_a_fail_closed_host_preview(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        request_path = self.temp / "fast-lane-quota-request.json"
+        host_status_path = self.temp / "fast-lane-quota-host-status.json"
+        quota_path = self.temp / "fast-lane-quota-context.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        host_status_path.write_text(json.dumps(host_status), encoding="utf-8")
+        quota_path.write_text("{}", encoding="utf-8")
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--host-status",
+                str(host_status_path),
+                "--quota-input",
+                str(quota_path),
+                "--quota-evaluation-time",
+                "2026-08-01T15:10:00Z",
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        result = json.loads(output)
+        self.assertEqual("usage_unknown", result["refill_plan"]["quota_balance"]["status"])
+        self.assertFalse(any(item["action"] == "start" for item in result["assignments"]))
+
 
 if __name__ == "__main__":
     unittest.main()
