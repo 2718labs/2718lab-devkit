@@ -1,0 +1,18 @@
+{
+  "schema": "2718lab-devkit/main-artifact-allowlist-v1",
+  "files": [
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    "LICENSE",
+    "mcp-tools/pyproject.toml",
+    "mcp-tools/server.py",
+    "mcp-tools/uv.lock"
+  ],
+  "trees": [
+    "mcp-tools/bugkiller",
+    "mcp-tools/code_atlas",
+    "mcp-tools/devkit_relay",
+    "mcp-tools/orchestrator",
+    "mcp-tools/project_index"
+  ]
+}

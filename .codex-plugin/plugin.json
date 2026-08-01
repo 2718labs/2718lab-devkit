@@ -1,7 +1,7 @@
 {
   "name": "2718lab-devkit",
-  "version": "0.3.0+codex.20260729030000",
-  "description": "2718lab development toolkit with release-candidate Code Atlas metadata and frozen interface contracts pending ATLAS-11 registration and ATLAS-13 E2E acceptance, plus Bugkiller workflow orchestration and MCP coordination. 2718lab 开发工具包，提供等待 ATLAS-11 注册和 ATLAS-13 E2E 验收的 Code Atlas 发布候选元数据与冻结接口契约，以及 Bugkiller 工作流编排与 MCP 协调。",
+  "version": "1.0.0-rc1",
+  "description": "Local MCP server for developer workflow coordination, indexing, and evidence handling.",
   "author": {
     "name": "2718lab",
     "url": "https://github.com/2718lab"
@@ -10,46 +10,21 @@
   "repository": "https://github.com/2718lab/2718lab-devkit",
   "license": "AGPL-3.0",
   "keywords": [
-    "astrbot",
     "mcp",
-    "fastmcp",
-    "python-engineering",
-    "open-source",
-    "chatbot-plugin",
-    "skills",
-    "code-atlas",
-    "automatic-ingestion",
-    "graph-recipes",
-    "team-decomposition",
-    "release-candidate",
-    "interface-contract",
-    "activation-gate"
+    "developer-tools",
+    "local"
   ],
-  "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "2718lab DevKit",
-    "shortDescription": "2718lab developer toolkit with Code Atlas release-candidate contracts / 含 Code Atlas 发布候选契约的 2718lab 开发工具包",
-    "longDescription": "English-first 2718lab development toolkit with Code Atlas release-candidate metadata and frozen interfaces pending ATLAS-11 registration and ATLAS-13 E2E acceptance, plus Bugkiller workflow orchestration and MCP coordination. 面向 Codex 的 2718lab 开发工具包，提供等待 ATLAS-11 注册和 ATLAS-13 E2E 验收的 Code Atlas 发布候选元数据与冻结接口，以及 Bugkiller 工作流编排与 MCP 协调。",
+    "shortDescription": "Local MCP server for developer workflows",
+    "longDescription": "A local MCP server for workflow coordination, indexing, and evidence handling.",
     "developerName": "2718lab",
     "category": "Developer Tools",
     "capabilities": [
-      "Skills",
-      "MCP",
-      "Agents",
-      "Release-candidate contract metadata",
-      "Frozen interface definitions",
-      "Activation-gate documentation",
-      "Activation-gated Code Atlas contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)",
-      "Activation-gated automatic ingestion contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)",
-      "Activation-gated graph recipes contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)",
-      "Activation-gated team decomposition contract (pending ATLAS-11 registration and ATLAS-13 E2E acceptance)"
+      "MCP server"
     ],
     "websiteURL": "https://github.com/2718lab/2718lab-devkit",
-    "defaultPrompt": [
-      "Review the Code Atlas v0.3 release-candidate contract and its ATLAS-11 activation gate.",
-      "Use the available Bugkiller tooling to decompose this engineering request with evidence gates.",
-      "审阅 Code Atlas v0.3 发布候选契约及其 ATLAS-11 激活门。"
-    ]
+    "defaultPrompt": []
   }
 }
