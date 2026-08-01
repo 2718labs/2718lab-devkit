@@ -93,7 +93,7 @@ def _request() -> dict[str, object]:
     return {
         "schema": "2718lab-devkit/relay-compile-request-v1",
         "workflow_id": "relay-contract",
-        "workspace_id": "workspace-main",
+        "workspace_id": "sha256:" + "d" * 64,
         "input_snapshot_id": "sha256:" + "a" * 64,
         "base_commit": "b" * 40,
         "capacity": 3,

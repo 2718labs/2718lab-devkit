@@ -559,7 +559,7 @@ def compile_plan(
     if request["schema"] != _REQUEST_SCHEMA:
         raise RelayPlanError("invalid_schema")
     workflow_id = _identifier(request["workflow_id"], "invalid_workflow_id")
-    workspace_id = _identifier(request["workspace_id"], "invalid_workspace_id")
+    workspace_id = _hash_identifier(request["workspace_id"], "invalid_workspace_id")
     input_snapshot_id = _hash_identifier(
         request["input_snapshot_id"], "invalid_snapshot_id"
     )

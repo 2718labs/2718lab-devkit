@@ -93,7 +93,7 @@ def _request() -> dict[str, object]:
     return {
         "schema": "2718lab-devkit/relay-compile-request-v1",
         "workflow_id": "relay-v2-contract",
-        "workspace_id": "workspace-main",
+        "workspace_id": "sha256:" + "d" * 64,
         "input_snapshot_id": "sha256:" + "b" * 64,
         "base_commit": "a" * 40,
         "capacity": 3,
@@ -150,11 +150,11 @@ def test_v2_compiles_registered_workspace_into_five_deterministic_queues() -> No
     }
     assert plan["schema"] == "2718lab-devkit/relay-plan-v1"
     assert resolver.calls == [
-        ("relay-v2-contract", "workspace-main", "sha256:" + "b" * 64)
+        ("relay-v2-contract", "sha256:" + "d" * 64, "sha256:" + "b" * 64)
     ]
     assert resolver.writes == 0
     assert plan["workspace_binding"] == {
-        "workspace_id": "workspace-main",
+        "workspace_id": "sha256:" + "d" * 64,
         "input_snapshot_id": "sha256:" + "b" * 64,
         "atlas_packet_ids": ["sha256:" + "c" * 64],
     }
@@ -248,12 +248,23 @@ def test_v3_rejects_unregistered_binding_as_domain_error() -> None:
         compile_plan(_request(), registry_resolver=MissingRegistry())
 
 
+def test_v3_rejects_nonopaque_workspace_identifier_before_registry_lookup() -> None:
+    request = _request()
+    request["workspace_id"] = "workspace-main"
+    resolver = RegistryResolver()
+
+    with pytest.raises(RelayPlanError, match="invalid_workspace_id"):
+        compile_plan(request, registry_resolver=resolver)
+
+    assert resolver.calls == []
+
+
 def test_v3_rejects_malformed_registry_data_as_corrupt() -> None:
     class MalformedRegistry:
         def resolve(self, **_: object) -> dict[str, object]:
             return {
                 "workflow_id": "relay-v2-contract",
-                "workspace_id": "workspace-main",
+                "workspace_id": "sha256:" + "d" * 64,
                 "input_snapshot_id": "sha256:" + "b" * 64,
                 "atlas_packet_ids": ["not-a-packet-id"],
                 "current": True,
