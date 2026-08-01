@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from hmac import compare_digest
-from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from pathlib import PurePosixPath
+from typing import Any
 
 from devkit_atlas.receipts import RawExecutionReceipt, ReceiptRepository
 
@@ -41,6 +42,7 @@ class OrchestratorService:
     _MAX_STATUS_CODE_ACCEPTANCES = 100
     _SAFE_ACCEPTANCE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
     _SAFE_RECEIPT_IDENTIFIER = re.compile(r"sha256:[0-9a-f]{64}\Z")
+    _WORKSPACE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
     _RECEIPT_HASH_FIELDS = (
         "session_id_hash",
         "turn_id_hash",
@@ -83,26 +85,24 @@ class OrchestratorService:
         required_evidence: tuple[str, ...] = (),
         input_hash: str = "",
         strict_index: bool = False,
-        workspace_root: str = "",
+        workspace_id: str = "",
         input_snapshot_id: str = "",
         task_node_ids: tuple[str, ...] = (),
         contract_node_ids: tuple[str, ...] = (),
     ) -> Task:
-        canonical_workspace = ""
         if strict_index:
-            if not input_snapshot_id or not task_node_ids:
+            if (
+                type(workspace_id) is not str
+                or self._WORKSPACE_ID.fullmatch(workspace_id) is None
+                or not input_snapshot_id
+                or not task_node_ids
+            ):
                 raise ServiceError(
                     "INDEX_UNAVAILABLE", "strict index binding is incomplete"
                 )
-            canonical = self._canonical_workspace(workspace_root)
-            if task.write_scope:
-                git_marker = canonical / ".git"
-                if not git_marker.is_file() or git_marker.is_symlink():
-                    raise ServiceError(
-                        "WORKTREE_UNOWNED", "strict write task is not a linked worktree"
-                    )
-            self._assert_index_current(canonical, input_snapshot_id, task.write_scope)
-            canonical_workspace = str(canonical)
+            self._assert_index_current(
+                workspace_id, input_snapshot_id, task.write_scope
+            )
         card_hash = f"sha256:{sha256(card.encode('utf-8')).hexdigest()}"
         registered = self._call(
             self._store.register_task,
@@ -112,7 +112,7 @@ class OrchestratorService:
             contract_subscriptions=tuple(direct_contract_hashes),
             required_evidence=tuple(required_evidence),
             strict_index=strict_index,
-            workspace_root=canonical_workspace,
+            workspace_id=workspace_id,
             input_snapshot_id=input_snapshot_id,
             task_node_ids=tuple(task_node_ids),
             contract_node_ids=tuple(contract_node_ids),
@@ -140,7 +140,7 @@ class OrchestratorService:
             if task.state == TaskState.RUNNING and binding.output_snapshot_id:
                 snapshot_id = binding.output_snapshot_id
             self._assert_index_current(
-                Path(binding.workspace_root),
+                binding.workspace_id,
                 snapshot_id,
                 task.write_scope,
             )
@@ -191,7 +191,7 @@ class OrchestratorService:
         if binding is not None:
             snapshot_id = binding.output_snapshot_id or binding.input_snapshot_id
             self._assert_index_current(
-                Path(binding.workspace_root), snapshot_id, task.write_scope
+                binding.workspace_id, snapshot_id, task.write_scope
             )
         receipt_attestation = None
         if task.task_kind is TaskKind.CODE:
@@ -477,6 +477,12 @@ class OrchestratorService:
             raise ServiceError(
                 "EVIDENCE_PATH_INVALID", "artifact path is outside evidence root"
             )
+        binding = self._call(self._store.get_index_binding, task_id)
+        if binding is not None and snapshot_id is not None:
+            task = self._call(self._store.get_task, task_id)
+            self._assert_index_current(
+                binding.workspace_id, snapshot_id, task.write_scope
+            )
         return self._call(
             self._store.register_task_artifact,
             task_id,
@@ -506,6 +512,10 @@ class OrchestratorService:
         task = self._call(self._store.get_task, task_id)
         if task.workflow_id != workflow_id:
             raise ServiceError("NOT_FOUND", "task is not in this workflow")
+        binding = self._call(self._store.get_index_binding, task_id)
+        if binding is None:
+            raise ServiceError("INDEX_UNAVAILABLE", "task has no strict index binding")
+        self._assert_index_current(binding.workspace_id, snapshot_id, task.write_scope)
         getter = getattr(self._index_service, "get_query_receipt", None)
         if getter is not None:
             try:
@@ -560,9 +570,7 @@ class OrchestratorService:
         if binding is None:
             raise ServiceError("INDEX_UNAVAILABLE", "task has no strict index binding")
         task = self._call(self._store.get_task, task_id)
-        self._assert_index_current(
-            Path(binding.workspace_root), snapshot_id, task.write_scope
-        )
+        self._assert_index_current(binding.workspace_id, snapshot_id, task.write_scope)
         return self._call(
             self._store.record_output_snapshot,
             task_id,
@@ -582,7 +590,7 @@ class OrchestratorService:
         epoch: int,
         now: str | None = None,
     ) -> Any:
-        from project_index.checkpoints import WorktreeOwnership
+        from project_index.checkpoints import WorkspaceOwnership
 
         task, binding = self._call(
             self._store.strict_task_context,
@@ -593,12 +601,12 @@ class OrchestratorService:
         )
         if task.workflow_id != workflow_id:
             raise ServiceError("NOT_FOUND", "task is not in this workflow")
-        return WorktreeOwnership(
+        return WorkspaceOwnership(
             workflow_id,
             task_id,
             owner,
             epoch,
-            binding.workspace_root,
+            binding.workspace_id,
             task.write_scope,
         )
 
@@ -885,6 +893,13 @@ class OrchestratorService:
         epoch: int,
         now: str | None,
     ) -> Task:
+        task = self._call(self._store.get_task, task_id)
+        binding = self._call(self._store.get_index_binding, task_id)
+        if binding is not None:
+            snapshot_id = binding.output_snapshot_id or binding.input_snapshot_id
+            self._assert_index_current(
+                binding.workspace_id, snapshot_id, task.write_scope
+            )
         return self._call(
             self._store.complete_task,
             task_id,
@@ -951,7 +966,7 @@ class OrchestratorService:
                 "INDEXED_DIFF_REQUIRED", "strict output evidence is missing"
             )
         self._assert_index_current(
-            Path(binding.workspace_root), binding.output_snapshot_id, task.write_scope
+            binding.workspace_id, binding.output_snapshot_id, task.write_scope
         )
         if self._index_service is None:
             raise ServiceError(
@@ -959,7 +974,9 @@ class OrchestratorService:
             )
         try:
             indexed_diff = self._index_service.diff(
-                binding.input_snapshot_id, binding.output_snapshot_id
+                binding.workspace_id,
+                binding.input_snapshot_id,
+                binding.output_snapshot_id,
             )
             computed_hash = self._index_diff_hash(indexed_diff)
         except ServiceError:
@@ -989,7 +1006,7 @@ class OrchestratorService:
             or checkpoint.kind != "checkpoint"
             or checkpoint.workflow_id != workflow_id
             or checkpoint.task_id != task.id
-            or checkpoint.workspace_root != binding.workspace_root
+            or getattr(checkpoint, "workspace_id", "") != binding.workspace_id
             or checkpoint.snapshot_id != binding.input_snapshot_id
             or tuple(checkpoint.write_scope) != task.write_scope
         ):
@@ -1173,38 +1190,24 @@ class OrchestratorService:
             raise ServiceError("INDEX_CORRUPT", "indexed diff is invalid") from error
         return f"sha256:{sha256(encoded).hexdigest()}"
 
-    @staticmethod
-    def _canonical_workspace(workspace_root: str) -> Path:
-        if not isinstance(workspace_root, str) or not workspace_root.strip():
-            raise ServiceError("INDEX_UNAVAILABLE", "strict workspace is missing")
-        supplied = Path(workspace_root).expanduser()
-        if not supplied.is_absolute():
-            raise ServiceError("INDEX_UNAVAILABLE", "strict workspace is not absolute")
-        try:
-            canonical = supplied.resolve(strict=True)
-        except OSError as error:
-            raise ServiceError(
-                "INDEX_UNAVAILABLE", "strict workspace is unavailable"
-            ) from error
-        if not canonical.is_dir():
-            raise ServiceError(
-                "INDEX_UNAVAILABLE", "strict workspace is not a directory"
-            )
-        return canonical
-
     def _assert_index_current(
         self,
-        workspace: Path,
+        workspace_id: str,
         snapshot_id: str,
         required_paths: tuple[str, ...],
     ) -> Any:
+        if (
+            type(workspace_id) is not str
+            or self._WORKSPACE_ID.fullmatch(workspace_id) is None
+        ):
+            raise ServiceError("INDEX_UNAVAILABLE", "strict workspace is unavailable")
         if self._index_service is None:
             raise ServiceError(
                 "INDEX_UNAVAILABLE", "project index service is unavailable"
             )
         try:
             return self._index_service.assert_current(
-                workspace,
+                workspace_id,
                 snapshot_id,
                 required_paths=tuple(required_paths) or None,
             )

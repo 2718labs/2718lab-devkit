@@ -8,9 +8,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from temp_support import task_scratch
 
 from orchestrator.models import Task, TaskState, Workflow, WorkflowKind, WorkflowState
 from orchestrator.store import (
@@ -18,13 +20,15 @@ from orchestrator.store import (
     CardHashMismatchError,
     LeaseConflictError,
     SQLiteStore,
+    StrictIndexError,
     VersionConflictError,
     WorkflowCancelledError,
 )
-from temp_support import task_scratch
 
 
 class SQLiteStoreServiceApiTests(unittest.TestCase):
+    _WORKSPACE_ID = "sha256:" + "1" * 64
+
     def setUp(self) -> None:
         scratch_root = task_scratch("orchestrator-store")
         self._temporary_directory = tempfile.TemporaryDirectory(dir=scratch_root)
@@ -52,6 +56,52 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
         return self.store.register_task(
             Task(task_id, self.workflow.id, task_id, "owner", state=state)
         )
+
+    def _seed_v5_strict_database(self, name: str) -> Path:
+        database = Path(self._temporary_directory.name) / name
+        seeded = SQLiteStore(database)
+        try:
+            seeded.create_workflow(
+                Workflow(
+                    "legacy-v5-workflow",
+                    WorkflowKind.DAG,
+                    "legacy",
+                    "summary",
+                    WorkflowState.RUNNING,
+                )
+            )
+            seeded.register_task(
+                Task(
+                    "legacy-v5-task",
+                    "legacy-v5-workflow",
+                    "legacy strict task",
+                    "worker",
+                    state=TaskState.READY,
+                ),
+                strict_index=True,
+                workspace_id=self._WORKSPACE_ID,
+                input_snapshot_id="sha256:input",
+                task_node_ids=("sha256:task-node",),
+            )
+        finally:
+            seeded.close()
+
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "UPDATE task_index_bindings SET workspace_root = ?",
+                ("D:/legacy-secret-workspace",),
+            )
+            connection.execute(
+                "ALTER TABLE task_index_bindings DROP COLUMN workspace_id"
+            )
+            connection.execute(
+                "UPDATE schema_metadata SET value = '5' WHERE key = 'schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return database
 
     def test_cancel_workflow_cancels_only_nonterminal_tasks_atomically(self) -> None:
         pending = self._register_task("pending", TaskState.RUNNING)
@@ -349,7 +399,7 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
 
         migrated = SQLiteStore(legacy_database)
         try:
-            self.assertEqual(5, migrated.schema_version())
+            self.assertEqual(6, migrated.schema_version())
             table_names = {
                 str(row["name"])
                 for row in migrated._connection.execute(
@@ -361,6 +411,107 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
             self.assertEqual("legacy task", migrated.get_task("legacy-v4-task").title)
         finally:
             migrated.close()
+
+    def test_v5_strict_rows_migrate_unbound_without_path_promotion_and_fail_closed(
+        self,
+    ) -> None:
+        legacy_database = self._seed_v5_strict_database("legacy-v5.sqlite")
+
+        migrated = SQLiteStore(legacy_database)
+        try:
+            columns = {
+                str(row["name"])
+                for row in migrated._connection.execute(
+                    "PRAGMA table_info(task_index_bindings)"
+                )
+            }
+            row = migrated._connection.execute(
+                "SELECT workspace_root, workspace_id FROM task_index_bindings WHERE task_id = ?",
+                ("legacy-v5-task",),
+            ).fetchone()
+            before = migrated.get_task("legacy-v5-task")
+            event_count = migrated._connection.execute(
+                "SELECT COUNT(*) FROM events WHERE task_id = ?", ("legacy-v5-task",)
+            ).fetchone()[0]
+
+            self.assertEqual(6, migrated.schema_version())
+            self.assertIn("workspace_id", columns)
+            self.assertEqual("D:/legacy-secret-workspace", row["workspace_root"])
+            self.assertEqual("", row["workspace_id"])
+            with self.assertRaises(StrictIndexError) as unreadable:
+                migrated.get_index_binding("legacy-v5-task")
+            self.assertEqual("INDEX_UNAVAILABLE", unreadable.exception.code)
+            with self.assertRaises(StrictIndexError) as unclaimable:
+                migrated.claim_task(
+                    "legacy-v5-task",
+                    "owner",
+                    "2099-01-01T00:00:00+00:00",
+                )
+            self.assertEqual("INDEX_UNAVAILABLE", unclaimable.exception.code)
+            self.assertEqual(before, migrated.get_task("legacy-v5-task"))
+            self.assertIsNone(migrated.get_lease("legacy-v5-task"))
+            self.assertEqual(
+                event_count,
+                migrated._connection.execute(
+                    "SELECT COUNT(*) FROM events WHERE task_id = ?",
+                    ("legacy-v5-task",),
+                ).fetchone()[0],
+            )
+        finally:
+            migrated.close()
+
+    def test_interrupted_v5_workspace_id_migration_rolls_back_column_and_version(
+        self,
+    ) -> None:
+        legacy_database = self._seed_v5_strict_database("interrupted-v5.sqlite")
+        real_connect = sqlite3.connect
+        interrupted_connections: list[sqlite3.Connection] = []
+
+        def connect_with_interrupted_migration(*args, **kwargs):
+            interrupted = real_connect(*args, **kwargs)
+            interrupted_connections.append(interrupted)
+
+            def deny_schema_version_update(action, table, _column, _database, _trigger):
+                if action == sqlite3.SQLITE_UPDATE and table == "schema_metadata":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            interrupted.set_authorizer(deny_schema_version_update)
+            return interrupted
+
+        with mock.patch(
+            "orchestrator.store.sqlite3.connect",
+            side_effect=connect_with_interrupted_migration,
+        ):
+            with self.assertRaises(sqlite3.DatabaseError):
+                SQLiteStore(legacy_database)
+        for interrupted in interrupted_connections:
+            interrupted.close()
+
+        connection = real_connect(legacy_database)
+        try:
+            schema_version = connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(task_index_bindings)"
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+
+        self.assertEqual("5", schema_version)
+        self.assertNotIn("workspace_id", columns)
+
+        reopened = SQLiteStore(legacy_database)
+        try:
+            self.assertEqual(6, reopened.schema_version())
+            with self.assertRaises(StrictIndexError):
+                reopened.get_index_binding("legacy-v5-task")
+        finally:
+            reopened.close()
 
     def test_claim_running_task_requires_expired_lease_for_takeover(self) -> None:
         task = self._register_task("running-claim", TaskState.RUNNING)

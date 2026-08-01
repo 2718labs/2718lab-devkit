@@ -12,8 +12,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from temp_support import task_scratch
 
 from orchestrator.models import (
     AtlasOutboxState,
@@ -35,7 +36,6 @@ from orchestrator.store import (
     StrictIndexError,
     VersionConflictError,
 )
-from temp_support import task_scratch
 
 
 class TypedTaskModelTests(unittest.TestCase):
@@ -83,7 +83,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             store = SQLiteStore(database)
             try:
-                self.assertEqual(5, store.schema_version())
+                self.assertEqual(6, store.schema_version())
                 self.assertEqual(
                     {"task_kind", "intent_id", "language", "framework"},
                     {
@@ -114,7 +114,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             restarted = SQLiteStore(database)
             try:
-                self.assertEqual(5, restarted.schema_version())
+                self.assertEqual(6, restarted.schema_version())
                 self.assertEqual(
                     Task(
                         "code-task",
@@ -213,7 +213,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             reopened = SQLiteStore(database)
             try:
-                self.assertEqual(5, reopened.schema_version())
+                self.assertEqual(6, reopened.schema_version())
                 self.assertEqual(
                     Task("legacy-task", "workflow-1", "legacy", "owner", version=2),
                     reopened.get_task("legacy-task"),
@@ -223,6 +223,8 @@ class TypedTaskStoreTests(unittest.TestCase):
 
 
 class CodeTaskAcceptanceStoreTests(unittest.TestCase):
+    _WORKSPACE_ID = "sha256:" + "1" * 64
+
     def setUp(self) -> None:
         scratch_root = task_scratch("orchestrator-code-acceptance")
         self._temporary_directory = tempfile.TemporaryDirectory(dir=scratch_root)
@@ -291,7 +293,7 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
                 framework="pytest",
             ),
             strict_index=True,
-            workspace_root="D:/workspace",
+            workspace_id=self._WORKSPACE_ID,
             input_snapshot_id=input_snapshot_id,
             task_node_ids=(f"sha256:task-node-{task_id}",),
             contract_node_ids=(f"sha256:contract-node-{task_id}",),
@@ -349,10 +351,8 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
         receipt_ids = tuple(
             sorted(
                 (
-                    "sha256:"
-                    + hashlib.sha256(f"{task_id}:patch".encode("utf-8")).hexdigest(),
-                    "sha256:"
-                    + hashlib.sha256(f"{task_id}:shell".encode("utf-8")).hexdigest(),
+                    "sha256:" + hashlib.sha256(f"{task_id}:patch".encode()).hexdigest(),
+                    "sha256:" + hashlib.sha256(f"{task_id}:shell".encode()).hexdigest(),
                 )
             )
         )
@@ -579,8 +579,9 @@ class CodeTaskAcceptanceStoreTests(unittest.TestCase):
                 framework="pytest",
             ),
             strict_index=True,
-            workspace_root="D:/workspace",
+            workspace_id=self._WORKSPACE_ID,
             input_snapshot_id="sha256:input-incomplete",
+            task_node_ids=("sha256:task-node-incomplete",),
         )
         self._acceptance_inputs[incomplete.id] = (
             "sha256:input-incomplete",

@@ -13,17 +13,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS))
 
+from temp_support import task_scratch  # noqa: E402
+
+import orchestrator.store as store_module  # noqa: E402
 from devkit_atlas.receipts import (  # noqa: E402
     HostCaptureContext,
     RawExecutionReceipt,
     ReceiptRepository,
 )
-import orchestrator.store as store_module  # noqa: E402
 from orchestrator.models import (  # noqa: E402
     AtlasOutboxState,
     Task,
@@ -42,7 +43,6 @@ from orchestrator.store import (  # noqa: E402
 )
 from project_index.checkpoints import CheckpointService  # noqa: E402
 from project_index.service import ProjectIndexService  # noqa: E402
-from temp_support import task_scratch  # noqa: E402
 
 
 class _StaticReceiptRepository:
@@ -144,7 +144,8 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
             receipt_repository=self.receipts,
         )
 
-        self.input_snapshot = self.index.sync(self.workspace)
+        self.workspace_id = self.index.project_index_register(self.workspace)
+        self.input_snapshot = self.index.sync(self.workspace_id)
         self.service.create_workflow(
             Workflow(
                 "workflow",
@@ -172,7 +173,7 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
             ),
             card="code task card",
             strict_index=True,
-            workspace_root=str(self.workspace),
+            workspace_id=self.workspace_id,
             input_snapshot_id=self.input_snapshot.snapshot_id,
             task_node_ids=("sha256:task-node",),
             contract_node_ids=("sha256:contract-node",),
@@ -196,7 +197,7 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
 
     def _prepare_code_task_completion(self) -> None:
         input_query = self.index.query(
-            self.workspace, self.input_snapshot.snapshot_id, "value"
+            self.workspace_id, self.input_snapshot.snapshot_id, "value"
         )
         self.service.record_index_query(
             "workflow",
@@ -226,9 +227,11 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
         )
 
         self.source.write_text("def value() -> int:\n    return 2\n", encoding="utf-8")
-        self.output_snapshot = self.index.sync(self.workspace)
+        self.output_snapshot = self.index.sync(self.workspace_id)
         indexed_diff = self.index.diff(
-            self.input_snapshot.snapshot_id, self.output_snapshot.snapshot_id
+            self.workspace_id,
+            self.input_snapshot.snapshot_id,
+            self.output_snapshot.snapshot_id,
         )
         self.service.record_output_snapshot(
             "code-task",
@@ -239,7 +242,7 @@ class CodeTaskAcceptanceFixture(unittest.TestCase):
             now=self._NOW,
         )
         output_query = self.index.query(
-            self.workspace, self.output_snapshot.snapshot_id, "value"
+            self.workspace_id, self.output_snapshot.snapshot_id, "value"
         )
         self.service.record_index_query(
             "workflow",
@@ -495,6 +498,43 @@ class CodeTaskAcceptanceServiceTests(CodeTaskAcceptanceFixture):
         self.assertIsNone(
             self.store.get_artifact(self.receipt_attestation.attestation_hash)
         )
+        durable_binding = self.store.get_index_binding("code-task")
+        self.assertEqual(self.workspace_id, durable_binding.workspace_id)
+        self.assertFalse(hasattr(durable_binding, "workspace_root"))
+
+    def test_acceptance_diff_is_bound_to_the_same_opaque_workspace_id(self) -> None:
+        with mock.patch.object(self.index, "diff", wraps=self.index.diff) as diff:
+            self._accept()
+
+        diff.assert_called_once_with(
+            self.workspace_id,
+            self.input_snapshot.snapshot_id,
+            self.output_snapshot.snapshot_id,
+        )
+
+    def test_cross_workspace_snapshot_registration_fails_before_store_writes(
+        self,
+    ) -> None:
+        other_workspace = self.root / "foreign-index-workspace"
+        other_workspace.mkdir()
+        (other_workspace / "foreign.py").write_text("value = 1\n", encoding="utf-8")
+        other_workspace_id = self.index.project_index_register(other_workspace)
+        foreign_snapshot = self.index.sync(other_workspace_id)
+
+        with self.assertRaises(ServiceError) as rejected:
+            self.service.register_task(
+                Task("foreign-snapshot-task", "workflow", "foreign", "worker"),
+                card="foreign snapshot card",
+                strict_index=True,
+                workspace_id=self.workspace_id,
+                input_snapshot_id=foreign_snapshot.snapshot_id,
+                task_node_ids=("sha256:foreign-task-node",),
+            )
+
+        self.assertEqual("NOT_FOUND", rejected.exception.code)
+        with self.assertRaises(KeyError):
+            self.store.get_task("foreign-snapshot-task")
+        self.assertIsNone(self.store.get_index_binding("foreign-snapshot-task"))
 
     def test_acceptance_rejects_duck_receipts_after_real_completion(self) -> None:
         records = dict(self.receipts_by_id)
@@ -971,7 +1011,27 @@ class CodeTaskAcceptanceServiceTests(CodeTaskAcceptanceFixture):
                 "kind": "checkpoint",
                 "workflow_id": "workflow",
                 "task_id": "other-task",
-                "workspace_root": str(self.workspace),
+                "workspace_root": "",
+                "workspace_id": self.workspace_id,
+                "snapshot_id": self.input_snapshot.snapshot_id,
+                "write_scope": ("src/app.py",),
+                "manifest_hash": self.checkpoint.manifest_hash,
+            },
+        )()
+        with mock.patch.object(self.checkpoints, "status", return_value=checkpoint):
+            self._assert_acceptance_rejected("SNAPSHOT_MISMATCH")
+
+    def test_cross_workspace_checkpoint_binding_blocks_acceptance(self) -> None:
+        checkpoint = type(
+            "Checkpoint",
+            (),
+            {
+                "checkpoint_id": self.checkpoint.checkpoint_id,
+                "kind": "checkpoint",
+                "workflow_id": "workflow",
+                "task_id": "code-task",
+                "workspace_root": "",
+                "workspace_id": "sha256:" + "2" * 64,
                 "snapshot_id": self.input_snapshot.snapshot_id,
                 "write_scope": ("src/app.py",),
                 "manifest_hash": self.checkpoint.manifest_hash,
@@ -1461,7 +1521,7 @@ class CodeTaskCompletionAttestationTests(CodeTaskAcceptanceFixture):
                 framework="pytest",
             ),
             strict_index=True,
-            workspace_root=str(self.workspace),
+            workspace_id=self.workspace_id,
             input_snapshot_id=self.input_snapshot.snapshot_id,
             task_node_ids=("sha256:second-task-node",),
             contract_node_ids=("sha256:second-contract-node",),

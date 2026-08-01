@@ -12,11 +12,11 @@ import re
 import secrets
 import sqlite3
 import uuid
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterator, Mapping
 
 from .models import (
     AtlasOutboxItem,
@@ -214,7 +214,7 @@ class TaskContextRequirements:
 @dataclass(frozen=True)
 class IndexBinding:
     task_id: str
-    workspace_root: str
+    workspace_id: str
     input_snapshot_id: str
     output_snapshot_id: str
     task_node_ids: tuple[str, ...]
@@ -269,7 +269,7 @@ class CodeTaskReceiptAttestation:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 5
+    _SCHEMA_VERSION = 6
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
@@ -355,7 +355,7 @@ class SQLiteStore:
         contract_subscriptions: tuple[str, ...] = (),
         required_evidence: tuple[str, ...] = (),
         strict_index: bool = False,
-        workspace_root: str = "",
+        workspace_id: str = "",
         input_snapshot_id: str = "",
         task_node_ids: tuple[str, ...] = (),
         contract_node_ids: tuple[str, ...] = (),
@@ -365,6 +365,13 @@ class SQLiteStore:
             raise CardHashMismatchError(
                 f"task card hash does not match task {task.id!r}"
             )
+        if strict_index and (
+            type(workspace_id) is not str
+            or self._SHA256_IDENTIFIER_PATTERN.fullmatch(workspace_id) is None
+            or not input_snapshot_id
+            or not task_node_ids
+        ):
+            raise StrictIndexError("INDEX_UNAVAILABLE")
         with self._transaction() as cursor:
             cursor.execute(
                 """
@@ -423,14 +430,14 @@ class SQLiteStore:
                 cursor.execute(
                     """
                     INSERT INTO task_index_bindings (
-                        task_id, workspace_root, input_snapshot_id,
+                        task_id, workspace_root, workspace_id, input_snapshot_id,
                         output_snapshot_id, task_node_ids, contract_node_ids,
                         checkpoint_id, indexed_diff_hash, fallback_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', 0)
+                    ) VALUES (?, '', ?, ?, ?, ?, ?, '', '', 0)
                     """,
                     (
                         task.id,
-                        workspace_root,
+                        workspace_id,
                         input_snapshot_id,
                         input_snapshot_id if not task.write_scope else "",
                         _encode_strings(task_node_ids),
@@ -1823,6 +1830,7 @@ class SQLiteStore:
         now_utc = _utc_timestamp(now) if now is not None else _utc_now()
         with self._transaction() as cursor:
             self._require_current_lease(cursor, task_id, owner, epoch, now=now_utc)
+            binding = self._optional_index_binding(cursor, task_id)
             task_context = cursor.execute(
                 """
                 SELECT
@@ -1892,9 +1900,6 @@ class SQLiteStore:
                 raise ArtifactConflictError(
                     f"artifact owner conflicts for {content_hash!r}"
                 )
-            binding = cursor.execute(
-                "SELECT * FROM task_index_bindings WHERE task_id = ?", (task_id,)
-            ).fetchone()
             if binding is not None and kind == "verification":
                 expected_snapshot = str(binding["output_snapshot_id"])
                 if not snapshot_id or snapshot_id != expected_snapshot:
@@ -2016,6 +2021,7 @@ class SQLiteStore:
             ).fetchone()
             if task is None:
                 raise KeyError(f"task not found: {task_id!r}")
+            self._optional_index_binding(cursor, task_id)
             workflow = cursor.execute(
                 "SELECT state FROM workflows WHERE id = ?", (task["workflow_id"],)
             ).fetchone()
@@ -2136,6 +2142,7 @@ class SQLiteStore:
         expiry_utc = _utc_timestamp(expires_at)
         normalized_target = self._validate_host_target(host_target)
         with self._transaction() as cursor:
+            self._optional_index_binding(cursor, task_id)
             return self._acquire_lease_in_transaction(
                 cursor, task_id, owner, expiry_utc, now_utc, normalized_target
             )
@@ -2533,11 +2540,13 @@ class SQLiteStore:
         ).fetchone()
         binding = self._connection.execute(
             """
-            SELECT input_snapshot_id, output_snapshot_id
+            SELECT *
             FROM task_index_bindings WHERE task_id = ?
             """,
             (attestation.code_task_id,),
         ).fetchone()
+        if binding is not None:
+            self._index_binding_from_row(binding)
         owner_rows = self._connection.execute(
             """
             SELECT receipt_id, code_task_version, attestation_hash
@@ -3080,11 +3089,22 @@ class SQLiteStore:
             )
         )
 
-    @staticmethod
-    def _require_index_binding(cursor: sqlite3.Cursor, task_id: str) -> sqlite3.Row:
+    @classmethod
+    def _optional_index_binding(
+        cls, cursor: sqlite3.Cursor, task_id: str
+    ) -> sqlite3.Row | None:
         row = cursor.execute(
             "SELECT * FROM task_index_bindings WHERE task_id = ?", (task_id,)
         ).fetchone()
+        if row is not None:
+            cls._workspace_id_from_row(row)
+        return row
+
+    @classmethod
+    def _require_index_binding(
+        cls, cursor: sqlite3.Cursor, task_id: str
+    ) -> sqlite3.Row:
+        row = cls._optional_index_binding(cursor, task_id)
         if row is None:
             raise StrictIndexError("INDEX_UNAVAILABLE")
         return row
@@ -3107,11 +3127,9 @@ class SQLiteStore:
             (task_id, event_type, snapshot_id, trace_id, _utc_now()),
         )
 
-    @staticmethod
-    def _require_strict_completion(cursor: sqlite3.Cursor, task_id: str) -> None:
-        binding = cursor.execute(
-            "SELECT * FROM task_index_bindings WHERE task_id = ?", (task_id,)
-        ).fetchone()
+    @classmethod
+    def _require_strict_completion(cls, cursor: sqlite3.Cursor, task_id: str) -> None:
+        binding = cls._optional_index_binding(cursor, task_id)
         if binding is None:
             return
         task = cursor.execute(
@@ -3147,11 +3165,21 @@ class SQLiteStore:
         if verification is None:
             raise StrictIndexError("VERIFICATION_EVIDENCE_REQUIRED")
 
-    @staticmethod
-    def _index_binding_from_row(row: sqlite3.Row) -> IndexBinding:
+    @classmethod
+    def _workspace_id_from_row(cls, row: sqlite3.Row) -> str:
+        workspace_id = row["workspace_id"]
+        if (
+            type(workspace_id) is not str
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(workspace_id) is None
+        ):
+            raise StrictIndexError("INDEX_UNAVAILABLE")
+        return workspace_id
+
+    @classmethod
+    def _index_binding_from_row(cls, row: sqlite3.Row) -> IndexBinding:
         return IndexBinding(
             str(row["task_id"]),
-            str(row["workspace_root"]),
+            cls._workspace_id_from_row(row),
             str(row["input_snapshot_id"]),
             str(row["output_snapshot_id"]),
             _decode_strings(row["task_node_ids"]),
@@ -3325,7 +3353,8 @@ class SQLiteStore:
                 );
                 CREATE TABLE IF NOT EXISTS task_index_bindings (
                     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
-                    workspace_root TEXT NOT NULL,
+                    workspace_root TEXT NOT NULL DEFAULT '',
+                    workspace_id TEXT NOT NULL DEFAULT '',
                     input_snapshot_id TEXT NOT NULL,
                     output_snapshot_id TEXT NOT NULL,
                     task_node_ids TEXT NOT NULL,
@@ -3410,6 +3439,17 @@ class SQLiteStore:
             if "framework" not in task_columns:
                 cursor.execute(
                     "ALTER TABLE tasks ADD COLUMN framework TEXT NOT NULL DEFAULT ''"
+                )
+            binding_columns = {
+                str(row["name"])
+                for row in cursor.execute(
+                    "PRAGMA table_info(task_index_bindings)"
+                ).fetchall()
+            }
+            if "workspace_id" not in binding_columns:
+                cursor.execute(
+                    "ALTER TABLE task_index_bindings "
+                    "ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''"
                 )
             cursor.execute(
                 """

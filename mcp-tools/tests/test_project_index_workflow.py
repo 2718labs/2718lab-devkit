@@ -7,36 +7,36 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from temp_support import task_scratch
 
 from orchestrator.models import Task, Workflow, WorkflowKind
 from orchestrator.service import OrchestratorService, ServiceError
 from orchestrator.store import SQLiteStore
 from project_index import IndexError, IndexSnapshot, IndexState
-from temp_support import task_scratch
+from project_index.checkpoints import WorkspaceOwnership
 
 
 class _IndexStub:
-    def __init__(self, workspace: Path, snapshot_id: str) -> None:
-        self.workspace = workspace.resolve()
+    def __init__(self, workspace_id: str, snapshot_id: str) -> None:
+        self.workspace_id = workspace_id
         self.snapshot_id = snapshot_id
         self.assertions: list[tuple[str, str, tuple[str, ...]]] = []
 
     def assert_current(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str,
         required_paths: tuple[str, ...] | None = None,
     ) -> IndexSnapshot:
-        canonical = Path(workspace).resolve()
         scope = tuple(required_paths or ())
-        self.assertions.append((canonical.as_posix(), snapshot_id, scope))
-        if canonical != self.workspace or snapshot_id != self.snapshot_id:
+        self.assertions.append((workspace_id, snapshot_id, scope))
+        if workspace_id != self.workspace_id or snapshot_id != self.snapshot_id:
             raise IndexError("INDEX_STALE", "snapshot is not current")
         return IndexSnapshot(
             snapshot_id,
-            canonical.as_posix(),
+            "",
             IndexState.INDEX_READY,
             1,
             1,
@@ -47,10 +47,13 @@ class _IndexStub:
             "sha256:manifest",
             "sha256:parsers",
             None,
+            workspace_id,
         )
 
 
 class StrictProjectIndexWorkflowTests(unittest.TestCase):
+    _WORKSPACE_ID = "sha256:" + "1" * 64
+
     def setUp(self) -> None:
         scratch = task_scratch("strict-project-index")
         self.directory = tempfile.TemporaryDirectory(dir=scratch)
@@ -61,7 +64,7 @@ class StrictProjectIndexWorkflowTests(unittest.TestCase):
         self.database = self.root / "orchestrator.sqlite3"
         self.store = SQLiteStore(self.database)
         self.addCleanup(self.store.close)
-        self.index = _IndexStub(self.workspace, "sha256:input")
+        self.index = _IndexStub(self._WORKSPACE_ID, "sha256:input")
         self.service = OrchestratorService(self.store, index_service=self.index)
         self.service.create_workflow(
             Workflow("wf", WorkflowKind.DAG, "title", "summary")
@@ -79,7 +82,7 @@ class StrictProjectIndexWorkflowTests(unittest.TestCase):
             task,
             card=f"card for {task_id}",
             strict_index=strict_index,
-            workspace_root=str(self.workspace),
+            workspace_id=self._WORKSPACE_ID,
             input_snapshot_id="sha256:input",
             task_node_ids=("sha256:task-node",),
             contract_node_ids=("sha256:contract-node",),
@@ -93,13 +96,74 @@ class StrictProjectIndexWorkflowTests(unittest.TestCase):
             expires_at="2099-01-01T00:00:00+00:00",
         )
 
-    def test_schema_v5_and_legacy_tasks_remain_unbound(self) -> None:
-        self.assertEqual(5, self.store.schema_version())
+    def test_schema_v6_and_legacy_tasks_remain_unbound(self) -> None:
+        self.assertEqual(6, self.store.schema_version())
         legacy = self.service.register_task(
             Task("legacy", "wf", "legacy", "writer"), card="legacy"
         )
 
         self.assertIsNone(self.store.get_index_binding(legacy.id))
+
+    def test_strict_registration_rejects_path_aliases_without_writes(self) -> None:
+        with self.assertRaises(TypeError):
+            self.service.register_task(
+                Task("path-alias", "wf", "path alias", "writer"),
+                card="path alias",
+                strict_index=True,
+                workspace_root=str(self.workspace),
+                input_snapshot_id="sha256:input",
+                task_node_ids=("sha256:task-node",),
+            )
+        with self.assertRaises(TypeError):
+            self.service.register_task(
+                Task("workspace-alias", "wf", "workspace alias", "writer"),
+                card="workspace alias",
+                strict_index=True,
+                workspace=str(self.workspace),
+                input_snapshot_id="sha256:input",
+                task_node_ids=("sha256:task-node",),
+            )
+
+        for task_id in ("path-alias", "workspace-alias"):
+            with self.assertRaises(KeyError):
+                self.store.get_task(task_id)
+            self.assertIsNone(self.store.get_index_binding(task_id))
+
+    def test_strict_registration_rejects_invalid_opaque_ids_without_writes(
+        self,
+    ) -> None:
+        for suffix, workspace_id in (
+            ("empty", ""),
+            ("path", str(self.workspace)),
+            ("pathlike", self.workspace),
+        ):
+            with self.subTest(workspace_id=workspace_id):
+                task_id = f"invalid-{suffix}"
+                with self.assertRaises(ServiceError) as rejected:
+                    self.service.register_task(
+                        Task(task_id, "wf", task_id, "writer"),
+                        card=task_id,
+                        strict_index=True,
+                        workspace_id=workspace_id,  # type: ignore[arg-type]
+                        input_snapshot_id="sha256:input",
+                        task_node_ids=("sha256:task-node",),
+                    )
+                self.assertEqual("INDEX_UNAVAILABLE", rejected.exception.code)
+                with self.assertRaises(KeyError):
+                    self.store.get_task(task_id)
+                self.assertIsNone(self.store.get_index_binding(task_id))
+
+    def test_strict_ownership_exposes_only_the_opaque_workspace_id(self) -> None:
+        self._register("owned")
+        _, lease = self._claim("owned")
+
+        ownership = self.service.strict_ownership(
+            "wf", "owned", owner="owner", epoch=lease.epoch
+        )
+
+        self.assertIsInstance(ownership, WorkspaceOwnership)
+        self.assertEqual(self._WORKSPACE_ID, ownership.workspace_id)
+        self.assertFalse(hasattr(ownership, "workspace_root"))
 
     def test_read_only_strict_task_requires_query_and_matching_verification(
         self,
@@ -163,9 +227,6 @@ class StrictProjectIndexWorkflowTests(unittest.TestCase):
     def test_write_task_enforces_checkpoint_output_diff_query_and_verification(
         self,
     ) -> None:
-        (self.workspace / ".git").write_text(
-            "gitdir: D:/linked/worktree\n", encoding="utf-8"
-        )
         self._register("write", write_scope=("src/app.py",))
         task, lease = self._claim("write")
 
@@ -244,9 +305,6 @@ class StrictProjectIndexWorkflowTests(unittest.TestCase):
     def test_running_write_task_recovers_against_recorded_output_snapshot(
         self,
     ) -> None:
-        (self.workspace / ".git").write_text(
-            "gitdir: D:/linked/worktree\n", encoding="utf-8"
-        )
         self._register("recover", write_scope=("src/app.py",))
         self.service.ready_wave("wf")
         task, lease = self.service.claim_task(
@@ -294,13 +352,13 @@ class StrictProjectIndexWorkflowTests(unittest.TestCase):
         self.assertGreater(recovered_lease.epoch, lease.epoch)
         self.assertEqual("sha256:output", self.index.assertions[-1][1])
 
-    def test_write_task_rejects_original_checkout_binding(self) -> None:
-        (self.workspace / ".git").mkdir()
+    def test_write_task_never_resolves_or_inspects_a_workspace_path(self) -> None:
+        registered = self._register("opaque-write", write_scope=("src/app.py",))
 
-        with self.assertRaises(ServiceError) as rejected:
-            self._register("unsafe", write_scope=("src/app.py",))
-
-        self.assertEqual("WORKTREE_UNOWNED", rejected.exception.code)
+        binding = self.store.get_index_binding(registered.id)
+        self.assertEqual(self._WORKSPACE_ID, binding.workspace_id)
+        self.assertEqual(self._WORKSPACE_ID, self.index.assertions[-1][0])
+        self.assertFalse(hasattr(binding, "workspace_root"))
 
 
 if __name__ == "__main__":
