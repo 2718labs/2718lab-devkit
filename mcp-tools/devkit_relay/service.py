@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from typing import Any
 
 from .canonical import canonical_hash
 from .evidence import CapabilitySigner, RelayCapabilityError
+from .proofs import (
+    IntegrationExpectation,
+    IntegrationProofError,
+    IntegrationProofReservation,
+    IntegrationProofResolver,
+    validate_integration_proof,
+)
 from .store import RelayStore, RelayStoreError
-
 
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
@@ -106,9 +113,16 @@ class RelayService:
     _MAX_CONFLICT_EDGES = 2_016
     _MAX_TEXT = 2_048
 
-    def __init__(self, store: RelayStore, *, capability_secret: bytes | str) -> None:
+    def __init__(
+        self,
+        store: RelayStore,
+        *,
+        capability_secret: bytes | str,
+        integration_proof_resolver: IntegrationProofResolver,
+    ) -> None:
         self._store = store
         self._capabilities = CapabilitySigner(capability_secret)
+        self._integration_proofs = integration_proof_resolver
 
     def issue_worker_capability(
         self,
@@ -359,17 +373,56 @@ class RelayService:
                 candidate_id=self._identifier(request["candidate_id"]),
                 **sol_fields,
             )
+        if "integration_proof_id" not in request:
+            raise RelayError("RELAY_INTEGRATION_PROOF_REQUIRED")
         self._exact_request_fields(
             request,
-            base | {"candidate_id", "integration_head", "integration_commit"},
+            base | {"candidate_id", "integration_proof_id"},
         )
-        return self._call(
-            self._store.integrate_candidate,
-            candidate_id=self._identifier(request["candidate_id"]),
-            integration_head=self._commit(request["integration_head"]),
-            integration_commit=self._commit(request["integration_commit"]),
+        candidate_id = self._identifier(request["candidate_id"])
+        proof_id = self._proof_id(request["integration_proof_id"])
+        expectation = self._proof_call(
+            self._store.integration_expectation,
+            candidate_id=candidate_id,
+            proof_id=proof_id,
             **sol_fields,
         )
+        try:
+            reservation = self._integration_proofs.reserve(proof_id, expectation)
+        except IntegrationProofError as error:
+            raise RelayError(error.code) from None
+        except Exception:
+            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+
+        try:
+            receipt = reservation.receipt
+            validate_integration_proof(proof_id, expectation, receipt)
+            result = self._call(
+                self._store.integrate_candidate,
+                candidate_id=candidate_id,
+                proof_id=proof_id,
+                expectation=expectation,
+                receipt=receipt,
+                **sol_fields,
+            )
+        except IntegrationProofError as error:
+            self._release_proof_reservation(reservation)
+            raise RelayError(error.code) from None
+        except RelayError:
+            self._release_proof_reservation(reservation)
+            raise
+        except Exception:
+            self._release_proof_reservation(reservation)
+            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+        try:
+            reservation.consume()
+        except IntegrationProofError as error:
+            self._release_proof_reservation(reservation)
+            raise RelayError(error.code) from None
+        except Exception:
+            self._release_proof_reservation(reservation)
+            raise RelayError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE") from None
+        return result
 
     def _lifecycle_fields(
         self, request: Mapping[str, Any], *, expected_scope: str
@@ -571,13 +624,23 @@ class RelayService:
                 raise RelayError("RELAY_PLAN_INVALID")
             path = item["path"]
             kind = item["kind"]
+            try:
+                path_utf8 = path.encode("utf-8", errors="strict")
+            except (AttributeError, UnicodeError):
+                raise RelayError("RELAY_PLAN_INVALID") from None
             if (
                 type(path) is not str
                 or not path
                 or len(path) > self._MAX_TEXT
+                or len(path_utf8) > self._MAX_TEXT
+                or unicodedata.normalize("NFC", path) != path
                 or path.startswith(("/", "~"))
                 or _SCOPE_PATH.match(path) is not None
                 or "\\" in path
+                or "\x00" in path
+                or any(
+                    ord(character) < 32 or ord(character) == 127 for character in path
+                )
                 or any(part in {"", ".", ".."} for part in path.split("/"))
                 or type(kind) is not str
                 or kind not in {"file", "tree"}
@@ -587,6 +650,8 @@ class RelayService:
         if scopes != sorted(scopes, key=lambda item: (item["path"], item["kind"])):
             raise RelayError("RELAY_PLAN_INVALID")
         if len({(item["path"], item["kind"]) for item in scopes}) != len(scopes):
+            raise RelayError("RELAY_PLAN_INVALID")
+        if len({item["path"].casefold() for item in scopes}) != len(scopes):
             raise RelayError("RELAY_PLAN_INVALID")
         return scopes
 
@@ -874,3 +939,33 @@ class RelayService:
             raise RelayError(error.code) from error
         except KeyError as error:
             raise RelayError("RELAY_REQUEST_INVALID") from error
+
+    @staticmethod
+    def _proof_call(
+        operation: Any, *args: Any, **kwargs: Any
+    ) -> IntegrationExpectation:
+        kwargs.pop("action", None)
+        try:
+            result = operation(*args, **kwargs)
+        except RelayStoreError as error:
+            raise RelayError(error.code) from error
+        except KeyError as error:
+            raise RelayError("RELAY_REQUEST_INVALID") from error
+        if type(result) is not IntegrationExpectation:
+            raise RelayError("RELAY_INTEGRATION_PROOF_CORRUPT")
+        return result
+
+    @staticmethod
+    def _release_proof_reservation(
+        reservation: IntegrationProofReservation,
+    ) -> None:
+        try:
+            reservation.release()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _proof_id(value: object) -> str:
+        if type(value) is not str or _DIGEST.fullmatch(value) is None:
+            raise RelayError("RELAY_INTEGRATION_PROOF_INVALID")
+        return value

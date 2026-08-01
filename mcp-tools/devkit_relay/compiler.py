@@ -14,7 +14,6 @@ from typing import Any, Protocol
 
 from .canonical import canonical_hash
 
-
 _REQUEST_SCHEMA = "2718lab-devkit/relay-compile-request-v1"
 _PLAN_SCHEMA = "2718lab-devkit/relay-plan-v1"
 _RUNTIME_POLICY_ID = "2718lab-devkit/relay-runtime-policy-v1"

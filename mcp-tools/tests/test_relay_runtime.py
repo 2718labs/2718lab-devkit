@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import sqlite3
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_relay.canonical import canonical_hash
 from devkit_relay.compiler import compile_plan
+from devkit_relay.proofs import (
+    IntegrationDeltaEntry,
+    IntegrationExpectation,
+    IntegrationProofError,
+    IntegrationProofReceipt,
+    IntegrationProofReservation,
+    IntegrationProofResolver,
+)
 from devkit_relay.service import RelayError, RelayService
 from devkit_relay.store import RelayStore
-
 
 _BASE_COMMIT = "a" * 40
 _INPUT_SNAPSHOT = "sha256:" + "b" * 64
@@ -261,9 +267,160 @@ def _maximum_graph_plan(graph_kind: str) -> dict[str, object]:
     return _compiled_plan(raw_tasks)
 
 
-def service(tmp_path: Path) -> tuple[RelayService, RelayStore]:
+class _RejectingProofResolver:
+    def reserve(
+        self, proof_id: str, expectation: IntegrationExpectation
+    ) -> IntegrationProofReservation:
+        del proof_id, expectation
+        raise IntegrationProofError("RELAY_INTEGRATION_PROOF_UNREGISTERED")
+
+
+class ProofRegistry:
+    """Host-ledger double used by lifecycle and proof-boundary tests."""
+
+    def __init__(self) -> None:
+        self.receipts: dict[str, IntegrationProofReceipt] = {}
+        self.states: dict[str, str] = {}
+        self._held: dict[tuple[str, str, str], str] = {}
+        self.fail_consume_once = False
+        self.on_reserve: object = None
+
+    def register(self, receipt: IntegrationProofReceipt) -> str:
+        proof_id = receipt.proof_id
+        if proof_id in self.receipts:
+            raise AssertionError("duplicate test proof")
+        self.receipts[proof_id] = receipt
+        self.states[proof_id] = "registered"
+        return proof_id
+
+    def reserve(
+        self, proof_id: str, expectation: IntegrationExpectation
+    ) -> IntegrationProofReservation:
+        receipt = self.receipts.get(proof_id)
+        if receipt is None:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_UNREGISTERED")
+        if receipt.expectation != expectation:
+            raise IntegrationProofError("RELAY_INTEGRATION_BINDING_MISMATCH")
+        state = self.states[proof_id]
+        if state == "reserved":
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
+        recovery = state == "consumed"
+        key = (
+            expectation.workspace_id,
+            receipt.repository_id,
+            receipt.integration_ref,
+        )
+        owner = self._held.get(key)
+        if owner is not None and owner != proof_id:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_BUSY")
+        if not recovery:
+            self.states[proof_id] = "reserved"
+            self._held[key] = proof_id
+        callback = self.on_reserve
+        if callable(callback):
+            callback()
+        return _ProofReservation(self, proof_id, key, recovery)
+
+
+class _ProofReservation:
+    def __init__(
+        self,
+        registry: ProofRegistry,
+        proof_id: str,
+        key: tuple[str, str, str],
+        recovery: bool,
+    ) -> None:
+        self._registry = registry
+        self._proof_id = proof_id
+        self._key = key
+        self._recovery = recovery
+
+    @property
+    def receipt(self) -> IntegrationProofReceipt:
+        return self._registry.receipts[self._proof_id]
+
+    def consume(self) -> None:
+        if self._recovery:
+            return
+        if self._registry.fail_consume_once:
+            self._registry.fail_consume_once = False
+            raise IntegrationProofError("RELAY_INTEGRATION_ATTESTOR_UNAVAILABLE")
+        self._registry.states[self._proof_id] = "consumed"
+        self._registry._held.pop(self._key, None)
+
+    def release(self) -> None:
+        if self._recovery:
+            return
+        if self._registry.states.get(self._proof_id) == "reserved":
+            self._registry.states[self._proof_id] = "registered"
+        self._registry._held.pop(self._key, None)
+
+
+def synthetic_integration_receipt(
+    expectation: IntegrationExpectation,
+    *,
+    final_commit: str | None = None,
+    delta_path: str | None = None,
+) -> IntegrationProofReceipt:
+    object_length = len(expectation.predecessor_integration_head)
+    object_format = "sha1" if object_length == 40 else "sha256"
+    scope = expectation.write_scope[0]
+    path = delta_path or (
+        scope.path if scope.kind == "file" else f"{scope.path}/integration-proof.txt"
+    )
+    delta = (
+        IntegrationDeltaEntry(
+            path=path,
+            old_oid="5" * object_length,
+            new_oid="6" * object_length,
+            old_mode="100644",
+            new_mode="100644",
+            old_type="blob",
+            new_type="blob",
+        ),
+    )
+    return IntegrationProofReceipt.create(
+        expectation=expectation,
+        object_format=object_format,
+        repository_id="sha256:" + "9" * 64,
+        integration_ref="refs/heads/main",
+        predecessor_commit=expectation.predecessor_integration_head,
+        candidate_head_commit=expectation.candidate_head_commit,
+        candidate_commits=(expectation.candidate_head_commit,),
+        final_commit=final_commit or "2" * object_length,
+        predecessor_tree="3" * object_length,
+        candidate_tree="4" * object_length,
+        final_tree="4" * object_length,
+        final_parent_commit=expectation.predecessor_integration_head,
+        ref_before_commit=expectation.predecessor_integration_head,
+        ref_after_commit=final_commit or "2" * object_length,
+        candidate_delta=delta,
+        final_delta=delta,
+        merge_free=True,
+        linear_ancestry=True,
+        attestor_id="host-git",
+        attestor_version="1.0",
+    )
+
+
+def service(
+    tmp_path: Path,
+    integration_proof_resolver: IntegrationProofResolver | None = None,
+) -> tuple[RelayService, RelayStore]:
     store = RelayStore(tmp_path / "relay.sqlite3")
-    return RelayService(store, capability_secret=b"relay-v3-test-secret"), store
+    resolver = (
+        _RejectingProofResolver()
+        if integration_proof_resolver is None
+        else integration_proof_resolver
+    )
+    return (
+        RelayService(
+            store,
+            capability_secret=b"relay-v3-test-secret",
+            integration_proof_resolver=resolver,
+        ),
+        store,
+    )
 
 
 def issue_worker(

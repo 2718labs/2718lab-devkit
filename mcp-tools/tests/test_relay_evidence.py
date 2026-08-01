@@ -7,11 +7,7 @@ from pathlib import Path
 
 import pytest
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from devkit_relay.evidence import CapabilitySigner, RelayCapabilityError
-from devkit_relay.service import RelayError
 
 from test_relay_runtime import (
     bind_worker,
@@ -21,6 +17,9 @@ from test_relay_runtime import (
     task,
     worker_request,
 )
+
+from devkit_relay.evidence import CapabilitySigner, RelayCapabilityError
+from devkit_relay.service import RelayError
 
 
 def test_capabilities_bind_worker_action_epoch_endpoint_and_scope(

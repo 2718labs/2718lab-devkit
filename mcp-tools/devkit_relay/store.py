@@ -9,10 +9,11 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any
 
 from .canonical import canonical_bytes, canonical_hash
 from .evidence import validate_evidence
@@ -24,7 +25,13 @@ from .models import (
     RelayTask,
     RelayTaskState,
 )
-
+from .proofs import (
+    IntegrationExpectation,
+    IntegrationProofError,
+    IntegrationProofReceipt,
+    IntegrationScopeEntry,
+    validate_integration_proof,
+)
 
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -65,10 +72,26 @@ class RelayStorageFailure(RelayStoreError):
     code = "RELAY_STORAGE_ERROR"
 
 
+class RelaySchemaIncompatible(RelayStoreError):
+    code = "RELAY_SCHEMA_INCOMPATIBLE"
+
+
+class RelayIntegrationProofCorrupt(RelayStoreError):
+    code = "RELAY_INTEGRATION_PROOF_CORRUPT"
+
+
+class RelayIntegrationProofReplay(RelayStoreError):
+    code = "RELAY_INTEGRATION_PROOF_REPLAY"
+
+
+class RelayIntegrationHeadStale(RelayStoreError):
+    code = "RELAY_INTEGRATION_HEAD_STALE"
+
+
 class RelayStore:
     """Own the atomic durable state behind Relay's five public tools."""
 
-    _SCHEMA_VERSION = 3
+    _SCHEMA_VERSION = 4
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
     def __init__(self, database: str | Path) -> None:
@@ -76,10 +99,16 @@ class RelayStore:
             str(database), isolation_level=None
         )
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA busy_timeout = 5000")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        try:
+            self._assert_schema_compatible()
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA busy_timeout = 5000")
+            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._create_schema()
+            self._assert_schema_shape()
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -102,6 +131,7 @@ class RelayStore:
             "relay_v3_idempotency",
             "relay_v3_evidence",
             "relay_v3_candidates",
+            "relay_v3_integration_proofs",
         )
         return canonical_hash(
             {
@@ -142,9 +172,9 @@ class RelayStore:
                     """
                     INSERT INTO relay_v3_runs
                         (run_id, workflow_id, plan_hash, plan_json, workspace_id,
-                         input_snapshot_id, base_commit, capacity, schedule_version,
-                         created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                         input_snapshot_id, base_commit, integration_head,
+                         integration_version, capacity, schedule_version, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?)
                     """,
                     (
                         run_id,
@@ -153,6 +183,7 @@ class RelayStore:
                         _encode_json(plan_data),
                         str(binding["workspace_id"]),
                         str(binding["input_snapshot_id"]),
+                        str(plan_data["base_commit"]),
                         str(plan_data["base_commit"]),
                         int(plan_data["capacity"]),
                         now,
@@ -569,7 +600,9 @@ class RelayStore:
                 )
                 if task.kind != "implementation" or lease.endpoint != endpoint:
                     raise RelayLeaseConflict()
-                if candidate_data["base_commit"] != run.base_commit:
+                if candidate_data["base_commit"] != self._lease_bootstrap_base(
+                    cursor, lease
+                ):
                     raise RelayStaleBase()
                 self._require_evidence(cursor, run, task, epoch, candidate_data)
                 existing = cursor.execute(
@@ -584,9 +617,9 @@ class RelayStore:
                         (candidate_id, run_id, task_id, originating_epoch, branch,
                          base_commit, head_commit, diff_hash, evidence_hashes_json,
                          pr_reference, status, review_digest, integration_commit,
-                         created_at, updated_at)
+                         integration_tree, integration_proof_id, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', NULL,
-                            NULL, ?, ?)
+                            NULL, NULL, NULL, ?, ?)
                     """,
                     (
                         candidate_data["candidate_id"],
@@ -625,7 +658,7 @@ class RelayStore:
                     cursor,
                     run,
                     task.task_id,
-                    candidate_id=candidate_data["candidate_id"],
+                    candidate_id=str(candidate_data["candidate_id"]),
                 )
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
@@ -710,6 +743,8 @@ class RelayStore:
                     "rebased",
                 }:
                     raise RelayStateStale()
+                if base_commit != run.integration_head:
+                    raise RelayIntegrationHeadStale()
                 self._require_evidence_hashes(
                     cursor, run, task, epoch, list(evidence_hashes)
                 )
@@ -782,6 +817,68 @@ class RelayStore:
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
+    def integration_expectation(
+        self,
+        workflow_id: str,
+        task_id: str,
+        *,
+        epoch: int,
+        expected_task_version: int,
+        candidate_id: str,
+        proof_id: str,
+    ) -> IntegrationExpectation:
+        """Snapshot the exact read-only binding a host proof must attest."""
+
+        connection = self._require_connection()
+        run = self._run_for_workflow(connection, workflow_id)
+        task = self._task_for_run(connection, run.run_id, task_id)
+        candidate = connection.execute(
+            """
+            SELECT * FROM relay_v3_candidates
+            WHERE candidate_id = ? AND run_id = ? AND task_id = ?
+              AND originating_epoch = ?
+            """,
+            (candidate_id, run.run_id, task_id, epoch),
+        ).fetchone()
+        if candidate is None:
+            raise RelayStateStale()
+
+        fresh = (
+            task.kind == "implementation"
+            and task.state is RelayTaskState.REVIEW_INTEGRATION
+            and task.task_version == expected_task_version
+            and task.last_lease_epoch == epoch
+            and task.candidate_id == candidate_id
+            and str(candidate["status"]) == "reviewed"
+        )
+        recovery = (
+            task.kind == "implementation"
+            and task.state is RelayTaskState.INTEGRATED
+            and task.task_version == expected_task_version + 1
+            and task.last_lease_epoch == epoch
+            and task.candidate_id == candidate_id
+            and str(candidate["status"]) == "integrated"
+        )
+        if not fresh and not recovery:
+            raise RelayStateStale()
+
+        proof_row = connection.execute(
+            "SELECT * FROM relay_v3_integration_proofs WHERE proof_id = ?",
+            (proof_id,),
+        ).fetchone()
+        if proof_row is not None and str(proof_row["candidate_id"]) != candidate_id:
+            raise RelayIntegrationProofReplay()
+
+        if fresh:
+            if proof_row is not None:
+                raise RelayIntegrationProofReplay()
+            return self._integration_expectation(run, task, candidate)
+
+        if proof_row is not None and candidate["integration_proof_id"] == proof_id:
+            receipt = self._validated_proof_row(connection, proof_row)
+            return receipt.expectation
+        raise RelayStateStale()
+
     def integrate_candidate(
         self,
         workflow_id: str,
@@ -790,38 +887,139 @@ class RelayStore:
         epoch: int,
         expected_task_version: int,
         candidate_id: str,
-        integration_head: str,
-        integration_commit: str,
+        proof_id: str,
+        expectation: IntegrationExpectation,
+        receipt: IntegrationProofReceipt,
     ) -> dict[str, object]:
-        """Record only Sol's reviewed matching-base integration decision."""
+        """Atomically persist a proof, integration, CAS head, and promotions."""
 
-        if (
-            _COMMIT.fullmatch(integration_head) is None
-            or _COMMIT.fullmatch(integration_commit) is None
-        ):
-            raise RelayCandidateError()
+        try:
+            validate_integration_proof(proof_id, expectation, receipt)
+        except IntegrationProofError as error:
+            raise RelayStoreError(error.code) from error
         now = _utc_now()
         try:
             with self._transaction() as cursor:
-                run, task, candidate = self._candidate_for_sol(
-                    cursor,
-                    workflow_id,
-                    task_id,
-                    epoch=epoch,
-                    expected_task_version=expected_task_version,
-                    candidate_id=candidate_id,
-                )
-                if str(candidate["status"]) != "reviewed":
+                run = self._run_for_workflow(cursor, workflow_id)
+                task = self._task_for_run(cursor, run.run_id, task_id)
+                candidate = cursor.execute(
+                    """
+                    SELECT * FROM relay_v3_candidates
+                    WHERE candidate_id = ? AND run_id = ? AND task_id = ?
+                      AND originating_epoch = ?
+                    """,
+                    (candidate_id, run.run_id, task_id, epoch),
+                ).fetchone()
+                if candidate is None:
                     raise RelayStateStale()
-                if str(candidate["base_commit"]) != integration_head:
-                    raise RelayStaleBase()
+
+                fresh = (
+                    task.kind == "implementation"
+                    and task.state is RelayTaskState.REVIEW_INTEGRATION
+                    and task.task_version == expected_task_version
+                    and task.last_lease_epoch == epoch
+                    and task.candidate_id == candidate_id
+                    and str(candidate["status"]) == "reviewed"
+                )
+                recovery = (
+                    task.kind == "implementation"
+                    and task.state is RelayTaskState.INTEGRATED
+                    and task.task_version == expected_task_version + 1
+                    and task.last_lease_epoch == epoch
+                    and task.candidate_id == candidate_id
+                    and str(candidate["status"]) == "integrated"
+                )
+                if not fresh and not recovery:
+                    raise RelayStateStale()
+
+                existing = cursor.execute(
+                    "SELECT * FROM relay_v3_integration_proofs WHERE proof_id = ?",
+                    (proof_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["candidate_id"]) != candidate_id
+                        or candidate["integration_proof_id"] != proof_id
+                        or not recovery
+                    ):
+                        raise RelayIntegrationProofReplay()
+                    persisted = self._validated_proof_row(cursor, existing)
+                    if persisted != receipt or persisted.expectation != expectation:
+                        raise RelayIntegrationProofCorrupt()
+                    if (
+                        task.state is not RelayTaskState.INTEGRATED
+                        or task.task_version != expected_task_version + 1
+                        or task.last_lease_epoch != epoch
+                        or task.candidate_id != candidate_id
+                        or str(candidate["status"]) != "integrated"
+                    ):
+                        raise RelayIntegrationProofCorrupt()
+                    return self._mutation_result(
+                        cursor, run, task.task_id, candidate_id=candidate_id
+                    )
+
+                if not fresh:
+                    raise RelayStateStale()
+
+                current = self._integration_expectation(run, task, candidate)
+                if (
+                    current.predecessor_integration_head
+                    != expectation.predecessor_integration_head
+                    or current.predecessor_integration_version
+                    != expectation.predecessor_integration_version
+                ):
+                    raise RelayIntegrationHeadStale()
+                if current != expectation:
+                    raise RelayStoreError("RELAY_INTEGRATION_BINDING_MISMATCH")
+                try:
+                    validate_integration_proof(proof_id, current, receipt)
+                except IntegrationProofError as error:
+                    raise RelayStoreError(error.code) from error
+
+                cursor.execute(
+                    """
+                    INSERT INTO relay_v3_integration_proofs
+                        (proof_id, run_id, workflow_id, task_id, candidate_id,
+                         integration_version, expectation_hash, expectation_json,
+                         receipt_json, repository_id, integration_ref,
+                         predecessor_commit, final_commit, final_tree, attestor_id,
+                         attestor_version, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proof_id,
+                        run.run_id,
+                        run.workflow_id,
+                        task.task_id,
+                        candidate_id,
+                        run.integration_version + 1,
+                        current.expectation_hash,
+                        _encode_json(current.to_dict()),
+                        _encode_json(receipt.to_dict()),
+                        receipt.repository_id,
+                        receipt.integration_ref,
+                        receipt.predecessor_commit,
+                        receipt.final_commit,
+                        receipt.final_tree,
+                        receipt.attestor_id,
+                        receipt.attestor_version,
+                        now,
+                    ),
+                )
                 cursor.execute(
                     """
                     UPDATE relay_v3_candidates
-                    SET status = 'integrated', integration_commit = ?, updated_at = ?
+                    SET status = 'integrated', integration_commit = ?,
+                        integration_tree = ?, integration_proof_id = ?, updated_at = ?
                     WHERE candidate_id = ?
                     """,
-                    (integration_commit, now, candidate_id),
+                    (
+                        receipt.final_commit,
+                        receipt.final_tree,
+                        proof_id,
+                        now,
+                        candidate_id,
+                    ),
                 )
                 cursor.execute(
                     """
@@ -831,12 +1029,31 @@ class RelayStore:
                     """,
                     (RelayTaskState.INTEGRATED.value, run.run_id, task.task_id),
                 )
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_runs
+                    SET integration_head = ?,
+                        integration_version = integration_version + 1
+                    WHERE run_id = ? AND integration_head = ?
+                      AND integration_version = ?
+                    """,
+                    (
+                        receipt.final_commit,
+                        run.run_id,
+                        run.integration_head,
+                        run.integration_version,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RelayIntegrationHeadStale()
                 self._promote_dependency_safe_tasks(cursor, run.run_id)
                 run = self._increment_schedule_version(cursor, run.run_id)
                 self._refresh_directives(cursor, run, now=now)
                 return self._mutation_result(
                     cursor, run, task.task_id, candidate_id=candidate_id
                 )
+        except IntegrationProofError as error:
+            raise RelayStoreError(error.code) from error
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
@@ -928,14 +1145,56 @@ class RelayStore:
                 (run.run_id,),
             ).fetchall()
         ]
+        proof_summaries: list[dict[str, object]] = []
+        predecessor_head = run.base_commit
+        predecessor_version = 0
+        proof_rows = connection.execute(
+            """
+            SELECT * FROM relay_v3_integration_proofs
+            WHERE run_id = ? ORDER BY integration_version, proof_id
+            """,
+            (run.run_id,),
+        ).fetchall()
+        for proof_row in proof_rows:
+            receipt = self._validated_proof_row(connection, proof_row)
+            integration_version = int(proof_row["integration_version"])
+            if (
+                integration_version != predecessor_version + 1
+                or receipt.expectation.predecessor_integration_version
+                != predecessor_version
+                or receipt.predecessor_commit != predecessor_head
+            ):
+                raise RelayIntegrationProofCorrupt()
+            proof_summaries.append(
+                {
+                    "proof_id": receipt.proof_id,
+                    "expectation_hash": receipt.expectation.expectation_hash,
+                    "task_id": receipt.expectation.task_id,
+                    "candidate_id": receipt.expectation.candidate_id,
+                    "integration_version": integration_version,
+                    "predecessor_commit": receipt.predecessor_commit,
+                    "final_commit": receipt.final_commit,
+                    "final_tree": receipt.final_tree,
+                    "attestor_id": receipt.attestor_id,
+                    "attestor_version": receipt.attestor_version,
+                }
+            )
+            predecessor_head = receipt.final_commit
+            predecessor_version = integration_version
+        if (
+            predecessor_head != run.integration_head
+            or predecessor_version != run.integration_version
+        ):
+            raise RelayIntegrationProofCorrupt()
         return {
-            "schema": "2718lab-devkit/relay-status-v1",
+            "schema": "2718lab-devkit/relay-status-v2",
             "workflow_id": workflow_id,
             "run": run.to_dict(),
             "schedule_version": run.schedule_version,
             "tasks": [task.to_dict() for task in tasks],
             "leases": leases,
             "candidates": candidates,
+            "integration_proofs": proof_summaries,
             "outstanding_action_ids": [
                 str(row["action_id"])
                 for row in connection.execute(
@@ -1051,10 +1310,30 @@ class RelayStore:
         return {
             "context_reservation_id": f"context-{suffix}",
             "branch": f"relay/{suffix}",
-            "base_commit": run.base_commit,
+            "base_commit": run.integration_head,
             "worktree_suffix": f"worktrees/{suffix}",
             "temporary_root_suffix": f"contexts/{suffix}",
         }
+
+    @staticmethod
+    def _lease_bootstrap_base(cursor: sqlite3.Cursor, lease: RelayLease) -> str:
+        row = cursor.execute(
+            "SELECT payload_json FROM relay_v3_actions WHERE lease_id = ?",
+            (lease.lease_id,),
+        ).fetchone()
+        if row is None:
+            raise RelayLeaseConflict()
+        try:
+            payload = _decode_json_object(str(row["payload_json"]))
+            bootstrap = payload["worktree_bootstrap"]
+            if type(bootstrap) is not dict:
+                raise TypeError
+            base_commit = bootstrap["base_commit"]
+            if type(base_commit) is not str or _COMMIT.fullmatch(base_commit) is None:
+                raise TypeError
+            return base_commit
+        except (KeyError, TypeError, ValueError):
+            raise RelayStorageFailure() from None
 
     def _release_lease(
         self, cursor: sqlite3.Cursor, lease: RelayLease, *, now: str
@@ -1343,6 +1622,136 @@ class RelayStore:
             raise RelayCandidateError()
         return run, task, candidate
 
+    @staticmethod
+    def _integration_expectation(
+        run: RelayRun, task: RelayTask, candidate: sqlite3.Row
+    ) -> IntegrationExpectation:
+        review_digest = candidate["review_digest"]
+        if type(review_digest) is not str or _DIGEST.fullmatch(review_digest) is None:
+            raise RelayStateStale()
+        try:
+            evidence_hashes = tuple(
+                _decode_string_list(str(candidate["evidence_hashes_json"]))
+            )
+            write_scope = tuple(
+                IntegrationScopeEntry(path=item["path"], kind=item["kind"])
+                for item in _task_scopes(task)
+            )
+        except (KeyError, TypeError, ValueError):
+            raise RelayStorageFailure() from None
+        return IntegrationExpectation(
+            workflow_id=run.workflow_id,
+            run_id=run.run_id,
+            plan_hash=run.plan_hash,
+            workspace_id=run.workspace_id,
+            task_id=task.task_id,
+            task_version=task.task_version,
+            originating_epoch=int(candidate["originating_epoch"]),
+            sol_scope="sol:integrate",
+            candidate_id=str(candidate["candidate_id"]),
+            candidate_base_commit=str(candidate["base_commit"]),
+            candidate_head_commit=str(candidate["head_commit"]),
+            candidate_diff_hash=str(candidate["diff_hash"]),
+            candidate_evidence_hashes=evidence_hashes,
+            review_digest=review_digest,
+            predecessor_integration_head=run.integration_head,
+            predecessor_integration_version=run.integration_version,
+            write_scope=write_scope,
+        )
+
+    def _validated_proof_row(
+        self,
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        row: sqlite3.Row,
+    ) -> IntegrationProofReceipt:
+        try:
+            expectation_data = _decode_json_object(str(row["expectation_json"]))
+            receipt_data = _decode_json_object(str(row["receipt_json"]))
+            expectation = IntegrationExpectation.from_dict(expectation_data)
+            receipt = IntegrationProofReceipt.from_dict(receipt_data)
+            proof_id = str(row["proof_id"])
+            validate_integration_proof(proof_id, expectation, receipt)
+            if (
+                row["expectation_hash"] != expectation.expectation_hash
+                or receipt.expectation != expectation
+                or row["run_id"] != expectation.run_id
+                or row["workflow_id"] != expectation.workflow_id
+                or row["task_id"] != expectation.task_id
+                or row["candidate_id"] != expectation.candidate_id
+                or row["integration_version"]
+                != expectation.predecessor_integration_version + 1
+                or row["repository_id"] != receipt.repository_id
+                or row["integration_ref"] != receipt.integration_ref
+                or row["predecessor_commit"] != receipt.predecessor_commit
+                or row["final_commit"] != receipt.final_commit
+                or row["final_tree"] != receipt.final_tree
+                or row["attestor_id"] != receipt.attestor_id
+                or row["attestor_version"] != receipt.attestor_version
+                or _encode_json(expectation.to_dict()) != row["expectation_json"]
+                or _encode_json(receipt.to_dict()) != row["receipt_json"]
+            ):
+                raise ValueError("proof row binding mismatch")
+            run_row = connection.execute(
+                "SELECT * FROM relay_v3_runs WHERE run_id = ?",
+                (expectation.run_id,),
+            ).fetchone()
+            task_row = connection.execute(
+                """
+                SELECT * FROM relay_v3_tasks WHERE run_id = ? AND task_id = ?
+                """,
+                (expectation.run_id, expectation.task_id),
+            ).fetchone()
+            if run_row is None or task_row is None:
+                raise ValueError("missing proof authority row")
+            task = self._task_from_row(task_row)
+            durable_scope = tuple(
+                IntegrationScopeEntry(path=item["path"], kind=item["kind"])
+                for item in _task_scopes(task)
+            )
+            if (
+                run_row["workflow_id"] != expectation.workflow_id
+                or run_row["plan_hash"] != expectation.plan_hash
+                or run_row["workspace_id"] != expectation.workspace_id
+                or task.kind != "implementation"
+                or task.state is not RelayTaskState.INTEGRATED
+                or task.task_version != expectation.task_version + 1
+                or task.last_lease_epoch != expectation.originating_epoch
+                or task.candidate_id != expectation.candidate_id
+                or durable_scope != expectation.write_scope
+            ):
+                raise ValueError("task proof binding mismatch")
+            candidate = connection.execute(
+                "SELECT * FROM relay_v3_candidates WHERE candidate_id = ?",
+                (expectation.candidate_id,),
+            ).fetchone()
+            if (
+                candidate is None
+                or candidate["run_id"] != expectation.run_id
+                or candidate["task_id"] != expectation.task_id
+                or candidate["originating_epoch"] != expectation.originating_epoch
+                or candidate["base_commit"] != expectation.candidate_base_commit
+                or candidate["head_commit"] != expectation.candidate_head_commit
+                or candidate["diff_hash"] != expectation.candidate_diff_hash
+                or tuple(_decode_string_list(str(candidate["evidence_hashes_json"])))
+                != expectation.candidate_evidence_hashes
+                or candidate["review_digest"] != expectation.review_digest
+                or candidate["integration_commit"] != receipt.final_commit
+                or candidate["integration_tree"] != receipt.final_tree
+                or candidate["integration_proof_id"] != proof_id
+                or candidate["status"] != "integrated"
+            ):
+                raise ValueError("candidate proof binding mismatch")
+            return receipt
+        except (
+            IntegrationProofError,
+            KeyError,
+            RelayStoreError,
+            TypeError,
+            ValueError,
+            UnicodeError,
+        ):
+            raise RelayIntegrationProofCorrupt() from None
+
     def _require_evidence(
         self,
         cursor: sqlite3.Cursor,
@@ -1351,9 +1760,10 @@ class RelayStore:
         epoch: int,
         candidate: Mapping[str, object],
     ) -> None:
-        self._require_evidence_hashes(
-            cursor, run, task, epoch, list(candidate["evidence_hashes"])
-        )
+        evidence_hashes = candidate["evidence_hashes"]
+        if type(evidence_hashes) is not list:
+            raise RelayCandidateError()
+        self._require_evidence_hashes(cursor, run, task, epoch, list(evidence_hashes))
 
     def _require_evidence_hashes(
         self,
@@ -1537,8 +1947,12 @@ class RelayStore:
             (idempotency_key, payload_hash, _encode_json(result), created_at),
         )
 
-    def _run_for_workflow(self, cursor: sqlite3.Cursor, workflow_id: str) -> RelayRun:
-        row = self._run_row_for_workflow(cursor, workflow_id)
+    def _run_for_workflow(
+        self,
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        workflow_id: str,
+    ) -> RelayRun:
+        row = self._run_row_for_workflow(connection, workflow_id)
         if row is None:
             raise KeyError(workflow_id)
         return self._run_from_row(row)
@@ -1561,9 +1975,12 @@ class RelayStore:
         ).fetchone()
 
     def _task_for_run(
-        self, cursor: sqlite3.Cursor, run_id: str, task_id: str
+        self,
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        run_id: str,
+        task_id: str,
     ) -> RelayTask:
-        row = cursor.execute(
+        row = connection.execute(
             """
             SELECT * FROM relay_v3_tasks WHERE run_id = ? AND task_id = ?
             """,
@@ -1603,6 +2020,15 @@ class RelayStore:
         capacity = row["capacity"]
         if type(capacity) is not int or not 1 <= capacity <= 3:
             raise RelayStorageFailure()
+        integration_head = row["integration_head"]
+        integration_version = row["integration_version"]
+        if (
+            type(integration_head) is not str
+            or _COMMIT.fullmatch(integration_head) is None
+            or type(integration_version) is not int
+            or integration_version < 0
+        ):
+            raise RelayIntegrationProofCorrupt()
         return RelayRun(
             run_id=str(row["run_id"]),
             workflow_id=str(row["workflow_id"]),
@@ -1610,6 +2036,8 @@ class RelayStore:
             workspace_id=str(row["workspace_id"]),
             input_snapshot_id=str(row["input_snapshot_id"]),
             base_commit=str(row["base_commit"]),
+            integration_head=integration_head,
+            integration_version=integration_version,
             capacity=capacity,
             schedule_version=int(row["schedule_version"]),
             created_at=str(row["created_at"]),
@@ -1698,6 +2126,16 @@ class RelayStore:
                 if row["integration_commit"] is None
                 else str(row["integration_commit"])
             ),
+            "integration_tree": (
+                None
+                if row["integration_tree"] is None
+                else str(row["integration_tree"])
+            ),
+            "integration_proof_id": (
+                None
+                if row["integration_proof_id"] is None
+                else str(row["integration_proof_id"])
+            ),
         }
 
     @staticmethod
@@ -1709,6 +2147,34 @@ class RelayStore:
             or any(character.isspace() for character in value)
         ):
             raise RelayIdempotencyConflict()
+
+    def _assert_schema_compatible(self) -> None:
+        """Inspect existing Relay metadata before any WAL or DDL mutation."""
+
+        connection = self._require_connection()
+        try:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            metadata = "relay_v3_schema_metadata"
+            relay_tables = {name for name in tables if name.startswith("relay_v3_")}
+            if metadata not in tables:
+                if relay_tables:
+                    raise RelaySchemaIncompatible()
+                return
+            rows = connection.execute(
+                "SELECT value FROM relay_v3_schema_metadata WHERE key = ?",
+                ("schema_version",),
+            ).fetchall()
+            if len(rows) != 1 or str(rows[0]["value"]) != str(self._SCHEMA_VERSION):
+                raise RelaySchemaIncompatible()
+        except RelaySchemaIncompatible:
+            raise
+        except sqlite3.Error as error:
+            raise RelaySchemaIncompatible() from error
 
     def _create_schema(self) -> None:
         connection = self._require_connection()
@@ -1727,6 +2193,9 @@ class RelayStore:
                     workspace_id TEXT NOT NULL,
                     input_snapshot_id TEXT NOT NULL,
                     base_commit TEXT NOT NULL,
+                    integration_head TEXT NOT NULL,
+                    integration_version INTEGER NOT NULL
+                        CHECK (integration_version >= 0),
                     capacity INTEGER NOT NULL
                         CHECK (typeof(capacity) = 'integer')
                         CHECK (capacity BETWEEN 1 AND 3),
@@ -1827,27 +2296,88 @@ class RelayStore:
                     status TEXT NOT NULL,
                     review_digest TEXT,
                     integration_commit TEXT,
+                    integration_tree TEXT,
+                    integration_proof_id TEXT UNIQUE,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE (run_id, task_id),
                     FOREIGN KEY (run_id, task_id)
                         REFERENCES relay_v3_tasks(run_id, task_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS relay_v3_integration_proofs (
+                    proof_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    workflow_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL UNIQUE,
+                    integration_version INTEGER NOT NULL CHECK (integration_version >= 1),
+                    expectation_hash TEXT NOT NULL,
+                    expectation_json TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    integration_ref TEXT NOT NULL,
+                    predecessor_commit TEXT NOT NULL,
+                    final_commit TEXT NOT NULL,
+                    final_tree TEXT NOT NULL,
+                    attestor_id TEXT NOT NULL,
+                    attestor_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (run_id, integration_version),
+                    FOREIGN KEY (run_id, task_id)
+                        REFERENCES relay_v3_tasks(run_id, task_id) ON DELETE RESTRICT,
+                    FOREIGN KEY (candidate_id)
+                        REFERENCES relay_v3_candidates(candidate_id) ON DELETE RESTRICT
+                );
                 CREATE INDEX IF NOT EXISTS relay_v3_tasks_by_state
                     ON relay_v3_tasks(run_id, state, priority DESC, ordinal, task_id);
                 CREATE INDEX IF NOT EXISTS relay_v3_directives_by_state
                     ON relay_v3_directives(run_id, state, expected_schedule_version);
+                CREATE INDEX IF NOT EXISTS relay_v3_proofs_by_run
+                    ON relay_v3_integration_proofs(run_id, integration_version);
                 """
             )
             connection.execute(
                 """
-                INSERT INTO relay_v3_schema_metadata (key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                INSERT OR IGNORE INTO relay_v3_schema_metadata (key, value)
+                VALUES (?, ?)
                 """,
                 ("schema_version", str(self._SCHEMA_VERSION)),
             )
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
+
+    def _assert_schema_shape(self) -> None:
+        connection = self._require_connection()
+        required = {
+            "relay_v3_runs": {
+                "integration_head",
+                "integration_version",
+                "schedule_version",
+            },
+            "relay_v3_candidates": {
+                "integration_commit",
+                "integration_tree",
+                "integration_proof_id",
+            },
+            "relay_v3_integration_proofs": {
+                "proof_id",
+                "integration_version",
+                "expectation_json",
+                "receipt_json",
+            },
+        }
+        try:
+            for table, columns in required.items():
+                actual = {
+                    str(row["name"])
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                if not columns <= actual:
+                    raise RelaySchemaIncompatible()
+        except RelaySchemaIncompatible:
+            raise
+        except sqlite3.Error as error:
+            raise RelaySchemaIncompatible() from error
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:

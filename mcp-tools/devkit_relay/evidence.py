@@ -9,8 +9,8 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from .canonical import canonical_bytes
 
+from .canonical import canonical_bytes
 
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _ENDPOINT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")

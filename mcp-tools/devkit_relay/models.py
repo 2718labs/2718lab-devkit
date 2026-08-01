@@ -7,11 +7,11 @@ capabilities, and host-process handles are intentionally excluded.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class RelayTaskState(str, Enum):
+class RelayTaskState(StrEnum):
     """Persisted task states projected into Relay's five queues."""
 
     PREPARED = "prepared"
@@ -48,6 +48,8 @@ class RelayRun:
     workspace_id: str
     input_snapshot_id: str
     base_commit: str
+    integration_head: str
+    integration_version: int
     capacity: int
     schedule_version: int
     created_at: str
@@ -60,6 +62,8 @@ class RelayRun:
             "workspace_id": self.workspace_id,
             "input_snapshot_id": self.input_snapshot_id,
             "base_commit": self.base_commit,
+            "integration_head": self.integration_head,
+            "integration_version": self.integration_version,
             "capacity": self.capacity,
             "schedule_version": self.schedule_version,
         }

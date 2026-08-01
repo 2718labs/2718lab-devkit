@@ -7,22 +7,22 @@ from pathlib import Path
 
 import pytest
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from devkit_relay.canonical import canonical_hash
-from devkit_relay.service import RelayError, RelayService
 
 from test_relay_runtime import (
     _BASE_COMMIT,
+    ProofRegistry,
     bind_worker,
     issue_worker,
     plan,
     service,
+    synthetic_integration_receipt,
     task,
     worker_request,
 )
 
+from devkit_relay.canonical import canonical_hash
+from devkit_relay.service import RelayError, RelayService
 
 _EVIDENCE_HASH = "sha256:" + "d" * 64
 _EXTRA_EVIDENCE_HASH = "sha256:" + "9" * 64
@@ -92,7 +92,8 @@ def _recovery_request(
 def test_candidate_handoff_releases_worker_slot_and_sol_integration_unblocks_dependency(
     tmp_path: Path,
 ) -> None:
-    relay, _store = service(tmp_path)
+    registry = ProofRegistry()
+    relay, store = service(tmp_path, registry)
     created = relay.start_create(
         plan(
             task(
@@ -211,6 +212,16 @@ def test_candidate_handoff_releases_worker_slot_and_sol_integration_unblocks_dep
     )
     assert review["candidate"]["status"] == "reviewed"
 
+    expectation = store.integration_expectation(
+        "relay-runtime-v3",
+        "writer-a",
+        epoch=int(lease["epoch"]),
+        expected_task_version=int(candidate_task["task_version"]),
+        candidate_id="candidate-a",
+        proof_id="sha256:" + "0" * 64,
+    )
+    proof_id = registry.register(synthetic_integration_receipt(expectation))
+
     integrated = relay.integrate(
         {
             "workflow_id": "relay-runtime-v3",
@@ -227,8 +238,7 @@ def test_candidate_handoff_releases_worker_slot_and_sol_integration_unblocks_dep
                 endpoint="sol-main",
             ),
             "candidate_id": "candidate-a",
-            "integration_head": _BASE_COMMIT,
-            "integration_commit": "2" * 40,
+            "integration_proof_id": proof_id,
         }
     )
     assert integrated["task"]["state"] == "integrated"
