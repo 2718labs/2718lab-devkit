@@ -1,8 +1,10 @@
 # Team Shapes and Routing
 
-Sol owns architecture, decomposition, dispatch, review, integration, and final
-acceptance. Execute in parallel only when cards have disjoint write scopes;
-same-path work queues behind the active owner.
+The coordinator owns decomposition, dispatch, integration, and final
+acceptance. It may perform mechanical integration directly. Use a Sol lane only
+when its exact host-attested route justifies architecture, a hard cross-boundary
+diagnosis, or independent terminal review. Execute in parallel only when cards
+have disjoint write scopes; same-path work queues behind the active owner.
 
 ## Current host policy
 
@@ -12,7 +14,8 @@ same-path work queues behind the active owner.
   implementation, integration, refactoring, security-sensitive work, and
   difficult regressions.
 - Sol High (`gpt-5.6-sol`, `high`) is only for explicit exceptional bounded
-  execution or deep investigation. Sol still owns final acceptance.
+  execution, deep investigation, architecture, or independent terminal review.
+  Its evidence informs the coordinator; it does not transfer acceptance ownership.
 - Luna (`gpt-5.6-luna`, `low`/`medium`/`high`/`xhigh`) is eligible only when
   the current Codex host capability report attests the exact requested pair;
   otherwise the route is unavailable and no model is silently substituted. A
@@ -30,8 +33,9 @@ capability-unavailable entry has no `recommended_route` fallback and makes the
 entire dispatch matrix `NO_SAFE_WORK`, with no worker assignment or queue. This permits an exactly attested Luna pair where appropriate
 while preserving Terra and Sol safety floors without scheduler-side guessing.
 
-`ultra` is lane-0 activation, never a worker effort. Sol High remains the
-exceptional worker ceiling at `high`; prewarm is a read-only evidence role, not
+`ultra` is lane-0 activation, never a worker effort. Lane 0 is the coordinator
+lane, not a fixed model selection; a Sol route is used only when the exact
+host-attested decision requires it. Prewarm is a read-only evidence role, not
 an execution role. Route receipts bind the dispatch event and historical core
 input so later lease/capability facts cannot rewrite an already-issued task.
 The rendered assignment's `host_dispatch.model` and
@@ -42,17 +46,18 @@ if its UI says Luna) fill those arguments implicitly.
 Each assignment also carries one bounded `index_context`; the host prepares
 its input/output query at lifecycle boundaries and the worker only consumes the
 packet, with no index polling or hand-written query choreography.
-The host archives only after Sol acceptance and final evidence binding, and all
-task temporary roots stay below `D:\bun\tmp\codex\<project-or-thread>` rather
-than a C-drive temporary directory.
+The host archives only after coordinator acceptance and final evidence binding.
+Fast Lane task temporary roots stay below the current compiler-approved
+`D:\bun\tmp\codex\<project-or-thread>` root. The quota sample cache remains a
+separately user-configurable path, and C-drive temporary roots remain forbidden.
 
 No execution worker merges another task, changes a sibling scope, or accepts
-its own task. A candidate commit and evidence always return to Sol.
+its own task. A candidate commit and evidence always return to the coordinator.
 
 ## GitHub-style local flow
 
 `task card + base revision -> isolated task branch/worktree -> scoped commit +
-evidence -> Sol review -> ordered integration/rebase -> CI gate -> release gate`
+evidence -> independent review when routed -> ordered integration/rebase -> CI gate -> release gate`
 
 This is local Git discipline, not remote-push or pull-request authorization.
 The integration record names candidate/source commit, base revision, accepted
@@ -71,7 +76,7 @@ delivery. It never grants task context, write scope, integration, or acceptance.
 ## Dispatch template
 
 ```text
-Role: <Luna | Terra High | Terra Max | Sol High>
+Role: <exact host-attested model / reasoning-effort>
 Task card: <absolute path>/tasks/<id>.md
 Base revision: <commit>
 Write scope: <exact files or directories>

@@ -1,9 +1,11 @@
 ---
 name: oss-repo-ops
-description: Prepare, review, release, tag, CI-enable, or submit a 2718lab/AstrBot open-source repository. Use for README, LICENSE, CHANGELOG, GitHub Actions, releases, PRs, and AstrBot market submission.
+description: Prepare, review, release, tag, CI-enable, or submit an explicitly scoped 2718lab/AstrBot open-source repository. Use for README, LICENSE, CHANGELOG, GitHub Actions, releases, PRs, and AstrBot market submission; never load it for an unrelated project.
 ---
 
 # 开源仓库运营
+
+范围门：只处理当前 DevKit/AstrBot 仓库；不要把 release 状态、远端或 CI 结论投影到其他项目。
 
 这是发布与仓库卫生的短说明书；工程实现转给对应技能：
 

@@ -4971,7 +4971,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "--host-status <fast-lane-host-status.json>",
             "Ultra automatic activation",
             "--enable",
-            "main Sol",
+            "协调器 lane 保有设计、集成、风险决策和最终验收责任",
             'action="start"',
             'action="retain"',
             "terminal",
@@ -4984,6 +4984,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             "worker effort 禁止 `ultra`",
             "prewarm 始终是独立的只读证据角色",
             "归档不是 adapter 操作",
+            "当前 bootstrap/read-context",
+            "--quota-state-path",
             "D:\\bun\\tmp\\codex\\<project-or-thread>",
         ):
             with self.subTest(expected=expected):
@@ -5005,7 +5007,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "routing_result_hash",
             "NO_SAFE_WORK",
             "non-`ultra` effort",
-            "after lane 0 acceptance",
+            "after coordinator-lane acceptance",
             "C-drive temporary roots are forbidden",
             "target gates",
             "canonical repo anchor",
@@ -5016,6 +5018,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             "parked endpoint bootstrap",
             "inert",
             "inert dispatch descriptors",
+            "inert projection",
+            "do not call host dispatch APIs",
             "no model call",
             "agent spawn",
             "remote service",
@@ -5024,6 +5028,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             "one regression",
             "one blocker review",
             "one global remediation",
+            "bootstrap/read-context boundary",
+            "--quota-state-path",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, document)

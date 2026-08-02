@@ -1,6 +1,6 @@
 ---
 name: fast-lane-routing
-description: Execute a compiled 2718lab Fast Lane plan with explicit model/effort routing, automatic cross-session selection, and bounded index context. Use when a Fast Lane assignment, cross-session projection, or host dispatch packet is present.
+description: Consume a compiled 2718lab Fast Lane plan with explicit model/effort routing, compiler-mandated cross-session decisions, and bounded index context. Use only when a trusted Fast Lane assignment, projection, or host-dispatch packet is present.
 ---
 
 # Fast Lane Routing
@@ -10,16 +10,19 @@ a prose task list or ask the LLM to rediscover routing.
 
 ## Dispatch
 
-1. For every `action="start"`, call the host dispatch tool with the exact
-   `assignment.host_dispatch.model` and `.reasoning_effort`.
+1. For every `action="start"`, a capable host dispatches with the exact
+   `assignment.host_dispatch.model` and `.reasoning_effort`. This skill and the
+   compiler never invoke a host tool themselves; if no trusted host capability
+   is available, stop and return the inert descriptor.
 2. Reject a dispatch when `require_explicit_route` is false, the route is
    missing, or `inherit_current_session_model` is true. Never let the current
    conversation model fill either argument.
 3. Treat `cross_session_dispatch_projection.status="external_session_required"`
-   as an automatic decision: dispatch every listed assignment to an isolated
-   independent session/worktree. Do not ask the LLM to choose local versus
-   cross-session, and do not create a session when the status is
-   `not_required` or `blocked`.
+   as a compiler-mandated host instruction, not an LLM choice. Only a trusted
+   host integration may mechanically create the listed independent
+   session/worktree(s), after worktree, lease, context, and predecessor fences
+   validate. Do not create a session when the status is `not_required` or
+   `blocked`.
 4. Preserve the assignment's lease, context, route, and predecessor fences.
    A missing or mismatched fence is fail-closed; it is not a reason to retry
    with an unrelated start.

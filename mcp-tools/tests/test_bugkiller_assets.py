@@ -29,7 +29,7 @@ class BugkillerAssetTests(unittest.TestCase):
         self.assertIn("name: bugkiller", text)
         self.assertIn("\n# Bugkiller\n", text)
         self.assertLessEqual(len(text.splitlines()), 120)
-        for marker in ("Terra High", "Terra Max", "Sol High", "Luna is unavailable"):
+        for marker in ("Terra High", "Terra Max", "Sol High", "does not admit Luna"):
             self.assertIn(marker, text)
 
     def test_references_preserve_durable_handoff_and_scope_boundaries(self) -> None:

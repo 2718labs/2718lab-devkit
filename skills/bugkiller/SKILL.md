@@ -1,11 +1,15 @@
 ---
 name: bugkiller
-description: Use when triaging, implementing, validating, or integrating a bounded repository fix through the Bugkiller workflow.
+description: Use for a bounded 2718lab DevKit repository fix through the Bugkiller workflow. Require an explicit DevKit task or user request; never load it for an unrelated project.
 ---
 
 # Bugkiller
 
-Sol owns architecture, dispatch, review, integration, and final acceptance.
+范围门：仅使用本任务已绑定的 DevKit 任务卡、工作树和证据；不把它们带入其他项目。
+
+The coordinator owns dispatch, integration, and final acceptance. Use a Sol
+lane only when the exact route warrants architecture, a hard diagnosis, or an
+independent terminal review.
 Read the assigned task card and direct contracts, then follow
 [roles and routing](references/roles.md), [workflow and delivery](references/workflow.md),
 and [safety](references/safety.md).
@@ -16,10 +20,13 @@ and [safety](references/safety.md).
 2. Route moderately complex or harder execution to Terra Max:
    `gpt-5.6-terra`, `max`.
 3. Use Sol High: `gpt-5.6-sol`, `high`, only for an explicitly exceptional
-   bounded execution or deep investigation.
-4. Luna is unavailable. Never attempt a Luna spawn or rename a substitute.
-5. A worker creates scoped evidence and a candidate commit; Sol alone reviews,
-   orders integration, and accepts.
+   bounded execution, deep investigation, architecture, or terminal review.
+4. Bugkiller's separately validated profile currently does not admit Luna;
+   never rename a substitute as Luna. This restriction does not override a
+   Fast Lane route whose host capability report attests Luna for another module.
+5. A worker creates scoped evidence and a candidate commit; an independent
+   reviewer is used only when the route requires one, and the coordinator
+   orders integration and accepts.
 
 ## Non-negotiables
 

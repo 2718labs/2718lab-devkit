@@ -7,7 +7,7 @@
 
 2718lab DevKit 是一个本地、仅 stdio 传输的 MCP 服务器，提供有边界的
 项目索引、Atlas 证据、Relay 生命周期协调和确定性的 Fast Lane 规划。
-本仓库对应 v1.0.0-rc1 发布候选版；已提交的 manifest 和 allowlist 定义
+本仓库承载版本化的 v1.0.0-rc1 包；已提交的 manifest 和 allowlist 定义
 公开产物范围，下面的安装、构建和验证章节给出支持的工作流。
 
 > [!IMPORTANT]
@@ -45,9 +45,11 @@
 
 ## 整体工作流
 
-默认工作流是 Fast Lane：配置宿主，让 `workflow-design` 编译有界计划，
-再让 `fast-lane-routing` 执行显式宿主派发。最短路径是：配置宿主，选择 MCP
-或 Fast Lane 入口，只让宿主执行有界动作，
+仓库级默认工作流是 Fast Lane。`workflow-design` 负责准备有界输入，宿主再调用
+`fastlane_compile` 或 `team_efficiency.py` 编译 inert 计划。
+`fast-lane-routing` 只是宿主消费指南：skill 和编译器本身都不会启动 agent，
+也不会创建跨会话工作树。最短路径是：配置宿主，选择 MCP 或 Fast Lane 入口，
+编译有界计划，只让有能力的宿主执行带围栏的描述符，
 再用终态证据完成集成、验收和归档。
 
 ```mermaid
@@ -78,11 +80,15 @@ flowchart TD
 
 ## Codex skill 导航
 
-插件只保留一个短总览（`skills/devkit-overview`）和一个工作流设计入口
+本地插件安装态包含可选的 Codex skill bundle：一个短总览
+（`skills/devkit-overview`）和一个工作流设计入口
 （`skills/workflow-design`，默认 Fast Lane）。模块说明书彼此独立，按需加载：
 
 `fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`。
+
+Skills 是说明书，不是 MCP 工具。只有任务已被限定为 2718lab DevKit 时才加载；
+它们刻意不进入 MCP-only 主 ZIP。
 
 ## 文档导航
 
@@ -94,8 +100,8 @@ flowchart TD
 - [工作包与任务卡规则](mcp-tools/devkit_fastlane/references/work-packages.md)
 - [编排运行时契约](mcp-tools/devkit_fastlane/references/orchestration-runtime.md)
 - [团队与 lane 模式](mcp-tools/devkit_fastlane/references/team-patterns.md)
-- [Ultra Fast Lane 设计](docs/superpowers/specs/2026-07-30-ultra-fast-lane-design.md)
-- [Codex-first 工具/插件设计](docs/superpowers/specs/2026-07-31-codex-first-tool-plugin-design.md)
+- [历史设计记录](docs/superpowers/README.md)：仅供追溯，可能提及已退出的组件，
+  不是当前实现契约。
 - [发布历史](CHANGELOG.md)
 
 实现入口见
@@ -130,12 +136,15 @@ flowchart TD
     uv run --locked --no-dev python server.py
 
 标准宿主配置是 .mcp.json。它以 mcp-tools 为工作目录运行上面的锁定命令，
-只转发以下宿主 bridge selector 名称：
+转发两个宿主私有 bridge selector 名称，以及可选的项目/线程范围标识：
 
 - CODEX_DEVKIT_HOST_BRIDGE_FD
 - CODEX_DEVKIT_HOST_BRIDGE_HANDLE
+- CODEX_PROJECT_ROOT、CODEX_WORKSPACE_ROOT
+- CODEX_PROJECT_ID、CODEX_WORKSPACE_ID、CODEX_THREAD_ID
 
-这些是 selector 名称，不是应该自行编造或塞进任务消息的值。需要私有
+这些是 selector 或 identity 名称，不是应该自行编造或塞进任务消息的值。后五项
+会把持久化状态限定在单个项目或线程，避免投影到另一个工作区。需要私有
 宿主 capability broker 或 proof registry 的 Relay 生命周期变更，在宿主
 没有提供可证明能力时会失败关闭，并返回
 RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也不会
@@ -151,9 +160,8 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的公共运行面
 仍是 MCP-only；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
 `team_efficiency.py` 兼容入口、其路由与额度平衡模块，以及宿主专用官方账号
-额度采集模块。它明确不包含
-`agents/`、`commands/`、`hooks/`、Claude 配置、CI 文件、宿主私有状态、
-prompts、静态 agent 或任意仓库文件。
+额度采集模块。它明确不包含可选 skill bundle、命令辅助文件、hooks、CI 文件、
+宿主私有状态、prompts、静态 agent 或任意仓库文件。
 
 Fast Lane 应通过以下可执行入口运行：
 
@@ -174,9 +182,17 @@ Fast Lane 应通过以下可执行入口运行：
 3. 默认 Codex 数据目录：
    %USERPROFILE%\.codex\data\2718lab-devkit。
 
+当宿主提供 CODEX_PROJECT_ROOT 或 CODEX_WORKSPACE_ROOT 时，持久化根会在
+`scoped-v1` 下按该项目根的 SHA-256 身份继续分域。没有项目根时，
+CODEX_PROJECT_ID、CODEX_WORKSPACE_ID 或 CODEX_THREAD_ID 会提供非路径的
+回退范围。原始项目路径或 identity 不会写入范围目录名。这能避免长生命周期
+插件进程把一个项目的 workflow、index 或 receipt 投影到另一个项目。没有范围
+的命令行调用为了兼容性仍使用未加后缀的根；宿主集成应始终提供项目或线程范围。
+
 临时目录依次使用显式提供的 CODEX_TASK_TEMP、TMPDIR、TEMP 或 TMP；都未
-提供时，使用 data 根旁的 .2718lab-devkit-scratch。运行时会拒绝不安全、
-重叠、缺失或 reparse-point 根目录，不会把回退状态写入仓库。
+提供时，使用 data 根旁的 .2718lab-devkit-scratch。已配置的临时根也会获得
+与持久化数据相同的范围后缀。运行时会拒绝不安全、重叠、缺失或 reparse-point
+根目录，不会把回退状态写入仓库。
 
 宿主中断后，应从持久化工作流租约、端点、artifact 引用、快照和有界
 receipt 恢复。继续前先重新绑定有效的当前上下文。不得从聊天记录、原始
@@ -190,23 +206,26 @@ mcp-tools/devkit_fastlane/scripts/fastlane_routing.py 和
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
 `fastlane_compile`，只返回惰性描述符。
 
-- Ultra 会激活编译器；低于 Ultra 的 effort 需要宿主显式启用。
+- 工作流默认不等于 CLI 隐式启动：宿主必须显式提供 effort。Ultra 会激活
+  编译器；低于 Ultra 的 effort 需要宿主显式传入 `--enable`。
 - 难度、风险、范围、验证成本、阻塞严重度和可用容量共同选择路由。
   请求的模型与推理级别保持显式，并且必须有宿主证明。
 - 每个 assignment 都会渲染给 `collaboration.spawn_agent` 使用的
   `host_dispatch`；宿主必须原样传入其中的 `model` 和 `reasoning_effort`，
   不得继承当前会话模型。assignment 同时携带一个有界 `index_context`：
   宿主只在边界各查询一次，worker 消费 packet，不轮询索引，也不手写索引编排。
-- 跨会话选择由 compiler 固定：projection 的
-  `dispatch_policy.action=dispatch_all` 时，宿主机械派发所有隔离会话/工作树；
-  不再让 LLM 自己判断是否跨会话。
-- 三个物理 worker 槽位被划分为 start/retain 和诚实的 idle 记录。
-  prewarm 始终是只读证据工作。
+- 跨会话选择由 compiler 固定。只有当
+  `dispatch_policy.action=dispatch_all` projection 及其 worktree/fence 义务都
+  验证通过时，有能力的宿主集成才机械消费所有列出的 assignment；编译器和 skill
+  本身不创建会话或工作树。
+- 每个 Codex 会话有三个本地 child 槽位，划分为 start/retain 和诚实的 idle
+  记录。存在新鲜签名额度快照及经验证的全局 ledger 时，主池可在所有会话间目标化
+  6、8、10 或 12 个非 Spark agent 槽位。prewarm 始终是只读证据工作。
 - 只有验证过的终态事件才能释放并补位。commentary 更新不会触发轮询
   或投机性 refill。
-- 当仓库内宿主 profile 要求时，Sol 负责协调器设计、集成、风险决策和
-  最终验收；Terra 处理常规及复杂的有界执行；Luna 只有在精确模型/
-  effort 组合被证明时才可使用。路由不会静默替换模型。
+- 协调器始终保有派发、集成、风险决策和验收责任。只有精确宿主证明的路由要求
+  架构、困难诊断或独立终审时才使用 Sol lane；Terra 和 Luna 各自处理被精确证明
+  的路线。路由不会静默替换模型。
 - Spark 是严重阻塞的窄道。它需要可复现的关键路径阻塞、有界解耦改动、
   明确停止条件和显式 entitlement，不是日常默认路线。
 
@@ -237,7 +256,7 @@ mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
 
 ## 验证
 
-RC1 集成树已按以下命令完成验证：
+请从将要构建的 revision 运行以下发布验证：
 
     cd mcp-tools
     uv run --locked pytest -q
@@ -245,16 +264,15 @@ RC1 集成树已按以下命令完成验证：
     uv run --locked ruff check devkit_atlas/service.py devkit_runtime/atlas_acceptance.py orchestrator/service.py project_index/checkpoints.py project_index/service.py project_index/store.py
     uv run --locked python -m compileall -q devkit_atlas devkit_runtime orchestrator project_index
 
-集成树全量回归结果为 1037 passed、13 skipped、40 个 subtests passed。
-全新产物 stdio 检查还验证了精确 17 工具清单、空 prompt/resource 列表、
-协议干净的 stdout、正常和拒绝调用、缺失宿主能力时的失败关闭，以及不依赖
-源 checkout 的独立启动。
+CI 和全新产物检查才是当前测试计数的唯一来源。它们验证精确 17 工具清单、
+空 prompt/resource 列表、协议干净的 stdout、正常和拒绝调用、缺失宿主能力时的
+失败关闭，以及不依赖源 checkout 的独立启动。本 README 刻意不冻结会过期的回归计数。
 
-## 发布状态
+## 版本
 
-本仓库对应 v1.0.0-rc1 发布候选版。发布说明见
+本仓库代表版本化的 v1.0.0-rc1 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
-和锁定依赖为准。
+和锁定依赖为准。发布工作流只会在声明的 gates 通过后发布匹配的 tag。
 
 ## 许可证
 

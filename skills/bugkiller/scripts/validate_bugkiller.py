@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[3]
 SKILL = ROOT / "skills" / "bugkiller" / "SKILL.md"
 REFERENCES = ROOT / "skills" / "bugkiller" / "references"
@@ -20,8 +19,8 @@ AGENT_MARKERS = {
     "bugkiller-sol-escalation.md": ("Sol High", "gpt-5.6-sol", "exceptional"),
 }
 DEPRECATED_AGENTS = (
-    "-".join(("bugkiller", "sol", "code", "writer")) + ".md",
-    "-".join(("bugkiller", "luna", "triage")) + ".md",
+    "bugkiller-sol-code-writer.md",
+    "bugkiller-luna-triage.md",
 )
 HANDOFF_SEQUENCE = (
     "workflow_artifact_register",
@@ -116,7 +115,7 @@ def main() -> int:
             "Terra High",
             "Terra Max",
             "Sol High",
-            "Luna is unavailable",
+            "does not admit Luna",
             "workflow_artifact_register",
             "workflow_message_ack",
         ):

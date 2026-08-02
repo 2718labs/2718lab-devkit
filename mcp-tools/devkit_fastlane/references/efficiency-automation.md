@@ -281,8 +281,10 @@ assignments or queues, even if another route is otherwise valid.
 
 `ultra` activates Fast Lane and lane 0 only; it never becomes a worker route.
 Every worker route is selected per task from the host-attested core result and
-must use a non-`ultra` effort. Main Sol lane 0 owns design, integration, risk
-decisions, and final acceptance. Prewarm remains a separate read-only evidence role;
+must use a non-`ultra` effort. The coordinator lane owns design, integration,
+risk decisions, and final acceptance; a Sol lane is selected only when the
+exact host-attested route warrants architecture, difficult diagnosis, or
+independent terminal review. Prewarm remains a separate read-only evidence role;
 it is never execution or acceptance evidence.
 
 The request supplies bounded work-package, target-gate, execution-context,
@@ -317,6 +319,9 @@ projection carries `dispatch_policy.action=dispatch_all` and
 `target=independent_codex_session`, the host dispatches every listed assignment
 mechanically. `dispatch_none` creates no session and `stop` fails closed;
 `selection_authority=compiler` and `llm_choice=false` must be preserved.
+This is still an inert projection: only a trusted host integration creates an
+independent session/worktree after its worktree, lease, context, and predecessor
+fences validate. The compiler and skills do not call host dispatch APIs.
 
 `3` is the per-Codex-session child-agent limit. It is not the global main-pool
 limit, and it does not mean three sessions. A fresh, signed quota snapshot sets
@@ -415,11 +420,12 @@ Rendered plans contain redacted bounded metadata only: no absolute
 repo/worktree/temp paths, prompts, raw command output, secrets, or raw
 external receipt bodies.
 
-The adapter never archives work. The host may archive only after lane 0 acceptance
-and final evidence binding have completed. Scratch files, worktrees,
-caches, and test evidence must remain under
-`D:\bun\tmp\codex\<project-or-thread>` by default; an explicitly configured
-`--quota-state-path` may use another approved drive. C-drive temporary roots are forbidden.
+The adapter never archives work. The host may archive only after coordinator-lane acceptance and final evidence binding have completed. Fast Lane scratch files,
+worktrees, ordinary caches, and test evidence must remain under the current
+compiler-approved `D:\bun\tmp\codex\<project-or-thread>` task root. This is a
+bootstrap/read-context boundary, not a claim that every plugin cache is D-only.
+`--quota-state-path` remains user-configurable and may use another approved
+drive. C-drive temporary roots are forbidden.
 
 ## CLI
 

@@ -39,7 +39,7 @@ SQLite 是 task、dependency、lease、attempt、event、evidence hash 和 budge
 
 ## Strict index write gate
 
-Legacy registrations retain `strict_index=false`. A strict task follows this exact sequence: `project_index_sync` -> `strict_index=true` -> `project_index_query` -> `trace_id` -> `worktree_checkpoint_create` -> `project_index_sync(bind_as="output")` -> `project_index_query` -> `trace_id` -> `workflow_artifact_register(kind="verification", snapshot_id=...)` -> `workflow_complete`. The first query and trace bind the input snapshot, the checkpoint precedes writes, and the output sync/query bind the verification snapshot before completion. Only Sol may call the acceptance completion gate after review.
+Legacy registrations retain `strict_index=false`. A strict task follows this exact sequence: `project_index_sync` -> `strict_index=true` -> `project_index_query` -> `trace_id` -> `worktree_checkpoint_create` -> `project_index_sync(bind_as="output")` -> `project_index_query` -> `trace_id` -> `workflow_artifact_register(kind="verification", snapshot_id=...)` -> `workflow_complete`. The first query and trace bind the input snapshot, the checkpoint precedes writes, and the output sync/query bind the verification snapshot before completion. Only the coordinator may call the acceptance completion gate after review; an independently routed Sol review does not transfer that ownership.
 
 ## 点对点通信
 
@@ -57,7 +57,7 @@ Durable handoff order is `workflow_artifact_register -> workflow_message_send ->
 
 1. 用 content hash 去重 repository map、task card、contract、测试命令和验证输出；相同输入不重复采集。
 2. `workflow_context` 不返回 sibling task cards、完整聊天历史或不相关日志。
-3. Sol owns architecture, dispatch, review, integration, and final acceptance. Terra High handles routine bounded work; Terra Max handles complex work; Sol High is explicit exceptional escalation only. Luna (`gpt-5.6-luna` / `low`, `medium`, `high`, or `xhigh`) is eligible only when the current Codex host capability report attests the exact requested pair; absent attestation returns unavailable without substitution. A request without an effort uses the profile's `medium` default only when that exact pair is attested. Bugkiller remains a separate policy surface.
+3. The coordinator owns dispatch, integration, and final acceptance, and may perform mechanical integration directly. Terra High handles routine bounded work; Terra Max handles complex work; Sol High is an explicit architecture, hard-diagnosis, or independent-terminal-review lane only. Luna (`gpt-5.6-luna` / `low`, `medium`, `high`, or `xhigh`) is eligible only when the current Codex host capability report attests the exact requested pair; absent attestation returns unavailable without substitution. A request without an effort uses the profile's `medium` default only when that exact pair is attested. Bugkiller remains a separate policy surface.
 4. 同一 write scope 只允许一个有效租约；只读任务可以并行。
 5. 任务完成只回传结构化摘要、artifact hashes 和阻塞项；长日志保存在证据路径。
 6. 普通低风险流程不创建 reviewer。高风险先问用户，用户允许后再分派危险审查。
@@ -80,9 +80,11 @@ safety floor, dispatch context, slot epoch, and the bounded historical core
 input. A terminal or retained assignment replays that historical input instead
 of reinterpreting it using a later scheduler event or lease. `ultra` activates
 lane 0; no worker may receive `ultra`. Prewarm stays read-only. Archive is a
-host action only after lane-0 acceptance and final evidence binding. All task
-temporary roots remain below `D:\bun\tmp\codex\<project-or-thread>`; C-drive
-temporary roots are forbidden.
+host action only after coordinator-lane acceptance and final evidence binding.
+Fast Lane task temporary roots must stay below the current compiler-approved
+`D:\bun\tmp\codex\<project-or-thread>` root. This does not constrain the
+separately user-configurable quota sample cache path. C-drive temporary roots
+are forbidden.
 
 ## 恢复
 

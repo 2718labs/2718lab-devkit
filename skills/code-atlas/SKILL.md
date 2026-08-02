@@ -1,9 +1,11 @@
 ---
 name: code-atlas
-description: Use when a scoped implementation needs a deterministic local recipe lookup, host-routing decision, or evidence-backed Code Atlas handoff.
+description: Use for an explicitly scoped 2718lab DevKit implementation that needs a deterministic local recipe lookup, host-routing decision, or evidence-backed Code Atlas handoff; never load it for an unrelated project.
 ---
 
 # Code Atlas
+
+范围门：只查询当前 DevKit 项目的本地证据；不跨项目复用任务、索引、缓存或路由结果。
 
 Use Code Atlas as a local, evidence-backed planning aid. It does not call a
 model, a network service, a vector database, or an external CodeGraph.

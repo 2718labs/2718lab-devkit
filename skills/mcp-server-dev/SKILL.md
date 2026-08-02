@@ -1,9 +1,11 @@
 ---
 name: mcp-server-dev
-description: Build, review, test, package, or integrate a Python MCP server. Use for FastMCP, mcp.server.fastmcp, @mcp.tool, resources/prompts, stdio/HTTP transports, or Codex .mcp.json integration.
+description: Build, review, test, package, or integrate a Python MCP server through an explicitly scoped 2718lab DevKit task. Use for FastMCP, mcp.server.fastmcp, @mcp.tool, resources/prompts, stdio/HTTP transports, or Codex .mcp.json integration; never load it for an unrelated project.
 ---
 
 # MCP Server 开发
+
+范围门：只处理当前 DevKit 任务的 MCP 边界；不要把它的运行时、配置或证据带入其他项目。
 
 这是 MCP 的短说明书；细节按需读取：
 

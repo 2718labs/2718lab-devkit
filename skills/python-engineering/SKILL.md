@@ -1,9 +1,11 @@
 ---
 name: python-engineering
-description: Set up, modify, review, test, package, or lint a Python repository. Use for pyproject.toml, uv/uv.lock, ruff, pyright, pytest, pre-commit, layout, dependencies, and CI tooling.
+description: Set up, modify, review, test, package, or lint a Python repository through an explicitly scoped 2718lab DevKit task. Use for pyproject.toml, uv/uv.lock, ruff, pyright, pytest, pre-commit, layout, dependencies, and CI tooling; never load it for an unrelated project.
 ---
 
 # Python 工程基线
+
+范围门：只对当前 DevKit 任务应用这些工程约束；不要把项目配置、缓存或验证结果带入其他项目。
 
 这是 Python 工具链的短说明书；详细配置按需读取：
 

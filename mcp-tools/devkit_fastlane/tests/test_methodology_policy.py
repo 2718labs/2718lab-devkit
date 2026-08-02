@@ -34,7 +34,7 @@ class MethodologyPolicyTests(unittest.TestCase):
         for required in (
             "isolated task branch/worktree",
             "scoped commit + evidence",
-            "Sol review",
+            "independent review when routed",
             "ordered integration/rebase",
             "CI gate",
             "release gate",
@@ -67,10 +67,14 @@ class MethodologyPolicyTests(unittest.TestCase):
         self.assertIn("Direct chat", text)
         self.assertIn("not the source of truth", text)
 
-    def test_runtime_keeps_sol_as_acceptance_owner(self) -> None:
+    def test_runtime_keeps_coordinator_as_acceptance_owner(self) -> None:
         text = ORCHESTRATION.read_text(encoding="utf-8")
 
-        self.assertIn("Only Sol may call the acceptance completion gate", text)
+        self.assertIn(
+            "Only the coordinator may call the acceptance completion gate", text
+        )
+        self.assertIn("does not transfer that ownership", text)
+        self.assertNotIn("Only Sol may call the acceptance completion gate", text)
         self.assertIn("gpt-5.6-luna", text)
         self.assertIn("capability report", text)
         self.assertIn("Bugkiller remains a separate policy surface", text)
@@ -90,7 +94,7 @@ class MethodologyPolicyTests(unittest.TestCase):
             "recommended_route",
             "worker effort 禁止 `ultra`",
             "Prewarm remains a separate read-only evidence role",
-            "after lane 0 acceptance",
+            "after coordinator-lane acceptance",
             "C-drive temporary roots are forbidden",
             "host_dispatch",
             "inherit_current_session_model",

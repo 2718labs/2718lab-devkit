@@ -1,9 +1,12 @@
 ---
 name: astrbot-plugin-dev
-description: Build, review, debug, test, or publish an AstrBot v4 plugin or IM bot. Use for astrbot_plugin packages, Star classes, metadata.yaml, _conf_schema.json, AstrBot Web API, LLM tools, and plugin-market work.
+description: Build, review, debug, test, or publish an AstrBot v4 plugin or IM bot through 2718lab DevKit. Use only when the user explicitly requests this DevKit module or the task is scoped to its AstrBot repository; never load it for an unrelated project.
 ---
 
 # AstrBot 插件开发
+
+范围门：只处理明确属于 2718lab/AstrBot 的任务；不携带 DevKit 的任务、缓存或
+工作流状态到其他项目。
 
 把本 skill 当作 AstrBot 的短说明书。不要凭记忆拼 API；先读所需章节：
 

@@ -6,7 +6,7 @@ remains an explicit later action.
 
 ## Required flow
 
-`task card + base revision -> isolated task branch/worktree -> scoped commit + evidence -> Sol review -> ordered integration/rebase -> CI gate -> release gate`
+`task card + base revision -> isolated task branch/worktree -> scoped commit + evidence -> independent review when routed -> ordered integration/rebase -> CI gate -> release gate`
 
 Each active task has one owner and an exact write scope. Parallel execution is
 allowed only when active scopes are disjoint. A same-path or parent/child-path
@@ -15,9 +15,9 @@ path outside its card, must not merge another task, must not rebase another
 task, or claim an unreviewed candidate branch is accepted.
 
 The integration record names the candidate/source commit, base revision,
-accepted evidence hash, integration order, and Sol review. The work-package
-validator exposes `validate_parallel_integration_record` for these shape and
-scope checks.
+accepted evidence hash, integration order, and independent-review identity when
+one is required. The work-package validator exposes
+`validate_parallel_integration_record` for these shape and scope checks.
 
 ## Durable MCP handoff
 

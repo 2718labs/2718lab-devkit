@@ -97,7 +97,7 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
-`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不运行 gate、不改写 Git、不领取或完成 workflow。lane 0/main Sol 始终负责设计、集成、风险决策和最终验收。
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
 
 host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
 `routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整
@@ -121,6 +121,9 @@ host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"
 `target="independent_codex_session"` 时，host 必须机械地派发该 projection 的全部
 assignments；`dispatch_none` 不创建会话，`stop` 失败关闭。该 policy 的
 `selection_authority="compiler"`、`llm_choice=false` 固定不变。
+这仍是 inert policy descriptor：只有可信 host integration 在 worktree、lease、
+context 与 predecessor fence 全部验证后才能机械创建独立会话/工作树；compiler 和
+skill 不直接调用 host dispatch 工具。
 
 每个 assignment 还必须消费 `host_dispatch`。其中的 `model` 和
 `reasoning_effort` 是本次调用的显式参数，`inherit_current_session_model=false`、
@@ -159,10 +162,11 @@ python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --h
 
 若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。独立会话必须在获准任务根下创建并绑定自己的隔离 Git worktree；不得把协调器的脏集成工作树当作 worker 工作区，缺失或无法验证 worktree 时 fail-closed。
 
-归档不是 adapter 操作：只能在 lane 0 已完成 acceptance、最终证据已绑定之后由 host 执行。
-默认 scratch、worktree、cache、测试证据都位于
-`D:\bun\tmp\codex\<project-or-thread>`；用户显式配置的 quota sample cache
-可使用其他获准盘符。禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。
+归档不是 adapter 操作：只能在协调器 lane 已完成 acceptance、最终证据已绑定之后由 host 执行。
+Fast Lane 的 scratch、worktree、普通 cache 和测试证据目前必须位于编译器批准的
+`D:\bun\tmp\codex\<project-or-thread>` 任务根；这是当前 bootstrap/read-context
+边界，不应误写成已经支持任意盘符。额度样本缓存 `--quota-state-path` 是独立的
+用户配置项，可使用获准的其他盘符。禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。
 
 ### 6. 验证与交付
 
