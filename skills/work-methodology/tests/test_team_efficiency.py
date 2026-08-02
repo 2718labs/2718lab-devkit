@@ -6276,6 +6276,59 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual("usage_unknown", result["refill_plan"]["quota_balance"]["status"])
         self.assertFalse(any(item["action"] == "start" for item in result["assignments"]))
 
+    def test_fast_lane_live_quota_source_failure_is_fail_closed(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        host_status = self.fast_lane_host_status(helper, request)
+        request_path = self.temp / "fast-lane-live-request.json"
+        host_status_path = self.temp / "fast-lane-live-host-status.json"
+        quota_path = self.temp / "fast-lane-live-quota.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        host_status_path.write_text(json.dumps(host_status), encoding="utf-8")
+        quota_path.write_text(
+            json.dumps(
+                {
+                    "snapshot": {
+                        "capacity": {
+                            "ledger_epoch": 1,
+                            "global_main_active": 0,
+                            "global_spark_active": 0,
+                            "host_main_active": 0,
+                            "host_spark_active": 0,
+                            "host_main_cap": 3,
+                            "host_spark_cap": 1,
+                            "active_lease_set_hash": "sha256:" + "a" * 64,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--host-status",
+                str(host_status_path),
+                "--quota-input",
+                str(quota_path),
+                "--live-quota",
+                "--codex-executable",
+                str(self.temp / "missing-codex"),
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("quota source unavailable", errors)
+        result = json.loads(output)
+        self.assertEqual("usage_unknown", result["refill_plan"]["quota_balance"]["status"])
+        self.assertFalse(any(item["action"] == "start" for item in result["assignments"]))
+
 
 if __name__ == "__main__":
     unittest.main()

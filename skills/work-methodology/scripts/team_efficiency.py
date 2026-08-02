@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -6915,6 +6916,29 @@ def _fast_lane_quota_module() -> Any:
     return module
 
 
+def _codex_account_quota_module() -> Any:
+    script = Path(__file__).with_name("codex_account_quota.py")
+    spec = importlib.util.spec_from_file_location("codex_account_quota", script)
+    if spec is None or spec.loader is None:
+        raise ValueError("Codex account quota provider is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["codex_account_quota"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _utc_now_z() -> str:
+    return (
+        datetime.now(UTC)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _unavailable_quota_key(_key_id: str) -> bytes | None:
+    return None
+
+
 def _fast_lane_quota_unknown() -> dict[str, Any]:
     decision = {
         "schema": "2718lab-devkit/fastlane-quota-balance-result-v1",
@@ -7157,6 +7181,14 @@ def _parser() -> argparse.ArgumentParser:
     fast_lane.add_argument("--host-status")
     fast_lane.add_argument("--quota-input")
     fast_lane.add_argument("--quota-evaluation-time")
+    fast_lane.add_argument(
+        "--live-quota",
+        action="store_true",
+        help="read the official local Codex app-server quota source",
+    )
+    fast_lane.add_argument("--codex-executable")
+    fast_lane.add_argument("--quota-state-path")
+    fast_lane.add_argument("--quota-timeout", type=float, default=8.0)
     fast_lane.add_argument("--reasoning-effort", action="append", default=[])
     fast_lane.add_argument("--enable", action="store_true")
 
@@ -7209,7 +7241,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if args.quota_input is None and args.quota_evaluation_time is not None:
                 raise ValueError("quota evaluation time requires quota input")
-            if args.quota_input is not None and args.quota_evaluation_time is None:
+            if (
+                args.quota_input is not None
+                and args.quota_evaluation_time is None
+                and not args.live_quota
+            ):
                 raise ValueError("quota input requires an evaluation time")
             quota_request = (
                 None
@@ -7222,18 +7258,55 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "quota request",
                 )
             )
+            quota_resolver = None
+            quota_evaluation_time = args.quota_evaluation_time
+            if args.live_quota:
+                if quota_request is None:
+                    raise ValueError("live quota requires quota input")
+                quota_module = _codex_account_quota_module()
+                try:
+                    base_snapshot = _mapping(
+                        quota_request.get("snapshot"), "quota request snapshot"
+                    )
+                    capacity = _mapping(
+                        base_snapshot.get("capacity"), "quota request capacity"
+                    )
+                    provider = quota_module.CodexQuotaProvider(
+                        executable=args.codex_executable,
+                        timeout_seconds=args.quota_timeout,
+                        state_path=(
+                            None
+                            if args.quota_state_path is None
+                            else Path(args.quota_state_path)
+                        ),
+                    )
+                    evidence = provider.read(capacity=capacity)
+                    quota_request = quota_module.attach_snapshot(
+                        quota_request, evidence
+                    )
+                    quota_resolver = evidence.key_resolver
+                    if quota_evaluation_time is None:
+                        quota_evaluation_time = str(
+                            evidence.snapshot["observed_at_utc_z"]
+                        )
+                except quota_module.CodexQuotaError:
+                    # A live source failure is a safe scheduler result, not a
+                    # reason to invent a percentage or start new work.
+                    print(
+                        "quota source unavailable; using usage_unknown",
+                        file=sys.stderr,
+                    )
+                    quota_resolver = _unavailable_quota_key
+                    if quota_evaluation_time is None:
+                        quota_evaluation_time = _utc_now_z()
             result = compile_fast_lane(
                 _mapping(request, "fast-lane request"),
                 reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),
                 enable=args.enable,
                 host_status=host_status,
                 quota_request=quota_request,
-                quota_trusted_key_resolver=(
-                    None
-                    if quota_request is None
-                    else (lambda _key_id: None)
-                ),
-                quota_evaluation_time_utc_z=args.quota_evaluation_time,
+                quota_trusted_key_resolver=quota_resolver,
+                quota_evaluation_time_utc_z=quota_evaluation_time,
             )
             _print_json(result)
         else:
