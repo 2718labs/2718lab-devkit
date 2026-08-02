@@ -4,6 +4,7 @@ import ast
 import contextlib
 import copy
 import hashlib
+import hmac
 import importlib.util
 import io
 import json
@@ -2720,6 +2721,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "refill_plan",
             "terminal_protocol",
             "workflow_policy",
+            "cross_session_dispatch_projection",
             "plan_hash",
         }
         needs_design_request = self.fast_lane_contexts_empty_request(helper)
@@ -6346,6 +6348,419 @@ class TeamEfficiencyTests(unittest.TestCase):
         result = json.loads(output)
         self.assertEqual("usage_unknown", result["refill_plan"]["quota_balance"]["status"])
         self.assertFalse(any(item["action"] == "start" for item in result["assignments"]))
+
+    def fast_lane_signed_quota_request(
+        self,
+        helper,
+        assignments: list[dict[str, object]],
+        *,
+        main_used: int = 950_000,
+        global_main_active: int = 0,
+        host_main_active: int = 0,
+        global_spark_active: int = 1,
+        valid_until_utc_z: str = "2026-08-01T15:10:30Z",
+    ) -> tuple[dict[str, object], object, set[str], set[str]]:
+        quota = helper._fast_lane_quota_module()
+        key = b"team-efficiency-cross-session-quota-key"
+        key_id = helper._sha256_json({"kind": "quota-key"})
+        source_id = helper._sha256_json({"kind": "quota-source"})
+        period_id = helper._sha256_json({"kind": "quota-period"})
+        lease_set = helper._sha256_json({"kind": "quota-lease-set"})
+        capacity = {
+            "ledger_epoch": 9,
+            "global_main_active": global_main_active,
+            "global_spark_active": global_spark_active,
+            "host_main_active": host_main_active,
+            "host_spark_active": 0,
+            "host_main_cap": 3,
+            "host_spark_cap": 1,
+            "active_lease_set_hash": lease_set,
+        }
+        snapshot_unsigned = {
+            "schema": "2718lab-devkit/host-quota-snapshot-v1",
+            "source": {
+                "kind": "codex_host_usage_snapshot",
+                "source_id_hash": source_id,
+                "key_id": key_id,
+            },
+            "snapshot_seq": 1,
+            "observed_at_utc_z": "2026-08-01T15:09:00Z",
+            "valid_until_utc_z": valid_until_utc_z,
+            "sample_window_seconds": 300,
+            "main": {
+                "period_id_hash": period_id,
+                "used_ppm": main_used,
+                "delta_ppm_300s": 0,
+            },
+            "spark": {
+                "period_id_hash": period_id,
+                "used_ppm": 100_000,
+                "delta_ppm_300s": 0,
+            },
+            "capacity": capacity,
+        }
+        snapshot_hash = quota._hash(snapshot_unsigned)
+        signed_snapshot = {**snapshot_unsigned, "snapshot_hash": snapshot_hash}
+        snapshot = {
+            **signed_snapshot,
+            "signature": {
+                "algorithm": "hmac-sha256",
+                "value": hmac.new(
+                    key,
+                    quota._canonical_json(signed_snapshot).encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest(),
+            },
+        }
+        candidates: list[dict[str, object]] = []
+        for index, assignment in enumerate(assignments):
+            candidate = {
+                "candidate_id": helper._sha256_json({"candidate": index}),
+                "workflow_key": helper._sha256_json({"workflow": index}),
+                "task_key": helper._sha256_json({"task": assignment["task_id"]}),
+                "pool": "main",
+                "scheduler_role": assignment["role"],
+                "route_lock": {
+                    "result_hash": assignment["routing_result_hash"],
+                    "task_fingerprint": assignment["task_fingerprint"],
+                    "lane": "terra",
+                    "model": assignment["model"],
+                    "effort": assignment["reasoning_effort"],
+                    "safety_floor_rank": assignment["routing_safety_floor_rank"],
+                },
+                "task_lease_epoch": assignment["assignment_epoch"],
+                "assignment_epoch": assignment["assignment_epoch"],
+                "assignment_token": assignment["assignment_token"],
+                "host_id_hash": helper._sha256_json({"host": "local"}),
+                "local_slot_id": assignment["slot_id"],
+                "write_scope_hash": assignment["write_scope_hash"],
+                "input_snapshot_id": assignment["workspace_input_snapshot_id"],
+                "spark_binding": None,
+            }
+            candidates.append(candidate)
+        request = {
+            "schema": "2718lab-devkit/fastlane-quota-balance-request-v1",
+            "policy_hash": quota._hash(quota._policy()),
+            "snapshot": snapshot,
+            "candidates": candidates,
+            "receipts": [],
+            "prior_audit_hash": None,
+        }
+        request["request_hash"] = quota._normalized_request_hash(request)
+        route_hashes = {
+            str(candidate["route_lock"]["result_hash"])
+            for candidate in candidates
+        }
+        lease_bindings = {
+            quota._candidate_binding_hash(candidate) for candidate in candidates
+        }
+        def resolver(value: str) -> bytes | None:
+            return key if value == key_id else None
+
+        provisional = quota.compile_quota_balance(
+            request,
+            trusted_key_resolver=resolver,
+            evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            verified_route_result_hashes=route_hashes,
+            verified_lease_scope_bindings=lease_bindings,
+        )
+        receipts: list[dict[str, object]] = []
+        for index, candidate in enumerate(candidates):
+            receipt_unsigned = {
+                "schema": "2718lab-devkit/global-admission-receipt-v1",
+                "admission_id": helper._sha256_json({"admission": index}),
+                "candidate_id": candidate["candidate_id"],
+                "decision_hash": provisional["decision_hash"],
+                "pool": "main",
+                "ledger_epoch_before": capacity["ledger_epoch"],
+                "ledger_epoch_after": capacity["ledger_epoch"] + 1,
+                "active_lease_set_hash_before": lease_set,
+                "active_lease_set_hash_after": helper._sha256_json(
+                    {"lease-set-after": index}
+                ),
+                "route_result_hash": candidate["route_lock"]["result_hash"],
+                "task_lease_epoch": candidate["task_lease_epoch"],
+                "assignment_epoch": candidate["assignment_epoch"],
+                "assignment_token": candidate["assignment_token"],
+                "host_id_hash": candidate["host_id_hash"],
+                "local_slot_id": candidate["local_slot_id"],
+                "write_scope_hash": candidate["write_scope_hash"],
+                "input_snapshot_id": candidate["input_snapshot_id"],
+                "issued_at_utc_z": "2026-08-01T15:09:00Z",
+                "expires_at_utc_z": "2026-08-01T15:10:30Z",
+                "prior_receipt_hash": None,
+            }
+            receipt_hash = quota._hash(receipt_unsigned)
+            signed_receipt = {**receipt_unsigned, "receipt_hash": receipt_hash}
+            receipts.append(
+                {
+                    **signed_receipt,
+                    "signature": {
+                        "algorithm": "hmac-sha256",
+                        "key_id": key_id,
+                        "value": hmac.new(
+                            key,
+                            quota._canonical_json(signed_receipt).encode("utf-8"),
+                            hashlib.sha256,
+                        ).hexdigest(),
+                    },
+                }
+            )
+        request["receipts"] = receipts
+        request["request_hash"] = quota._normalized_request_hash(request)
+        return request, resolver, route_hashes, lease_bindings
+
+    def test_fast_lane_projects_deterministic_fenced_external_sessions(self) -> None:
+        helper = load_efficiency()
+        work_package = self.decomposition_manifest()
+        work_package["capacity"] = 6
+        work_package["artifacts"] = [
+            {
+                "task_id": f"FAST-LANE-CROSS-{index}",
+                "goal": f"Implement cross-session unit {index}",
+                "output_boundary": f"cross-session unit {index}",
+                "write_scope": [f"src/fast_lane/cross_{index}.py"],
+                "depends_on": [],
+                "required_evidence": [f"cross-proof-{index}"],
+                "complexity": "moderate",
+                "execution_contracts": ["contracts/fast-lane"],
+            }
+            for index in range(1, 7)
+        ]
+        request = self.fast_lane_request(helper, work_package=work_package)
+        host_status = self.fast_lane_host_status(helper, request)
+        local = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+        )
+        local_starts = [
+            item for item in local["assignments"] if item["action"] == "start"
+        ]
+        self.assertEqual(3, len(local_starts))
+        quota_request, resolver, route_hashes, lease_bindings = (
+            self.fast_lane_signed_quota_request(helper, local_starts)
+        )
+
+        result = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+            quota_request=quota_request,
+            quota_trusted_key_resolver=resolver,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=route_hashes,
+            quota_verified_lease_scope_bindings=lease_bindings,
+        )
+        repeated = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+            quota_request=quota_request,
+            quota_trusted_key_resolver=resolver,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=route_hashes,
+            quota_verified_lease_scope_bindings=lease_bindings,
+        )
+
+        projection = result["cross_session_dispatch_projection"]
+        self.assertEqual(projection, repeated["cross_session_dispatch_projection"])
+        self.assertEqual("external_session_required", projection["status"])
+        self.assertEqual(3, projection["local_capacity"])
+        self.assertEqual(0, projection["local_active_count"])
+        self.assertEqual(6, projection["global_main_target"])
+        self.assertEqual(6, projection["global_main_free"])
+        self.assertEqual(3, projection["external_session_count"])
+        self.assertEqual(
+            projection["external_assignment_ids"],
+            [item["assignment_id"] for item in projection["assignments"]],
+        )
+        for assignment in projection["assignments"]:
+            self.assertEqual("external_session_required", assignment["action"])
+            self.assertEqual("not_created", assignment["session_state"])
+            self.assertEqual(
+                assignment["context_hash"],
+                assignment["lease_fencing_predecessor"]["context_hash"],
+            )
+            self.assertTrue(
+                assignment["lease_fencing_predecessor"]["predecessor_hash"].startswith(
+                    "sha256:"
+                )
+            )
+            self.assertNotIn("host_target", assignment)
+
+    def test_fast_lane_cross_session_projection_never_bypasses_local_or_host_fences(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+
+        def request_with_units(count: int) -> dict[str, object]:
+            work_package = self.decomposition_manifest()
+            work_package["capacity"] = min(16, count)
+            work_package["artifacts"] = [
+                {
+                    "task_id": f"FAST-LANE-EXTERNAL-{index}",
+                    "goal": f"External capacity unit {index}",
+                    "output_boundary": f"external capacity unit {index}",
+                    "write_scope": [f"src/fast_lane/external_{index}.py"],
+                    "depends_on": [],
+                    "required_evidence": [f"external-proof-{index}"],
+                    "complexity": "moderate",
+                    "execution_contracts": ["contracts/fast-lane"],
+                }
+                for index in range(1, count + 1)
+            ]
+            return self.fast_lane_request(helper, work_package=work_package)
+
+        under_capacity_request = request_with_units(2)
+        under_capacity_host = self.fast_lane_host_status(
+            helper, under_capacity_request
+        )
+        under_capacity_local = helper.compile_fast_lane(
+            under_capacity_request,
+            reasoning_effort="ultra",
+            host_status=under_capacity_host,
+        )
+        under_capacity_starts = [
+            item
+            for item in under_capacity_local["assignments"]
+            if item["action"] == "start"
+        ]
+        under_quota, under_resolver, under_routes, under_bindings = (
+            self.fast_lane_signed_quota_request(helper, under_capacity_starts)
+        )
+        under_capacity = helper.compile_fast_lane(
+            under_capacity_request,
+            reasoning_effort="ultra",
+            host_status=under_capacity_host,
+            quota_request=under_quota,
+            quota_trusted_key_resolver=under_resolver,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=under_routes,
+            quota_verified_lease_scope_bindings=under_bindings,
+        )["cross_session_dispatch_projection"]
+        self.assertEqual("not_required", under_capacity["status"])
+        self.assertEqual(0, under_capacity["external_session_count"])
+        self.assertIn("local_capacity_available", under_capacity["reason_codes"])
+
+        request = request_with_units(6)
+        host_status = self.fast_lane_host_status(helper, request)
+        local = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+        )
+        local_starts = [
+            item for item in local["assignments"] if item["action"] == "start"
+        ]
+        quota_request, resolver, route_hashes, lease_bindings = (
+            self.fast_lane_signed_quota_request(helper, local_starts)
+        )
+        unavailable = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+            quota_request=quota_request,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=route_hashes,
+            quota_verified_lease_scope_bindings=lease_bindings,
+        )["cross_session_dispatch_projection"]
+        self.assertEqual("blocked", unavailable["status"])
+        self.assertEqual(0, unavailable["external_session_count"])
+        self.assertIn("quota_usage_unknown", unavailable["reason_codes"])
+
+        stale_quota, stale_resolver, stale_routes, stale_bindings = (
+            self.fast_lane_signed_quota_request(
+                helper,
+                local_starts,
+                valid_until_utc_z="2026-08-01T15:09:30Z",
+            )
+        )
+        stale = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+            quota_request=stale_quota,
+            quota_trusted_key_resolver=stale_resolver,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=stale_routes,
+            quota_verified_lease_scope_bindings=stale_bindings,
+        )["cross_session_dispatch_projection"]
+        self.assertEqual("blocked", stale["status"])
+        self.assertEqual(0, stale["external_session_count"])
+        self.assertIn("quota_snapshot_stale", stale["reason_codes"])
+
+        fenced_quota, fenced_resolver, fenced_routes, fenced_bindings = (
+            self.fast_lane_signed_quota_request(
+                helper,
+                local_starts[:2],
+                host_main_active=1,
+                global_main_active=1,
+            )
+        )
+        fenced = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+            quota_request=fenced_quota,
+            quota_trusted_key_resolver=fenced_resolver,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=fenced_routes,
+            quota_verified_lease_scope_bindings=fenced_bindings,
+        )["cross_session_dispatch_projection"]
+        self.assertEqual("blocked", fenced["status"])
+        self.assertEqual(0, fenced["external_session_count"])
+        self.assertIn("quota_host_status_fenced", fenced["reason_codes"])
+
+        foreign_host = copy.deepcopy(host_status)
+        foreign_host["routing_context"]["routes"].pop()
+        foreign = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=foreign_host,
+            quota_request=quota_request,
+            quota_trusted_key_resolver=resolver,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=route_hashes,
+            quota_verified_lease_scope_bindings=lease_bindings,
+        )["cross_session_dispatch_projection"]
+        self.assertEqual("blocked", foreign["status"])
+        self.assertEqual(0, foreign["external_session_count"])
+        self.assertIn("no_safe_work", foreign["reason_codes"])
+
+        over_bound_request = request_with_units(13)
+        over_bound_host = self.fast_lane_host_status(helper, over_bound_request)
+        over_bound_local = helper.compile_fast_lane(
+            over_bound_request,
+            reasoning_effort="ultra",
+            host_status=over_bound_host,
+        )
+        over_bound_starts = [
+            item
+            for item in over_bound_local["assignments"]
+            if item["action"] == "start"
+        ]
+        (
+            over_bound_quota,
+            over_bound_resolver,
+            over_bound_routes,
+            over_bound_bindings,
+        ) = (
+            self.fast_lane_signed_quota_request(helper, over_bound_starts)
+        )
+        over_bound = helper.compile_fast_lane(
+            over_bound_request,
+            reasoning_effort="ultra",
+            host_status=over_bound_host,
+            quota_request=over_bound_quota,
+            quota_trusted_key_resolver=over_bound_resolver,
+            quota_evaluation_time_utc_z="2026-08-01T15:10:00Z",
+            quota_verified_route_result_hashes=over_bound_routes,
+            quota_verified_lease_scope_bindings=over_bound_bindings,
+        )["cross_session_dispatch_projection"]
+        self.assertEqual("blocked", over_bound["status"])
+        self.assertEqual(0, over_bound["external_session_count"])
+        self.assertIn("external_assignment_limit_exceeded", over_bound["reason_codes"])
 
 
 if __name__ == "__main__":

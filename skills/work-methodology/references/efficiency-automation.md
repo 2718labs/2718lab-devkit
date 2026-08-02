@@ -287,12 +287,39 @@ it is never execution or acceptance evidence.
 
 The request supplies bounded work-package, target-gate, execution-context,
 read-context, remediation, and scheduler-state data. The plan binds a source
-plan hash, partitions exactly three subagent slots into start/retain
+plan hash, partitions exactly three **local child slots** into start/retain
 assignments and honest idle slots, and carries canonical dispatch
 receipts/tokens. The host spawns only `action="start"`; it never respawns a
 retained assignment and refills a free slot only after a terminal event. Neither
 the compiler nor the host polls commentary updates or refills from commentary
 (`no commentary polling`).
+
+### Cross-session capacity projection
+
+`3` is a per-Codex-session limit: one coordinator plus at most three local
+children. It is not the global main-pool limit. A fresh, signed quota snapshot
+sets the global main-pool target to exactly `6`, `8`, `10`, or `12`; Spark is a
+separate pool and is never counted in, or used to enlarge, that main-pool
+total. The compiler derives global free capacity only from the verified main
+snapshot and global ledger evidence, never from a caller-supplied capacity
+number.
+
+When all three local child slots are fully occupied or admitted and verified
+main-pool capacity remains, the plan may contain an inert
+`external_session_required` projection. It is an assignment/lease **plan**, not
+an external host action: it creates no session, worker, target, process, or
+workflow transition. Each deterministic external assignment carries the exact
+task route/context plus a predecessor fence binding the source plan, quota
+snapshot and decision hashes, ledger epoch, active-lease-set hash, and its
+assignment identity. The independent-session owner must revalidate that fence
+and acquire its own atomic workflow/ledger claim before any execution.
+
+If a local child slot is unfilled, the projection is `not_required`; it cannot
+invent an external assignment. Unknown, stale, untrusted, receipt-invalid,
+foreign-host, mismatched, or exhausted evidence blocks the projection with no
+assignments. The projection is bounded to nine external requirements
+(`12 - 3`); a larger queue is blocked rather than truncated. External plans
+cannot route `ultra` or Spark work.
 
 Where the declared lifecycle orders `host_spawn_exact_route` before
 `workflow_claim_with_host_target`, that spawn is a `parked endpoint bootstrap`,

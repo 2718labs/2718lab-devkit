@@ -34,6 +34,7 @@ MAX_GATE_TIMEOUT_SECONDS = 3600
 MAX_FAST_LANE_ROUTE_REQUEST_BYTES = 32 * 1024
 MAX_FAST_LANE_HOST_STATUS_BYTES = 3 * 1024 * 1024
 FAST_LANE_SLOT_IDS = ("slot-1", "slot-2", "slot-3")
+MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS = 9
 FAST_LANE_REASONING_EFFORTS = frozenset(
     {"low", "medium", "high", "xhigh", "max", "ultra"}
 )
@@ -442,7 +443,65 @@ _FAST_LANE_PLAN_FIELDS = frozenset(
         "refill_plan",
         "terminal_protocol",
         "workflow_policy",
+        "cross_session_dispatch_projection",
         "plan_hash",
+    }
+)
+_FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "source_plan_hash",
+        "workflow_id_hash",
+        "local_capacity",
+        "local_active_count",
+        "local_free",
+        "global_main_target",
+        "global_main_active",
+        "global_main_free",
+        "global_main_free_after_local_starts",
+        "quota_evidence_hash",
+        "quota_snapshot_hash",
+        "quota_decision_hash",
+        "external_session_count",
+        "external_assignment_ids",
+        "assignments",
+        "reason_codes",
+        "projection_hash",
+    }
+)
+_FAST_LANE_EXTERNAL_ASSIGNMENT_FIELDS = frozenset(
+    {
+        "schema",
+        "assignment_id",
+        "action",
+        "session_state",
+        "pool",
+        "task_id",
+        "role",
+        "model",
+        "reasoning_effort",
+        "route",
+        "context_hash",
+        "lease_fencing_predecessor",
+        "reason",
+    }
+)
+_FAST_LANE_EXTERNAL_LEASE_PREDECESSOR_FIELDS = frozenset(
+    {
+        "schema",
+        "predecessor_hash",
+        "source_plan_hash",
+        "workflow_id_hash",
+        "task_id",
+        "role",
+        "context_hash",
+        "routing_result_hash",
+        "quota_evidence_hash",
+        "quota_snapshot_hash",
+        "quota_decision_hash",
+        "ledger_epoch",
+        "active_lease_set_hash",
     }
 )
 _FAST_LANE_PHASES = frozenset(
@@ -6755,6 +6814,15 @@ def _render_fast_lane_status(
         "refill_plan": _fast_lane_refill_plan(),
         "terminal_protocol": _fast_lane_terminal_protocol(source_plan),
         "workflow_policy": _fast_lane_workflow_policy(),
+        "cross_session_dispatch_projection": _fast_lane_cross_session_projection(
+            {"source_plan_hash": validated["source_plan_hash"]},
+            reference_result={},
+            host_status=None,
+            occupancy=None,
+            quota_evidence=_fast_lane_main_capacity_evidence_unknown(
+                "quota_usage_unknown"
+            ),
+        ),
     }
     result["plan_hash"] = _sha256_json(result)
     _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
@@ -7064,6 +7132,403 @@ def _apply_fast_lane_quota_balance(
     return updated
 
 
+def _fast_lane_main_capacity_evidence_unknown(reason: str) -> dict[str, Any]:
+    evidence = {
+        "schema": "2718lab-devkit/fastlane-main-capacity-evidence-v1",
+        "status": "blocked",
+        "snapshot_hash": None,
+        "decision_hash": None,
+        "ledger_epoch": None,
+        "global_main_target": None,
+        "global_main_active": None,
+        "global_main_free": None,
+        "host_main_active": None,
+        "active_lease_set_hash": None,
+        "reason_codes": [reason],
+    }
+    return {**evidence, "evidence_hash": _sha256_json(evidence)}
+
+
+def _validated_fast_lane_main_capacity_evidence(value: object) -> dict[str, Any]:
+    evidence = _mapping(value, "main capacity evidence")
+    expected = frozenset(
+        {
+            "schema",
+            "status",
+            "snapshot_hash",
+            "decision_hash",
+            "ledger_epoch",
+            "global_main_target",
+            "global_main_active",
+            "global_main_free",
+            "host_main_active",
+            "active_lease_set_hash",
+            "reason_codes",
+            "evidence_hash",
+        }
+    )
+    _exact_keys(evidence, expected, "main capacity evidence")
+    if evidence["schema"] != "2718lab-devkit/fastlane-main-capacity-evidence-v1":
+        raise ValueError("main capacity evidence schema is invalid")
+    status = _text(evidence["status"], "main capacity evidence.status", maximum=32)
+    if status not in {"resolved", "blocked"}:
+        raise ValueError("main capacity evidence status is invalid")
+    reasons = _fast_lane_reason_codes(evidence["reason_codes"])
+    if reasons is None:
+        raise ValueError("main capacity evidence reasons are invalid")
+
+    def optional_hash(field: str) -> str | None:
+        item = evidence[field]
+        return None if item is None else _hash(item, f"main capacity evidence.{field}")
+
+    def optional_int(field: str, maximum: int) -> int | None:
+        item = evidence[field]
+        if item is None:
+            return None
+        if type(item) is not int or not 0 <= item <= maximum:
+            raise ValueError(f"main capacity evidence.{field} is invalid")
+        return item
+
+    normalized = {
+        "schema": evidence["schema"],
+        "status": status,
+        "snapshot_hash": optional_hash("snapshot_hash"),
+        "decision_hash": optional_hash("decision_hash"),
+        "ledger_epoch": optional_int("ledger_epoch", 2**63 - 1),
+        "global_main_target": optional_int("global_main_target", 12),
+        "global_main_active": optional_int("global_main_active", 12),
+        "global_main_free": optional_int("global_main_free", 12),
+        "host_main_active": optional_int("host_main_active", 8),
+        "active_lease_set_hash": optional_hash("active_lease_set_hash"),
+        "reason_codes": reasons,
+    }
+    if normalized["status"] == "resolved":
+        if (
+            normalized["global_main_target"] not in {6, 8, 10, 12}
+            or normalized["global_main_active"] is None
+            or normalized["host_main_active"] is None
+            or normalized["ledger_epoch"] is None
+            or normalized["snapshot_hash"] is None
+            or normalized["decision_hash"] is None
+            or normalized["active_lease_set_hash"] is None
+        ):
+            raise ValueError("resolved main capacity evidence is incomplete")
+        expected_free = max(
+            0,
+            normalized["global_main_target"] - normalized["global_main_active"],
+        )
+        if normalized["global_main_free"] != expected_free:
+            raise ValueError("main capacity evidence free count is invalid")
+    supplied_hash = _hash(
+        evidence["evidence_hash"], "main capacity evidence.evidence_hash"
+    )
+    if supplied_hash != _sha256_json(normalized):
+        raise ValueError("main capacity evidence hash is invalid")
+    return {**normalized, "evidence_hash": supplied_hash}
+
+
+def _fast_lane_main_capacity_evidence(
+    quota_request: Mapping[str, Any] | None,
+    *,
+    trusted_key_resolver: Callable[[str], bytes | None] | None,
+    evaluation_time_utc_z: str | None,
+    verified_route_result_hashes: Iterable[str],
+    verified_lease_scope_bindings: Iterable[str],
+) -> dict[str, Any]:
+    if quota_request is None:
+        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
+    if trusted_key_resolver is None or not callable(trusted_key_resolver):
+        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
+    if not isinstance(evaluation_time_utc_z, str):
+        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
+    try:
+        module = _fast_lane_quota_module()
+        evidence = module.compile_main_capacity_evidence(
+            quota_request,
+            trusted_key_resolver=trusted_key_resolver,
+            evaluation_time_utc_z=evaluation_time_utc_z,
+            verified_route_result_hashes=verified_route_result_hashes,
+            verified_lease_scope_bindings=verified_lease_scope_bindings,
+        )
+        return _validated_fast_lane_main_capacity_evidence(evidence)
+    except (OSError, TypeError, ValueError):
+        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
+
+
+def _fast_lane_cross_session_projection(
+    result: Mapping[str, Any],
+    *,
+    reference_result: Mapping[str, Any],
+    host_status: Mapping[str, Any] | None,
+    occupancy: Mapping[str, Any] | None,
+    quota_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compile inert external-session requirements from already-bound evidence."""
+
+    source_plan_hash = _hash(result["source_plan_hash"], "source plan hash")
+    local_active_count = (
+        None
+        if occupancy is None
+        else len(occupancy.get("active_slot_ids", ()))
+    )
+    local_free = (
+        None
+        if local_active_count is None
+        else len(FAST_LANE_SLOT_IDS) - local_active_count
+    )
+    workflow_id_hash = (
+        None
+        if host_status is None
+        else _sha256_json({"workflow_id": host_status["workflow_id"]})
+    )
+    evidence_hash = quota_evidence.get("evidence_hash")
+    snapshot_hash = quota_evidence.get("snapshot_hash")
+    decision_hash = quota_evidence.get("decision_hash")
+    target = quota_evidence.get("global_main_target")
+    global_active = quota_evidence.get("global_main_active")
+    global_free = quota_evidence.get("global_main_free")
+
+    def seal(
+        status: str,
+        reason_codes: Sequence[str],
+        assignments: Sequence[Mapping[str, Any]] = (),
+        *,
+        global_free_after_local_starts: int | None = None,
+    ) -> dict[str, Any]:
+        normalized_assignments = [dict(item) for item in assignments]
+        projection = {
+            "schema": "team-efficiency/fast-lane-cross-session-dispatch-projection-v1",
+            "status": status,
+            "source_plan_hash": source_plan_hash,
+            "workflow_id_hash": workflow_id_hash,
+            "local_capacity": len(FAST_LANE_SLOT_IDS),
+            "local_active_count": local_active_count,
+            "local_free": local_free,
+            "global_main_target": target,
+            "global_main_active": global_active,
+            "global_main_free": global_free,
+            "global_main_free_after_local_starts": global_free_after_local_starts,
+            "quota_evidence_hash": evidence_hash,
+            "quota_snapshot_hash": snapshot_hash,
+            "quota_decision_hash": decision_hash,
+            "external_session_count": len(normalized_assignments),
+            "external_assignment_ids": [
+                item["assignment_id"] for item in normalized_assignments
+            ],
+            "assignments": normalized_assignments,
+            "reason_codes": sorted(set(reason_codes)),
+        }
+        projection["projection_hash"] = _sha256_json(projection)
+        _exact_keys(
+            projection,
+            _FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS,
+            "cross-session dispatch projection",
+        )
+        return projection
+
+    if host_status is None or occupancy is None or local_active_count is None:
+        return seal("blocked", ("host_status_unavailable",))
+    if quota_evidence.get("status") != "resolved":
+        reasons = quota_evidence.get("reason_codes")
+        return seal(
+            "blocked",
+            reasons if isinstance(reasons, Sequence) else ("quota_usage_unknown",),
+        )
+    if local_active_count != quota_evidence.get("host_main_active"):
+        return seal("blocked", ("quota_host_status_fenced",))
+    if not isinstance(global_active, int) or global_active < local_active_count:
+        return seal("blocked", ("quota_global_capacity_fenced",))
+    if (
+        result.get("status") != "active"
+        or result.get("decision_code") != "FAST_LANE_ACTIVE"
+    ):
+        return seal("blocked", ("no_safe_work",))
+
+    def start_keys(plan: Mapping[str, Any]) -> set[tuple[str, str, str]]:
+        values = plan.get("assignments")
+        if not isinstance(values, Sequence) or isinstance(
+            values, (str, bytes, bytearray)
+        ):
+            raise TypeError("cross-session assignments are invalid")
+        return {
+            (
+                _task_id(item["task_id"], "cross-session assignment.task_id"),
+                _text(item["role"], "cross-session assignment.role", maximum=32),
+                _hash(
+                    item["assignment_token"],
+                    "cross-session assignment.assignment_token",
+                ),
+            )
+            for item in values
+            if isinstance(item, Mapping) and item.get("action") == "start"
+        }
+
+    try:
+        reference_starts = start_keys(reference_result)
+        admitted_starts = start_keys(result)
+    except (KeyError, TypeError, ValueError):
+        return seal("blocked", ("local_assignment_invalid",))
+    if reference_starts != admitted_starts:
+        return seal("blocked", ("quota_local_admission_incomplete",))
+    local_start_count = len(admitted_starts)
+    if local_active_count + local_start_count > len(FAST_LANE_SLOT_IDS):
+        return seal("blocked", ("local_capacity_overcommitted",))
+    if local_active_count + local_start_count < len(FAST_LANE_SLOT_IDS):
+        return seal("not_required", ("local_capacity_available",))
+    if not isinstance(global_free, int):
+        return seal("blocked", ("quota_usage_unknown",))
+    global_free_after_starts = max(0, global_free - local_start_count)
+
+    queue = reference_result.get("ready_queue")
+    if not isinstance(queue, Sequence) or isinstance(queue, (str, bytes, bytearray)):
+        return seal(
+            "blocked",
+            ("cross_session_queue_invalid",),
+            global_free_after_local_starts=global_free_after_starts,
+        )
+    queued = [item for item in queue if isinstance(item, Mapping)]
+    if len(queued) != len(queue):
+        return seal(
+            "blocked",
+            ("cross_session_queue_invalid",),
+            global_free_after_local_starts=global_free_after_starts,
+        )
+    if not queued:
+        return seal(
+            "not_required",
+            ("no_external_session_required",),
+            global_free_after_local_starts=global_free_after_starts,
+        )
+    if len(queued) > MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS:
+        return seal(
+            "blocked",
+            ("external_assignment_limit_exceeded",),
+            global_free_after_local_starts=global_free_after_starts,
+        )
+    if len(queued) > global_free_after_starts:
+        return seal(
+            "blocked",
+            ("quota_global_capacity_exhausted",),
+            global_free_after_local_starts=global_free_after_starts,
+        )
+
+    try:
+        external: list[dict[str, Any]] = []
+        for item in sorted(queued, key=lambda value: (value["task_id"], value["role"])):
+            task_id = _task_id(item["task_id"], "external assignment.task_id")
+            role = _text(item["role"], "external assignment.role", maximum=32)
+            model = _text(item["model"], "external assignment.model", maximum=64)
+            effort = _fast_lane_effort(item["reasoning_effort"])
+            if effort == "ultra" or model == "gpt-5.3-codex-spark":
+                raise ValueError("external assignment route is not main-pool safe")
+            context_hash = _hash(
+                item["context_hash"], "external assignment.context_hash"
+            )
+            route = {
+                "model": model,
+                "reasoning_effort": effort,
+                "routing_context_hash": _hash(
+                    item["routing_context_hash"],
+                    "external assignment.routing_context_hash",
+                ),
+                "routing_result_hash": _hash(
+                    item["routing_result_hash"],
+                    "external assignment.routing_result_hash",
+                ),
+                "task_fingerprint": _hash(
+                    item["task_fingerprint"],
+                    "external assignment.task_fingerprint",
+                ),
+                "routing_reason_codes": _fast_lane_reason_codes(
+                    item["routing_reason_codes"]
+                ),
+                "routing_safety_floor_rank": item["routing_safety_floor_rank"],
+            }
+            if route["routing_reason_codes"] is None or (
+                type(route["routing_safety_floor_rank"]) is not int
+                or not 10 <= route["routing_safety_floor_rank"] <= 110
+            ):
+                raise ValueError("external assignment route is invalid")
+            predecessor = {
+                "schema": "team-efficiency/fast-lane-external-lease-predecessor-v1",
+                "source_plan_hash": source_plan_hash,
+                "workflow_id_hash": workflow_id_hash,
+                "task_id": task_id,
+                "role": role,
+                "context_hash": context_hash,
+                "routing_result_hash": route["routing_result_hash"],
+                "quota_evidence_hash": evidence_hash,
+                "quota_snapshot_hash": snapshot_hash,
+                "quota_decision_hash": decision_hash,
+                "ledger_epoch": quota_evidence["ledger_epoch"],
+                "active_lease_set_hash": quota_evidence["active_lease_set_hash"],
+            }
+            predecessor["predecessor_hash"] = _sha256_json(predecessor)
+            _exact_keys(
+                predecessor,
+                _FAST_LANE_EXTERNAL_LEASE_PREDECESSOR_FIELDS,
+                "external lease predecessor",
+            )
+            assignment = {
+                "schema": "team-efficiency/fast-lane-external-session-assignment-v1",
+                "action": "external_session_required",
+                "session_state": "not_created",
+                "pool": "main",
+                "task_id": task_id,
+                "role": role,
+                "model": model,
+                "reasoning_effort": effort,
+                "route": route,
+                "context_hash": context_hash,
+                "lease_fencing_predecessor": predecessor,
+                "reason": "local_capacity_exhausted",
+            }
+            assignment["assignment_id"] = _sha256_json(assignment)
+            _exact_keys(
+                assignment,
+                _FAST_LANE_EXTERNAL_ASSIGNMENT_FIELDS,
+                "external session assignment",
+            )
+            external.append(assignment)
+    except (KeyError, TypeError, ValueError):
+        return seal(
+            "blocked",
+            ("cross_session_candidate_invalid",),
+            global_free_after_local_starts=global_free_after_starts,
+        )
+    return seal(
+        "external_session_required",
+        ("local_capacity_exhausted",),
+        external,
+        global_free_after_local_starts=global_free_after_starts,
+    )
+
+
+def _apply_fast_lane_cross_session_projection(
+    result: Mapping[str, Any],
+    *,
+    reference_result: Mapping[str, Any],
+    host_status: Mapping[str, Any] | None,
+    occupancy: Mapping[str, Any] | None,
+    quota_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    projection = _fast_lane_cross_session_projection(
+        result,
+        reference_result=reference_result,
+        host_status=host_status,
+        occupancy=occupancy,
+        quota_evidence=quota_evidence,
+    )
+    updated = {**result, "cross_session_dispatch_projection": projection}
+    updated["plan_hash"] = _sha256_json(
+        {key: value for key, value in updated.items() if key != "plan_hash"}
+    )
+    _exact_keys(updated, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    if len(_json_bytes(updated)) > MAX_MANIFEST_BYTES:
+        raise ValueError("fast-lane plan exceeds its byte budget")
+    return updated
+
+
 def compile_fast_lane(
     request: Mapping[str, Any],
     *,
@@ -7126,6 +7591,14 @@ def compile_fast_lane(
         _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
         if len(_json_bytes(result)) > MAX_MANIFEST_BYTES:
             raise ValueError("fast-lane plan exceeds its byte budget")
+    reference_result = result
+    quota_evidence = _fast_lane_main_capacity_evidence(
+        quota_request,
+        trusted_key_resolver=quota_trusted_key_resolver,
+        evaluation_time_utc_z=quota_evaluation_time_utc_z,
+        verified_route_result_hashes=quota_verified_route_result_hashes,
+        verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+    )
     if quota_request is not None:
         decision = _fast_lane_quota_decision(
             quota_request,
@@ -7134,12 +7607,18 @@ def compile_fast_lane(
             verified_route_result_hashes=quota_verified_route_result_hashes,
             verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
         )
-        return _apply_fast_lane_quota_balance(
+        result = _apply_fast_lane_quota_balance(
             result,
             quota_request=quota_request,
             quota_decision=decision,
         )
-    return result
+    return _apply_fast_lane_cross_session_projection(
+        result,
+        reference_result=reference_result,
+        host_status=status,
+        occupancy=occupancy,
+        quota_evidence=quota_evidence,
+    )
 
 
 def _read_json(path_text: str, *, maximum: int) -> Any:

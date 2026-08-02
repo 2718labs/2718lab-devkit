@@ -802,6 +802,143 @@ def compile_quota_balance(
     )
 
 
+def _main_capacity_evidence(
+    *,
+    status: str,
+    snapshot_hash: str | None,
+    decision_hash: str | None,
+    ledger_epoch: int | None,
+    global_main_target: int | None,
+    global_main_active: int | None,
+    host_main_active: int | None,
+    active_lease_set_hash: str | None,
+    reason_codes: Iterable[str],
+) -> dict[str, Any]:
+    reasons = sorted(set(reason_codes))[:_MAX_REASON_CODES]
+    global_main_free = (
+        None
+        if global_main_target is None or global_main_active is None
+        else max(0, global_main_target - global_main_active)
+    )
+    evidence = {
+        "schema": "2718lab-devkit/fastlane-main-capacity-evidence-v1",
+        "status": status,
+        "snapshot_hash": snapshot_hash,
+        "decision_hash": decision_hash,
+        "ledger_epoch": ledger_epoch,
+        "global_main_target": global_main_target,
+        "global_main_active": global_main_active,
+        "global_main_free": global_main_free,
+        "host_main_active": host_main_active,
+        "active_lease_set_hash": active_lease_set_hash,
+        "reason_codes": reasons,
+    }
+    return {**evidence, "evidence_hash": _hash(evidence)}
+
+
+def compile_main_capacity_evidence(
+    request: Mapping[str, Any],
+    *,
+    trusted_key_resolver: HashResolver,
+    evaluation_time_utc_z: str,
+    verified_route_result_hashes: Iterable[str],
+    verified_lease_scope_bindings: Iterable[str],
+) -> dict[str, Any]:
+    """Return only verified main-pool capacity facts for inert host planning."""
+
+    try:
+        decision = compile_quota_balance(
+            request,
+            trusted_key_resolver=trusted_key_resolver,
+            evaluation_time_utc_z=evaluation_time_utc_z,
+            verified_route_result_hashes=verified_route_result_hashes,
+            verified_lease_scope_bindings=verified_lease_scope_bindings,
+        )
+    except (OSError, TypeError, ValueError):
+        return _main_capacity_evidence(
+            status="blocked",
+            snapshot_hash=None,
+            decision_hash=None,
+            ledger_epoch=None,
+            global_main_target=None,
+            global_main_active=None,
+            host_main_active=None,
+            active_lease_set_hash=None,
+            reason_codes=("quota_usage_unknown",),
+        )
+
+    reasons = decision.get("reason_codes", [])
+    if not isinstance(reasons, list) or not all(
+        isinstance(reason, str) for reason in reasons
+    ):
+        reasons = ["quota_usage_unknown"]
+    if decision.get("status") != "resolved":
+        return _main_capacity_evidence(
+            status="blocked",
+            snapshot_hash=None,
+            decision_hash=None,
+            ledger_epoch=None,
+            global_main_target=None,
+            global_main_active=None,
+            host_main_active=None,
+            active_lease_set_hash=None,
+            reason_codes=reasons,
+        )
+
+    try:
+        snapshot, _ = _verified_snapshot(
+            request.get("snapshot"),
+            trusted_key_resolver=trusted_key_resolver,
+            evaluation_time_utc_z=evaluation_time_utc_z,
+        )
+        capacity = _mapping(snapshot["capacity"])
+        target = decision["global_main_target"]
+        ledger_epoch = decision["ledger_epoch"]
+        snapshot_hash = decision["snapshot_hash"]
+        decision_hash = decision["decision_hash"]
+        if (
+            target not in {6, 8, 10, 12}
+            or type(ledger_epoch) is not int
+            or not _is_hash(snapshot_hash)
+            or not _is_hash(decision_hash)
+            or snapshot_hash != snapshot["snapshot_hash"]
+            or ledger_epoch != capacity["ledger_epoch"]
+        ):
+            raise ValueError("main capacity evidence is inconsistent")
+    except (KeyError, TypeError, ValueError, PermissionError, TimeoutError):
+        return _main_capacity_evidence(
+            status="blocked",
+            snapshot_hash=None,
+            decision_hash=None,
+            ledger_epoch=None,
+            global_main_target=None,
+            global_main_active=None,
+            host_main_active=None,
+            active_lease_set_hash=None,
+            reason_codes=("quota_usage_unknown",),
+        )
+
+    blocked_reasons = {
+        "quota_main_paused",
+        "quota_receipt_invalid",
+        "quota_receipt_required",
+        "quota_snapshot_stale",
+        "quota_snapshot_untrusted",
+        "quota_usage_unknown",
+    }
+    return _main_capacity_evidence(
+        status="blocked" if blocked_reasons.intersection(reasons) else "resolved",
+        snapshot_hash=snapshot_hash,
+        decision_hash=decision_hash,
+        ledger_epoch=ledger_epoch,
+        global_main_target=target,
+        global_main_active=capacity["global_main_active"],
+        host_main_active=capacity["host_main_active"],
+        active_lease_set_hash=capacity["active_lease_set_hash"],
+        reason_codes=reasons,
+    )
+
+
 def evaluate_coordinator_kernel(
     input_value: Mapping[str, Any],
     trusted_capability_hashes: Iterable[str],
