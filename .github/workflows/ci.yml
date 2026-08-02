@@ -19,7 +19,7 @@ jobs:
         working-directory: mcp-tools
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure task-local runtime storage
         shell: pwsh
@@ -40,7 +40,7 @@ jobs:
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -90,10 +90,10 @@ jobs:
         working-directory: extensions/astrbot
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -126,10 +126,10 @@ jobs:
         working-directory: skills/work-methodology
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -190,10 +190,10 @@ jobs:
     needs: [mcp-runtime, astrbot-extension, fast-lane]
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -218,7 +218,7 @@ jobs:
           echo "path=${output}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload primary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: 2718lab-devkit-primary-${{ github.sha }}
           path: |
