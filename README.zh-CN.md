@@ -7,15 +7,15 @@
 
 2718lab DevKit 是一个本地、仅 stdio 传输的 MCP 服务器，提供有边界的
 项目索引、Atlas 证据、Relay 生命周期协调和确定性的 Fast Lane 规划。
-本仓库包含 v1.0.0-rc1 发布候选版，已完成本地集成和测试；本文不声称
-已经远程发布、市场安装或热重载。
+本仓库对应 v1.0.0-rc1 发布候选版；已提交的 manifest 和 allowlist 定义
+公开产物范围，下面的安装、构建和验证章节给出支持的工作流。
 
 > [!IMPORTANT]
 > **工作流提醒：** 先用有界证据路由；一个写入范围只允许一个 writer；执行前必须
 > claim 并 bind；只有验证过的终态事件才能 refill；完成集成和验收后才能归档。
-> prewarm 只读，`action="retain"` 不是新 spawn。任务根、缓存、工作树和证据统一放在
-> `D:\bun\tmp\codex\<project-or-thread>`（默认）；显式配置的 quota 样本缓存可以放在
-> 其他获准盘符。
+> prewarm 只读，`action="retain"` 不是新 spawn。任务临时目录、缓存、工作树和证据
+> 应放在隔离的用户自有工作区；需要时显式配置 quota 样本缓存路径。不要把运行时
+> 状态或凭据提交到仓库。
 
 ## 已交付内容
 
@@ -132,14 +132,14 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 ## 构建主产物
 
-allowlist builder 会在插件源码树之外生成确定性的 ZIP。例如使用 D 盘任务根：
+allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output D:\bun\tmp\codex\2718-devkit\artifacts\2718lab-devkit-v1.0.0-rc1.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0-rc1.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的六棵运行时目录树。它
 不会打包 skills、prompts、静态 agent、宿主私有状态或任意仓库文件。
-构建输出和临时证据必须留在 D:\bun\tmp\codex 下；不要使用 C 盘临时根。
+构建输出和临时证据应放在源码树之外，并排除在版本控制之外。
 
 ## 运行时数据与崩溃恢复
 
@@ -189,8 +189,8 @@ skills/work-methodology/scripts/team_efficiency.py。
 详细的额度采集与快照契约见
 [codex_account_quota.py](skills/work-methodology/scripts/codex_account_quota.py)。它不会读取
 `auth.json`、cookie 或私有 HTTP 接口；样本缓存路径由用户通过
-`--quota-state-path` 配置（例如 G 盘项目缓存）。未提供时跟随
-`CODEX_TASK_TEMP`，不会静默回落到 C 盘临时目录。
+`--quota-state-path` 配置（例如其他已配置盘符上的项目缓存）。未提供时跟随
+`CODEX_TASK_TEMP`，不会静默回落到未批准的临时目录。
 
 ## 安全与范围边界
 
@@ -205,7 +205,7 @@ skills/work-methodology/scripts/team_efficiency.py。
 
 ## 验证
 
-RC1 集成树在 D 盘任务根下执行了：
+RC1 集成树已按以下命令完成验证：
 
     cd mcp-tools
     uv run --locked pytest -q
@@ -220,9 +220,9 @@ RC1 集成树在 D 盘任务根下执行了：
 
 ## 发布状态
 
-当前是准备马上 push 和打 tag 的 v1.0.0-rc1 发布候选版。发布前完成最后检查：
-复核 [CHANGELOG.md](CHANGELOG.md)，确认目标远程和分支，构建 allowlist 产物，
-并从短路径 D 盘任务根重复聚焦验证。
+本仓库对应 v1.0.0-rc1 发布候选版。发布说明见
+[CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
+和锁定依赖为准。
 
 ## 许可证
 

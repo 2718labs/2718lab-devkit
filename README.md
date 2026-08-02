@@ -7,17 +7,17 @@
 
 2718lab DevKit is a local, stdio-only MCP server for bounded project indexing,
 Atlas evidence, Relay lifecycle coordination, and deterministic Fast Lane
-planning. This repository contains the v1.0.0-rc1 release candidate. It is
-locally integrated and tested, but this README does not claim a remote
-publication, marketplace installation, or hot reload.
+planning. This repository contains the v1.0.0-rc1 release candidate. The
+checked-in manifest and allowlist define the public package surface; the install,
+build, and verification sections below describe the supported workflow.
 
 > [!IMPORTANT]
 > **Workflow reminder:** route from bounded evidence, keep one writer per
 > write scope, claim and bind before execution, refill only after a validated
 > terminal event, integrate and accept before archiving. Prewarm is read-only;
-> `action="retain"` is not a new spawn. Keep task roots, caches, worktrees,
-> and evidence under `D:\bun\tmp\codex\<project-or-thread>` by default; an
-> explicitly configured quota sample path may use another approved drive.
+> `action="retain"` is not a new spawn. Keep task scratch, caches, worktrees,
+> and evidence in an isolated user-owned workspace; configure quota sample
+> storage explicitly when needed. Do not commit runtime state or credentials.
 
 ## What is shipped
 
@@ -141,16 +141,16 @@ handles or falls back to an unrelated local start.
 ## Build the primary artifact
 
 The allowlisted builder creates a deterministic ZIP outside the plugin source
-tree. For example, with a D-drive task root:
+tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output D:\bun\tmp\codex\2718-devkit\artifacts\2718lab-devkit-v1.0.0-rc1.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0-rc1.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the six runtime trees selected by
 .codex-plugin/main-artifact-allowlist.json. It does not package skills,
 prompts, static agents, host-private state, or arbitrary repository files.
-Build output and temporary evidence must stay under D:\bun\tmp\codex; do not
-use a C-drive temporary root.
+Keep build output and temporary evidence outside the source tree and out of
+version control.
 
 ## Runtime data and recovery
 
@@ -208,9 +208,10 @@ signature errors:
 The detailed producer contract is in
 [codex_account_quota.py](skills/work-methodology/scripts/codex_account_quota.py).
 It never reads `auth.json`, cookies, or private HTTP endpoints; its sample
-cache path is user-configurable through `--quota-state-path` (for example a
-G-drive project cache). If no path is supplied, it follows `CODEX_TASK_TEMP`;
-it never silently falls back to a C-drive temporary directory.
+cache path is user-configurable through `--quota-state-path` (for example, a
+project cache on another configured drive). If no path is supplied, it follows
+`CODEX_TASK_TEMP`; it never silently falls back to an unapproved temporary
+directory.
 
 ## Safety and scope boundaries
 
@@ -228,7 +229,7 @@ it never silently falls back to a C-drive temporary directory.
 
 ## Verification
 
-The RC1 integration was verified from a fresh D-drive task root with:
+The RC1 integration was verified with:
 
     cd mcp-tools
     uv run --locked pytest -q
@@ -244,11 +245,9 @@ source-checkout independence.
 
 ## Release status
 
-This is the v1.0.0-rc1 release candidate prepared for the upcoming push and
-tag. Before publishing, complete the final release checks: review
-[CHANGELOG.md](CHANGELOG.md), confirm the target remote and branch, build the
-allowlisted artifact, and repeat the focused verification from a short D-drive
-task root.
+This repository corresponds to the v1.0.0-rc1 release candidate. Release notes
+are in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in
+manifest, artifact allowlist, and locked dependency set.
 
 ## License
 
