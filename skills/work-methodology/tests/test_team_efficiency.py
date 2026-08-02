@@ -205,13 +205,19 @@ def canonical_bytes(value: object) -> bytes:
 class TeamEfficiencyTests(unittest.TestCase):
     def setUp(self) -> None:
         task_temp = Path(os.environ["CODEX_TASK_TEMP"])
+        task_temp = task_temp.resolve(strict=False)
+        if not task_temp.is_absolute():
+            raise AssertionError("CODEX_TASK_TEMP must be an absolute path")
         task_temp.mkdir(parents=True, exist_ok=True)
         self._temporary_directory = tempfile.TemporaryDirectory(dir=task_temp)
         self.temp = Path(self._temporary_directory.name)
         self.safe_root = task_temp
-        codex_temp_root = Path(r"D:\bun\tmp\codex").resolve(strict=False)
+        self.fast_lane_task_root = (
+            Path(r"D:\bun\tmp\codex") / self.temp.name
+        ).resolve(strict=False)
+        self.fast_lane_task_root.mkdir(parents=True, exist_ok=True)
         self.project = (
-            self.safe_root.resolve(strict=False).relative_to(codex_temp_root).as_posix()
+            self.fast_lane_task_root.relative_to(r"D:\bun\tmp\codex").as_posix()
         )
         self.repo = (
             Path(r"D:\bun\tmp\codex\2718-devkit\worktrees") / "atlas12b-team-efficiency"
@@ -453,8 +459,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             "write_scope": ["skills/work-methodology/scripts/team_efficiency.py"],
             "repo": self.repo,
             "project": self.project,
-            "worktree": self.safe_root / "worktrees" / "atlas12b-team-efficiency",
-            "temp_target": self.safe_root / "tasks" / "atlas12b",
+            "worktree": self.fast_lane_task_root / "worktrees" / "atlas12b-team-efficiency",
+            "temp_target": self.fast_lane_task_root / "tasks" / "atlas12b",
         }
 
     def resume_packet(self) -> dict[str, object]:
@@ -603,8 +609,12 @@ class TeamEfficiencyTests(unittest.TestCase):
                         write_scope=unit["write_scope"],
                         repo=self.repo,
                         project=self.project,
-                        worktree=self.safe_root / "worktrees" / f"fast-lane-{task_slug}",
-                        temp_target=self.safe_root / "tasks" / f"fast-lane-{task_slug}",
+                        worktree=(
+                            self.fast_lane_task_root / "worktrees" / f"fast-lane-{task_slug}"
+                        ),
+                        temp_target=(
+                            self.fast_lane_task_root / "tasks" / f"fast-lane-{task_slug}"
+                        ),
                     ),
                     "workspace_input_snapshot_id": self.fast_lane_execution_snapshot_id(
                         helper, task_id
@@ -750,12 +760,12 @@ class TeamEfficiencyTests(unittest.TestCase):
                 repo=self.repo,
                 project=self.project,
                 worktree=(
-                    self.safe_root / "worktrees" / f"fast-lane-{task_slug}"
+                    self.fast_lane_task_root / "worktrees" / f"fast-lane-{task_slug}"
                     if worktree is None
                     else worktree
                 ),
                 temp_target=(
-                    self.safe_root / "tasks" / f"fast-lane-{task_slug}"
+                    self.fast_lane_task_root / "tasks" / f"fast-lane-{task_slug}"
                     if temp_target is None
                     else temp_target
                 ),
@@ -1136,8 +1146,16 @@ class TeamEfficiencyTests(unittest.TestCase):
                     helper,
                     task_id=unit["task_id"],
                     role=role,
-                    worktree=self.safe_root / "worktrees" / f"fast-lane-read-{task_slug}",
-                    temp_target=self.safe_root / "tasks" / f"fast-lane-read-{task_slug}",
+                    worktree=(
+                        self.fast_lane_task_root
+                        / "worktrees"
+                        / f"fast-lane-read-{task_slug}"
+                    ),
+                    temp_target=(
+                        self.fast_lane_task_root
+                        / "tasks"
+                        / f"fast-lane-read-{task_slug}"
+                    ),
                     read_scope=list(unit["write_scope"]) or ["src/service.py"],
                 )
             )
@@ -1162,7 +1180,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "role": role,
             "repo": str(self.repo if repo is None else repo),
             "worktree": str(
-                self.safe_root / "worktrees" / "fast-lane-read"
+                self.fast_lane_task_root / "worktrees" / "fast-lane-read"
                 if worktree is None
                 else worktree
             ),
@@ -1179,7 +1197,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 else read_scope
             ),
             "temp_target": str(
-                self.safe_root / "tasks" / "fast-lane-read"
+                self.fast_lane_task_root / "tasks" / "fast-lane-read"
                 if temp_target is None
                 else temp_target
             ),
@@ -2411,8 +2429,8 @@ class TeamEfficiencyTests(unittest.TestCase):
                 helper,
                 task_id=task_id,
                 role="prewarm",
-                worktree=self.safe_root / "worktrees" / task_id.lower(),
-                temp_target=self.safe_root / "tasks" / task_id.lower(),
+                worktree=self.fast_lane_task_root / "worktrees" / task_id.lower(),
+                temp_target=self.fast_lane_task_root / "tasks" / task_id.lower(),
                 read_scope=[f"src/fast_lane/{task_id[-1].lower()}.py"],
             )
             for task_id in ("FAST-LANE-C", "FAST-LANE-D")
@@ -3491,7 +3509,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         temp_target_is_task_root = copy.deepcopy(baseline)
         temp_target_is_task_root["read_contexts"] = [
-            self.fast_lane_read_context(helper, temp_target=self.safe_root)
+            self.fast_lane_read_context(helper, temp_target=self.fast_lane_task_root)
         ]
         invalid_cases.append(("temp_target_is_task_root", temp_target_is_task_root))
 
@@ -3501,8 +3519,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.fast_lane_read_context(
                 helper,
                 task_id="ATLAS-12B-B",
-                worktree=self.safe_root / "worktrees" / "fast-lane-read",
-                temp_target=self.safe_root / "tasks" / "fast-lane-read",
+                worktree=self.fast_lane_task_root / "worktrees" / "fast-lane-read",
+                temp_target=self.fast_lane_task_root / "tasks" / "fast-lane-read",
             ),
         ]
         invalid_cases.append(("duplicate_read_targets", duplicate_read_targets))
@@ -4859,7 +4877,7 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_bootstrap_is_portable_to_any_compliant_codex_project_root(self) -> None:
         helper = load_efficiency()
         codex_root = Path(r"D:\bun\tmp\codex").resolve(strict=False)
-        project_root = self.safe_root / "portable-project" / "nested-root"
+        project_root = self.fast_lane_task_root / "portable-project" / "nested-root"
         project = project_root.resolve(strict=False).relative_to(codex_root).as_posix()
         worktree = project_root / "worktrees" / "portable-atlas"
         temp_target = project_root / "tasks" / "portable-atlas"
@@ -4882,7 +4900,7 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_bootstrap_apply_uses_the_validated_argument_vector_only(self) -> None:
         helper = load_efficiency()
         apply_target = self.bootstrap_kwargs()
-        apply_target["worktree"] = self.temp / "apply-worktree"
+        apply_target["worktree"] = self.fast_lane_task_root / "apply-worktree"
         plan = helper.build_bootstrap_plan(**apply_target)
         calls: list[tuple[list[str], bool, dict[str, str]]] = []
         probes: list[tuple[list[str], bool, dict[str, str]]] = []
@@ -4925,7 +4943,7 @@ class TeamEfficiencyTests(unittest.TestCase):
     ) -> None:
         helper = load_efficiency()
         apply_target = self.bootstrap_kwargs()
-        apply_target["worktree"] = self.temp / "failed-apply-worktree"
+        apply_target["worktree"] = self.fast_lane_task_root / "failed-apply-worktree"
         plan = helper.build_bootstrap_plan(**apply_target)
         applied: list[list[str]] = []
 
@@ -4957,12 +4975,12 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper.build_bootstrap_plan(**unsafe_scope)
 
         escaped_target = self.bootstrap_kwargs()
-        escaped_target["worktree"] = self.safe_root.parent.parent / "outside"
+        escaped_target["worktree"] = self.fast_lane_task_root.parent.parent / "outside"
         with self.assertRaises(ValueError):
             helper.build_bootstrap_plan(**escaped_target)
 
         existing_target = self.bootstrap_kwargs()
-        existing_target["worktree"] = self.temp / "existing-worktree"
+        existing_target["worktree"] = self.fast_lane_task_root / "existing-worktree"
         plan = helper.build_bootstrap_plan(**existing_target)
         target = Path(plan["worktree"])
         target.mkdir(parents=True, exist_ok=True)

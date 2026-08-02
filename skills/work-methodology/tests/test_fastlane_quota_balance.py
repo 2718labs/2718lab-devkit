@@ -551,6 +551,31 @@ class QuotaBalanceTests(unittest.TestCase):
                 self.assertEqual([], decision["spark_proposal_ids"])
                 self.assertIn(reason, decision["reason_codes"])
 
+    def test_q07a_spark_follows_main_when_lag_is_significant(self) -> None:
+        quota = load_quota_module()
+        spark = make_candidate(
+            "q07a",
+            pool="spark",
+            lane="spark",
+            model="gpt-5.3-codex-spark",
+            effort="xhigh",
+            spark_binding={
+                "spark_proof_hash": digest_text("spark-proof"),
+                "parent_main_route_hash": digest_text("parent-route"),
+                "parent_admission_id": digest_text("parent-admission"),
+                "writer_handoff_hash": digest_text("writer-handoff"),
+            },
+        )
+        decision = self.compile(
+            quota,
+            make_request(
+                snapshot=make_snapshot(main_used=650000, spark_used=570000),
+                candidates=[spark],
+            ),
+        )
+        self.assertEqual([spark["candidate_id"]], decision["spark_proposal_ids"])
+        self.assertIn("spark_follow_lag", decision["reason_codes"])
+
     def test_q08_ordinary_main_work_cannot_be_transformed_into_a_spark_strike(
         self,
     ) -> None:
