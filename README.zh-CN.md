@@ -30,6 +30,50 @@
   难度和宿主能力证据选择显式模型/推理级别，不创建 agent、不改 Git、
   不执行命令。
 
+## 核心模块速览
+
+| 模块 | 作用 | 从哪里开始 |
+| --- | --- | --- |
+| [`mcp-tools/server.py`](mcp-tools/server.py) | stdio MCP 入口和公共 16 工具面 | [精确 MCP 面](#精确-mcp-面) |
+| [`mcp-tools/project_index/`](mcp-tools/project_index/) | 工作区注册、受限快照、状态和图查询 | [Project Index 工具](#精确-mcp-面) |
+| [`mcp-tools/devkit_atlas/`](mcp-tools/devkit_atlas/) | 证据图查询、实现包、渲染和验收投影 | [Atlas 工具](#精确-mcp-面) |
+| [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | 显式工作包编译和生命周期宿主动作 | [Relay 工具](#精确-mcp-面) |
+| [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | 运行时路径、checkpoint、持久边界和宿主私有 bridge | [运行时数据与恢复](#运行时数据与崩溃恢复) |
+| [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | 持久化 workflow、task、lease 和生命周期状态 | [workflow 生命周期](skills/work-methodology/references/efficiency-automation.md#workflow-lifecycle-plan) |
+| [`skills/work-methodology/`](skills/work-methodology/) | 确定性路由/Fast Lane 编译器、额度快照采集、契约和测试 | [Fast Lane 契约](skills/work-methodology/SKILL.md) |
+| [`.codex-plugin/`](.codex-plugin/) | 插件 manifest、产物 allowlist 和可复现构建器 | [构建主产物](#构建主产物) |
+
+## 整体工作流
+
+最短路径是：配置宿主，选择 MCP 或 Fast Lane 入口，只让宿主执行有界动作，
+再用终态证据完成集成、验收和归档。
+
+```mermaid
+flowchart TD
+    A["安装并配置 .mcp.json"] --> B{"选择入口"}
+    subgraph MCP["MCP 运行时"]
+        C["mcp-tools/server.py<br/>stdio 入口"] --> D["Project Index / Checkpoint<br/>Atlas / Relay"] --> E["有界结果<br/>宿主动作"]
+    end
+    subgraph FAST["Fast Lane"]
+        F["fast-lane request<br/>+ host-status"] --> G["team_efficiency.py<br/>纯编译器"]
+        G --> H["fastlane_routing.py<br/>精确宿主能力证明"]
+        H --> I{"是否启用额度平衡？"}
+        I -->|是| J["codex_account_quota.py<br/>Codex app-server 快照"]
+        I -->|否| K["使用有界宿主证据"]
+        J --> L["额度 / 宿主证据<br/>绑定到规划"]
+        K --> L
+        L --> M["inert 计划<br/>start / retain / idle"]
+        M --> N["宿主 claim → bind → start"]
+        N --> O{"是否有已验证终态事件？"}
+        O -->|否| P["保留 / 带围栏恢复<br/>不投机 refill"]
+        O -->|是| Q["集成 + 验证"] --> R["lane 0 验收"] --> S["归档独立任务"]
+        G -. "无效或过期" .-> X["失败关闭<br/>NO_SAFE_WORK / usage_unknown"]
+        J -. "额度源失败" .-> X
+    end
+    B -->|MCP 工具| C
+    B -->|Fast Lane| F
+```
+
 ## 文档导航
 
 把本页作为入口，按契约跳转到需要的细节，不必重复阅读整个仓库：
@@ -46,7 +90,7 @@
 
 实现入口见
 [Fast Lane 编译器](skills/work-methodology/scripts/team_efficiency.py) 和
-[实时 Codex 额度生产器](skills/work-methodology/scripts/codex_account_quota.py)。
+[实时 Codex 额度采集与快照模块](skills/work-methodology/scripts/codex_account_quota.py)。
 
 ## 精确 MCP 面
 
@@ -142,7 +186,7 @@ skills/work-methodology/scripts/team_efficiency.py。
 
     python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
 
-详细生产器契约见
+详细的额度采集与快照契约见
 [codex_account_quota.py](skills/work-methodology/scripts/codex_account_quota.py)。它不会读取
 `auth.json`、cookie 或私有 HTTP 接口；样本缓存路径由用户通过
 `--quota-state-path` 配置（例如 G 盘项目缓存）。未提供时跟随
@@ -150,7 +194,7 @@ skills/work-methodology/scripts/team_efficiency.py。
 
 ## 安全与范围边界
 
-- Atlas 是本地确定性服务，不调用 LLM、向量库、外部 CodeGraph、网络
+- Atlas 是本地确定性服务，暂时无法接入第三方源；不调用 LLM、向量库、网络
   服务、Shell 或补丁应用器。
 - Relay 编译显式工作包并返回宿主动作，不伪造成功 spawn；真正的 Codex
   调度由宿主负责。
@@ -176,9 +220,9 @@ RC1 集成树在 D 盘任务根下执行了：
 
 ## 发布状态
 
-当前是 v1.0.0-rc1，不是已发布版本。本仓库状态不声称已有 tag 或远程发布。
-在 push 或打 tag 前，请复核 CHANGELOG.md，确认目标远程和分支，构建
-allowlist 产物，并从短路径 D 盘任务根重复聚焦验证。
+当前是准备马上 push 和打 tag 的 v1.0.0-rc1 发布候选版。发布前完成最后检查：
+复核 [CHANGELOG.md](CHANGELOG.md)，确认目标远程和分支，构建 allowlist 产物，
+并从短路径 D 盘任务根重复聚焦验证。
 
 ## 许可证
 

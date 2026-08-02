@@ -131,7 +131,7 @@ host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
 ```
 
-`--live-quota` 要求 `--quota-input` 已携带 host 绑定的 `snapshot.capacity`，生产器会替换快照并
+`--live-quota` 要求 `--quota-input` 已携带 host 绑定的 `snapshot.capacity`，额度采集模块会替换快照并
 重算 request hash；`--quota-state-path`（默认 `CODEX_TASK_TEMP` 下的缓存）只保存最近样本的
 非敏感百分比/周期 hash，用于计算 300 秒斜率。首个样本没有前值时斜率为 0，下一次采样才计算
 增量；周期 reset 或缓存失效会清零增量。命令、JSONL、响应大小、超时和字段均有边界，来源异常、

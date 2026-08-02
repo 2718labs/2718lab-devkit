@@ -35,6 +35,51 @@ publication, marketplace installation, or hot reload.
   selects explicit model/effort routes from bounded difficulty and host
   capability evidence; it never spawns agents, edits Git, or runs commands.
 
+## Module overview
+
+| Module | Responsibility | Start here |
+| --- | --- | --- |
+| [`mcp-tools/server.py`](mcp-tools/server.py) | stdio MCP entry point and the public 16-tool surface | [MCP surface](#exact-mcp-surface) |
+| [`mcp-tools/project_index/`](mcp-tools/project_index/) | workspace registration, bounded snapshots, status, and graph queries | [Project Index tools](#exact-mcp-surface) |
+| [`mcp-tools/devkit_atlas/`](mcp-tools/devkit_atlas/) | evidence graph queries, implementation packets, rendering, and acceptance projection | [Atlas tools](#exact-mcp-surface) |
+| [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | explicit work-package compilation and lifecycle host actions | [Relay tools](#exact-mcp-surface) |
+| [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | runtime paths, checkpoints, durable boundaries, and the private host bridge | [runtime and recovery](#runtime-data-and-recovery) |
+| [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | durable workflow, task, lease, and lifecycle state | [workflow lifecycle](skills/work-methodology/references/efficiency-automation.md#workflow-lifecycle-plan) |
+| [`skills/work-methodology/`](skills/work-methodology/) | deterministic routing/Fast Lane compiler, quota snapshot collection, contracts, and tests | [Fast Lane contract](skills/work-methodology/SKILL.md) |
+| [`.codex-plugin/`](.codex-plugin/) | plugin manifest, artifact allowlist, and reproducible package builder | [artifact build](#build-the-primary-artifact) |
+
+## Overall workflow
+
+The short path is: configure the host, choose the MCP or Fast Lane entry,
+let the host execute only bounded actions, and close the lifecycle with
+terminal evidence, integration, acceptance, and archive.
+
+```mermaid
+flowchart TD
+    A["Install + configure .mcp.json"] --> B{"Choose entry"}
+    subgraph MCP["MCP runtime"]
+        C["mcp-tools/server.py<br/>stdio entry"] --> D["Project Index / Checkpoint<br/>Atlas / Relay"] --> E["Bounded result<br/>host action"]
+    end
+    subgraph FAST["Fast Lane"]
+        F["fast-lane request<br/>+ host-status"] --> G["team_efficiency.py<br/>pure compiler"]
+        G --> H["fastlane_routing.py<br/>exact host attestation"]
+        H --> I{"Quota balancing enabled?"}
+        I -->|yes| J["codex_account_quota.py<br/>Codex app-server snapshot"]
+        I -->|no| K["Use bounded host evidence"]
+        J --> L["Quota / host evidence<br/>bound into planning"]
+        K --> L
+        L --> M["Inert plan<br/>start / retain / idle"]
+        M --> N["Host claim → bind → start"]
+        N --> O{"Validated terminal event?"}
+        O -->|no| P["Retain / fenced recovery<br/>no speculative refill"]
+        O -->|yes| Q["Integrate + verify"] --> R["Lane 0 acceptance"] --> S["Archive independent task"]
+        G -. "invalid or stale" .-> X["Fail closed<br/>NO_SAFE_WORK / usage_unknown"]
+        J -. "source failure" .-> X
+    end
+    B -->|MCP tools| C
+    B -->|Fast Lane| F
+```
+
 ## Documentation map
 
 Use this page as the entry point, then follow the contract links instead of
@@ -169,8 +214,9 @@ it never silently falls back to a C-drive temporary directory.
 
 ## Safety and scope boundaries
 
-- Atlas is deterministic and local. It does not call an LLM, vector store,
-  external CodeGraph, network service, shell, or patch applier.
+- Atlas is deterministic and local. It cannot currently connect to third-party
+  sources; it does not call an LLM, vector store, network service, shell, or
+  patch applier.
 - Relay compiles explicit packages and returns host actions; it does not
   fabricate successful spawns. The host owns the actual Codex dispatch.
 - Worktree, branch, lease, task, snapshot, receipt, and evidence identities
@@ -198,11 +244,11 @@ source-checkout independence.
 
 ## Release status
 
-This is v1.0.0-rc1, not a published release. There is no tag or remote
-publication asserted by this repository state. Before pushing or tagging,
-review CHANGELOG.md, confirm the intended remote and branch, build the
-allowlisted artifact, and repeat the focused verification from a short
-D-drive task root.
+This is the v1.0.0-rc1 release candidate prepared for the upcoming push and
+tag. Before publishing, complete the final release checks: review
+[CHANGELOG.md](CHANGELOG.md), confirm the target remote and branch, build the
+allowlisted artifact, and repeat the focused verification from a short D-drive
+task root.
 
 ## License
 
