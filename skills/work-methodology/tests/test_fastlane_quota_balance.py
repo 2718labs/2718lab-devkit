@@ -551,6 +551,31 @@ class QuotaBalanceTests(unittest.TestCase):
                 self.assertEqual([], decision["spark_proposal_ids"])
                 self.assertIn(reason, decision["reason_codes"])
 
+    def test_q07a_spark_follows_main_when_lag_is_significant(self) -> None:
+        quota = load_quota_module()
+        spark = make_candidate(
+            "q07a",
+            pool="spark",
+            lane="spark",
+            model="gpt-5.3-codex-spark",
+            effort="xhigh",
+            spark_binding={
+                "spark_proof_hash": digest_text("spark-proof"),
+                "parent_main_route_hash": digest_text("parent-route"),
+                "parent_admission_id": digest_text("parent-admission"),
+                "writer_handoff_hash": digest_text("writer-handoff"),
+            },
+        )
+        decision = self.compile(
+            quota,
+            make_request(
+                snapshot=make_snapshot(main_used=650000, spark_used=570000),
+                candidates=[spark],
+            ),
+        )
+        self.assertEqual([spark["candidate_id"]], decision["spark_proposal_ids"])
+        self.assertIn("spark_follow_lag", decision["reason_codes"])
+
     def test_q08_ordinary_main_work_cannot_be_transformed_into_a_spark_strike(
         self,
     ) -> None:
@@ -749,6 +774,66 @@ class QuotaBalanceTests(unittest.TestCase):
         )
         self.assertEqual("MECHANICAL_ALLOWED", allowed["status"])
         self.assertEqual("NEEDS_SOL_LOCK", denied["status"])
+
+    def test_q17_main_capacity_evidence_uses_only_main_pool_targets(self) -> None:
+        quota = load_quota_module()
+        cases = (
+            (500_000, 0, 12),
+            (650_000, 0, 10),
+            (800_000, 0, 8),
+            (950_000, 0, 6),
+        )
+        for main_used, main_slope, expected_target in cases:
+            with self.subTest(target=expected_target):
+                request = make_request(
+                    snapshot=make_snapshot(
+                        main_used=main_used,
+                        main_slope=main_slope,
+                        global_main_active=5,
+                        global_spark_active=1,
+                    ),
+                    candidates=[],
+                )
+                evidence = quota.compile_main_capacity_evidence(
+                    request,
+                    trusted_key_resolver=self.resolver,
+                    evaluation_time_utc_z=EVALUATION_TIME,
+                    verified_route_result_hashes=(),
+                    verified_lease_scope_bindings=(),
+                )
+
+                self.assertEqual("resolved", evidence["status"])
+                self.assertEqual(expected_target, evidence["global_main_target"])
+                self.assertEqual(expected_target - 5, evidence["global_main_free"])
+                self.assertNotIn("global_spark_active", evidence)
+
+    def test_q18_main_capacity_evidence_fails_closed_when_usage_is_stale_or_untrusted(
+        self,
+    ) -> None:
+        quota = load_quota_module()
+        stale = make_request(
+            snapshot=make_snapshot(valid_until="2026-08-01T15:09:30Z"),
+            candidates=[],
+        )
+        stale_evidence = quota.compile_main_capacity_evidence(
+            stale,
+            trusted_key_resolver=self.resolver,
+            evaluation_time_utc_z=EVALUATION_TIME,
+            verified_route_result_hashes=(),
+            verified_lease_scope_bindings=(),
+        )
+        untrusted_evidence = quota.compile_main_capacity_evidence(
+            make_request(candidates=[]),
+            trusted_key_resolver=lambda _key_id: None,
+            evaluation_time_utc_z=EVALUATION_TIME,
+            verified_route_result_hashes=(),
+            verified_lease_scope_bindings=(),
+        )
+
+        self.assertEqual("blocked", stale_evidence["status"])
+        self.assertIn("quota_snapshot_stale", stale_evidence["reason_codes"])
+        self.assertEqual("blocked", untrusted_evidence["status"])
+        self.assertIn("quota_snapshot_untrusted", untrusted_evidence["reason_codes"])
 
 
 if __name__ == "__main__":

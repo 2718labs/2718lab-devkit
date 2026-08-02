@@ -703,9 +703,13 @@ class _PosixPublisher:
                     follow_symlinks=False,
                 )
             )
+            # Size and timestamps are expected to change while the private ZIP
+            # is being written.  The pinned object identity must remain stable;
+            # comparing the full metadata snapshot here would reject every
+            # non-empty artifact on Linux after its first write.
             if (
-                handle_identity != self._zip_identity
-                or entry_identity != handle_identity
+                not _same_posix_object(handle_identity, self._zip_identity)
+                or not _same_posix_object(entry_identity, handle_identity)
             ):
                 raise ArtifactSecureIOError(
                     ARTIFACT_ATOMIC_PUBLISH_FAILED,

@@ -22,18 +22,6 @@ def _codex_capabilities() -> dict[str, object]:
     }
 
 
-def _claude_capabilities() -> dict[str, object]:
-    return {
-        "host": "claude",
-        "models": {
-            "opus": {"reasoning": ["coordinator"]},
-            "sonnet": {"reasoning": ["standard"]},
-            "haiku": {"reasoning": ["light"]},
-            "fable": {"reasoning": ["high"]},
-        },
-    }
-
-
 def test_normal_complex_and_exceptional_codex_routes_are_exact() -> None:
     normal = resolve_role(
         {"host": "codex", "role": "code", "complexity": "normal"},
@@ -122,9 +110,7 @@ def test_luna_rejects_an_unattested_effort_without_substitution() -> None:
         {"host": "codex", "role": "luna", "reasoning": "xhigh"},
         {
             "host": "codex",
-            "models": {
-                "gpt-5.6-luna": {"reasoning": ["low", "medium", "high"]}
-            },
+            "models": {"gpt-5.6-luna": {"reasoning": ["low", "medium", "high"]}},
         },
     )
 
@@ -195,31 +181,40 @@ def test_empty_or_invalid_custom_profiles_never_fall_back_to_defaults() -> None:
     assert wrong_type.reason == "invalid_policy"
 
 
-def test_claude_profiles_and_fable_escalation_are_explicit() -> None:
-    coordinator = resolve_role(
-        {"host": "claude", "role": "coordinator"}, _claude_capabilities()
-    )
-    code = resolve_role({"host": "claude", "role": "code"}, _claude_capabilities())
-    light = resolve_role({"host": "claude", "role": "light"}, _claude_capabilities())
-    denied_fable = resolve_role(
-        {"host": "claude", "role": "fable"}, _claude_capabilities()
-    )
-    fable = resolve_role(
-        {
-            "host": "claude",
-            "role": "fable",
-            "escalation_reason": "cross-boundary security investigation",
-        },
-        _claude_capabilities(),
+def test_router_exposes_only_the_codex_host_profile() -> None:
+    assert set(HOST_PROFILES["hosts"]) == {"codex"}
+    removed_host = resolve_role(
+        {"host": "claude", "role": "coordinator"}, _codex_capabilities()
     )
 
-    assert coordinator.effective_model == "opus"
-    assert code.effective_model == "sonnet"
-    assert light.effective_model == "haiku"
-    assert denied_fable.status is RoutingStatus.REJECTED
-    assert denied_fable.reason == "explicit_escalation_reason_required"
-    assert fable.status is RoutingStatus.RESOLVED
-    assert fable.effective_model == "fable"
+    assert removed_host.status is RoutingStatus.REJECTED
+    assert removed_host.reason == "unknown_host"
+
+
+def test_custom_policy_cannot_restore_a_removed_host() -> None:
+    restored_host = resolve_role(
+        {"host": "claude", "role": "coordinator"},
+        {
+            "host": "claude",
+            "models": {"test-model": {"reasoning": "high"}},
+        },
+        profiles={
+            "hosts": {
+                "claude": {
+                    "roles": {
+                        "coordinator": {
+                            "model": "test-model",
+                            "reasoning": "high",
+                        }
+                    }
+                }
+            }
+        },
+    )
+
+    assert restored_host.status is RoutingStatus.REJECTED
+    assert restored_host.reason == "unknown_host"
+    assert restored_host.effective_model is None
 
 
 @pytest.mark.parametrize(

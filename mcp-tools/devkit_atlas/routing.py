@@ -99,11 +99,6 @@ _ROLE_ALIASES = {
         "code_worker": "code",
         "coding": "code",
     },
-    "claude": {
-        "opus": "coordinator",
-        "sonnet": "code",
-        "haiku": "light",
-    },
 }
 _COMPLEXITY_ALIASES = {"routine": "normal", "bounded": "normal"}
 
@@ -278,6 +273,16 @@ def resolve_role(
             requested_model=supplied_model,
             requested_reasoning=supplied_reasoning,
             reason="invalid_request",
+        )
+
+    if host != "codex":
+        return _result(
+            RoutingStatus.REJECTED,
+            requested_host=host,
+            requested_role=raw_role,
+            requested_model=supplied_model,
+            requested_reasoning=supplied_reasoning,
+            reason="unknown_host",
         )
 
     role = _ROLE_ALIASES.get(host, {}).get(raw_role, raw_role)

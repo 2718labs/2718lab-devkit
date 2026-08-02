@@ -40,6 +40,6 @@ async def long_task(x: int, ctx: Context) -> str:
 
 if __name__ == "__main__":
     # 本地调试: uv run mcp dev server_sdk.py
-    # 接入 Claude Desktop: uv run mcp install server_sdk.py
+    # 接入 Codex: 在插件根目录的 .mcp.json 中声明 command/args/cwd
     # 常驻网络服务改用: mcp.run(transport="streamable-http")
     mcp.run()

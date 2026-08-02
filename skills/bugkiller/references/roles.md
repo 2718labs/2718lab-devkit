@@ -12,17 +12,11 @@ capability or substitute a model/reasoning level.
 | Terra Max | `gpt-5.6-terra` / `max` | Moderately complex/harder implementation, integration, refactoring, security-sensitive work, and difficult regressions. |
 | Sol High (`bugkiller-sol-escalation`) | `gpt-5.6-sol` / `high` | Explicit exceptional bounded execution or deep investigation. |
 | Luna | unavailable | Do not spawn Luna and do not label a substitute as Luna. |
-| Claude Opus | coordinator | Claude coordinator profile. |
-| Claude Sonnet | code worker | Claude code-worker profile. |
-| Claude Haiku | light worker | Claude light-worker profile. |
-| Claude Fable | explicit high-cost escalation | Requires a recorded explicit escalation reason; never automatic. |
-
 Workers accept only their exact scope and return a candidate commit plus
 evidence to Sol. No execution worker may accept its own task or broaden write
 scope. Parallel tasks require disjoint active scopes; same-path work queues
 behind the active owner.
 
-`spawn_agent` exposes available host model choices, but availability is a
+`spawn_agent` exposes available Codex host model choices, but availability is a
 reported capability fact rather than authorization. Luna's unavailable state
-is final for the current route. Fable must have a non-empty reason before it
-can be selected.
+is final for the current route.

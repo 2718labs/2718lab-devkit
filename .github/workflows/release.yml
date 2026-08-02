@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate tag, manifests, and changelog
+        id: validate
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"].strip()
+          if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", tag):
+              raise SystemExit(f"invalid release tag: {tag!r}")
+
+          version = tag[1:]
+          plugin = json.loads(Path(".codex-plugin/plugin.json").read_text())
+          if plugin.get("version") != version:
+              raise SystemExit(
+                  f".codex-plugin/plugin.json version {plugin.get('version')!r} "
+                  f"does not match {version!r}"
+              )
+
+          with Path("mcp-tools/pyproject.toml").open("rb") as handle:
+              mcp_version = tomllib.load(handle)["project"]["version"]
+
+          def pep440(value: str) -> str:
+              return re.sub(r"-(?=(?:a|b|rc|post|dev)\d)", "", value)
+
+          if pep440(mcp_version) != pep440(version):
+              raise SystemExit(
+                  f"mcp-tools version {mcp_version!r} does not match {version!r}"
+              )
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          if not re.search(rf"^## \[v?{re.escape(version)}\]", changelog, re.M):
+              raise SystemExit(f"CHANGELOG.md has no entry for {version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"tag={tag}\nversion={version}\n")
+          print(f"validated release {tag}")
+          PY
+
+  quality:
+    name: Re-run release quality gates
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv
+
+      - name: Check MCP runtime
+        working-directory: mcp-tools
+        run: |
+          uv lock --check
+          uv sync --locked --all-groups
+          uv run --locked ruff check \
+            devkit_atlas/service.py \
+            devkit_runtime/atlas_acceptance.py \
+            orchestrator/service.py \
+            project_index/checkpoints.py \
+            project_index/service.py \
+            project_index/store.py
+          uv run --locked ruff format --check \
+            devkit_atlas/service.py \
+            devkit_runtime/atlas_acceptance.py \
+            orchestrator/service.py \
+            project_index/checkpoints.py \
+            project_index/service.py \
+            project_index/store.py
+          uv run --locked pyright server.py
+          uv run --locked python -m py_compile server.py
+          uv run --locked pytest -q
+
+      - name: Check AstrBot extension
+        working-directory: extensions/astrbot
+        run: |
+          uv lock --check
+          uv sync --locked --all-groups
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+          uv run --locked pyright
+          uv run --locked pytest -q
+
+  publish:
+    name: Build and publish GitHub Release
+    needs: [metadata, quality]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build allowlisted artifact
+        id: build
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          output="${RUNNER_TEMP}/2718lab-devkit-${RELEASE_VERSION}.zip"
+          python .codex-plugin/build_main_artifact.py \
+            --plugin-root . \
+            --allowlist .codex-plugin/main-artifact-allowlist.json \
+            --output "${output}"
+          unzip -t "${output}"
+          sha256sum "${output}" | tee "${output}.sha256"
+          echo "path=${output}" >> "${GITHUB_OUTPUT}"
+
+      - name: Extract release notes
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          python - <<'PY' > "${RUNNER_TEMP}/release-notes.md"
+          import os
+          import re
+          from pathlib import Path
+
+          version = re.escape(os.environ["RELEASE_VERSION"])
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          match = re.search(rf"^## \[v?{version}\].*?\n(.*?)(?=^## \[|\Z)", changelog, re.M | re.S)
+          if not match:
+              raise SystemExit("release notes not found")
+          print(match.group(1).strip())
+          PY
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          ARTIFACT: ${{ steps.build.outputs.path }}
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            "${ARTIFACT}" \
+            "${ARTIFACT}.sha256" \
+            --verify-tag \
+            --title "${RELEASE_TAG}" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md"

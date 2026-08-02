@@ -1,6 +1,6 @@
 ---
 name: mcp-server-dev
-description: 团队 MCP (Model Context Protocol) 服务器开发规范与 FastMCP API 参考。凡是涉及用 Python 构建 MCP 服务器的任务都必须使用本 skill——新建/编写/修改/评审/调试/打包 MCP server,提到 FastMCP、mcp.server.fastmcp、@mcp.tool、MCP tools/resources/prompts、stdio/Streamable HTTP/SSE 传输、mcp dev/mcp install、claude mcp add、Claude Desktop/Claude Code 接入,或要把已有 Python 功能暴露成 MCP 工具时。即使只写一小段 FastMCP 代码片段也要先查本 skill,因为存在两个同名但 API 相异的 FastMCP 包(官方 SDK 内置 v1.x 的 mcp.server.fastmcp 与 jlowin 独立版 fastmcp 3.x),装饰器括号、transport 字符串、Context 获取方式全都不同,凭记忆写必然混串。Use this skill whenever the user mentions MCP servers, FastMCP, Model Context Protocol tooling, or exposing Python functions as MCP tools/resources/prompts.
+description: 团队 MCP (Model Context Protocol) 服务器开发规范与 FastMCP API 参考。凡是涉及用 Python 构建 MCP 服务器的任务都必须使用本 skill——新建/编写/修改/评审/调试/打包 MCP server,提到 FastMCP、mcp.server.fastmcp、@mcp.tool、MCP tools/resources/prompts、stdio/Streamable HTTP/SSE 传输、mcp dev/mcp run、Codex `.mcp.json` 接入,或要把已有 Python 功能暴露成 MCP 工具时。即使只写一小段 FastMCP 代码片段也要先查本 skill,因为存在两个同名但 API 相异的 FastMCP 包(官方 SDK 内置 v1.x 的 mcp.server.fastmcp 与 jlowin 独立版 fastmcp 3.x),装饰器括号、transport 字符串、Context 获取方式全都不同,凭记忆写必然混串。Use this skill whenever the user mentions MCP servers, FastMCP, Model Context Protocol tooling, or exposing Python functions as MCP tools/resources/prompts.
 ---
 
 # MCP Server 开发(团队规范版)
@@ -13,7 +13,7 @@ description: 团队 MCP (Model Context Protocol) 服务器开发规范与 FastMC
 
 - `references/api-fastmcp-sdk.md` — (A) 官方 MCP Python SDK 内置 v1.x `mcp.server.fastmcp` 全量 API。
 - `references/api-fastmcp-standalone.md` — (B) 独立版 `fastmcp`(jlowin/Prefect,当前 3.4.4)全量 API。
-- `references/packaging-and-integration.md` — 打包、`mcp dev`/`mcp install`/`fastmcp run`、接入 Claude Desktop/Code、传输选型、部署。
+- `references/packaging-and-integration.md` — 打包、`mcp dev`/`mcp run`/`fastmcp run`、接入 Codex `.mcp.json`、传输选型、部署。
 - `assets/templates/` — 两套可直接复制的起步模板(A 版 + B 版 + pyproject.toml)。
 - `scripts/validate_mcp_server.py` — 交付前机械自检脚本,**必须运行**(见第 5 步)。
 
@@ -49,7 +49,7 @@ description: 团队 MCP (Model Context Protocol) 服务器开发规范与 FastMC
 | 加 tool/resource/prompt | 确认现有项目用的是哪个包 → 读对应 api-reference 章节 → 照抄其代码样式改写 |
 | 代码评审 | 对照第 0/2/4 条逐条检查,跑 `validate_mcp_server.py` 辅助,输出评审格式(见文末) |
 | 打包/发布 | 读 `packaging-and-integration.md`;仓库层面的发布/CI/版本流程转 `oss-repo-ops` |
-| 接入 Claude Desktop/Code | 读 `packaging-and-integration.md` 第 3/4 节 |
+| 接入 Codex MCP | 读 `packaging-and-integration.md` 第 3 节 |
 
 ### 第 2 步:选包决策
 
@@ -168,7 +168,7 @@ python3 <skill目录>/scripts/validate_mcp_server.py <server目录或文件>
 
 ### 第 6 步:交付物说明
 
-交付时向用户说明本地调试方式:(A) 用 `uv run mcp dev server.py` 起 Inspector;(B) 用 `fastmcp run server.py:mcp` 或加 `--transport http`。接入 Claude Desktop/Code 的具体命令、pyproject 依赖钉法、传输选型建议,详见 `packaging-and-integration.md`。仓库发布(README/LICENSE/CI/tag)转 `oss-repo-ops`,不在本 skill 范围。
+交付时向用户说明本地调试方式:(A) 用 `uv run mcp dev server.py` 起 Inspector;(B) 用 `fastmcp run server.py:mcp` 或加 `--transport http`。接入 Codex 的 `.mcp.json` 配置、pyproject 依赖钉法、传输选型建议,详见 `packaging-and-integration.md`。仓库发布(README/LICENSE/CI/tag)转 `oss-repo-ops`,不在本 skill 范围。
 
 ## 代码评审输出格式
 

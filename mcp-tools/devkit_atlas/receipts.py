@@ -23,7 +23,6 @@ from typing import Any
 from .canonical import canonical_hash, canonical_json
 from .security import MAX_COMMAND_SPEC_BYTES
 
-
 RAW_RECEIPT_SCHEMA_VERSION = "1"
 MAX_CONTEXT_BYTES = 4_096
 MAX_IDENTIFIER_BYTES = 256
@@ -119,10 +118,7 @@ _POSIX_ABSOLUTE_PATH = re.compile(
 )
 
 _DIRECT_TOOLS = {
-    "bash": ("claude", "shell"),
     "shell_command": ("codex", "shell"),
-    "edit": ("claude", "patch"),
-    "write": ("claude", "patch"),
     "apply_patch": ("codex", "patch"),
 }
 _WRAPPER_TOOLS = frozenset({"code", "exec"})
@@ -682,8 +678,6 @@ def _host(payload: Mapping[str, Any]) -> str | None:
     if value is None:
         return None
     normalized = re.sub(r"[^a-z0-9]+", "", value.casefold())
-    if normalized in {"claude", "claudecode"}:
-        return "claude"
     if normalized in {"codex", "openaicodex"}:
         return "codex"
     return None
@@ -939,7 +933,7 @@ def _valid_capture_context(value: object) -> bool:
     if not isinstance(value, HostCaptureContext):
         return False
     return bool(
-        value.host in {"claude", "codex"}
+        value.host == "codex"
         and _bounded_text(value.session_id, MAX_CONTEXT_BYTES) is not None
         and _bounded_text(value.turn_id, MAX_CONTEXT_BYTES) is not None
         and _bounded_text(value.workspace, MAX_CONTEXT_BYTES) is not None
@@ -1086,7 +1080,7 @@ def _validate_receipt(receipt: RawExecutionReceipt, *, evidence_key: bytes) -> N
     try:
         valid = (
             receipt.schema_version == RAW_RECEIPT_SCHEMA_VERSION
-            and receipt.host in {"claude", "codex"}
+            and receipt.host == "codex"
             and receipt.canonical_tool in {"shell", "patch"}
             and bool(_HASH.fullmatch(receipt.receipt_id))
             and all(

@@ -2,8 +2,9 @@
 
 All notable changes to 2718lab DevKit are documented here.
 
-The project follows Keep a Changelog conventions. The current entry is a
-release candidate and does not imply that a Git tag or remote release exists.
+The project follows Keep a Changelog conventions. Tagged versions are
+published by the repository release workflow after the CI and artifact checks
+pass.
 
 ## [1.0.0-rc1] - 2026-08-02
 

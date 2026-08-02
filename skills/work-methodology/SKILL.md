@@ -138,7 +138,7 @@ python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --h
 缺少任一池、错 Spark 标签或 bridge 缺失/错绑时保持 `usage_unknown`，不得猜测当前账户百分比，
 也不得启动新任务。
 
-若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。
+若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。独立会话必须在获准任务根下创建并绑定自己的隔离 Git worktree；不得把协调器的脏集成工作树当作 worker 工作区，缺失或无法验证 worktree 时 fail-closed。
 
 归档不是 adapter 操作：只能在 lane 0 已完成 acceptance、最终证据已绑定之后由 host 执行。
 默认 scratch、worktree、cache、测试证据都位于

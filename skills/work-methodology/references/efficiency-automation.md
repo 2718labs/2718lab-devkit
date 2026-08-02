@@ -287,12 +287,48 @@ it is never execution or acceptance evidence.
 
 The request supplies bounded work-package, target-gate, execution-context,
 read-context, remediation, and scheduler-state data. The plan binds a source
-plan hash, partitions exactly three subagent slots into start/retain
+plan hash, partitions exactly three **local child slots** into start/retain
 assignments and honest idle slots, and carries canonical dispatch
 receipts/tokens. The host spawns only `action="start"`; it never respawns a
 retained assignment and refills a free slot only after a terminal event. Neither
 the compiler nor the host polls commentary updates or refills from commentary
 (`no commentary polling`).
+
+### Cross-session capacity projection
+
+`3` is the per-Codex-session child-agent limit. It is not the global main-pool
+limit, and it does not mean three sessions. A fresh, signed quota snapshot sets
+the global main-pool target to exactly `6`, `8`, `10`, or `12` **non-Spark agent
+slots across all sessions**. The global active/free values come from the
+verified cross-session ledger; they are agent counts, never a session count or
+an inferred number of sessions. Spark is a separate pool and is never counted
+in, or used to enlarge, that main-pool total. The compiler derives global free
+capacity only from the verified main snapshot and global ledger evidence, never
+from a caller-supplied capacity number.
+
+When all three local child slots are fully occupied or admitted and verified
+main-pool agent capacity remains, the plan may contain an inert
+`external_session_required` projection. It is an assignment/lease **plan**, not
+an external host action: it creates no session, worker, target, process, or
+workflow transition. Each deterministic external assignment carries the exact
+task route/context plus a predecessor fence binding the source plan, quota
+snapshot and decision hashes, ledger epoch, active-lease-set hash, and its
+assignment identity. Every external assignment also carries
+`worktree_required=true`: the independent-session owner must create and bind
+an isolated Git worktree under the approved task root, never the coordinator's
+dirty integration checkout, then revalidate that fence and acquire its own
+atomic workflow/ledger claim before any execution. A missing, foreign, or
+unverified worktree fails closed.
+
+If a local child slot is unfilled, the projection is `not_required`; it cannot
+invent an external assignment. `external_agent_count` counts additional agent
+assignments, not sessions: several assignments may be placed in one validated
+external worktree/session. Unknown, stale, untrusted, receipt-invalid,
+foreign-host, mismatched, or exhausted evidence blocks the projection with no
+assignments. At target `12`, the maximum is nine additional agent assignments
+after three local child admissions (`12 - 3`), never nine sessions; a larger
+queue is blocked rather than truncated. External plans cannot route `ultra` or
+Spark work.
 
 Where the declared lifecycle orders `host_spawn_exact_route` before
 `workflow_claim_with_host_target`, that spawn is a `parked endpoint bootstrap`,

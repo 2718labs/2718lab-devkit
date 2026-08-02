@@ -16,8 +16,8 @@ import pytest
 from devkit_atlas.canonical import canonical_hash, canonical_json
 from devkit_atlas.receipts import (
     EVIDENCE_KEY_FILENAME,
-    HostCaptureContext,
     MAX_CONTEXT_BYTES,
+    HostCaptureContext,
     RawExecutionReceipt,
     ReceiptConflictError,
     ReceiptIntegrityError,
@@ -25,7 +25,6 @@ from devkit_atlas.receipts import (
     normalize_post_tool_use,
 )
 from devkit_atlas.security import MAX_COMMAND_SPEC_BYTES
-
 
 ROOT = Path(__file__).resolve().parents[2]
 RECEIPT_HOOK = Path(__file__).resolve().parents[1] / "devkit_atlas" / "receipt_hook.py"
@@ -57,8 +56,6 @@ def _host_capture_context(
         else ""
     )
     context_host = host or {
-        "claude": "claude",
-        "claudecode": "claude",
         "codex": "codex",
         "openaicodex": "codex",
     }.get(normalized, "codex")
@@ -185,7 +182,7 @@ def test_authenticated_context_requires_explicit_recognized_matching_root_host()
 
     assert _normalize(missing_host, host="codex") == ()
     assert _normalize(unknown_host, host="codex") == ()
-    assert _normalize(mismatched_host, host="claude") == ()
+    assert _normalize(mismatched_host, host="other") == ()
 
 
 def test_successful_and_failed_exits_are_explicit_facts() -> None:
@@ -196,21 +193,7 @@ def test_successful_and_failed_exits_are_explicit_facts() -> None:
     assert (failed.exit_code, failed.success) == (17, False)
 
 
-@pytest.mark.parametrize(
-    ("tool_name", "canonical_tool", "tool_input"),
-    (
-        ("Bash", "shell", {"command": "python -m pytest -q"}),
-        (
-            "Edit",
-            "patch",
-            {"file_path": "package.py", "old_string": "old", "new_string": "new"},
-        ),
-        ("Write", "patch", {"file_path": "package.py", "content": "new"}),
-    ),
-)
-def test_direct_claude_native_tools_normalize_to_canonical_classes(
-    tool_name: str, canonical_tool: str, tool_input: dict[str, str]
-) -> None:
+def test_non_codex_host_and_native_tools_are_rejected() -> None:
     payload = {
         "host": "claude",
         "context": {
@@ -219,19 +202,29 @@ def test_direct_claude_native_tools_normalize_to_canonical_classes(
             "turn_id": "claude-turn-1",
             "workspace": _WORKSPACE,
         },
-        "tool_name": tool_name,
-        "tool_use_id": f"claude-{tool_name.casefold()}-1",
-        "tool_input": tool_input,
+        "tool_name": "Bash",
+        "tool_use_id": "foreign-tool-1",
+        "tool_input": {"command": "python -m pytest -q"},
         "tool_response": {"success": True, "stdout": "safe fixture output"},
         "observed_at": "2026-07-29T01:02:03Z",
     }
 
-    receipt = _normalize(payload)[0]
+    assert _normalize(payload) == ()
 
-    assert receipt.host == "claude"
-    assert receipt.canonical_tool == canonical_tool
-    if canonical_tool == "patch":
-        assert receipt.command_spec == ()
+
+@pytest.mark.parametrize("native_tool", ("Bash", "Edit", "Write"))
+def test_removed_native_tool_aliases_are_rejected_for_codex(native_tool: str) -> None:
+    payload = _codex_shell_payload()
+    payload["tool_name"] = native_tool
+
+    assert _normalize(payload) == ()
+
+
+def test_codex_only_capture_rejects_removed_claude_host_alias() -> None:
+    payload = _codex_shell_payload()
+    payload["host"] = "claude"
+
+    assert _normalize(payload) == ()
 
 
 def test_nested_wrapper_normalizes_shell_and_patch_results() -> None:
@@ -258,8 +251,8 @@ def test_nested_wrapper_rejects_cross_host_tool_claims() -> None:
         "results": [
             {
                 **_codex_shell_payload(),
-                "host": "claude",
-                "tool_name": "Bash",
+                "host": "other",
+                "tool_name": "shell_command",
                 "tool_use_id": "mismatched-host-tool",
             }
         ]

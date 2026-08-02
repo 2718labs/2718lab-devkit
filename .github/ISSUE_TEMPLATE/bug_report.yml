@@ -1,0 +1,73 @@
+name: "Bug report"
+description: Report a reproducible runtime, packaging, or documentation problem.
+title: "[Bug] "
+labels: ["type/fix"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove credentials, tokens, private host paths, and raw quota data before posting logs.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and the expected behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Give the smallest reproducible command or sequence.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: DevKit version
+      placeholder: "v1.0.0-rc1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options:
+        - Codex
+        - Other
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Paste relevant output after removing secrets and personal paths.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow the project's Code of Conduct.
+          required: true

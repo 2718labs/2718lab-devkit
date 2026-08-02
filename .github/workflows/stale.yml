@@ -1,0 +1,37 @@
+name: Mark stale issues
+
+on:
+  schedule:
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Preview changes without modifying issues
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark inactive issues
+        uses: actions/stale@v10
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          operations-per-run: 100
+          days-before-issue-stale: 60
+          days-before-issue-close: 30
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          stale-issue-label: "status/stale"
+          stale-issue-message: >-
+            This issue has been marked stale after 60 days without activity.
+            Reply with a current reproduction or update to keep it open.
+          close-issue-message: >-
+            This issue was closed after remaining inactive. Reopen it or create
+            a new issue with updated reproduction details if the problem remains.
+          debug-only: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}

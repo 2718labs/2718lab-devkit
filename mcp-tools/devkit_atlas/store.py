@@ -1542,7 +1542,10 @@ class AtlasStore:
             self._bundle_verify_blob_file(path, blob_hash, content)
             return
         self._bundle_prepare_blob_parent(path.parent)
-        _assert_safe_existing_path(path.parent)
+        try:
+            _assert_safe_existing_path(path.parent)
+        except StoreConflictError as exc:
+            raise StoreConflictError("blob path conflict") from exc
         temp: Path | None = None
         temp_identity: tuple[int, int, int, int, int] | None = None
         for _attempt in range(64):
@@ -1590,7 +1593,10 @@ class AtlasStore:
         staged_paths.remove((temp, temp_identity))
 
     def _bundle_prepare_blob_parent(self, parent: Path) -> None:
-        _assert_safe_existing_path(self._cas_root)
+        try:
+            _assert_safe_existing_path(self._cas_root)
+        except StoreConflictError as exc:
+            raise StoreConflictError("blob path conflict") from exc
         try:
             relative = parent.relative_to(self._cas_root)
         except ValueError as exc:
@@ -1605,7 +1611,10 @@ class AtlasStore:
                 raise StoreConflictError("blob path conflict") from exc
             if _unsafe_file_status(current, value) or not stat.S_ISDIR(value.st_mode):
                 raise StoreConflictError("blob path conflict")
-        _assert_safe_existing_path(parent)
+        try:
+            _assert_safe_existing_path(parent)
+        except StoreConflictError as exc:
+            raise StoreConflictError("blob path conflict") from exc
 
     def _bundle_verify_blob_file(
         self, path: Path, blob_hash: str, expected: bytes

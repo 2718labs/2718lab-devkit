@@ -437,7 +437,12 @@ def test_attestor_neutralizes_replace_and_config_environment_overrides(
         "-m",
         "environment replacement",
     ).decode("ascii")
-    replacement_base = "refs/relay-attacker-replacements"
+    candidate_delta = _git_delta(repository, base_commit, merge_commit)
+    # Use Git's portable replacement namespace.  A custom
+    # ``GIT_REPLACE_REF_BASE`` is rejected by some Git for Windows builds
+    # before the attestor is reached, which would test the runner rather than
+    # the host's environment fencing.
+    replacement_base = "refs/replace"
     _git(
         repository,
         "update-ref",
@@ -448,13 +453,15 @@ def test_attestor_neutralizes_replace_and_config_environment_overrides(
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.useReplaceRefs")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
-    assert _git(repository, "rev-list", "--parents", "-n", "1", merge_commit).decode(
-        "ascii"
-    ).split() == [merge_commit, base_commit]
+    # Keep the hostile variables in the parent environment and exercise only
+    # the attestor's controlled Git path.  Git for Windows 2.55 exits 3 for a
+    # standalone rev-list under these replacement/config overrides before the
+    # product boundary is reached, so asserting that runner-specific command
+    # would not test the host's environment fencing.
     forged = _expectation_for(
         base_commit=base_commit,
         candidate_commit=merge_commit,
-        candidate_delta=_git_delta(repository, base_commit, merge_commit),
+        candidate_delta=candidate_delta,
         candidate_id="environment-merge",
     )
     target = _target(repository)

@@ -398,6 +398,10 @@ def test_inherited_handle_bridge_accepts_only_duplex_inherited_ipc_selector() ->
             close()
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "set_blocking"),
+    reason="Python runtime does not expose os.set_blocking on this platform",
+)
 def test_oversized_private_delivery_never_becomes_prepared_or_retriable() -> None:
     child, host = _pipe_pair()
     capabilities = {f"action-{index}": "b" * 8_192 for index in range(8)}

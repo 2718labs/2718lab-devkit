@@ -6,10 +6,18 @@ import os
 from pathlib import Path
 
 
-def test_server_card_temp_and_cache_environment_stays_under_d_task_root() -> None:
-    task_root = Path(os.environ["CODEX_TASK_TEMP"]).resolve()
+def test_server_card_temp_and_cache_environment_stays_under_task_root() -> None:
+    configured_task_root = Path(os.environ["CODEX_TASK_TEMP"])
 
-    assert task_root.drive.casefold() == "d:"
+    assert configured_task_root.is_absolute()
+    task_root = configured_task_root.resolve()
+    if os.name == "nt":
+        assert task_root.drive.casefold() == "d:"
+    else:
+        runner_temp = os.environ.get("RUNNER_TEMP")
+        if runner_temp:
+            assert task_root.is_relative_to(Path(runner_temp).resolve())
+
     for name in (
         "CODEX_TASK_TEMP",
         "TEMP",
@@ -18,8 +26,9 @@ def test_server_card_temp_and_cache_environment_stays_under_d_task_root() -> Non
         "PYTHONPYCACHEPREFIX",
         "UV_CACHE_DIR",
     ):
-        value = Path(os.environ[name]).resolve()
-        assert value.is_relative_to(task_root), name
+        configured_value = Path(os.environ[name])
+        assert configured_value.is_absolute(), name
+        assert configured_value.resolve().is_relative_to(task_root), name
 
 
 def test_server_does_not_restore_legacy_data_or_temp_ownership() -> None:

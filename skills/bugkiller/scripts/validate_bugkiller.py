@@ -86,9 +86,7 @@ def validate_profiles(errors: list[str]) -> None:
     root = _mapping(payload)
     hosts = _mapping(root.get("hosts") if root else None)
     codex = _mapping(hosts.get("codex") if hosts else None)
-    claude = _mapping(hosts.get("claude") if hosts else None)
     codex_roles = _mapping(codex.get("roles") if codex else None)
-    claude_roles = _mapping(claude.get("roles") if claude else None)
     expected = {
         "normal": ("gpt-5.6-terra", "high"),
         "complex": ("gpt-5.6-terra", "max"),
@@ -102,13 +100,8 @@ def validate_profiles(errors: list[str]) -> None:
     luna = _mapping(codex_roles.get("luna") if codex_roles else None)
     if luna is None or luna.get("status") != "unavailable":
         fail(errors, "host profile must declare Luna unavailable")
-    for role, model in (("coordinator", "opus"), ("code", "sonnet"), ("light", "haiku")):
-        value = _mapping(claude_roles.get(role) if claude_roles else None)
-        if value is None or value.get("model") != model:
-            fail(errors, f"host profile missing Claude {role} route")
-    fable = _mapping(claude_roles.get("fable") if claude_roles else None)
-    if fable is None or fable.get("requires_escalation_reason") is not True:
-        fail(errors, "host profile must require an explicit Fable escalation reason")
+    if set(hosts or {}) != {"codex"}:
+        fail(errors, "host profile must expose Codex only")
 
 
 def main() -> int:
@@ -144,11 +137,6 @@ def main() -> int:
         "Terra Max",
         "Sol High",
         "Luna",
-        "Opus",
-        "Sonnet",
-        "Haiku",
-        "Fable",
-        "explicit escalation reason",
     ):
         if marker not in roles:
             fail(errors, f"roles.md missing routing marker: {marker}")
