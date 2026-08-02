@@ -804,9 +804,7 @@ class QuotaBalanceTests(unittest.TestCase):
 
                 self.assertEqual("resolved", evidence["status"])
                 self.assertEqual(expected_target, evidence["global_main_target"])
-                self.assertEqual(
-                    expected_target - 5, evidence["global_main_free"]
-                )
+                self.assertEqual(expected_target - 5, evidence["global_main_free"])
                 self.assertNotIn("global_spark_active", evidence)
 
     def test_q18_main_capacity_evidence_fails_closed_when_usage_is_stale_or_untrusted(

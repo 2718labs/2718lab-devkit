@@ -139,9 +139,7 @@ _FAST_LANE_READ_CONTEXT_FIELDS = frozenset(
         "temp_target",
     }
 )
-_FAST_LANE_READ_ROLES = frozenset(
-    {"verification", "prewarm", "review", "design_probe"}
-)
+_FAST_LANE_READ_ROLES = frozenset({"verification", "prewarm", "review", "design_probe"})
 _FAST_LANE_SCHEDULER_FIELDS = frozenset(
     {
         "source_plan_hash",
@@ -242,7 +240,16 @@ _FAST_LANE_HOST_LEASE_FIELDS = frozenset(
     {"task_id", "lease_epoch", "endpoint", "state"}
 )
 _FAST_LANE_HOST_STATES = frozenset(
-    {"pending_init", "running", "completed", "done", "failed", "blocked", "expired", "interrupted"}
+    {
+        "pending_init",
+        "running",
+        "completed",
+        "done",
+        "failed",
+        "blocked",
+        "expired",
+        "interrupted",
+    }
 )
 _FAST_LANE_DISPATCH_RECEIPT_FIELDS = frozenset(
     {
@@ -1671,7 +1678,9 @@ def _atlas_packet(value: object) -> dict[str, Any]:
             source["request_hash"], "ImplementationPacket request_hash"
         ),
         "matcher_version": _atlas_text(
-            source["matcher_version"], "ImplementationPacket matcher_version", maximum=64
+            source["matcher_version"],
+            "ImplementationPacket matcher_version",
+            maximum=64,
         ),
         "target_paths": _normalised_list(
             source["target_paths"],
@@ -2551,7 +2560,9 @@ def _fast_lane_unit_index(
 def _fast_lane_topology_index(
     units: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, int]:
-    remaining = {task_id: set(unit.get("depends_on", [])) for task_id, unit in units.items()}
+    remaining = {
+        task_id: set(unit.get("depends_on", [])) for task_id, unit in units.items()
+    }
     ordered: list[str] = []
     while remaining:
         ready = sorted(task_id for task_id, deps in remaining.items() if not deps)
@@ -2568,7 +2579,9 @@ def _fast_lane_topology_index(
 def _fast_lane_completed_ids(
     scheduler_state: Mapping[str, Any],
 ) -> frozenset[str]:
-    return frozenset(record["task_id"] for record in scheduler_state.get("completed_tasks", []))
+    return frozenset(
+        record["task_id"] for record in scheduler_state.get("completed_tasks", [])
+    )
 
 
 def _fast_lane_dependency_ready(
@@ -2588,12 +2601,19 @@ def _fast_lane_conflict_graph(
         if lane0_scopes and _scope_conflicts(unit.get("write_scope", []), lane0_scopes):
             graph.setdefault(task_id, []).append("lane-0")
         for assignment in running:
-            if assignment.get("role") != "execution" or assignment.get("task_id") == task_id:
+            if (
+                assignment.get("role") != "execution"
+                or assignment.get("task_id") == task_id
+            ):
                 continue
             other = units.get(str(assignment.get("task_id")))
-            if other and _scope_conflicts(unit.get("write_scope", []), other.get("write_scope", [])):
+            if other and _scope_conflicts(
+                unit.get("write_scope", []), other.get("write_scope", [])
+            ):
                 graph.setdefault(task_id, []).append(str(assignment.get("task_id")))
-    return {task_id: sorted(set(neighbors)) for task_id, neighbors in sorted(graph.items())}
+    return {
+        task_id: sorted(set(neighbors)) for task_id, neighbors in sorted(graph.items())
+    }
 
 
 def _fast_lane_critical_path_distance(
@@ -2609,9 +2629,14 @@ def _fast_lane_critical_path_distance(
         for dependency in units[task_id].get("depends_on", [])
         if dependency not in completed
     ]
-    distance = 0 if not unfinished else 1 + max(
-        _fast_lane_critical_path_distance(dependency, units, completed, memo)
-        for dependency in unfinished
+    distance = (
+        0
+        if not unfinished
+        else 1
+        + max(
+            _fast_lane_critical_path_distance(dependency, units, completed, memo)
+            for dependency in unfinished
+        )
     )
     memo[task_id] = distance
     return distance
@@ -2634,7 +2659,9 @@ def _fast_lane_ready_items(
             continue
         if unit.get("unit_kind") == "verification":
             continue
-        if _fast_lane_dependency_ready(unit, completed) and "lane-0" not in graph.get(task_id, ()):
+        if _fast_lane_dependency_ready(unit, completed) and "lane-0" not in graph.get(
+            task_id, ()
+        ):
             ready.append(unit)
     return sorted(ready, key=lambda item: str(item["task_id"]))
 
@@ -2661,12 +2688,26 @@ def _fast_lane_preferred_prewarms(
     candidates: list[tuple[tuple[int, int, int, str], str]] = []
     occupied = completed | blocked | running | candidate | reviewed
     for task_id, unit in units.items():
-        if task_id in occupied or unit.get("unit_kind") not in {None, "artifact", "code"}:
+        if task_id in occupied or unit.get("unit_kind") not in {
+            None,
+            "artifact",
+            "code",
+        }:
             continue
         if (task_id, "prewarm") not in read_contexts:
             continue
         distance = _fast_lane_critical_path_distance(task_id, units, completed, memo)
-        candidates.append(((distance, topology.get(task_id, 0), wave_index.get(task_id, 0), task_id), task_id))
+        candidates.append(
+            (
+                (
+                    distance,
+                    topology.get(task_id, 0),
+                    wave_index.get(task_id, 0),
+                    task_id,
+                ),
+                task_id,
+            )
+        )
     return [task_id for _, task_id in sorted(candidates)]
 
 
@@ -2791,12 +2832,18 @@ def _fast_lane_select_actions(
         return [], _fast_lane_idle_slots("TERMINAL_PHASE_OWNED_BY_LANE0")
     completed = _fast_lane_completed_ids(state)
     blocked = frozenset(state.get("blocked_task_ids", []))
-    running = {assignment["task_id"] for assignment in state.get("running_assignments", [])}
-    candidates = {record["task_id"] for record in state.get("review_ready_candidates", [])}
+    running = {
+        assignment["task_id"] for assignment in state.get("running_assignments", [])
+    }
+    candidates = {
+        record["task_id"] for record in state.get("review_ready_candidates", [])
+    }
     reviewed = {record["task_id"] for record in state.get("reviewed_candidates", [])}
     lane0 = state.get("lane0_state", {})
     lane0_scopes = lane0.get("owned_write_scopes", [])
-    graph = _fast_lane_conflict_graph(units, lane0_scopes=lane0_scopes, running=state.get("running_assignments", []))
+    graph = _fast_lane_conflict_graph(
+        units, lane0_scopes=lane0_scopes, running=state.get("running_assignments", [])
+    )
     actions: list[dict[str, Any]] = []
     for assignment in _fast_lane_validate_retained_assignments(validated):
         actions.append({**assignment, "action": "retain"})
@@ -2804,7 +2851,15 @@ def _fast_lane_select_actions(
     free_slots = [slot for slot in FAST_LANE_SLOT_IDS if slot not in used_slots]
     capacity = min(int(source_plan.get("capacity", 0)), len(FAST_LANE_SLOT_IDS))
     writers = sum(1 for assignment in actions if assignment.get("role") == "execution")
-    ready = _fast_lane_ready_items(units, completed, blocked, frozenset(running), frozenset(candidates), frozenset(reviewed), conflict_graph=graph)
+    ready = _fast_lane_ready_items(
+        units,
+        completed,
+        blocked,
+        frozenset(running),
+        frozenset(candidates),
+        frozenset(reviewed),
+        conflict_graph=graph,
+    )
     ready_ids = {str(unit["task_id"]) for unit in ready}
     selected_scopes = [
         units[assignment["task_id"]].get("write_scope", [])
@@ -2814,7 +2869,10 @@ def _fast_lane_select_actions(
     for unit in ready:
         if not free_slots or writers >= min(capacity, 2):
             break
-        if any(_scope_conflicts(unit.get("write_scope", []), scope) for scope in selected_scopes):
+        if any(
+            _scope_conflicts(unit.get("write_scope", []), scope)
+            for scope in selected_scopes
+        ):
             continue
         route = _fast_lane_route(validated["routing_context"], unit, "execution")
         if route is None:
@@ -2824,7 +2882,10 @@ def _fast_lane_select_actions(
         actions.append(assignment)
         selected_scopes.append(unit.get("write_scope", []))
         writers += 1
-    read_contexts = {(context["task_id"], context["role"]) for context in validated.get("read_contexts", [])}
+    read_contexts = {
+        (context["task_id"], context["role"])
+        for context in validated.get("read_contexts", [])
+    }
     review_records = sorted(
         state.get("review_ready_candidates", []), key=lambda item: item["task_id"]
     )
@@ -2883,32 +2944,38 @@ def _fast_lane_select_actions(
             actions.append(assignment)
     if free_slots and writers < capacity:
         for unit in ready:
-            if not free_slots or str(unit["task_id"]) in ready_ids and any(item.get("task_id") == unit["task_id"] for item in actions):
+            if (
+                not free_slots
+                or str(unit["task_id"]) in ready_ids
+                and any(item.get("task_id") == unit["task_id"] for item in actions)
+            ):
                 continue
-            if any(_scope_conflicts(unit.get("write_scope", []), scope) for scope in selected_scopes):
+            if any(
+                _scope_conflicts(unit.get("write_scope", []), scope)
+                for scope in selected_scopes
+            ):
                 continue
-            route = _fast_lane_route(
-                validated["routing_context"], unit, "execution"
-            )
+            route = _fast_lane_route(validated["routing_context"], unit, "execution")
             if route is None:
                 continue
             slot_id = free_slots.pop(0)
-            assignment = _fast_lane_assignment(validated, unit, "execution", slot_id, route)
+            assignment = _fast_lane_assignment(
+                validated, unit, "execution", slot_id, route
+            )
             actions.append(assignment)
             selected_scopes.append(unit.get("write_scope", []))
             writers += 1
             break
-    remaining_ids = set(units) - completed - blocked - {
-        str(item["task_id"]) for item in actions
-    }
+    remaining_ids = (
+        set(units) - completed - blocked - {str(item["task_id"]) for item in actions}
+    )
     unroutable = [
         unit
         for task_id, unit in units.items()
         if task_id in remaining_ids
         and unit.get("unit_kind") != "verification"
         and _fast_lane_dependency_ready(unit, completed)
-        and _fast_lane_route(validated["routing_context"], unit, "execution")
-        is None
+        and _fast_lane_route(validated["routing_context"], unit, "execution") is None
     ]
     if unroutable:
         idle_reason = _fast_lane_route_reason(
@@ -2999,15 +3066,29 @@ def _fast_lane_build_dispatch_context(
     task_id = str(unit["task_id"])
     execution = (
         next(
-            (item for item in validated["execution_contexts"] if item["task_id"] == task_id),
+            (
+                item
+                for item in validated["execution_contexts"]
+                if item["task_id"] == task_id
+            ),
             None,
         )
         if role == "execution"
         else None
     )
-    read = next((item for item in validated["read_contexts"] if item["task_id"] == task_id and item["role"] == role), None)
+    read = next(
+        (
+            item
+            for item in validated["read_contexts"]
+            if item["task_id"] == task_id and item["role"] == role
+        ),
+        None,
+    )
     target = (
-        next((item for item in validated["target_gates"] if item["task_id"] == task_id), None)
+        next(
+            (item for item in validated["target_gates"] if item["task_id"] == task_id),
+            None,
+        )
         if role in {"execution", "verification"}
         else None
     )
@@ -3042,10 +3123,14 @@ def _fast_lane_build_dispatch_context(
         "task_id": task_id,
         "role": role,
         "source_plan_hash": validated["source_plan_hash"],
-        "integration_commit": validated["scheduler_state"]["integration_state"]["commit"],
+        "integration_commit": validated["scheduler_state"]["integration_state"][
+            "commit"
+        ],
         "integration_tree": validated["scheduler_state"]["integration_state"]["tree"],
         "workspace_input_snapshot_id": (
-            None if work_context is None else work_context["workspace_input_snapshot_id"]
+            None
+            if work_context is None
+            else work_context["workspace_input_snapshot_id"]
         ),
         "direct_dependency_result_hashes": [],
         "direct_contract_hashes": list(unit.get("direct_contract_hashes", [])),
@@ -3053,13 +3138,26 @@ def _fast_lane_build_dispatch_context(
         "task_node_ids": list(unit.get("task_node_ids", [])),
         "contract_node_ids": list(unit.get("contract_node_ids", [])),
         "acceptance_constraints": list(unit.get("acceptance_constraints", [])),
-        "execution_context_hash": None if execution is None else _sha256_json(execution),
-        "bootstrap_plan_hash": None if execution is None else _sha256_json(execution["bootstrap_plan"]),
-        "base_commit": None if execution is None else execution["bootstrap_plan"]["base_commit"],
+        "execution_context_hash": None
+        if execution is None
+        else _sha256_json(execution),
+        "bootstrap_plan_hash": None
+        if execution is None
+        else _sha256_json(execution["bootstrap_plan"]),
+        "base_commit": None
+        if execution is None
+        else execution["bootstrap_plan"]["base_commit"],
         "branch": None if execution is None else execution["bootstrap_plan"]["branch"],
         "write_scope_hash": _sha256_json(write_scope),
         "read_context_hash": None if read is None else _sha256_json(read),
-        "target_gates_hash": None if target is None else _sha256_json({"driver_gate_id": target["driver_gate_id"], "target_gates": target["gates"]}),
+        "target_gates_hash": None
+        if target is None
+        else _sha256_json(
+            {
+                "driver_gate_id": target["driver_gate_id"],
+                "target_gates": target["gates"],
+            }
+        ),
         "candidate_commit": (
             None if review_candidate is None else review_candidate["candidate_commit"]
         ),
@@ -3073,7 +3171,9 @@ def _fast_lane_build_dispatch_context(
             if review_candidate is None
             else list(review_candidate["green_evidence_hashes"])
         ),
-        "basis_hash": _sha256_json(read) if role in {"prewarm", "design_probe"} and read is not None else None,
+        "basis_hash": _sha256_json(read)
+        if role in {"prewarm", "design_probe"} and read is not None
+        else None,
         "prewarm_evidence_hash": (
             None
             if role != "execution" or prewarm is None or not prewarm_is_revalidated
@@ -3555,7 +3655,10 @@ def _fast_lane_routing_core() -> Any | None:
     module_name = "_team_efficiency_fastlane_routing"
     core_path = Path(__file__).with_name("fastlane_routing.py").resolve()
     loaded = sys.modules.get(module_name)
-    if loaded is not None and Path(str(getattr(loaded, "__file__", ""))).resolve() == core_path:
+    if (
+        loaded is not None
+        and Path(str(getattr(loaded, "__file__", ""))).resolve() == core_path
+    ):
         return loaded
     try:
         spec = importlib.util.spec_from_file_location(module_name, core_path)
@@ -3613,7 +3716,9 @@ def _fast_lane_core_decision(
     task_id = entry["task_id"]
     scheduler_role = entry["scheduler_role"]
     expected_core_role = _FAST_LANE_CORE_ROLE_BY_SCHEDULER_ROLE[scheduler_role]
-    expected_access = "workspace_write" if scheduler_role == "execution" else "read_only"
+    expected_access = (
+        "workspace_write" if scheduler_role == "execution" else "read_only"
+    )
     raw_request = entry["request"]
     try:
         request = _mapping(raw_request, "routing request")
@@ -3628,9 +3733,7 @@ def _fast_lane_core_decision(
             trusted_authorization_evidence_hashes=entry[
                 "trusted_authorization_evidence_hashes"
             ],
-            trusted_override_receipt_hashes=entry[
-                "trusted_override_receipt_hashes"
-            ],
+            trusted_override_receipt_hashes=entry["trusted_override_receipt_hashes"],
             trusted_evidence_hashes=entry["trusted_evidence_hashes"],
             coordinator_endpoint_hash=entry["coordinator_endpoint_hash"],
             compatibility_floor=entry["compatibility_floor"],
@@ -3642,9 +3745,7 @@ def _fast_lane_core_decision(
     reason_codes = _fast_lane_reason_codes(result.get("reason_codes"))
     if result.get("status") != "resolved":
         return None, (
-            "routing_context_invalid"
-            if reason_codes is None
-            else str(reason_codes[0])
+            "routing_context_invalid" if reason_codes is None else str(reason_codes[0])
         )
     route = result.get("route")
     safety_floor = result.get("safety_floor")
@@ -3658,9 +3759,7 @@ def _fast_lane_core_decision(
         floor_rank = floor["rank"]
         if type(floor_rank) is not int or not 10 <= floor_rank <= 110:
             return None, "routing_context_invalid"
-        task_fingerprint = _hash(
-            result["task_fingerprint"], "core task_fingerprint"
-        )
+        task_fingerprint = _hash(result["task_fingerprint"], "core task_fingerprint")
         render_hash = _hash(result["render_hash"], "core render_hash")
         scheduler_facts = _mapping(
             request["scheduler_facts"], "routing request.scheduler_facts"
@@ -3788,9 +3887,7 @@ def _fast_lane_routing_context(
         "decisions": decisions,
         "reasons": reasons,
         "default_reason": "routing_context_missing",
-        "global_failure_reason": (
-            None if not failure_reasons else failure_reasons[0]
-        ),
+        "global_failure_reason": (None if not failure_reasons else failure_reasons[0]),
     }
 
 
@@ -3830,8 +3927,7 @@ def _fast_lane_unroutable_action(
     completed = _fast_lane_completed_ids(state)
     blocked = frozenset(state.get("blocked_task_ids", []))
     running = {
-        assignment["task_id"]
-        for assignment in state.get("running_assignments", [])
+        assignment["task_id"] for assignment in state.get("running_assignments", [])
     }
     routing_context = validated["routing_context"]
     phase = state["phase"]
@@ -3869,9 +3965,7 @@ def _fast_lane_unroutable_action(
     candidates = {
         record["task_id"] for record in state.get("review_ready_candidates", [])
     }
-    reviewed = {
-        record["task_id"] for record in state.get("reviewed_candidates", [])
-    }
+    reviewed = {record["task_id"] for record in state.get("reviewed_candidates", [])}
     graph = _fast_lane_conflict_graph(
         units,
         lane0_scopes=state["lane0_state"]["owned_write_scopes"],
@@ -4004,17 +4098,21 @@ def _validated_fast_lane_gate(value: object, field: str) -> dict[str, Any]:
         gate["red_expected_exit_codes"], f"{field}.red_expected_exit_codes"
     )
     green_expected_exit_code = gate["green_expected_exit_code"]
-    if type(green_expected_exit_code) is not int or not 0 <= green_expected_exit_code <= 255:
+    if (
+        type(green_expected_exit_code) is not int
+        or not 0 <= green_expected_exit_code <= 255
+    ):
         raise ValueError(f"{field}.green_expected_exit_code is invalid")
     timeout_seconds = gate["timeout_seconds"]
-    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_GATE_TIMEOUT_SECONDS:
+    if (
+        type(timeout_seconds) is not int
+        or not 1 <= timeout_seconds <= MAX_GATE_TIMEOUT_SECONDS
+    ):
         raise ValueError(f"{field}.timeout_seconds is invalid")
     red_failure_ids = _fast_lane_failure_ids(
         gate["red_failure_ids"], f"{field}.red_failure_ids"
     )
-    expected_fingerprint = _fast_lane_red_failure_fingerprint(
-        gate_id, red_failure_ids
-    )
+    expected_fingerprint = _fast_lane_red_failure_fingerprint(gate_id, red_failure_ids)
     fingerprint_value = gate["red_failure_fingerprint"]
     if expected_fingerprint is None:
         if fingerprint_value is not None:
@@ -4089,12 +4187,16 @@ def _validated_fast_lane_target_gates(
     target_ids = [target["task_id"] for target in normalized_targets]
     if len(set(target_ids)) != len(target_ids):
         raise ValueError("target_gates contains duplicate task ids")
-    normalized_targets = sorted(normalized_targets, key=lambda target: target["task_id"])
+    normalized_targets = sorted(
+        normalized_targets, key=lambda target: target["task_id"]
+    )
 
     source_plan = _mapping(source_plan_value, "source plan")
     if _text(source_plan["status"], "source plan.status", maximum=32) != "planned":
         return normalized_targets
-    source_kind = _text(source_plan["source_kind"], "source plan.source_kind", maximum=64)
+    source_kind = _text(
+        source_plan["source_kind"], "source plan.source_kind", maximum=64
+    )
     units_value = source_plan["units"]
     if not isinstance(units_value, Sequence) or isinstance(
         units_value, (str, bytes, bytearray)
@@ -4188,9 +4290,7 @@ def _fast_lane_integration_state(value: object) -> dict[str, Any]:
     commit = _git_id(
         integration.get("commit"), "scheduler_state.integration_state.commit"
     )
-    tree = _git_id(
-        integration.get("tree"), "scheduler_state.integration_state.tree"
-    )
+    tree = _git_id(integration.get("tree"), "scheduler_state.integration_state.tree")
     snapshot_value = integration.get("integration_workspace_snapshot_id")
     snapshot = (
         None
@@ -4322,9 +4422,7 @@ def _validated_fast_lane_contexts(
     units_by_task_id: dict[str, Mapping[str, Any]] = {}
     for index, item in enumerate(units):
         unit = _mapping(item, f"source plan.units[{index}]")
-        task_id = _task_id(
-            unit.get("task_id"), f"source plan.units[{index}].task_id"
-        )
+        task_id = _task_id(unit.get("task_id"), f"source plan.units[{index}].task_id")
         if task_id in units_by_task_id:
             raise ValueError("source plan contains duplicate task ids")
         units_by_task_id[task_id] = unit
@@ -4355,9 +4453,7 @@ def _validated_fast_lane_contexts(
         )
         plan = normalized["bootstrap_plan"]
         repo = _absolute_path(plan["repo"], f"{field}.bootstrap_plan.repo")
-        worktree = _absolute_path(
-            plan["worktree"], f"{field}.bootstrap_plan.worktree"
-        )
+        worktree = _absolute_path(plan["worktree"], f"{field}.bootstrap_plan.worktree")
         temp_target = _absolute_path(
             plan["temp_target"], f"{field}.bootstrap_plan.temp_target"
         )
@@ -4432,8 +4528,7 @@ def _validated_fast_lane_contexts(
             raise ValueError("fast-lane context worktree and temp target must differ")
         roots = project_roots or [codex_root]
         if not any(
-            temp_target != root and temp_target.is_relative_to(root)
-            for root in roots
+            temp_target != root and temp_target.is_relative_to(root) for root in roots
         ):
             raise ValueError("read context temp target must stay below the task root")
         worktrees.add(worktree_id)
@@ -4442,9 +4537,7 @@ def _validated_fast_lane_contexts(
     phase = _text(scheduler_state.get("phase"), "scheduler_state.phase", maximum=32)
     if phase == "integration_regression":
         verification_contexts = [
-            context
-            for context in read_contexts
-            if context["role"] == "verification"
+            context for context in read_contexts if context["role"] == "verification"
         ]
         if len(verification_contexts) != 1:
             raise ValueError(
@@ -4492,7 +4585,10 @@ def _validated_fast_lane_dispatch_context(
     role = _text(record["role"], "dispatch context.role", maximum=32)
     if role not in {"execution", "verification", "prewarm", "review", "design_probe"}:
         raise ValueError("dispatch context role is invalid")
-    if _hash(record["source_plan_hash"], "dispatch context.source_plan_hash") != source_plan_hash:
+    if (
+        _hash(record["source_plan_hash"], "dispatch context.source_plan_hash")
+        != source_plan_hash
+    ):
         raise ValueError("dispatch context source plan is stale")
     normalized: dict[str, Any] = {
         "task_id": task_id,
@@ -4539,9 +4635,7 @@ def _validated_fast_lane_dispatch_context(
         "base_commit": _fast_lane_optional_git_id(
             record["base_commit"], "dispatch context.base_commit"
         ),
-        "branch": None
-        if record["branch"] is None
-        else _branch(record["branch"]),
+        "branch": None if record["branch"] is None else _branch(record["branch"]),
         "write_scope_hash": _fast_lane_optional_hash(
             record["write_scope_hash"], "dispatch context.write_scope_hash"
         ),
@@ -4688,12 +4782,17 @@ def _validated_fast_lane_terminal_result(
         or receipt["assignment_epoch"] != slot_epochs[receipt["slot_id"]]
     ):
         raise ValueError("terminal result receipt is stale")
-    assignment_token = _hash(result["assignment_token"], "terminal result.assignment_token")
+    assignment_token = _hash(
+        result["assignment_token"], "terminal result.assignment_token"
+    )
     if assignment_token != _fast_lane_assignment_token(receipt):
         raise ValueError("terminal result token is invalid")
     recovery_of = receipt["recovery_of_assignment_token"]
     if recovery_of is not None:
-        if role not in {"execution", "verification"} or receipt["assignment_epoch"] <= 1:
+        if (
+            role not in {"execution", "verification"}
+            or receipt["assignment_epoch"] <= 1
+        ):
             raise ValueError("terminal result recovery is invalid")
         predecessor = dict(receipt)
         predecessor["assignment_epoch"] = receipt["assignment_epoch"] - 1
@@ -4710,9 +4809,7 @@ def _validated_fast_lane_terminal_result(
         or receipt["read_context_hash"] != context["read_context_hash"]
     ):
         raise ValueError("terminal result receipt is not bound to its context")
-    _fast_lane_historical_receipt_route(
-        receipt, source_plan_hash=source_plan_hash
-    )
+    _fast_lane_historical_receipt_route(receipt, source_plan_hash=source_plan_hash)
 
     outcome = _text(result["outcome"], "terminal result.outcome", maximum=32)
     candidate_commit = _fast_lane_optional_git_id(
@@ -4889,11 +4986,10 @@ def _validated_fast_lane_completion_receipt(
         receipt["workspace_input_snapshot_id"],
         "completion receipt.workspace_input_snapshot_id",
     )
-    if (
-        workspace_input_snapshot_id
-        != dispatch_context["workspace_input_snapshot_id"]
-    ):
-        raise ValueError("completion receipt input snapshot is not bound to its context")
+    if workspace_input_snapshot_id != dispatch_context["workspace_input_snapshot_id"]:
+        raise ValueError(
+            "completion receipt input snapshot is not bound to its context"
+        )
     output_workspace_snapshot_id = _fast_lane_optional_hash(
         receipt["output_workspace_snapshot_id"],
         "completion receipt.output_workspace_snapshot_id",
@@ -4995,18 +5091,17 @@ def _validated_fast_lane_lifecycle_records(
     normalized_completed: list[dict[str, Any]] = []
     for record in completed_tasks:
         terminal_result = terminal(record["terminal_result"])
-        if (
-            terminal_result["task_id"] != record["task_id"]
-            or record["terminal_result_hash"] != _sha256_json(terminal_result)
-        ):
+        if terminal_result["task_id"] != record["task_id"] or record[
+            "terminal_result_hash"
+        ] != _sha256_json(terminal_result):
             raise ValueError("completed terminal result is invalid")
         completion_receipt = _validated_fast_lane_completion_receipt(
             record["completion_receipt"],
             terminal_result=terminal_result,
             completion_kind=record["completion_kind"],
-            dispatch_context=context_by_key[(
-                terminal_result["task_id"], terminal_result["role"]
-            )],
+            dispatch_context=context_by_key[
+                (terminal_result["task_id"], terminal_result["role"])
+            ],
             verification_read_context=read_context_by_key.get(
                 (terminal_result["task_id"], "verification")
             ),
@@ -5039,7 +5134,8 @@ def _validated_fast_lane_lifecycle_records(
             or record["candidate_commit"] != terminal_result["candidate_commit"]
             or record["candidate_tree"] != terminal_result["candidate_tree"]
             or record["red_evidence_hashes"] != terminal_result["red_evidence_hashes"]
-            or record["green_evidence_hashes"] != terminal_result["green_evidence_hashes"]
+            or record["green_evidence_hashes"]
+            != terminal_result["green_evidence_hashes"]
             or record["terminal_result_hash"] != _sha256_json(terminal_result)
         ):
             raise ValueError("review-ready candidate is invalid")
@@ -5065,13 +5161,16 @@ def _validated_fast_lane_lifecycle_records(
             or record["candidate_commit"] != terminal_result["candidate_commit"]
             or record["candidate_tree"] != terminal_result["candidate_tree"]
             or record["red_evidence_hashes"] != terminal_result["red_evidence_hashes"]
-            or record["green_evidence_hashes"] != terminal_result["green_evidence_hashes"]
+            or record["green_evidence_hashes"]
+            != terminal_result["green_evidence_hashes"]
             or record["review_hash"] != review_terminal["review_hash"]
             or record["terminal_result_hash"] != _sha256_json(terminal_result)
             or record["review_terminal_result_hash"] != _sha256_json(review_terminal)
-            or (review_context := context_by_key.get((record["task_id"], "review"))) is None
+            or (review_context := context_by_key.get((record["task_id"], "review")))
+            is None
             or review_context["candidate_commit"] != terminal_result["candidate_commit"]
-            or review_context["red_evidence_hashes"] != terminal_result["red_evidence_hashes"]
+            or review_context["red_evidence_hashes"]
+            != terminal_result["red_evidence_hashes"]
             or review_context["green_evidence_hashes"]
             != terminal_result["green_evidence_hashes"]
         ):
@@ -5086,9 +5185,7 @@ def _validated_fast_lane_lifecycle_records(
             }
         )
 
-    def annotation(
-        records: list[dict[str, Any]], role: str
-    ) -> list[dict[str, Any]]:
+    def annotation(records: list[dict[str, Any]], role: str) -> list[dict[str, Any]]:
         normalized_records: list[dict[str, Any]] = []
         for record in records:
             terminal_result = terminal(record["terminal_result"])
@@ -5139,7 +5236,10 @@ def _validated_fast_lane_remediation_request(
         return {"_automation_stopped": True}
     blocker_hash = _hash(request["blocker_review_hash"], "remediation blocker hash")
     finding_hash = _hash(request["finding_hash"], "remediation finding hash")
-    if _hash(request["source_plan_hash"], "remediation source plan hash") != source_plan_hash:
+    if (
+        _hash(request["source_plan_hash"], "remediation source plan hash")
+        != source_plan_hash
+    ):
         raise ValueError("remediation source plan is stale")
     seed = _sha256_json(
         {
@@ -5162,7 +5262,10 @@ def _validated_fast_lane_remediation_request(
     }
     source_ids = set(source_units)
     affected = _normalised_list(
-        request["affected_task_ids"], "remediation affected_task_ids", _task_id, required=True
+        request["affected_task_ids"],
+        "remediation affected_task_ids",
+        _task_id,
+        required=True,
     )
     dependencies = _normalised_list(
         request["dependencies"], "remediation dependencies", _task_id, required=True
@@ -5171,12 +5274,20 @@ def _validated_fast_lane_remediation_request(
         raise ValueError("remediation dependency is unknown")
     if any(item not in dependencies for item in affected):
         raise ValueError("remediation affected task is not a dependency")
-    if _git_id(request["base_integration_commit"], "remediation base commit") != integration_state["commit"]:
+    if (
+        _git_id(request["base_integration_commit"], "remediation base commit")
+        != integration_state["commit"]
+    ):
         raise ValueError("remediation base commit is stale")
-    if _git_id(request["base_integration_tree"], "remediation base tree") != integration_state["tree"]:
+    if (
+        _git_id(request["base_integration_tree"], "remediation base tree")
+        != integration_state["tree"]
+    ):
         raise ValueError("remediation base tree is stale")
     goal = _text(request["goal"], "remediation goal", maximum=256)
-    output_boundary = _text(request["output_boundary"], "remediation output boundary", maximum=256)
+    output_boundary = _text(
+        request["output_boundary"], "remediation output boundary", maximum=256
+    )
     write_scope = _normalised_scopes(request["write_scope"], "remediation write_scope")
     if (
         len(affected) != 1
@@ -5200,7 +5311,9 @@ def _validated_fast_lane_remediation_request(
     required_evidence = _fast_lane_label_list(
         request["required_evidence"], "remediation required_evidence"
     )
-    task_node_ids = _fast_lane_hash_list(request["task_node_ids"], "remediation task_node_ids")
+    task_node_ids = _fast_lane_hash_list(
+        request["task_node_ids"], "remediation task_node_ids"
+    )
     if not task_node_ids:
         raise ValueError("remediation task node evidence is required")
     contract_node_ids = _fast_lane_hash_list(
@@ -5211,7 +5324,11 @@ def _validated_fast_lane_remediation_request(
     )
     driver_gate_id = _label(request["driver_gate_id"], "remediation driver_gate_id")
     target_gates = request["target_gates"]
-    if not isinstance(target_gates, Sequence) or isinstance(target_gates, (str, bytes, bytearray)) or len(target_gates) != 1:
+    if (
+        not isinstance(target_gates, Sequence)
+        or isinstance(target_gates, (str, bytes, bytearray))
+        or len(target_gates) != 1
+    ):
         raise ValueError("remediation target gates must contain one gate")
     gate = _validated_fast_lane_gate(target_gates[0], "remediation target_gates[0]")
     if gate["gate_id"] != driver_gate_id:
@@ -5290,11 +5407,15 @@ def _validated_fast_lane_completed_tasks(value: object) -> list[dict[str, Any]]:
         field = f"completed_tasks[{index}]"
         record = _mapping(item, field)
         _exact_keys(record, _FAST_LANE_COMPLETED_FIELDS, field)
-        completion_kind = _text(record["completion_kind"], f"{field}.completion_kind", maximum=32)
+        completion_kind = _text(
+            record["completion_kind"], f"{field}.completion_kind", maximum=32
+        )
         if completion_kind not in {"integrated_candidate", "verification_evidence"}:
             raise ValueError("completion kind is invalid")
         terminal_result = _fast_lane_embedded_record(
-            record["terminal_result"], record["terminal_result_hash"], f"{field}.terminal_result"
+            record["terminal_result"],
+            record["terminal_result_hash"],
+            f"{field}.terminal_result",
         )
         completion_receipt = _fast_lane_embedded_record(
             record["completion_receipt"],
@@ -5309,8 +5430,12 @@ def _validated_fast_lane_completed_tasks(value: object) -> list[dict[str, Any]]:
             {
                 "task_id": _task_id(record["task_id"], f"{field}.task_id"),
                 "completion_kind": completion_kind,
-                "integration_commit": _git_id(record["integration_commit"], f"{field}.integration_commit"),
-                "integration_tree": _git_id(record["integration_tree"], f"{field}.integration_tree"),
+                "integration_commit": _git_id(
+                    record["integration_commit"], f"{field}.integration_commit"
+                ),
+                "integration_tree": _git_id(
+                    record["integration_tree"], f"{field}.integration_tree"
+                ),
                 "result_hash": result_hash,
                 "terminal_result_hash": _sha256_json(terminal_result),
                 "terminal_result": terminal_result,
@@ -5328,22 +5453,36 @@ def _validated_fast_lane_review_candidates(
     value: object, *, reviewed: bool
 ) -> list[dict[str, Any]]:
     field_name = "reviewed_candidates" if reviewed else "review_ready_candidates"
-    expected = _FAST_LANE_REVIEWED_FIELDS if reviewed else _FAST_LANE_REVIEW_READY_FIELDS
-    records = _bounded_records(value, f"scheduler_state.{field_name}", maximum=MAX_MANIFEST_UNITS)
+    expected = (
+        _FAST_LANE_REVIEWED_FIELDS if reviewed else _FAST_LANE_REVIEW_READY_FIELDS
+    )
+    records = _bounded_records(
+        value, f"scheduler_state.{field_name}", maximum=MAX_MANIFEST_UNITS
+    )
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(records):
         field = f"{field_name}[{index}]"
         record = _mapping(item, field)
         _exact_keys(record, expected, field)
         terminal_result = _fast_lane_embedded_record(
-            record["terminal_result"], record["terminal_result_hash"], f"{field}.terminal_result"
+            record["terminal_result"],
+            record["terminal_result_hash"],
+            f"{field}.terminal_result",
         )
         candidate = {
             "task_id": _task_id(record["task_id"], f"{field}.task_id"),
-            "candidate_commit": _git_id(record["candidate_commit"], f"{field}.candidate_commit"),
-            "candidate_tree": _git_id(record["candidate_tree"], f"{field}.candidate_tree"),
-            "red_evidence_hashes": _fast_lane_hash_list(record["red_evidence_hashes"], f"{field}.red_evidence_hashes"),
-            "green_evidence_hashes": _fast_lane_hash_list(record["green_evidence_hashes"], f"{field}.green_evidence_hashes"),
+            "candidate_commit": _git_id(
+                record["candidate_commit"], f"{field}.candidate_commit"
+            ),
+            "candidate_tree": _git_id(
+                record["candidate_tree"], f"{field}.candidate_tree"
+            ),
+            "red_evidence_hashes": _fast_lane_hash_list(
+                record["red_evidence_hashes"], f"{field}.red_evidence_hashes"
+            ),
+            "green_evidence_hashes": _fast_lane_hash_list(
+                record["green_evidence_hashes"], f"{field}.green_evidence_hashes"
+            ),
             "terminal_result_hash": _sha256_json(terminal_result),
             "terminal_result": terminal_result,
         }
@@ -5375,19 +5514,27 @@ def _validated_fast_lane_annotation_evidence(
     value: object, *, prewarm: bool
 ) -> list[dict[str, Any]]:
     field_name = "prewarmed_evidence" if prewarm else "design_evidence"
-    expected = _FAST_LANE_PREWARMED_FIELDS if prewarm else _FAST_LANE_DESIGN_EVIDENCE_FIELDS
-    records = _bounded_records(value, f"scheduler_state.{field_name}", maximum=MAX_MANIFEST_UNITS)
+    expected = (
+        _FAST_LANE_PREWARMED_FIELDS if prewarm else _FAST_LANE_DESIGN_EVIDENCE_FIELDS
+    )
+    records = _bounded_records(
+        value, f"scheduler_state.{field_name}", maximum=MAX_MANIFEST_UNITS
+    )
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(records):
         field = f"{field_name}[{index}]"
         record = _mapping(item, field)
         _exact_keys(record, expected, field)
         terminal_result = _fast_lane_embedded_record(
-            record["terminal_result"], record["terminal_result_hash"], f"{field}.terminal_result"
+            record["terminal_result"],
+            record["terminal_result_hash"],
+            f"{field}.terminal_result",
         )
         evidence = {
             "task_id": _task_id(record["task_id"], f"{field}.task_id"),
-            "observation_basis_hash": _hash(record["observation_basis_hash"], f"{field}.observation_basis_hash"),
+            "observation_basis_hash": _hash(
+                record["observation_basis_hash"], f"{field}.observation_basis_hash"
+            ),
             "evidence_hash": _hash(record["evidence_hash"], f"{field}.evidence_hash"),
             "terminal_result_hash": _sha256_json(terminal_result),
             "terminal_result": terminal_result,
@@ -5401,7 +5548,9 @@ def _validated_fast_lane_annotation_evidence(
                     "revalidation_evidence_hash",
                 )
             ]
-            if any(value is None for value in optional) and any(value is not None for value in optional):
+            if any(value is None for value in optional) and any(
+                value is not None for value in optional
+            ):
                 raise ValueError("prewarm revalidation hashes must be jointly present")
             evidence.update(
                 dict(
@@ -5437,13 +5586,21 @@ def _validated_fast_lane_scheduler_state(
     state = _mapping(value, "scheduler_state")
     _exact_keys(state, _FAST_LANE_SCHEDULER_FIELDS, "scheduler_state")
     source_state_hash = state["source_plan_hash"]
-    if source_state_hash is not None and _hash(source_state_hash, "scheduler_state.source_plan_hash") != source_plan_hash:
+    if (
+        source_state_hash is not None
+        and _hash(source_state_hash, "scheduler_state.source_plan_hash")
+        != source_plan_hash
+    ):
         raise ValueError("scheduler source plan is stale")
     phase = _text(state["phase"], "scheduler_state.phase", maximum=32)
     if phase not in _FAST_LANE_PHASES:
         raise ValueError("fast-lane phase is invalid")
-    integration = _mapping(state["integration_state"], "scheduler_state.integration_state")
-    _exact_keys(integration, _FAST_LANE_INTEGRATION_FIELDS, "scheduler integration state")
+    integration = _mapping(
+        state["integration_state"], "scheduler_state.integration_state"
+    )
+    _exact_keys(
+        integration, _FAST_LANE_INTEGRATION_FIELDS, "scheduler integration state"
+    )
     integration_state = _fast_lane_integration_state(state)
     lane0 = _mapping(state["lane0_state"], "scheduler_state.lane0_state")
     _exact_keys(lane0, _FAST_LANE_LANE0_FIELDS, "scheduler lane0 state")
@@ -5451,7 +5608,9 @@ def _validated_fast_lane_scheduler_state(
     if active_task_id is not None:
         active_task_id = _task_id(active_task_id, "scheduler lane0 active_task_id")
     owned_write_scopes = _normalised_list(
-        lane0["owned_write_scopes"], "scheduler lane0 owned_write_scopes", _relative_scope,
+        lane0["owned_write_scopes"],
+        "scheduler lane0 owned_write_scopes",
+        _relative_scope,
         maximum=MAX_WRITE_SCOPES,
     )
 
@@ -5494,7 +5653,9 @@ def _validated_fast_lane_scheduler_state(
         if any(record["task_id"] not in task_ids for record in collection):
             raise ValueError("scheduler lifecycle record references an unknown task")
     dispatch_contexts_value = _bounded_records(
-        state["dispatch_contexts"], "scheduler_state.dispatch_contexts", maximum=MAX_MANIFEST_UNITS
+        state["dispatch_contexts"],
+        "scheduler_state.dispatch_contexts",
+        maximum=MAX_MANIFEST_UNITS,
     )
     dispatch_contexts = [
         _validated_fast_lane_dispatch_context(
@@ -5502,7 +5663,9 @@ def _validated_fast_lane_scheduler_state(
         )
         for item in dispatch_contexts_value
     ]
-    context_by_key = {(item["task_id"], item["role"]): item for item in dispatch_contexts}
+    context_by_key = {
+        (item["task_id"], item["role"]): item for item in dispatch_contexts
+    }
     if len(context_by_key) != len(dispatch_contexts):
         raise ValueError("dispatch contexts contain duplicates")
     execution_by_task = {context["task_id"]: context for context in execution_contexts}
@@ -5520,11 +5683,15 @@ def _validated_fast_lane_scheduler_state(
                 raise ValueError("execution dispatch context has no execution context")
             plan = execution_context["bootstrap_plan"]
             target = gates_by_task.get(task_id)
-            expected_target_hash = None if target is None else _sha256_json(
-                {
-                    "driver_gate_id": target["driver_gate_id"],
-                    "target_gates": target["gates"],
-                }
+            expected_target_hash = (
+                None
+                if target is None
+                else _sha256_json(
+                    {
+                        "driver_gate_id": target["driver_gate_id"],
+                        "target_gates": target["gates"],
+                    }
+                )
             )
             if (
                 context["execution_context_hash"] != _sha256_json(execution_context)
@@ -5583,7 +5750,9 @@ def _validated_fast_lane_scheduler_state(
         slot_epochs[slot_id] = epoch
 
     running_value = _bounded_records(
-        state["running_assignments"], "scheduler_state.running_assignments", maximum=len(FAST_LANE_SLOT_IDS)
+        state["running_assignments"],
+        "scheduler_state.running_assignments",
+        maximum=len(FAST_LANE_SLOT_IDS),
     )
     running: list[dict[str, Any]] = []
     seen_slots: set[str] = set()
@@ -5591,36 +5760,46 @@ def _validated_fast_lane_scheduler_state(
     seen_tokens: set[str] = set()
     for index, item in enumerate(running_value):
         assignment = _mapping(item, f"running_assignments[{index}]")
-        _exact_keys(assignment, _FAST_LANE_ASSIGNMENT_FIELDS, f"running_assignments[{index}]")
+        _exact_keys(
+            assignment, _FAST_LANE_ASSIGNMENT_FIELDS, f"running_assignments[{index}]"
+        )
         slot_id = _label(assignment["slot_id"], f"running_assignments[{index}].slot_id")
         if slot_id not in FAST_LANE_SLOT_IDS or slot_id in seen_slots:
             raise ValueError("running assignment slot is invalid or duplicated")
-        task_id = _task_id(assignment["task_id"], f"running_assignments[{index}].task_id")
-        role = _text(assignment["role"], f"running_assignments[{index}].role", maximum=32)
+        task_id = _task_id(
+            assignment["task_id"], f"running_assignments[{index}].task_id"
+        )
+        role = _text(
+            assignment["role"], f"running_assignments[{index}].role", maximum=32
+        )
         if task_id not in task_ids or task_id in seen_tasks:
             raise ValueError("running assignment task is invalid or duplicated")
         epoch = assignment["assignment_epoch"]
         if type(epoch) is not int or epoch <= 0 or epoch != slot_epochs[slot_id]:
             raise ValueError("running assignment epoch is invalid")
         receipt = _validated_fast_lane_dispatch_receipt(assignment["dispatch_receipt"])
-        if receipt["task_id"] != task_id or receipt["role"] != role or receipt["slot_id"] != slot_id or receipt["assignment_epoch"] != epoch:
+        if (
+            receipt["task_id"] != task_id
+            or receipt["role"] != role
+            or receipt["slot_id"] != slot_id
+            or receipt["assignment_epoch"] != epoch
+        ):
             raise ValueError("running assignment receipt does not bind assignment")
         if role not in _FAST_LANE_ROLES:
             raise ValueError("running assignment role is invalid")
         if task_id not in units_by_task_id:
             raise ValueError("running assignment source unit is unknown")
         if (
-            phase == "integration_regression"
-            and role != "verification"
-        ) or (
-            phase in {"blocker_review", "acceptance", "stopped"}
-        ) or (
-            phase == "remediation" and role != "execution"
-        ) or (
-            phase == "execution" and role == "verification"
+            (phase == "integration_regression" and role != "verification")
+            or (phase in {"blocker_review", "acceptance", "stopped"})
+            or (phase == "remediation" and role != "execution")
+            or (phase == "execution" and role == "verification")
         ):
             raise ValueError("running assignment role is invalid for the phase")
-        token = _hash(assignment["assignment_token"], f"running_assignments[{index}].assignment_token")
+        token = _hash(
+            assignment["assignment_token"],
+            f"running_assignments[{index}].assignment_token",
+        )
         if token != _fast_lane_assignment_token(receipt) or token in seen_tokens:
             raise ValueError("running assignment token is invalid or duplicated")
         recovery_of = receipt["recovery_of_assignment_token"]
@@ -5633,7 +5812,9 @@ def _validated_fast_lane_scheduler_state(
             if recovery_of != _fast_lane_assignment_token(predecessor):
                 raise ValueError("running assignment recovery predecessor is invalid")
         context = context_by_key.get((task_id, role))
-        if context is None or context["context_hash"] != _hash(assignment["context_hash"], "running assignment.context_hash"):
+        if context is None or context["context_hash"] != _hash(
+            assignment["context_hash"], "running assignment.context_hash"
+        ):
             raise ValueError("running assignment context is not ledgered")
         if receipt["dispatch_context_hash"] != context["context_hash"]:
             raise ValueError("running assignment receipt context is stale")
@@ -5681,9 +5862,7 @@ def _validated_fast_lane_scheduler_state(
             or receipt["read_context_hash"] != context["read_context_hash"]
         ):
             raise ValueError("running assignment receipt fields disagree")
-        _fast_lane_historical_receipt_route(
-            receipt, source_plan_hash=source_plan_hash
-        )
+        _fast_lane_historical_receipt_route(receipt, source_plan_hash=source_plan_hash)
         normalized_assignment = dict(assignment)
         normalized_assignment.update(
             {
@@ -5699,9 +5878,7 @@ def _validated_fast_lane_scheduler_state(
                 "routing_result_hash": receipt["routing_result_hash"],
                 "task_fingerprint": receipt["task_fingerprint"],
                 "routing_reason_codes": list(receipt["routing_reason_codes"]),
-                "routing_safety_floor_rank": receipt[
-                    "routing_safety_floor_rank"
-                ],
+                "routing_safety_floor_rank": receipt["routing_safety_floor_rank"],
                 "dispatch_receipt": receipt,
             }
         )
@@ -5755,10 +5932,20 @@ def _validated_fast_lane_scheduler_state(
     review_ready_ids = {record["task_id"] for record in review_ready_candidates}
     reviewed_ids = {record["task_id"] for record in reviewed_candidates}
     if active_task_id is not None and active_task_id in (
-        completed_ids | review_ready_ids | reviewed_ids | seen_tasks | set(blocked_task_ids)
+        completed_ids
+        | review_ready_ids
+        | reviewed_ids
+        | seen_tasks
+        | set(blocked_task_ids)
     ):
         raise ValueError("lane 0 and a subagent cannot own the same task")
-    exclusive_sets = [completed_ids, review_ready_ids, reviewed_ids, seen_tasks, set(blocked_task_ids)]
+    exclusive_sets = [
+        completed_ids,
+        review_ready_ids,
+        reviewed_ids,
+        seen_tasks,
+        set(blocked_task_ids),
+    ]
     for index, left in enumerate(exclusive_sets):
         for right in exclusive_sets[index + 1 :]:
             if left.intersection(right):
@@ -5768,31 +5955,65 @@ def _validated_fast_lane_scheduler_state(
     if prewarmed_ids.intersection(design_ids):
         raise ValueError("prewarm and design evidence overlap")
 
-    global_state = _mapping(state["global_remediation"], "scheduler_state.global_remediation")
-    _exact_keys(global_state, _FAST_LANE_GLOBAL_REMEDIATION_FIELDS, "global remediation")
+    global_state = _mapping(
+        state["global_remediation"], "scheduler_state.global_remediation"
+    )
+    _exact_keys(
+        global_state, _FAST_LANE_GLOBAL_REMEDIATION_FIELDS, "global remediation"
+    )
     round_value = global_state["round"]
     if type(round_value) is not int or round_value not in {0, 1}:
         raise ValueError("global remediation round is invalid")
     global_state_normalized = dict(global_state)
-    remediation_state = _text(global_state["state"], "global remediation.state", maximum=32)
-    if remediation_state not in {"not_requested", "approved", "running", "completed", "stopped"}:
+    remediation_state = _text(
+        global_state["state"], "global remediation.state", maximum=32
+    )
+    if remediation_state not in {
+        "not_requested",
+        "approved",
+        "running",
+        "completed",
+        "stopped",
+    }:
         raise ValueError("global remediation state is invalid")
     global_state_normalized["state"] = remediation_state
     if round_value == 0:
-        if any(global_state[key] is not None for key in ("task_id", "blocker_review_hash", "finding_hash", "dispatch_receipt", "completion_receipt_hash")) or global_state["affected_task_ids"]:
+        if (
+            any(
+                global_state[key] is not None
+                for key in (
+                    "task_id",
+                    "blocker_review_hash",
+                    "finding_hash",
+                    "dispatch_receipt",
+                    "completion_receipt_hash",
+                )
+            )
+            or global_state["affected_task_ids"]
+        ):
             raise ValueError("round-zero remediation state must be empty")
     else:
         if remediation_state == "not_requested":
             raise ValueError("round-one remediation state is not requested")
-        task_id = _text(global_state["task_id"], "global remediation.task_id", maximum=32)
+        task_id = _text(
+            global_state["task_id"], "global remediation.task_id", maximum=32
+        )
         if remediation is None or task_id != remediation["task_id"]:
             raise ValueError("global remediation request is missing")
         global_state_normalized["task_id"] = task_id
         global_state_normalized["affected_task_ids"] = _normalised_list(
-            global_state["affected_task_ids"], "global remediation.affected_task_ids", _task_id, required=True
+            global_state["affected_task_ids"],
+            "global remediation.affected_task_ids",
+            _task_id,
+            required=True,
         )
-        global_state_normalized["blocker_review_hash"] = _hash(global_state["blocker_review_hash"], "global remediation.blocker_review_hash")
-        global_state_normalized["finding_hash"] = _hash(global_state["finding_hash"], "global remediation.finding_hash")
+        global_state_normalized["blocker_review_hash"] = _hash(
+            global_state["blocker_review_hash"],
+            "global remediation.blocker_review_hash",
+        )
+        global_state_normalized["finding_hash"] = _hash(
+            global_state["finding_hash"], "global remediation.finding_hash"
+        )
         if (
             global_state_normalized["affected_task_ids"]
             != remediation["affected_task_ids"]
@@ -5814,7 +6035,9 @@ def _validated_fast_lane_scheduler_state(
                 or global_state["completion_receipt_hash"] is not None
                 or running_remediation is not None
             ):
-                raise ValueError("approved remediation must not carry execution evidence")
+                raise ValueError(
+                    "approved remediation must not carry execution evidence"
+                )
         elif remediation_state == "running":
             if global_state["completion_receipt_hash"] is not None:
                 raise ValueError("running remediation cannot carry completion evidence")
@@ -5855,7 +6078,9 @@ def _validated_fast_lane_scheduler_state(
                 or global_state["completion_receipt_hash"] is not None
                 or running_remediation is not None
             ):
-                raise ValueError("stopped remediation must not carry execution evidence")
+                raise ValueError(
+                    "stopped remediation must not carry execution evidence"
+                )
 
     has_persisted_state = bool(
         completed_tasks
@@ -5880,7 +6105,10 @@ def _validated_fast_lane_scheduler_state(
             "source_plan_hash": None if source_state_hash is None else source_plan_hash,
             "phase": phase,
             "integration_state": integration_state,
-            "lane0_state": {"active_task_id": active_task_id, "owned_write_scopes": owned_write_scopes},
+            "lane0_state": {
+                "active_task_id": active_task_id,
+                "owned_write_scopes": owned_write_scopes,
+            },
             "completed_tasks": completed_tasks,
             "review_ready_candidates": review_ready_candidates,
             "reviewed_candidates": reviewed_candidates,
@@ -6189,9 +6417,7 @@ def _fast_lane_host_slot_occupancy_audit(
         if binding["workflow_id"] != workflow or binding["state"] != "running":
             continue
         try:
-            assignment_task_id = _task_id(
-                assignment["task_id"], "assignment.task_id"
-            )
+            assignment_task_id = _task_id(assignment["task_id"], "assignment.task_id")
             assignment_epoch = assignment["assignment_epoch"]
             assignment_token = _hash(
                 assignment["assignment_token"], "assignment.assignment_token"
@@ -6202,7 +6428,8 @@ def _fast_lane_host_slot_occupancy_audit(
             receipt = _mapping(assignment["dispatch_receipt"], "dispatch receipt")
             receipt_token = _fast_lane_assignment_token(receipt)
             receipt_context_hash = _hash(
-                receipt["dispatch_context_hash"], "dispatch receipt.dispatch_context_hash"
+                receipt["dispatch_context_hash"],
+                "dispatch receipt.dispatch_context_hash",
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -6266,8 +6493,7 @@ def _validated_fast_lane_routing_entry(value: object, field: str) -> dict[str, A
     _reject_sensitive_or_absolute_text(request_text, f"{field}.request")
     compatibility_floor = entry["compatibility_floor"]
     if compatibility_floor is not None and (
-        type(compatibility_floor) is not int
-        or not 10 <= compatibility_floor <= 110
+        type(compatibility_floor) is not int or not 10 <= compatibility_floor <= 110
     ):
         raise ValueError(f"{field}.compatibility_floor is invalid")
     return {
@@ -6530,7 +6756,9 @@ def _fast_lane_assignment_output(
         "execution_context_hash": execution_context_hash,
         "read_context_hash": read_context_hash,
         "workspace_input_snapshot_id": context["workspace_input_snapshot_id"],
-        "read_base_commit": context["integration_commit"] if role != "execution" else None,
+        "read_base_commit": context["integration_commit"]
+        if role != "execution"
+        else None,
         "read_tree": context["integration_tree"] if role != "execution" else None,
         "base_commit": context["base_commit"],
         "bootstrap_plan_hash": context["bootstrap_plan_hash"],
@@ -6549,7 +6777,9 @@ def _fast_lane_assignment_output(
         "task_node_ids": list(context["task_node_ids"]),
         "contract_node_ids": list(context["contract_node_ids"]),
         "acceptance_constraints": list(context["acceptance_constraints"]),
-        "driver_gate_id": None if role_target is None else role_target["driver_gate_id"],
+        "driver_gate_id": None
+        if role_target is None
+        else role_target["driver_gate_id"],
         "target_gates": [] if role_target is None else list(role_target["gates"]),
         "candidate_commit": context["candidate_commit"],
         "basis_hash": context["basis_hash"],
@@ -6582,17 +6812,30 @@ def _fast_lane_queue_item(
 def _fast_lane_queues(
     validated: Mapping[str, Any],
     assignments: Sequence[Mapping[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     source_plan = validated["source_plan"]
     units = _fast_lane_unit_index(source_plan)
     state = validated["scheduler_state"]
     completed = _fast_lane_completed_ids(state)
     blocked = frozenset(state.get("blocked_task_ids", []))
-    running = {assignment["task_id"] for assignment in state.get("running_assignments", [])}
-    candidates = {record["task_id"] for record in state.get("review_ready_candidates", [])}
+    running = {
+        assignment["task_id"] for assignment in state.get("running_assignments", [])
+    }
+    candidates = {
+        record["task_id"] for record in state.get("review_ready_candidates", [])
+    }
     reviewed = {record["task_id"] for record in state.get("reviewed_candidates", [])}
-    read_contexts = {(context["task_id"], context["role"]) for context in validated["read_contexts"]}
-    assigned_keys = {(assignment["task_id"], assignment["role"]) for assignment in assignments}
+    read_contexts = {
+        (context["task_id"], context["role"]) for context in validated["read_contexts"]
+    }
+    assigned_keys = {
+        (assignment["task_id"], assignment["role"]) for assignment in assignments
+    }
     assigned_task_ids = {task_id for task_id, _ in assigned_keys}
     phase = state["phase"]
     if phase == "integration_regression":
@@ -6600,7 +6843,8 @@ def _fast_lane_queues(
             _fast_lane_queue_item(validated, unit, "verification", route)
             for task_id, unit in sorted(units.items())
             if unit.get("unit_kind") == "verification"
-            and task_id not in completed | blocked | frozenset(running) | assigned_task_ids
+            and task_id
+            not in completed | blocked | frozenset(running) | assigned_task_ids
             and _fast_lane_dependency_ready(unit, completed)
             and (task_id, "verification") in read_contexts
             and (
@@ -6616,7 +6860,8 @@ def _fast_lane_queues(
             _fast_lane_queue_item(validated, unit, "execution", route)
             for task_id, unit in sorted(units.items())
             if unit.get("unit_kind") == "remediation"
-            and task_id not in completed | blocked | frozenset(running) | assigned_task_ids
+            and task_id
+            not in completed | blocked | frozenset(running) | assigned_task_ids
             and _fast_lane_dependency_ready(unit, completed)
             and (
                 route := _fast_lane_route(
@@ -6644,11 +6889,7 @@ def _fast_lane_queues(
             frozenset(reviewed),
             conflict_graph=graph,
         )
-        if (
-            route := _fast_lane_route(
-                validated["routing_context"], unit, "execution"
-            )
-        )
+        if (route := _fast_lane_route(validated["routing_context"], unit, "execution"))
         is not None
         and unit["task_id"] not in assigned_task_ids
     ]
@@ -6808,7 +7049,9 @@ def _render_fast_lane_status(
         "invalidated_evidence_task_ids": _fast_lane_invalidated_evidence_task_ids(
             validated
         ),
-        "idle_slots": list(idle_slots) if idle_slots is not None else _fast_lane_idle_slots(
+        "idle_slots": list(idle_slots)
+        if idle_slots is not None
+        else _fast_lane_idle_slots(
             idle_reason, [assignment["slot_id"] for assignment in running_assignments]
         ),
         "refill_plan": _fast_lane_refill_plan(),
@@ -6901,7 +7144,10 @@ def _render_fast_lane_plan(
             planned_assignments=[],
             idle_slots=_fast_lane_idle_slots("TERMINAL_PHASE_OWNED_BY_LANE0"),
         )
-    if validated["scheduler_state"]["running_assignments"] or validated["execution_contexts"]:
+    if (
+        validated["scheduler_state"]["running_assignments"]
+        or validated["execution_contexts"]
+    ):
         actions, idle_slots = _fast_lane_build_schedule(validated, activation)
         if actions:
             return _render_fast_lane_status(
@@ -6913,7 +7159,7 @@ def _render_fast_lane_plan(
                 next_action="adjudicate_and_integrate",
                 planned_assignments=actions,
                 idle_slots=idle_slots,
-        )
+            )
         lane0_scopes = validated["scheduler_state"]["lane0_state"]["owned_write_scopes"]
         source_units = validated["source_plan"].get("units", [])
         if lane0_scopes and any(
@@ -6956,9 +7202,11 @@ def _render_fast_lane_plan(
             idle_slots=_fast_lane_idle_slots(reason),
         )
     contexts = validated["execution_contexts"]
-    has_execution_contexts = isinstance(contexts, Sequence) and not isinstance(
-        contexts, (str, bytes, bytearray)
-    ) and bool(contexts)
+    has_execution_contexts = (
+        isinstance(contexts, Sequence)
+        and not isinstance(contexts, (str, bytes, bytearray))
+        and bool(contexts)
+    )
     return _render_fast_lane_status(
         validated,
         activation,
@@ -6996,11 +7244,7 @@ def _codex_account_quota_module() -> Any:
 
 
 def _utc_now_z() -> str:
-    return (
-        datetime.now(UTC)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _unavailable_quota_key(_key_id: str) -> bytes | None:
@@ -7267,9 +7511,7 @@ def _fast_lane_cross_session_projection(
 
     source_plan_hash = _hash(result["source_plan_hash"], "source plan hash")
     local_active_count = (
-        None
-        if occupancy is None
-        else len(occupancy.get("active_slot_ids", ()))
+        None if occupancy is None else len(occupancy.get("active_slot_ids", ()))
     )
     local_free = (
         None
@@ -7543,15 +7785,11 @@ def compile_fast_lane(
 ) -> dict[str, Any]:
     activation = _fast_lane_activation(reasoning_effort, enable)
     status = (
-        None
-        if host_status is None
-        else _validated_fast_lane_host_status(host_status)
+        None if host_status is None else _validated_fast_lane_host_status(host_status)
     )
     validated = _validated_fast_lane_request(
         request,
-        host_routing_context=(
-            None if status is None else status["routing_context"]
-        ),
+        host_routing_context=(None if status is None else status["routing_context"]),
     )
     occupancy: dict[str, Any] | None = None
     if status is not None:
