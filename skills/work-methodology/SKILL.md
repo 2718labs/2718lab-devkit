@@ -116,6 +116,12 @@ prewarm 始终是独立的只读证据角色，不能变为 execution。
 
 host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后（only after a terminal event）refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。
 
+额度遥测走同一条 host-private inherited-handle bridge，不走环境变量、文件邮箱或公开 MCP tool：先发送
+`kind="quota_snapshot_request"`（`host-quota-snapshot-request-v1`），再接收绑定同一
+`request_id` 的 `kind="quota_snapshot"`（`host-quota-snapshot-response-v1`）。响应内层必须是
+`host-quota-snapshot-v1`，并由 `fastlane_quota_balance` 继续验证快照哈希、签名、租约世代与
+120 秒 freshness；bridge 缺失、错绑或异常时保持 `usage_unknown`，不得猜测当前账户百分比。
+
 若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。
 
 归档不是 adapter 操作：只能在 lane 0 已完成 acceptance、最终证据已绑定之后由 host 执行。

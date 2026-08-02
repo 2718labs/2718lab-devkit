@@ -510,6 +510,57 @@ def test_inherited_handle_bridge_frames_authenticates_sequences_and_recovers_del
         host.close()
 
 
+def test_inherited_handle_bridge_round_trips_a_quota_snapshot_request() -> None:
+    child, host = _pipe_pair()
+    snapshot = {
+        "schema": "2718lab-devkit/host-quota-snapshot-v1",
+        "snapshot_hash": "sha256:" + "a" * 64,
+        "signature": {"algorithm": "hmac-sha256", "key_id": "sha256:" + "b" * 64},
+    }
+    try:
+        child.request_quota_snapshot(request_id="quota-epoch-1")
+        request = host.receive()
+        assert request.kind == "quota_snapshot_request"
+        assert request.action_id == "quota-epoch-1"
+        assert request.payload == {
+            "schema": "2718lab-devkit/host-quota-snapshot-request-v1",
+            "request_id": "quota-epoch-1",
+        }
+
+        host.send_private(
+            kind="quota_snapshot",
+            action_id="quota-epoch-1",
+            payload={
+                "schema": "2718lab-devkit/host-quota-snapshot-response-v1",
+                "snapshot": snapshot,
+            },
+        )
+        assert child.receive_quota_snapshot(request_id="quota-epoch-1") == snapshot
+    finally:
+        child.close()
+        host.close()
+
+
+def test_inherited_handle_bridge_rejects_an_unbound_quota_snapshot_response() -> None:
+    child, host = _pipe_pair()
+    try:
+        host.send_private(
+            kind="quota_snapshot",
+            action_id="quota-epoch-foreign",
+            payload={
+                "schema": "2718lab-devkit/host-quota-snapshot-response-v1",
+                "snapshot": {},
+            },
+        )
+        with pytest.raises(HostBridgeError) as caught:
+            child.receive_quota_snapshot(request_id="quota-epoch-1")
+        assert caught.value.code == "HOST_BRIDGE_QUOTA_INVALID"
+        assert child.is_available is False
+    finally:
+        child.close()
+        host.close()
+
+
 def test_inherited_handle_bridge_rejects_bad_frame_mac_and_sequence() -> None:
     child, host = _pipe_pair()
     try:
