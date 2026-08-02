@@ -25,15 +25,15 @@ jobs:
       run:
         working-directory: mcp-tools
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Prepare task-local runtime storage
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           mkdir -p "$CODEX_TASK_TEMP" "$TEMP" "$PYTHONPYCACHEPREFIX" "$UV_CACHE_DIR"
-
-      - name: Check out repository
-        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
