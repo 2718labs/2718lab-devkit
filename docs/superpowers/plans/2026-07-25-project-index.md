@@ -81,6 +81,7 @@
 - [ ] Run the complete MCP and methodology tests with D-drive task temp.
 - [ ] Run Bugkiller, MCP, and Codex plugin validators.
 - [ ] Sync the exact files to long-term and marketplace sources.
-- [ ] Reinstall `2718lab-devkit@<marketplace-name>` and repeat verification from
+- [ ] Reinstall `2718lab-devkit@pidan-local-plugins` and repeat verification from
   the installed cache.
 - [ ] Do not commit, push, create a PR, or publish a separate repository.
+

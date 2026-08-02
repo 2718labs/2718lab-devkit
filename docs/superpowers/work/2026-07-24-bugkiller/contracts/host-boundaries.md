@@ -28,7 +28,4 @@ Plugin agents are `agents/*.md` files with YAML front matter and Markdown instru
 
 ## Storage
 
-Use explicit `DEVKIT_HOME`, then legacy `BUGKILLER_HOME`, then `PLUGIN_DATA`,
-then `CODEX_HOME/2718lab-devkit`. Reject plugin cache/repository paths and
-unsafe permissions. Current task scratch remains under a task-scoped
-`CODEX_TASK_TEMP` outside the repository.
+Use explicit `BUGKILLER_HOME`, then `PLUGIN_DATA`, then `CODEX_HOME/bugkiller`. Reject plugin cache/repository paths and unsafe permissions. Current task scratch remains under `D:\bun\tmp\codex\bugkiller-plugin`.

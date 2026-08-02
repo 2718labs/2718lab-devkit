@@ -1,78 +1,75 @@
-# Team 形状与调度
+# Team Shapes and Routing
 
-审查不是默认 team 成员。先按依赖关系分派执行；只有命中危险门禁且用户同意，才增加 reviewer 或高成本模型。
+Sol owns architecture, decomposition, dispatch, review, integration, and final
+acceptance. Execute in parallel only when cards have disjoint write scopes;
+same-path work queues behind the active owner.
 
-这些角色供全部领域 skill 使用，不由 Bugkiller 独占：
+## Current host policy
 
-- 低成本分诊派发 `2718lab-triage`；
-- 调查与接地派发只读 `2718lab-investigator`；
-- 文档写入派发 `2718lab-doc-writer`，永不写代码；
-- 代码写入派发 `2718lab-code-writer`，模型 `gpt-5.6-sol`、推理 `ultra`；
-- 独立验证派发只读 `2718lab-verifier`；
-- 危险审查使用只读 `2718lab-risk-reviewer`，普通任务不自动增加它或 reviewer。
+- Terra High (`gpt-5.6-terra`, `high`) handles routine, bounded coding,
+  testing, debugging, documentation, investigation, and validation.
+- Terra Max (`gpt-5.6-terra`, `max`) handles moderately complex or harder
+  implementation, integration, refactoring, security-sensitive work, and
+  difficult regressions.
+- Sol High (`gpt-5.6-sol`, `high`) is only for explicit exceptional bounded
+  execution or deep investigation. Sol still owns final acceptance.
+- Luna (`gpt-5.6-luna`, `low`/`medium`/`high`/`xhigh`) is eligible only when
+  the current Codex host capability report attests the exact requested pair;
+  otherwise the route is unavailable and no model is silently substituted. A
+  request without an effort uses the profile's `medium` default only when that
+  exact pair is attested. This shared Codex host policy does not alter
+  Bugkiller, which remains a separate policy surface.
+- Claude routes are Opus coordinator, Sonnet code worker, Haiku light worker,
+  and Fable only as an explicitly reasoned powerful/expensive escalation.
 
-任务卡同时指定领域 skill 与角色。角色限制权限，领域 skill 提供 AstrBot、MCP、
-Python、开源交付或缺陷处理的事实与验收规则。
+## Fast Lane v3 worker selection
 
-## Team 形状
+Fast Lane does not promote the host policy above into a fixed scheduler table.
+For each `(task_id, scheduler_role)`, the host attests a complete routing-core
+request; the adapter may emit only the core-resolved, exact model/effort pair
+and its bounded route receipt. A missing, duplicate, unknown, mismatched, or
+capability-unavailable entry has no `recommended_route` fallback and makes the
+entire dispatch matrix `NO_SAFE_WORK`, with no worker assignment or queue. This permits an exactly attested Luna pair where appropriate
+while preserving Terra and Sol safety floors without scheduler-side guessing.
 
-### 探索型
+`ultra` is lane-0 activation, never a worker effort. Sol High remains the
+exceptional worker ceiling at `high`; prewarm is a read-only evidence role, not
+an execution role. Route receipts bind the dispatch event and historical core
+input so later lease/capability facts cannot rewrite an already-issued task.
+The host archives only after Sol acceptance and final evidence binding, and all
+task temporary roots stay below `D:\bun\tmp\codex\<project-or-thread>` rather
+than a C-drive temporary directory.
 
-适用：根因或代码位置不清楚。
+No execution worker merges another task, changes a sibling scope, or accepts
+its own task. A candidate commit and evidence always return to Sol.
 
-- 每个探索员只负责一个目录、子系统或假设，全部只读。
-- 汇总由主代理完成；探索员之间不共享可变状态。
-- 每个探索任务使用独立任务卡，避免把全仓上下文复制给所有代理。
+## GitHub-style local flow
 
-### 扇出实现型
+`task card + base revision -> isolated task branch/worktree -> scoped commit +
+evidence -> Sol review -> ordered integration/rebase -> CI gate -> release gate`
 
-适用：两个以上任务有不重叠写入范围，且共享接口已经稳定。
+This is local Git discipline, not remote-push or pull-request authorization.
+The integration record names candidate/source commit, base revision, accepted
+evidence hash, and integration order.
 
-- 每张任务卡只有一个 owner 和一个明确 write scope。
-- 共享类型/API 放入一个小型 contract，任务卡只链接它。
-- 有共享可变文件或顺序依赖时不得并行写入。
+## Durable MCP handoff
 
-### 方案比选型
+The source of truth is the task-owned artifact, not direct chat:
 
-适用：存在多个可行路线，选择条件尚未明确。
+`workflow_artifact_register -> workflow_message_send -> workflow_inbox ->
+workflow_artifact_resolve -> workflow_message_ack`
 
-- 每条路线一张只读任务卡，要求给出适用边界和最小证据。
-- 主代理依据用户目标裁决，不默认增加红队。
-- 若路线涉及安全、数据或不可逆副作用，先进入危险门禁询问用户。
+Use `collaboration.send_message` only as a compact wake-up after durable
+delivery. It never grants task context, write scope, integration, or acceptance.
 
-### 危险审查型
-
-仅适用：安全、权限、凭据、数据删除/迁移、生产发布、远程写入或其他不可逆风险，并且用户明确同意审查。
-
-- reviewer 只读，不修改实现。
-- reviewer 只接收风险说明、最终 diff、验证证据和相关 contract。
-- 审查完成后仍回到用户门禁；审查结论不自动授权外部动作。
-
-## Dispatch 模板
+## Dispatch template
 
 ```text
-角色：<探索/实现/验证/危险审查>
-任务卡：<绝对路径>/tasks/<id>.md
-只读契约：<任务卡直接链接的 contracts，可为空>
-允许写入：<精确文件/目录；只读任务写 none>
-验收：<精确命令和通过条件>
-禁止：不要读取 sibling task cards；不要修改 write scope 外文件；不要回滚他人变化。
-回传：改动文件、真实命令与输出、结论、阻塞项。
+Role: <Luna | Terra High | Terra Max | Sol High>
+Task card: <absolute path>/tasks/<id>.md
+Base revision: <commit>
+Write scope: <exact files or directories>
+Acceptance: <exact commands and expected result>
+Return: scoped candidate commit, evidence hash, blockers.
+Forbidden: sibling changes, direct merge/rebase, unreviewed acceptance.
 ```
-
-任务卡本身承载详细上下文。dispatch 不复制任务卡全文，也不附带总设计文档。
-
-## 调度规则
-
-1. 主代理只加载 `index.md`、当前 wave 的卡片标题和必要 contract。
-2. 执行代理只加载自己的卡片及其中显式链接的 contract。
-3. 新发现的跨任务约束先写入 contract，再通知受影响 owner；不要把全部历史广播给所有代理。
-4. 代理完成后，把状态和结果摘要写回 index；完整日志留在任务证据目录。
-5. 低风险任务依赖测试和真实调用验证，不依赖自动 reviewer。
-
-## Token 经济学
-
-- 一次读改验证可完成的任务不开 team。
-- 强耦合任务串行执行，不做伪并行。
-- 不提前写所有未来 wave 的详细卡片；只为 ready/in-progress 任务建卡。
-- 不让协调代理读取全部实现细节，不让执行代理读取完整产品历史。

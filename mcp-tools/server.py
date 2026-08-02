@@ -1,303 +1,475 @@
-"""2718lab-tools —— 2718lab-devkit 捆绑的 MCP 服务器(真·程序部分)。
+"""The locked 16-tool stdio surface for the 2718lab DevKit runtime."""
 
-把 devkit 里的几个校验脚本包装成 Claude 可直接调用的 MCP 工具:发布自检、
-AstrBot 插件校验、MCP server 校验、Python 工程骨架校验。
+from __future__ import annotations
 
-用法:由插件的 .mcp.json 以 stdio 方式拉起(python server.py)。
-依赖:官方 MCP Python SDK —— `pip install mcp`(或 `uv pip install mcp`)。
-
-框架保真:本文件遵循 mcp-server-dev skill 的 (A) 包规范 ——
-`from mcp.server.fastmcp import FastMCP`、装饰器带括号 `@mcp.tool()`、
-工具 schema 由函数类型注解生成(不是 AstrBot 的 docstring Args 约定),
-stdio 模式下不得写标准输出(stdout 是协议通道),日志走 stderr。
-"""
-
-import hashlib
-import json
-import os
-import sqlite3
-import subprocess
-import sys
-from contextlib import contextmanager
-from dataclasses import fields, is_dataclass
-from datetime import UTC, datetime
-from enum import Enum
+import atexit
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Mapping
+from typing import Literal, Protocol, TypeVar, cast
 
-from bugkiller.policy import route_case
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from orchestrator.adapters import detect_repository
-from orchestrator.approval_service import ApprovalEffectService
-from orchestrator.approvals import ApprovalError, ApprovalManifest
-from orchestrator.models import Task, Workflow, WorkflowKind
-from orchestrator.service import OrchestratorService, ServiceError
-from orchestrator.store import SQLiteStore
-from project_index import IndexError as ProjectIndexError
-from project_index import ProjectIndexService
-from project_index.checkpoints import CheckpointService
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-# server.py 在 <plugin_root>/mcp-tools/ 下;插件根 = 上一级,skills 脚本在其下
+from devkit_relay.compiler import compile_plan
+from devkit_relay.service import RelayService
+from devkit_runtime.composition import RuntimeRoot
+from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
+from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
+from devkit_runtime.tool_result import (
+    TOOL_ANNOTATIONS,
+    ResultContractError,
+    envelope_failure,
+    result_from_exception,
+)
+from devkit_runtime.uow import RuntimeUnitOfWork
+from project_index.checkpoints import WorkspaceOwnership
+
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-SKILLS = PLUGIN_ROOT / "skills"
+mcp = FastMCP(name="2718lab-devkit")
 
-mcp = FastMCP(name="2718lab-tools")
-_READ_ONLY = ToolAnnotations(
-    readOnlyHint=True,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
+
+class _StrictModel(BaseModel):
+    """MCP request records reject unknown fields before entering a runtime UoW."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, strict=True)
+
+
+class TaskLeaseRef(_StrictModel):
+    """The exact public lease tuple; it never carries a root or a capability."""
+
+    workflow_id: str
+    task_id: str
+    owner: str
+    lease_epoch: int
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> TaskLeaseRef:
+        if (
+            not self.workflow_id.strip()
+            or not self.task_id.strip()
+            or not self.owner.strip()
+            or self.lease_epoch < 1
+        ):
+            raise ValueError("invalid task lease")
+        return self
+
+
+class RelayCompileRequest(_StrictModel):
+    schema_: Literal["2718lab-devkit/relay-compile-request-v1"] = Field(alias="schema")
+    workflow_id: str
+    workspace_id: str
+    input_snapshot_id: str
+    base_commit: str
+    capacity: int
+    tasks: list[dict[str, object]]
+
+
+class RelayStartCreateRequest(_StrictModel):
+    mode: Literal["create"]
+    plan: dict[str, object]
+    idempotency_key: str
+
+
+class RelayStartRefillRequest(_StrictModel):
+    mode: Literal["refill"]
+    workflow_id: str
+    refill_directive_id: str
+    expected_schedule_version: int
+    idempotency_key: str
+
+
+class _RelayLifecycleRequest(_StrictModel):
+    workflow_id: str
+    task_id: str
+    epoch: int
+    endpoint: str
+    expected_task_version: int
+    capability: str
+
+
+class RelayBindEndpointRequest(_RelayLifecycleRequest):
+    action: Literal["bind_endpoint"]
+
+
+class RelayHeartbeatRequest(_RelayLifecycleRequest):
+    action: Literal["heartbeat"]
+
+
+class RelayEvidenceRequest(_RelayLifecycleRequest):
+    action: Literal["evidence"]
+    evidence: dict[str, object]
+
+
+class RelayTerminalRequest(_RelayLifecycleRequest):
+    action: Literal["terminal"]
+    outcome: object
+
+
+class RelayCandidateHandoffRequest(_RelayLifecycleRequest):
+    action: Literal["candidate_handoff"]
+    candidate: dict[str, object]
+
+
+class RelayApproveReadonlyRequest(_RelayLifecycleRequest):
+    action: Literal["approve_readonly"]
+
+
+class RelayReviewRequest(_RelayLifecycleRequest):
+    action: Literal["review"]
+    candidate_id: str
+    review_digest: str
+
+
+class RelayRebaseRequest(_RelayLifecycleRequest):
+    action: Literal["rebase"]
+    candidate_id: str
+    base_commit: str
+    head_commit: str
+    diff_hash: str
+    evidence_hashes: list[str]
+
+
+class RelayRejectRequest(_RelayLifecycleRequest):
+    action: Literal["reject"]
+    candidate_id: str
+
+
+class RelayIntegrateRequest(_RelayLifecycleRequest):
+    action: Literal["integrate"]
+    candidate_id: str
+    integration_proof_id: str
+
+
+RelayStartRequest = RelayStartCreateRequest | RelayStartRefillRequest
+RelayHandoffRequest = (
+    RelayBindEndpointRequest
+    | RelayHeartbeatRequest
+    | RelayEvidenceRequest
+    | RelayTerminalRequest
+    | RelayCandidateHandoffRequest
 )
-_DESTRUCTIVE_JOURNAL_MUTATION = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=True,
-    idempotentHint=False,
-    openWorldHint=False,
-)
-_IDEMPOTENT_MUTATION = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
+RelayIntegrationRequest = (
+    RelayApproveReadonlyRequest
+    | RelayReviewRequest
+    | RelayRebaseRequest
+    | RelayRejectRequest
+    | RelayIntegrateRequest
 )
 
 
-class RuntimeContractError(RuntimeError):
-    """Stable runtime boundary failure returned through JSON tool envelopes."""
+class _TaskLeaseAuthority(Protocol):
+    """Host-private task authority injected by an embedding process when present."""
 
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
+    def ownership_for(
+        self, task_lease: TaskLeaseRef, *, workspace_id: str
+    ) -> WorkspaceOwnership: ...
+
+    def bind_output_snapshot(
+        self, task_lease: TaskLeaseRef, *, workspace_id: str, snapshot: object
+    ) -> None: ...
+
+    def record_query_receipt(
+        self, task_lease: TaskLeaseRef, *, workspace_id: str, result: object
+    ) -> None: ...
+
+
+class _RequestError(ValueError):
+    """A bounded, public request failure raised before a persistent operation."""
+
+    def __init__(self, code: str) -> None:
         self.code = code
+        super().__init__(code)
 
 
-def _resolve_data_root() -> Path:
-    """Resolve the durable data root without falling back into plugin source."""
-    if os.environ.get("DEVKIT_HOME"):
-        candidate = Path(os.environ["DEVKIT_HOME"])
-    elif os.environ.get("BUGKILLER_HOME"):
-        candidate = Path(os.environ["BUGKILLER_HOME"])
-    elif os.environ.get("PLUGIN_DATA"):
-        candidate = Path(os.environ["PLUGIN_DATA"])
-    elif os.environ.get("CODEX_HOME"):
-        candidate = Path(os.environ["CODEX_HOME"]) / "2718lab-devkit"
-    else:
-        candidate = Path.home() / ".codex" / "data" / "2718lab-devkit"
+_TModel = TypeVar("_TModel", bound=BaseModel)
+_RUNTIME_ROOT: RuntimeRoot | None = None
+_TASK_LEASE_AUTHORITY: _TaskLeaseAuthority | None = None
 
-    resolved = candidate.expanduser().resolve()
-    plugin_root = PLUGIN_ROOT.resolve()
-    if resolved == plugin_root or plugin_root in resolved.parents:
-        raise RuntimeContractError(
-            "DATA_ROOT_INVALID", "plugin source cannot be used as data storage"
-        )
-    folded_parts = tuple(part.casefold() for part in resolved.parts)
-    if any(
-        folded_parts[index : index + 2] == ("plugins", "cache")
-        for index in range(max(0, len(folded_parts) - 1))
+
+def _tool_annotations(name: str) -> ToolAnnotations:
+    read_only, destructive, idempotent, open_world = TOOL_ANNOTATIONS[name]
+    return ToolAnnotations(
+        readOnlyHint=read_only,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=open_world,
+    )
+
+
+def _default_runtime_root() -> RuntimeRoot:
+    """Create the pure process root; bootstrap is deliberately never implicit."""
+
+    return RuntimeRoot(RuntimeConfig.load(protected_roots=(PLUGIN_ROOT,)))
+
+
+def _runtime_root() -> RuntimeRoot:
+    global _RUNTIME_ROOT
+    if _RUNTIME_ROOT is None:
+        _RUNTIME_ROOT = _default_runtime_root()
+    return _RUNTIME_ROOT
+
+
+def _install_runtime_root_for_host(root: RuntimeRoot) -> None:
+    """Private embedding seam for a host-injected broker or proof resolver."""
+
+    if not isinstance(root, RuntimeRoot):
+        raise TypeError("root must be a RuntimeRoot")
+    global _RUNTIME_ROOT
+    previous = _RUNTIME_ROOT
+    _RUNTIME_ROOT = root
+    if previous is not None and previous is not root:
+        previous.shutdown()
+
+
+def _install_task_lease_authority_for_host(authority: _TaskLeaseAuthority) -> None:
+    """Install a private verifier without adding a public workflow surface."""
+
+    global _TASK_LEASE_AUTHORITY
+    _TASK_LEASE_AUTHORITY = authority
+
+
+def _shutdown_runtime() -> None:
+    root = _RUNTIME_ROOT
+    if root is not None:
+        root.shutdown()
+
+
+atexit.register(_shutdown_runtime)
+
+
+def _failure(code: str) -> dict[str, object]:
+    return envelope_failure(code)
+
+
+def _runtime_failure(
+    error: RuntimeConfigError | RelayRuntimeError,
+) -> dict[str, object]:
+    if isinstance(error, RuntimeConfigError):
+        if error.code in {"DATA_ROOT_INVALID", "DATA_ROOT_UNAVAILABLE"}:
+            return _failure(error.code)
+        return _failure("INTERNAL_ERROR")
+    if error.code == "RELAY_STORAGE_ERROR":
+        return _failure("STORAGE_ERROR")
+    if error.code in {"RELAY_REQUEST_INVALID", "RELAY_CAPABILITY_BROKER_UNAVAILABLE"}:
+        return _failure(error.code)
+    return _failure("INTERNAL_ERROR")
+
+
+def _invoke(
+    tool_name: str,
+    *,
+    read_only: bool,
+    invalid_code: str = "INVALID_REQUEST",
+    operation: Callable[[RuntimeUnitOfWork], object],
+) -> dict[str, object]:
+    """Run one operation inside a fresh UoW and project its exact result."""
+
+    try:
+        with _runtime_root().open_uow(read_only=read_only) as uow:
+            return uow.tool_results.project(tool_name, operation(uow))
+    except _RequestError as error:
+        return _failure(error.code)
+    except (RuntimeConfigError, RelayRuntimeError) as error:
+        return _runtime_failure(error)
+    except ResultContractError:
+        return _failure("INTERNAL_ERROR")
+    except Exception as error:
+        return result_from_exception(error, invalid_code=invalid_code)
+
+
+def _parse_model(value: object, model: type[_TModel], *, code: str) -> _TModel:
+    try:
+        if isinstance(value, model):
+            return value
+        return model.model_validate(value)
+    except ValidationError as error:
+        raise _RequestError(code) from error
+
+
+def _task_lease(value: TaskLeaseRef | None) -> TaskLeaseRef | None:
+    if value is None:
+        return None
+    return _parse_model(value, TaskLeaseRef, code="INVALID_REQUEST")
+
+
+def _model_payload(value: BaseModel) -> dict[str, object]:
+    return cast(dict[str, object], value.model_dump(by_alias=True))
+
+
+def _relay_compile_request(value: RelayCompileRequest) -> dict[str, object]:
+    return _model_payload(
+        _parse_model(value, RelayCompileRequest, code="RELAY_REQUEST_INVALID")
+    )
+
+
+def _relay_start_request(value: RelayStartRequest) -> dict[str, object]:
+    if isinstance(value, (RelayStartCreateRequest, RelayStartRefillRequest)):
+        return _model_payload(value)
+    if type(value) is not dict:
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    model = {
+        "create": RelayStartCreateRequest,
+        "refill": RelayStartRefillRequest,
+    }.get(value.get("mode"))
+    if model is None:
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    return _model_payload(_parse_model(value, model, code="RELAY_REQUEST_INVALID"))
+
+
+def _relay_handoff_request(value: RelayHandoffRequest) -> dict[str, object]:
+    handoff_models: tuple[type[BaseModel], ...] = (
+        RelayBindEndpointRequest,
+        RelayHeartbeatRequest,
+        RelayEvidenceRequest,
+        RelayTerminalRequest,
+        RelayCandidateHandoffRequest,
+    )
+    if isinstance(value, handoff_models):
+        return _model_payload(value)
+    if type(value) is not dict:
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    model = {
+        "bind_endpoint": RelayBindEndpointRequest,
+        "heartbeat": RelayHeartbeatRequest,
+        "evidence": RelayEvidenceRequest,
+        "terminal": RelayTerminalRequest,
+        "candidate_handoff": RelayCandidateHandoffRequest,
+    }.get(value.get("action"))
+    if model is None:
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    return _model_payload(_parse_model(value, model, code="RELAY_REQUEST_INVALID"))
+
+
+def _relay_integrate_request(value: RelayIntegrationRequest) -> dict[str, object]:
+    integrate_models: tuple[type[BaseModel], ...] = (
+        RelayApproveReadonlyRequest,
+        RelayReviewRequest,
+        RelayRebaseRequest,
+        RelayRejectRequest,
+        RelayIntegrateRequest,
+    )
+    if isinstance(value, integrate_models):
+        return _model_payload(value)
+    if type(value) is not dict:
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    model = {
+        "approve_readonly": RelayApproveReadonlyRequest,
+        "review": RelayReviewRequest,
+        "rebase": RelayRebaseRequest,
+        "reject": RelayRejectRequest,
+        "integrate": RelayIntegrateRequest,
+    }.get(value.get("action"))
+    if model is None:
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    return _model_payload(_parse_model(value, model, code="RELAY_REQUEST_INVALID"))
+
+
+def _require_lease_authority() -> _TaskLeaseAuthority:
+    if _TASK_LEASE_AUTHORITY is None:
+        raise _RequestError("WORKTREE_UNOWNED")
+    return _TASK_LEASE_AUTHORITY
+
+
+def _workspace_ownership(
+    task_lease: TaskLeaseRef, *, workspace_id: str
+) -> WorkspaceOwnership:
+    ownership = _require_lease_authority().ownership_for(
+        task_lease, workspace_id=workspace_id
+    )
+    if (
+        not isinstance(ownership, WorkspaceOwnership)
+        or ownership.workflow_id != task_lease.workflow_id
+        or ownership.task_id != task_lease.task_id
+        or ownership.owner != task_lease.owner
+        or ownership.lease_epoch != task_lease.lease_epoch
+        or ownership.workspace_id != workspace_id
     ):
-        raise RuntimeContractError(
-            "DATA_ROOT_INVALID", "plugin cache cannot be used as data storage"
-        )
-    return resolved
+        raise _RequestError("WORKTREE_UNOWNED")
+    return ownership
 
 
-def _prepare_data_root() -> Path:
-    root = _resolve_data_root()
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise RuntimeContractError(
-            "DATA_ROOT_UNAVAILABLE", "durable data root is unavailable"
-        ) from error
-    if not root.is_dir():
-        raise RuntimeContractError(
-            "DATA_ROOT_INVALID", "durable data root is not a directory"
-        )
-    return root
+def _relay_runtime(uow: RuntimeUnitOfWork) -> RelayRuntime:
+    relay = uow.relay
+    if not isinstance(relay, RelayRuntime):
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    return relay
 
 
-@contextmanager
-def _orchestrator_runtime(
-    index_service: ProjectIndexService | None = None,
-) -> Iterator[tuple[SQLiteStore, OrchestratorService]]:
-    root = _prepare_data_root()
-    store = SQLiteStore(root / "orchestrator.sqlite3")
-    try:
-        yield (
-            store,
-            OrchestratorService(
-                store, index_service=index_service, evidence_root="evidence"
-            ),
-        )
-    finally:
-        store.close()
+def _relay_service(runtime: RelayRuntime) -> RelayService:
+    """Use the lifecycle service already owned by the typed Relay runtime."""
+
+    service = runtime._relay_service
+    if not isinstance(service, RelayService):
+        raise _RequestError("RELAY_REQUEST_INVALID")
+    return service
 
 
-@contextmanager
-def _project_index_runtime() -> Iterator[tuple[ProjectIndexService, CheckpointService]]:
-    root = _prepare_data_root()
-    database = root / "project-index.sqlite3"
-    index = ProjectIndexService(database)
-    checkpoints = CheckpointService(database, root / "checkpoint-cas", index)
-    try:
-        yield index, checkpoints
-    finally:
-        checkpoints.close()
-        index.close()
+@mcp.tool(annotations=_tool_annotations("project_index_register"))
+def project_index_register(workspace_root: str) -> dict[str, object]:
+    """Register the sole public path input and return only an opaque workspace id."""
+
+    return _invoke(
+        "project_index_register",
+        read_only=False,
+        operation=lambda uow: (
+            uow.project_checkpoint.project_index.project_index_register(workspace_root)
+        ),
+    )
 
 
-@contextmanager
-def _approval_runtime() -> Iterator[ApprovalEffectService]:
-    service = ApprovalEffectService(_prepare_data_root() / "approvals.sqlite3")
-    try:
-        yield service
-    finally:
-        service.journal.close()
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, datetime):
-        return value.astimezone(UTC).isoformat()
-    if isinstance(value, Path):
-        return str(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: _json_safe(getattr(value, field.name))
-            for field in fields(value)
-        }
-    if isinstance(value, Mapping):
-        return {
-            str(key.value if isinstance(key, Enum) else key): _json_safe(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_safe(item) for item in value]
-    return str(value)
-
-
-def _safe_call(operation: Callable[[], Any]) -> dict[str, Any]:
-    try:
-        return {"ok": True, "data": _json_safe(operation())}
-    except RuntimeContractError as error:
-        code = error.code
-    except ServiceError as error:
-        code = error.code
-    except ProjectIndexError as error:
-        code = error.code
-    except ApprovalError:
-        code = "APPROVAL_REJECTED"
-    except KeyError:
-        code = "NOT_FOUND"
-    except (TypeError, ValueError):
-        code = "INVALID_REQUEST"
-    except sqlite3.Error:
-        code = "STORAGE_ERROR"
-    except OSError:
-        code = "RUNTIME_IO_ERROR"
-    except Exception:
-        code = "INTERNAL_ERROR"
-    return {"ok": False, "error": {"code": code, "message": "request rejected"}}
-
-
-def _manifest(payload: Mapping[str, Any]) -> ApprovalManifest:
-    return ApprovalManifest(**dict(payload))
-
-
-def _lease_tuple_complete(
-    workflow_id: str,
-    task_id: str,
-    owner: str,
-    lease_epoch: int,
-) -> bool:
-    supplied = (bool(workflow_id), bool(task_id), bool(owner), lease_epoch > 0)
-    if any(supplied) and not all(supplied):
-        raise RuntimeContractError("INVALID_REQUEST", "task lease tuple is incomplete")
-    return all(supplied)
-
-
-def _content_hash(value: Any) -> str:
-    encoded = json.dumps(
-        _json_safe(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-@mcp.tool(annotations=_IDEMPOTENT_MUTATION)
+@mcp.tool(annotations=_tool_annotations("project_index_sync"))
 def project_index_sync(
-    workspace: str,
+    workspace_id: str,
     include_paths: list[str] | None = None,
-    workflow_id: str = "",
-    task_id: str = "",
-    owner: str = "",
-    lease_epoch: int = 0,
-    bind_as: str = "",
-) -> dict[str, Any]:
-    """Synchronize a deterministic project snapshot and optionally bind task output."""
+    task_lease: TaskLeaseRef | None = None,
+    bind_as: Literal["output"] | None = None,
+) -> dict[str, object]:
+    """Synchronize one registered workspace without accepting a second root."""
 
-    def operation() -> Any:
-        lease_bound = _lease_tuple_complete(workflow_id, task_id, owner, lease_epoch)
-        if bind_as not in {"", "output"}:
-            raise RuntimeContractError(
-                "INVALID_REQUEST", "unsupported snapshot binding"
+    try:
+        lease = _task_lease(task_lease)
+        if (lease is None) != (bind_as is None):
+            raise _RequestError("INVALID_REQUEST")
+    except _RequestError as error:
+        return _failure(error.code)
+
+    def operation(uow: RuntimeUnitOfWork) -> object:
+        authority = _require_lease_authority() if lease is not None else None
+        snapshot = uow.project_checkpoint.project_index.sync(
+            workspace_id, include_paths
+        )
+        if authority is not None:
+            if lease is None:
+                raise _RequestError("INVALID_REQUEST")
+            authority.bind_output_snapshot(
+                lease, workspace_id=workspace_id, snapshot=snapshot
             )
-        if bind_as == "output" and not lease_bound:
-            raise RuntimeContractError(
-                "INVALID_REQUEST", "output binding requires a task lease"
-            )
+        return snapshot
 
-        with _project_index_runtime() as (index, _):
-            snapshot = index.sync(workspace, include_paths)
-            if bind_as != "output":
-                return snapshot
-            with _orchestrator_runtime(index) as (store, service):
-                service.strict_ownership(
-                    workflow_id,
-                    task_id,
-                    owner=owner,
-                    epoch=lease_epoch,
-                )
-                binding = store.get_index_binding(task_id)
-                if binding is None:
-                    raise RuntimeContractError(
-                        "INDEX_UNAVAILABLE", "task has no strict index binding"
-                    )
-                indexed_diff = index.diff(
-                    binding.input_snapshot_id, snapshot.snapshot_id
-                )
-                service.record_output_snapshot(
-                    task_id,
-                    owner=owner,
-                    epoch=lease_epoch,
-                    snapshot_id=snapshot.snapshot_id,
-                    diff_hash=_content_hash(indexed_diff),
-                )
-            return snapshot
-
-    return _safe_call(operation)
+    return _invoke("project_index_sync", read_only=False, operation=operation)
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_tool_annotations("project_index_status"))
 def project_index_status(
-    workspace: str,
+    workspace_id: str,
     snapshot_id: str | None = None,
     required_paths: list[str] | None = None,
-) -> dict[str, Any]:
-    """Return deterministic index freshness and coverage metadata."""
+) -> dict[str, object]:
+    """Read verified index status through the opaque workspace boundary."""
 
-    def operation() -> Any:
-        with _project_index_runtime() as (index, _):
-            return index.status(workspace, snapshot_id, required_paths)
+    return _invoke(
+        "project_index_status",
+        read_only=True,
+        operation=lambda uow: uow.project_checkpoint.project_index.status(
+            workspace_id, snapshot_id, required_paths
+        ),
+    )
 
-    return _safe_call(operation)
 
-
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_tool_annotations("project_index_query"))
 def project_index_query(
-    workspace: str,
+    workspace_id: str,
     snapshot_id: str,
     query: str,
     mode: Literal["lexical", "graph", "impact"] = "lexical",
@@ -308,677 +480,275 @@ def project_index_query(
     source_lines: int = 12,
     byte_budget: int = 32768,
     allow_miss_escape: bool = False,
-    workflow_id: str = "",
-    task_id: str = "",
-    owner: str = "",
-    lease_epoch: int = 0,
-) -> dict[str, Any]:
-    """Query bounded nodes: lexical matches text, graph follows all edges, and impact follows incoming dependents."""
+    task_lease: TaskLeaseRef | None = None,
+) -> dict[str, object]:
+    """Run a receipt-persisting bounded query against one workspace id."""
 
-    def operation() -> Any:
-        lease_bound = _lease_tuple_complete(workflow_id, task_id, owner, lease_epoch)
-        with _project_index_runtime() as (index, _):
-            result = index.query(
-                workspace,
-                snapshot_id,
-                query,
-                mode=mode,
-                node_kinds=tuple(node_kinds or ()),
-                relations=tuple(relations or ()),
-                max_nodes=max_nodes,
-                max_depth=max_depth,
-                source_lines=source_lines,
-                byte_budget=byte_budget,
-                allow_miss_escape=allow_miss_escape,
+    try:
+        lease = _task_lease(task_lease)
+    except _RequestError as error:
+        return _failure(error.code)
+
+    def operation(uow: RuntimeUnitOfWork) -> object:
+        authority = _require_lease_authority() if lease is not None else None
+        result = uow.project_checkpoint.query(
+            workspace_id,
+            snapshot_id,
+            query,
+            mode=mode,
+            node_kinds=tuple(node_kinds or ()),
+            relations=tuple(relations or ()),
+            max_nodes=max_nodes,
+            max_depth=max_depth,
+            source_lines=source_lines,
+            byte_budget=byte_budget,
+            allow_miss_escape=allow_miss_escape,
+        )
+        if authority is not None:
+            if lease is None:
+                raise _RequestError("INVALID_REQUEST")
+            authority.record_query_receipt(
+                lease, workspace_id=workspace_id, result=result
             )
-            if lease_bound:
-                receipt = index.get_query_receipt(result.trace_id)
-                with _orchestrator_runtime(index) as (_, service):
-                    service.record_index_query(
-                        workflow_id,
-                        task_id,
-                        owner=owner,
-                        epoch=lease_epoch,
-                        trace_id=result.trace_id,
-                        snapshot_id=result.snapshot_id,
-                        miss_escape_used=receipt.miss_escape_used,
-                    )
-            return result
+        return result
 
-    return _safe_call(operation)
+    return _invoke("project_index_query", read_only=False, operation=operation)
 
 
-@mcp.tool(annotations=_IDEMPOTENT_MUTATION)
+@mcp.tool(annotations=_tool_annotations("worktree_checkpoint_create"))
 def worktree_checkpoint_create(
-    workflow_id: str,
-    task_id: str,
-    owner: str,
-    lease_epoch: int,
-    snapshot_id: str,
-) -> dict[str, Any]:
-    """Create and record a checkpoint for the strict task's stored write scope."""
+    workspace_id: str, task_lease: TaskLeaseRef, snapshot_id: str
+) -> dict[str, object]:
+    """Create a checkpoint only after a host-private lease authority resolves scope."""
 
-    def operation() -> Any:
-        with _project_index_runtime() as (index, checkpoints):
-            with _orchestrator_runtime(index) as (_, service):
-                ownership = service.strict_ownership(
-                    workflow_id,
-                    task_id,
-                    owner=owner,
-                    epoch=lease_epoch,
-                )
-                checkpoint = checkpoints.create(ownership, snapshot_id)
-                service.record_checkpoint(
-                    task_id,
-                    owner=owner,
-                    epoch=lease_epoch,
-                    checkpoint_id=checkpoint.checkpoint_id,
-                )
-                return checkpoint
-
-    return _safe_call(operation)
+    try:
+        lease = _task_lease(task_lease)
+        if lease is None:
+            raise _RequestError("INVALID_REQUEST")
+    except _RequestError as error:
+        return _failure(error.code)
+    return _invoke(
+        "worktree_checkpoint_create",
+        read_only=False,
+        operation=lambda uow: uow.project_checkpoint.create(
+            workspace_id,
+            _workspace_ownership(lease, workspace_id=workspace_id),
+            snapshot_id,
+        ),
+    )
 
 
-@mcp.tool(annotations=_READ_ONLY)
-def worktree_checkpoint_status(checkpoint_id: str) -> dict[str, Any]:
-    """Return verified checkpoint metadata without exposing stored file bodies."""
+@mcp.tool(annotations=_tool_annotations("worktree_checkpoint_status"))
+def worktree_checkpoint_status(
+    workspace_id: str, checkpoint_id: str
+) -> dict[str, object]:
+    """Read checkpoint metadata through its compound workspace boundary."""
 
-    def operation() -> Any:
-        with _project_index_runtime() as (_, checkpoints):
-            return checkpoints.status(checkpoint_id)
+    return _invoke(
+        "worktree_checkpoint_status",
+        read_only=True,
+        operation=lambda uow: uow.project_checkpoint.status(
+            workspace_id, checkpoint_id
+        ),
+    )
 
-    return _safe_call(operation)
 
-
-@mcp.tool(annotations=_DESTRUCTIVE_JOURNAL_MUTATION)
+@mcp.tool(annotations=_tool_annotations("worktree_checkpoint_restore"))
 def worktree_checkpoint_restore(
-    workflow_id: str,
-    task_id: str,
-    owner: str,
-    lease_epoch: int,
+    workspace_id: str,
+    task_lease: TaskLeaseRef,
     checkpoint_id: str,
     expected_current_snapshot_id: str,
-) -> dict[str, Any]:
-    """Restore a task-owned checkpoint after lease and snapshot compare-and-swap checks."""
+) -> dict[str, object]:
+    """Restore only a task-owned checkpoint after the root authority check."""
 
-    def operation() -> Any:
-        with _project_index_runtime() as (index, checkpoints):
-            with _orchestrator_runtime(index) as (_, service):
-                ownership = service.strict_ownership(
-                    workflow_id,
-                    task_id,
-                    owner=owner,
-                    epoch=lease_epoch,
-                )
-                return checkpoints.restore(
-                    ownership,
-                    checkpoint_id,
-                    expected_current_snapshot_id,
-                )
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_create(
-    workflow_id: str,
-    kind: str,
-    title: str,
-    product_summary: str,
-    policy_version: str = "",
-) -> dict[str, Any]:
-    """Create one durable linear or DAG workflow."""
-
-    def operation() -> Workflow:
-        now = datetime.now(UTC).isoformat()
-        workflow = Workflow(
-            workflow_id,
-            WorkflowKind(kind),
-            title,
-            product_summary,
-            policy_version=policy_version,
-            created_at=now,
-            updated_at=now,
-        )
-        with _orchestrator_runtime() as (_, service):
-            return service.create_workflow(workflow)
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_register_task(
-    workflow_id: str,
-    task_id: str,
-    title: str,
-    owner_role: str,
-    card: str,
-    dependencies: list[str] | None = None,
-    write_scope: list[str] | None = None,
-    direct_contract_hashes: list[str] | None = None,
-    required_evidence: list[str] | None = None,
-    input_hash: str = "",
-    strict_index: bool = False,
-    workspace_root: str = "",
-    input_snapshot_id: str = "",
-    task_node_ids: list[str] | None = None,
-    contract_node_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    """Register one task and its task-scoped durable context."""
-
-    def operation() -> Task:
-        task = Task(
-            task_id,
-            workflow_id,
-            title,
-            owner_role,
-            dependencies=tuple(dependencies or ()),
-            write_scope=tuple(write_scope or ()),
-        )
-        if strict_index:
-            with (
-                _project_index_runtime() as (index, _),
-                _orchestrator_runtime(index) as (_, service),
-            ):
-                return service.register_task(
-                    task,
-                    card=card,
-                    direct_contract_hashes=tuple(direct_contract_hashes or ()),
-                    required_evidence=tuple(required_evidence or ()),
-                    input_hash=input_hash,
-                    strict_index=True,
-                    workspace_root=workspace_root,
-                    input_snapshot_id=input_snapshot_id,
-                    task_node_ids=tuple(task_node_ids or ()),
-                    contract_node_ids=tuple(contract_node_ids or ()),
-                )
-        with _orchestrator_runtime() as (_, service):
-            return service.register_task(
-                task,
-                card=card,
-                direct_contract_hashes=tuple(direct_contract_hashes or ()),
-                required_evidence=tuple(required_evidence or ()),
-                input_hash=input_hash,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_ready(workflow_id: str) -> dict[str, Any]:
-    """Promote and return the next durable ready wave."""
-
-    def operation() -> tuple[Task, ...]:
-        with _orchestrator_runtime() as (_, service):
-            return service.ready_wave(workflow_id)
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_claim(
-    task_id: str,
-    owner: str,
-    expires_at: str,
-    host_target: str | None = None,
-    now: str | None = None,
-) -> dict[str, Any]:
-    """Claim a ready task and optionally bind its canonical Codex target."""
-
-    def operation() -> Any:
-        with (
-            _project_index_runtime() as (index, _),
-            _orchestrator_runtime(index) as (_, service),
-        ):
-            return service.claim_task(
-                task_id,
-                owner,
-                expires_at=expires_at,
-                host_target=host_target,
-                now=now,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_endpoint_bind(
-    workflow_id: str,
-    task_id: str,
-    owner: str,
-    lease_epoch: int,
-    host_target: str,
-    now: str | None = None,
-) -> dict[str, Any]:
-    """Bind or replace the current lease's canonical Codex collaboration target."""
-
-    def operation() -> Any:
-        with _orchestrator_runtime() as (_, service):
-            return service.bind_endpoint(
-                workflow_id,
-                task_id,
-                owner=owner,
-                epoch=lease_epoch,
-                host_target=host_target,
-                now=now,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_complete(
-    task_id: str,
-    expected_version: int,
-    owner: str,
-    lease_epoch: int,
-    result_hash: str = "",
-    now: str | None = None,
-) -> dict[str, Any]:
-    """Complete a task using task version and lease compare-and-swap."""
-
-    def operation() -> Task:
-        with (
-            _project_index_runtime() as (index, _),
-            _orchestrator_runtime(index) as (_, service),
-        ):
-            return service.complete_task(
-                task_id,
-                expected_version=expected_version,
-                owner=owner,
-                epoch=lease_epoch,
-                result_hash=result_hash,
-                now=now,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def workflow_status(workflow_id: str) -> dict[str, Any]:
-    """Return the workflow record and all task state summaries."""
-
-    def operation() -> dict[str, Any]:
-        with _orchestrator_runtime() as (_, service):
-            return service.status(workflow_id)
-
-    return _safe_call(operation)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def workflow_context(
-    workflow_id: str,
-    role: str,
-    task_id: str | None = None,
-) -> dict[str, Any]:
-    """Return a product, coordinator, or single-agent scoped projection."""
-
-    def operation() -> dict[str, Any]:
-        with _orchestrator_runtime() as (_, service):
-            return service.context(workflow_id, role=role, task_id=task_id)
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_artifact_register(
-    workflow_id: str,
-    task_id: str,
-    owner: str,
-    lease_epoch: int,
-    kind: str,
-    artifact_hash: str,
-    safe_path: str,
-    size: int,
-    redaction_version: str,
-    snapshot_id: str | None = None,
-) -> dict[str, Any]:
-    """Register metadata for a task-owned redacted artifact; accepts no body."""
-
-    def operation() -> Any:
-        if snapshot_id is not None:
-            with (
-                _project_index_runtime() as (index, _),
-                _orchestrator_runtime(index) as (_, service),
-            ):
-                return service.register_artifact(
-                    workflow_id,
-                    task_id,
-                    owner=owner,
-                    epoch=lease_epoch,
-                    kind=kind,
-                    content_hash=artifact_hash,
-                    safe_path=safe_path,
-                    size=size,
-                    redaction_version=redaction_version,
-                    snapshot_id=snapshot_id,
-                )
-        with _orchestrator_runtime() as (_, service):
-            return service.register_artifact(
-                workflow_id,
-                task_id,
-                owner=owner,
-                epoch=lease_epoch,
-                kind=kind,
-                content_hash=artifact_hash,
-                safe_path=safe_path,
-                size=size,
-                redaction_version=redaction_version,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def workflow_peers(workflow_id: str, task_id: str) -> dict[str, Any]:
-    """Return only authorized dependency or common-contract peers."""
-
-    def operation() -> Any:
-        with _orchestrator_runtime() as (_, service):
-            return service.peers(workflow_id, task_id)
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_message_send(
-    workflow_id: str,
-    sender_task_id: str,
-    recipient_task_id: str,
-    owner: str,
-    lease_epoch: int,
-    correlation_id: str,
-    artifact_hash: str,
-    metadata: dict[str, str],
-    ttl_seconds: int,
-) -> dict[str, Any]:
-    """Enqueue an artifact reference and return only minimal delivery data."""
-
-    def operation() -> Any:
-        with _orchestrator_runtime() as (_, service):
-            return service.send_message(
-                workflow_id,
-                sender_task_id,
-                recipient_task_id,
-                owner=owner,
-                epoch=lease_epoch,
-                correlation_id=correlation_id,
-                artifact_hash=artifact_hash,
-                metadata=metadata,
-                ttl_seconds=ttl_seconds,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def workflow_inbox(
-    workflow_id: str,
-    recipient_task_id: str,
-    owner: str,
-    lease_epoch: int,
-    cursor: str | None = None,
-    limit: int = 50,
-) -> dict[str, Any]:
-    """Read only the current recipient lease's durable mailbox."""
-
-    def operation() -> Any:
-        with _orchestrator_runtime() as (_, service):
-            return service.inbox(
-                workflow_id,
-                recipient_task_id,
-                owner=owner,
-                epoch=lease_epoch,
-                cursor=cursor,
-                limit=limit,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def workflow_artifact_resolve(
-    workflow_id: str,
-    recipient_task_id: str,
-    owner: str,
-    lease_epoch: int,
-    delivery_id: str,
-    now: str | None = None,
-) -> dict[str, Any]:
-    """Resolve one current recipient delivery to its registered artifact metadata."""
-
-    def operation() -> Any:
-        with _orchestrator_runtime() as (_, service):
-            return service.resolve_artifact(
-                workflow_id,
-                recipient_task_id,
-                owner=owner,
-                epoch=lease_epoch,
-                delivery_id=delivery_id,
-                now=now,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_message_ack(
-    workflow_id: str,
-    recipient_task_id: str,
-    owner: str,
-    lease_epoch: int,
-    delivery_id: str,
-) -> dict[str, Any]:
-    """Acknowledge one recipient-owned durable mailbox delivery."""
-
-    def operation() -> Any:
-        with _orchestrator_runtime() as (_, service):
-            return service.ack_message(
-                workflow_id,
-                recipient_task_id,
-                delivery_id,
-                owner=owner,
-                epoch=lease_epoch,
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_cancel(
-    workflow_id: str,
-    expected_version: int | None = None,
-) -> dict[str, Any]:
-    """Cancel a workflow and every nonterminal task atomically."""
-
-    def operation() -> Workflow:
-        with _orchestrator_runtime() as (_, service):
-            return service.cancel_workflow(
-                workflow_id, expected_version=expected_version
-            )
-
-    return _safe_call(operation)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def bugkiller_route(
-    risk_triggers: list[str],
-    luna_available: bool = True,
-    terra_available: bool = True,
-    approved_escalation: bool = False,
-) -> dict[str, Any]:
-    """Return the pure Bugkiller risk route without executing any command."""
-    return _safe_call(
-        lambda: route_case(
-            risk_triggers,
-            luna_available=luna_available,
-            terra_available=terra_available,
-            approved_escalation=approved_escalation,
-        )
-    )
-
-
-def _detect_adapters(repository: str) -> dict[str, Any]:
-    def operation() -> Any:
-        task_temp = _prepare_data_root() / "task-temp"
-        task_temp.mkdir(parents=True, exist_ok=True)
-        return detect_repository(repository, task_temp_root=task_temp)
-
-    return _safe_call(operation)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def workflow_detect_adapters(repository: str) -> dict[str, Any]:
-    """Return shared structured verification command specs without executing them."""
-    return _detect_adapters(repository)
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def bugkiller_detect_adapters(repository: str) -> dict[str, Any]:
-    """Compatibility alias for workflow_detect_adapters."""
-    return _detect_adapters(repository)
-
-
-def _approval_prepare(manifest: dict[str, Any], expires_at: str) -> dict[str, Any]:
-    def operation() -> Any:
-        with _approval_runtime() as service:
-            return service.prepare(
-                _manifest(manifest), expires_at=datetime.fromisoformat(expires_at)
-            )
-
-    return _safe_call(operation)
-
-
-def _approval_grant(approval_id: str) -> dict[str, Any]:
-    def operation() -> Any:
-        with _approval_runtime() as service:
-            return service.grant(approval_id)
-
-    return _safe_call(operation)
-
-
-def _approval_deny(approval_id: str) -> dict[str, Any]:
-    def operation() -> Any:
-        with _approval_runtime() as service:
-            return service.deny(approval_id)
-
-    return _safe_call(operation)
-
-
-def _approval_claim(approval_id: str, manifest: dict[str, Any]) -> dict[str, Any]:
-    def operation() -> Any:
-        with _approval_runtime() as service:
-            return service.claim(approval_id, _manifest(manifest))
-
-    return _safe_call(operation)
-
-
-@mcp.tool()
-def workflow_approval_prepare(
-    manifest: dict[str, Any], expires_at: str
-) -> dict[str, Any]:
-    """Prepare a shared immutable approval record; performs no external effect."""
-    return _approval_prepare(manifest, expires_at)
-
-
-@mcp.tool(annotations=_DESTRUCTIVE_JOURNAL_MUTATION)
-def workflow_approval_grant(approval_id: str) -> dict[str, Any]:
-    """Record approval only after the host obtains explicit user confirmation."""
-    return _approval_grant(approval_id)
-
-
-@mcp.tool()
-def workflow_approval_deny(approval_id: str) -> dict[str, Any]:
-    """Record denial for a prepared workflow manifest without consuming a grant."""
-    return _approval_deny(approval_id)
-
-
-@mcp.tool(annotations=_DESTRUCTIVE_JOURNAL_MUTATION)
-def workflow_approval_claim(
-    approval_id: str, manifest: dict[str, Any]
-) -> dict[str, Any]:
-    """Claim a single-use workflow grant; never executes Git or network work."""
-    return _approval_claim(approval_id, manifest)
-
-
-@mcp.tool()
-def bugkiller_approval_prepare(
-    manifest: dict[str, Any], expires_at: str
-) -> dict[str, Any]:
-    """Compatibility alias for workflow_approval_prepare."""
-    return _approval_prepare(manifest, expires_at)
-
-
-@mcp.tool(annotations=_DESTRUCTIVE_JOURNAL_MUTATION)
-def bugkiller_approval_grant(approval_id: str) -> dict[str, Any]:
-    """Compatibility alias for workflow_approval_grant after user confirmation."""
-    return _approval_grant(approval_id)
-
-
-@mcp.tool()
-def bugkiller_approval_deny(approval_id: str) -> dict[str, Any]:
-    """Compatibility alias for workflow_approval_deny."""
-    return _approval_deny(approval_id)
-
-
-@mcp.tool(annotations=_DESTRUCTIVE_JOURNAL_MUTATION)
-def bugkiller_approval_claim(
-    approval_id: str, manifest: dict[str, Any]
-) -> dict[str, Any]:
-    """Compatibility alias for workflow_approval_claim."""
-    return _approval_claim(approval_id, manifest)
-
-
-def _run_script(script: Path, target: str) -> str:
-    if not script.exists():
-        return f"[2718lab-tools] 找不到校验脚本:{script}"
     try:
-        proc = subprocess.run(
-            [sys.executable, str(script), target],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        return f"[2718lab-tools] 校验超时(>120s):{script.name}"
-    except OSError as e:
-        return f"[2718lab-tools] 无法运行 {script.name}:{e}"
-    body = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return body or f"[2718lab-tools] {script.name} 无输出(exit={proc.returncode})"
-
-
-@mcp.tool(annotations=_READ_ONLY)
-def check_release(repo_dir: str) -> str:
-    """发布前自检:对 AstrBot 插件 / 工具仓库运行 oss-repo-ops 的 check_release.py 并返回报告(version 2 段号浮点数陷阱、repo .git、astrbot_version 引号、16MB 体积、必备文件等)。repo_dir 为仓库目录路径。"""
-    return _run_script(
-        SKILLS / "oss-repo-ops" / "scripts" / "check_release.py", repo_dir
+        lease = _task_lease(task_lease)
+        if lease is None:
+            raise _RequestError("INVALID_REQUEST")
+    except _RequestError as error:
+        return _failure(error.code)
+    return _invoke(
+        "worktree_checkpoint_restore",
+        read_only=False,
+        operation=lambda uow: uow.project_checkpoint.restore(
+            workspace_id,
+            _workspace_ownership(lease, workspace_id=workspace_id),
+            checkpoint_id,
+            expected_current_snapshot_id,
+        ),
     )
 
 
-@mcp.tool(annotations=_READ_ONLY)
-def validate_astrbot_plugin(plugin_dir: str) -> str:
-    """校验 AstrBot 插件:运行 astrbot-plugin-dev 的 validate_plugin.py 并返回结果。plugin_dir 为插件目录路径。"""
-    return _run_script(
-        SKILLS / "astrbot-plugin-dev" / "scripts" / "validate_plugin.py", plugin_dir
+@mcp.tool(annotations=_tool_annotations("atlas_query"))
+def atlas_query(
+    root_node_ids: list[str] | None = None,
+    node_kinds: list[str] | None = None,
+    relations: list[str] | None = None,
+    intent_id: str | None = None,
+    max_nodes: int = 50,
+    max_edges: int = 100,
+    max_depth: int = 1,
+    byte_budget: int = 65536,
+) -> dict[str, object]:
+    """Read bounded Atlas graph facts only."""
+
+    return _invoke(
+        "atlas_query",
+        read_only=True,
+        operation=lambda uow: uow.atlas.graph_query(
+            root_node_ids=root_node_ids,
+            node_kinds=node_kinds,
+            relations=relations,
+            intent_id=intent_id,
+            max_nodes=max_nodes,
+            max_edges=max_edges,
+            max_depth=max_depth,
+            byte_budget=byte_budget,
+        ),
+        invalid_code="ATLAS_REQUEST_INVALID",
     )
 
 
-@mcp.tool(annotations=_READ_ONLY)
-def validate_mcp_server(target: str) -> str:
-    """校验 MCP 服务器代码:运行 mcp-server-dev 的 validate_mcp_server.py(混包检测、装饰器括号、transport 白名单等)。target 为 server 目录或文件路径。"""
-    return _run_script(
-        SKILLS / "mcp-server-dev" / "scripts" / "validate_mcp_server.py", target
+@mcp.tool(annotations=_tool_annotations("atlas_prepare"))
+def atlas_prepare(
+    workspace_id: str,
+    snapshot_id: str,
+    intent_id: str,
+    language: str,
+    framework: str | None = None,
+    target_paths: list[str] | None = None,
+    target_symbols: list[str] | None = None,
+    max_candidates: int = 20,
+    byte_budget: int = 131072,
+) -> dict[str, object]:
+    """Prepare an Atlas packet through one call-owned read/write UoW."""
+
+    return _invoke(
+        "atlas_prepare",
+        read_only=False,
+        operation=lambda uow: uow.atlas.prepare(
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            intent_id=intent_id,
+            language=language,
+            framework=framework,
+            target_paths=target_paths,
+            target_symbols=target_symbols,
+            max_candidates=max_candidates,
+            byte_budget=byte_budget,
+        ),
+        invalid_code="ATLAS_REQUEST_INVALID",
     )
 
 
-@mcp.tool(annotations=_READ_ONLY)
-def check_python_project(project_dir: str) -> str:
-    """校验 Python 工程骨架:运行 python-engineering 的 validate_project.py(pyproject / 版本号 / 布局等)。project_dir 为项目目录路径。"""
-    return _run_script(
-        SKILLS / "python-engineering" / "scripts" / "validate_project.py", project_dir
+@mcp.tool(annotations=_tool_annotations("atlas_render"))
+def atlas_render(
+    workspace_id: str, snapshot_id: str, packet_id: str, bindings: dict[str, str]
+) -> dict[str, object]:
+    """Render a verified Atlas packet without exposing any host path."""
+
+    return _invoke(
+        "atlas_render",
+        read_only=True,
+        operation=lambda uow: uow.atlas.render(
+            workspace_id, snapshot_id, packet_id, bindings
+        ),
+        invalid_code="ATLAS_REQUEST_INVALID",
+    )
+
+
+@mcp.tool(annotations=_tool_annotations("atlas_accept"))
+def atlas_accept(
+    workflow_id: str, code_task_id: str, acceptance_id: str, ingestion_key: str
+) -> dict[str, object]:
+    """Accept Atlas evidence by its four opaque identifiers only."""
+
+    return _invoke(
+        "atlas_accept",
+        read_only=False,
+        operation=lambda uow: uow.atlas.accept(
+            workflow_id, code_task_id, acceptance_id, ingestion_key
+        ),
+        invalid_code="ATLAS_REQUEST_INVALID",
+    )
+
+
+@mcp.tool(annotations=_tool_annotations("relay_compile"))
+def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
+    """Compile a locked Relay request using only verified read snapshots."""
+
+    try:
+        payload = _relay_compile_request(request)
+    except _RequestError as error:
+        return _failure(error.code)
+    return _invoke(
+        "relay_compile",
+        read_only=True,
+        operation=lambda uow: compile_plan(payload, registry_resolver=uow.registry),
+        invalid_code="RELAY_REQUEST_INVALID",
+    )
+
+
+@mcp.tool(annotations=_tool_annotations("relay_start"))
+def relay_start(request: RelayStartRequest) -> dict[str, object]:
+    """Start Relay only when the private capability broker is available."""
+
+    try:
+        payload = _relay_start_request(request)
+    except _RequestError as error:
+        return _failure(error.code)
+    return _invoke(
+        "relay_start",
+        read_only=False,
+        operation=lambda uow: _relay_runtime(uow).start(payload),
+        invalid_code="RELAY_REQUEST_INVALID",
+    )
+
+
+@mcp.tool(annotations=_tool_annotations("relay_status"))
+def relay_status(workflow_id: str) -> dict[str, object]:
+    """Read Relay status without requiring a broker or proof provider."""
+
+    return _invoke(
+        "relay_status",
+        read_only=True,
+        operation=lambda uow: uow.relay.status(workflow_id),
+        invalid_code="RELAY_REQUEST_INVALID",
+    )
+
+
+@mcp.tool(annotations=_tool_annotations("relay_handoff"))
+def relay_handoff(request: RelayHandoffRequest) -> dict[str, object]:
+    """Apply one exact worker lifecycle action through the Relay runtime owner."""
+
+    try:
+        payload = _relay_handoff_request(request)
+    except _RequestError as error:
+        return _failure(error.code)
+    return _invoke(
+        "relay_handoff",
+        read_only=False,
+        operation=lambda uow: _relay_service(_relay_runtime(uow)).handoff(payload),
+        invalid_code="RELAY_REQUEST_INVALID",
+    )
+
+
+@mcp.tool(annotations=_tool_annotations("relay_integrate"))
+def relay_integrate(request: RelayIntegrationRequest) -> dict[str, object]:
+    """Apply a proof-bound Relay integration action with no head/commit inputs."""
+
+    try:
+        payload = _relay_integrate_request(request)
+    except _RequestError as error:
+        return _failure(error.code)
+    return _invoke(
+        "relay_integrate",
+        read_only=False,
+        operation=lambda uow: _relay_service(_relay_runtime(uow)).integrate(payload),
+        invalid_code="RELAY_REQUEST_INVALID",
     )
 
 
 if __name__ == "__main__":
-    # 由 .mcp.json 以 stdio 方式拉起;本地调试可 `uv run mcp dev server.py`
     mcp.run()

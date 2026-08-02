@@ -38,11 +38,11 @@ jobs:
           echo "Running ruff format..."
           FORMAT_LOG=$(uvx ruff==0.14.2 format . 2>&1 || true)
           echo "$FORMAT_LOG"
-
+          
           echo "Running ruff check --fix..."
           CHECK_LOG=$(uvx ruff==0.14.2 check --fix . 2>&1 || true)
           echo "$CHECK_LOG"
-
+          
           # 将日志保存到文件供后续脚本读取
           echo "$FORMAT_LOG" > format.log
           echo "$CHECK_LOG" > check.log
@@ -52,31 +52,31 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-
+            
             const formatLog = fs.readFileSync('format.log', 'utf8');
             const checkLog = fs.readFileSync('check.log', 'utf8');
-
+            
             // --- 解析格式化日志 ---
             // 示例: "1 file reformatted, 2 files left unchanged."
             const formatMatch = formatLog.match(/(\d+) file(s)? reformatted/);
             const reformattedCount = formatMatch ? parseInt(formatMatch[1]) : 0;
-
+            
             const unchangedMatch = formatLog.match(/(\d+) file(s)? left unchanged/);
             const unchangedCount = unchangedMatch ? parseInt(unchangedMatch[1]) : 0;
-
+            
             // --- 解析检查日志 ---
             // 示例: "Found 2 errors (1 fixed, 1 remaining)."
             let fixedCount = 0;
             let remainingCount = 0;
             let totalErrors = 0;
-
+            
             const errorMatch = checkLog.match(/Found (\d+) error/);
             if (errorMatch) {
                 totalErrors = parseInt(errorMatch[1]);
-
+                
                 const fixedMatch = checkLog.match(/\((\d+) fixed/);
                 if (fixedMatch) fixedCount = parseInt(fixedMatch[1]);
-
+                
                 const remainingMatch = checkLog.match(/, (\d+) remaining\)/);
                 if (remainingMatch) {
                     remainingCount = parseInt(remainingMatch[1]);
@@ -85,24 +85,24 @@ jobs:
                     if (fixedCount === 0) remainingCount = totalErrors;
                 }
             }
-
+            
             // --- 构建报告内容 ---
             let summary = '';
             let isSuccess = (reformattedCount === 0 && remainingCount === 0);
-
+            
             if (isSuccess) {
                 summary = '### ✅ All checked pass!';
             } else {
                 summary = '### ⚠️ 代码质量检查报告\n\n';
                 summary += '> 发现部分文件需要格式化或存在代码问题，建议在本地运行 `ruff format .` 和 `ruff check --fix .`。\n\n';
-
+                
                 // 格式化部分
                 if (reformattedCount > 0) {
                     summary += `**🖌️ 格式化**: \`${reformattedCount}\` 个文件被重新格式化 (未变更: ${unchangedCount})\n`;
                 } else {
                     summary += `**🖌️ 格式化**: ✅ 无需变更\n`;
                 }
-
+                
                 // 代码检查部分
                 if (totalErrors > 0) {
                     summary += `**🛡️ 代码检查**: 发现 \`${totalErrors}\` 个问题\n`;
@@ -111,7 +111,7 @@ jobs:
                 } else {
                     summary += `**🛡️ 代码检查**: ✅ 通过\n`;
                 }
-
+                
                 // 错误详情 (如果有剩余错误)
                 if (remainingCount > 0) {
                     // 截取部分日志以防过长
@@ -119,29 +119,29 @@ jobs:
                     summary += `\n<details><summary>🔍 错误详情</summary>\n\n\`\`\`text${logPreview}\n\n\`\`\`\n</details>`;
                 }
             }
-
+            
             // --- 输出到 Job Summary ---
             await core.summary.addRaw(summary).write();
-
+            
             // --- PR 评论 (仅在 PR 事件触发时) ---
             if (context.eventName === 'pull_request') {
                 const issue_number = context.issue.number;
                 const owner = context.repo.owner;
                 const repo = context.repo.repo;
-
+                
                 // 获取现有评论
                 const comments = await github.rest.issues.listComments({
                     owner,
                     repo,
                     issue_number,
                 });
-
+                
                 // 查找机器人之前发的 Ruff 报告评论
                 const botComment = comments.data.find(comment =>
                     comment.user.type === 'Bot' &&
                     (comment.body.includes('代码质量检查报告') || comment.body.includes('All checked pass'))
                 );
-
+                
                 if (botComment) {
                     // 如果已有评论，更新它
                     await github.rest.issues.updateComment({
@@ -164,7 +164,7 @@ jobs:
                     }
                 }
             }
-
+            
             // --- 设置 Job 状态 ---
             if (!isSuccess) {
                 core.setFailed('代码格式或质量检测未通过，请检查报告。');

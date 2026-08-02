@@ -1,15 +1,20 @@
-"""Contract tests for the specialized Bugkiller overlay."""
+"""Contract tests for current Bugkiller routing assets."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 
+
 ROOT = Path(__file__).resolve().parents[2]
 SKILL = ROOT / "skills" / "bugkiller" / "SKILL.md"
 REFERENCES = ROOT / "skills" / "bugkiller" / "references"
+AGENTS = ROOT / "agents"
+PROFILE = ROOT / "skills" / "code-atlas" / "assets" / "host-profiles.json"
+UI_METADATA = AGENTS / "openai.yaml"
 VALIDATOR = ROOT / "skills" / "bugkiller" / "scripts" / "validate_bugkiller.py"
 
 
@@ -18,83 +23,94 @@ def read(path: Path) -> str:
 
 
 class BugkillerAssetTests(unittest.TestCase):
-    def test_skill_is_thin_and_routes_to_references(self) -> None:
+    def test_skill_is_thin_and_names_current_routing_policy(self) -> None:
         text = read(SKILL)
+
         self.assertTrue(text.startswith("---\n"))
         self.assertIn("name: bugkiller", text)
-        self.assertIn("description: Use when", text)
         self.assertIn("\n# Bugkiller\n", text)
         self.assertLessEqual(len(text.splitlines()), 120)
-        self.assertIn("references/", text)
+        for marker in ("Terra High", "Terra Max", "Sol High", "Luna is unavailable"):
+            self.assertIn(marker, text)
 
-    def test_references_preserve_mailbox_and_permission_boundaries(self) -> None:
+    def test_references_preserve_durable_handoff_and_scope_boundaries(self) -> None:
         text = "\n".join(read(path) for path in REFERENCES.glob("*.md"))
-        for required in (
-            "DEGRADED_SKILL_ONLY",
+        cursor = 0
+        for marker in (
             "workflow_artifact_register",
             "workflow_message_send",
-            "collaboration.send_message",
             "workflow_inbox",
+            "workflow_artifact_resolve",
             "workflow_message_ack",
-            "TTL",
-            "does not grant",
         ):
-            self.assertIn(required, text)
-        self.assertNotIn("coordinator forwards", text.lower())
+            cursor = text.find(marker, cursor)
+            self.assertGreaterEqual(cursor, 0, marker)
+            cursor += len(marker)
+        for marker in ("does not grant", "candidate commit", "final acceptance"):
+            self.assertIn(marker, text)
         roles = read(REFERENCES / "roles.md")
-        for required in (
-            "spawn",
-            "model choices",
-            "explicitly select Luna",
-            "2718lab-doc-writer",
-            "2718lab-code-writer",
-            "2718lab-risk-reviewer",
-            "gpt-5.6-sol",
-            "ultra",
-            "DEGRADED_TRIAGE",
+        for marker in (
+            "Sol coordinator",
+            "gpt-5.6-terra",
+            "Terra High",
+            "Terra Max",
+            "Sol High",
+            "Luna",
+            "Opus",
+            "Sonnet",
+            "Haiku",
+            "Fable",
+            "explicit escalation reason",
         ):
-            self.assertIn(required, roles)
-        self.assertIn("read-only roles never write code", " ".join(roles.split()))
-        self.assertNotIn("only patch writer", roles)
+            self.assertIn(marker, roles)
 
-    def test_bugkiller_reuses_shared_agents(self) -> None:
-        skill = read(SKILL)
-        roles = read(REFERENCES / "roles.md")
-        combined = "\n".join((skill, roles))
-        for agent in (
-            "2718lab-triage",
-            "2718lab-investigator",
-            "2718lab-doc-writer",
-            "2718lab-verifier",
-            "2718lab-code-writer",
-            "2718lab-risk-reviewer",
+    def test_agent_assets_match_current_roles_and_remove_obsolete_assets(self) -> None:
+        expected = {
+            "bugkiller-sol-coordinator.md": ("Sol", "final acceptance"),
+            "bugkiller-terra-investigator.md": ("Terra High", "gpt-5.6-terra"),
+            "bugkiller-terra-doc-writer.md": ("Terra High", "documentation-only"),
+            "bugkiller-terra-verifier.md": ("Terra High", "read-only"),
+            "bugkiller-sol-escalation.md": ("Sol High", "exceptional"),
+        }
+        for filename, markers in expected.items():
+            content = read(AGENTS / filename)
+            self.assertTrue(content.startswith("---\n"), filename)
+            self.assertIn("\n# ", content, filename)
+            for marker in markers:
+                self.assertIn(marker, content, filename)
+
+        for filename in (
+            "-".join(("bugkiller", "sol", "code", "writer")) + ".md",
+            "-".join(("bugkiller", "luna", "triage")) + ".md",
         ):
-            self.assertIn(agent, combined)
-        self.assertNotIn("bugkiller-sol-code-writer", combined)
-        self.assertNotIn("bugkiller-terra-doc-writer", combined)
+            self.assertFalse((AGENTS / filename).exists(), filename)
 
-    def test_strict_index_workflow_policy_names_every_gate_in_order(self) -> None:
-        text = read(REFERENCES / "workflow.md")
-        ordered = (
-            "project_index_sync",
-            "strict_index=true",
-            "project_index_query",
-            "trace_id",
-            "worktree_checkpoint_create",
-            'project_index_sync(bind_as="output")',
-            "project_index_query",
-            "trace_id",
-            'workflow_artifact_register(kind="verification", snapshot_id=...)',
-            "workflow_complete",
+    def test_host_profile_encodes_exact_routes_and_luna_unavailability(self) -> None:
+        profile = json.loads(read(PROFILE))
+        roles = profile["hosts"]["codex"]["roles"]
+
+        self.assertEqual(
+            {"model": "gpt-5.6-terra", "reasoning": "high"},
+            {key: roles["code"]["normal"][key] for key in ("model", "reasoning")},
         )
-        cursor = 0
-        for marker in ordered:
-            with self.subTest(marker=marker):
-                cursor = text.find(marker, cursor)
-                self.assertGreaterEqual(
-                    cursor, 0, f"missing or out-of-order marker: {marker}"
-                )
-                cursor += len(marker)
+        self.assertEqual(
+            {"model": "gpt-5.6-terra", "reasoning": "max"},
+            {key: roles["code"]["complex"][key] for key in ("model", "reasoning")},
+        )
+        self.assertEqual("unavailable", roles["luna"]["status"])
+        claude = profile["hosts"]["claude"]["roles"]
+        self.assertEqual("opus", claude["coordinator"]["model"])
+        self.assertEqual("sonnet", claude["code"]["model"])
+        self.assertEqual("haiku", claude["light"]["model"])
+        self.assertTrue(claude["fable"]["requires_escalation_reason"])
+
+    def test_plugin_ui_metadata_has_only_ui_fields(self) -> None:
+        text = read(UI_METADATA)
+        self.assertIn("interface:", text)
+        for marker in ("display_name:", "short_description:", "default_prompt:"):
+            self.assertIn(marker, text)
+        self.assertNotIn("agents:", text)
+        self.assertNotIn("model:", text)
 
     def test_validator_accepts_all_assets(self) -> None:
         result = subprocess.run(

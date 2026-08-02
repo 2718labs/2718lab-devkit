@@ -34,23 +34,16 @@ SQLite 是 task、dependency、lease、attempt、event、evidence hash 和 budge
 | `workflow_artifact_resolve` | 领取方以当前租约把自己的 delivery hash 解析为受限 artifact 路径与元数据 |
 | `workflow_message_ack` | 以 recipient 和 delivery id 确认已处理消息，保留审计摘要 |
 | `workflow_cancel` | 冻结新 claim，撤销租约并记录取消事件 |
-| `workflow_detect_adapters` | 为任意领域任务返回结构化、本地且无 shell 的验证命令规格 |
-| `workflow_approval_prepare`, `workflow_approval_grant`, `workflow_approval_deny`, `workflow_approval_claim` | 为 commit、push、PR 保存不可变、单次使用的共享审批记录 |
 
-插件将这个通用协调 MCP 注册为 `2718lab-tools`；所有领域 skill 都可以直接使用，
-Bugkiller 只是其中一种上层工作流。MCP 只管理编排数据，不在服务内部启动模型或
-隐藏 shell 命令。Codex 主代理读取 ready wave 后显式创建子代理。
+插件将这个通用协调 MCP 注册为 `2718lab-tools`；Bugkiller 只是使用它的一种上层工作流。MCP 只管理编排数据，不在服务内部启动模型或隐藏 shell 命令。Codex 主代理读取 ready wave 后显式创建子代理。
 
 ## Strict index write gate
 
-Legacy registrations retain `strict_index=false`. A strict task follows this exact sequence: `project_index_sync` -> `strict_index=true` -> `project_index_query` -> `trace_id` -> `worktree_checkpoint_create` -> `project_index_sync(bind_as="output")` -> `project_index_query` -> `trace_id` -> `workflow_artifact_register(kind="verification", snapshot_id=...)` -> `workflow_complete`. The first query and trace bind the input snapshot, the checkpoint precedes writes, and the output sync/query bind the verification snapshot before completion.
-
-输入快照允许任务卡在精确 `write scope` 中声明尚不存在、准备新建的文件，但仅限
-路径当前确实不存在、解析后仍位于工作区内且父级路径安全的情况。已经被输入快照
-覆盖的文件若消失，或计划新建路径在注册前意外出现，仍返回 `INDEX_STALE`。不得为
-绕过新文件门禁把精确文件范围扩大成整个目录；输出快照与完成门禁必须覆盖实际产物。
+Legacy registrations retain `strict_index=false`. A strict task follows this exact sequence: `project_index_sync` -> `strict_index=true` -> `project_index_query` -> `trace_id` -> `worktree_checkpoint_create` -> `project_index_sync(bind_as="output")` -> `project_index_query` -> `trace_id` -> `workflow_artifact_register(kind="verification", snapshot_id=...)` -> `workflow_complete`. The first query and trace bind the input snapshot, the checkpoint precedes writes, and the output sync/query bind the verification snapshot before completion. Only Sol may call the acceptance completion gate after review.
 
 ## 点对点通信
+
+Durable handoff order is `workflow_artifact_register -> workflow_message_send -> workflow_inbox -> workflow_artifact_resolve -> workflow_message_ack`. Direct chat may wake a worker after durable delivery but is never task context, evidence, handoff, or acceptance source of truth.
 
 消息仅可在已注册的 dependency edge 两端，或同一 workflow 中显式订阅同一 contract 的任务之间发送；订阅关系由任务注册时固定，不能由消息创建。消息不会扩大接收方的 role、lease、contract access 或 write scope。
 
@@ -64,13 +57,32 @@ Legacy registrations retain `strict_index=false`. A strict task follows this exa
 
 1. 用 content hash 去重 repository map、task card、contract、测试命令和验证输出；相同输入不重复采集。
 2. `workflow_context` 不返回 sibling task cards、完整聊天历史或不相关日志。
-3. `2718lab-triage` 处理分诊与证据整理，`2718lab-investigator` 负责只读定位，
-   `2718lab-code-writer` 负责受限实现，`2718lab-verifier` 独立验证；
-   `2718lab-risk-reviewer` 默认预算为零。
+3. Sol owns architecture, dispatch, review, integration, and final acceptance. Terra High handles routine bounded work; Terra Max handles complex work; Sol High is explicit exceptional escalation only. Luna (`gpt-5.6-luna` / `low`, `medium`, `high`, or `xhigh`) is eligible only when the current Codex host capability report attests the exact requested pair; absent attestation returns unavailable without substitution. A request without an effort uses the profile's `medium` default only when that exact pair is attested. Bugkiller remains a separate policy surface.
 4. 同一 write scope 只允许一个有效租约；只读任务可以并行。
 5. 任务完成只回传结构化摘要、artifact hashes 和阻塞项；长日志保存在证据路径。
 6. 普通低风险流程不创建 reviewer。高风险先问用户，用户允许后再分派危险审查。
 7. 协调器仅协调 peer capability、delivery id 和 artifact hash；不得将消息正文作为 status、context 或 agent-to-agent relay 的一部分。
+
+## Fast Lane v3 scheduler boundary
+
+Fast Lane is not a second routing policy. The host gives the inert scheduler a
+bounded exact-key status object and complete per-`(task_id, scheduler_role)`
+core requests. The adapter validates the key against the source unit, invokes
+the pure routing core, and emits only its bounded decision and receipt fields.
+It must never reconstruct score/floor/capability fallback from a legacy
+`recommended_route` or profile. Missing, duplicate, unknown, role-mismatched,
+or unavailable core context invalidates the whole dispatch matrix as
+`NO_SAFE_WORK`, with no worker assignment or queue; no fixed worker route is
+substituted.
+
+The receipt/token bind context/result hashes, task fingerprint, reason codes,
+safety floor, dispatch context, slot epoch, and the bounded historical core
+input. A terminal or retained assignment replays that historical input instead
+of reinterpreting it using a later scheduler event or lease. `ultra` activates
+lane 0; no worker may receive `ultra`. Prewarm stays read-only. Archive is a
+host action only after lane-0 acceptance and final evidence binding. All task
+temporary roots remain below `D:\bun\tmp\codex\<project-or-thread>`; C-drive
+temporary roots are forbidden.
 
 ## 恢复
 

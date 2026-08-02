@@ -1,14 +1,11 @@
 {
   "name": "2718lab-devkit",
-  "version": "0.2.0",
-  "description": "2718lab 工程基础设施技能包，提供确定性项目索引、耐久任务编排、受控恢复，以及 AstrBot、MCP、Python 与开源交付规范。",
+  "version": "0.3.0",
+  "description": "2718lab development toolkit with release-candidate Code Atlas metadata and frozen interface contracts pending ATLAS-11 registration and ATLAS-13 E2E acceptance, plus Bugkiller workflow and MCP coordination. 2718lab 开发工具包，提供等待 ATLAS-11 注册和 ATLAS-13 E2E 验收的 Code Atlas 发布候选元数据与冻结接口契约，以及 Bugkiller 工作流与 MCP 协调。",
   "author": {
-    "name": "2718lab",
-    "url": "https://github.com/2718labs"
+    "name": "2718lab"
   },
-  "homepage": "https://github.com/2718labs/2718lab-devkit",
-  "repository": "https://github.com/2718labs/2718lab-devkit",
-  "license": "AGPL-3.0",
+  "homepage": "https://github.com/2718lab/2718lab-devkit",
   "keywords": [
     "astrbot",
     "mcp",
@@ -16,6 +13,13 @@
     "python-engineering",
     "open-source",
     "chatbot-plugin",
-    "skills"
+    "skills",
+    "code-atlas",
+    "automatic-ingestion",
+    "graph-recipes",
+    "team-decomposition",
+    "release-candidate",
+    "interface-contract",
+    "activation-gate"
   ]
 }

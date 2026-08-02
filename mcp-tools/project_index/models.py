@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+
 PROVENANCE_VALUES = frozenset({"observed", "resolved", "declared"})
+WORKSPACE_BINDING_STATES = frozenset({"active", "historical_unverified"})
 
 
 class IndexError(RuntimeError):
@@ -22,6 +24,7 @@ class IndexState(str, Enum):
     INDEX_STALE = "INDEX_STALE"
     INDEX_UNAVAILABLE = "INDEX_UNAVAILABLE"
     INDEX_CORRUPT = "INDEX_CORRUPT"
+    HISTORICAL_UNVERIFIED = "historical_unverified"
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,37 @@ class IndexSnapshot:
     manifest_hash: str = ""
     parser_set_hash: str = ""
     head: str | None = None
+    workspace_id: str = ""
+    binding_state: str = "active"
+
+    def __post_init__(self) -> None:
+        if self.binding_state not in WORKSPACE_BINDING_STATES:
+            raise ValueError("unsupported project-index workspace binding state")
+
+    @property
+    def trust_state(self) -> str:
+        """Compatibility spelling for the workspace binding trust state."""
+        return self.binding_state
+
+    @property
+    def historical_unverified(self) -> bool:
+        return self.binding_state == "historical_unverified"
+
+
+@dataclass(frozen=True)
+class SnapshotFacts:
+    snapshot: IndexSnapshot
+    file_hashes: tuple[tuple[str, str], ...]
+    nodes: tuple[IndexNode, ...]
+    edges: tuple[IndexEdge, ...]
+    gaps: tuple[CoverageGap, ...]
+
+
+@dataclass(frozen=True)
+class SnapshotFile:
+    path: str
+    content_hash: str
+    body: bytes
 
 
 @dataclass(frozen=True)
@@ -108,6 +142,7 @@ class IndexStatus:
     missing_paths: tuple[str, ...] = ()
     changed_paths: tuple[str, ...] = ()
     gaps: tuple[CoverageGap, ...] = ()
+    binding_state: str = "active"
 
 
 @dataclass(frozen=True)

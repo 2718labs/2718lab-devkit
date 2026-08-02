@@ -10,6 +10,16 @@
           }
         ],
         "matcher": "Edit|Write"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/execution_receipt.py\"",
+            "timeout": 10
+          }
+        ],
+        "matcher": "Bash|Edit|Write|shell_command|apply_patch|Code|exec"
       }
     ]
   }

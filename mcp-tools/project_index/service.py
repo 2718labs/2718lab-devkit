@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 from collections import deque
-from dataclasses import asdict
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Mapping, Sequence
+from typing import TYPE_CHECKING, BinaryIO, cast
+
+if TYPE_CHECKING:
+    from devkit_runtime.workspace_authority import WorkspaceRootAuthority
 
 from . import extractors
 from .extractors import ParsedExtraction, SourceFile
@@ -26,11 +32,16 @@ from .models import (
     QueryReceipt,
     QueryResult,
     SnapshotDiff,
+    SnapshotFacts,
+    SnapshotFile,
     SourceWindow,
 )
+from .registry import WorkspaceRegistry
 from .store import ProjectIndexStore, StoreError
+from .workspace import is_workspace_id, workspace_identity
 
-_SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v2"
+_SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v4"
+_READ_CHUNK_SIZE = 64 * 1024
 _REPARSE_POINT = 0x400
 _IGNORED_DIRECTORIES = frozenset(
     {
@@ -62,29 +73,168 @@ _INDEX_DATABASE_NAMES = frozenset(
 )
 
 
+@dataclass
+class _OpenedWorkspaceFile:
+    """A verified descriptor held only for the duration of one file read."""
+
+    relative_path: str
+    before: os.stat_result
+    opened: os.stat_result
+    stream: BinaryIO
+
+
+@dataclass(frozen=True)
+class _StandaloneWorkspaceAccess:
+    """Temporary standalone-package compatibility binding until R9 packaging."""
+
+    workspace_id: str
+    root: Path
+
+
+class _StandaloneWorkspaceRootAuthority:
+    """Keep legacy Project Index-only distributions usable during R1-R8."""
+
+    def __init__(self, registry: WorkspaceRegistry) -> None:
+        self._registry = registry
+
+    def resolve(self, workspace_id: str) -> _StandaloneWorkspaceAccess:
+        return _StandaloneWorkspaceAccess(
+            workspace_id, self._registry.resolve(workspace_id)
+        )
+
+
+def _workspace_authority_for(registry: WorkspaceRegistry) -> WorkspaceRootAuthority:
+    """Use the runtime authority, retaining standalone compatibility through R8."""
+
+    try:
+        from devkit_runtime.workspace_authority import WorkspaceRootAuthority
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"devkit_runtime", "devkit_runtime.workspace_authority"}:
+            raise
+        return cast(
+            "WorkspaceRootAuthority", _StandaloneWorkspaceRootAuthority(registry)
+        )
+    return WorkspaceRootAuthority(registry)
+
+
+def _called_by_runtime_bootstrap() -> bool:
+    """Keep the explicit bootstrap call as the only mutating constructor path."""
+
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            if (
+                frame.f_code.co_name == "_bootstrap_stores"
+                and frame.f_globals.get("__name__") == "devkit_runtime.bootstrap"
+            ):
+                return True
+            frame = frame.f_back
+    finally:
+        del frame
+    return False
+
+
 class ProjectIndexService:
     """Own a rebuildable graph database and expose bounded deterministic reads."""
 
     def __init__(self, database_path: str | Path) -> None:
         self._database_path = Path(database_path).resolve(strict=False)
         try:
-            self._store = ProjectIndexStore(self._database_path)
+            if _called_by_runtime_bootstrap():
+                self._store = ProjectIndexStore.bootstrap(self._database_path)
+            else:
+                self._store = ProjectIndexStore.open_prepared(self._database_path)
+            self._registry = WorkspaceRegistry(self._store)
+            self._workspace_authority = _workspace_authority_for(self._registry)
         except sqlite3.DatabaseError as exc:
             raise IndexError(
                 "INDEX_CORRUPT", "project index database is corrupt"
+            ) from exc
+        except StoreError as exc:
+            raise IndexError(
+                "INDEX_UNAVAILABLE", "project index database is unavailable"
             ) from exc
         except OSError as exc:
             raise IndexError(
                 "INDEX_UNAVAILABLE", "project index database is unavailable"
             ) from exc
 
+    @classmethod
+    def from_prepared_store(cls, store: ProjectIndexStore) -> ProjectIndexService:
+        """Create a non-mutating service over one externally prepared store."""
+
+        service = cls.__new__(cls)
+        service._database_path = store.database_path
+        service._store = store
+        service._registry = WorkspaceRegistry(store)
+        service._workspace_authority = _workspace_authority_for(service._registry)
+        return service
+
+    @property
+    def workspace_authority(self) -> WorkspaceRootAuthority:
+        """Return the sole typed authority shared with checkpoint operations."""
+
+        return self._workspace_authority
+
     def close(self) -> None:
         self._store.close()
 
+    def project_index_register(self, workspace_root: str | Path) -> str:
+        """Register the sole accepted filesystem-root input for project indexing."""
+        try:
+            return self._registry.project_index_register(workspace_root)
+        except StoreError as exc:
+            raise IndexError(
+                "INDEX_CORRUPT", "project index workspace registry is corrupt"
+            ) from exc
+
+    def revalidate_snapshot(self, workspace_id: str, snapshot_id: str) -> IndexSnapshot:
+        """Explicitly promote one migrated path snapshot after a full current check."""
+        registered_id, root = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(
+            registered_id, snapshot_id, allow_historical=True
+        )
+        if snapshot.binding_state != "historical_unverified":
+            raise IndexError("INVALID_QUERY", "snapshot is not awaiting revalidation")
+        historical_identity = self._store.historical_binding_identity(
+            registered_id, snapshot_id
+        )
+        try:
+            current_identity = workspace_identity(root)
+        except IndexError as exc:
+            raise IndexError(
+                "WORKSPACE_REBIND", "workspace registration is no longer valid"
+            ) from exc
+        if not historical_identity or historical_identity != current_identity:
+            raise IndexError(
+                "WORKSPACE_REBIND", "workspace registration is no longer valid"
+            )
+        expected = self._store.file_hashes(snapshot_id)
+        current = {
+            source.path: source.content_hash
+            for source in self._collect_files(
+                root,
+                self._store.include_paths(snapshot_id),
+                error_code="INDEX_STALE",
+            )
+        }
+        if current != expected:
+            raise IndexError(
+                "INDEX_STALE", "project index snapshot does not match the workspace"
+            )
+        try:
+            return self._store.activate_historical_snapshot(registered_id, snapshot_id)
+        except (sqlite3.DatabaseError, StoreError) as exc:
+            raise IndexError(
+                "INDEX_CORRUPT", "project index historical binding is corrupt"
+            ) from exc
+
     def sync(
-        self, workspace: str | Path, include_paths: Sequence[str | Path] | None = None
+        self,
+        workspace_id: str,
+        include_paths: Sequence[str | Path] | None = None,
     ) -> IndexSnapshot:
-        root = self._canonical_workspace(workspace)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
         normalized_includes = self._normalize_paths(include_paths)
         files = self._collect_files(root, normalized_includes)
         parsed_by_key: dict[tuple[str, str, str], ParsedExtraction] = {}
@@ -119,14 +269,14 @@ class ProjectIndexService:
         parser_set_hash = _parser_set_hash(parsed_files)
         head = _git_head(root)
         snapshot_id = _snapshot_identifier(
-            root,
+            workspace_id=workspace_id,
             manifest_hash=manifest_hash,
             parser_set_hash=parser_set_hash,
             head=head,
         )
         snapshot = IndexSnapshot(
             snapshot_id=snapshot_id,
-            workspace=_workspace_key(root),
+            workspace=workspace_id,
             state=IndexState.INDEX_PARTIAL
             if extraction.gaps
             else IndexState.INDEX_READY,
@@ -139,6 +289,7 @@ class ProjectIndexService:
             manifest_hash=manifest_hash,
             parser_set_hash=parser_set_hash,
             head=head,
+            workspace_id=workspace_id,
         )
         try:
             return self._store.put_snapshot(
@@ -157,24 +308,31 @@ class ProjectIndexService:
 
     def status(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str | None = None,
         required_paths: Sequence[str | Path] | None = None,
     ) -> IndexStatus:
-        root = self._canonical_workspace(workspace)
-        workspace_key = _workspace_key(root)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
         snapshot = (
-            self._store.get_snapshot(snapshot_id)
+            self._store.get_snapshot_for_workspace(workspace_id, snapshot_id)
             if snapshot_id
-            else self._store.latest_snapshot(workspace_key)
+            else self._store.latest_snapshot(workspace_id)
         )
         required = self._normalize_paths(required_paths)
-        if snapshot is None or snapshot.workspace != workspace_key:
+        if snapshot is None or snapshot.workspace_id != workspace_id:
             return IndexStatus(
-                workspace_key,
+                workspace_id,
                 snapshot_id,
                 IndexState.INDEX_UNAVAILABLE,
                 required_paths=required,
+            )
+        if snapshot.binding_state != "active":
+            return IndexStatus(
+                workspace=workspace_id,
+                snapshot_id=snapshot.snapshot_id,
+                state=IndexState.HISTORICAL_UNVERIFIED,
+                required_paths=required,
+                binding_state=snapshot.binding_state,
             )
 
         expected = self._store.file_hashes(snapshot.snapshot_id)
@@ -218,18 +376,19 @@ class ProjectIndexService:
         else:
             state = snapshot.state
         return IndexStatus(
-            workspace=workspace_key,
+            workspace=workspace_id,
             snapshot_id=snapshot.snapshot_id,
             state=state,
             required_paths=required,
             missing_paths=missing,
             changed_paths=changed,
             gaps=self._store.gaps(snapshot.snapshot_id),
+            binding_state=snapshot.binding_state,
         )
 
     def query(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str,
         query: str,
         mode: str = "lexical",
@@ -241,8 +400,8 @@ class ProjectIndexService:
         byte_budget: int = 32768,
         allow_miss_escape: bool = False,
     ) -> QueryResult:
-        root = self._canonical_workspace(workspace)
-        snapshot = self._require_snapshot(root, snapshot_id)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(workspace_id, snapshot_id)
         normalized_mode = str(mode).casefold()
         if normalized_mode not in {"lexical", "graph", "impact"}:
             raise IndexError("INVALID_QUERY", "query mode is not supported")
@@ -382,11 +541,13 @@ class ProjectIndexService:
         """Compatibility alias for fetching a successful query receipt."""
         return self.get_query_receipt(trace_id)
 
-    def diff(self, from_snapshot_id: str, to_snapshot_id: str) -> SnapshotDiff:
-        before = self._store.get_snapshot(from_snapshot_id)
-        after = self._store.get_snapshot(to_snapshot_id)
-        if before is None or after is None:
-            raise IndexError("NOT_FOUND", "project index snapshot was not found")
+    def diff(
+        self, workspace_id: str, from_snapshot_id: str, to_snapshot_id: str
+    ) -> SnapshotDiff:
+        """Compare two active snapshots belonging to one registered workspace."""
+        workspace_id, _ = self._workspace_for_reference(workspace_id)
+        self._require_snapshot(workspace_id, from_snapshot_id)
+        self._require_snapshot(workspace_id, to_snapshot_id)
         before_files = self._store.file_hashes(from_snapshot_id)
         after_files = self._store.file_hashes(to_snapshot_id)
         before_paths = set(before_files)
@@ -415,63 +576,188 @@ class ProjectIndexService:
 
     def assert_current(
         self,
-        workspace: str | Path,
+        workspace_id: str,
         snapshot_id: str,
         required_paths: Sequence[str | Path] | None = None,
-        *,
-        allow_absent_paths: bool = False,
     ) -> IndexSnapshot:
-        current = self.status(workspace, snapshot_id, required_paths)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
+        if required_paths is None:
+            snapshot = self._require_snapshot(workspace_id, snapshot_id)
+            captured_files = self._collect_files(
+                root,
+                self._store.include_paths(snapshot.snapshot_id),
+                error_code="INDEX_STALE",
+            )
+            return self._assert_current_with_files(
+                workspace_id, snapshot_id, captured_files
+            )
+        current = self.status(workspace_id, snapshot_id, required_paths)
         if current.state is IndexState.INDEX_UNAVAILABLE:
             raise IndexError("NOT_FOUND", "project index snapshot was not found")
-        missing_paths = current.missing_paths
-        if allow_absent_paths and missing_paths:
-            root = self._canonical_workspace(workspace)
-            missing_paths = tuple(
-                scope
-                for scope in missing_paths
-                if not self._is_safe_absent_path(root, scope)
-            )
-        if current.state is IndexState.INDEX_STALE or missing_paths:
+        if current.state is IndexState.INDEX_STALE or current.missing_paths:
             raise IndexError(
                 "INDEX_STALE", "project index snapshot does not match the workspace"
             )
-        root = self._canonical_workspace(workspace)
-        return self._require_snapshot(root, snapshot_id)
+        return self._require_snapshot(workspace_id, snapshot_id)
 
-    @staticmethod
-    def _is_safe_absent_path(root: Path, scope: str) -> bool:
-        parts = PurePosixPath(scope).parts
-        target = root.joinpath(*parts)
-        if target.exists() or target.is_symlink():
-            return False
-        current = root
-        for part in parts[:-1]:
-            current /= part
-            if current.is_symlink():
-                return False
-            if current.exists() and not current.is_dir():
-                return False
-        try:
-            resolved = target.resolve(strict=False)
-        except (OSError, RuntimeError):
-            return False
-        return root in resolved.parents
-
-    def _require_snapshot(self, root: Path, snapshot_id: str) -> IndexSnapshot:
-        snapshot = self._store.get_snapshot(snapshot_id)
-        if snapshot is None or snapshot.workspace != _workspace_key(root):
-            raise IndexError("NOT_FOUND", "project index snapshot was not found")
+    def _assert_current_with_files(
+        self,
+        workspace_id: str,
+        snapshot_id: str,
+        captured_files: Sequence[SourceFile],
+    ) -> IndexSnapshot:
+        snapshot = self._require_snapshot(workspace_id, snapshot_id)
+        expected = self._store.file_hashes(snapshot.snapshot_id)
+        current = {source.path: source.content_hash for source in captured_files}
+        if any(
+            expected.get(path) != current.get(path)
+            for path in set(expected).union(current)
+        ):
+            raise IndexError(
+                "INDEX_STALE", "project index snapshot does not match the workspace"
+            )
         return snapshot
 
-    def _canonical_workspace(self, workspace: str | Path) -> Path:
-        try:
-            root = Path(workspace).resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise IndexError("INDEX_UNAVAILABLE", "workspace is unavailable") from exc
-        if not root.is_dir():
-            raise IndexError("INDEX_UNAVAILABLE", "workspace is unavailable")
-        return root
+    def snapshot_facts(self, workspace_id: str, snapshot_id: str) -> SnapshotFacts:
+        workspace_id, _ = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(
+            workspace_id, snapshot_id, allow_historical=True
+        )
+        return SnapshotFacts(
+            snapshot=snapshot,
+            file_hashes=tuple(sorted(self._store.file_hashes(snapshot_id).items())),
+            nodes=tuple(
+                sorted(
+                    self._store.nodes(snapshot_id),
+                    key=lambda node: (node.path, node.node_id),
+                )
+            ),
+            edges=tuple(
+                sorted(self._store.edges(snapshot_id), key=lambda edge: edge.edge_id)
+            ),
+            gaps=tuple(
+                sorted(
+                    self._store.gaps(snapshot_id),
+                    key=lambda gap: (gap.path, gap.code, gap.message),
+                )
+            ),
+        )
+
+    def read_snapshot_files(
+        self,
+        workspace_id: str,
+        snapshot_id: str,
+        paths: Sequence[str | Path],
+        *,
+        byte_budget: int,
+    ) -> tuple[SnapshotFile, ...]:
+        if type(byte_budget) is not int or byte_budget <= 0:
+            raise IndexError("INVALID_QUERY", "byte_budget must be a positive integer")
+        normalized_paths = self._normalize_read_paths(paths)
+        workspace_id, root = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(workspace_id, snapshot_id)
+        expected_hashes = self._store.file_hashes(snapshot_id)
+        for relative_path in normalized_paths:
+            if relative_path not in expected_hashes:
+                raise IndexError(
+                    "NOT_FOUND", "project index source file was not snapshotted"
+                )
+        _prevalidate_requested_file_sizes(root, normalized_paths, byte_budget)
+        captured_hashes, captured_bodies = self._scan_snapshot_files(
+            root,
+            self._store.include_paths(snapshot.snapshot_id),
+            frozenset(normalized_paths),
+            byte_budget,
+        )
+        if captured_hashes != expected_hashes:
+            raise IndexError(
+                "INDEX_STALE", "project index snapshot does not match the workspace"
+            )
+        files: list[SnapshotFile] = []
+        for relative_path in normalized_paths:
+            expected_hash = expected_hashes.get(relative_path)
+            if expected_hash is None:  # Defensive: membership was checked pre-scan.
+                raise IndexError(
+                    "NOT_FOUND", "project index source file was not snapshotted"
+                )
+            body = captured_bodies.get(relative_path)
+            if body is None or captured_hashes.get(relative_path) != expected_hash:
+                raise IndexError(
+                    "INDEX_STALE", "project index source hash no longer matches"
+                )
+            files.append(SnapshotFile(relative_path, expected_hash, body))
+        return tuple(files)
+
+    def _scan_snapshot_files(
+        self,
+        root: Path,
+        include_paths: Sequence[str],
+        requested: frozenset[str],
+        byte_budget: int,
+    ) -> tuple[dict[str, str], dict[str, bytes]]:
+        hashes: dict[str, str] = {}
+        bodies: dict[str, bytes] = {}
+        used = 0
+        database_names = {
+            os.path.normcase(str(self._database_path)),
+            os.path.normcase(f"{self._database_path}-wal"),
+            os.path.normcase(f"{self._database_path}-shm"),
+        }
+        for current_root, directory_names, file_names in os.walk(
+            root, topdown=True, followlinks=False
+        ):
+            current = Path(current_root)
+            directory_names[:] = sorted(
+                name
+                for name in directory_names
+                if name.casefold() not in _IGNORED_DIRECTORIES
+                and not _unsafe_path(current / name)
+                and _path_may_match(
+                    (current / name).relative_to(root).as_posix(), include_paths
+                )
+            )
+            for name in sorted(file_names):
+                candidate = current / name
+                relative = candidate.relative_to(root).as_posix()
+                if (
+                    not _path_matches(relative, include_paths)
+                    or _unsafe_path(candidate)
+                    or _ignored_database(candidate, database_names)
+                ):
+                    continue
+                retain = relative in requested
+                digest, body, size = _stream_workspace_file(
+                    root, candidate, retain, byte_budget - used
+                )
+                if retain:
+                    used += size
+                    if used > byte_budget:
+                        raise IndexError("INVALID_QUERY", "byte_budget exceeded")
+                    if body is None:
+                        raise IndexError(
+                            "INDEX_STALE", "project index source disappeared"
+                        )
+                    bodies[relative] = body
+                hashes[relative] = digest
+        return hashes, bodies
+
+    def _require_snapshot(
+        self, workspace_id: str, snapshot_id: str, *, allow_historical: bool = False
+    ) -> IndexSnapshot:
+        snapshot = self._store.get_snapshot_for_workspace(workspace_id, snapshot_id)
+        if snapshot is None:
+            raise IndexError("NOT_FOUND", "project index snapshot was not found")
+        if snapshot.binding_state != "active" and not allow_historical:
+            raise IndexError(
+                "HISTORICAL_UNVERIFIED", "project index snapshot requires revalidation"
+            )
+        return snapshot
+
+    def _workspace_for_reference(self, workspace_id: str) -> tuple[str, Path]:
+        """Resolve a previously registered opaque workspace identifier only."""
+        if not isinstance(workspace_id, str) or not is_workspace_id(workspace_id):
+            raise IndexError("WORKSPACE_UNREGISTERED", "workspace is not registered")
+        return workspace_id, self.workspace_authority.resolve(workspace_id).root
 
     def _normalize_paths(self, paths: Sequence[str | Path] | None) -> tuple[str, ...]:
         if paths is None:
@@ -499,8 +785,35 @@ class ProjectIndexService:
             normalized.add(clean)
         return tuple(sorted(normalized))
 
+    def _normalize_read_paths(self, paths: Sequence[str | Path]) -> tuple[str, ...]:
+        if isinstance(paths, (str, bytes)):
+            raise IndexError("SCOPE_ESCAPE", "index paths must be a sequence")
+        try:
+            supplied = tuple(paths)
+        except TypeError as exc:
+            raise IndexError("SCOPE_ESCAPE", "index paths must be a sequence") from exc
+        if not supplied:
+            raise IndexError("SCOPE_ESCAPE", "index paths must not be empty")
+        normalized = self._normalize_paths(supplied)
+        if len(normalized) != len(supplied) or tuple(normalized) != tuple(
+            str(value).replace("\\", "/") for value in supplied
+        ):
+            raise IndexError("SCOPE_ESCAPE", "index paths must be unique and ordered")
+        for path in normalized:
+            parts = tuple(part.casefold() for part in PurePosixPath(path).parts)
+            if (
+                any(part in _IGNORED_DIRECTORIES or ":" in part for part in parts)
+                or parts[-1] in _INDEX_DATABASE_NAMES
+            ):
+                raise IndexError("SCOPE_ESCAPE", "index path is generated or internal")
+        return normalized
+
     def _collect_files(
-        self, root: Path, include_paths: Sequence[str]
+        self,
+        root: Path,
+        include_paths: Sequence[str],
+        *,
+        error_code: str = "INDEX_UNAVAILABLE",
     ) -> tuple[SourceFile, ...]:
         files: list[SourceFile] = []
         database_names = {
@@ -531,11 +844,12 @@ class ProjectIndexService:
                 ):
                     continue
                 try:
-                    data = full_path.read_bytes()
-                except OSError as exc:
+                    data = _capture_regular_file(root, full_path)
+                except IndexError as exc:
+                    if exc.code == error_code:
+                        raise
                     raise IndexError(
-                        "INDEX_UNAVAILABLE",
-                        f"workspace file is unreadable: {relative_path}",
+                        error_code, f"workspace file is unreadable: {relative_path}"
                     ) from exc
                 content_hash = _content_hash(data)
                 try:
@@ -586,7 +900,11 @@ def _parser_set_hash(parsed: Sequence[ParsedExtraction]) -> str:
 
 
 def _snapshot_identifier(
-    root: Path, *, manifest_hash: str, parser_set_hash: str, head: str | None
+    *,
+    workspace_id: str,
+    manifest_hash: str,
+    parser_set_hash: str,
+    head: str | None,
 ) -> str:
     return _hash_json(
         {
@@ -594,7 +912,7 @@ def _snapshot_identifier(
             "head": head,
             "manifest_hash": manifest_hash,
             "parser_set_hash": parser_set_hash,
-            "workspace": _workspace_key(root),
+            "workspace_id": workspace_id,
         }
     )
 
@@ -656,10 +974,6 @@ def _content_hash(data: bytes) -> str:
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
 
 
-def _workspace_key(root: Path) -> str:
-    return root.as_posix()
-
-
 def _unsafe_path(path: Path) -> bool:
     try:
         if path.is_symlink():
@@ -671,6 +985,8 @@ def _unsafe_path(path: Path) -> bool:
 
 
 def _verified_workspace_file(root: Path, relative_path: str) -> Path:
+    if _unsafe_path(root):
+        raise IndexError("INDEX_STALE", "project index workspace is no longer safe")
     candidate = root
     for part in PurePosixPath(relative_path).parts:
         candidate /= part
@@ -685,6 +1001,194 @@ def _verified_workspace_file(root: Path, relative_path: str) -> Path:
             "INDEX_STALE", "project index source path left the workspace"
         ) from exc
     return candidate
+
+
+def _capture_regular_file(root: Path, candidate: Path) -> bytes:
+    try:
+        relative_path = candidate.relative_to(root).as_posix()
+        candidate = _verified_workspace_file(root, relative_path)
+        before = candidate.lstat()
+        if _unsafe_stat_result(before) or not stat.S_ISREG(before.st_mode):
+            raise IndexError("INDEX_STALE", "project index source path is not regular")
+        descriptor = os.open(candidate, _read_only_open_flags())
+        try:
+            stream = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
+            opened = os.fstat(stream.fileno())
+            if _unsafe_stat_result(opened) or not stat.S_ISREG(opened.st_mode):
+                raise IndexError(
+                    "INDEX_STALE", "project index source path is not regular"
+                )
+            body = stream.read()
+        candidate = _verified_workspace_file(root, relative_path)
+        after = candidate.lstat()
+    except IndexError:
+        raise
+    except OSError as exc:
+        raise IndexError(
+            "INDEX_STALE", "project index source file is unavailable"
+        ) from exc
+    if _file_identity(before) != _file_identity(opened) or _file_identity(
+        opened
+    ) != _file_identity(after):
+        raise IndexError(
+            "INDEX_STALE", "project index source file changed while reading"
+        )
+    if _unsafe_stat_result(after) or not stat.S_ISREG(after.st_mode):
+        raise IndexError("INDEX_STALE", "project index source path is not regular")
+    return body
+
+
+def _prevalidate_requested_file_sizes(
+    root: Path, requested_paths: Sequence[str], byte_budget: int
+) -> None:
+    """Reject a requested aggregate that cannot fit before any body is read."""
+
+    used = 0
+    for relative_path in requested_paths:
+        candidate = root.joinpath(*PurePosixPath(relative_path).parts)
+        opened_file = _open_workspace_file(root, candidate)
+        try:
+            size = opened_file.opened.st_size
+            if size > byte_budget - used:
+                raise IndexError("INVALID_QUERY", "byte_budget exceeded")
+            used += size
+        finally:
+            _close_workspace_file(opened_file)
+
+
+def _stream_workspace_file(
+    root: Path, candidate: Path, retain: bool, remaining_budget: int
+) -> tuple[str, bytes | None, int]:
+    opened_file = _open_workspace_file(root, candidate)
+    try:
+        return _read_open_workspace_file(root, opened_file, retain, remaining_budget)
+    finally:
+        _close_workspace_file(opened_file)
+
+
+def _open_workspace_file(root: Path, candidate: Path) -> _OpenedWorkspaceFile:
+    stream: BinaryIO | None = None
+    try:
+        relative_path = candidate.relative_to(root).as_posix()
+        candidate = _verified_workspace_file(root, relative_path)
+        before = candidate.lstat()
+        if _unsafe_stat_result(before) or not stat.S_ISREG(before.st_mode):
+            raise IndexError("INDEX_STALE", "project index source path is not regular")
+        descriptor = os.open(candidate, _read_only_open_flags())
+        try:
+            stream = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        opened = os.fstat(stream.fileno())
+        if _unsafe_stat_result(opened) or not stat.S_ISREG(opened.st_mode):
+            raise IndexError("INDEX_STALE", "project index source path is not regular")
+        if _file_identity(before) != _file_identity(opened):
+            raise IndexError(
+                "INDEX_STALE", "project index source file changed while opening"
+            )
+        return _OpenedWorkspaceFile(relative_path, before, opened, stream)
+    except IndexError:
+        if stream is not None:
+            _close_workspace_stream(stream)
+        raise
+    except (OSError, ValueError) as exc:
+        if stream is not None:
+            _close_workspace_stream(stream)
+        raise IndexError(
+            "INDEX_STALE", "project index source file is unavailable"
+        ) from exc
+
+
+def _read_open_workspace_file(
+    root: Path,
+    opened_file: _OpenedWorkspaceFile,
+    retain: bool,
+    remaining_budget: int,
+) -> tuple[str, bytes | None, int]:
+    try:
+        _assert_opened_workspace_file_current(root, opened_file)
+        size = opened_file.opened.st_size
+        if retain and size > remaining_budget:
+            raise IndexError("INVALID_QUERY", "byte_budget exceeded")
+        digest = hashlib.sha256()
+        chunks: list[bytes] | None = [] if retain else None
+        retained = 0
+        remaining = size
+        while remaining:
+            read_size = min(_READ_CHUNK_SIZE, remaining)
+            chunk = opened_file.stream.read(read_size)
+            if not chunk or len(chunk) > read_size:
+                raise IndexError(
+                    "INDEX_STALE", "project index source file changed while reading"
+                )
+            digest.update(chunk)
+            remaining -= len(chunk)
+            if chunks is not None:
+                if retained + len(chunk) > remaining_budget:
+                    raise IndexError("INVALID_QUERY", "byte_budget exceeded")
+                retained += len(chunk)
+                chunks.append(chunk)
+        if opened_file.stream.read(1):
+            raise IndexError(
+                "INDEX_STALE", "project index source file changed while reading"
+            )
+        _assert_opened_workspace_file_current(root, opened_file)
+    except IndexError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise IndexError(
+            "INDEX_STALE", "project index source file is unavailable"
+        ) from exc
+    body = None if chunks is None else b"".join(chunks)
+    return f"sha256:{digest.hexdigest()}", body, size
+
+
+def _assert_opened_workspace_file_current(
+    root: Path, opened_file: _OpenedWorkspaceFile
+) -> None:
+    candidate = _verified_workspace_file(root, opened_file.relative_path)
+    after = candidate.lstat()
+    if _unsafe_stat_result(after) or not stat.S_ISREG(after.st_mode):
+        raise IndexError("INDEX_STALE", "project index source path is not regular")
+    if _file_identity(opened_file.before) != _file_identity(
+        opened_file.opened
+    ) or _file_identity(opened_file.opened) != _file_identity(after):
+        raise IndexError(
+            "INDEX_STALE", "project index source file changed while reading"
+        )
+
+
+def _close_workspace_file(opened_file: _OpenedWorkspaceFile) -> None:
+    _close_workspace_stream(opened_file.stream)
+
+
+def _close_workspace_stream(stream: BinaryIO) -> None:
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _read_only_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _file_identity(path_stat: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+    )
+
+
+def _unsafe_stat_result(path_stat: os.stat_result) -> bool:
+    return bool(getattr(path_stat, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def _ignored_database(path: Path, exact_names: set[str]) -> bool:
@@ -871,9 +1375,7 @@ def _bounded_items(
     return tuple(selected), used_bytes, truncated
 
 
-def _encoded_size(
-    value: IndexNode | IndexEdge | CoverageGap | SourceWindow,
-) -> int:
+def _encoded_size(value: object) -> int:
     return len(
         json.dumps(
             asdict(value), ensure_ascii=True, separators=(",", ":"), sort_keys=True

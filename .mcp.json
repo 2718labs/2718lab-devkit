@@ -1,14 +1,12 @@
 {
   "mcpServers": {
-    "2718lab-tools": {
-      "command": "python",
-      "args": ["mcp-tools/server.py"],
-      "cwd": ".",
+    "2718lab-devkit": {
+      "command": "uv",
+      "args": ["run", "--locked", "--no-dev", "python", "server.py"],
+      "cwd": "mcp-tools",
       "env_vars": [
-        "DEVKIT_HOME",
-        "BUGKILLER_HOME",
-        "PLUGIN_DATA",
-        "CODEX_HOME"
+        "CODEX_DEVKIT_HOST_BRIDGE_FD",
+        "CODEX_DEVKIT_HOST_BRIDGE_HANDLE"
       ]
     }
   }

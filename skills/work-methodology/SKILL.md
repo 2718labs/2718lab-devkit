@@ -7,30 +7,12 @@ description: Use when a 2718lab engineering task spans multiple files or agents,
 
 核心原则：给用户方向，给代理边界，给执行证据。不要让任何角色读取与自己无关的完整大文档。
 
-## 共享执行层
-
-本 skill 是全部 2718lab 领域 skill 的共享执行层，不隶属于 Bugkiller。
-`astrbot-plugin-dev`、`mcp-server-dev`、`python-engineering`、
-`oss-repo-ops` 和 `bugkiller` 都可以使用同一套 `2718lab-tools`：
-项目索引、耐久工作流、检查点、仓库适配器、审批日志和证据邮箱。
-
-通用 Agent 也由本层定义：
-
-- `2718lab-triage`：只读分诊与证据整理；
-- `2718lab-investigator`：只读调查、接地与定位；
-- `2718lab-doc-writer`：仅写明确授权的文档；
-- `2718lab-verifier`：只读验收与证据登记；
-- `2718lab-code-writer`：在精确写入范围内实现代码；
-- `2718lab-risk-reviewer`：仅在危险用户审批后执行只读审查。
-
-领域 skill 决定“什么是正确的”，本 skill 决定“怎样受控地完成”。Bugkiller
-只追加缺陷状态机、风险触发器和缺陷证据规则，不拥有这些共享能力。
-
 按需读取：
 
 - 多代理或需要持久计划：读 `references/work-packages.md`。
 - 需要创建、领取或恢复任务：读 `references/orchestration-runtime.md`。
 - 需要选择 team 形状或写 dispatch：读 `references/team-patterns.md`。
+- 需要生成安全的本地启动计划、恢复包、Todo 状态、契约/缓存检查、手工工件 wave、Fast Lane request/plan，或基于 `ImplementationPacket.to_dict()` / observed `GraphQueryResult.to_dict()` 的 Atlas 证据 wave 与工作流生命周期计划：读 `references/efficiency-automation.md`。
 - 不确定框架/API：读 `references/grounding-discipline.md`。
 - 准备交付：读 `references/verification-checklist.md`。
 
@@ -91,6 +73,10 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 
 多代理任务优先使用 `2718lab-tools` 的可执行编排：SQLite 保存任务 DAG、租约、事件和内容哈希，MCP 返回 ready wave、claim 结果和角色化上下文。Markdown 工作包是面向人和 agent 的投影视图，不是权威状态。
 
+执行 `team_efficiency.py` 生成的生命周期计划时，先按拓扑顺序完成全部 `workflow_register_task`，再逐 wave 调用 `workflow_ready`、`workflow_claim` 和 `workflow_endpoint_bind`；只有当前 wave 的所有任务都达到 `DONE` 才进入下一 wave。`workflow_ready` 因先前已将任务提升为 READY 而返回空集时，仍以 SQLite 中的持久任务状态为 claim 前置条件，不要求返回集合与计划 wave 完全相等。
+
+`task_episode_graph` 只能由可信 host 转发真实 Code Atlas 输出。规范化哈希、标识符和 provenance 字段只验证内部一致性，不认证调用方提供的 JSON 来源；observed fixture 也不是端到端真实性证据，来源认证边界由 ATLAS-12C 完成。
+
 严格索引任务在 `workflow_register_task` 时标记 `strict_index=true`：先 `project_index_sync`，再 `project_index_query` 取得 `trace_id`，创建 `worktree_checkpoint_create`，写入后以 `project_index_sync(bind_as="output")` 和再次查询确认输出；最后登记 `workflow_artifact_register(kind="verification", snapshot_id=...)`，才可 `workflow_complete`。旧任务保持 `strict_index=false`。
 
 如果 MCP 不可用，允许按 `references/work-packages.md` 使用文件降级，但必须标记 `DEGRADED_SKILL_ONLY`，关闭并发写入和崩溃恢复承诺，并向用户说明这不等价于完整插件。
@@ -102,6 +88,62 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 ### 5. 调度与回传
 
 按 `references/team-patterns.md` 选择最小 team。每个 dispatch 必须给出任务卡绝对路径、允许写入的路径、依赖、验收命令和禁止事项。代理只回传：改动文件、真实命令输出、结论和阻塞项。
+
+#### Ultra Fast Lane
+
+对实质性的 Ultra 任务，host 调用：
+
+```text
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+```
+
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不运行 gate、不改写 Git、不领取或完成 workflow。lane 0/main Sol 始终负责设计、集成、风险决策和最终验收。
+
+host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
+`routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整
+（每个不超过 32 KiB 的）`2718lab-devkit/fastlane-routing-request-v3` 和可信证据 hash；scheduler 只调用
+`fastlane_routing.py`，不得从 `recommended_route`、profile 或 capability 猜测/重建
+score、floor、fallback。每个 start receipt 绑定 `routing_context_hash`、
+`routing_result_hash`、`task_fingerprint`、reason codes、safety-floor rank 以及该次有界
+routing input；生命周期校验重放该历史 core input，不以较晚的 host event 改写旧 receipt。
+该 envelope 最多容纳原 16 个 unit 和一个已批准 remediation unit 的 85 个 task/role entries。
+
+缺少、重复、未知 task、task/role 不一致或 core unavailable（包括 capability 未 attested）
+任一此类条目都必须让整个 dispatch plan fail closed 到 `NO_SAFE_WORK`（零 worker、零队列），绝不回落到固定 `recommended_route`。
+`ultra` 只激活
+lane；worker model/effort 逐任务由 core 和 host attestation 决定，worker effort 禁止 `ultra`。
+prewarm 始终是独立的只读证据角色，不能变为 execution。
+
+host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后（only after a terminal event）refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。
+
+额度遥测优先由 host-private inherited-handle bridge 传递：先发送
+`kind="quota_snapshot_request"`（`host-quota-snapshot-request-v1`），再接收绑定同一
+`request_id` 的 `kind="quota_snapshot"`（`host-quota-snapshot-response-v1`）。响应内层必须是
+`host-quota-snapshot-v1`，并由 `fastlane_quota_balance` 继续验证快照哈希、签名、租约世代与
+120 秒 freshness。host 需要在同一进程内接入
+`scripts/codex_account_quota.py` 的 `CodexQuotaProvider`：它只调用官方
+`codex app-server --stdio` 的 JSONL `initialize`、`account/read`（`refreshToken=false`）和
+`account/rateLimits/read`，严格按 `limitId="codex"` 与
+`limitName="GPT-5.3-Codex-Spark"` 取主池/Spark 池，HMAC key 只留内存；不读
+`auth.json`、cookie、环境变量邮箱或私有 HTTP 接口。可执行入口为：
+
+```text
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
+```
+
+`--live-quota` 要求 `--quota-input` 已携带 host 绑定的 `snapshot.capacity`，额度采集模块会替换快照并
+重算 request hash；`--quota-state-path`（默认 `CODEX_TASK_TEMP` 下的缓存）只保存最近样本的
+非敏感百分比/周期 hash，用于计算 300 秒斜率。首个样本没有前值时斜率为 0，下一次采样才计算
+增量；周期 reset 或缓存失效会清零增量。命令、JSONL、响应大小、超时和字段均有边界，来源异常、
+缺少任一池、错 Spark 标签或 bridge 缺失/错绑时保持 `usage_unknown`，不得猜测当前账户百分比，
+也不得启动新任务。
+
+若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。
+
+归档不是 adapter 操作：只能在 lane 0 已完成 acceptance、最终证据已绑定之后由 host 执行。
+默认 scratch、worktree、cache、测试证据都位于
+`D:\bun\tmp\codex\<project-or-thread>`；用户显式配置的 quota sample cache
+可使用其他获准盘符。禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。
 
 ### 6. 验证与交付
 

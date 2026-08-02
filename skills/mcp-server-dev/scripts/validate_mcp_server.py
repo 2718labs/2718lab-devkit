@@ -83,17 +83,12 @@ def detect_package(trees: dict[Path, ast.AST]) -> str | None:
                     has_a = True
                 elif m == "fastmcp" or m.startswith("fastmcp."):
                     has_b = True
-                if (
-                    m == "mcp.server"
-                    or m.startswith("mcp.server.")
-                    and "MCPServer" in {a.name for a in node.names}
-                ):
+                if m == "mcp.server" or m.startswith("mcp.server.") and "MCPServer" in \
+                        {a.name for a in node.names}:
                     for a in node.names:
                         if a.name == "MCPServer":
-                            err(
-                                f"{node.module}: import MCPServer —— 这是 SDK main 分支的 "
-                                "v2 alpha 类名,禁止生产使用;稳定 API 是 v1.x 的 FastMCP"
-                            )
+                            err(f"{node.module}: import MCPServer —— 这是 SDK main 分支的 "
+                                "v2 alpha 类名,禁止生产使用;稳定 API 是 v1.x 的 FastMCP")
             elif isinstance(node, ast.Import):
                 for a in node.names:
                     tm = top_module(a.name)
@@ -119,33 +114,25 @@ def check_decorators_and_transport(files, trees, package):
                     short = name.split(".")[-1]
                     if short in ("tool", "prompt"):
                         if package == "A" and not is_call:
-                            err(
-                                f"{p}: {node.name} 用了裸 @mcp.{short}(不带括号) —— "
+                            err(f"{p}: {node.name} 用了裸 @mcp.{short}(不带括号) —— "
                                 "(A) 包 v1.x 文档里没有这种写法,必须写成 "
-                                f"@mcp.{short}(),不要把 (B) 包的语法搬过来"
-                            )
+                                f"@mcp.{short}(),不要把 (B) 包的语法搬过来")
                         if package == "B" and not is_call:
                             pass  # (B) 包允许裸装饰器
                     if short == "resource":
                         if not is_call or not (isinstance(dec, ast.Call) and dec.args):
-                            err(
-                                f"{p}: {node.name} 的 @mcp.resource(...) 缺少 URI 字符串参数,"
-                                "两个包都要求 resource 必须带 URI"
-                            )
+                            err(f"{p}: {node.name} 的 @mcp.resource(...) 缺少 URI 字符串参数,"
+                                "两个包都要求 resource 必须带 URI")
                     # tool/prompt 用了 (B) 已弃用的 enabled= 参数
                     if short == "tool" and is_call and isinstance(dec, ast.Call):
                         for kw in dec.keywords:
                             if kw.arg == "enabled":
-                                warn(
-                                    f"{p}: {node.name} 的 @mcp.tool(enabled=...) —— "
-                                    "(B) 3.0.0 起已弃用,改用 mcp.enable()/mcp.disable()"
-                                )
+                                warn(f"{p}: {node.name} 的 @mcp.tool(enabled=...) —— "
+                                     "(B) 3.0.0 起已弃用,改用 mcp.enable()/mcp.disable()")
                     # tool 函数缺返回类型注解
                     if short == "tool" and node.returns is None:
-                        warn(
-                            f"{p}: {node.name} 是 tool 但缺少返回类型注解,"
-                            "补上有助于生成结构化输出 schema"
-                        )
+                        warn(f"{p}: {node.name} 是 tool 但缺少返回类型注解,"
+                             "补上有助于生成结构化输出 schema")
 
             # Context 获取方式检查(仅 (A) 包禁用 get_context/CurrentContext)
             if package == "A" and isinstance(node, ast.Call):
@@ -155,51 +142,37 @@ def check_decorators_and_transport(files, trees, package):
                 elif isinstance(node.func, ast.Attribute):
                     fname = node.func.attr
                 if fname in ("get_context", "CurrentContext"):
-                    err(
-                        f"{p}: 调用了 {fname}() —— (A) 包 v1.x 没有依赖注入辅助函数,"
-                        "这是 (B) 独立版 2.x/3.x 才有的 API,不要混用"
-                    )
+                    err(f"{p}: 调用了 {fname}() —— (A) 包 v1.x 没有依赖注入辅助函数,"
+                        "这是 (B) 独立版 2.x/3.x 才有的 API,不要混用")
 
             # transport 字符串检查:mcp.run(transport=...) 或 fastmcp run --transport
             if isinstance(node, ast.Call):
                 fattr = node.func.attr if isinstance(node.func, ast.Attribute) else None
                 if fattr == "run":
                     for kw in node.keywords:
-                        if (
-                            kw.arg == "transport"
-                            and isinstance(kw.value, ast.Constant)
-                            and isinstance(kw.value.value, str)
-                        ):
+                        if kw.arg == "transport" and isinstance(kw.value, ast.Constant) \
+                                and isinstance(kw.value.value, str):
                             val = kw.value.value
                             if val not in whitelist:
                                 hint = ""
                                 if val == "streamable-http" and package == "B":
-                                    hint = (
-                                        '(B) 现行字符串是 "http",不是 (A) 包的连字符版'
-                                    )
+                                    hint = "(B) 现行字符串是 \"http\",不是 (A) 包的连字符版"
                                 elif val == "http" and package == "A":
-                                    hint = '(A) 包不用 "http",应为 "streamable-http"'
+                                    hint = "(A) 包不用 \"http\",应为 \"streamable-http\""
                                 elif "streamable_http" in val:
-                                    hint = '下划线写法两个包文档都没有,应为连字符 "streamable-http"(A)/"http"(B)'
-                                err(
-                                    f"{p}: transport={val!r} 不在 ({package}) 包白名单 "
-                                    f"{sorted(whitelist)} 内 {hint}"
-                                )
+                                    hint = "下划线写法两个包文档都没有,应为连字符 \"streamable-http\"(A)/\"http\"(B)"
+                                err(f"{p}: transport={val!r} 不在 ({package}) 包白名单 "
+                                    f"{sorted(whitelist)} 内 {hint}")
     del other
 
 
 def check_print_in_stdio(files, trees):
     for p, tree in trees.items():
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "print"
-            ):
-                warn(
-                    f"{p}: 出现 print() —— stdio 模式下 stdout 是协议通道,"
-                    "日志请用 ctx.info/debug/warning/error 或标准 logging 写 stderr"
-                )
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id == "print":
+                warn(f"{p}: 出现 print() —— stdio 模式下 stdout 是协议通道,"
+                     "日志请用 ctx.info/debug/warning/error 或标准 logging 写 stderr")
                 break
 
 
@@ -225,15 +198,11 @@ def check_pyproject(target: Path, package: str | None):
     has_mcp_dep = re.search(r'"mcp(\[[^\]]*\])?\s*[><=!~]', text) is not None
     has_fastmcp_dep = re.search(r'"fastmcp\s*[><=!~]', text) is not None
     if has_mcp_dep and has_fastmcp_dep:
-        err(
-            "pyproject.toml 同时声明了 mcp[cli] 和 fastmcp 依赖 —— 一个项目只能选一个包"
-        )
+        err("pyproject.toml 同时声明了 mcp[cli] 和 fastmcp 依赖 —— 一个项目只能选一个包")
     if package == "A":
         if not re.search(r'"mcp(\[[^\]]*\])?\s*>=\s*1\s*,\s*<\s*2"', text):
-            warn(
-                'pyproject.toml 未按 "mcp[cli]>=1,<2" 钉版本上界,'
-                "存在解析到 v2 alpha(MCPServer,breaking API)的风险"
-            )
+            warn('pyproject.toml 未按 "mcp[cli]>=1,<2" 钉版本上界,'
+                 "存在解析到 v2 alpha(MCPServer,breaking API)的风险")
 
 
 def main():
@@ -273,17 +242,13 @@ def main():
 
     print(f"== MCP server 自检: {target} ==")
     if package in ("A", "B"):
-        print(
-            f"检测到包: ({package}) {'SDK 内置 v1.x mcp.server.fastmcp' if package == 'A' else '独立版 fastmcp 3.x'}"
-        )
+        print(f"检测到包: ({package}) {'SDK 内置 v1.x mcp.server.fastmcp' if package == 'A' else '独立版 fastmcp 3.x'}")
     for e in ERRORS:
         print(f"[错误] {e}")
     for w in WARNS:
         print(f"[警告] {w}")
-    print(
-        f"结果: {len(ERRORS)} 个错误, {len(WARNS)} 个警告 -> "
-        + ("不可交付,必须修复错误" if ERRORS else "通过")
-    )
+    print(f"结果: {len(ERRORS)} 个错误, {len(WARNS)} 个警告 -> "
+          + ("不可交付,必须修复错误" if ERRORS else "通过"))
     sys.exit(1 if ERRORS else 0)
 
 

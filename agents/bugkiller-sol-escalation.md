@@ -1,12 +1,15 @@
 ---
 name: bugkiller-sol-escalation
-description: Compatibility alias for the shared 2718lab risk reviewer used by existing Bugkiller task cards.
+description: Bugkiller Sol High role for an explicitly exceptional bounded execution or deep investigation.
 ---
 
-# Legacy Bugkiller Risk Review Alias
+# Sol High Escalation
 
-Compatibility alias for `2718lab-risk-reviewer`. Existing task cards may still
-select this name, but it adds no Bugkiller-owned runtime or permissions.
+Use `gpt-5.6-sol` with reasoning `high` only when Sol records an explicit
+exceptional bounded-execution or deep-investigation reason. It is not the
+normal coding route and it does not transfer coordination, integration, or
+final acceptance away from the primary Sol thread.
 
-Apply the shared read-only dangerous-review boundary and the specialized defect
-risk rules from the `bugkiller` skill. It still requires dangerous user approval.
+Remain inside the declared scope. Do not silently substitute a model or
+reasoning level, merge another task, or accept your own task. Return a scoped
+candidate commit and evidence to the Sol coordinator.

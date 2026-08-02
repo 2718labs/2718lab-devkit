@@ -47,18 +47,9 @@ lint = ["ruff>=0.8"]                 # 也可以按用途拆更细的组,dev 组
 
 来源:[Astral uv: Managing dependencies](https://docs.astral.sh/uv/concepts/projects/dependencies/)
 
-## 3. 打包模式与 `[build-system]`
+## 3. `[build-system]`(唯二选项,逐字照抄)
 
-**选项 0:只运行、不打包的应用 → 明确关闭 package 模式**
-
-```toml
-[tool.uv]
-package = false
-```
-
-只有不构建 wheel、不发布到 PyPI、不会作为包安装的 flat-layout 应用可以使用这个模式并省略 `[build-system]`。`uv run`、`uv sync` 和锁文件仍正常工作;一旦需要构建、安装或发布,删除这项并从下面两个构建后端中选择一个。
-
-**打包选项 A:纯 Python 项目 → uv_build**(uv v0.6 起为 `uv init --package` 的默认后端)
+**选项 A:纯 Python 项目 → uv_build**(uv v0.6 起为 `uv init` 默认后端)
 
 ```toml
 [build-system]
@@ -66,7 +57,7 @@ requires = ["uv_build>=0.8.3,<0.9.0"]   # 版本号随你本地 uv 版本走,以
 build-backend = "uv_build"
 ```
 
-**打包选项 B:有构建脚本或 C 扩展 → hatchling**
+**选项 B:有构建脚本或 C 扩展 → hatchling**
 
 ```toml
 [build-system]
@@ -74,9 +65,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 ```
 
-**注意**:后端字符串是 `"uv_build"`(下划线,不是 `"uv.build"` 或 `"uv-build"`),`requires` 里的包名同样是 `uv_build`(不是裸 `uv`)。两个打包后端不要在同一个项目里混用或抄错字符串——写错会导致 `uv build` / `pip install .` 直接失败。新建项目时优先让 `uv init --package` 自动生成这一节并照抄其产出的版本号,而不是手写。
+**注意**:后端字符串是 `"uv_build"`(下划线,不是 `"uv.build"` 或 `"uv-build"`),`requires` 里的包名同样是 `uv_build`(不是裸 `uv`)。两个后端不要在同一个项目里混用或抄错字符串——写错会导致 `uv build` / `pip install .` 直接失败。新建项目时优先让 `uv init` 自动生成这一节并照抄其产出的版本号,而不是手写。
 
-来源:[Astral uv: Configuring projects](https://docs.astral.sh/uv/concepts/projects/config/)、[Astral uv: The uv build backend](https://docs.astral.sh/uv/concepts/build-backend/)、[pydevtools: Why does uv use Hatch as a build backend?](https://pydevtools.com/handbook/explanation/why-does-uv-use-hatch-as-a-backend/)
+来源:[Astral uv: The uv build backend](https://docs.astral.sh/uv/concepts/build-backend/)、[pydevtools: Why does uv use Hatch as a build backend?](https://pydevtools.com/handbook/explanation/why-does-uv-use-hatch-as-a-backend/)
 
 ## 4. PEP 440 版本号语法
 

@@ -68,13 +68,6 @@ def warn(msg: str) -> None:
     warnings.append(msg)
 
 
-def is_uv_no_package_app(data: dict | None) -> bool:
-    if not isinstance(data, dict):
-        return False
-    uv = data.get("tool", {}).get("uv", {})
-    return isinstance(uv, dict) and uv.get("package") is False
-
-
 def check_pyproject(repo: Path) -> dict | None:
     pyproject_path = repo / "pyproject.toml"
     if not pyproject_path.is_file():
@@ -101,35 +94,26 @@ def check_pyproject(repo: Path) -> dict | None:
     version = project.get("version")
     if isinstance(version, str):
         if not PEP440_RE.match(version):
-            error(
-                f"version={version!r} 不是合法 PEP 440 版本号(合法写法参考 references/pyproject-reference.md §4,如 1.0.0a1 / 1.0.0alpha1 / 1.0.0.post1)"
-            )
+            error(f"version={version!r} 不是合法 PEP 440 版本号(合法写法参考 references/pyproject-reference.md §4,如 1.0.0a1 / 1.0.0alpha1 / 1.0.0.post1)")
         if version.startswith("v"):
-            error(
-                f"version={version!r} 带 v 前缀,PEP 440 不允许(与 AstrBot metadata.yaml 的约定相反,不要混用)"
-            )
+            error(f"version={version!r} 带 v 前缀,PEP 440 不允许(与 AstrBot metadata.yaml 的约定相反,不要混用)")
 
     requires_python = project.get("requires-python")
     if not requires_python:
-        warn('[project] 未设置 requires-python,建议至少 ">=3.10"')
+        warn("[project] 未设置 requires-python,建议至少 \">=3.10\"")
     else:
         m = re.search(r">=\s*3\.(\d+)", requires_python)
         if m:
             minor = int(m.group(1))
             if minor < 10:
-                error(
-                    f"requires-python 下界为 3.{minor},低于团队最低要求 3.10(3.9 已 EOL)"
-                )
+                error(f"requires-python 下界为 3.{minor},低于团队最低要求 3.10(3.9 已 EOL)")
         else:
-            warn(
-                f"requires-python={requires_python!r} 未识别出 >=3.x 下界写法,人工确认"
-            )
+            warn(f"requires-python={requires_python!r} 未识别出 >=3.x 下界写法,人工确认")
 
     # build-system 白名单
     build_system = data.get("build-system")
     if not isinstance(build_system, dict):
-        if not is_uv_no_package_app(data):
-            error("缺少 [build-system]")
+        error("缺少 [build-system]")
     else:
         backend = build_system.get("build-backend")
         if backend not in ALLOWED_BUILD_BACKENDS:
@@ -143,26 +127,15 @@ def check_pyproject(repo: Path) -> dict | None:
     if isinstance(pyright_cfg, dict):
         leaked = [k for k in MYPY_ONLY_KEYS if k in pyright_cfg]
         if leaked:
-            error(
-                f"[tool.pyright] 混入了 mypy 专属键: {leaked},pyright 不认识这些键(会静默无效)"
-            )
+            error(f"[tool.pyright] 混入了 mypy 专属键: {leaked},pyright 不认识这些键(会静默无效)")
 
     return data
 
 
-def check_src_layout(
-    repo: Path,
-    project: dict | None,
-    *,
-    no_package_app: bool = False,
-) -> None:
+def check_src_layout(repo: Path, project: dict | None) -> None:
     src_dir = repo / "src"
     if not src_dir.is_dir():
-        if not no_package_app:
-            warn(
-                "未找到 src/ 目录(flat-layout 项目可忽略;"
-                "要发布/被 import 的库应使用 src-layout)"
-            )
+        warn("未找到 src/ 目录(flat-layout 项目可忽略;要发布/被 import 的库应使用 src-layout)")
         return
 
     if project is None:
@@ -187,9 +160,7 @@ def check_uv_lock(repo: Path) -> None:
         for line in gitignore_text.splitlines():
             stripped = line.strip()
             if stripped in {"uv.lock", "/uv.lock", "*.lock"}:
-                error(
-                    f".gitignore 里的规则 {stripped!r} 会把 uv.lock 排除在版本控制外,必须提交它"
-                )
+                error(f".gitignore 里的规则 {stripped!r} 会把 uv.lock 排除在版本控制外,必须提交它")
 
     if gitignore_path.is_file():
         gitignore_text = gitignore_path.read_text(encoding="utf-8", errors="ignore")
@@ -210,9 +181,7 @@ def check_banned_words(repo: Path) -> None:
     workflows_dir = repo / ".github" / "workflows"
     candidate_files = list(repo.glob("README*"))
     if workflows_dir.is_dir():
-        candidate_files += list(workflows_dir.glob("*.yml")) + list(
-            workflows_dir.glob("*.yaml")
-        )
+        candidate_files += list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml"))
 
     for f in candidate_files:
         if not f.is_file():
@@ -223,9 +192,7 @@ def check_banned_words(repo: Path) -> None:
             continue
         for word in BANNED_WORDS_IN_DOCS_OR_CI:
             if word in text:
-                error(
-                    f"{f.relative_to(repo)} 中出现禁词 {word!r},应改为 uv 等价命令(见第 0 条:见到这些词就是写错了)"
-                )
+                error(f"{f.relative_to(repo)} 中出现禁词 {word!r},应改为 uv 等价命令(见第 0 条:见到这些词就是写错了)")
 
 
 def main() -> int:
@@ -240,7 +207,7 @@ def main() -> int:
 
     data = check_pyproject(repo)
     project = data.get("project") if isinstance(data, dict) else None
-    check_src_layout(repo, project, no_package_app=is_uv_no_package_app(data))
+    check_src_layout(repo, project)
     check_uv_lock(repo)
     check_banned_words(repo)
 

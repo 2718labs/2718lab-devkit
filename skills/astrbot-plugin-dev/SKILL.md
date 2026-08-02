@@ -7,14 +7,6 @@ description: 团队 AstrBot 插件开发规范与 API 参考(基线 AstrBot v4.2
 
 为团队开发 AstrBot 插件时,严格按本文件执行。**不要凭记忆写 AstrBot API**——AstrBot 的接口与 NoneBot/Koishi 等框架完全不同且迭代快,记忆极易出错;本文件和参考文件里的写法才是准确的。
 
-## 共享执行层
-
-本 skill 负责 AstrBot 领域事实，不单独拥有编排。多步骤或多 Agent 任务使用
-`work-methodology`、`2718lab-tools` 以及通用
-`2718lab-triage` / `2718lab-investigator` / `2718lab-doc-writer` /
-`2718lab-code-writer` / `2718lab-verifier` / `2718lab-risk-reviewer`。
-角色权限听共享执行层，AstrBot API 与验收规则听本 skill。
-
 配套文件:
 
 - `references/api-reference.md` — 全部 API 的确切用法(装饰器/事件钩子/消息组件/LLM 工具/配置/存储/会话控制/主动消息)与版本门槛。**写任何本文件未覆盖的 API 前,必须先读它对应章节**。

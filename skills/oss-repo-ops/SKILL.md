@@ -12,14 +12,6 @@ description: 开源仓库运营与 AstrBot 插件市场上架规范。凡是涉�
 - MCP 服务器仓库同样适用本 skill 的发布与卫生规则,代码归 `mcp-server-dev`。
 - 评审节奏、交付方法论 → `work-methodology`。
 
-## 共享执行层
-
-本 skill 负责开源交付领域事实，不单独拥有编排。多步骤或多 Agent 任务使用
-`work-methodology`、`2718lab-tools` 以及通用
-`2718lab-triage` / `2718lab-investigator` / `2718lab-doc-writer` /
-`2718lab-code-writer` / `2718lab-verifier` / `2718lab-risk-reviewer`。
-角色权限听共享执行层，发布与仓库验收规则听本 skill；远程动作仍逐项经过用户门禁。
-
 配套文件:
 
 - `references/astrbot-market.md` — 完整市场提交流程、字段陷阱、排错。
@@ -102,8 +94,7 @@ jobs:
 
 ### 第 5 步:交付前自检
 
-运行本 skill 自带的自检脚本。脚本按 `metadata.yaml` 或
-`.codex-plugin/plugin.json` 自动识别 AstrBot/Codex 插件仓库:
+运行本 skill 自带的自检脚本:
 
 ```bash
 python3 <skill目录>/scripts/check_release.py <仓库目录>

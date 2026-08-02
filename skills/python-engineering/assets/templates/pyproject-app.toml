@@ -17,10 +17,11 @@ dev = [
     "pytest>=8.0",
 ]
 
-# 这是只运行、不构建 wheel、不发布到 PyPI 的应用。
-# 将来需要作为包安装或发布时,删除这一节并改用受支持的 [build-system]。
-[tool.uv]
-package = false
+# 应用/脚本项目通常不需要真正 build 成 wheel 发布,但 uv 项目仍需声明 [build-system] 才能被识别为可安装包。
+# 没有构建脚本/C 扩展时同样用 uv_build,不要因为"是应用"就随手写别的后端。
+[build-system]
+requires = ["uv_build>=0.8.3,<0.9.0"]
+build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 88

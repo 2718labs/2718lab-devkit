@@ -25,3 +25,4 @@ follow symlinks/reparse points automatically.
 
 Strict tasks are index-bound from planning through verification; rollback reuses
 the old snapshot; existing non-strict workflows remain compatible.
+

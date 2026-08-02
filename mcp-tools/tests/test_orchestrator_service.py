@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
 
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
@@ -22,13 +22,12 @@ from orchestrator.models import (  # noqa: E402
 )
 from orchestrator.service import OrchestratorService, ServiceError  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
+from temp_support import task_scratch  # noqa: E402
 
 
 class OrchestratorServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        scratch_root = Path(os.environ["CODEX_TASK_TEMP"]) / "orchestrator-service"
-        scratch_root.mkdir(parents=True, exist_ok=True)
-        self.tempdir = tempfile.TemporaryDirectory(dir=scratch_root)
+        self.tempdir = tempfile.TemporaryDirectory(dir=task_scratch("orchestrator-service"))
         self.store = SQLiteStore(Path(self.tempdir.name) / "orchestrator.sqlite")
         self.service = OrchestratorService(self.store)
         self.addCleanup(self.tempdir.cleanup)

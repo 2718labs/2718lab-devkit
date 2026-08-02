@@ -12,13 +12,23 @@ import re
 import secrets
 import sqlite3
 import uuid
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterator, Mapping
 
-from .models import Task, TaskState, Workflow, WorkflowKind, WorkflowState
+from .models import (
+    AtlasOutboxItem,
+    AtlasOutboxState,
+    CodeTaskAcceptance,
+    Task,
+    TaskKind,
+    TaskState,
+    Workflow,
+    WorkflowKind,
+    WorkflowState,
+)
 
 
 class StoreError(RuntimeError):
@@ -53,6 +63,36 @@ class ArtifactConflictError(StoreError):
     """Raised when an artifact hash is reused with different metadata."""
 
     code = "ARTIFACT_CONFLICT"
+
+
+class AcceptanceConflictError(StoreError):
+    """Raised when one code task is reused with different accepted content."""
+
+    code = "ACCEPTANCE_CONFLICT"
+
+
+class AcceptanceAuthorizationError(StoreError):
+    """Raised when durable task/coordinator authority is not satisfied."""
+
+    code = "ACCEPTANCE_FORBIDDEN"
+
+
+class AcceptanceEvidenceError(StoreError):
+    """Raised when an acceptance has no immutable evidence binding."""
+
+    code = "EVIDENCE_INCOMPLETE"
+
+
+class AtlasOutboxTransitionError(StoreError):
+    """Raised when an outbox item would leave an immutable terminal state."""
+
+    code = "OUTBOX_TERMINAL"
+
+
+class AtlasOutboxAttemptLimitError(StoreError):
+    """Raised when a pending outbox item reaches its bounded retry limit."""
+
+    code = "OUTBOX_ATTEMPTS_EXHAUSTED"
 
 
 class InvalidTaskStateError(StoreError):
@@ -174,7 +214,7 @@ class TaskContextRequirements:
 @dataclass(frozen=True)
 class IndexBinding:
     task_id: str
-    workspace_root: str
+    workspace_id: str
     input_snapshot_id: str
     output_snapshot_id: str
     task_node_ids: tuple[str, ...]
@@ -184,18 +224,84 @@ class IndexBinding:
     fallback_count: int
 
 
+@dataclass(frozen=True)
+class TaskAcceptanceEvidence:
+    """Bound output evidence identifiers selected from one strict task."""
+
+    output_query_trace_id: str
+    verification_artifact_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodeTaskEvidenceBinding:
+    """Canonical, privacy-bounded evidence retained with one acceptance."""
+
+    schema_version: str
+    workflow_id: str
+    code_task_id: str
+    code_task_version: int
+    input_snapshot_id: str
+    output_snapshot_id: str
+    indexed_diff_hash: str
+    checkpoint_id: str
+    checkpoint_hash: str
+    output_query_trace_id: str
+    verification_artifact_hashes: tuple[str, ...]
+    execution_receipt_ids: tuple[str, ...]
+    evidence_binding_hash: str
+
+
+@dataclass(frozen=True)
+class CodeTaskReceiptAttestation:
+    """Producer-owned content address binding receipts to one code-task output."""
+
+    schema_version: str
+    workflow_id: str
+    code_task_id: str
+    code_task_version: int
+    input_snapshot_id: str
+    output_snapshot_id: str
+    workspace_hash: str
+    execution_receipt_ids: tuple[str, ...]
+    attestation_hash: str
+
+
+@dataclass(frozen=True)
+class AcceptedCodeTaskEvidence:
+    """Immutable facts needed to rebuild one accepted Atlas projection."""
+
+    acceptance: CodeTaskAcceptance
+    task: Task
+    index_binding: IndexBinding
+    task_evidence: TaskAcceptanceEvidence
+    evidence_binding: CodeTaskEvidenceBinding
+    receipt_attestation: CodeTaskReceiptAttestation
+
+
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 3
+    _SCHEMA_VERSION = 6
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
+    _MAX_ATLAS_OUTBOX_ATTEMPTS = 16
+    _MAX_ATLAS_OUTBOX_LIMIT = 100
+    _MAX_SAFE_ACCEPTANCE_IDENTIFIER_LENGTH = 256
+    _MAX_SAFE_OUTBOX_CODE_LENGTH = 64
+    _MAX_SAFE_OUTBOX_REASON_COUNT = 8
+    _MAX_CODE_TASK_EVIDENCE_ITEMS = 32
+    _MAX_CODE_TASK_ACCEPTANCE_LIST = 100
+    _EVIDENCE_BINDING_SCHEMA_VERSION = "acceptance-evidence-binding/v1"
+    _EVIDENCE_BINDING_EVENT_TYPE = "code_task_evidence_binding"
+    _RECEIPT_ATTESTATION_SCHEMA_VERSION = "code-task-receipt-attestation/v1"
     _HOST_TARGET_PATTERN = re.compile(r"/root(?:/[a-z0-9_]+)*\Z")
+    _SAFE_ACCEPTANCE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+    _SHA256_IDENTIFIER_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+    _SAFE_OUTBOX_CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 
     def __init__(self, database: str | Path) -> None:
         self._connection = sqlite3.connect(str(database), isolation_level=None)
-        self._closed = False
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
@@ -204,9 +310,9 @@ class SQLiteStore:
 
     def close(self) -> None:
         """Close the underlying database connection."""
-        if not self._closed:
+        if self._connection is not None:
             self._connection.close()
-            self._closed = True
+            self._connection = None  # type: ignore[assignment]
 
     def schema_version(self) -> int:
         row = self._connection.execute(
@@ -261,7 +367,7 @@ class SQLiteStore:
         contract_subscriptions: tuple[str, ...] = (),
         required_evidence: tuple[str, ...] = (),
         strict_index: bool = False,
-        workspace_root: str = "",
+        workspace_id: str = "",
         input_snapshot_id: str = "",
         task_node_ids: tuple[str, ...] = (),
         contract_node_ids: tuple[str, ...] = (),
@@ -271,12 +377,20 @@ class SQLiteStore:
             raise CardHashMismatchError(
                 f"task card hash does not match task {task.id!r}"
             )
+        if strict_index and (
+            type(workspace_id) is not str
+            or self._SHA256_IDENTIFIER_PATTERN.fullmatch(workspace_id) is None
+            or not input_snapshot_id
+            or not task_node_ids
+        ):
+            raise StrictIndexError("INDEX_UNAVAILABLE")
         with self._transaction() as cursor:
             cursor.execute(
                 """
                 INSERT INTO tasks
-                    (id, workflow_id, title, owner_role, state, write_scope, card_hash, result_hash, version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, workflow_id, title, owner_role, state, write_scope, card_hash, result_hash,
+                     version, task_kind, intent_id, language, framework)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
@@ -288,6 +402,10 @@ class SQLiteStore:
                     task.card_hash,
                     task.result_hash,
                     task.version,
+                    task.task_kind.value,
+                    task.intent_id,
+                    task.language,
+                    task.framework,
                 ),
             )
             if card_body is not None:
@@ -324,14 +442,14 @@ class SQLiteStore:
                 cursor.execute(
                     """
                     INSERT INTO task_index_bindings (
-                        task_id, workspace_root, input_snapshot_id,
+                        task_id, workspace_root, workspace_id, input_snapshot_id,
                         output_snapshot_id, task_node_ids, contract_node_ids,
                         checkpoint_id, indexed_diff_hash, fallback_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', 0)
+                    ) VALUES (?, '', ?, ?, ?, ?, ?, '', '', 0)
                     """,
                     (
                         task.id,
-                        workspace_root,
+                        workspace_id,
                         input_snapshot_id,
                         input_snapshot_id if not task.write_scope else "",
                         _encode_strings(task_node_ids),
@@ -660,9 +778,7 @@ class SQLiteStore:
                     "pending",
                 ),
             )
-            sequence = cursor.lastrowid
-            if sequence is None:
-                raise sqlite3.DatabaseError("message insert did not return a row id")
+            sequence = int(cursor.lastrowid)
             self._append_event_in_transaction(
                 cursor,
                 workflow_id,
@@ -851,6 +967,756 @@ class SQLiteStore:
             self._task_from_row(row, self.dependencies_for(row["id"])) for row in rows
         )
 
+    def insert_code_task_acceptance(
+        self,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        coordinator_task_id: str,
+        coordinator_owner: str,
+        coordinator_epoch: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        intent_id: str,
+        language: str,
+        framework: str,
+        evidence_binding: CodeTaskEvidenceBinding | None = None,
+        created_at: str,
+        now: str | None = None,
+    ) -> tuple[CodeTaskAcceptance, AtlasOutboxItem]:
+        """Authorize and insert one acceptance with its outbox item atomically.
+
+        This persistence boundary enforces durable task, strict-index, and live
+        coordinator gates. Receipt-specific policy and Atlas projection stay in
+        the service layer.
+        """
+        payload_json = self._canonical_code_task_acceptance_payload(
+            workflow_id=workflow_id,
+            task_id=task_id,
+            task_version=task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+            intent_id=intent_id,
+            language=language,
+            framework=framework,
+        )
+        payload_hash = _payload_hash(payload_json)
+        accepted_at = _utc_timestamp(created_at)
+        authorization_now = _utc_timestamp(now) if now is not None else _utc_now()
+        if evidence_binding is None:
+            raise AcceptanceEvidenceError("acceptance evidence binding is required")
+        self._validate_code_task_evidence_binding(
+            evidence_binding,
+            workflow_id=workflow_id,
+            task_id=task_id,
+            task_version=task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+        )
+
+        with self._transaction() as cursor:
+            self._require_authorized_code_task_acceptance(
+                cursor,
+                workflow_id=workflow_id,
+                task_id=task_id,
+                task_version=task_version,
+                coordinator_task_id=coordinator_task_id,
+                coordinator_owner=coordinator_owner,
+                coordinator_epoch=coordinator_epoch,
+                input_snapshot_id=input_snapshot_id,
+                output_snapshot_id=output_snapshot_id,
+                indexed_diff_hash=indexed_diff_hash,
+                intent_id=intent_id,
+                language=language,
+                framework=framework,
+                now=authorization_now,
+            )
+            receipt_attestation_row = cursor.execute(
+                """
+                SELECT * FROM code_task_receipt_attestations
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if receipt_attestation_row is None:
+                raise AcceptanceEvidenceError(
+                    "code task receipt attestation is required"
+                )
+            receipt_attestation = self._code_task_receipt_attestation_from_row(
+                receipt_attestation_row
+            )
+            if (
+                receipt_attestation.workflow_id != workflow_id
+                or receipt_attestation.code_task_version != task_version
+                or receipt_attestation.input_snapshot_id != input_snapshot_id
+                or receipt_attestation.output_snapshot_id != output_snapshot_id
+                or receipt_attestation.execution_receipt_ids
+                != evidence_binding.execution_receipt_ids
+                or receipt_attestation.attestation_hash
+                not in evidence_binding.verification_artifact_hashes
+            ):
+                raise AcceptanceConflictError(
+                    "receipt attestation does not match acceptance evidence"
+                )
+            existing_row = cursor.execute(
+                "SELECT * FROM code_task_acceptances WHERE code_task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._acceptance_from_row(existing_row)
+                if (
+                    existing.payload_hash != payload_hash
+                    or str(existing_row["payload_json"]) != payload_json
+                ):
+                    raise AcceptanceConflictError(
+                        f"code task already has different acceptance content: {task_id!r}"
+                    )
+                outbox_row = cursor.execute(
+                    "SELECT * FROM atlas_ingestion_outbox WHERE acceptance_id = ?",
+                    (existing.acceptance_id,),
+                ).fetchone()
+                if outbox_row is None:
+                    raise StoreError(
+                        f"acceptance is missing its durable outbox item: {task_id!r}"
+                    )
+                self._require_existing_code_task_evidence_binding(
+                    cursor, existing, evidence_binding
+                )
+                return existing, self._atlas_outbox_from_row(outbox_row)
+
+            cursor.execute(
+                """
+                INSERT INTO code_task_acceptances (
+                    acceptance_id, workflow_id, code_task_id, code_task_version,
+                    input_snapshot_id, output_snapshot_id, indexed_diff_hash,
+                    intent_id, language, framework, payload_json, payload_hash,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload_hash,
+                    workflow_id,
+                    task_id,
+                    task_version,
+                    input_snapshot_id,
+                    output_snapshot_id,
+                    indexed_diff_hash,
+                    intent_id,
+                    language,
+                    framework,
+                    payload_json,
+                    payload_hash,
+                    accepted_at,
+                ),
+            )
+            acceptance_row = cursor.execute(
+                "SELECT * FROM code_task_acceptances WHERE acceptance_id = ?",
+                (payload_hash,),
+            ).fetchone()
+            acceptance = self._acceptance_from_row(acceptance_row)
+            self._insert_code_task_evidence_binding(
+                cursor,
+                acceptance,
+                evidence_binding,
+                created_at=accepted_at,
+            )
+            outbox = self._insert_atlas_outbox(
+                cursor,
+                acceptance,
+                payload_json=payload_json,
+                created_at=accepted_at,
+            )
+        return acceptance, outbox
+
+    def acceptance_for_task(self, task_id: str) -> CodeTaskAcceptance | None:
+        """Return an accepted code task's immutable metadata, if it exists."""
+        row = self._connection.execute(
+            "SELECT * FROM code_task_acceptances WHERE code_task_id = ?", (task_id,)
+        ).fetchone()
+        return None if row is None else self._acceptance_from_row(row)
+
+    def acceptance_for_workflow_task(
+        self, workflow_id: str, code_task_id: str
+    ) -> CodeTaskAcceptance | None:
+        """Look up one acceptance through its exact immutable task identity."""
+
+        self._safe_acceptance_identifier("workflow_id", workflow_id)
+        self._safe_acceptance_identifier("code_task_id", code_task_id)
+        row = self._connection.execute(
+            """
+            SELECT * FROM code_task_acceptances
+            WHERE workflow_id = ? AND code_task_id = ?
+            """,
+            (workflow_id, code_task_id),
+        ).fetchone()
+        return None if row is None else self._acceptance_from_row(row)
+
+    def list_code_task_acceptances(
+        self, workflow_id: str, *, limit: int
+    ) -> tuple[CodeTaskAcceptance, ...]:
+        """Return a bounded deterministic acceptance projection for one workflow."""
+
+        self._validate_code_task_acceptance_list_limit(limit)
+        rows = self._connection.execute(
+            """
+            SELECT * FROM code_task_acceptances
+            WHERE workflow_id = ?
+            ORDER BY created_at, acceptance_id
+            LIMIT ?
+            """,
+            (workflow_id, limit),
+        ).fetchall()
+        return tuple(self._acceptance_from_row(row) for row in rows)
+
+    def atlas_outbox_for_acceptance(self, acceptance_id: str) -> AtlasOutboxItem | None:
+        """Return the one outbox row owned by an immutable acceptance, if present."""
+
+        self._safe_acceptance_identifier("acceptance_id", acceptance_id)
+        row = self._connection.execute(
+            "SELECT * FROM atlas_ingestion_outbox WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()
+        return None if row is None else self._atlas_outbox_from_row(row)
+
+    def task_acceptance_evidence(
+        self, task_id: str, output_snapshot_id: str
+    ) -> TaskAcceptanceEvidence:
+        """Return only deterministic output evidence identifiers for one task."""
+
+        self._safe_acceptance_identifier("task_id", task_id)
+        self._safe_acceptance_identifier("output_snapshot_id", output_snapshot_id)
+        query_rows = self._connection.execute(
+            """
+            SELECT trace_id FROM task_index_query_receipts
+            WHERE task_id = ? AND snapshot_id = ?
+            ORDER BY trace_id
+            LIMIT 2
+            """,
+            (task_id, output_snapshot_id),
+        ).fetchall()
+        if len(query_rows) != 1:
+            raise StrictIndexError("QUERY_RECEIPT_REQUIRED")
+        artifact_rows = self._connection.execute(
+            """
+            SELECT content_hash FROM task_index_verification_artifacts
+            WHERE task_id = ? AND snapshot_id = ?
+            ORDER BY content_hash
+            LIMIT ?
+            """,
+            (task_id, output_snapshot_id, self._MAX_CODE_TASK_EVIDENCE_ITEMS + 1),
+        ).fetchall()
+        attestation_row = self._connection.execute(
+            """
+            SELECT attestation_hash FROM code_task_receipt_attestations
+            WHERE task_id = ? AND output_snapshot_id = ?
+            """,
+            (task_id, output_snapshot_id),
+        ).fetchone()
+        verification_hashes = tuple(
+            sorted(
+                {
+                    *(str(row["content_hash"]) for row in artifact_rows),
+                    *(
+                        ()
+                        if attestation_row is None
+                        else (str(attestation_row["attestation_hash"]),)
+                    ),
+                }
+            )
+        )
+        if (
+            not verification_hashes
+            or len(verification_hashes) > self._MAX_CODE_TASK_EVIDENCE_ITEMS
+        ):
+            raise StrictIndexError("VERIFICATION_EVIDENCE_REQUIRED")
+        return TaskAcceptanceEvidence(
+            str(query_rows[0]["trace_id"]),
+            verification_hashes,
+        )
+
+    def code_task_receipt_attestation_for_task(
+        self, task_id: str
+    ) -> CodeTaskReceiptAttestation | None:
+        """Recover and integrity-check one completion-gated receipt attestation."""
+
+        self._safe_acceptance_identifier("task_id", task_id)
+        row = self._connection.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._code_task_receipt_attestation_from_row(row)
+
+    def code_task_receipt_attestation_for_acceptance(
+        self, acceptance_id: str
+    ) -> CodeTaskReceiptAttestation | None:
+        """Recover a typed receipt attestation through immutable acceptance identity."""
+
+        self._safe_acceptance_identifier("acceptance_id", acceptance_id)
+        acceptance = self._connection.execute(
+            "SELECT * FROM code_task_acceptances WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()
+        if acceptance is None:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            (str(acceptance["code_task_id"]),),
+        ).fetchone()
+        if row is None:
+            raise AcceptanceConflictError(
+                "accepted code task has no receipt attestation"
+            )
+        attestation = self._code_task_receipt_attestation_from_row(row)
+        if (
+            attestation.workflow_id != str(acceptance["workflow_id"])
+            or attestation.code_task_id != str(acceptance["code_task_id"])
+            or attestation.code_task_version != int(acceptance["code_task_version"])
+            or attestation.input_snapshot_id != str(acceptance["input_snapshot_id"])
+            or attestation.output_snapshot_id != str(acceptance["output_snapshot_id"])
+        ):
+            raise AcceptanceConflictError(
+                "receipt attestation does not match acceptance"
+            )
+        return attestation
+
+    def evidence_binding_for_acceptance(
+        self, acceptance_id: str
+    ) -> CodeTaskEvidenceBinding | None:
+        """Read one typed recovery binding by immutable acceptance identity."""
+
+        self._safe_acceptance_identifier("acceptance_id", acceptance_id)
+        row = self._connection.execute(
+            "SELECT * FROM code_task_acceptances WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._code_task_evidence_binding_for_acceptance(
+            self._acceptance_from_row(row)
+        )
+
+    def evidence_binding_for_ingestion(
+        self, ingestion_key: str
+    ) -> CodeTaskEvidenceBinding | None:
+        """Read one typed recovery binding by immutable ingestion identity."""
+
+        self._safe_acceptance_identifier("ingestion_key", ingestion_key)
+        row = self._connection.execute(
+            """
+            SELECT acceptances.*
+            FROM atlas_ingestion_outbox AS outbox
+            JOIN code_task_acceptances AS acceptances
+                ON acceptances.acceptance_id = outbox.acceptance_id
+            WHERE outbox.ingestion_key = ?
+            """,
+            (ingestion_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._code_task_evidence_binding_for_acceptance(
+            self._acceptance_from_row(row)
+        )
+
+    def accepted_code_task_evidence(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> AcceptedCodeTaskEvidence | None:
+        """Read one exact acceptance without trusting its mutable outbox payload.
+
+        The returned values are reconstructed from durable acceptance, binding,
+        task, receipt-attestation, and artifact records. Outbox state and
+        ``payload_json`` deliberately remain outside this boundary.
+        """
+
+        for field_name, value in (
+            ("workflow_id", workflow_id),
+            ("code_task_id", code_task_id),
+            ("acceptance_id", acceptance_id),
+            ("ingestion_key", ingestion_key),
+        ):
+            self._safe_acceptance_identifier(field_name, value)
+
+        connection = self._connection
+        if connection is None:
+            raise AcceptanceEvidenceError("accepted code task store is unavailable")
+        acceptance = self.acceptance_for_workflow_task(workflow_id, code_task_id)
+        if acceptance is None:
+            known_acceptance = connection.execute(
+                "SELECT 1 FROM code_task_acceptances WHERE acceptance_id = ?",
+                (acceptance_id,),
+            ).fetchone()
+            known_ingestion = connection.execute(
+                "SELECT 1 FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+                (ingestion_key,),
+            ).fetchone()
+            if known_acceptance is not None or known_ingestion is not None:
+                raise AcceptanceConflictError(
+                    "accepted code task identity does not match its public pair"
+                )
+            return None
+        expected_payload = self._canonical_code_task_acceptance_payload(
+            workflow_id=acceptance.workflow_id,
+            task_id=acceptance.code_task_id,
+            task_version=acceptance.code_task_version,
+            input_snapshot_id=acceptance.input_snapshot_id,
+            output_snapshot_id=acceptance.output_snapshot_id,
+            indexed_diff_hash=acceptance.indexed_diff_hash,
+            intent_id=acceptance.intent_id,
+            language=acceptance.language,
+            framework=acceptance.framework,
+        )
+        expected_payload_hash = _payload_hash(expected_payload)
+        if (
+            acceptance.acceptance_id != expected_payload_hash
+            or acceptance.payload_hash != expected_payload_hash
+            or acceptance_id != expected_payload_hash
+        ):
+            raise AcceptanceConflictError("accepted code task identity is inconsistent")
+
+        outbox = connection.execute(
+            """
+            SELECT ingestion_key, acceptance_id, payload_hash
+            FROM atlas_ingestion_outbox
+            WHERE acceptance_id = ?
+            """,
+            (acceptance.acceptance_id,),
+        ).fetchone()
+        if outbox is None:
+            raise AcceptanceEvidenceError("accepted code task outbox is unavailable")
+        if (
+            str(outbox["acceptance_id"]) != acceptance.acceptance_id
+            or str(outbox["ingestion_key"]) != expected_payload_hash
+            or str(outbox["payload_hash"]) != expected_payload_hash
+            or ingestion_key != expected_payload_hash
+        ):
+            raise AcceptanceConflictError(
+                "accepted code task ingestion identity changed"
+            )
+
+        try:
+            task = self.get_task(code_task_id)
+        except KeyError as error:
+            raise AcceptanceEvidenceError(
+                "accepted code task is unavailable"
+            ) from error
+        if (
+            task.workflow_id != workflow_id
+            or task.task_kind is not TaskKind.CODE
+            or task.state is not TaskState.DONE
+            or task.version != acceptance.code_task_version
+            or task.intent_id != acceptance.intent_id
+            or task.language != acceptance.language
+            or task.framework != acceptance.framework
+            or not task.write_scope
+        ):
+            raise AcceptanceConflictError("accepted code task metadata changed")
+
+        index_binding = self.get_index_binding(code_task_id)
+        if index_binding is None:
+            raise AcceptanceEvidenceError(
+                "accepted code task index binding is unavailable"
+            )
+        if (
+            index_binding.input_snapshot_id != acceptance.input_snapshot_id
+            or index_binding.output_snapshot_id != acceptance.output_snapshot_id
+            or index_binding.indexed_diff_hash != acceptance.indexed_diff_hash
+            or not index_binding.checkpoint_id
+        ):
+            raise AcceptanceConflictError("accepted code task index binding changed")
+
+        binding_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM events
+            WHERE workflow_id = ? AND task_id = ? AND event_type = ?
+            """,
+            (
+                workflow_id,
+                code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+            ),
+        ).fetchone()[0]
+        if int(binding_count) == 0:
+            raise AcceptanceEvidenceError(
+                "accepted code task evidence binding is unavailable"
+            )
+        if int(binding_count) != 1:
+            raise AcceptanceConflictError("accepted code task evidence binding changed")
+        evidence_binding = self.evidence_binding_for_acceptance(
+            acceptance.acceptance_id
+        )
+        if evidence_binding is None:
+            raise AcceptanceEvidenceError(
+                "accepted code task evidence binding is unavailable"
+            )
+        if (
+            evidence_binding.workflow_id != workflow_id
+            or evidence_binding.code_task_id != code_task_id
+            or evidence_binding.code_task_version != acceptance.code_task_version
+            or evidence_binding.input_snapshot_id != acceptance.input_snapshot_id
+            or evidence_binding.output_snapshot_id != acceptance.output_snapshot_id
+            or evidence_binding.indexed_diff_hash != acceptance.indexed_diff_hash
+            or evidence_binding.checkpoint_id != index_binding.checkpoint_id
+        ):
+            raise AcceptanceConflictError("accepted code task evidence binding changed")
+
+        try:
+            task_evidence = self.task_acceptance_evidence(
+                code_task_id, acceptance.output_snapshot_id
+            )
+        except StrictIndexError as error:
+            raise AcceptanceEvidenceError(
+                "accepted code task output evidence is unavailable"
+            ) from error
+        if (
+            task_evidence.output_query_trace_id
+            != evidence_binding.output_query_trace_id
+        ):
+            raise AcceptanceConflictError("accepted code task output evidence changed")
+        if (
+            task_evidence.verification_artifact_hashes
+            != evidence_binding.verification_artifact_hashes
+        ):
+            if set(task_evidence.verification_artifact_hashes).issubset(
+                evidence_binding.verification_artifact_hashes
+            ):
+                raise AcceptanceEvidenceError(
+                    "accepted code task verification evidence is unavailable"
+                )
+            raise AcceptanceConflictError("accepted code task output evidence changed")
+
+        attestation_count = connection.execute(
+            "SELECT COUNT(*) FROM code_task_receipt_attestations WHERE task_id = ?",
+            (code_task_id,),
+        ).fetchone()[0]
+        if int(attestation_count) == 0:
+            raise AcceptanceEvidenceError(
+                "accepted code task receipt attestation is unavailable"
+            )
+        if int(attestation_count) != 1:
+            raise AcceptanceConflictError(
+                "accepted code task receipt attestation changed"
+            )
+        receipt_attestation = self.code_task_receipt_attestation_for_acceptance(
+            acceptance.acceptance_id
+        )
+        if receipt_attestation is None:
+            raise AcceptanceEvidenceError(
+                "accepted code task receipt attestation is unavailable"
+            )
+        if (
+            receipt_attestation.workflow_id != workflow_id
+            or receipt_attestation.code_task_id != code_task_id
+            or receipt_attestation.code_task_version != acceptance.code_task_version
+            or receipt_attestation.input_snapshot_id != acceptance.input_snapshot_id
+            or receipt_attestation.output_snapshot_id != acceptance.output_snapshot_id
+            or receipt_attestation.execution_receipt_ids
+            != evidence_binding.execution_receipt_ids
+            or receipt_attestation.attestation_hash
+            not in evidence_binding.verification_artifact_hashes
+        ):
+            raise AcceptanceConflictError(
+                "accepted code task receipt attestation changed"
+            )
+        if not task.result_hash:
+            raise AcceptanceEvidenceError(
+                "accepted code task result evidence is unavailable"
+            )
+        if task.result_hash not in evidence_binding.verification_artifact_hashes:
+            raise AcceptanceConflictError("accepted code task result evidence changed")
+        for artifact_hash in evidence_binding.verification_artifact_hashes:
+            if (
+                artifact_hash == receipt_attestation.attestation_hash
+                and artifact_hash != task.result_hash
+            ):
+                continue
+            artifact = self.get_artifact(artifact_hash)
+            if artifact is None:
+                raise AcceptanceEvidenceError(
+                    "accepted code task verification evidence is unavailable"
+                )
+            if artifact.kind != "verification":
+                raise AcceptanceConflictError(
+                    "accepted code task verification evidence changed"
+                )
+
+        return AcceptedCodeTaskEvidence(
+            acceptance=acceptance,
+            task=task,
+            index_binding=index_binding,
+            task_evidence=task_evidence,
+            evidence_binding=evidence_binding,
+            receipt_attestation=receipt_attestation,
+        )
+
+    def pending_atlas_outbox(self, *, limit: int) -> tuple[AtlasOutboxItem, ...]:
+        """Return pending ingestion work in deterministic creation/key order."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= self._MAX_ATLAS_OUTBOX_LIMIT
+        ):
+            raise ValueError(
+                "outbox limit must be an integer between 1 and "
+                f"{self._MAX_ATLAS_OUTBOX_LIMIT}"
+            )
+        rows = self._connection.execute(
+            """
+            SELECT * FROM atlas_ingestion_outbox
+            WHERE state = ?
+            ORDER BY created_at, ingestion_key
+            LIMIT ?
+            """,
+            (AtlasOutboxState.PENDING.value, limit),
+        ).fetchall()
+        return tuple(self._atlas_outbox_from_row(row) for row in rows)
+
+    def pending_ingestions(self, *, limit: int) -> tuple[AtlasOutboxItem, ...]:
+        """Compatibility name for the durable, pending Atlas ingestion queue."""
+        return self.pending_atlas_outbox(limit=limit)
+
+    def mark_atlas_outbox_state(
+        self,
+        ingestion_key: str,
+        state: AtlasOutboxState,
+        *,
+        error_code: str = "",
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Advance one pending outbox item or record a bounded pending retry."""
+        if not isinstance(state, AtlasOutboxState):
+            raise ValueError("outbox state must be an AtlasOutboxState")
+        self._safe_acceptance_identifier("ingestion_key", ingestion_key)
+        safe_error_code = self._safe_outbox_code(
+            "error_code", error_code, allow_empty=True
+        )
+        safe_reason_codes = self._safe_outbox_reason_codes(reason_codes)
+        if state is AtlasOutboxState.PENDING and not safe_error_code:
+            raise ValueError("pending retry requires a stable error code")
+        if state is AtlasOutboxState.PROJECTED and safe_error_code:
+            raise ValueError("projected outbox state cannot retain an error code")
+        if state is AtlasOutboxState.QUARANTINED and not safe_error_code:
+            raise ValueError("quarantined outbox state requires a stable error code")
+        updated_at = _utc_timestamp(now) if now is not None else _utc_now()
+
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+                (ingestion_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"atlas outbox item not found: {ingestion_key!r}")
+            current = AtlasOutboxState(str(row["state"]))
+            if current is not AtlasOutboxState.PENDING:
+                if current is state:
+                    return self._atlas_outbox_from_row(row)
+                raise AtlasOutboxTransitionError(
+                    f"terminal outbox item cannot change state: {ingestion_key!r}"
+                )
+
+            if state is AtlasOutboxState.PENDING:
+                if int(row["attempt_count"]) >= self._MAX_ATLAS_OUTBOX_ATTEMPTS:
+                    raise AtlasOutboxAttemptLimitError(
+                        f"outbox retry limit reached: {ingestion_key!r}"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE atlas_ingestion_outbox
+                    SET attempt_count = attempt_count + 1,
+                        last_error_code = ?,
+                        reason_codes_json = ?,
+                        updated_at = ?
+                    WHERE ingestion_key = ?
+                    """,
+                    (
+                        safe_error_code,
+                        _encode_outbox_reason_codes(safe_reason_codes),
+                        updated_at,
+                        ingestion_key,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE atlas_ingestion_outbox
+                    SET state = ?,
+                        last_error_code = ?,
+                        reason_codes_json = ?,
+                        updated_at = ?
+                    WHERE ingestion_key = ?
+                    """,
+                    (
+                        state.value,
+                        safe_error_code,
+                        _encode_outbox_reason_codes(safe_reason_codes),
+                        updated_at,
+                        ingestion_key,
+                    ),
+                )
+            updated_row = cursor.execute(
+                "SELECT * FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+                (ingestion_key,),
+            ).fetchone()
+        return self._atlas_outbox_from_row(updated_row)
+
+    def mark_atlas_outbox_projected(
+        self,
+        ingestion_key: str,
+        *,
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Mark a pending outbox item permanently projected."""
+        return self.mark_atlas_outbox_state(
+            ingestion_key,
+            AtlasOutboxState.PROJECTED,
+            reason_codes=reason_codes,
+            now=now,
+        )
+
+    def mark_atlas_outbox_quarantined(
+        self,
+        ingestion_key: str,
+        *,
+        error_code: str,
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Mark a pending outbox item permanently quarantined."""
+        return self.mark_atlas_outbox_state(
+            ingestion_key,
+            AtlasOutboxState.QUARANTINED,
+            error_code=error_code,
+            reason_codes=reason_codes,
+            now=now,
+        )
+
+    def mark_atlas_outbox_retry(
+        self,
+        ingestion_key: str,
+        *,
+        error_code: str,
+        reason_codes: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> AtlasOutboxItem:
+        """Record one bounded retry while leaving the item pending."""
+        return self.mark_atlas_outbox_state(
+            ingestion_key,
+            AtlasOutboxState.PENDING,
+            error_code=error_code,
+            reason_codes=reason_codes,
+            now=now,
+        )
+
     def dependencies_for(self, task_id: str) -> tuple[str, ...]:
         rows = self._connection.execute(
             "SELECT dependency_id FROM task_dependencies WHERE task_id = ? ORDER BY rowid",
@@ -886,13 +1752,18 @@ class SQLiteStore:
         epoch: int,
         *,
         result_hash: str | None = None,
+        receipt_attestation: CodeTaskReceiptAttestation | None = None,
         now: str | None = None,
     ) -> Task:
         """Complete a task only when the caller still owns the supplied epoch."""
         now_utc = _utc_timestamp(now) if now is not None else _utc_now()
         with self._transaction() as cursor:
             self._require_current_lease(cursor, task_id, owner, epoch, now=now_utc)
-            self._require_strict_completion(cursor, task_id)
+            task_row = cursor.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"task not found: {task_id!r}")
             workflow = cursor.execute(
                 """
                 SELECT workflows.state
@@ -908,20 +1779,200 @@ class SQLiteStore:
                 raise WorkflowCancelledError(
                     f"workflow is cancelled for task {task_id!r}"
                 )
-            cursor.execute(
-                """
-                UPDATE tasks
-                SET state = ?, result_hash = COALESCE(?, result_hash), version = version + 1
-                WHERE id = ? AND version = ?
-                """,
-                (state.value, result_hash, task_id, expected_version),
+            is_code_completion = (
+                state is TaskState.DONE
+                and str(task_row["task_kind"]) == TaskKind.CODE.value
             )
+            final_version = expected_version
+            if is_code_completion:
+                if (
+                    isinstance(expected_version, bool)
+                    or not isinstance(expected_version, int)
+                    or not 0 <= expected_version < 2**63 - 1
+                ):
+                    raise VersionConflictError(
+                        f"task version is not current: {task_id!r}"
+                    )
+                final_version += 1
+
+            if (
+                is_code_completion
+                and str(task_row["state"]) == TaskState.DONE.value
+                and int(task_row["version"]) == final_version
+            ):
+                if receipt_attestation is None:
+                    raise AcceptanceEvidenceError(
+                        "code task receipt attestation is required"
+                    )
+                binding = self._require_index_binding(cursor, task_id)
+                self._validate_completion_receipt_attestation(
+                    receipt_attestation,
+                    task_row=task_row,
+                    binding=binding,
+                    final_version=final_version,
+                )
+                if (
+                    result_hash is not None
+                    and str(task_row["result_hash"]) != result_hash
+                ):
+                    raise AcceptanceConflictError(
+                        "completed task result hash does not match retry"
+                    )
+                persisted_row = cursor.execute(
+                    """
+                    SELECT * FROM code_task_receipt_attestations
+                    WHERE task_id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if persisted_row is None:
+                    raise AcceptanceConflictError(
+                        "completed code task has no receipt attestation"
+                    )
+                persisted = self._code_task_receipt_attestation_from_row(persisted_row)
+                if persisted != receipt_attestation:
+                    raise AcceptanceConflictError(
+                        "completed task receipt attestation does not match retry"
+                    )
+                return self._task_from_row(task_row)
+
+            if is_code_completion and str(task_row["state"]) != TaskState.RUNNING.value:
+                raise InvalidTaskStateError(
+                    f"task must be running before completion: {task_id!r}"
+                )
+            if int(task_row["version"]) != expected_version:
+                raise VersionConflictError(f"task version is not current: {task_id!r}")
+            self._require_strict_completion(cursor, task_id)
+
+            if is_code_completion:
+                if receipt_attestation is None:
+                    raise AcceptanceEvidenceError(
+                        "code task receipt attestation is required"
+                    )
+                binding = self._require_index_binding(cursor, task_id)
+                self._validate_completion_receipt_attestation(
+                    receipt_attestation,
+                    task_row=task_row,
+                    binding=binding,
+                    final_version=final_version,
+                )
+
+            if is_code_completion:
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, result_hash = COALESCE(?, result_hash),
+                        version = version + 1
+                    WHERE id = ? AND state = ? AND version = ?
+                    """,
+                    (
+                        state.value,
+                        result_hash,
+                        task_id,
+                        TaskState.RUNNING.value,
+                        expected_version,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, result_hash = COALESCE(?, result_hash),
+                        version = version + 1
+                    WHERE id = ? AND version = ?
+                    """,
+                    (state.value, result_hash, task_id, expected_version),
+                )
             if cursor.rowcount != 1:
                 raise VersionConflictError(f"task version is not current: {task_id!r}")
+            if is_code_completion:
+                self._insert_code_task_receipt_attestation(
+                    cursor, receipt_attestation, created_at=now_utc
+                )
             row = cursor.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
         return self._task_from_row(row)
+
+    def _validate_completion_receipt_attestation(
+        self,
+        receipt_attestation: CodeTaskReceiptAttestation,
+        *,
+        task_row: sqlite3.Row,
+        binding: sqlite3.Row,
+        final_version: int,
+    ) -> None:
+        try:
+            self._validate_code_task_receipt_attestation(
+                receipt_attestation,
+                workflow_id=str(task_row["workflow_id"]),
+                task_id=str(task_row["id"]),
+                task_version=final_version,
+                input_snapshot_id=str(binding["input_snapshot_id"]),
+                output_snapshot_id=str(binding["output_snapshot_id"]),
+            )
+        except ValueError as error:
+            raise AcceptanceEvidenceError(
+                "code task receipt attestation is invalid"
+            ) from error
+
+    def _insert_code_task_receipt_attestation(
+        self,
+        cursor: sqlite3.Cursor,
+        receipt_attestation: CodeTaskReceiptAttestation,
+        *,
+        created_at: str,
+    ) -> None:
+        existing = cursor.execute(
+            "SELECT * FROM code_task_receipt_attestations WHERE task_id = ?",
+            (receipt_attestation.code_task_id,),
+        ).fetchone()
+        if existing is not None:
+            persisted = self._code_task_receipt_attestation_from_row(existing)
+            if persisted != receipt_attestation:
+                raise AcceptanceConflictError(
+                    "code task already has a different receipt attestation"
+                )
+            return
+        try:
+            cursor.execute(
+                """
+                INSERT INTO code_task_receipt_attestations (
+                    task_id, workflow_id, code_task_version, input_snapshot_id,
+                    output_snapshot_id, workspace_hash, execution_receipt_ids,
+                    attestation_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt_attestation.code_task_id,
+                    receipt_attestation.workflow_id,
+                    receipt_attestation.code_task_version,
+                    receipt_attestation.input_snapshot_id,
+                    receipt_attestation.output_snapshot_id,
+                    receipt_attestation.workspace_hash,
+                    _encode_strings(receipt_attestation.execution_receipt_ids),
+                    receipt_attestation.attestation_hash,
+                    created_at,
+                ),
+            )
+            for receipt_id in receipt_attestation.execution_receipt_ids:
+                cursor.execute(
+                    """
+                    INSERT INTO code_task_receipt_owners (
+                        receipt_id, task_id, code_task_version, attestation_hash
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        receipt_id,
+                        receipt_attestation.code_task_id,
+                        receipt_attestation.code_task_version,
+                        receipt_attestation.attestation_hash,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise AcceptanceConflictError(
+                "execution receipt is already owned by another code task"
+            ) from error
 
     def cancel_workflow(
         self, workflow_id: str, *, expected_version: int | None = None
@@ -1041,20 +2092,31 @@ class SQLiteStore:
         now_utc = _utc_timestamp(now) if now is not None else _utc_now()
         with self._transaction() as cursor:
             self._require_current_lease(cursor, task_id, owner, epoch, now=now_utc)
-            workflow = cursor.execute(
+            binding = self._optional_index_binding(cursor, task_id)
+            task_context = cursor.execute(
                 """
-                SELECT workflows.state
+                SELECT
+                    workflows.state AS workflow_state,
+                    tasks.state AS task_state
                 FROM workflows JOIN tasks ON tasks.workflow_id = workflows.id
                 WHERE tasks.id = ?
                 """,
                 (task_id,),
             ).fetchone()
             if (
-                workflow is not None
-                and workflow["state"] == WorkflowState.CANCELLED.value
+                task_context is not None
+                and task_context["workflow_state"] == WorkflowState.CANCELLED.value
             ):
                 raise WorkflowCancelledError(
                     f"workflow is cancelled for task {task_id!r}"
+                )
+            if (
+                kind == "verification"
+                and task_context is not None
+                and task_context["task_state"] != TaskState.RUNNING.value
+            ):
+                raise InvalidTaskStateError(
+                    f"verification evidence requires a running task: {task_id!r}"
                 )
             artifact = cursor.execute(
                 "SELECT * FROM artifacts WHERE content_hash = ?", (content_hash,)
@@ -1100,9 +2162,6 @@ class SQLiteStore:
                 raise ArtifactConflictError(
                     f"artifact owner conflicts for {content_hash!r}"
                 )
-            binding = cursor.execute(
-                "SELECT * FROM task_index_bindings WHERE task_id = ?", (task_id,)
-            ).fetchone()
             if binding is not None and kind == "verification":
                 expected_snapshot = str(binding["output_snapshot_id"])
                 if not snapshot_id or snapshot_id != expected_snapshot:
@@ -1224,6 +2283,7 @@ class SQLiteStore:
             ).fetchone()
             if task is None:
                 raise KeyError(f"task not found: {task_id!r}")
+            self._optional_index_binding(cursor, task_id)
             workflow = cursor.execute(
                 "SELECT state FROM workflows WHERE id = ?", (task["workflow_id"],)
             ).fetchone()
@@ -1318,9 +2378,7 @@ class SQLiteStore:
                     _utc_now(),
                 ),
             )
-            sequence = cursor.lastrowid
-            if sequence is None:
-                raise sqlite3.DatabaseError("event insert did not return a row id")
+            sequence = int(cursor.lastrowid)
             row = cursor.execute(
                 "SELECT * FROM events WHERE sequence = ?", (sequence,)
             ).fetchone()
@@ -1346,6 +2404,7 @@ class SQLiteStore:
         expiry_utc = _utc_timestamp(expires_at)
         normalized_target = self._validate_host_target(host_target)
         with self._transaction() as cursor:
+            self._optional_index_binding(cursor, task_id)
             return self._acquire_lease_in_transaction(
                 cursor, task_id, owner, expiry_utc, now_utc, normalized_target
             )
@@ -1547,11 +2606,767 @@ class SQLiteStore:
             ),
         )
 
-    @staticmethod
-    def _require_index_binding(cursor: sqlite3.Cursor, task_id: str) -> sqlite3.Row:
+    def _insert_atlas_outbox(
+        self,
+        cursor: sqlite3.Cursor,
+        acceptance: CodeTaskAcceptance,
+        *,
+        payload_json: str,
+        created_at: str,
+    ) -> AtlasOutboxItem:
+        """Insert the single pending ingestion row owned by an acceptance."""
+        cursor.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                acceptance.payload_hash,
+                acceptance.acceptance_id,
+                payload_json,
+                acceptance.payload_hash,
+                AtlasOutboxState.PENDING.value,
+                0,
+                "",
+                "[]",
+                created_at,
+                created_at,
+            ),
+        )
+        row = cursor.execute(
+            "SELECT * FROM atlas_ingestion_outbox WHERE ingestion_key = ?",
+            (acceptance.payload_hash,),
+        ).fetchone()
+        return self._atlas_outbox_from_row(row)
+
+    @classmethod
+    def build_code_task_evidence_binding(
+        cls,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        checkpoint_id: str,
+        checkpoint_hash: str,
+        output_query_trace_id: str,
+        verification_artifact_hashes: tuple[str, ...],
+        execution_receipt_ids: tuple[str, ...],
+    ) -> CodeTaskEvidenceBinding:
+        """Construct one canonical typed evidence binding without persistence."""
+
+        payload = cls._code_task_evidence_binding_payload(
+            workflow_id=workflow_id,
+            task_id=task_id,
+            task_version=task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            indexed_diff_hash=indexed_diff_hash,
+            checkpoint_id=checkpoint_id,
+            checkpoint_hash=checkpoint_hash,
+            output_query_trace_id=output_query_trace_id,
+            verification_artifact_hashes=verification_artifact_hashes,
+            execution_receipt_ids=execution_receipt_ids,
+        )
+        payload_json = _canonical_evidence_binding_json(payload)
+        return CodeTaskEvidenceBinding(
+            str(payload["schema_version"]),
+            str(payload["workflow_id"]),
+            str(payload["code_task_id"]),
+            int(payload["code_task_version"]),
+            str(payload["input_snapshot_id"]),
+            str(payload["output_snapshot_id"]),
+            str(payload["indexed_diff_hash"]),
+            str(payload["checkpoint_id"]),
+            str(payload["checkpoint_hash"]),
+            str(payload["output_query_trace_id"]),
+            tuple(payload["verification_artifact_hashes"]),
+            tuple(payload["execution_receipt_ids"]),
+            _payload_hash(payload_json),
+        )
+
+    @classmethod
+    def build_code_task_receipt_attestation(
+        cls,
+        *,
+        workflow_id: str,
+        code_task_id: str,
+        code_task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        workspace_hash: str,
+        execution_receipt_ids: tuple[str, ...],
+    ) -> CodeTaskReceiptAttestation:
+        """Recompute the producer-owned receipt attestation without persistence."""
+
+        payload = cls._code_task_receipt_attestation_payload(
+            workflow_id=workflow_id,
+            code_task_id=code_task_id,
+            code_task_version=code_task_version,
+            input_snapshot_id=input_snapshot_id,
+            output_snapshot_id=output_snapshot_id,
+            workspace_hash=workspace_hash,
+            execution_receipt_ids=execution_receipt_ids,
+        )
+        payload_json = _canonical_receipt_attestation_json(payload)
+        return CodeTaskReceiptAttestation(
+            str(payload["schema_version"]),
+            str(payload["workflow_id"]),
+            str(payload["code_task_id"]),
+            int(payload["code_task_version"]),
+            str(payload["input_snapshot_id"]),
+            str(payload["output_snapshot_id"]),
+            str(payload["workspace_hash"]),
+            tuple(payload["execution_receipt_ids"]),
+            _payload_hash(payload_json),
+        )
+
+    @classmethod
+    def _validate_code_task_receipt_attestation(
+        cls,
+        receipt_attestation: CodeTaskReceiptAttestation,
+        *,
+        workflow_id: str | None = None,
+        task_id: str | None = None,
+        task_version: int | None = None,
+        input_snapshot_id: str | None = None,
+        output_snapshot_id: str | None = None,
+    ) -> None:
+        if not isinstance(receipt_attestation, CodeTaskReceiptAttestation):
+            raise ValueError("receipt_attestation must be a CodeTaskReceiptAttestation")
+        expected = cls.build_code_task_receipt_attestation(
+            workflow_id=receipt_attestation.workflow_id,
+            code_task_id=receipt_attestation.code_task_id,
+            code_task_version=receipt_attestation.code_task_version,
+            input_snapshot_id=receipt_attestation.input_snapshot_id,
+            output_snapshot_id=receipt_attestation.output_snapshot_id,
+            workspace_hash=receipt_attestation.workspace_hash,
+            execution_receipt_ids=receipt_attestation.execution_receipt_ids,
+        )
+        if expected != receipt_attestation:
+            raise ValueError("receipt attestation is not canonical")
+        if (
+            (workflow_id is not None and receipt_attestation.workflow_id != workflow_id)
+            or (task_id is not None and receipt_attestation.code_task_id != task_id)
+            or (
+                task_version is not None
+                and receipt_attestation.code_task_version != task_version
+            )
+            or (
+                input_snapshot_id is not None
+                and receipt_attestation.input_snapshot_id != input_snapshot_id
+            )
+            or (
+                output_snapshot_id is not None
+                and receipt_attestation.output_snapshot_id != output_snapshot_id
+            )
+        ):
+            raise AcceptanceConflictError(
+                "receipt attestation does not match code task completion"
+            )
+
+    def _code_task_receipt_attestation_from_row(
+        self, row: sqlite3.Row
+    ) -> CodeTaskReceiptAttestation:
+        try:
+            encoded_receipt_ids = str(row["execution_receipt_ids"])
+            receipt_ids = _decode_strings(encoded_receipt_ids)
+            attestation = self.build_code_task_receipt_attestation(
+                workflow_id=str(row["workflow_id"]),
+                code_task_id=str(row["task_id"]),
+                code_task_version=int(row["code_task_version"]),
+                input_snapshot_id=str(row["input_snapshot_id"]),
+                output_snapshot_id=str(row["output_snapshot_id"]),
+                workspace_hash=str(row["workspace_hash"]),
+                execution_receipt_ids=receipt_ids,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise AcceptanceConflictError(
+                "code task receipt attestation is corrupt"
+            ) from error
+        if (
+            encoded_receipt_ids != _encode_strings(attestation.execution_receipt_ids)
+            or str(row["attestation_hash"]) != attestation.attestation_hash
+        ):
+            raise AcceptanceConflictError(
+                "code task receipt attestation hash is corrupt"
+            )
+
+        task = self._connection.execute(
+            "SELECT workflow_id, state, version, task_kind FROM tasks WHERE id = ?",
+            (attestation.code_task_id,),
+        ).fetchone()
+        binding = self._connection.execute(
+            """
+            SELECT *
+            FROM task_index_bindings WHERE task_id = ?
+            """,
+            (attestation.code_task_id,),
+        ).fetchone()
+        if binding is not None:
+            self._index_binding_from_row(binding)
+        owner_rows = self._connection.execute(
+            """
+            SELECT receipt_id, code_task_version, attestation_hash
+            FROM code_task_receipt_owners
+            WHERE task_id = ?
+            ORDER BY receipt_id
+            """,
+            (attestation.code_task_id,),
+        ).fetchall()
+        if (
+            task is None
+            or str(task["workflow_id"]) != attestation.workflow_id
+            or str(task["state"]) != TaskState.DONE.value
+            or int(task["version"]) != attestation.code_task_version
+            or str(task["task_kind"]) != TaskKind.CODE.value
+            or binding is None
+            or str(binding["input_snapshot_id"]) != attestation.input_snapshot_id
+            or str(binding["output_snapshot_id"]) != attestation.output_snapshot_id
+            or tuple(str(owner["receipt_id"]) for owner in owner_rows)
+            != attestation.execution_receipt_ids
+            or any(
+                int(owner["code_task_version"]) != attestation.code_task_version
+                or str(owner["attestation_hash"]) != attestation.attestation_hash
+                for owner in owner_rows
+            )
+        ):
+            raise AcceptanceConflictError(
+                "code task receipt attestation ownership is corrupt"
+            )
+        return attestation
+
+    def _insert_code_task_evidence_binding(
+        self,
+        cursor: sqlite3.Cursor,
+        acceptance: CodeTaskAcceptance,
+        evidence_binding: CodeTaskEvidenceBinding,
+        *,
+        created_at: str,
+    ) -> None:
+        payload_json = self._code_task_evidence_binding_json(evidence_binding)
+        cursor.execute(
+            """
+            INSERT INTO events
+                (workflow_id, task_id, event_type, redacted_payload, payload_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                acceptance.workflow_id,
+                acceptance.code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+                payload_json,
+                evidence_binding.evidence_binding_hash,
+                created_at,
+            ),
+        )
+
+    def _require_existing_code_task_evidence_binding(
+        self,
+        cursor: sqlite3.Cursor,
+        acceptance: CodeTaskAcceptance,
+        evidence_binding: CodeTaskEvidenceBinding,
+    ) -> None:
+        rows = cursor.execute(
+            """
+            SELECT redacted_payload, payload_hash FROM events
+            WHERE workflow_id = ? AND task_id = ? AND event_type = ?
+            ORDER BY sequence
+            """,
+            (
+                acceptance.workflow_id,
+                acceptance.code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+            ),
+        ).fetchall()
+        if len(rows) != 1:
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence is not durable: {acceptance.code_task_id!r}"
+            )
+        payload_json = self._code_task_evidence_binding_json(evidence_binding)
+        row = rows[0]
+        if (
+            str(row["redacted_payload"]) != payload_json
+            or str(row["payload_hash"]) != evidence_binding.evidence_binding_hash
+        ):
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence changed: {acceptance.code_task_id!r}"
+            )
+
+    def _code_task_evidence_binding_for_acceptance(
+        self, acceptance: CodeTaskAcceptance
+    ) -> CodeTaskEvidenceBinding:
+        rows = self._connection.execute(
+            """
+            SELECT redacted_payload, payload_hash FROM events
+            WHERE workflow_id = ? AND task_id = ? AND event_type = ?
+            ORDER BY sequence
+            """,
+            (
+                acceptance.workflow_id,
+                acceptance.code_task_id,
+                self._EVIDENCE_BINDING_EVENT_TYPE,
+            ),
+        ).fetchall()
+        if len(rows) != 1:
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence is not durable: {acceptance.code_task_id!r}"
+            )
+        binding = self._code_task_evidence_binding_from_event(rows[0])
+        if (
+            binding.workflow_id != acceptance.workflow_id
+            or binding.code_task_id != acceptance.code_task_id
+            or binding.code_task_version != acceptance.code_task_version
+            or binding.input_snapshot_id != acceptance.input_snapshot_id
+            or binding.output_snapshot_id != acceptance.output_snapshot_id
+            or binding.indexed_diff_hash != acceptance.indexed_diff_hash
+        ):
+            raise AcceptanceConflictError(
+                f"code task acceptance evidence is inconsistent: {acceptance.code_task_id!r}"
+            )
+        return binding
+
+    @classmethod
+    def _code_task_evidence_binding_from_event(
+        cls, row: sqlite3.Row
+    ) -> CodeTaskEvidenceBinding:
+        try:
+            payload_json = str(row["redacted_payload"])
+            payload = json.loads(payload_json)
+            if (
+                not isinstance(payload, dict)
+                or set(payload)
+                != {
+                    "checkpoint_hash",
+                    "checkpoint_id",
+                    "code_task_id",
+                    "code_task_version",
+                    "execution_receipt_ids",
+                    "indexed_diff_hash",
+                    "input_snapshot_id",
+                    "output_query_trace_id",
+                    "output_snapshot_id",
+                    "schema_version",
+                    "verification_artifact_hashes",
+                    "workflow_id",
+                }
+                or _canonical_evidence_binding_json(payload) != payload_json
+                or not isinstance(payload["verification_artifact_hashes"], list)
+                or not isinstance(payload["execution_receipt_ids"], list)
+                or payload["schema_version"] != cls._EVIDENCE_BINDING_SCHEMA_VERSION
+            ):
+                raise ValueError("evidence binding payload is invalid")
+            binding = cls.build_code_task_evidence_binding(
+                workflow_id=payload["workflow_id"],
+                task_id=payload["code_task_id"],
+                task_version=payload["code_task_version"],
+                input_snapshot_id=payload["input_snapshot_id"],
+                output_snapshot_id=payload["output_snapshot_id"],
+                indexed_diff_hash=payload["indexed_diff_hash"],
+                checkpoint_id=payload["checkpoint_id"],
+                checkpoint_hash=payload["checkpoint_hash"],
+                output_query_trace_id=payload["output_query_trace_id"],
+                verification_artifact_hashes=tuple(
+                    payload["verification_artifact_hashes"]
+                ),
+                execution_receipt_ids=tuple(payload["execution_receipt_ids"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise AcceptanceConflictError(
+                "code task evidence binding is corrupt"
+            ) from error
+        if str(row["payload_hash"]) != binding.evidence_binding_hash:
+            raise AcceptanceConflictError("code task evidence binding hash is corrupt")
+        return binding
+
+    @classmethod
+    def _code_task_evidence_binding_json(
+        cls, evidence_binding: CodeTaskEvidenceBinding
+    ) -> str:
+        cls._validate_code_task_evidence_binding(evidence_binding)
+        payload = cls._code_task_evidence_binding_payload(
+            workflow_id=evidence_binding.workflow_id,
+            task_id=evidence_binding.code_task_id,
+            task_version=evidence_binding.code_task_version,
+            input_snapshot_id=evidence_binding.input_snapshot_id,
+            output_snapshot_id=evidence_binding.output_snapshot_id,
+            indexed_diff_hash=evidence_binding.indexed_diff_hash,
+            checkpoint_id=evidence_binding.checkpoint_id,
+            checkpoint_hash=evidence_binding.checkpoint_hash,
+            output_query_trace_id=evidence_binding.output_query_trace_id,
+            verification_artifact_hashes=evidence_binding.verification_artifact_hashes,
+            execution_receipt_ids=evidence_binding.execution_receipt_ids,
+        )
+        return _canonical_evidence_binding_json(payload)
+
+    @classmethod
+    def _validate_code_task_evidence_binding(
+        cls,
+        evidence_binding: CodeTaskEvidenceBinding,
+        *,
+        workflow_id: str | None = None,
+        task_id: str | None = None,
+        task_version: int | None = None,
+        input_snapshot_id: str | None = None,
+        output_snapshot_id: str | None = None,
+        indexed_diff_hash: str | None = None,
+    ) -> None:
+        if not isinstance(evidence_binding, CodeTaskEvidenceBinding):
+            raise ValueError("evidence_binding must be a CodeTaskEvidenceBinding")
+        expected = cls.build_code_task_evidence_binding(
+            workflow_id=evidence_binding.workflow_id,
+            task_id=evidence_binding.code_task_id,
+            task_version=evidence_binding.code_task_version,
+            input_snapshot_id=evidence_binding.input_snapshot_id,
+            output_snapshot_id=evidence_binding.output_snapshot_id,
+            indexed_diff_hash=evidence_binding.indexed_diff_hash,
+            checkpoint_id=evidence_binding.checkpoint_id,
+            checkpoint_hash=evidence_binding.checkpoint_hash,
+            output_query_trace_id=evidence_binding.output_query_trace_id,
+            verification_artifact_hashes=evidence_binding.verification_artifact_hashes,
+            execution_receipt_ids=evidence_binding.execution_receipt_ids,
+        )
+        if expected != evidence_binding:
+            raise ValueError("evidence binding is not canonical")
+        if (
+            (workflow_id is not None and evidence_binding.workflow_id != workflow_id)
+            or (task_id is not None and evidence_binding.code_task_id != task_id)
+            or (
+                task_version is not None
+                and evidence_binding.code_task_version != task_version
+            )
+            or (
+                input_snapshot_id is not None
+                and evidence_binding.input_snapshot_id != input_snapshot_id
+            )
+            or (
+                output_snapshot_id is not None
+                and evidence_binding.output_snapshot_id != output_snapshot_id
+            )
+            or (
+                indexed_diff_hash is not None
+                and evidence_binding.indexed_diff_hash != indexed_diff_hash
+            )
+        ):
+            raise AcceptanceConflictError("evidence binding does not match acceptance")
+
+    @classmethod
+    def _code_task_evidence_binding_payload(
+        cls,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        checkpoint_id: str,
+        checkpoint_hash: str,
+        output_query_trace_id: str,
+        verification_artifact_hashes: tuple[str, ...],
+        execution_receipt_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        if (
+            isinstance(task_version, bool)
+            or not isinstance(task_version, int)
+            or not 0 <= task_version <= 2**63 - 1
+        ):
+            raise ValueError("task_version must be a non-negative SQLite integer")
+        return {
+            "schema_version": cls._EVIDENCE_BINDING_SCHEMA_VERSION,
+            "workflow_id": cls._safe_acceptance_identifier("workflow_id", workflow_id),
+            "code_task_id": cls._safe_acceptance_identifier("code_task_id", task_id),
+            "code_task_version": task_version,
+            "input_snapshot_id": cls._safe_acceptance_identifier(
+                "input_snapshot_id", input_snapshot_id
+            ),
+            "output_snapshot_id": cls._safe_acceptance_identifier(
+                "output_snapshot_id", output_snapshot_id
+            ),
+            "indexed_diff_hash": cls._safe_acceptance_identifier(
+                "indexed_diff_hash", indexed_diff_hash
+            ),
+            "checkpoint_id": cls._safe_acceptance_identifier(
+                "checkpoint_id", checkpoint_id
+            ),
+            "checkpoint_hash": cls._safe_acceptance_identifier(
+                "checkpoint_hash", checkpoint_hash
+            ),
+            "output_query_trace_id": cls._safe_acceptance_identifier(
+                "output_query_trace_id", output_query_trace_id
+            ),
+            "verification_artifact_hashes": list(
+                cls._safe_evidence_identifier_list(
+                    "verification_artifact_hashes", verification_artifact_hashes
+                )
+            ),
+            "execution_receipt_ids": list(
+                cls._safe_evidence_identifier_list(
+                    "execution_receipt_ids", execution_receipt_ids
+                )
+            ),
+        }
+
+    @classmethod
+    def _code_task_receipt_attestation_payload(
+        cls,
+        *,
+        workflow_id: str,
+        code_task_id: str,
+        code_task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        workspace_hash: str,
+        execution_receipt_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        if (
+            isinstance(code_task_version, bool)
+            or not isinstance(code_task_version, int)
+            or not 0 <= code_task_version <= 2**63 - 1
+        ):
+            raise ValueError("code_task_version must be a non-negative SQLite integer")
+        receipt_ids = cls._safe_evidence_identifier_list(
+            "execution_receipt_ids", execution_receipt_ids
+        )
+        return {
+            "schema_version": cls._RECEIPT_ATTESTATION_SCHEMA_VERSION,
+            "workflow_id": cls._safe_acceptance_identifier("workflow_id", workflow_id),
+            "code_task_id": cls._safe_acceptance_identifier(
+                "code_task_id", code_task_id
+            ),
+            "code_task_version": code_task_version,
+            "input_snapshot_id": cls._safe_acceptance_identifier(
+                "input_snapshot_id", input_snapshot_id
+            ),
+            "output_snapshot_id": cls._safe_acceptance_identifier(
+                "output_snapshot_id", output_snapshot_id
+            ),
+            "workspace_hash": cls._safe_sha256_identifier(
+                "workspace_hash", workspace_hash
+            ),
+            "execution_receipt_ids": [
+                cls._safe_sha256_identifier("execution_receipt_ids", receipt_id)
+                for receipt_id in receipt_ids
+            ],
+        }
+
+    @classmethod
+    def _safe_evidence_identifier_list(
+        cls, field_name: str, values: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        if (
+            not isinstance(values, tuple)
+            or not values
+            or len(values) > cls._MAX_CODE_TASK_EVIDENCE_ITEMS
+            or tuple(sorted(set(values))) != values
+        ):
+            raise ValueError(f"{field_name} must be a sorted unique bounded tuple")
+        return tuple(
+            cls._safe_acceptance_identifier(field_name, value) for value in values
+        )
+
+    def _require_authorized_code_task_acceptance(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        coordinator_task_id: str,
+        coordinator_owner: str,
+        coordinator_epoch: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        intent_id: str,
+        language: str,
+        framework: str,
+        now: str,
+    ) -> None:
+        coordinator = cursor.execute(
+            "SELECT workflow_id, owner_role, state FROM tasks WHERE id = ?",
+            (coordinator_task_id,),
+        ).fetchone()
+        if (
+            coordinator is None
+            or str(coordinator["workflow_id"]) != workflow_id
+            or str(coordinator["owner_role"]) not in {"sol", "opus"}
+            or str(coordinator["state"]) != TaskState.RUNNING.value
+        ):
+            raise AcceptanceAuthorizationError(
+                "acceptance requires a same-workflow sol or opus coordinator"
+            )
+        self._require_current_lease(
+            cursor,
+            coordinator_task_id,
+            coordinator_owner,
+            coordinator_epoch,
+            now=now,
+        )
+
+        task = cursor.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or str(task["workflow_id"]) != workflow_id
+            or str(task["task_kind"]) != TaskKind.CODE.value
+        ):
+            raise AcceptanceAuthorizationError(
+                "acceptance requires a code task in the coordinator workflow"
+            )
+        if int(task["version"]) != task_version:
+            raise VersionConflictError(f"task version is not current: {task_id!r}")
+        if str(task["state"]) != TaskState.DONE.value:
+            raise InvalidTaskStateError(
+                f"code task must be done before acceptance: {task_id!r}"
+            )
+
+        binding = self._require_index_binding(cursor, task_id)
+        self._require_strict_completion(cursor, task_id)
+        if (
+            str(binding["input_snapshot_id"]) != input_snapshot_id
+            or str(binding["output_snapshot_id"]) != output_snapshot_id
+            or str(binding["indexed_diff_hash"]) != indexed_diff_hash
+            or str(task["intent_id"]) != intent_id
+            or str(task["language"]) != language
+            or str(task["framework"]) != framework
+        ):
+            raise AcceptanceConflictError(
+                f"acceptance metadata is not current for code task: {task_id!r}"
+            )
+
+    @classmethod
+    def _canonical_code_task_acceptance_payload(
+        cls,
+        *,
+        workflow_id: str,
+        task_id: str,
+        task_version: int,
+        input_snapshot_id: str,
+        output_snapshot_id: str,
+        indexed_diff_hash: str,
+        intent_id: str,
+        language: str,
+        framework: str,
+    ) -> str:
+        if (
+            isinstance(task_version, bool)
+            or not isinstance(task_version, int)
+            or not 0 <= task_version <= 2**63 - 1
+        ):
+            raise ValueError("task_version must be a non-negative SQLite integer")
+        payload = {
+            "framework": cls._safe_acceptance_identifier(
+                "framework", framework, allow_empty=True
+            ),
+            "indexed_diff_hash": cls._safe_acceptance_identifier(
+                "indexed_diff_hash", indexed_diff_hash
+            ),
+            "input_snapshot_id": cls._safe_acceptance_identifier(
+                "input_snapshot_id", input_snapshot_id
+            ),
+            "intent_id": cls._safe_acceptance_identifier("intent_id", intent_id),
+            "language": cls._safe_acceptance_identifier("language", language),
+            "output_snapshot_id": cls._safe_acceptance_identifier(
+                "output_snapshot_id", output_snapshot_id
+            ),
+            "task_id": cls._safe_acceptance_identifier("task_id", task_id),
+            "task_kind": TaskKind.CODE.value,
+            "task_version": task_version,
+            "workflow_id": cls._safe_acceptance_identifier("workflow_id", workflow_id),
+        }
+        return _canonical_payload_json(payload)
+
+    @classmethod
+    def _safe_acceptance_identifier(
+        cls, field_name: str, value: str, *, allow_empty: bool = False
+    ) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        if not value and allow_empty:
+            return ""
+        if (
+            not value
+            or len(value) > cls._MAX_SAFE_ACCEPTANCE_IDENTIFIER_LENGTH
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(value) is None
+        ):
+            raise ValueError(f"{field_name} must be a bounded opaque identifier")
+        return value
+
+    @classmethod
+    def _safe_sha256_identifier(cls, field_name: str, value: str) -> str:
+        cls._safe_acceptance_identifier(field_name, value)
+        if cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"{field_name} must be a canonical sha256 identifier")
+        return value
+
+    @classmethod
+    def _validate_code_task_acceptance_list_limit(cls, limit: int) -> None:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= cls._MAX_CODE_TASK_ACCEPTANCE_LIST
+        ):
+            raise ValueError(
+                "acceptance list limit must be an integer between 1 and "
+                f"{cls._MAX_CODE_TASK_ACCEPTANCE_LIST}"
+            )
+
+    @classmethod
+    def _safe_outbox_code(
+        cls, field_name: str, value: str, *, allow_empty: bool = False
+    ) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        if not value and allow_empty:
+            return ""
+        if (
+            not value
+            or len(value) > cls._MAX_SAFE_OUTBOX_CODE_LENGTH
+            or cls._SAFE_OUTBOX_CODE_PATTERN.fullmatch(value) is None
+        ):
+            raise ValueError(f"{field_name} must be a stable safe code")
+        return value
+
+    @classmethod
+    def _safe_outbox_reason_codes(
+        cls, reason_codes: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        if not isinstance(reason_codes, tuple):
+            raise ValueError("reason_codes must be a tuple of stable safe codes")
+        if len(reason_codes) > cls._MAX_SAFE_OUTBOX_REASON_COUNT:
+            raise ValueError("too many outbox reason codes")
+        return tuple(
+            sorted(
+                {
+                    cls._safe_outbox_code("reason_code", reason_code)
+                    for reason_code in reason_codes
+                }
+            )
+        )
+
+    @classmethod
+    def _optional_index_binding(
+        cls, cursor: sqlite3.Cursor, task_id: str
+    ) -> sqlite3.Row | None:
         row = cursor.execute(
             "SELECT * FROM task_index_bindings WHERE task_id = ?", (task_id,)
         ).fetchone()
+        if row is not None:
+            cls._workspace_id_from_row(row)
+        return row
+
+    @classmethod
+    def _require_index_binding(
+        cls, cursor: sqlite3.Cursor, task_id: str
+    ) -> sqlite3.Row:
+        row = cls._optional_index_binding(cursor, task_id)
         if row is None:
             raise StrictIndexError("INDEX_UNAVAILABLE")
         return row
@@ -1574,11 +3389,9 @@ class SQLiteStore:
             (task_id, event_type, snapshot_id, trace_id, _utc_now()),
         )
 
-    @staticmethod
-    def _require_strict_completion(cursor: sqlite3.Cursor, task_id: str) -> None:
-        binding = cursor.execute(
-            "SELECT * FROM task_index_bindings WHERE task_id = ?", (task_id,)
-        ).fetchone()
+    @classmethod
+    def _require_strict_completion(cls, cursor: sqlite3.Cursor, task_id: str) -> None:
+        binding = cls._optional_index_binding(cursor, task_id)
         if binding is None:
             return
         task = cursor.execute(
@@ -1614,11 +3427,21 @@ class SQLiteStore:
         if verification is None:
             raise StrictIndexError("VERIFICATION_EVIDENCE_REQUIRED")
 
-    @staticmethod
-    def _index_binding_from_row(row: sqlite3.Row) -> IndexBinding:
+    @classmethod
+    def _workspace_id_from_row(cls, row: sqlite3.Row) -> str:
+        workspace_id = row["workspace_id"]
+        if (
+            type(workspace_id) is not str
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(workspace_id) is None
+        ):
+            raise StrictIndexError("INDEX_UNAVAILABLE")
+        return workspace_id
+
+    @classmethod
+    def _index_binding_from_row(cls, row: sqlite3.Row) -> IndexBinding:
         return IndexBinding(
             str(row["task_id"]),
-            str(row["workspace_root"]),
+            cls._workspace_id_from_row(row),
             str(row["input_snapshot_id"]),
             str(row["output_snapshot_id"]),
             _decode_strings(row["task_node_ids"]),
@@ -1629,8 +3452,9 @@ class SQLiteStore:
         )
 
     def _create_schema(self) -> None:
-        with self._connection:
-            self._connection.executescript(
+        with self._transaction() as cursor:
+            _execute_schema_statements(
+                cursor,
                 """
                 CREATE TABLE IF NOT EXISTS schema_metadata (
                     key TEXT PRIMARY KEY,
@@ -1656,9 +3480,79 @@ class SQLiteStore:
                     write_scope TEXT NOT NULL,
                     card_hash TEXT NOT NULL,
                     result_hash TEXT NOT NULL,
-                    version INTEGER NOT NULL
+                    version INTEGER NOT NULL,
+                    task_kind TEXT NOT NULL DEFAULT 'general',
+                    intent_id TEXT NOT NULL DEFAULT '',
+                    language TEXT NOT NULL DEFAULT '',
+                    framework TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_workflow_state ON tasks(workflow_id, state);
+                CREATE TABLE IF NOT EXISTS code_task_acceptances (
+                    acceptance_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                    code_task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+                    code_task_version INTEGER NOT NULL,
+                    input_snapshot_id TEXT NOT NULL,
+                    output_snapshot_id TEXT NOT NULL,
+                    indexed_diff_hash TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    framework TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    CHECK (acceptance_id = payload_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_code_task_acceptances_workflow
+                    ON code_task_acceptances(workflow_id, created_at, acceptance_id);
+                CREATE TABLE IF NOT EXISTS code_task_receipt_attestations (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+                    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                    code_task_version INTEGER NOT NULL,
+                    input_snapshot_id TEXT NOT NULL,
+                    output_snapshot_id TEXT NOT NULL,
+                    workspace_hash TEXT NOT NULL,
+                    execution_receipt_ids TEXT NOT NULL,
+                    attestation_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (task_id, code_task_version, attestation_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_code_task_receipt_attestations_workflow
+                    ON code_task_receipt_attestations(
+                        workflow_id, code_task_version, task_id
+                    );
+                CREATE TABLE IF NOT EXISTS code_task_receipt_owners (
+                    receipt_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    code_task_version INTEGER NOT NULL,
+                    attestation_hash TEXT NOT NULL,
+                    FOREIGN KEY (task_id, code_task_version, attestation_hash)
+                        REFERENCES code_task_receipt_attestations(
+                            task_id, code_task_version, attestation_hash
+                        )
+                );
+                CREATE INDEX IF NOT EXISTS idx_code_task_receipt_owners_task
+                    ON code_task_receipt_owners(
+                        task_id, code_task_version, attestation_hash, receipt_id
+                    );
+                CREATE TABLE IF NOT EXISTS atlas_ingestion_outbox (
+                    ingestion_key TEXT PRIMARY KEY,
+                    acceptance_id TEXT NOT NULL UNIQUE
+                        REFERENCES code_task_acceptances(acceptance_id),
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('pending', 'projected', 'quarantined')),
+                    attempt_count INTEGER NOT NULL
+                        CHECK (attempt_count BETWEEN 0 AND 16),
+                    last_error_code TEXT NOT NULL,
+                    reason_codes_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (ingestion_key = payload_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_atlas_outbox_pending
+                    ON atlas_ingestion_outbox(state, created_at, ingestion_key);
                 CREATE TABLE IF NOT EXISTS task_dependencies (
                     task_id TEXT NOT NULL REFERENCES tasks(id),
                     dependency_id TEXT NOT NULL REFERENCES tasks(id),
@@ -1721,7 +3615,8 @@ class SQLiteStore:
                 );
                 CREATE TABLE IF NOT EXISTS task_index_bindings (
                     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
-                    workspace_root TEXT NOT NULL,
+                    workspace_root TEXT NOT NULL DEFAULT '',
+                    workspace_id TEXT NOT NULL DEFAULT '',
                     input_snapshot_id TEXT NOT NULL,
                     output_snapshot_id TEXT NOT NULL,
                     task_node_ids TEXT NOT NULL,
@@ -1779,19 +3674,46 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_recipient_inbox
                     ON messages(workflow_id, recipient_task_id, sequence);
-                """
+                """,
             )
             columns = {
                 str(row["name"])
-                for row in self._connection.execute(
-                    "PRAGMA table_info(leases)"
-                ).fetchall()
+                for row in cursor.execute("PRAGMA table_info(leases)").fetchall()
             }
             if "host_target" not in columns:
-                self._connection.execute(
-                    "ALTER TABLE leases ADD COLUMN host_target TEXT"
+                cursor.execute("ALTER TABLE leases ADD COLUMN host_target TEXT")
+            task_columns = {
+                str(row["name"])
+                for row in cursor.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "task_kind" not in task_columns:
+                cursor.execute(
+                    "ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'general'"
                 )
-            self._connection.execute(
+            if "intent_id" not in task_columns:
+                cursor.execute(
+                    "ALTER TABLE tasks ADD COLUMN intent_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "language" not in task_columns:
+                cursor.execute(
+                    "ALTER TABLE tasks ADD COLUMN language TEXT NOT NULL DEFAULT ''"
+                )
+            if "framework" not in task_columns:
+                cursor.execute(
+                    "ALTER TABLE tasks ADD COLUMN framework TEXT NOT NULL DEFAULT ''"
+                )
+            binding_columns = {
+                str(row["name"])
+                for row in cursor.execute(
+                    "PRAGMA table_info(task_index_bindings)"
+                ).fetchall()
+            }
+            if "workspace_id" not in binding_columns:
+                cursor.execute(
+                    "ALTER TABLE task_index_bindings "
+                    "ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''"
+                )
+            cursor.execute(
                 """
                 INSERT INTO schema_metadata (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -1838,6 +3760,41 @@ class SQLiteStore:
             row["card_hash"],
             row["result_hash"],
             int(row["version"]),
+            TaskKind(row["task_kind"]),
+            row["intent_id"],
+            row["language"],
+            row["framework"],
+        )
+
+    @staticmethod
+    def _acceptance_from_row(row: sqlite3.Row) -> CodeTaskAcceptance:
+        return CodeTaskAcceptance(
+            str(row["acceptance_id"]),
+            str(row["workflow_id"]),
+            str(row["code_task_id"]),
+            int(row["code_task_version"]),
+            str(row["input_snapshot_id"]),
+            str(row["output_snapshot_id"]),
+            str(row["indexed_diff_hash"]),
+            str(row["intent_id"]),
+            str(row["language"]),
+            str(row["framework"]),
+            str(row["payload_hash"]),
+            str(row["created_at"]),
+        )
+
+    @staticmethod
+    def _atlas_outbox_from_row(row: sqlite3.Row) -> AtlasOutboxItem:
+        return AtlasOutboxItem(
+            str(row["ingestion_key"]),
+            str(row["acceptance_id"]),
+            str(row["payload_hash"]),
+            AtlasOutboxState(str(row["state"])),
+            int(row["attempt_count"]),
+            str(row["last_error_code"]),
+            _decode_outbox_reason_codes(str(row["reason_codes_json"])),
+            str(row["created_at"]),
+            str(row["updated_at"]),
         )
 
     @staticmethod
@@ -2009,12 +3966,49 @@ class SQLiteStore:
         return host_target
 
 
+def _execute_schema_statements(cursor: sqlite3.Cursor, script: str) -> None:
+    """Execute one schema script statement-by-statement in the caller's transaction."""
+    pending_lines: list[str] = []
+    for line in script.splitlines():
+        pending_lines.append(line)
+        statement = "\n".join(pending_lines).strip()
+        if statement and sqlite3.complete_statement(statement):
+            cursor.execute(statement)
+            pending_lines.clear()
+    if any(line.strip() for line in pending_lines):
+        raise StoreError("schema script ended with an incomplete statement")
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
 def _card_hash(card_body: str) -> str:
     digest = hashlib.sha256(card_body.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _canonical_payload_json(payload: Mapping[str, object]) -> str:
+    """Encode a fixed, safe metadata map in content-addressed form."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _canonical_evidence_binding_json(payload: Mapping[str, object]) -> str:
+    """Encode the ATLAS-10D binding with its independently frozen contract."""
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def _canonical_receipt_attestation_json(payload: Mapping[str, object]) -> str:
+    """Encode the producer receipt attestation with its frozen contract."""
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def _payload_hash(payload_json: str) -> str:
+    digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
 
 
@@ -2047,3 +4041,16 @@ def _encode_metadata(metadata: Mapping[str, str]) -> str:
 def _decode_metadata(value: str) -> tuple[tuple[str, str], ...]:
     decoded = json.loads(value)
     return tuple(sorted((str(key), str(item)) for key, item in decoded.items()))
+
+
+def _encode_outbox_reason_codes(reason_codes: tuple[str, ...]) -> str:
+    return json.dumps(reason_codes, separators=(",", ":"))
+
+
+def _decode_outbox_reason_codes(value: str) -> tuple[str, ...]:
+    decoded = json.loads(value)
+    if not isinstance(decoded, list) or any(
+        not isinstance(reason_code, str) for reason_code in decoded
+    ):
+        raise StoreError("stored outbox reasons are invalid")
+    return tuple(decoded)

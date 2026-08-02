@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
 
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
@@ -17,13 +17,12 @@ if str(MCP_TOOLS) not in sys.path:
 from orchestrator.models import Task, Workflow, WorkflowKind  # noqa: E402
 from orchestrator.service import OrchestratorService, ServiceError  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
+from temp_support import task_scratch  # noqa: E402
 
 
 class OrchestratorMessagingTests(unittest.TestCase):
     def setUp(self) -> None:
-        scratch_root = Path(os.environ["CODEX_TASK_TEMP"]) / "orchestrator-messaging"
-        scratch_root.mkdir(parents=True, exist_ok=True)
-        self.tempdir = tempfile.TemporaryDirectory(dir=scratch_root)
+        self.tempdir = tempfile.TemporaryDirectory(dir=task_scratch("orchestrator-messaging"))
         self.database = Path(self.tempdir.name) / "orchestrator.sqlite"
         self.store = SQLiteStore(self.database)
         self.addCleanup(self.tempdir.cleanup)

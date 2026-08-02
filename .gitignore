@@ -1,31 +1,49 @@
-# Python
+# Python bytecode and quality-tool caches
 __pycache__/
 *.py[cod]
-.venv/
-venv/
+.pytest_cache/
+.ruff_cache/
 .mypy_cache/
 .pyright/
-.ruff_cache/
-.pytest_cache/
-.coverage
+.tox/
+.nox/
+.coverage*
 htmlcov/
+
+# Virtual environments and build output
+.venv/
+venv/
 build/
 dist/
+*.egg-info/
 
-# Runtime state and local evidence
-*.db
+# Runtime and task-local state
 *.sqlite
 *.sqlite3
-checkpoint-cas/
-evidence/
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+*.log
+tmp/
+temp/
+task-temp/
 
-# Secrets and local configuration
+# Local IDE settings and credentials
+.vscode/
+.idea/
+*.code-workspace
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
 
-# OS and editors
+# Operating-system metadata
 .DS_Store
 Thumbs.db
-.idea/
-.vscode/

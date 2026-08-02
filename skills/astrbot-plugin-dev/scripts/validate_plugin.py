@@ -30,17 +30,8 @@ BANNED_IMPORTS = {
 }
 CORE_OVERLAP_PKGS = {"aiohttp", "pydantic", "openai", "quart", "pillow", "psutil"}
 # 框架 DEFAULT_VALUE_MAP(astrbot/core/config/default.py)的严格白名单:9 个,无 "dict"。
-VALID_SCHEMA_TYPES = {
-    "string",
-    "text",
-    "int",
-    "float",
-    "bool",
-    "object",
-    "list",
-    "template_list",
-    "file",
-}
+VALID_SCHEMA_TYPES = {"string", "text", "int", "float", "bool", "object", "list",
+                      "template_list", "file"}
 
 
 def err(msg):
@@ -97,27 +88,18 @@ def check_python(root: Path) -> bool:
             # jsonify( 检查(v4.26.0 起后端 FastAPI,不再是 Quart 的 jsonify idiom)
             elif isinstance(node, ast.Call) and (
                 (isinstance(node.func, ast.Name) and node.func.id == "jsonify")
-                or (
-                    isinstance(node.func, ast.Attribute) and node.func.attr == "jsonify"
-                )
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "jsonify")
             ):
-                warn(
-                    f"{rel}: 出现 jsonify(...) —— AstrBot v4.26.0 起 Web 后端为 FastAPI,"
-                    "插件 Web API handler 请改用 astrbot.api.web 的 json_response() 等"
-                )
+                warn(f"{rel}: 出现 jsonify(...) —— AstrBot v4.26.0 起 Web 后端为 FastAPI,"
+                     "插件 Web API handler 请改用 astrbot.api.web 的 json_response() 等")
             # print( 检查
-            elif (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "print"
-            ):
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id == "print":
                 warn(f"{rel}: 使用 print(),应改用 from astrbot.api import logger")
             # Star 子类收集
             elif isinstance(node, ast.ClassDef):
-                bases = {
-                    b.id if isinstance(b, ast.Name) else getattr(b, "attr", "")
-                    for b in node.bases
-                }
+                bases = {b.id if isinstance(b, ast.Name) else getattr(b, "attr", "")
+                         for b in node.bases}
                 if "Star" in bases:
                     star_classes.append((str(rel), node))
 
@@ -125,27 +107,18 @@ def check_python(root: Path) -> bool:
         err("未找到继承 Star 的插件主类")
         return uses_web_api
     if len(star_classes) > 1:
-        err(
-            f"存在多个 Star 子类 {[(f, c.name) for f, c in star_classes]},"
-            "整个插件只允许 main.py 中定义一个(框架按模块注册,多个会互相覆盖)"
-        )
+        err(f"存在多个 Star 子类 {[(f, c.name) for f, c in star_classes]},"
+            "整个插件只允许 main.py 中定义一个(框架按模块注册,多个会互相覆盖)")
     rel, cls = star_classes[0]
     if rel != "main.py":
         err(f"Star 子类 {cls.name} 定义在 {rel},必须定义在 main.py(否则框架匹配不到)")
 
-    methods = {
-        m.name: m
-        for m in cls.body
-        if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    methods = {m.name: m for m in cls.body
+               if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))}
     if "__del__" in methods:
-        err(
-            f"插件类 {cls.name} 定义了 __del__ —— 它会让框架永不调用 terminate(),必须删除"
-        )
+        err(f"插件类 {cls.name} 定义了 __del__ —— 它会让框架永不调用 terminate(),必须删除")
     if "terminate" not in methods:
-        warn(
-            f"插件类 {cls.name} 未定义 terminate();若创建过任务/会话/句柄则必须定义并清理"
-        )
+        warn(f"插件类 {cls.name} 未定义 terminate();若创建过任务/会话/句柄则必须定义并清理")
 
     # 指令 handler 必须是异步生成器(yield);llm_tool 需要 Args: docstring
     for m in methods.values():
@@ -163,55 +136,37 @@ def check_python(root: Path) -> bool:
         # 装饰器挂在同一 handler 的 event_filters 上做 AND)。多命令名用 alias={...}。
         cmd_count = sum(1 for x in decs if x in ("command", "command_group"))
         if cmd_count >= 2:
-            err(
-                f"main.py: handler {m.name} 叠加了 {cmd_count} 个 "
+            err(f"main.py: handler {m.name} 叠加了 {cmd_count} 个 "
                 "@filter.command/command_group —— 多 filter 为 AND 关系,不同命令名"
-                "不可能同时匹配,该 handler 永不触发;多命令名请用 alias={...}"
-            )
+                "不可能同时匹配,该 handler 永不触发;多命令名请用 alias={...}")
         has_yield = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(m))
-        if (
-            "command" in dec_str
-            or "regex" in dec_str
-            or "event_message_type" in dec_str
-        ):
+        if ("command" in dec_str or "regex" in dec_str or "event_message_type" in dec_str):
             if not isinstance(m, ast.AsyncFunctionDef):
                 err(f"main.py: handler {m.name} 必须是 async def")
             if not has_yield:
-                ret_str = any(
-                    isinstance(n, ast.Return) and n.value is not None
-                    for n in ast.walk(m)
-                )
+                ret_str = any(isinstance(n, ast.Return) and n.value is not None
+                              for n in ast.walk(m))
                 if ret_str:
-                    err(
-                        f"main.py: handler {m.name} 用 return 返回值——协程 return 字符串"
-                        "不会发出任何消息,必须改为 yield event.plain_result(...)"
-                    )
+                    err(f"main.py: handler {m.name} 用 return 返回值——协程 return 字符串"
+                        "不会发出任何消息,必须改为 yield event.plain_result(...)")
                 else:
                     warn(f"main.py: handler {m.name} 没有 yield,确认是否需要回复消息")
         if "llm_tool" in dec_str:
             ds = ast.get_docstring(m) or ""
             if "Args:" not in ds:
-                err(
-                    f"main.py: llm_tool {m.name} 的 docstring 缺少 'Args:' 段——"
-                    "参数 Schema 完全由 docstring 生成,缺失则参数被静默丢弃"
-                )
+                err(f"main.py: llm_tool {m.name} 的 docstring 缺少 'Args:' 段——"
+                    "参数 Schema 完全由 docstring 生成,缺失则参数被静默丢弃")
             elif not re.search(r"\w+\s*\(\s*(string|number|boolean|object|array)", ds):
-                err(
-                    f"main.py: llm_tool {m.name} 的 Args: 段参数缺少类型标注,"
-                    "格式必须是 '参数名(string): 描述'"
-                )
+                err(f"main.py: llm_tool {m.name} 的 Args: 段参数缺少类型标注,"
+                    "格式必须是 '参数名(string): 描述'")
 
     # 数据写插件目录检查(启发式)
-    all_src = "\n".join(
-        p.read_text(encoding="utf-8", errors="replace") for p in py_files(root)
-    )
-    if re.search(r"os\.path\.dirname\(\s*__file__\s*\)", all_src) and re.search(
-        r"(json\.dump|open\([^)]*[\"']w|write)", all_src
-    ):
-        warn(
-            "疑似把数据写在插件自身目录(dirname(__file__)),插件更新会整目录删除,"
-            "持久化必须用 StarTools.get_data_dir()"
-        )
+    all_src = "\n".join(p.read_text(encoding="utf-8", errors="replace")
+                        for p in py_files(root))
+    if re.search(r"os\.path\.dirname\(\s*__file__\s*\)", all_src) and \
+            re.search(r"(json\.dump|open\([^)]*[\"']w|write)", all_src):
+        warn("疑似把数据写在插件自身目录(dirname(__file__)),插件更新会整目录删除,"
+             "持久化必须用 StarTools.get_data_dir()")
 
     return uses_web_api
 
@@ -236,10 +191,8 @@ def check_metadata(root: Path):
     name = fields.get("name", "")
     if name:
         if not name.isidentifier() or keyword.iskeyword(name):
-            err(
-                f"metadata.yaml: name={name!r} 不是合法 Python 标识符"
-                "(安装时目录会重命名为 name,连字符/空格会直接装不上)"
-            )
+            err(f"metadata.yaml: name={name!r} 不是合法 Python 标识符"
+                "(安装时目录会重命名为 name,连字符/空格会直接装不上)")
         if not name.startswith("astrbot_plugin_"):
             warn(f"metadata.yaml: name={name!r} 建议以 astrbot_plugin_ 开头")
 
@@ -247,18 +200,14 @@ def check_metadata(root: Path):
     if version and re.fullmatch(r"\d+(\.\d+)?", version):
         raw = re.search(r"^version\s*:\s*(\S+)", text, re.M)
         if raw and not raw.group(1).startswith(("'", '"')):
-            err(
-                f"metadata.yaml: version: {version} 会被 YAML 解析为数字而非字符串,"
-                "请写成 v 前缀(如 v1.0.0)或加引号"
-            )
+            err(f"metadata.yaml: version: {version} 会被 YAML 解析为数字而非字符串,"
+                "请写成 v 前缀(如 v1.0.0)或加引号")
 
     if not fields.get("repo"):
         warn("metadata.yaml 未填 repo —— 用户将无法通过面板更新插件;发布市场必填")
     av = fields.get("astrbot_version", "")
     if not av:
-        warn(
-            'metadata.yaml 未声明 astrbot_version(团队规范强制;按实测最低版本填,如 ">=4.16,<5")'
-        )
+        warn("metadata.yaml 未声明 astrbot_version(团队规范强制;按实测最低版本填,如 \">=4.16,<5\")")
     elif av.startswith("v"):
         err(f"metadata.yaml: astrbot_version={av!r} 不能带 v 前缀(PEP 440 约束格式)")
 
@@ -280,11 +229,9 @@ def check_web_api_version(root: Path, uses_web_api: bool):
         return
     lower_bound = (int(lb.group(1)), int(lb.group(2) or 0))
     if lower_bound < (4, 26):
-        warn(
-            f"source 使用了 astrbot.api.web,但 metadata.yaml: astrbot_version={av!r} "
-            "下界低于 4.26(该模块 AstrBot v4.26.0+ 才存在,v4.26.0 前后端是 Quart),"
-            "请把下界抬到 >=4.26"
-        )
+        warn(f"source 使用了 astrbot.api.web,但 metadata.yaml: astrbot_version={av!r} "
+             "下界低于 4.26(该模块 AstrBot v4.26.0+ 才存在,v4.26.0 前后端是 Quart),"
+             "请把下界抬到 >=4.26")
 
 
 def check_schema(root: Path):
@@ -294,10 +241,8 @@ def check_schema(root: Path):
     try:
         schema = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        err(
-            f"_conf_schema.json 不是合法 JSON({e})——注意 JSON 不允许注释、"
-            "尾逗号、单引号;该文件非法会导致插件加载失败"
-        )
+        err(f"_conf_schema.json 不是合法 JSON({e})——注意 JSON 不允许注释、"
+            "尾逗号、单引号;该文件非法会导致插件加载失败")
         return
     if not isinstance(schema, dict):
         err("_conf_schema.json 顶层必须是对象")
@@ -308,10 +253,8 @@ def check_schema(root: Path):
             continue
         t = item.get("type")
         if t not in VALID_SCHEMA_TYPES:
-            err(
-                f"_conf_schema.json: {key}.type={t!r} 非法(合法值: "
-                f"{sorted(VALID_SCHEMA_TYPES)}),会导致插件加载失败"
-            )
+            err(f"_conf_schema.json: {key}.type={t!r} 非法(合法值: "
+                f"{sorted(VALID_SCHEMA_TYPES)}),会导致插件加载失败")
         if "default" not in item:
             warn(f"_conf_schema.json: {key} 建议显式给 default")
         if "description" not in item:
@@ -332,10 +275,8 @@ def check_requirements(root: Path):
         if pkg in ("astrbot", "astrbot-api"):
             err("requirements.txt 不得包含 astrbot 本身(插件运行在 AstrBot 进程内)")
         if pkg in CORE_OVERLAP_PKGS and "==" in line:
-            err(
-                f"requirements.txt: {line!r} 钉死了与 AstrBot 核心重叠的包版本,"
-                "会触发核心依赖保护 DependencyConflictError 装不上;改为宽松下界(>=)或不写版本"
-            )
+            err(f"requirements.txt: {line!r} 钉死了与 AstrBot 核心重叠的包版本,"
+                "会触发核心依赖保护 DependencyConflictError 装不上;改为宽松下界(>=)或不写版本")
 
 
 def main():
@@ -358,10 +299,8 @@ def main():
         print(f"[错误] {e}")
     for w in WARNS:
         print(f"[警告] {w}")
-    print(
-        f"结果: {len(ERRORS)} 个错误, {len(WARNS)} 个警告 -> "
-        + ("不可交付,必须修复错误" if ERRORS else "通过")
-    )
+    print(f"结果: {len(ERRORS)} 个错误, {len(WARNS)} 个警告 -> "
+          + ("不可交付,必须修复错误" if ERRORS else "通过"))
     sys.exit(1 if ERRORS else 0)
 
 

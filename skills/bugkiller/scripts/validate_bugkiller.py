@@ -1,37 +1,44 @@
-"""Validate the specialized Bugkiller overlay without third-party packages."""
+"""Validate current Bugkiller routing and durable-handoff assets."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
+
 
 ROOT = Path(__file__).resolve().parents[3]
 SKILL = ROOT / "skills" / "bugkiller" / "SKILL.md"
 REFERENCES = ROOT / "skills" / "bugkiller" / "references"
-SHARED_AGENTS = (
-    "2718lab-triage",
-    "2718lab-investigator",
-    "2718lab-doc-writer",
-    "2718lab-verifier",
-    "2718lab-code-writer",
-    "2718lab-risk-reviewer",
+AGENTS = ROOT / "agents"
+PROFILE = ROOT / "skills" / "code-atlas" / "assets" / "host-profiles.json"
+AGENT_MARKERS = {
+    "bugkiller-sol-coordinator.md": ("Sol", "final acceptance", "Terra High"),
+    "bugkiller-terra-investigator.md": ("Terra High", "gpt-5.6-terra", "high"),
+    "bugkiller-terra-doc-writer.md": ("Terra High", "documentation-only"),
+    "bugkiller-terra-verifier.md": ("Terra High", "read-only", "verification"),
+    "bugkiller-sol-escalation.md": ("Sol High", "gpt-5.6-sol", "exceptional"),
+}
+DEPRECATED_AGENTS = (
+    "-".join(("bugkiller", "sol", "code", "writer")) + ".md",
+    "-".join(("bugkiller", "luna", "triage")) + ".md",
 )
-STRICT_WORKFLOW_SEQUENCE = (
-    "project_index_sync",
-    "strict_index=true",
-    "project_index_query",
-    "trace_id",
-    "worktree_checkpoint_create",
-    'project_index_sync(bind_as="output")',
-    "project_index_query",
-    "trace_id",
-    'workflow_artifact_register(kind="verification", snapshot_id=...)',
-    "workflow_complete",
+HANDOFF_SEQUENCE = (
+    "workflow_artifact_register",
+    "workflow_message_send",
+    "workflow_inbox",
+    "workflow_artifact_resolve",
+    "workflow_message_ack",
 )
 
 
-def read(path: Path, errors: list[str]) -> str:
+def fail(errors: list[str], message: str) -> None:
+    errors.append(message)
+
+
+def text(path: Path, errors: list[str]) -> str:
     if not path.is_file():
-        errors.append(f"missing file: {path.relative_to(ROOT)}")
+        fail(errors, f"missing file: {path.relative_to(ROOT)}")
         return ""
     return path.read_text(encoding="utf-8")
 
@@ -40,86 +47,133 @@ def valid_frontmatter(content: str) -> bool:
     if not content.startswith("---\n"):
         return False
     end = content.find("\n---\n", 4)
-    return end >= 0 and "name:" in content[4:end] and "description:" in content[4:end]
+    if end < 0:
+        return False
+    frontmatter = content[4:end]
+    return "name:" in frontmatter and "description:" in frontmatter
 
 
-def require_ordered(
-    content: str, markers: tuple[str, ...], errors: list[str], source: str
+def has_markdown_body(content: str) -> bool:
+    end = content.find("\n---\n", 4)
+    return end >= 0 and "\n# " in content[end + 5 :]
+
+
+def require_ordered_markers(
+    content: str,
+    markers: tuple[str, ...],
+    errors: list[str],
+    source: str,
 ) -> None:
     cursor = 0
     for marker in markers:
         position = content.find(marker, cursor)
         if position < 0:
-            errors.append(f"{source} missing or out-of-order marker: {marker}")
-        else:
-            cursor = position + len(marker)
+            fail(errors, f"{source} missing or out-of-order marker: {marker}")
+            continue
+        cursor = position + len(marker)
+
+
+def _mapping(value: object) -> dict[str, Any] | None:
+    return value if isinstance(value, dict) else None
+
+
+def validate_profiles(errors: list[str]) -> None:
+    try:
+        payload = json.loads(PROFILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(errors, f"invalid host profile asset: {exc}")
+        return
+    root = _mapping(payload)
+    hosts = _mapping(root.get("hosts") if root else None)
+    codex = _mapping(hosts.get("codex") if hosts else None)
+    claude = _mapping(hosts.get("claude") if hosts else None)
+    codex_roles = _mapping(codex.get("roles") if codex else None)
+    claude_roles = _mapping(claude.get("roles") if claude else None)
+    expected = {
+        "normal": ("gpt-5.6-terra", "high"),
+        "complex": ("gpt-5.6-terra", "max"),
+        "exceptional": ("gpt-5.6-sol", "high"),
+    }
+    code = _mapping(codex_roles.get("code") if codex_roles else None)
+    for route, (model, reasoning) in expected.items():
+        value = _mapping(code.get(route) if code else None)
+        if value is None or value.get("model") != model or value.get("reasoning") != reasoning:
+            fail(errors, f"host profile missing Codex {route} route")
+    luna = _mapping(codex_roles.get("luna") if codex_roles else None)
+    if luna is None or luna.get("status") != "unavailable":
+        fail(errors, "host profile must declare Luna unavailable")
+    for role, model in (("coordinator", "opus"), ("code", "sonnet"), ("light", "haiku")):
+        value = _mapping(claude_roles.get(role) if claude_roles else None)
+        if value is None or value.get("model") != model:
+            fail(errors, f"host profile missing Claude {role} route")
+    fable = _mapping(claude_roles.get("fable") if claude_roles else None)
+    if fable is None or fable.get("requires_escalation_reason") is not True:
+        fail(errors, "host profile must require an explicit Fable escalation reason")
 
 
 def main() -> int:
     errors: list[str] = []
-    skill = read(SKILL, errors)
+    skill = text(SKILL, errors)
     if skill:
-        if not valid_frontmatter(skill) or "\n# Bugkiller\n" not in skill:
-            errors.append("SKILL.md needs valid frontmatter and a Markdown body")
+        if not valid_frontmatter(skill) or not has_markdown_body(skill):
+            fail(errors, "SKILL.md needs YAML frontmatter and a Markdown body")
         if len(skill.splitlines()) > 120:
-            errors.append("SKILL.md must remain at or below 120 lines")
+            fail(errors, "SKILL.md must remain at or below 120 lines")
         for marker in (
-            "specialized defect workflow",
-            "shared execution layer",
-            "共享执行层",
-            "work-methodology",
-            "2718lab-tools",
-            "gpt-5.6-sol",
-            "ultra",
-            "DEGRADED_SKILL_ONLY",
+            "Terra High",
+            "Terra Max",
+            "Sol High",
+            "Luna is unavailable",
+            "workflow_artifact_register",
+            "workflow_message_ack",
         ):
             if marker not in skill:
-                errors.append(f"SKILL.md missing marker: {marker}")
-        for agent in SHARED_AGENTS:
-            if agent not in skill:
-                errors.append(f"SKILL.md missing shared agent: {agent}")
-        if "bugkiller-sol-code-writer" in skill:
-            errors.append("SKILL.md must route through the shared code writer")
+                fail(errors, f"SKILL.md missing routing marker: {marker}")
 
-    reference_text = "\n".join(read(path, errors) for path in REFERENCES.glob("*.md"))
-    for marker in (
-        "DEGRADED_SKILL_ONLY",
-        "workflow_artifact_register",
-        "workflow_message_send",
-        "collaboration.send_message",
-        "workflow_inbox",
-        "workflow_message_ack",
-        "TTL",
-        "does not grant",
-    ):
+    reference_text = "\n".join(text(path, errors) for path in REFERENCES.glob("*.md"))
+    for marker in (*HANDOFF_SEQUENCE, "TTL", "does not grant", "candidate commit"):
         if marker not in reference_text:
-            errors.append(f"references missing policy marker: {marker}")
-
-    roles = read(REFERENCES / "roles.md", errors)
+            fail(errors, f"references missing policy marker: {marker}")
+    workflow = text(REFERENCES / "workflow.md", errors)
+    require_ordered_markers(workflow, HANDOFF_SEQUENCE, errors, "workflow.md")
+    roles = text(REFERENCES / "roles.md", errors)
     for marker in (
-        "spawn",
-        "model choices",
-        "explicitly select Luna",
-        "explicitly select Terra",
-        "DEGRADED_TRIAGE",
-        "gpt-5.6-sol",
-        "ultra",
-        *SHARED_AGENTS,
+        "Sol coordinator",
+        "gpt-5.6-terra",
+        "Terra High",
+        "Terra Max",
+        "Sol High",
+        "Luna",
+        "Opus",
+        "Sonnet",
+        "Haiku",
+        "Fable",
+        "explicit escalation reason",
     ):
         if marker not in roles:
-            errors.append(f"roles.md missing routing marker: {marker}")
-    for legacy in ("bugkiller-sol-code-writer", "bugkiller-terra-doc-writer"):
-        if legacy in roles:
-            errors.append(f"roles.md contains legacy role: {legacy}")
+            fail(errors, f"roles.md missing routing marker: {marker}")
 
-    workflow = read(REFERENCES / "workflow.md", errors)
-    require_ordered(
-        workflow,
-        STRICT_WORKFLOW_SEQUENCE,
-        errors,
-        "workflow.md",
-    )
+    for filename, markers in AGENT_MARKERS.items():
+        content = text(AGENTS / filename, errors)
+        if content and (not valid_frontmatter(content) or not has_markdown_body(content)):
+            fail(errors, f"{filename} needs YAML frontmatter and a Markdown body")
+        for marker in markers:
+            if content and marker not in content:
+                fail(errors, f"{filename} missing marker: {marker}")
+    for filename in DEPRECATED_AGENTS:
+        if (AGENTS / filename).exists():
+            fail(errors, "obsolete routing agent asset must be removed")
 
+    ui_metadata = text(AGENTS / "openai.yaml", errors)
+    if not ui_metadata.startswith("interface:\n"):
+        fail(errors, "openai.yaml needs an interface UI metadata mapping")
+    for marker in ("display_name:", "short_description:", "default_prompt:"):
+        if marker not in ui_metadata:
+            fail(errors, f"openai.yaml missing interface field: {marker}")
+    if "agents:" in ui_metadata or "model:" in ui_metadata or ".toml" in ui_metadata:
+        fail(errors, "openai.yaml must remain UI metadata only")
+
+    validate_profiles(errors)
     if errors:
         print("Bugkiller asset validation failed:")
         print("\n".join(f"- {error}" for error in errors))

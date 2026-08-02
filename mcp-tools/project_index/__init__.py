@@ -13,10 +13,14 @@ from .models import (
     SnapshotDiff,
     SourceWindow,
 )
+from .checkpoints import Checkpoint, CheckpointService, WorkspaceOwnership
+from .registry import WorkspaceRegistry
 from .service import ProjectIndexService
 
 __all__ = [
     "CoverageGap",
+    "Checkpoint",
+    "CheckpointService",
     "IndexEdge",
     "IndexError",
     "IndexNode",
@@ -28,4 +32,6 @@ __all__ = [
     "QueryResult",
     "SnapshotDiff",
     "SourceWindow",
+    "WorkspaceOwnership",
+    "WorkspaceRegistry",
 ]

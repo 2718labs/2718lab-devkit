@@ -133,3 +133,4 @@ licenses and notices must be recorded before bundling new parser packages.
 - Restore returns task-owned worktrees byte-for-byte to the checkpoint and never
   changes the original workspace.
 - Existing non-strict workflows and Bugkiller peer messaging remain compatible.
+

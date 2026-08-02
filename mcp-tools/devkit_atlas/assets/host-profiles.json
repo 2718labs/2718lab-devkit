@@ -1,0 +1,62 @@
+{
+  "schema_version": "1",
+  "hosts": {
+    "codex": {
+      "roles": {
+        "coordinator": {
+          "model": "gpt-5.6-sol",
+          "reasoning": "high",
+          "purpose": "coordination"
+        },
+        "code": {
+          "normal": {
+            "model": "gpt-5.6-terra",
+            "reasoning": "high",
+            "purpose": "routine_execution"
+          },
+          "complex": {
+            "model": "gpt-5.6-terra",
+            "reasoning": "max",
+            "purpose": "complex_execution"
+          },
+          "exceptional": {
+            "model": "gpt-5.6-sol",
+            "reasoning": "high",
+            "purpose": "exceptional_bounded_execution"
+          }
+        },
+        "luna": {
+          "model": "gpt-5.6-luna",
+          "reasoning": ["low", "medium", "high", "xhigh"],
+          "default_reasoning": "medium",
+          "purpose": "bounded_routine_execution"
+        }
+      }
+    },
+    "claude": {
+      "roles": {
+        "coordinator": {
+          "model": "opus",
+          "reasoning": "coordinator",
+          "purpose": "coordination"
+        },
+        "code": {
+          "model": "sonnet",
+          "reasoning": "standard",
+          "purpose": "code_execution"
+        },
+        "light": {
+          "model": "haiku",
+          "reasoning": "light",
+          "purpose": "light_execution"
+        },
+        "fable": {
+          "model": "fable",
+          "reasoning": "high",
+          "purpose": "explicit_expensive_escalation",
+          "requires_escalation_reason": true
+        }
+      }
+    }
+  }
+}

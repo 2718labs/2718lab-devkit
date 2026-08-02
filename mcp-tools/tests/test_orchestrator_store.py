@@ -13,11 +13,14 @@ from orchestrator.models import Task, TaskState, Workflow, WorkflowKind
 from orchestrator.store import (
     SQLiteStore,
     StaleLeaseError,
+    StrictIndexError,
     VersionConflictError,
 )
 
 
 class SQLiteStoreTests(unittest.TestCase):
+    _WORKSPACE_ID = "sha256:" + "1" * 64
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.database = Path(self.directory.name) / "orchestrator.sqlite3"
@@ -33,9 +36,68 @@ class SQLiteStoreTests(unittest.TestCase):
         return Task(task_id, self.workflow.id, task_id, "terra")
 
     def test_schema_uses_wal_foreign_keys_and_current_schema_version(self) -> None:
-        self.assertEqual(self.store.schema_version(), 3)
+        self.assertEqual(self.store.schema_version(), 6)
         self.assertEqual(self.store.journal_mode(), "wal")
         self.assertTrue(self.store.foreign_keys_enabled())
+
+    def test_strict_binding_persists_only_an_opaque_workspace_authority(self) -> None:
+        task = self.store.register_task(
+            self._task("strict"),
+            strict_index=True,
+            workspace_id=self._WORKSPACE_ID,
+            input_snapshot_id="sha256:input",
+            task_node_ids=("sha256:task-node",),
+        )
+
+        binding = self.store.get_index_binding(task.id)
+        row = self.store._connection.execute(
+            "SELECT workspace_root, workspace_id FROM task_index_bindings WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+
+        self.assertEqual(self._WORKSPACE_ID, binding.workspace_id)
+        self.assertFalse(hasattr(binding, "workspace_root"))
+        self.assertEqual("", row["workspace_root"])
+        self.assertEqual(self._WORKSPACE_ID, row["workspace_id"])
+
+    def test_store_rejects_path_alias_and_invalid_workspace_id_before_writes(
+        self,
+    ) -> None:
+        with self.assertRaises(TypeError):
+            self.store.register_task(
+                self._task("path-alias"),
+                strict_index=True,
+                workspace_root="D:/workspace",
+                input_snapshot_id="sha256:input",
+                task_node_ids=("sha256:task-node",),
+            )
+        with self.assertRaises(TypeError):
+            self.store.register_task(
+                self._task("workspace-alias"),
+                strict_index=True,
+                workspace="D:/workspace",
+                input_snapshot_id="sha256:input",
+                task_node_ids=("sha256:task-node",),
+            )
+        for task_id, workspace_id in (
+            ("invalid-id", "D:/workspace"),
+            ("path-value", self.database.parent),
+        ):
+            with self.subTest(workspace_id=workspace_id):
+                with self.assertRaises(StrictIndexError) as invalid:
+                    self.store.register_task(
+                        self._task(task_id),
+                        strict_index=True,
+                        workspace_id=workspace_id,  # type: ignore[arg-type]
+                        input_snapshot_id="sha256:input",
+                        task_node_ids=("sha256:task-node",),
+                    )
+                self.assertEqual("INDEX_UNAVAILABLE", invalid.exception.code)
+
+        for task_id in ("path-alias", "workspace-alias", "invalid-id", "path-value"):
+            with self.assertRaises(KeyError):
+                self.store.get_task(task_id)
+            self.assertIsNone(self.store.get_index_binding(task_id))
 
     def test_reopen_preserves_workflows_tasks_and_append_only_event_order(self) -> None:
         self.store.register_task(self._task("one"))

@@ -9,14 +9,6 @@ description: 团队 MCP (Model Context Protocol) 服务器开发规范与 FastMC
 
 > 边界:给 AstrBot 写插件(哪怕插件内部要调 MCP client)用 `astrbot-plugin-dev`,本 skill 只管独立的 MCP server。
 
-## 共享执行层
-
-本 skill 负责 MCP/FastMCP 领域事实，不单独拥有编排。多步骤或多 Agent 任务使用
-`work-methodology`、`2718lab-tools` 以及通用
-`2718lab-triage` / `2718lab-investigator` / `2718lab-doc-writer` /
-`2718lab-code-writer` / `2718lab-verifier` / `2718lab-risk-reviewer`。
-角色权限听共享执行层，MCP API 与验收规则听本 skill。
-
 配套文件:
 
 - `references/api-fastmcp-sdk.md` — (A) 官方 MCP Python SDK 内置 v1.x `mcp.server.fastmcp` 全量 API。

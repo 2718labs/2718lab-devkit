@@ -7,14 +7,6 @@ description: 团队 Python 工程基线与工具链规范。凡是要新建/改�
 
 为工作室任何 Python 仓库做工程骨架时,严格按本文件执行。**不要凭记忆写工具链配置**——uv/ruff/pyright 迭代极快,配置键、命令、默认规则集记忆极易出错(例如 ruff 默认只开 `E4/E7/E9/F`,不是想当然的一整套规则族);本文件和参考文件里的写法才是准确的。
 
-## 共享执行层
-
-本 skill 负责 Python 工程领域事实，不单独拥有编排。多步骤或多 Agent 任务使用
-`work-methodology`、`2718lab-tools` 以及通用
-`2718lab-triage` / `2718lab-investigator` / `2718lab-doc-writer` /
-`2718lab-code-writer` / `2718lab-verifier` / `2718lab-risk-reviewer`。
-角色权限听共享执行层，Python 工具链与验收规则听本 skill。
-
 配套文件:
 
 - `references/pyproject-reference.md` — 全量注解版 pyproject.toml + `[tool.ruff]`/`[tool.pyright]`/`[tool.pytest.ini_options]`/`[build-system]` 各配置键权威表、PEP 440 语法、Python EOL 表。**写任何本文件未覆盖的配置键前,必须先读它对应章节**。
@@ -61,14 +53,11 @@ description: 团队 Python 工程基线与工具链规范。凡是要新建/改�
 ### 第 2 步:项目结构
 
 - 判断标准:**要发布到 PyPI 或会被 `import`** 的库/CLI → 必须 src-layout(`src/<package_name>/`)。只跑 `uv run` 的脚本/应用 → 可以 flat-layout(代码直接放仓库根或简单子目录)。
-- 明确不打包、不发布、只通过 `uv run` 启动的应用,在 pyproject 中写 `[tool.uv] package = false`,可以不声明 `[build-system]`;一旦项目需要构建 wheel、发布或作为包安装,仍必须使用下方受支持的构建后端。
 - src-layout 树示意见 `assets/templates/src_layout.txt`。
 - `uv.lock` **必须**进 git(跨平台锁文件,团队协作与 CI 复现依赖靠它);`.venv/` **必须**进 `.gitignore`(本地生成物,不进版本控制)。
 - `.python-version` 钉住解释器版本(如 `3.12`),`uv` 与 `pyright` 都会读它,避免"我电脑上是对的"。
 
-### 第 3 步:pyproject.toml 标准底稿
-
-下面是需要打包的库/CLI 底稿,占位符 `<package_name>` 替换成真实包名。只运行、不打包的 flat-layout 应用改用 `assets/templates/pyproject-app.toml`,由 `[tool.uv] package = false` 明确关闭打包。
+### 第 3 步:pyproject.toml 标准底稿(直接以此为底稿,占位符 `<package_name>` 替换成真实包名)
 
 ```toml
 [project]
@@ -87,7 +76,7 @@ dev = [
     "pytest>=8.0",
 ]
 
-# 需要打包时:纯 Python 库/CLI 用 uv_build;有构建脚本或 C 扩展用 hatchling —— 唯二选项,后端字符串逐字照抄,不要自创
+# 纯 Python 库/CLI 用 uv_build;有构建脚本或 C 扩展用 hatchling —— 唯二选项,后端字符串逐字照抄,不要自创
 [build-system]
 requires = ["uv_build>=0.8.3,<0.9.0"] # 版本上界随 uv 版本走,新建项目用 `uv init` 生成后照抄实际值
 build-backend = "uv_build"
@@ -134,7 +123,6 @@ build-backend = "hatchling.build"
 8. `pre-commit` 装 ruff / ruff-format / pyright 三个 hook,`pre-commit install` 写进仓库上手文档(README 或类似位置)。
 9. 版本号单一来源 = pyproject `[project.version]`,必须合法 PEP 440,不需要在别处(如 `__version__.py`)重复手写并保持同步。
 10. 不手动 `activate` 虚拟环境,一律 `uv run <cmd>` 或 `uv run pytest` 这种形式执行。
-11. 只有明确的 no-package 应用可以省略 `[build-system]`,且必须声明 `[tool.uv] package = false`;库、CLI 包和任何会构建/安装/发布的项目仍必须声明受支持的构建后端。
 
 ### 第 5 步:交付前自检(必须执行,不可跳过)
 
@@ -153,7 +141,7 @@ uv run pyright
 uv run pytest
 ```
 
-**0 错误才能交付**。`validate_project.py` 机械检查:pyproject 可解析且 PEP 621 必填字段齐全、`version` 合法 PEP 440、`requires-python` 下界 ≥3.10、打包项目的 `build-backend` 属于白名单二选一(`uv_build` / `hatchling.build`)、无构建后端的应用明确声明 `[tool.uv] package = false`、src-layout 目录名与 `[project.name]` 一致、`uv.lock` 存在且未被 `.gitignore` 误排除、禁词扫描(文档/CI 里出现 `setup.py`、`poetry`、`pip install`)、mypy 专属键(如 `disallow_untyped_defs`)混入 `[tool.pyright]`。
+**0 错误才能交付**。`validate_project.py` 机械检查:pyproject 可解析且 PEP 621 必填字段齐全、`version` 合法 PEP 440、`requires-python` 下界 ≥3.10、`build-backend` 属于白名单二选一(`uv_build` / `hatchling.build`)、src-layout 目录名与 `[project.name]` 一致、`uv.lock` 存在且未被 `.gitignore` 误排除、禁词扫描(文档/CI 里出现 `setup.py`、`poetry`、`pip install`)、mypy 专属键(如 `disallow_untyped_defs`)混入 `[tool.pyright]`。
 
 若环境无法跑脚本,逐条人工核对上面第 2-4 步,并额外用 `python -c "import tomllib; tomllib.load(open('pyproject.toml','rb'))"` 验证 pyproject 语法合法。
 
