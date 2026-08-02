@@ -197,6 +197,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Test Linux artifact contract
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          python -m pytest -q mcp-tools/tests/test_primary_artifact.py
+
       - name: Build deterministic artifact
         id: build
         shell: bash
