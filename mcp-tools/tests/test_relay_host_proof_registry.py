@@ -438,7 +438,11 @@ def test_attestor_neutralizes_replace_and_config_environment_overrides(
         "-m",
         "environment replacement",
     ).decode("ascii")
-    replacement_base = "refs/relay-attacker-replacements"
+    # Use Git's portable replacement namespace.  A custom
+    # ``GIT_REPLACE_REF_BASE`` is rejected by some Git for Windows builds
+    # before the attestor is reached, which would test the runner rather than
+    # the host's environment fencing.
+    replacement_base = "refs/replace"
     _git(
         repository,
         "update-ref",
