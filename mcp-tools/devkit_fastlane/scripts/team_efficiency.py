@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -43,6 +44,8 @@ FAST_LANE_REASONING_EFFORTS = frozenset(
 _FAST_LANE_DEFERRED_ROUTE_REASONS = frozenset(
     {"dependency_not_ready", "scope_conflict_active"}
 )
+_DEFAULT_FASTLANE_TASK_ROOT = Path(r"D:\bun\tmp\codex")
+_FASTLANE_TASK_ROOT_ENV = "CODEX_FASTLANE_TASK_ROOT"
 
 _TASK_ID = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|FLR1-[0-9a-f]{24})$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -83,7 +86,7 @@ _PACKET_FIELDS = frozenset(
         "redacted",
     }
 )
-_BOOTSTRAP_FIELDS = frozenset(
+_BOOTSTRAP_V1_FIELDS = frozenset(
     {
         "schema",
         "mode",
@@ -100,6 +103,7 @@ _BOOTSTRAP_FIELDS = frozenset(
         "workflow_fields",
     }
 )
+_BOOTSTRAP_V2_FIELDS = _BOOTSTRAP_V1_FIELDS | frozenset({"task_root_hash"})
 _CACHE_FIELDS = frozenset(
     {
         "candidate_commit",
@@ -130,6 +134,8 @@ _FAST_LANE_READ_CONTEXT_FIELDS = frozenset(
     {
         "task_id",
         "role",
+        "project",
+        "task_root_hash",
         "repo",
         "worktree",
         "base_commit",
@@ -833,20 +839,147 @@ def _branch(value: object) -> str:
     return text
 
 
-def _project_root(project: object) -> tuple[str, Path]:
+def _project_root(
+    project: object,
+    *,
+    task_root: Path | None = None,
+) -> tuple[str, Path]:
     project_text = _relative_scope(project, "project")
-    root = Path(r"D:\bun\tmp\codex").joinpath(*project_text.split("/"))
-    return project_text, root.resolve(strict=False)
+    configured_root = (
+        _configured_fastlane_task_root() if task_root is None else task_root
+    )
+    candidate = configured_root.joinpath(*project_text.split("/"))
+    _reject_reparse_points_below(candidate, configured_root, "project")
+    root = candidate.resolve(strict=False)
+    _strictly_below(root, configured_root, "project")
+    return project_text, root
 
 
-def _absolute_path(value: object, field: str) -> Path:
+def _reject_windows_path_aliases(path: Path, field: str) -> None:
+    normalized = str(path).replace("/", "\\")
+    if normalized.startswith("\\\\"):
+        raise ValueError(f"{field} must be a local path")
+    for part in path.parts[1:]:
+        trimmed = part.rstrip(" .")
+        device_name = trimmed.split(".", 1)[0].rstrip(" ").casefold()
+        if (
+            trimmed != part
+            or not trimmed
+            or ":" in part
+            or device_name
+            in {
+                "con",
+                "prn",
+                "aux",
+                "nul",
+                "com1",
+                "com2",
+                "com3",
+                "com4",
+                "com5",
+                "com6",
+                "com7",
+                "com8",
+                "com9",
+                "lpt1",
+                "lpt2",
+                "lpt3",
+                "lpt4",
+                "lpt5",
+                "lpt6",
+                "lpt7",
+                "lpt8",
+                "lpt9",
+            }
+        ):
+            raise ValueError(f"{field} contains a Windows-normalized alias")
+
+
+def _absolute_path(
+    value: object,
+    field: str,
+    *,
+    root_bound: bool = False,
+    resolve_path: bool = True,
+) -> Path:
     try:
         path = Path(value)  # type: ignore[arg-type]
     except TypeError as error:
         raise ValueError(f"{field} must be a path") from error
     if not path.is_absolute():
         raise ValueError(f"{field} must be absolute")
-    return path.resolve(strict=False)
+    if root_bound:
+        _reject_windows_path_aliases(path, field)
+    return path.resolve(strict=False) if resolve_path else path
+
+
+def _path_has_reparse_point(path: Path, *, missing_ok: bool = False) -> bool:
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        if missing_ok:
+            return False
+        raise ValueError("configured task root cannot be inspected") from None
+    except OSError as error:
+        raise ValueError("configured task root cannot be inspected") from error
+    return path.is_symlink() or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _reject_reparse_points_below(path: Path, root: Path, field: str) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{field} must stay below the task root") from error
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if _path_has_reparse_point(current, missing_ok=True):
+            raise ValueError(f"{field} must not use reparse points")
+
+
+def _configured_fastlane_task_root() -> Path:
+    configured = os.environ.get(_FASTLANE_TASK_ROOT_ENV)
+    if configured is None:
+        return _DEFAULT_FASTLANE_TASK_ROOT.resolve(strict=False)
+    if not configured or configured != configured.strip():
+        raise ValueError("configured fast-lane task root is invalid")
+    normalized = configured.replace("/", "\\")
+    if normalized.startswith("\\\\"):
+        raise ValueError("configured fast-lane task root must be local")
+    try:
+        candidate = Path(configured)
+    except TypeError as error:
+        raise ValueError("configured fast-lane task root is invalid") from error
+    if (
+        not candidate.is_absolute()
+        or any(part == ".." for part in candidate.parts)
+        or any(part.rstrip(" .") != part for part in candidate.parts[1:])
+    ):
+        raise ValueError("configured fast-lane task root must be absolute")
+    if candidate.drive.casefold() == "c:" or candidate == Path(candidate.anchor):
+        raise ValueError("configured fast-lane task root is not approved")
+    if not candidate.is_dir():
+        raise ValueError("configured fast-lane task root must be an existing directory")
+    current = candidate
+    while True:
+        if _path_has_reparse_point(current):
+            raise ValueError(
+                "configured fast-lane task root must not use reparse points"
+            )
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    resolved = candidate.resolve(strict=True)
+    if (
+        resolved.drive.casefold() == "c:"
+        or resolved == Path(resolved.anchor)
+        or any(part.rstrip(" .") != part for part in resolved.parts[1:])
+    ):
+        raise ValueError("configured fast-lane task root is not approved")
+    return resolved
 
 
 def _strictly_below(path: Path, root: Path, field: str) -> None:
@@ -856,6 +989,245 @@ def _strictly_below(path: Path, root: Path, field: str) -> None:
         raise ValueError(f"{field} must stay below the task root") from error
     if path == root:
         raise ValueError(f"{field} must be below the task root")
+
+
+def _strictly_below_any(path: Path, roots: Sequence[Path], field: str) -> None:
+    for root in roots:
+        try:
+            _strictly_below(path, root, field)
+            return
+        except ValueError:
+            continue
+    raise ValueError(f"{field} must stay below the task root")
+
+
+def _root_bound_path(
+    value: object,
+    field: str,
+    *,
+    task_root: Path,
+    project_root: Path,
+) -> Path:
+    lexical_path = _absolute_path(
+        value,
+        field,
+        root_bound=True,
+        resolve_path=False,
+    )
+    _strictly_below(lexical_path, project_root, field)
+    _reject_reparse_points_below(lexical_path, task_root, field)
+    resolved = lexical_path.resolve(strict=False)
+    _strictly_below(resolved, project_root, field)
+    return resolved
+
+
+def _pin_windows_directory(path: Path, field: str) -> int | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x0080,
+        0x0001,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle == invalid:
+        raise ValueError(f"{field} cannot be pinned without delete sharing")
+    information = _ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        kernel32.CloseHandle(handle)
+        raise ValueError(f"{field} cannot be inspected through its pinned handle")
+    if information.dwFileAttributes & 0x0400:
+        kernel32.CloseHandle(handle)
+        raise ValueError(f"{field} must not use reparse points")
+    return int(handle)
+
+
+class _PinnedDirectoryTree:
+    def __init__(self) -> None:
+        self._handles: list[int] = []
+        self._identities: set[str] = set()
+
+    def __enter__(self) -> _PinnedDirectoryTree:
+        return self
+
+    def __exit__(self, *_arguments: object) -> None:
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        for handle in reversed(self._handles):
+            close_handle(handle)
+        self._handles.clear()
+        self._identities.clear()
+
+    def pin(self, path: Path, field: str) -> None:
+        identity = str(path).casefold()
+        if identity in self._identities:
+            return
+        handle = _pin_windows_directory(path, field)
+        if handle is not None:
+            self._handles.append(handle)
+        self._identities.add(identity)
+
+    def pin_ancestors(self, path: Path, field: str) -> None:
+        current = path
+        while True:
+            self.pin(current, field)
+            parent = current.parent
+            if parent == current:
+                return
+            current = parent
+
+
+def _create_verified_directory(
+    path: Path,
+    *,
+    task_root: Path,
+    project_root: Path,
+    field: str,
+    allow_project_root: bool = False,
+    pins: _PinnedDirectoryTree,
+) -> Path:
+    if path == project_root:
+        if not allow_project_root:
+            raise ValueError(f"{field} must be below the task root")
+    else:
+        _strictly_below(path, project_root, field)
+    _reject_reparse_points_below(path, task_root, field)
+    if not task_root.is_dir() or _path_has_reparse_point(task_root):
+        raise ValueError("configured task root cannot be safely created below")
+    pins.pin_ancestors(task_root, "configured task root")
+    try:
+        relative = path.relative_to(task_root)
+    except ValueError as error:
+        raise ValueError(f"{field} must stay below the task root") from error
+
+    current = task_root
+    for part in relative.parts:
+        if not current.is_dir() or _path_has_reparse_point(current):
+            raise ValueError(f"{field} must not use reparse points")
+        pins.pin(current, field)
+        current = current / part
+        try:
+            current.mkdir()
+        except FileExistsError:
+            pass
+        if not current.is_dir() or _path_has_reparse_point(current):
+            raise ValueError(f"{field} must not use reparse points")
+        pins.pin(current, field)
+        resolved_current = current.resolve(strict=True)
+        try:
+            resolved_current.relative_to(task_root)
+        except ValueError as error:
+            raise ValueError(f"{field} must stay below the task root") from error
+
+    verified = path.resolve(strict=True)
+    if verified == project_root:
+        if not allow_project_root:
+            raise ValueError(f"{field} must be below the task root")
+    else:
+        _strictly_below(verified, project_root, field)
+    if not verified.is_dir():
+        raise ValueError(f"{field} must be a directory")
+    return verified
+
+
+def _create_fresh_verified_directory(
+    path: Path,
+    *,
+    task_root: Path,
+    project_root: Path,
+    field: str,
+    pins: _PinnedDirectoryTree,
+) -> Path:
+    _strictly_below(path, project_root, field)
+    _reject_reparse_points_below(path, task_root, field)
+    try:
+        path.mkdir()
+    except FileExistsError:
+        raise ValueError(f"{field} target already exists") from None
+    except OSError as error:
+        raise ValueError(f"{field} cannot be created") from error
+    if not path.is_dir() or _path_has_reparse_point(path):
+        raise ValueError(f"{field} must not use reparse points")
+    pins.pin(path, field)
+    verified = path.resolve(strict=True)
+    _strictly_below(verified, project_root, field)
+    if not verified.is_dir():
+        raise ValueError(f"{field} must be a directory")
+    return verified
+
+
+def _is_default_fastlane_task_root(root: Path) -> bool:
+    return (
+        str(root).casefold()
+        == str(_DEFAULT_FASTLANE_TASK_ROOT.resolve(strict=False)).casefold()
+    )
+
+
+def _fastlane_task_root_hash(root: Path) -> str:
+    return _sha256_json(
+        {
+            "schema": "team-efficiency/fast-lane-task-root-binding-v1",
+            "task_root": str(root),
+        }
+    )
+
+
+def _bootstrap_task_root(plan: Mapping[str, Any]) -> Path:
+    root = _configured_fastlane_task_root()
+    if plan["schema"] == "team-efficiency/bootstrap-v1":
+        if not _is_default_fastlane_task_root(root):
+            raise ValueError("bootstrap plan task root changed")
+        return root
+    if plan["schema"] == "team-efficiency/bootstrap-v2":
+        if plan["task_root_hash"] != _fastlane_task_root_hash(root):
+            raise ValueError("bootstrap plan task root changed")
+        return root
+    raise ValueError("bootstrap plan is not eligible for apply")
 
 
 def build_bootstrap_plan(
@@ -875,14 +1247,23 @@ def build_bootstrap_plan(
     normalized_base = _git_id(base_commit, "base_commit")
     normalized_branch = _branch(branch)
     normalized_scope = _normalised_scopes(write_scope)
-    normalized_project, root = _project_root(project)
+    task_root = _configured_fastlane_task_root()
+    normalized_project, root = _project_root(project, task_root=task_root)
     repo_path = _absolute_path(repo, "repo")
     if not repo_path.is_dir():
         raise ValueError("repo must be an existing directory")
-    worktree_path = _absolute_path(worktree, "worktree")
-    temp_path = _absolute_path(temp_target, "temp_target")
-    _strictly_below(worktree_path, root, "worktree")
-    _strictly_below(temp_path, root, "temp_target")
+    worktree_path = _root_bound_path(
+        worktree,
+        "worktree",
+        task_root=task_root,
+        project_root=root,
+    )
+    temp_path = _root_bound_path(
+        temp_target,
+        "temp_target",
+        task_root=task_root,
+        project_root=root,
+    )
 
     command_argv = [
         "git",
@@ -895,7 +1276,7 @@ def build_bootstrap_plan(
         str(worktree_path),
         normalized_base,
     ]
-    return {
+    plan: dict[str, Any] = {
         "schema": "team-efficiency/bootstrap-v1",
         "mode": "dry_run",
         "task_id": normalized_task,
@@ -914,15 +1295,22 @@ def build_bootstrap_plan(
             "workflow_endpoint_bind",
         ],
     }
+    if not _is_default_fastlane_task_root(task_root):
+        plan["schema"] = "team-efficiency/bootstrap-v2"
+        plan["task_root_hash"] = _fastlane_task_root_hash(task_root)
+    return plan
 
 
 def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     candidate = _mapping(plan, "bootstrap plan")
-    _exact_keys(candidate, _BOOTSTRAP_FIELDS, "bootstrap plan")
-    if (
-        candidate["mode"] != "dry_run"
-        or candidate["schema"] != "team-efficiency/bootstrap-v1"
-    ):
+    schema = candidate.get("schema")
+    if schema == "team-efficiency/bootstrap-v1":
+        _exact_keys(candidate, _BOOTSTRAP_V1_FIELDS, "bootstrap plan")
+    elif schema == "team-efficiency/bootstrap-v2":
+        _exact_keys(candidate, _BOOTSTRAP_V2_FIELDS, "bootstrap plan")
+    else:
+        raise ValueError("bootstrap plan is not eligible for apply")
+    if candidate["mode"] != "dry_run":
         raise ValueError("bootstrap plan is not eligible for apply")
     rebuilt = build_bootstrap_plan(
         task_id=candidate["task_id"],
@@ -941,24 +1329,37 @@ def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
 
 def _temporary_environment(
     plan: Mapping[str, Any],
-) -> tuple[dict[str, str], Path, Path]:
-    _, root = _project_root(plan["project"])
-    temp_target = _absolute_path(plan["temp_target"], "temp_target")
-    _strictly_below(temp_target, root, "temp_target")
+) -> tuple[dict[str, str], Path, Path, Path]:
+    task_root = _bootstrap_task_root(plan)
+    _, root = _project_root(plan["project"], task_root=task_root)
+    temp_target = _root_bound_path(
+        plan["temp_target"],
+        "temp_target",
+        task_root=task_root,
+        project_root=root,
+    )
     environment = os.environ.copy()
     target_text = str(temp_target)
     for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
         environment[name] = target_text
-    return environment, temp_target, root
+    environment["PYTHONPYCACHEPREFIX"] = str(temp_target / "pycache")
+    environment["UV_CACHE_DIR"] = str(temp_target / "uv-cache")
+    return environment, temp_target, root, task_root
 
 
-def _create_verified_temp_target(temp_target: Path, root: Path) -> Path:
-    temp_target.mkdir(parents=True, exist_ok=True)
-    verified = temp_target.resolve(strict=True)
-    _strictly_below(verified, root, "temp_target")
-    if not verified.is_dir():
-        raise ValueError("temp_target must be a directory")
-    return verified
+def _create_verified_temp_target(
+    temp_target: Path,
+    root: Path,
+    task_root: Path,
+    pins: _PinnedDirectoryTree,
+) -> Path:
+    return _create_verified_directory(
+        temp_target,
+        task_root=task_root,
+        project_root=root,
+        field="temp_target",
+        pins=pins,
+    )
 
 
 def _run_git_probe(argv: list[str], *, check: bool, env: Mapping[str, str]) -> None:
@@ -984,35 +1385,63 @@ def apply_bootstrap_plan(
     """Apply the one validated argument-vector operation after an absence check."""
 
     validated = _validated_bootstrap_plan(plan)
-    worktree = Path(validated["worktree"])
+    task_root = _bootstrap_task_root(validated)
+    _, root = _project_root(validated["project"], task_root=task_root)
+    worktree = _root_bound_path(
+        validated["worktree"],
+        "worktree",
+        task_root=task_root,
+        project_root=root,
+    )
     if worktree.exists():
         raise ValueError("worktree target already exists")
-    environment, temp_target, root = _temporary_environment(validated)
-    selected_probe = probe_runner if probe_runner is not None else _run_git_probe
-    selected_probe(
-        ["git", "-C", validated["repo"], "rev-parse", "--git-dir"],
-        check=True,
-        env=environment,
-    )
-    selected_probe(
-        [
-            "git",
-            "-C",
-            validated["repo"],
-            "rev-parse",
-            "--verify",
-            f"{validated['base_commit']}^{{commit}}",
-        ],
-        check=True,
-        env=environment,
-    )
-    verified_temp_target = _create_verified_temp_target(temp_target, root)
-    for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
-        environment[name] = str(verified_temp_target)
-    if worktree.exists():
-        raise ValueError("worktree target already exists")
-    selected_runner = runner if runner is not None else _run_worktree_add
-    selected_runner(validated["command_argv"], check=True, env=environment)
+    environment, temp_target, root, task_root = _temporary_environment(validated)
+    with _PinnedDirectoryTree() as pins:
+        verified_temp_target = _create_verified_temp_target(
+            temp_target,
+            root,
+            task_root,
+            pins,
+        )
+        for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
+            environment[name] = str(verified_temp_target)
+        environment["PYTHONPYCACHEPREFIX"] = str(verified_temp_target / "pycache")
+        environment["UV_CACHE_DIR"] = str(verified_temp_target / "uv-cache")
+        selected_probe = probe_runner if probe_runner is not None else _run_git_probe
+        selected_probe(
+            ["git", "-C", validated["repo"], "rev-parse", "--git-dir"],
+            check=True,
+            env=environment,
+        )
+        selected_probe(
+            [
+                "git",
+                "-C",
+                validated["repo"],
+                "rev-parse",
+                "--verify",
+                f"{validated['base_commit']}^{{commit}}",
+            ],
+            check=True,
+            env=environment,
+        )
+        _create_verified_directory(
+            worktree.parent,
+            task_root=task_root,
+            project_root=root,
+            field="worktree parent",
+            allow_project_root=True,
+            pins=pins,
+        )
+        worktree = _create_fresh_verified_directory(
+            worktree,
+            task_root=task_root,
+            project_root=root,
+            field="worktree",
+            pins=pins,
+        )
+        selected_runner = runner if runner is not None else _run_worktree_add
+        selected_runner(validated["command_argv"], check=True, env=environment)
     applied = dict(validated)
     applied["mode"] = "applied"
     return applied
@@ -3102,9 +3531,7 @@ def _fast_lane_assignment(
     }
 
 
-def _fast_lane_host_dispatch(
-    model: object, reasoning_effort: object
-) -> dict[str, Any]:
+def _fast_lane_host_dispatch(model: object, reasoning_effort: object) -> dict[str, Any]:
     """Render the exact host spawn tuple; never rely on session inheritance."""
 
     dispatch = {
@@ -4416,8 +4843,18 @@ def _validated_fast_lane_read_context(
     role = _text(context["role"], "read context.role", maximum=32)
     if role not in _FAST_LANE_READ_ROLES:
         raise ValueError("read context role is invalid")
+    task_root = _configured_fastlane_task_root()
+    task_root_hash = _hash(context["task_root_hash"], "read context.task_root_hash")
+    if task_root_hash != _fastlane_task_root_hash(task_root):
+        raise ValueError("read context task root changed")
+    project, project_root = _project_root(context["project"], task_root=task_root)
     repo = _absolute_path(context["repo"], "read context.repo")
-    worktree = _absolute_path(context["worktree"], "read context.worktree")
+    worktree = _root_bound_path(
+        context["worktree"],
+        "read context.worktree",
+        task_root=task_root,
+        project_root=project_root,
+    )
     if worktree == repo:
         raise ValueError("read context worktree must differ from repo")
     base_commit = _git_id(context["base_commit"], "read context.base_commit")
@@ -4427,7 +4864,12 @@ def _validated_fast_lane_read_context(
         "read context.workspace_input_snapshot_id",
     )
     read_scope = _normalised_scopes(context["read_scope"], "read context.read_scope")
-    temp_target = _absolute_path(context["temp_target"], "read context.temp_target")
+    temp_target = _root_bound_path(
+        context["temp_target"],
+        "read context.temp_target",
+        task_root=task_root,
+        project_root=project_root,
+    )
 
     unit_kind = unit.get("unit_kind")
     if role == "verification" and unit_kind is not None and unit_kind != "verification":
@@ -4440,6 +4882,8 @@ def _validated_fast_lane_read_context(
     return {
         "task_id": task_id,
         "role": role,
+        "project": project,
+        "task_root_hash": task_root_hash,
         "repo": str(repo),
         "worktree": str(worktree),
         "base_commit": base_commit,
@@ -4551,7 +4995,6 @@ def _validated_fast_lane_contexts(
     if execution_records and execution_task_ids != execution_capable_ids:
         raise ValueError("execution contexts must cover the source task set")
 
-    codex_root = Path(r"D:\bun\tmp\codex").resolve(strict=False)
     for index, record in enumerate(read_records):
         field = f"read_contexts[{index}]"
         context = _mapping(record, field)
@@ -4586,11 +5029,15 @@ def _validated_fast_lane_contexts(
             raise ValueError("fast-lane contexts contain duplicate temp targets")
         if temp_id == worktree_id:
             raise ValueError("fast-lane context worktree and temp target must differ")
-        roots = project_roots or [codex_root]
-        if not any(
-            temp_target != root and temp_target.is_relative_to(root) for root in roots
+        _, read_project_root = _project_root(normalized["project"])
+        if project_roots and not any(
+            _fast_lane_path_identity(read_project_root)
+            == _fast_lane_path_identity(project_root)
+            for project_root in project_roots
         ):
-            raise ValueError("read context temp target must stay below the task root")
+            raise ValueError("read context project does not match execution project")
+        _strictly_below(worktree, read_project_root, "read context worktree")
+        _strictly_below(temp_target, read_project_root, "read context temp target")
         worktrees.add(worktree_id)
         temp_targets.add(temp_id)
         read_contexts.append(normalized)
@@ -6914,10 +7361,15 @@ def _validated_fast_lane_index_context(
         _exact_keys(step, frozenset({"action", "required", "when"}), f"{field}.{name}")
         action = _text(step["action"], f"{field}.{name}.action", maximum=32)
         when = _text(step["when"], f"{field}.{name}.when", maximum=32)
-        if action != "query_once" or when not in {
-            "dispatch_boundary",
-            "terminal_boundary",
-        } or type(step["required"]) is not bool:
+        if (
+            action != "query_once"
+            or when
+            not in {
+                "dispatch_boundary",
+                "terminal_boundary",
+            }
+            or type(step["required"]) is not bool
+        ):
             raise ValueError("index query step is invalid")
         query_steps[name] = {
             "action": action,
@@ -6931,9 +7383,10 @@ def _validated_fast_lane_index_context(
         f"{field}.worker",
     )
     worker_action = _text(worker["action"], f"{field}.worker.action", maximum=32)
-    if worker_action not in {"consume_only", "skip"} or type(
-        worker["mid_item_polling"]
-    ) is not bool:
+    if (
+        worker_action not in {"consume_only", "skip"}
+        or type(worker["mid_item_polling"]) is not bool
+    ):
         raise ValueError("index worker policy is invalid")
     prohibited_values = _bounded_records(
         worker["prohibited_operations"],

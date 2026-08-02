@@ -9,7 +9,19 @@ input as code and has no model or remote-service interface.
 
 `bootstrap` requires a task id, full base commit, safe branch, bounded relative
 write scope, existing repository, project identifier, worktree target, and temp
-target. Both targets must be strictly below `D:\bun\tmp\codex\<project>`.
+target. Its host-configured base root is `CODEX_FASTLANE_TASK_ROOT`, or the
+compatible default `D:\bun\tmp\codex` when unset. A configured root must be an
+existing local absolute non-C, non-volume-root directory without reparse points;
+project components and root-bound target components cannot be reparse points;
+the lexical path is checked before canonicalization. Both bootstrap targets and every
+read-context worktree/temp target must be strictly below the declared derived
+`<root>/<project>` task root. A read context names its bounded `project`, carries
+the current canonical `task_root_hash`, and, when execution contexts exist, must
+match one of their projects. Win32-normalized aliases (including trailing
+dot/space and reserved device names) are rejected for root-bound targets. The
+root never comes from request JSON or a bootstrap plan: default plans remain
+bootstrap-v1, while a non-default root is bound by a canonical hash in
+bootstrap-v2. A changed configuration fails revalidation before Git runs.
 
 The default output is a canonical dry-run plan. Its only eligible apply vector
 is:
@@ -21,8 +33,15 @@ git -C <repo> worktree add -b <branch> <worktree> <base-commit>
 `--apply` revalidates that exact plan and requires the worktree target to be
 absent. Before the apply vector, fixed read-only Git probes verify the local
 repository and full base commit. The helper creates or verifies only the
-validated temp target and passes it as `TEMP`, `TMP`, `TMPDIR`, and
-`CODEX_TASK_TEMP` to those child processes.
+validated temp target, then creates its own fresh empty worktree leaf before
+passing that exact path to Git. It passes the temp target as `TEMP`, `TMP`, `TMPDIR`, and
+`CODEX_TASK_TEMP` to those child processes. It also pins
+`PYTHONPYCACHEPREFIX=<temp>/pycache` and `UV_CACHE_DIR=<temp>/uv-cache`, so
+child caches cannot silently return to C. Creation proceeds one checked path
+component at a time. On Windows it also pins the configured-root ancestry and
+each participating directory, including that fresh worktree leaf, with read-only
+sharing (no write/delete sharing) through creation and the Git vector. A pre-existing
+leaf or inability to pin fails closed rather than falling back to path-only creation.
 
 ## Resume, status, contracts, and cache metadata
 
@@ -421,11 +440,12 @@ repo/worktree/temp paths, prompts, raw command output, secrets, or raw
 external receipt bodies.
 
 The adapter never archives work. The host may archive only after coordinator-lane acceptance and final evidence binding have completed. Fast Lane scratch files,
-worktrees, ordinary caches, and test evidence must remain under the current
-compiler-approved `D:\bun\tmp\codex\<project-or-thread>` task root. This is a
+worktrees, ordinary caches, test evidence, and read worktrees must remain below
+the declared project root derived from trusted `CODEX_FASTLANE_TASK_ROOT` (or
+the compatible `D:\bun\tmp\codex` default). This remains the
 bootstrap/read-context boundary, not a claim that every plugin cache is D-only.
-`--quota-state-path` remains user-configurable and may use another approved
-drive. C-drive temporary roots are forbidden.
+`--quota-state-path`
+remains user-configurable and may use another approved drive. C-drive temporary roots are forbidden.
 
 ## CLI
 

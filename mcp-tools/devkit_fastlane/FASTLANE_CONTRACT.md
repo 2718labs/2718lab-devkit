@@ -163,10 +163,21 @@ python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --h
 若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。独立会话必须在获准任务根下创建并绑定自己的隔离 Git worktree；不得把协调器的脏集成工作树当作 worker 工作区，缺失或无法验证 worktree 时 fail-closed。
 
 归档不是 adapter 操作：只能在协调器 lane 已完成 acceptance、最终证据已绑定之后由 host 执行。
-Fast Lane 的 scratch、worktree、普通 cache 和测试证据目前必须位于编译器批准的
-`D:\bun\tmp\codex\<project-or-thread>` 任务根；这是当前 bootstrap/read-context
-边界，不应误写成已经支持任意盘符。额度样本缓存 `--quota-state-path` 是独立的
-用户配置项，可使用获准的其他盘符。禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。
+Fast Lane 的宿主任务根由 `CODEX_FASTLANE_TASK_ROOT` 配置；未设置时保持兼容默认 `D:\bun\tmp\codex`。
+配置值必须是现存的、本地绝对、非 C 盘、不得为卷根且不含 reparse-point
+的目录，编译器只在其下派生受限 `project` 的任务根，并在规范化前按词法路径拒绝 project
+子路径中的 reparse-point。bootstrap 和 read-context 的 worktree、scratch、普通 cache 与测试
+证据都必须严格位于该派生根下；每个 read-context 必须声明 project，且有 execution
+context 时必须与其 project 对齐，并携带 `task_root_hash`；配置变化时每个
+read-context 与 bootstrap 都重算该 hash。路径尾随点/空格、保留设备名或根外目标均
+fail-closed；Windows apply 在目录创建和 Git 调用期间持有只共享 read、拒绝 write/delete
+共享的目录句柄：它会自行创建、校验并 pin 空的最终 worktree 叶目录后才调用 Git，拿不到句柄或
+叶目录已存在就停止。默认 bootstrap 保持 v1；非默认根使用只携带规范根 hash 的
+bootstrap-v2，在 apply 前重算该 hash。该变量是宿主配置，不是 request 或 bootstrap
+plan 可自报的根字段。
+额度样本缓存 `--quota-state-path` 仍是独立的用户配置项，可使用
+获准的其他盘符。禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。这仍是当前 bootstrap/read-context
+边界。
 
 ### 6. 验证与交付
 

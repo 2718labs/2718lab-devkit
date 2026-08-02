@@ -57,6 +57,7 @@ class BugkillerMetadataTests(unittest.TestCase):
                 "CODEX_PROJECT_ID",
                 "CODEX_WORKSPACE_ID",
                 "CODEX_THREAD_ID",
+                "CODEX_FASTLANE_TASK_ROOT",
             ],
         )
         self.assertNotIn("CLAUDE_PLUGIN_ROOT", json.dumps(metadata))

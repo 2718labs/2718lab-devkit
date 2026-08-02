@@ -47,9 +47,12 @@ Each assignment also carries one bounded `index_context`; the host prepares
 its input/output query at lifecycle boundaries and the worker only consumes the
 packet, with no index polling or hand-written query choreography.
 The host archives only after coordinator acceptance and final evidence binding.
-Fast Lane task temporary roots stay below the current compiler-approved
-`D:\bun\tmp\codex\<project-or-thread>` root. The quota sample cache remains a
-separately user-configurable path, and C-drive temporary roots remain forbidden.
+Fast Lane task roots derive from trusted `CODEX_FASTLANE_TASK_ROOT`, or the
+compatible `D:\bun\tmp\codex` default. Worker/read worktrees and temporary
+targets stay strictly below their declared project root; standalone read
+contexts carry the same bounded project identity and canonical task-root hash.
+The quota sample cache remains a separately user-configurable path, and C-drive
+temporary roots remain forbidden.
 
 No execution worker merges another task, changes a sibling scope, or accepts
 its own task. A candidate commit and evidence always return to the coordinator.

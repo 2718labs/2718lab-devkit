@@ -173,6 +173,21 @@ Fast Lane 应通过以下可执行入口运行：
 保存样本缓存。构建输出、额度缓存和临时证据都应放在源码树之外，并排除在版本
 控制之外。
 
+Fast Lane 的 worktree 与 worker cache 位置由 `CODEX_FASTLANE_TASK_ROOT`
+独立配置，MCP manifest 会从宿主转发该变量。未设置时保持
+`D:\bun\tmp\codex`；设置时必须是现存、本地绝对、非 C 盘、不得为卷根且无
+reparse-point 的目录。编译器只会在其下派生受限的相对 `project`，根变化、越界
+目标、project reparse-point、Win32 路径别名或不在声明 project 下的 read worktree
+都会 fail-closed；每个 read context 也绑定规范根 hash。默认 bootstrap 输出仍是
+v1；非默认根只在 bootstrap-v2 中以同一规范 hash 绑定，绝不接受 request 自报根
+路径。这是可信宿主配置，绝不是 request JSON 字段。
+
+例如，先创建目标目录，再在启动 Codex 前设置 G 盘任务根：
+
+```powershell
+$env:CODEX_FASTLANE_TASK_ROOT = 'G:\CodexData\fastlane'
+```
+
 ## 运行时数据与崩溃恢复
 
 持久化数据留在本地。RuntimeConfig 按以下顺序解析数据根：

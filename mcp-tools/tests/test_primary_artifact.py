@@ -63,6 +63,7 @@ EXPECTED_ENV_VARS = (
     "CODEX_PROJECT_ID",
     "CODEX_WORKSPACE_ID",
     "CODEX_THREAD_ID",
+    "CODEX_FASTLANE_TASK_ROOT",
 )
 
 
@@ -610,7 +611,9 @@ def test_linux_publisher_allows_expected_write_before_identity_check(
 
     backend = builder.get_secure_backend()
     with backend.open_root(plugin_root) as source_root:
-        with backend.open_output_parent(output_parent, source_root=source_root) as publisher:
+        with backend.open_output_parent(
+            output_parent, source_root=source_root
+        ) as publisher:
             private_zip = publisher.create_zip_temp()
             private_zip.write(b"deterministic payload\n")
             publisher.publish("artifact.zip")

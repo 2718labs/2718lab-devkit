@@ -191,6 +191,24 @@ stores only the bounded recent sample; without the option, it uses
 output, quota caches, and temporary evidence outside the source tree and out
 of version control.
 
+Fast Lane worktree and worker-cache placement is independently configured by
+`CODEX_FASTLANE_TASK_ROOT`, which the MCP manifest forwards from the host.
+When it is unset, Fast Lane preserves `D:\bun\tmp\codex`; when set, it must
+name an existing local absolute non-C, non-volume-root directory without
+reparse points. The compiler derives the bounded relative `project` below that
+root and rejects root changes, root escapes, project reparse points, Win32 path
+aliases, or read worktrees outside their declared project. Every read context
+also binds the canonical root hash. Default bootstrap output remains v1; a
+non-default root is bound by the same canonical hash in bootstrap-v2, never by
+a request-provided root value. This is trusted host configuration, never a
+request-JSON field.
+
+For example, configure an existing G-drive root before starting Codex:
+
+```powershell
+$env:CODEX_FASTLANE_TASK_ROOT = 'G:\CodexData\fastlane'
+```
+
 ## Runtime data and recovery
 
 Persistent data is local. RuntimeConfig resolves the data root in this order:
