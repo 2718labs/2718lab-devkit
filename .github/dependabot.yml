@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/mcp-tools"
+    schedule:
+      interval: "weekly"
+    groups:
+      mcp-python-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/extensions/astrbot"
+    schedule:
+      interval: "weekly"
+    groups:
+      astrbot-extension-dependencies:
+        patterns:
+          - "*"
