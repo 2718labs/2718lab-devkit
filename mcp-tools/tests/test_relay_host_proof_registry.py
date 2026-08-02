@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import sqlite3
+import subprocess
 import sys
 import threading
 from dataclasses import replace
@@ -448,9 +449,26 @@ def test_attestor_neutralizes_replace_and_config_environment_overrides(
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.useReplaceRefs")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
-    assert _git(repository, "rev-list", "--parents", "-n", "1", merge_commit).decode(
-        "ascii"
-    ).split() == [merge_commit, base_commit]
+    attacker_environment = os.environ.copy()
+    for key in tuple(attacker_environment):
+        if key.startswith("GIT_"):
+            attacker_environment.pop(key, None)
+    attacker_environment.update(
+        {
+            "GIT_REPLACE_REF_BASE": replacement_base,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.useReplaceRefs",
+            "GIT_CONFIG_VALUE_0": "true",
+        }
+    )
+    hostile = subprocess.run(
+        ["git", "rev-list", "--parents", "-n", "1", merge_commit],
+        cwd=repository,
+        env=attacker_environment,
+        capture_output=True,
+        check=True,
+    )
+    assert hostile.stdout.decode("ascii").strip().split() == [merge_commit, base_commit]
     forged = _expectation_for(
         base_commit=base_commit,
         candidate_commit=merge_commit,
