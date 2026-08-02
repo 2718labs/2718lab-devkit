@@ -22,11 +22,6 @@ stable rejected or unavailable result. Policy assets are not capability claims.
 | Codex | complex code / Terra Max | `gpt-5.6-terra` / `max` | Moderate-or-harder implementation, integration, refactoring, security work, and regressions. |
 | Codex | exceptional bounded code / Sol High | `gpt-5.6-sol` / `high` | Explicit exceptional execution or deep investigation only; Sol still owns final acceptance. |
 | Codex | Luna | `gpt-5.6-luna` / requested `low`, `medium`, `high`, or `xhigh` with an exact host capability attestation | Missing or mismatched attestation returns `UNAVAILABLE`; an omitted effort uses the profile's `medium` default only when attested. Never substitute another model or alter Bugkiller's separate policy surface. |
-| Claude | coordinator | Opus / coordinator | Coordinator profile. |
-| Claude | code | Sonnet / standard | Code-worker profile. |
-| Claude | light | Haiku / light | Light-worker profile. |
-| Claude | Fable | Fable / high | Powerful, expensive escalation only with a non-empty explicit escalation reason. |
-
 The resolver rejects a caller-supplied model or reasoning value that differs
 from policy. It never silently downgrades or upgrades a route.
 

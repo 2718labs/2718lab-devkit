@@ -11,10 +11,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
-
+from typing import Any
 
 _MCP_TOOLS = Path(__file__).resolve().parents[1]
 _PLUGIN_ROOT = _MCP_TOOLS.parent
@@ -74,12 +74,7 @@ def _capture_context(payload: Mapping[str, Any], context_type: Any) -> Any | Non
     normalized_host = "".join(
         character for character in raw_host.casefold() if character.isalnum()
     )
-    host = {
-        "claude": "claude",
-        "claudecode": "claude",
-        "codex": "codex",
-        "openaicodex": "codex",
-    }.get(normalized_host)
+    host = {"codex": "codex", "openaicodex": "codex"}.get(normalized_host)
     if host is None:
         return None
     nested = payload.get("context")

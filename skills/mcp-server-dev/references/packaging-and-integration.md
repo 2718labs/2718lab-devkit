@@ -1,6 +1,6 @@
 # 打包、调试与接入(两包通用 + 各自差异)
 
-本文件管:项目打包(pyproject/uv)、本地调试命令、接入 Claude Desktop / Claude Code、传输选型建议。**不管** GitHub release / CI 流程(见 `oss-repo-ops` skill),**不管**通用 Python 工程规范如测试/typing/异步项目布局(见 `python-engineering` skill)。
+本文件管:项目打包(pyproject/uv)、本地调试命令、接入 Codex 插件的 `.mcp.json`、传输选型建议。**不管** GitHub release / CI 流程(见 `oss-repo-ops` skill),**不管**通用 Python 工程规范如测试/typing/异步项目布局(见 `python-engineering` skill)。
 
 ## 1. pyproject.toml 模板要点
 
@@ -62,47 +62,37 @@ fastmcp run my_server.py:mcp                          # stdio,CLI 直接 import 
 fastmcp run my_server.py:mcp --transport http --port 8000
 ```
 
-## 3. 接入 Claude Desktop
+## 3. 接入 Codex 插件
 
-### (A) SDK 内置 v1.x
+Codex 插件只通过插件根目录的 `.mcp.json` 声明 MCP server，不执行第三方客户端安装命令。
+配置保持可审计的 stdio 入口，例如:
 
-```bash
-uv run mcp install server.py
-uv run mcp install server.py --name "My Analytics Server" -v API_KEY=abc123 -v DB_URL=... -f .env
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "uv",
+      "args": ["run", "--locked", "python", "server.py"],
+      "cwd": "mcp-tools"
+    }
+  }
+}
 ```
 
-- `--name` 覆盖 Claude Desktop 里显示的服务器名。
-- `-v KEY=VALUE` 注入环境变量,可重复传多个。
-- `-f .env` 从 env 文件批量加载环境变量。
-
-### (B) 独立版 3.x
-
-grounding report 抓取的页面里没有给出 (B) 包对应 `mcp install` 的等价命令;fastmcp CLI 目前确认的子命令只有 `fastmcp run`(见上)。若需要把 (B) 包 server 接入 Claude Desktop,按 Claude Desktop 官方配置文件手工写 `command`/`args` 指向 `fastmcp run xxx.py:mcp` 或直接指向解释器 + 脚本,**不要**臆造一个 `fastmcp install` 命令——grounding 里没出现过,查不到就不写。
-
-## 4. 接入 Claude Code
-
-(A) 包 v1.x README quickstart 给出的方式,是直接注册一个跑在 HTTP transport 上的 server:
-
-```bash
-claude mcp add --transport http my-server http://localhost:8000/mcp
-```
-
-也就是说:先用 `mcp.run(transport="streamable-http")` (A) 或 `mcp.run(transport="http")` (B) 把 server 起在本地端口,再用 `claude mcp add --transport http <name> <url>` 注册。grounding 里没有 (B) 包专属的 Claude Code 接入命令,按同样的 `claude mcp add --transport http` 方式处理即可(注册命令来自 Claude Code 自身,不属于任一 FastMCP 包)。
-
-## 5. 传输选型建议
+## 4. 传输选型建议
 
 | 场景 | 建议 transport |
 |---|---|
-| 本地单机、被 Claude Desktop/Code 当子进程拉起 | 默认 stdio,不传 transport 参数 |
+| 本地单机、被 Codex 插件当子进程拉起 | 默认 stdio,不传 transport 参数 |
 | 需要独立进程常驻、被多个客户端通过网络连接 | (A) `"streamable-http"` / (B) `"http"` |
 | 旧客户端只认 SSE,或历史项目已用 SSE | `"sse"`——两包文档都提示这是过渡/legacy 选项,新项目优先选 HTTP |
 
-## 6. 部署提醒
+## 5. 部署提醒
 
 - stdio 模式下,**standard output 是协议通道**,任何 `print()` 都会污染协议流导致客户端解析失败。日志一律走 Context(`ctx.info/debug/warning/error`)或标准 `logging` 模块写到 stderr,不写 stdout。
 - HTTP/SSE 常驻部署时,注意进程重启策略、端口固定、以及日志落盘(不依赖 Context,因为常驻服务可能没有活跃请求时也要记录日志,这部分按 `python-engineering` 通用工程规范处理)。
 
-## 7. 姊妹 skill 分工
+## 6. 姊妹 skill 分工
 
 - 通用 Python 工程(测试、typing、异步、项目布局)→ `python-engineering`。
 - GitHub 发布、CI、版本流程 → `oss-repo-ops`。

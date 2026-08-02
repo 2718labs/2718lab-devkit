@@ -111,18 +111,13 @@ mcp.run(transport="sse", mount_path="/search")
 ```bash
 uv run mcp dev server.py                    # MCP Inspector 调试模式
 uv run mcp dev server.py --with pandas --with-editable .
-uv run mcp install server.py                # 装进 Claude Desktop
-uv run mcp install server.py --name "My Analytics Server" -v API_KEY=abc123 -v DB_URL=... -f .env
 uv run mcp run server.py                    # 直接运行(仅限 FastMCP,低层 Server 不支持)
 ```
 
 文档原话:"`uv run mcp run` 或 `uv run mcp dev` 只支持用 FastMCP 写的 server,不支持低层 Server 变体"——如果代码里用的是低层 Server 变体而不是 `FastMCP`,这两个命令跑不起来(grounding 里只提到"低层 Server / low-level server variant"这个说法,没给出具体 import 路径,该路径本文件不确认,不要照抄成 `mcp.server.lowlevel.Server`)。
 
-接入 Claude Code(v1.x README quickstart 里给的是这条,不是 `mcp install`):
-
-```bash
-claude mcp add --transport http my-server http://localhost:8000/mcp
-```
+Codex 插件不执行客户端安装命令；在插件根目录的 `.mcp.json` 中声明
+`command`、`args` 和 `cwd`，再由 Codex 以 stdio 启动 server。
 
 来源:docs/server.md §"Running Your Server";README.md
 

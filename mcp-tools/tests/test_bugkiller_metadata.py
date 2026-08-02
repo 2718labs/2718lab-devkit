@@ -56,12 +56,17 @@ class BugkillerMetadataTests(unittest.TestCase):
         )
         self.assertNotIn("CLAUDE_PLUGIN_ROOT", json.dumps(metadata))
 
-    def test_legacy_source_trees_remain_in_place_but_are_not_advertised(self) -> None:
+    def test_codex_only_source_boundary(self) -> None:
+        for removed_surface in (".claude-plugin", "hooks"):
+            surface = ROOT / removed_surface
+            self.assertFalse(surface.is_file(), removed_surface)
+            self.assertFalse(
+                surface.is_dir() and any(surface.iterdir()),
+                removed_surface,
+            )
         for relative_path in (
-            ".claude-plugin",
             "agents",
             "commands",
-            "hooks",
             "skills",
             "extensions",
         ):

@@ -32,31 +32,6 @@
           "purpose": "bounded_routine_execution"
         }
       }
-    },
-    "claude": {
-      "roles": {
-        "coordinator": {
-          "model": "opus",
-          "reasoning": "coordinator",
-          "purpose": "coordination"
-        },
-        "code": {
-          "model": "sonnet",
-          "reasoning": "standard",
-          "purpose": "code_execution"
-        },
-        "light": {
-          "model": "haiku",
-          "reasoning": "light",
-          "purpose": "light_execution"
-        },
-        "fable": {
-          "model": "fable",
-          "reasoning": "high",
-          "purpose": "explicit_expensive_escalation",
-          "requires_escalation_reason": true
-        }
-      }
     }
   }
 }

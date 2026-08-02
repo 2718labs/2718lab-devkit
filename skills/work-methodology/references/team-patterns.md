@@ -19,8 +19,6 @@ same-path work queues behind the active owner.
   request without an effort uses the profile's `medium` default only when that
   exact pair is attested. This shared Codex host policy does not alter
   Bugkiller, which remains a separate policy surface.
-- Claude routes are Opus coordinator, Sonnet code worker, Haiku light worker,
-  and Fable only as an explicitly reasoned powerful/expensive escalation.
 
 ## Fast Lane v3 worker selection
 

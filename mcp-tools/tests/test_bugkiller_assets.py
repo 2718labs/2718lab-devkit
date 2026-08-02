@@ -8,7 +8,6 @@ import sys
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SKILL = ROOT / "skills" / "bugkiller" / "SKILL.md"
 REFERENCES = ROOT / "skills" / "bugkiller" / "references"
@@ -56,11 +55,6 @@ class BugkillerAssetTests(unittest.TestCase):
             "Terra Max",
             "Sol High",
             "Luna",
-            "Opus",
-            "Sonnet",
-            "Haiku",
-            "Fable",
-            "explicit escalation reason",
         ):
             self.assertIn(marker, roles)
 
@@ -98,11 +92,7 @@ class BugkillerAssetTests(unittest.TestCase):
             {key: roles["code"]["complex"][key] for key in ("model", "reasoning")},
         )
         self.assertEqual("unavailable", roles["luna"]["status"])
-        claude = profile["hosts"]["claude"]["roles"]
-        self.assertEqual("opus", claude["coordinator"]["model"])
-        self.assertEqual("sonnet", claude["code"]["model"])
-        self.assertEqual("haiku", claude["light"]["model"])
-        self.assertTrue(claude["fable"]["requires_escalation_reason"])
+        self.assertEqual({"codex"}, set(profile["hosts"]))
 
     def test_plugin_ui_metadata_has_only_ui_fields(self) -> None:
         text = read(UI_METADATA)
