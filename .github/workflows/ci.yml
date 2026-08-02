@@ -13,7 +13,7 @@ permissions:
 jobs:
   mcp-runtime:
     name: MCP runtime (Python 3.11)
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     defaults:
       run:
         working-directory: mcp-tools
@@ -22,20 +22,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure task-local runtime storage
-        shell: bash
+        shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          set -euo pipefail
-          root="${RUNNER_TEMP}/2718lab-devkit-task/mcp-runtime"
-          mkdir -p "$root/tmp" "$root/pycache" "$root/uv-cache"
-          {
-            echo "CODEX_TASK_TEMP=$root"
-            echo "TEMP=$root/tmp"
-            echo "TMP=$root/tmp"
-            echo "TMPDIR=$root/tmp"
-            echo "PYTHONPYCACHEPREFIX=$root/pycache"
-            echo "UV_CACHE_DIR=$root/uv-cache"
-          } >> "$GITHUB_ENV"
+          $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-task\mcp-runtime'
+          New-Item -ItemType Directory -Force -Path `
+            (Join-Path $root 'tmp'), `
+            (Join-Path $root 'pycache'), `
+            (Join-Path $root 'uv-cache') | Out-Null
+          @(
+            "CODEX_TASK_TEMP=$root"
+            "TEMP=$(Join-Path $root 'tmp')"
+            "TMP=$(Join-Path $root 'tmp')"
+            "TMPDIR=$(Join-Path $root 'tmp')"
+            "PYTHONPYCACHEPREFIX=$(Join-Path $root 'pycache')"
+            "UV_CACHE_DIR=$(Join-Path $root 'uv-cache')"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up Python
         uses: actions/setup-python@v5
