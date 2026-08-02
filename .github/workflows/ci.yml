@@ -14,10 +14,24 @@ jobs:
   mcp-runtime:
     name: MCP runtime (Python 3.11)
     runs-on: ubuntu-latest
+    env:
+      CODEX_TASK_TEMP: ${{ github.workspace }}/.codex-task-temp/mcp-runtime
+      TEMP: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/tmp
+      TMP: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/tmp
+      TMPDIR: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/tmp
+      PYTHONPYCACHEPREFIX: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/pycache
+      UV_CACHE_DIR: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/uv-cache
     defaults:
       run:
         working-directory: mcp-tools
     steps:
+      - name: Prepare task-local runtime storage
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$CODEX_TASK_TEMP" "$TEMP" "$PYTHONPYCACHEPREFIX" "$UV_CACHE_DIR"
+
       - name: Check out repository
         uses: actions/checkout@v4
 
