@@ -1,6 +1,12 @@
 # 2718lab DevKit Codex-first Tool Plugin Design
 
-**Status:** approved design, pending written-spec review
+**Status:** approved design; implementation integrated in v1.0.0-rc1
+
+> Implementation note (2026-08-02): this document records the design rationale
+> and durable boundaries. The shipped public MCP contract is the exact
+> 16-tool surface documented in the repository README. The initial Atlas/Relay
+> seven-tool grouping below is retained as a design decomposition, not as a
+> claim that only seven tools are registered.
 
 **Date:** 2026-07-31
 
@@ -58,7 +64,7 @@ framework.
 | Atlas tools | `atlas_*` | `atlas_query`, `atlas_prepare`, `atlas_render`, `atlas_accept` |
 | Atlas database | `atlas.sqlite3` | under the durable data root |
 | Dispatch service | Relay | `devkit_relay` |
-| Relay tools | `relay_*` | `relay_compile`, `relay_start`, `relay_status` |
+| Relay tools | `relay_*` | `relay_compile`, `relay_start`, `relay_status`, `relay_handoff`, `relay_integrate` |
 | Relay database | `relay.sqlite3` | under the durable data root |
 
 `AtlasStore` and `ATLAS_*` identifiers may remain when their meaning is
@@ -306,16 +312,18 @@ schema labels expose the canonical names.
 
 ## 11. Implementation And Tests
 
-Implementation registers the seven canonical tools in the existing stdio
-server, moves Atlas code to `devkit_atlas`, introduces `devkit_relay`, wires
+Implementation registers the exact sixteen-tool stdio surface: the four
+Project Index tools, three Checkpoint tools, four Atlas tools, and five Relay
+tools. It moves Atlas code to `devkit_atlas`, introduces `devkit_relay`, wires
 the production acceptance-evidence reader, and removes primary-plugin prompt,
-static-agent, and skill-aggregation metadata. Existing project-index and
-Bugkiller behavior remains bounded supporting functionality.
+static-agent, and skill-aggregation metadata. Existing Bugkiller behavior
+remains bounded supporting functionality.
 
 Acceptance requires all of the following:
 
-1. The Atlas and Relay inventory is exactly the four and three tools listed
-   above, with no old public aliases and no MCP prompt surface.
+1. The public inventory is exactly the sixteen Project Index, Checkpoint,
+   Atlas, and Relay tools documented by the shipped README, with no old public
+   aliases and no MCP prompt or resource surface.
 2. A fresh stdio MCP process starts independently, lists the canonical tools,
    and keeps stdout protocol-clean.
 3. `relay_compile` is deterministic and performs no durable mutation;

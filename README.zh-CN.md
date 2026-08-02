@@ -1,116 +1,145 @@
 [English](README.md)
 
-# 2718lab DevKit — Code Atlas v0.3.0 发布候选契约
+# 2718lab DevKit —— MCP-only v1.0.0-rc1
 
-`2718lab-devkit` 是面向 Codex 与 Claude 宿主工作流的本地开发工具包。本文描述已经冻结的 **v0.3.0 发布候选元数据与契约**，不是已经激活的 Code Atlas 发布。Sol 仍负责集成和最终端到端验收；本文不声称该版本已经发布、安装、热重载，或已经通过最终 E2E 验证。
+[![版本](https://img.shields.io/badge/version-v1.0.0--rc1-blue)](./.codex-plugin/plugin.json)
+[![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-## 概览
+2718lab DevKit 是一个本地、仅 stdio 传输的 MCP 服务器，提供有边界的
+项目索引、Atlas 证据、Relay 生命周期协调和确定性的 Fast Lane 规划。
+本仓库包含 v1.0.0-rc1 发布候选版，已完成本地集成和测试；本文不声称
+已经远程发布、市场安装或热重载。
 
-Code Atlas 将有边界、已验收的工程证据转为确定性的本地图谱知识：图谱节点、边、配方和内容寻址存储（CAS）。它帮助工作者准备和渲染受范围限制的实现包，不必让 LLM 每次重新推断常规仓库结构。
+## 已交付内容
 
-它刻意不是自主编码系统。任务卡、声明的写入范围、审阅和验证仍然是权威。证据不足时，Sol 负责一次设计；此外负责调度、审阅、集成和最终验收，但不必在每个已验证的 Atlas 任务前手工拆分任务。
+- Project Index 提供不透明工作区注册、受限快照、状态和图查询。
+- Checkpoint 服务创建、检查和恢复证据绑定的快照。
+- Atlas 提供有边界的图查询、实现包准备、惰性渲染和持久化验收投影。
+- Relay 验证显式工作包并暴露生命周期状态。Python 只返回结构化宿主
+  动作；工作树准备和 agent 调度仍由 Codex 宿主负责。
+- 主包是 MCP-only：精确暴露 16 个工具，不暴露 MCP prompts、MCP
+  resources、静态 prompt agent 或模型运行器。
+- Fast Lane 仍是 work-methodology skill 中的纯本地编译器。它根据有界
+  难度和宿主能力证据选择显式模型/推理级别，不创建 agent、不改 Git、
+  不执行命令。
 
-## 安装状态
+## 精确 MCP 面
 
-v0.3.0 是发布候选版。本文不声称远程发布或安装成功。Code Atlas MCP 的激活仍受 ATLAS-11 注册和 ATLAS-13 端到端验收门控。待 Sol 验收已发布版本后，本地 marketplace 标识仍为 `2718lab-devkit@pidan-local-plugins`；应在新的 Codex 任务中验证已安装产物，而不要假定源码改动能够热重载。
+公共服务器名为 2718lab-devkit。每个结果都使用有界的
+2718lab-devkit/tool-result-v1 包络。公共面精确包含：
 
-## 四个冻结的 Code Atlas 接口名称——ATLAS-11 激活门
-
-下列名称定义冻结的 v0.3 接口契约。它们**当前尚未由 FastMCP 工具集注册**，不能从该工具集调用，也不会激活自动入库。ATLAS-11 必须先完成注册和契约测试，接口才可调用；之后 ATLAS-13 还必须通过最终 E2E 验收。
-
-| 工具 | 用途 | 安全边界 |
-| --- | --- | --- |
-| `code_atlas_graph_query` | 契约：激活后读取有边界的本地图谱邻域。 | 将返回图谱记录和哈希，不返回无边界的源码转储。 |
-| `code_atlas_prepare` | 契约：激活后匹配已验证的本地配方并准备实现包。 | 将返回状态和证据绑定的包；不会编辑工作区。 |
-| `code_atlas_render` | 契约：激活后从有效实现包和绑定值渲染确定性补丁候选。 | 将返回候选和惰性测试规范；不会应用补丁或运行命令。 |
-| `workflow_accept_code_task` | 契约：激活后验收经协调器授权的代码任务结果，并排队本地 Atlas 入库。 | 将继续受权限和证据约束；工作者不能自行验收。 |
-
-下方状态契约现已冻结，但相关 MCP 接口仍等待 ATLAS-11 注册。
-
-| 状态 | 精确动作 |
+| 区域 | 工具 |
 | --- | --- |
-| `READY` | 在分配范围内使用已验证的本地配方并验证。 |
-| `NO_VERIFIED_RECIPE` | 执行一次常规的范围内实现，保留证据，之后允许稍后自动本地入库。不得回退到外部 CodeGraph、LLM 或向量服务。 |
-| `INDEX_STALE` | 在使用配方前刷新已批准的本地索引。 |
-| `AMBIGUOUS_MATCH` | 停止并请 Sol 选择或收窄契约。 |
-| `UNSUPPORTED_LANGUAGE` | 记录缺口并保持任务范围；不得编造配方。 |
-| `RENDER_INVALID` | 拒绝候选，保留证据，并修正本地契约。 |
-| `EVIDENCE_INCOMPLETE` | 在声称已验证配方前收集有边界的本地证据。 |
-| `RECIPE_QUARANTINED` | 不得使用该配方；保留隔离原因。 |
-| `INGEST_PENDING` | 保留已验收实现的证据，供稍后本地入库。 |
-| `ATLAS_UNAVAILABLE` | 使用任务卡中受范围限制的后备方案并记录降级状态。 |
-| `MODEL_UNAVAILABLE` | 不得替换模型；将路由结果返回给 Sol。 |
+| Project Index | project_index_register、project_index_sync、project_index_status、project_index_query |
+| Checkpoint | worktree_checkpoint_create、worktree_checkpoint_status、worktree_checkpoint_restore |
+| Atlas | atlas_query、atlas_prepare、atlas_render、atlas_accept |
+| Relay | relay_compile、relay_start、relay_status、relay_handoff、relay_integrate |
 
-## 确定性的本地图谱和配方
+服务器没有 prompt 或 resource 面。工具输入是结构化且有界的；绝对工作
+者路径、Shell 片段、原始源码、凭据、无界命令输出和调用方伪造的验收证据
+都会被拒绝。
 
-图谱包含带类型的知识节点和显式边，用于表达本地配方、约束、依赖、测试规范、证据描述和已验收任务情节。配方和二进制/模板资产以本地 CAS 中的规范 SHA-256 内容地址引用。查询、匹配、渲染、规范化和冲突处理都是确定性的，并受节点、边、深度和字节预算限制。
+## 本地安装与运行
 
-Code Atlas **不使用 LLM、嵌入、向量数据库、网络服务或外部 CodeGraph**，也绝不回退到外部 CodeGraph。它是本地的计划与复用辅助工具，不是模型路由器、Shell 执行器、补丁应用器或隐藏调度器。
+要求：Python 3.11 或更高版本，以及 uv。
 
-## 计划中的已验收任务自动入库
+在仓库根目录执行：
 
-在 ATLAS-11 注册和 ATLAS-13 E2E 验收完成后，冻结的 `workflow_accept_code_task` 契约将写入持久化的验收/outbox 记录，并排队确定性的本地投影。投影将记录一个脱敏的 `TaskEpisode` 节点。只有严格的复用、隐私和证据门全部通过时，才会创建配方和 CAS 存储；否则结果将只保留为 episode-only。重复的相同验收将是幂等的；冲突载荷将被拒绝，不会悄悄替换已有知识。
+    cd mcp-tools
+    uv sync --locked --no-dev
+    uv run --locked --no-dev python server.py
 
-即使某任务不安全或不够通用、不能成为可复用配方，这一计划流程也能保留有用的图谱历史。若被激活，自动入库绝不存储原始源码、原始命令输出、凭据或任意执行转录。
+标准宿主配置是 .mcp.json。它以 mcp-tools 为工作目录运行上面的锁定命令，
+只转发以下宿主 bridge selector 名称：
 
-## Atlas 派生的工作包和最大安全波次
+- CODEX_DEVKIT_HOST_BRIDGE_FD
+- CODEX_DEVKIT_HOST_BRIDGE_HANDLE
 
-对于已验证且结构充分的 Code Atlas `ImplementationPacket`/`TaskEpisode` 图，调度器会确定性地派生执行单元、受限写入范围、直接契约哈希、依赖关系、注册计划和最大的安全并行波次。已就绪且写入范围与直接契约都不冲突的单元可以同时运行；同一路径或契约冲突的工作会在当前所有者之后排队。这一本地派生不使用 LLM、向量系统或外部 CodeGraph。
+这些是 selector 名称，不是应该自行编造或塞进任务消息的值。需要私有
+宿主 capability broker 或 proof registry 的 Relay 生命周期变更，在宿主
+没有提供可证明能力时会失败关闭，并返回
+RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也不会
+退回到无关的本地 start。
 
-只有证据未知或不足时，任务才标记为 `needs_design` 并一次性交给 Sol 设计；不会靠猜测强行并行。待激活门完成后，经授权验收且通过严格复用、隐私和证据门的模式可以入库到本地图谱，并由同一确定性派生过程复用。
+## 构建主产物
 
-本地 GitHub 风格路径为：
+allowlist builder 会在插件源码树之外生成确定性的 ZIP。例如使用 D 盘任务根：
 
-`任务卡 + 基线修订 → 独立工作树/分支 → 范围内提交 + 证据 → Sol 审阅 → 有序集成/rebase → CI 门 → 发布门`
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output D:\bun\tmp\codex\2718-devkit\artifacts\2718lab-devkit-v1.0.0-rc1.zip
 
-工作者不能合并同伴工作、扩展自己的写入范围，或宣称未经审阅的分支已被验收。持久化同伴交接使用 `workflow_artifact_register → workflow_message_send → workflow_inbox → workflow_artifact_resolve → workflow_message_ack`；聊天可以唤醒工作者，但不是事实来源。
+产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
+.codex-plugin/main-artifact-allowlist.json 选中的六棵运行时目录树。它
+不会打包 skills、prompts、静态 agent、宿主私有状态或任意仓库文件。
+构建输出和临时证据必须留在 D:\bun\tmp\codex 下；不要使用 C 盘临时根。
 
-## Todo、状态和崩溃恢复
+## 运行时数据与崩溃恢复
 
-确定性的团队辅助工具提供受限的 `bootstrap`、`status`、`resume-packet`、`contract-check` 和 `cache-key` 操作。Todo/状态视图区分 `pending_init`、`running`、`blocked` 和 `done`，因此排队初始化不会被展示为正在运行的并行任务。恢复包只包含有边界且脱敏的标识符、租约/端点状态、证据哈希、候选/基线提交和下一步动作。
+持久化数据留在本地。RuntimeConfig 按以下顺序解析数据根：
 
-宿主中断后，应重新绑定当前端点和租约，检查持久化收件箱与 artifact 引用，验证恢复包，并从下一个已授权动作继续。绝不能从聊天记录或原始日志重建权限。
+1. 宿主显式提供的绝对目录 PLUGIN_DATA。
+2. CODEX_HOME/data/2718lab-devkit。
+3. 默认 Codex 数据目录：
+   %USERPROFILE%\.codex\data\2718lab-devkit。
 
-## 隐私、数据根和安全降级
+临时目录依次使用显式提供的 CODEX_TASK_TEMP、TMPDIR、TEMP 或 TMP；都未
+提供时，使用 data 根旁的 .2718lab-devkit-scratch。运行时会拒绝不安全、
+重叠、缺失或 reparse-point 根目录，不会把回退状态写入仓库。
 
-运行时数据保留在本地。Code Atlas 和工作流证据使用配置的插件数据根；任务草稿、工作树、缓存和测试证据放在 `D:\bun\tmp\codex\<project-or-thread>` 下，绝不使用 C 盘临时根。记录经过规范化、大小限制、脱敏和内容寻址。
+宿主中断后，应从持久化工作流租约、端点、artifact 引用、快照和有界
+receipt 恢复。继续前先重新绑定有效的当前上下文。不得从聊天记录、原始
+日志或无关的新 start 重建权限。独立任务只有在证据、提交、集成和验收
+全部完成后才可归档。
 
-索引过期、证据不完整、契约不匹配、宿主不可用或配方被隔离时，系统会失败关闭或记录受范围限制的降级状态。它不会执行任意命令、泄露秘密、静默替换模型或联系外部服务。
+## 确定性 Fast Lane
 
-## 当前 Codex 角色
+Fast Lane 编译器位于
+skills/work-methodology/scripts/fastlane_routing.py 和
+skills/work-methodology/scripts/team_efficiency.py。
 
-仓库内的宿主 profile 是路由权威。声明的宿主能力无法满足精确路由时，结果为 `UNAVAILABLE` 和 `capability_unavailable`；显式路由与 profile 冲突才是 `REJECTED`。运行时不会静默替换模型或推理级别。
+- Ultra 会激活编译器；低于 Ultra 的 effort 需要宿主显式启用。
+- 难度、风险、范围、验证成本、阻塞严重度和可用容量共同选择路由。
+  请求的模型与推理级别保持显式，并且必须有宿主证明。
+- 三个物理 worker 槽位被划分为 start/retain 和诚实的 idle 记录。
+  prewarm 始终是只读证据工作。
+- 只有验证过的终态事件才能释放并补位。commentary 更新不会触发轮询
+  或投机性 refill。
+- 当仓库内宿主 profile 要求时，Sol 负责协调器设计、集成、风险决策和
+  最终验收；Terra 处理常规及复杂的有界执行；Luna 只有在精确模型/
+  effort 组合被证明时才可使用。路由不会静默替换模型。
+- Spark 是严重阻塞的窄道。它需要可复现的关键路径阻塞、有界解耦改动、
+  明确停止条件和显式 entitlement，不是日常默认路线。
 
-| 角色 | 当前职责 |
-| --- | --- |
-| Sol 主对话 | `gpt-5.6-sol` 的 `high`：负责协调、设计、拆分、调度、审阅、集成和最终验收。 |
-| Terra High | `gpt-5.6-terra` 的 `high`：负责常规且有边界的编码、测试、调试、文档和辅助验证。 |
-| Terra Max | `gpt-5.6-terra` 的 `max`：负责中等及以上难度的实现、集成、重构、安全敏感执行和困难回归。 |
-| Sol High | `gpt-5.6-sol` 的 `high`，可选且仅用于特别复杂的有边界执行或深度调查；验收仍由 Sol 主对话负责。 |
-| Luna | 只有当前 Codex 宿主能力报告证明请求的 `gpt-5.6-luna` / `low`、`medium`、`high` 或 `xhigh` 精确组合时才可用；缺少或不匹配证明时返回不可用，不会静默替换模型。未指定 effort 时，仅在 `medium` 精确组合有证明时使用 profile 默认值。本共享 Codex profile 不迁移 Bugkiller；后者仍是独立的策略面。 |
+## 安全与范围边界
 
-## Claude 角色
+- Atlas 是本地确定性服务，不调用 LLM、向量库、外部 CodeGraph、网络
+  服务、Shell 或补丁应用器。
+- Relay 编译显式工作包并返回宿主动作，不伪造成功 spawn；真正的 Codex
+  调度由宿主负责。
+- 工作树、分支、租约、任务、快照、receipt 和证据身份均有绑定；过期、
+  伪造、跨工作流或冲突输入会失败关闭。
+- stdio stdout 只承载协议；诊断写入 stderr。
+- 运行时数据、任务临时目录、工作树、缓存和验证证据均保持本地且有界。
 
-| 家族 | 当前职责 |
-| --- | --- |
-| Opus | 使用 profile 的 `coordinator` 推理级别进行协调。 |
-| Sonnet | 使用 `standard` 进行常规代码执行。 |
-| Haiku | 使用 `light` 处理轻量任务。 |
-| Fable | 使用 `high` 推理，强且昂贵，仅可显式升级；绝不是自动默认，且必须提供显式、非空的升级理由。 |
+## 验证
 
-## 恢复与验证
+RC1 集成树在 D 盘任务根下执行了：
 
-恢复以证据为中心：保留任务卡、范围内分支、候选提交、验收/outbox 状态、artifact 哈希和有边界的恢复包。恢复后以及集成前，重新运行相关的聚焦检查。精确的验证缓存键可以避免重复未变的非核心检查，但核心验证绝不接受部分或未知指纹。
+    cd mcp-tools
+    uv run --locked pytest -q
+    uv lock --check
+    uv run --locked ruff check devkit_atlas/service.py devkit_runtime/atlas_acceptance.py orchestrator/service.py project_index/checkpoints.py project_index/service.py project_index/store.py
+    uv run --locked python -m compileall -q devkit_atlas devkit_runtime orchestrator project_index
 
-发布前，Sol 会验证契约兼容性、任务/租约权限、隐私/脱敏边界、范围内差异、定向测试、静态检查、有序集成和最终 E2E 循环。本文不声称这些最终检查已通过。
+集成树全量回归结果为 1037 passed、13 skipped、40 个 subtests passed。
+全新产物 stdio 检查还验证了精确 16 工具清单、空 prompt/resource 列表、
+协议干净的 stdout、正常和拒绝调用、缺失宿主能力时的失败关闭，以及不依赖
+源 checkout 的独立启动。
 
-## 限制
+## 发布状态
 
-- Code Atlas 是本地且确定性的；没有 LLM、向量、网络或外部 CodeGraph 回退。
-- 渲染出的补丁只是候选，不是已应用的改动，也不是运行它的授权。
-- 只有严格的证据和隐私门通过后，配方才可复用；许多已验收任务正确地只保留为 episode-only。
-- 任务拆分只最大化不冲突的工作；含糊或重叠范围需要设计或排队。
-- 本发布候选指南不是发布、安装、热重载或最终 E2E 的声明。
+当前是 v1.0.0-rc1，不是已发布版本。本仓库状态不声称已有 tag 或远程发布。
+在 push 或打 tag 前，请复核 CHANGELOG.md，确认目标远程和分支，构建
+allowlist 产物，并从短路径 D 盘任务根重复聚焦验证。
 
 ## 许可证
 

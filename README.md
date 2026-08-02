@@ -1,119 +1,164 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — Code Atlas v0.3.0 release-candidate contract
+# 2718lab DevKit — MCP-only v1.0.0-rc1
 
-`2718lab-devkit` is a local development toolkit for Codex and Claude-hosted workflows. This document describes frozen **v0.3.0 release-candidate metadata and contract**, not an activated Code Atlas release. Sol still owns integration and final end-to-end acceptance; it does not claim this version has been published, installed, hot-reloaded, or passed final E2E verification.
+[![version](https://img.shields.io/badge/version-v1.0.0--rc1-blue)](./.codex-plugin/plugin.json)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-## Overview
+2718lab DevKit is a local, stdio-only MCP server for bounded project indexing,
+Atlas evidence, Relay lifecycle coordination, and deterministic Fast Lane
+planning. This repository contains the v1.0.0-rc1 release candidate. It is
+locally integrated and tested, but this README does not claim a remote
+publication, marketplace installation, or hot reload.
 
-Code Atlas turns bounded, accepted engineering evidence into deterministic local graph knowledge: graph-shaped nodes, edges, recipes, and content-addressed blobs (CAS). It helps a worker prepare and render a scoped implementation packet without asking an LLM to rediscover routine repository structure.
+## What is shipped
 
-It is deliberately not an autonomous coding system. A task card, declared write scope, review, and verification remain authoritative. Sol owns the single design pass when evidence is insufficient, plus dispatch, review, integration, and final acceptance; it does not need to pre-decompose every verified Atlas task.
+- Project Index exposes opaque workspace registration, bounded snapshots,
+  status, and graph queries.
+- Checkpoint services create, inspect, and restore evidence-bound snapshots.
+- Atlas provides bounded graph queries, packet preparation, inert rendering,
+  and durable acceptance projection.
+- Relay validates explicit work packages and exposes lifecycle state. Python
+  returns structured host actions; the Codex host remains responsible for
+  worktree bootstrap and agent dispatch.
+- The primary package is MCP-only: it exposes exactly 16 tools, no MCP prompts,
+  no MCP resources, no static prompt agents, and no model runner.
+- Fast Lane remains a pure local compiler in the work-methodology skill. It
+  selects explicit model/effort routes from bounded difficulty and host
+  capability evidence; it never spawns agents, edits Git, or runs commands.
 
-## Installation status
+## Exact MCP surface
 
-v0.3.0 is a release candidate. No remote publication or successful installation is asserted here. The Code Atlas MCP activation remains gated on ATLAS-11 registration and ATLAS-13 end-to-end acceptance. Once Sol accepts a published release, the local marketplace identifier remains `2718lab-devkit@pidan-local-plugins`; verify the installed artifact in a new Codex task rather than assuming source changes hot-reload.
+The public server name is 2718lab-devkit. Every result uses the bounded
+2718lab-devkit/tool-result-v1 envelope. The public surface is exactly:
 
-## Four frozen Code Atlas interface names — ATLAS-11 activation gate
-
-The following names define the frozen v0.3 interface contract. They are **not currently registered by the FastMCP tool set**, cannot be called from it, and do not activate automatic ingestion. ATLAS-11 must register and contract-test them before this interface becomes callable; ATLAS-13 must then pass final E2E acceptance.
-
-| Tool | Purpose | Safety boundary |
-| --- | --- | --- |
-| `code_atlas_graph_query` | Contract: read a bounded local graph neighbourhood after activation. | Would return graph records and hashes, never an unbounded source dump. |
-| `code_atlas_prepare` | Contract: match a verified local recipe and prepare an implementation packet after activation. | Would return a status and evidence-bound packet; it would not edit a workspace. |
-| `code_atlas_render` | Contract: render a deterministic patch candidate from a valid packet and bindings after activation. | Would return a candidate and inert test specifications; it would not apply a patch or run commands. |
-| `workflow_accept_code_task` | Contract: accept a coordinator-authorized code-task result and queue local Atlas ingestion after activation. | Would remain authority- and evidence-bound; workers could not self-accept. |
-
-The status contract below is frozen now, but the related MCP interface remains pending ATLAS-11 registration.
-
-| Status | Exact action |
+| Area | Tools |
 | --- | --- |
-| `READY` | Use the local verified recipe within the assigned scope and verify it. |
-| `NO_VERIFIED_RECIPE` | Perform one normal scoped implementation, preserve evidence, then allow later automatic local ingestion. Do not fall back to an external CodeGraph, LLM, or vector service. |
-| `INDEX_STALE` | Refresh the approved local index before using a recipe. |
-| `AMBIGUOUS_MATCH` | Stop and ask Sol to select or narrow the contract. |
-| `UNSUPPORTED_LANGUAGE` | Record the gap and keep the task scoped; do not invent a recipe. |
-| `RENDER_INVALID` | Reject the candidate, keep evidence, and correct the local contract. |
-| `EVIDENCE_INCOMPLETE` | Collect bounded local evidence before claiming a verified recipe. |
-| `RECIPE_QUARANTINED` | Do not use the recipe; preserve the quarantine reason. |
-| `INGEST_PENDING` | Keep the accepted implementation evidence for later local ingestion. |
-| `ATLAS_UNAVAILABLE` | Use the task card's scoped fallback and record the degraded state. |
-| `MODEL_UNAVAILABLE` | Do not substitute a model; return the routing result to Sol. |
+| Project Index | project_index_register, project_index_sync, project_index_status, project_index_query |
+| Checkpoints | worktree_checkpoint_create, worktree_checkpoint_status, worktree_checkpoint_restore |
+| Atlas | atlas_query, atlas_prepare, atlas_render, atlas_accept |
+| Relay | relay_compile, relay_start, relay_status, relay_handoff, relay_integrate |
 
-## Deterministic local graph and recipes
+The server has no prompt or resource surface. Tool inputs are structured and
+bounded; absolute worker paths, shell fragments, raw source, credentials,
+unbounded command output, and caller-forged acceptance evidence are rejected.
 
-The graph contains typed knowledge nodes and explicit edges for local recipes, constraints, dependencies, test specifications, evidence descriptors, and accepted task episodes. Recipes and binary/template assets are referenced by canonical SHA-256 content addresses in the local CAS. Queries, matching, rendering, canonicalization, and conflict handling are deterministic and bounded by node, edge, depth, and byte budgets.
+## Install and run locally
 
-Code Atlas uses **no LLM, embeddings, vector database, network service, or external CodeGraph**. It never falls back to an external CodeGraph. It is a local planning and reuse aid, not a model router, shell executor, patch applier, or hidden dispatcher.
+Requirements: Python 3.11 or newer and uv.
 
-## Planned automatic accepted-task ingestion
+From the repository root:
 
-After ATLAS-11 registration and ATLAS-13 E2E acceptance, the frozen `workflow_accept_code_task` contract would write a durable acceptance/outbox record and queue deterministic local projection. Projection would record a redacted `TaskEpisode` node. Recipe creation and CAS storage would occur only when strict reuse, privacy, and evidence gates pass; otherwise the result would remain episode-only. Repeated identical acceptance would be idempotent, while a conflicting payload would be rejected rather than silently replacing knowledge.
+    cd mcp-tools
+    uv sync --locked --no-dev
+    uv run --locked --no-dev python server.py
 
-This planned flow preserves useful graph history even when a task is not safe or general enough to become a reusable recipe. If activated, automatic ingestion must never store raw source, raw command output, credentials, or an arbitrary execution transcript.
+The canonical host configuration is .mcp.json. It runs the locked command
+above with mcp-tools as the working directory. The configuration forwards only
+the host bridge selector names:
 
-## Atlas-derived work packages and maximal safe waves
+- CODEX_DEVKIT_HOST_BRIDGE_FD
+- CODEX_DEVKIT_HOST_BRIDGE_HANDLE
 
-For a verified, sufficiently structured Code Atlas `ImplementationPacket`/`TaskEpisode` graph, the scheduler deterministically derives execution units, bounded write scopes, direct contract hashes, dependencies, a registration plan, and the maximal safe parallel waves. Ready units whose write scopes and direct contracts do not conflict may run together; same-path or contract-conflicting work queues behind its active owner. This local derivation does not use an LLM, a vector system, or an external CodeGraph.
+These names are selectors, not values to invent or copy into a task message.
+Relay lifecycle mutations that need the private host capability broker or proof
+registry fail closed when the host does not provide an attested capability,
+using RELAY_CAPABILITY_BROKER_UNAVAILABLE. The server never exposes raw
+handles or falls back to an unrelated local start.
 
-Only when the evidence is unknown or insufficient is the task marked `needs_design` and handed to Sol for one design pass; it is not guessed into parallel execution. After the pending activation gates, an authorized accepted pattern that passes the strict reuse, privacy, and evidence gates may be ingested into the local graph and reused by the same deterministic derivation.
+## Build the primary artifact
 
-The local GitHub-style path is:
+The allowlisted builder creates a deterministic ZIP outside the plugin source
+tree. For example, with a D-drive task root:
 
-`task card + base revision → isolated worktree/branch → scoped commit + evidence → Sol review → ordered integration/rebase → CI gate → release gate`
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output D:\bun\tmp\codex\2718-devkit\artifacts\2718lab-devkit-v1.0.0-rc1.zip
 
-Workers do not merge peers, extend their own write scope, or declare an unreviewed branch accepted. Durable peer handoff uses `workflow_artifact_register → workflow_message_send → workflow_inbox → workflow_artifact_resolve → workflow_message_ack`; chat may wake a worker but is not the source of truth.
+The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
+project, and the six runtime trees selected by
+.codex-plugin/main-artifact-allowlist.json. It does not package skills,
+prompts, static agents, host-private state, or arbitrary repository files.
+Build output and temporary evidence must stay under D:\bun\tmp\codex; do not
+use a C-drive temporary root.
 
-## Todo, status, and crash resume
+## Runtime data and recovery
 
-The deterministic team helper provides bounded `bootstrap`, `status`, `resume-packet`, `contract-check`, and `cache-key` operations. Todo/status views distinguish `pending_init`, `running`, `blocked`, and `done`, so queued initialization is not presented as active parallel work. Resume packets contain only bounded, redacted identifiers, lease/endpoint state, evidence hashes, candidate/base commits, and the next action.
+Persistent data is local. RuntimeConfig resolves the data root in this order:
 
-After a host interruption, rebind the current endpoint and lease, inspect the durable inbox and artifact references, validate the resume packet, and continue from the next authorized action. Never reconstruct authority from chat history or raw logs.
+1. PLUGIN_DATA, when the host explicitly provides an absolute directory.
+2. CODEX_HOME/data/2718lab-devkit.
+3. The default Codex data directory:
+   %USERPROFILE%\.codex\data\2718lab-devkit.
 
-## Privacy, data roots, and safe degradation
+Scratch paths use CODEX_TASK_TEMP, TMPDIR, TEMP, or TMP when explicitly
+provided, otherwise a sibling .2718lab-devkit-scratch directory. The runtime
+rejects unsafe, overlapping, missing, or reparse-point roots and does not write
+fallback state into the repository.
 
-Runtime data stays local. Code Atlas and workflow evidence use the configured plugin data root; task scratch files, worktrees, caches, and test evidence are kept under `D:\bun\tmp\codex\<project-or-thread>`, never a C-drive temporary root. Records are canonical, size-bounded, redacted, and content-addressed.
+After a host interruption, resume from the durable workflow lease, endpoint,
+artifact references, snapshots, and bounded receipts. Rebind a valid current
+context before continuing. Do not reconstruct authority from chat history,
+raw logs, or an unrelated new start. Archive a completed independent task only
+after evidence, commit, integration, and acceptance have all succeeded.
 
-If an index is stale, evidence is incomplete, a contract mismatches, a host is unavailable, or a recipe is quarantined, the system fails closed or records a scoped degraded state. It does not execute arbitrary commands, reveal secrets, silently substitute a model, or contact an external service.
+## Deterministic Fast Lane
 
-## Current Codex roles
+The Fast Lane compiler is in
+skills/work-methodology/scripts/fastlane_routing.py and
+skills/work-methodology/scripts/team_efficiency.py.
 
-The checked-in host profile is the routing authority. When a declared host capability
-cannot satisfy an exact route, the routing result is `UNAVAILABLE` with
-`capability_unavailable`; an explicit route/profile conflict is `REJECTED`. The runtime
-does not silently substitute a model or reasoning level.
+- Ultra activates the compiler; lower efforts require the host's explicit
+  enablement.
+- Difficulty, risk, scope, verification cost, blocker severity, and available
+  capacity select the route. The requested model and reasoning effort remain
+  explicit and host-attested.
+- Three physical worker slots are partitioned into start/retain and honest
+  idle records. Prewarm is read-only evidence work.
+- A free slot is refilled only after a validated terminal event. Commentary
+  updates never trigger polling or speculative refill.
+- Sol is reserved for the coordinator's design, integration, risk decisions,
+  and final acceptance when the checked-in host profile requires it. Terra
+  handles normal and complex bounded execution; Luna is used only for an
+  exactly attested model/effort pair. No route silently substitutes a model.
+- Spark is a narrow severe-blocker lane. It requires a reproducible critical
+  path blocker, a bounded decoupling change, a clear stop condition, and
+  explicit entitlement; it is not a routine default.
 
-| Role | Current responsibility |
-| --- | --- |
-| Sol main | `gpt-5.6-sol` at `high` for coordination: design, decomposition, dispatch, review, integration, and final acceptance. |
-| Terra High | `gpt-5.6-terra` at `high` for routine bounded coding, testing, debugging, documentation, and auxiliary validation. |
-| Terra Max | `gpt-5.6-terra` at `max` for moderate-or-harder implementation, integration, refactoring, security-sensitive execution, and difficult regressions. |
-| Sol High | `gpt-5.6-sol` at `high`, optional only for exceptional bounded execution or deep investigation; Sol main still owns acceptance. |
-| Luna | `gpt-5.6-luna` at the requested `low`, `medium`, `high`, or `xhigh` effort only when the current Codex host capability report attests that exact pair; otherwise the route is unavailable and no substitute is labelled Luna. An omitted effort uses the profile's `medium` default only when attested. This shared Codex profile does not migrate Bugkiller, which remains a separate policy surface. |
+## Safety and scope boundaries
 
-## Claude roles
+- Atlas is deterministic and local. It does not call an LLM, vector store,
+  external CodeGraph, network service, shell, or patch applier.
+- Relay compiles explicit packages and returns host actions; it does not
+  fabricate successful spawns. The host owns the actual Codex dispatch.
+- Worktree, branch, lease, task, snapshot, receipt, and evidence identities
+  are bound and fail closed on stale, forged, cross-workflow, or conflicting
+  input.
+- stdio stdout is protocol-only. Diagnostics go to stderr.
+- Runtime data, task scratch, worktrees, caches, and verification evidence
+  remain local and bounded.
 
-| Family | Current responsibility |
-| --- | --- |
-| Opus | Coordinator at the profile's `coordinator` reasoning level. |
-| Sonnet | Regular code execution at `standard`. |
-| Haiku | Light tasks at `light`. |
-| Fable | `high`-reasoning, expensive explicit escalation only; it is never an automatic default and requires an explicit non-empty escalation reason. |
+## Verification
 
-## Recovery and verification
+The RC1 integration was verified from a fresh D-drive task root with:
 
-Recovery is evidence-led: preserve the task card, scoped branch, candidate commit, acceptance/outbox state, artifact hashes, and bounded resume packet. Re-run the relevant focused checks after resume and before integration. An exact verification-cache key may avoid repeating an unchanged non-core lane, but core verification never accepts partial or unknown fingerprints.
+    cd mcp-tools
+    uv run --locked pytest -q
+    uv lock --check
+    uv run --locked ruff check devkit_atlas/service.py devkit_runtime/atlas_acceptance.py orchestrator/service.py project_index/checkpoints.py project_index/service.py project_index/store.py
+    uv run --locked python -m compileall -q devkit_atlas devkit_runtime orchestrator project_index
 
-Before release, Sol verifies contract compatibility, task/lease authority, privacy/redaction boundaries, scoped diffs, targeted tests, static checks, ordered integration, and the final E2E cycle. This documentation does not claim those final checks have passed.
+The full regression result for the integrated tree was 1037 passed, 13
+skipped, and 40 subtests passed. The fresh-artifact stdio checks also verify
+the exact 16-tool inventory, empty prompt/resource lists, protocol-clean
+stdout, normal and rejected calls, missing-host capability failure, and
+source-checkout independence.
 
-## Limitations
+## Release status
 
-- Code Atlas is local and deterministic; it has no LLM, vector, network, or external CodeGraph fallback.
-- A rendered patch is a candidate, not an applied change or approval to run it.
-- A recipe is reusable only after strict evidence and privacy gates; many accepted tasks correctly remain episode-only.
-- Task decomposition maximizes only non-conflicting work. Ambiguous or overlapping scopes require design or queueing.
-- This release-candidate guide is not a publication, installation, hot-reload, or final-E2E claim.
+This is v1.0.0-rc1, not a published release. There is no tag or remote
+publication asserted by this repository state. Before pushing or tagging,
+review CHANGELOG.md, confirm the intended remote and branch, build the
+allowlisted artifact, and repeat the focused verification from a short
+D-drive task root.
 
 ## License
 
