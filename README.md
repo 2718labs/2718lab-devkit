@@ -11,6 +11,14 @@ planning. This repository contains the v1.0.0-rc1 release candidate. It is
 locally integrated and tested, but this README does not claim a remote
 publication, marketplace installation, or hot reload.
 
+> [!IMPORTANT]
+> **Workflow reminder:** route from bounded evidence, keep one writer per
+> write scope, claim and bind before execution, refill only after a validated
+> terminal event, integrate and accept before archiving. Prewarm is read-only;
+> `action="retain"` is not a new spawn. Keep task roots, caches, worktrees,
+> and evidence under `D:\bun\tmp\codex\<project-or-thread>` by default; an
+> explicitly configured quota sample path may use another approved drive.
+
 ## What is shipped
 
 - Project Index exposes opaque workspace registration, bounded snapshots,
@@ -26,6 +34,25 @@ publication, marketplace installation, or hot reload.
 - Fast Lane remains a pure local compiler in the work-methodology skill. It
   selects explicit model/effort routes from bounded difficulty and host
   capability evidence; it never spawns agents, edits Git, or runs commands.
+
+## Documentation map
+
+Use this page as the entry point, then follow the contract links instead of
+re-reading the whole repository:
+
+- [Work methodology and Fast Lane contract](skills/work-methodology/SKILL.md)
+- [Efficiency automation reference and CLI details](skills/work-methodology/references/efficiency-automation.md)
+- [Verification checklist](skills/work-methodology/references/verification-checklist.md)
+- [Work-package and task-card rules](skills/work-methodology/references/work-packages.md)
+- [Orchestration runtime contract](skills/work-methodology/references/orchestration-runtime.md)
+- [Team and lane patterns](skills/work-methodology/references/team-patterns.md)
+- [Ultra Fast Lane design](docs/superpowers/specs/2026-07-30-ultra-fast-lane-design.md)
+- [Codex-first tool/plugin design](docs/superpowers/specs/2026-07-31-codex-first-tool-plugin-design.md)
+- [Release history](CHANGELOG.md)
+
+For implementation entry points, see
+[the Fast Lane compiler](skills/work-methodology/scripts/team_efficiency.py) and
+[the live Codex quota producer](skills/work-methodology/scripts/codex_account_quota.py).
 
 ## Exact MCP surface
 
@@ -122,6 +149,23 @@ skills/work-methodology/scripts/team_efficiency.py.
 - Spark is a narrow severe-blocker lane. It requires a reproducible critical
   path blocker, a bounded decoupling change, a clear stop condition, and
   explicit entitlement; it is not a routine default.
+
+### Live account quota reminder
+
+The host must opt into the official local Codex account source when quota
+balancing is part of a dispatch. `--live-quota` reads the main and Spark pools
+through `codex app-server --stdio`, binds the fresh signed snapshot to the
+quota request, and fails closed to `usage_unknown` on source, freshness, or
+signature errors:
+
+    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
+
+The detailed producer contract is in
+[codex_account_quota.py](skills/work-methodology/scripts/codex_account_quota.py).
+It never reads `auth.json`, cookies, or private HTTP endpoints; its sample
+cache path is user-configurable through `--quota-state-path` (for example a
+G-drive project cache). If no path is supplied, it follows `CODEX_TASK_TEMP`;
+it never silently falls back to a C-drive temporary directory.
 
 ## Safety and scope boundaries
 

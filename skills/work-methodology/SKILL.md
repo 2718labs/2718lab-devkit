@@ -141,8 +141,9 @@ python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --h
 若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。
 
 归档不是 adapter 操作：只能在 lane 0 已完成 acceptance、最终证据已绑定之后由 host 执行。
-所有 scratch、worktree、cache、测试证据都位于 `D:\bun\tmp\codex\<project-or-thread>`；禁止把
-`TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。
+默认 scratch、worktree、cache、测试证据都位于
+`D:\bun\tmp\codex\<project-or-thread>`；用户显式配置的 quota sample cache
+可使用其他获准盘符。禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。
 
 ### 6. 验证与交付
 

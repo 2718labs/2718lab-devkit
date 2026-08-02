@@ -35,7 +35,6 @@ _SNAPSHOT_TTL_SECONDS = 120
 _MAX_JSONL_LINE_BYTES = 128 * 1024
 _MAX_MESSAGES = 64
 _CACHE_SCHEMA = "2718lab-devkit/codex-quota-sample-cache-v1"
-_STATE_ROOT = "d:\\bun\\tmp\\codex\\"
 
 
 class CodexQuotaError(RuntimeError):
@@ -114,9 +113,12 @@ def _validate_state_path(value: Path | None) -> Path | None:
             return None
         value = Path(raw) / "codex-quota-sample-cache.json"
     path = value.expanduser().resolve(strict=False)
-    normalized = str(path).replace("/", "\\").lower()
-    if os.name == "nt" and not normalized.startswith(_STATE_ROOT):
-        raise CodexQuotaError("quota state path must be under the D task root")
+    if not path.is_absolute():
+        raise CodexQuotaError("quota state path must be absolute")
+    if os.name == "nt" and path.drive.upper() == "C:":
+        raise CodexQuotaError(
+            "quota state path must use an explicit non-C configured root"
+        )
     return path
 
 

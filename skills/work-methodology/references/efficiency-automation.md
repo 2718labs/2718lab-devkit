@@ -310,6 +310,34 @@ read-only role and is not a name for this bootstrap.
 Prewarm is read-only evidence, not acceptance evidence: a later writer may
 reuse it only after current-basis delta revalidation passes.
 
+### Live account quota
+
+When quota balancing participates in dispatch, the host uses
+`--live-quota` so the planner receives a fresh signed snapshot from the local
+Codex app-server. The adapter calls only
+`account/read` (with `refreshToken=false`) and `account/rateLimits/read`, then
+binds the exact `codex` main pool and the exact
+`GPT-5.3-Codex-Spark` pool into the quota request. The implementation is
+[`codex_account_quota.py`](../scripts/codex_account_quota.py); its HMAC key
+stays in memory and it never reads `auth.json`, cookies, or a private HTTP
+endpoint.
+
+The base quota request must carry the host-bound `snapshot.capacity`. The live
+adapter replaces only the snapshot, recomputes `request_hash`, and calls the
+pure compiler with the in-memory key resolver:
+
+```text
+python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
+```
+
+The first sample has no prior slope and therefore records zero delta; later
+samples in the same reset period calculate the bounded 300-second increase.
+Missing pools, malformed JSONL, timeouts, stale signatures, or an unavailable
+source return `usage_unknown` and block new starts. The sample cache is
+non-sensitive and user-configurable through `--quota-state-path` (for example
+a G-drive project cache). If omitted, it follows `CODEX_TASK_TEMP`; it never
+silently falls back to a C-drive temporary directory.
+
 The terminal protocol is bounded to one regression (the integration regression
 pass), one blocker review, and at most one global remediation (targeted to the
 finding). Candidate or review results never unlock a dependency; lane 0 integration, artifact
@@ -332,7 +360,8 @@ external receipt bodies.
 The adapter never archives work. The host may archive only after lane 0 acceptance
 and final evidence binding have completed. Scratch files, worktrees,
 caches, and test evidence must remain under
-`D:\bun\tmp\codex\<project-or-thread>`; C-drive temporary roots are forbidden.
+`D:\bun\tmp\codex\<project-or-thread>` by default; an explicitly configured
+`--quota-state-path` may use another approved drive. C-drive temporary roots are forbidden.
 
 ## CLI
 

@@ -211,7 +211,11 @@ class CodexAccountQuotaTests(unittest.TestCase):
         self.assertEqual(0, first.snapshot["main"]["delta_ppm_300s"])
         self.assertEqual(10000, second.snapshot["main"]["delta_ppm_300s"])
 
-    def test_state_cache_rejects_c_drive_path(self) -> None:
+    def test_state_cache_accepts_explicit_user_configured_g_drive_path(self) -> None:
+        module = load_provider()
+        module.CodexQuotaProvider(state_path=Path("G:/2718lab-devkit/quota-cache.json"))
+
+    def test_state_cache_rejects_unapproved_c_drive_temp_path(self) -> None:
         module = load_provider()
         with self.assertRaises(module.CodexQuotaError):
             module.CodexQuotaProvider(state_path=Path("C:/codex-quota-cache.json"))

@@ -10,6 +10,13 @@
 本仓库包含 v1.0.0-rc1 发布候选版，已完成本地集成和测试；本文不声称
 已经远程发布、市场安装或热重载。
 
+> [!IMPORTANT]
+> **工作流提醒：** 先用有界证据路由；一个写入范围只允许一个 writer；执行前必须
+> claim 并 bind；只有验证过的终态事件才能 refill；完成集成和验收后才能归档。
+> prewarm 只读，`action="retain"` 不是新 spawn。任务根、缓存、工作树和证据统一放在
+> `D:\bun\tmp\codex\<project-or-thread>`（默认）；显式配置的 quota 样本缓存可以放在
+> 其他获准盘符。
+
 ## 已交付内容
 
 - Project Index 提供不透明工作区注册、受限快照、状态和图查询。
@@ -22,6 +29,24 @@
 - Fast Lane 仍是 work-methodology skill 中的纯本地编译器。它根据有界
   难度和宿主能力证据选择显式模型/推理级别，不创建 agent、不改 Git、
   不执行命令。
+
+## 文档导航
+
+把本页作为入口，按契约跳转到需要的细节，不必重复阅读整个仓库：
+
+- [工作方法与 Fast Lane 契约](skills/work-methodology/SKILL.md)
+- [效率自动化参考与 CLI 细节](skills/work-methodology/references/efficiency-automation.md)
+- [验证清单](skills/work-methodology/references/verification-checklist.md)
+- [工作包与任务卡规则](skills/work-methodology/references/work-packages.md)
+- [编排运行时契约](skills/work-methodology/references/orchestration-runtime.md)
+- [团队与 lane 模式](skills/work-methodology/references/team-patterns.md)
+- [Ultra Fast Lane 设计](docs/superpowers/specs/2026-07-30-ultra-fast-lane-design.md)
+- [Codex-first 工具/插件设计](docs/superpowers/specs/2026-07-31-codex-first-tool-plugin-design.md)
+- [发布历史](CHANGELOG.md)
+
+实现入口见
+[Fast Lane 编译器](skills/work-methodology/scripts/team_efficiency.py) 和
+[实时 Codex 额度生产器](skills/work-methodology/scripts/codex_account_quota.py)。
 
 ## 精确 MCP 面
 
@@ -108,6 +133,20 @@ skills/work-methodology/scripts/team_efficiency.py。
   effort 组合被证明时才可使用。路由不会静默替换模型。
 - Spark 是严重阻塞的窄道。它需要可复现的关键路径阻塞、有界解耦改动、
   明确停止条件和显式 entitlement，不是日常默认路线。
+
+### 实时账号额度提醒
+
+需要额度平衡时，宿主必须显式接入官方本地 Codex 额度源。`--live-quota` 通过
+`codex app-server --stdio` 读取主池和 Spark 池，把新鲜签名快照绑定到 quota request；
+来源、freshness 或签名异常时会失败关闭为 `usage_unknown`：
+
+    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
+
+详细生产器契约见
+[codex_account_quota.py](skills/work-methodology/scripts/codex_account_quota.py)。它不会读取
+`auth.json`、cookie 或私有 HTTP 接口；样本缓存路径由用户通过
+`--quota-state-path` 配置（例如 G 盘项目缓存）。未提供时跟随
+`CODEX_TASK_TEMP`，不会静默回落到 C 盘临时目录。
 
 ## 安全与范围边界
 
