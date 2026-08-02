@@ -7,7 +7,20 @@
     ".codex-plugin/fastlane_todo_projection.py",
     "mcp-tools/pyproject.toml",
     "mcp-tools/server.py",
-    "mcp-tools/uv.lock"
+    "mcp-tools/uv.lock",
+    "skills/work-methodology/SKILL.md",
+    "skills/work-methodology/assets/fastlane-quota-balance-policy-v1.json",
+    "skills/work-methodology/assets/fastlane-routing-policy-v3.json",
+    "skills/work-methodology/references/efficiency-automation.md",
+    "skills/work-methodology/references/grounding-discipline.md",
+    "skills/work-methodology/references/orchestration-runtime.md",
+    "skills/work-methodology/references/team-patterns.md",
+    "skills/work-methodology/references/verification-checklist.md",
+    "skills/work-methodology/references/work-packages.md",
+    "skills/work-methodology/scripts/codex_account_quota.py",
+    "skills/work-methodology/scripts/fastlane_quota_balance.py",
+    "skills/work-methodology/scripts/fastlane_routing.py",
+    "skills/work-methodology/scripts/team_efficiency.py"
   ],
   "trees": [
     "mcp-tools/bugkiller",
