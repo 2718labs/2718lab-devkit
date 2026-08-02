@@ -6657,6 +6657,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         for assignment in projection["assignments"]:
             self.assertEqual("external_session_required", assignment["action"])
             self.assertEqual("not_created", assignment["session_state"])
+            self.assertTrue(assignment["worktree_required"])
             self.assertEqual(
                 assignment["context_hash"],
                 assignment["lease_fencing_predecessor"]["context_hash"],

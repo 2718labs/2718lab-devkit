@@ -311,8 +311,12 @@ an external host action: it creates no session, worker, target, process, or
 workflow transition. Each deterministic external assignment carries the exact
 task route/context plus a predecessor fence binding the source plan, quota
 snapshot and decision hashes, ledger epoch, active-lease-set hash, and its
-assignment identity. The independent-session owner must revalidate that fence
-and acquire its own atomic workflow/ledger claim before any execution.
+assignment identity. Every external assignment also carries
+`worktree_required=true`: the independent-session owner must create and bind
+an isolated Git worktree under the approved task root, never the coordinator's
+dirty integration checkout, then revalidate that fence and acquire its own
+atomic workflow/ledger claim before any execution. A missing, foreign, or
+unverified worktree fails closed.
 
 If a local child slot is unfilled, the projection is `not_required`; it cannot
 invent an external assignment. Unknown, stale, untrusted, receipt-invalid,
