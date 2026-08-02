@@ -15,12 +15,12 @@ jobs:
     name: MCP runtime (Python 3.11)
     runs-on: ubuntu-latest
     env:
-      CODEX_TASK_TEMP: ${{ github.workspace }}/.codex-task-temp/mcp-runtime
-      TEMP: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/tmp
-      TMP: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/tmp
-      TMPDIR: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/tmp
-      PYTHONPYCACHEPREFIX: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/pycache
-      UV_CACHE_DIR: ${{ github.workspace }}/.codex-task-temp/mcp-runtime/uv-cache
+      CODEX_TASK_TEMP: ${{ runner.temp }}/2718lab-devkit-task/mcp-runtime
+      TEMP: ${{ runner.temp }}/2718lab-devkit-task/mcp-runtime/tmp
+      TMP: ${{ runner.temp }}/2718lab-devkit-task/mcp-runtime/tmp
+      TMPDIR: ${{ runner.temp }}/2718lab-devkit-task/mcp-runtime/tmp
+      PYTHONPYCACHEPREFIX: ${{ runner.temp }}/2718lab-devkit-task/mcp-runtime/pycache
+      UV_CACHE_DIR: ${{ runner.temp }}/2718lab-devkit-task/mcp-runtime/uv-cache
     defaults:
       run:
         working-directory: mcp-tools

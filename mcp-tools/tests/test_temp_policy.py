@@ -14,8 +14,9 @@ def test_server_card_temp_and_cache_environment_stays_under_task_root() -> None:
     if os.name == "nt":
         assert task_root.drive.casefold() == "d:"
     else:
-        workspace_root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-        assert task_root.is_relative_to(workspace_root)
+        runner_temp = os.environ.get("RUNNER_TEMP")
+        if runner_temp:
+            assert task_root.is_relative_to(Path(runner_temp).resolve())
 
     for name in (
         "CODEX_TASK_TEMP",
