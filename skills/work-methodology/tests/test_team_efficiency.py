@@ -6649,7 +6649,14 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(0, projection["local_active_count"])
         self.assertEqual(6, projection["global_main_target"])
         self.assertEqual(6, projection["global_main_free"])
-        self.assertEqual(3, projection["external_session_count"])
+        self.assertEqual(
+            "all_non_spark_agents_across_sessions", projection["main_pool_scope"]
+        )
+        self.assertEqual(3, projection["external_agent_count"])
+        self.assertEqual(
+            projection["global_main_free"],
+            len(local_starts) + projection["external_agent_count"],
+        )
         self.assertEqual(
             projection["external_assignment_ids"],
             [item["assignment_id"] for item in projection["assignments"]],
@@ -6718,7 +6725,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=under_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("not_required", under_capacity["status"])
-        self.assertEqual(0, under_capacity["external_session_count"])
+        self.assertEqual(0, under_capacity["external_agent_count"])
         self.assertIn("local_capacity_available", under_capacity["reason_codes"])
 
         request = request_with_units(6)
@@ -6744,7 +6751,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=lease_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("blocked", unavailable["status"])
-        self.assertEqual(0, unavailable["external_session_count"])
+        self.assertEqual(0, unavailable["external_agent_count"])
         self.assertIn("quota_usage_unknown", unavailable["reason_codes"])
 
         stale_quota, stale_resolver, stale_routes, stale_bindings = (
@@ -6765,7 +6772,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=stale_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("blocked", stale["status"])
-        self.assertEqual(0, stale["external_session_count"])
+        self.assertEqual(0, stale["external_agent_count"])
         self.assertIn("quota_snapshot_stale", stale["reason_codes"])
 
         fenced_quota, fenced_resolver, fenced_routes, fenced_bindings = (
@@ -6787,7 +6794,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=fenced_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("blocked", fenced["status"])
-        self.assertEqual(0, fenced["external_session_count"])
+        self.assertEqual(0, fenced["external_agent_count"])
         self.assertIn("quota_host_status_fenced", fenced["reason_codes"])
 
         foreign_host = copy.deepcopy(host_status)
@@ -6803,7 +6810,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=lease_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("blocked", foreign["status"])
-        self.assertEqual(0, foreign["external_session_count"])
+        self.assertEqual(0, foreign["external_agent_count"])
         self.assertIn("no_safe_work", foreign["reason_codes"])
 
         over_bound_request = request_with_units(13)
@@ -6835,7 +6842,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=over_bound_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("blocked", over_bound["status"])
-        self.assertEqual(0, over_bound["external_session_count"])
+        self.assertEqual(0, over_bound["external_agent_count"])
         self.assertIn("external_assignment_limit_exceeded", over_bound["reason_codes"])
 
 

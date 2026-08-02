@@ -463,6 +463,7 @@ _FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS = frozenset(
         "local_capacity",
         "local_active_count",
         "local_free",
+        "main_pool_scope",
         "global_main_target",
         "global_main_active",
         "global_main_free",
@@ -470,7 +471,7 @@ _FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS = frozenset(
         "quota_evidence_hash",
         "quota_snapshot_hash",
         "quota_decision_hash",
-        "external_session_count",
+        "external_agent_count",
         "external_assignment_ids",
         "assignments",
         "reason_codes",
@@ -7508,7 +7509,7 @@ def _fast_lane_cross_session_projection(
     occupancy: Mapping[str, Any] | None,
     quota_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Compile inert external-session requirements from already-bound evidence."""
+    """Compile inert external-agent assignments from already-bound evidence."""
 
     source_plan_hash = _hash(result["source_plan_hash"], "source plan hash")
     local_active_count = (
@@ -7540,13 +7541,14 @@ def _fast_lane_cross_session_projection(
     ) -> dict[str, Any]:
         normalized_assignments = [dict(item) for item in assignments]
         projection = {
-            "schema": "team-efficiency/fast-lane-cross-session-dispatch-projection-v1",
+            "schema": "team-efficiency/fast-lane-cross-session-dispatch-projection-v2",
             "status": status,
             "source_plan_hash": source_plan_hash,
             "workflow_id_hash": workflow_id_hash,
             "local_capacity": len(FAST_LANE_SLOT_IDS),
             "local_active_count": local_active_count,
             "local_free": local_free,
+            "main_pool_scope": "all_non_spark_agents_across_sessions",
             "global_main_target": target,
             "global_main_active": global_active,
             "global_main_free": global_free,
@@ -7554,7 +7556,7 @@ def _fast_lane_cross_session_projection(
             "quota_evidence_hash": evidence_hash,
             "quota_snapshot_hash": snapshot_hash,
             "quota_decision_hash": decision_hash,
-            "external_session_count": len(normalized_assignments),
+            "external_agent_count": len(normalized_assignments),
             "external_assignment_ids": [
                 item["assignment_id"] for item in normalized_assignments
             ],
