@@ -248,7 +248,11 @@ def _runtime_failure(
     error: RuntimeConfigError | RelayRuntimeError,
 ) -> dict[str, object]:
     if isinstance(error, RuntimeConfigError):
-        if error.code in {"DATA_ROOT_INVALID", "DATA_ROOT_UNAVAILABLE"}:
+        if error.code in {
+            "DATA_ROOT_INVALID",
+            "DATA_ROOT_UNAVAILABLE",
+            "PROJECT_SCOPE_INVALID",
+        }:
             return _failure(error.code)
         return _failure("INTERNAL_ERROR")
     if error.code == "RELAY_STORAGE_ERROR":

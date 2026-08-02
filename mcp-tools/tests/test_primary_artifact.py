@@ -55,9 +55,14 @@ EXPECTED_TREES = (
     "mcp-tools/orchestrator",
     "mcp-tools/project_index",
 )
-EXPECTED_BRIDGE_SELECTORS = (
+EXPECTED_ENV_VARS = (
     "CODEX_DEVKIT_HOST_BRIDGE_FD",
     "CODEX_DEVKIT_HOST_BRIDGE_HANDLE",
+    "CODEX_PROJECT_ROOT",
+    "CODEX_WORKSPACE_ROOT",
+    "CODEX_PROJECT_ID",
+    "CODEX_WORKSPACE_ID",
+    "CODEX_THREAD_ID",
 )
 
 
@@ -176,7 +181,7 @@ def test_primary_allowlist_is_explicit_and_runtime_only() -> None:
         assert excluded not in serialized
 
 
-def test_primary_mcp_config_exports_only_locked_bridge_selectors() -> None:
+def test_primary_mcp_config_exports_only_locked_bridge_and_context_variables() -> None:
     configuration = json.loads(MCP_CONFIG.read_text(encoding="utf-8"))
 
     assert set(configuration) == {"mcpServers"}
@@ -184,7 +189,7 @@ def test_primary_mcp_config_exports_only_locked_bridge_selectors() -> None:
     assert set(servers) == {"2718lab-devkit"}
     server = servers["2718lab-devkit"]
     assert set(server) == {"command", "args", "cwd", "env_vars"}
-    assert tuple(server["env_vars"]) == EXPECTED_BRIDGE_SELECTORS
+    assert tuple(server["env_vars"]) == EXPECTED_ENV_VARS
     serialized = json.dumps(configuration, ensure_ascii=False).casefold()
     for forbidden in (
         "bugkiller_home",

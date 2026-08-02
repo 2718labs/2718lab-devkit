@@ -177,8 +177,19 @@ Persistent data is local. RuntimeConfig resolves the data root in this order:
 3. The default Codex data directory:
    %USERPROFILE%\.codex\data\2718lab-devkit.
 
+When the host provides CODEX_PROJECT_ROOT or CODEX_WORKSPACE_ROOT, the durable
+root is further scoped below `scoped-v1` by a SHA-256 identity of that project
+root. If a project root is unavailable, CODEX_PROJECT_ID, CODEX_WORKSPACE_ID,
+or CODEX_THREAD_ID provides a non-path fallback scope. The raw project path or
+identity is never written into the scope directory name. This prevents a
+long-lived plugin process from projecting one project's workflows, indexes, or
+receipts into another project. A command-line invocation with no scope keeps
+the unsuffixed root for backwards compatibility; the host integration should
+always provide a project or thread scope.
+
 Scratch paths use CODEX_TASK_TEMP, TMPDIR, TEMP, or TMP when explicitly
-provided, otherwise a sibling .2718lab-devkit-scratch directory. The runtime
+provided, otherwise a sibling .2718lab-devkit-scratch directory. A configured
+scratch base receives the same scope suffix as durable data. The runtime
 rejects unsafe, overlapping, missing, or reparse-point roots and does not write
 fallback state into the repository.
 

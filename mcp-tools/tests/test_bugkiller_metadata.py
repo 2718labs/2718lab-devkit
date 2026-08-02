@@ -52,6 +52,11 @@ class BugkillerMetadataTests(unittest.TestCase):
             [
                 "CODEX_DEVKIT_HOST_BRIDGE_FD",
                 "CODEX_DEVKIT_HOST_BRIDGE_HANDLE",
+                "CODEX_PROJECT_ROOT",
+                "CODEX_WORKSPACE_ROOT",
+                "CODEX_PROJECT_ID",
+                "CODEX_WORKSPACE_ID",
+                "CODEX_THREAD_ID",
             ],
         )
         self.assertNotIn("CLAUDE_PLUGIN_ROOT", json.dumps(metadata))

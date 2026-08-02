@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+_SCOPE_DIRECTORY = "scoped-v1"
+_SCOPE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_PROJECT_ROOT_ENV_NAMES = ("CODEX_PROJECT_ROOT", "CODEX_WORKSPACE_ROOT")
+_PROJECT_ID_ENV_NAMES = (
+    "CODEX_PROJECT_ID",
+    "CODEX_WORKSPACE_ID",
+    "CODEX_THREAD_ID",
+)
 
 
 class RuntimeConfigError(RuntimeError):
@@ -62,13 +73,15 @@ class RuntimeConfig:
         values = os.environ if environ is None else environ
         plugin_data = values.get("PLUGIN_DATA")
         if plugin_data:
-            data_root = _absolute_path(plugin_data)
+            data_base = _absolute_path(plugin_data)
         else:
             codex_home = values.get("CODEX_HOME")
             if codex_home:
-                data_root = _absolute_path(codex_home) / "data" / "2718lab-devkit"
+                data_base = _absolute_path(codex_home) / "data" / "2718lab-devkit"
             else:
-                data_root = Path.home() / ".codex" / "data" / "2718lab-devkit"
+                data_base = Path.home() / ".codex" / "data" / "2718lab-devkit"
+        scope = _resolve_scope(values)
+        data_root = _scoped_root(data_base, scope)
         protected = tuple(_absolute_path(item) for item in protected_roots)
         if not _safe_directory_path(data_root, require_exists=False) or any(
             not _safe_directory_path(root, require_exists=False) for root in protected
@@ -78,7 +91,7 @@ class RuntimeConfig:
             raise RuntimeConfigError("DATA_ROOT_INVALID")
         return cls(
             data_root=data_root,
-            scratch_root=_resolve_scratch(values, data_root, protected),
+            scratch_root=_resolve_scratch(values, data_root, protected, scope),
         )
 
 
@@ -90,13 +103,19 @@ def _absolute_path(value: str | Path) -> Path:
 
 
 def _resolve_scratch(
-    values: Mapping[str, str], data_root: Path, protected_roots: tuple[Path, ...]
+    values: Mapping[str, str],
+    data_root: Path,
+    protected_roots: tuple[Path, ...],
+    scope: tuple[str, str] | None,
 ) -> Path:
     for name in ("CODEX_TASK_TEMP", "TMPDIR", "TEMP", "TMP"):
         configured = values.get(name)
         if configured:
-            scratch_root = _absolute_path(configured)
-            if not _safe_existing_directory(scratch_root) or any(
+            scratch_base = _absolute_path(configured)
+            if not _safe_existing_directory(scratch_base):
+                raise RuntimeConfigError("DATA_ROOT_INVALID")
+            scratch_root = _scoped_root(scratch_base, scope)
+            if not _safe_directory_path(scratch_root, require_exists=False) or any(
                 _paths_overlap(scratch_root, root)
                 for root in (data_root, *protected_roots)
             ):
@@ -108,6 +127,36 @@ def _resolve_scratch(
     ):
         raise RuntimeConfigError("DATA_ROOT_INVALID")
     return fallback
+
+
+def _resolve_scope(values: Mapping[str, str]) -> tuple[str, str] | None:
+    """Resolve a host-provided project identity without persisting its path."""
+
+    for name in _PROJECT_ROOT_ENV_NAMES:
+        raw = values.get(name)
+        if not raw:
+            continue
+        candidate = _absolute_path(raw)
+        if not _safe_existing_directory(candidate):
+            raise RuntimeConfigError("PROJECT_SCOPE_INVALID")
+        return "project-root", os.path.normcase(str(candidate))
+
+    for name in _PROJECT_ID_ENV_NAMES:
+        raw = values.get(name)
+        if not raw:
+            continue
+        if _SCOPE_ID.fullmatch(raw) is None:
+            raise RuntimeConfigError("PROJECT_SCOPE_INVALID")
+        return name.casefold(), raw
+    return None
+
+
+def _scoped_root(base: Path, scope: tuple[str, str] | None) -> Path:
+    if scope is None:
+        return base
+    kind, value = scope
+    digest = hashlib.sha256(f"{kind}\0{value}".encode()).hexdigest()
+    return base / _SCOPE_DIRECTORY / f"{kind}-{digest}"
 
 
 def _safe_existing_directory(path: Path) -> bool:
