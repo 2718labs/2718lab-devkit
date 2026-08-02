@@ -150,11 +150,11 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install Fast Lane test tools
-        run: python -m pip install --disable-pip-version-check pytest ruff
+        run: python -m pip install --disable-pip-version-check pytest ruff==0.16.1
 
       - name: Ruff check
         run: >-
-          python -m ruff check
+          python -m ruff check --select E,F --ignore E501
           scripts/team_efficiency.py
           scripts/fastlane_quota_balance.py
           tests/test_team_efficiency.py
