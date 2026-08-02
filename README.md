@@ -147,10 +147,24 @@ tree. Choose an output directory outside the source tree:
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the six runtime trees selected by
-.codex-plugin/main-artifact-allowlist.json. It does not package skills,
-prompts, static agents, host-private state, or arbitrary repository files.
-Keep build output and temporary evidence outside the source tree and out of
-version control.
+.codex-plugin/main-artifact-allowlist.json. Its public runtime remains
+MCP-only; the ZIP also carries the minimal executable Fast Lane methodology
+subset: the work-methodology contract, required references and policy assets,
+the `team_efficiency.py` entry point, its routing and quota-balance modules,
+and the official-account quota producer. It deliberately excludes
+`agents/`, `commands/`, `hooks/`, Claude configuration, CI files, host-private
+state, prompts, static agents, and arbitrary repository files.
+
+Run Fast Lane through its executable entry point:
+
+    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+
+For live quota, add `--quota-input`, `--live-quota`, and an optional absolute
+`--quota-state-path <user-owned-cache-file>`. That user-configurable cache
+stores only the bounded recent sample; without the option, it uses
+`CODEX_TASK_TEMP` when set and otherwise keeps no sample cache. Keep build
+output, quota caches, and temporary evidence outside the source tree and out
+of version control.
 
 ## Runtime data and recovery
 

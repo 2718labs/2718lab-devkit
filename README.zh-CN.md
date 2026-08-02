@@ -137,9 +137,22 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
     python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0-rc1.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
-.codex-plugin/main-artifact-allowlist.json 选中的六棵运行时目录树。它
-不会打包 skills、prompts、静态 agent、宿主私有状态或任意仓库文件。
-构建输出和临时证据应放在源码树之外，并排除在版本控制之外。
+.codex-plugin/main-artifact-allowlist.json 选中的六棵运行时目录树。它的
+公共运行面仍是 MCP-only；ZIP 同时携带可执行 Fast Lane 方法论的最小子集：
+work-methodology 契约、必需参考资料和策略 assets、`team_efficiency.py`
+入口、其路由与额度平衡模块，以及官方账号额度采集模块。它明确不包含
+`agents/`、`commands/`、`hooks/`、Claude 配置、CI 文件、宿主私有状态、
+prompts、静态 agent 或任意仓库文件。
+
+Fast Lane 应通过以下可执行入口运行：
+
+    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+
+需要实时额度时，补充 `--quota-input`、`--live-quota`，并可选择提供绝对路径的
+`--quota-state-path <user-owned-cache-file>`。这个由用户配置的缓存只保存有界的
+最近样本；未提供该选项时，会在已设置的 `CODEX_TASK_TEMP` 下使用缓存，否则不
+保存样本缓存。构建输出、额度缓存和临时证据都应放在源码树之外，并排除在版本
+控制之外。
 
 ## 运行时数据与崩溃恢复
 
