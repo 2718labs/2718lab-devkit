@@ -592,6 +592,26 @@ def test_builder_rejects_output_inside_plugin_root(tmp_path: Path) -> None:
     assert not output.exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux publisher contract")
+def test_linux_publisher_allows_expected_write_before_identity_check(
+    tmp_path: Path,
+) -> None:
+    """A private ZIP may grow while retaining its pinned filesystem object."""
+    builder = _load_builder_module()
+    plugin_root = _copy_fixture(tmp_path)
+    output_parent = tmp_path / "output"
+    output_parent.mkdir()
+
+    backend = builder.get_secure_backend()
+    with backend.open_root(plugin_root) as source_root:
+        with backend.open_output_parent(output_parent, source_root=source_root) as publisher:
+            private_zip = publisher.create_zip_temp()
+            private_zip.write(b"deterministic payload\n")
+            publisher.publish("artifact.zip")
+
+    assert (output_parent / "artifact.zip").read_bytes() == b"deterministic payload\n"
+
+
 @pytest.mark.parametrize(
     ("field", "unsafe_value"),
     [
