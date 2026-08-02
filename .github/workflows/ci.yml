@@ -120,7 +120,7 @@ jobs:
 
   fast-lane:
     name: Fast Lane contracts (Python 3.11)
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     defaults:
       run:
         working-directory: skills/work-methodology
@@ -134,20 +134,22 @@ jobs:
           python-version: "3.11"
 
       - name: Configure task-local runtime storage
-        shell: bash
+        shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          set -euo pipefail
-          root="${RUNNER_TEMP}/2718lab-devkit-task/fast-lane"
-          mkdir -p "$root/tmp" "$root/pycache" "$root/pip-cache"
-          {
-            echo "CODEX_TASK_TEMP=$root"
-            echo "TEMP=$root/tmp"
-            echo "TMP=$root/tmp"
-            echo "TMPDIR=$root/tmp"
-            echo "PYTHONPYCACHEPREFIX=$root/pycache"
-            echo "PIP_CACHE_DIR=$root/pip-cache"
-          } >> "$GITHUB_ENV"
+          $root = 'D:\bun\tmp\codex\2718lab-devkit-ci\fast-lane'
+          New-Item -ItemType Directory -Force -Path `
+            (Join-Path $root 'tmp'), `
+            (Join-Path $root 'pycache'), `
+            (Join-Path $root 'pip-cache') | Out-Null
+          @(
+            "CODEX_TASK_TEMP=$root"
+            "TEMP=$(Join-Path $root 'tmp')"
+            "TMP=$(Join-Path $root 'tmp')"
+            "TMPDIR=$(Join-Path $root 'tmp')"
+            "PYTHONPYCACHEPREFIX=$(Join-Path $root 'pycache')"
+            "PIP_CACHE_DIR=$(Join-Path $root 'pip-cache')"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Fast Lane test tools
         run: python -m pip install --disable-pip-version-check pytest ruff==0.16.1
