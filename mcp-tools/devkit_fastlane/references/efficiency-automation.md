@@ -294,7 +294,29 @@ retained assignment and refills a free slot only after a terminal event. Neither
 the compiler nor the host polls commentary updates or refills from commentary
 (`no commentary polling`).
 
+Every rendered assignment includes `host_dispatch`. The host MUST call
+`collaboration.spawn_agent` with the exact `model` and `reasoning_effort` from
+that object, with `inherit_current_session_model=false`; omitting either value
+or allowing the current session model to fill it is a rejected dispatch. This
+keeps the visible route (for example Terra, Sol, or Luna) identical to the
+attested route in the receipt.
+
+Every rendered assignment also includes one bounded `index_context` packet.
+The host owns its `project_index` preparation: one input query at the dispatch
+boundary and, for writers, one output query at the terminal boundary. The
+worker receives the packet and consumes its anchors/scope; it does not invent
+queries, call `project_index_register/sync/status/query`, or poll status while
+working. A missing or hash-invalid packet stops that assignment. The compact
+packet is the normal path; the long list of index lifecycle operations is no
+longer an LLM task list.
+
 ### Cross-session capacity projection
+
+Cross-session selection is compiler-owned, not an LLM preference. When the
+projection carries `dispatch_policy.action=dispatch_all` and
+`target=independent_codex_session`, the host dispatches every listed assignment
+mechanically. `dispatch_none` creates no session and `stop` fails closed;
+`selection_authority=compiler` and `llm_choice=false` must be preserved.
 
 `3` is the per-Codex-session child-agent limit. It is not the global main-pool
 limit, and it does not mean three sessions. A fresh, signed quota snapshot sets

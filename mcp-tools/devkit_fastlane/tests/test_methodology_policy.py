@@ -92,6 +92,10 @@ class MethodologyPolicyTests(unittest.TestCase):
             "Prewarm remains a separate read-only evidence role",
             "after lane 0 acceptance",
             "C-drive temporary roots are forbidden",
+            "host_dispatch",
+            "inherit_current_session_model",
+            "index_context",
+            "worker only consumes",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, text)

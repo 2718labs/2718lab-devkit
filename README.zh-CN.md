@@ -45,7 +45,9 @@
 
 ## 整体工作流
 
-最短路径是：配置宿主，选择 MCP 或 Fast Lane 入口，只让宿主执行有界动作，
+默认工作流是 Fast Lane：配置宿主，让 `workflow-design` 编译有界计划，
+再让 `fast-lane-routing` 执行显式宿主派发。最短路径是：配置宿主，选择 MCP
+或 Fast Lane 入口，只让宿主执行有界动作，
 再用终态证据完成集成、验收和归档。
 
 ```mermaid
@@ -73,6 +75,14 @@ flowchart TD
     B -->|MCP 工具| C
     B -->|Fast Lane| F
 ```
+
+## Codex skill 导航
+
+插件只保留一个短总览（`skills/devkit-overview`）和一个工作流设计入口
+（`skills/workflow-design`，默认 Fast Lane）。模块说明书彼此独立，按需加载：
+
+`fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
+`mcp-server-dev` · `oss-repo-ops` · `python-engineering`。
 
 ## 文档导航
 
@@ -183,6 +193,13 @@ mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
 - Ultra 会激活编译器；低于 Ultra 的 effort 需要宿主显式启用。
 - 难度、风险、范围、验证成本、阻塞严重度和可用容量共同选择路由。
   请求的模型与推理级别保持显式，并且必须有宿主证明。
+- 每个 assignment 都会渲染给 `collaboration.spawn_agent` 使用的
+  `host_dispatch`；宿主必须原样传入其中的 `model` 和 `reasoning_effort`，
+  不得继承当前会话模型。assignment 同时携带一个有界 `index_context`：
+  宿主只在边界各查询一次，worker 消费 packet，不轮询索引，也不手写索引编排。
+- 跨会话选择由 compiler 固定：projection 的
+  `dispatch_policy.action=dispatch_all` 时，宿主机械派发所有隔离会话/工作树；
+  不再让 LLM 自己判断是否跨会话。
 - 三个物理 worker 槽位被划分为 start/retain 和诚实的 idle 记录。
   prewarm 始终是只读证据工作。
 - 只有验证过的终态事件才能释放并补位。commentary 更新不会触发轮询

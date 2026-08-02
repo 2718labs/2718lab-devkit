@@ -471,11 +471,21 @@ _FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS = frozenset(
         "quota_evidence_hash",
         "quota_snapshot_hash",
         "quota_decision_hash",
+        "dispatch_policy",
         "external_agent_count",
         "external_assignment_ids",
         "assignments",
         "reason_codes",
         "projection_hash",
+    }
+)
+_FAST_LANE_CROSS_SESSION_DISPATCH_POLICY_FIELDS = frozenset(
+    {
+        "schema",
+        "selection_authority",
+        "action",
+        "target",
+        "llm_choice",
     }
 )
 _FAST_LANE_EXTERNAL_ASSIGNMENT_FIELDS = frozenset(
@@ -491,9 +501,39 @@ _FAST_LANE_EXTERNAL_ASSIGNMENT_FIELDS = frozenset(
         "model",
         "reasoning_effort",
         "route",
+        "host_dispatch",
+        "index_context",
         "context_hash",
         "lease_fencing_predecessor",
         "reason",
+    }
+)
+_FAST_LANE_HOST_DISPATCH_FIELDS = frozenset(
+    {
+        "schema",
+        "kind",
+        "model",
+        "reasoning_effort",
+        "inherit_current_session_model",
+        "require_explicit_route",
+        "missing_route_action",
+    }
+)
+_FAST_LANE_INDEX_CONTEXT_FIELDS = frozenset(
+    {
+        "schema",
+        "mode",
+        "task_id",
+        "role",
+        "dispatch_context_hash",
+        "input_snapshot_id",
+        "scope",
+        "anchors",
+        "query",
+        "input_query",
+        "output_query",
+        "worker",
+        "context_hash",
     }
 )
 _FAST_LANE_EXTERNAL_LEASE_PREDECESSOR_FIELDS = frozenset(
@@ -3060,6 +3100,24 @@ def _fast_lane_assignment(
         "dispatch_receipt": receipt,
         "_context": context,
     }
+
+
+def _fast_lane_host_dispatch(
+    model: object, reasoning_effort: object
+) -> dict[str, Any]:
+    """Render the exact host spawn tuple; never rely on session inheritance."""
+
+    dispatch = {
+        "schema": "team-efficiency/fast-lane-host-dispatch-v1",
+        "kind": "codex.spawn_agent",
+        "model": _text(model, "host dispatch model", maximum=64),
+        "reasoning_effort": _fast_lane_effort(reasoning_effort),
+        "inherit_current_session_model": False,
+        "require_explicit_route": True,
+        "missing_route_action": "reject",
+    }
+    _exact_keys(dispatch, _FAST_LANE_HOST_DISPATCH_FIELDS, "host dispatch")
+    return dispatch
 
 
 def _fast_lane_build_dispatch_context(
@@ -6602,7 +6660,7 @@ def _fast_lane_workflow_policy() -> dict[str, Any]:
                 "boundary": "strict_writer_start",
                 "roles": ["execution"],
                 "operations": [
-                    "project_index_sync_input_worker_worktree",
+                    "project_index_prepare_input_context",
                     "workflow_create_if_absent",
                     "workflow_register_task_strict_index",
                     "workflow_ready",
@@ -6614,11 +6672,10 @@ def _fast_lane_workflow_policy() -> dict[str, Any]:
                 "boundary": "strict_writer_execution_and_completion_preparation",
                 "roles": ["execution"],
                 "operations": [
-                    "project_index_query_input",
+                    "worker_consume_index_context",
                     "worktree_checkpoint_create_before_first_write",
                     "native_scoped_write_and_target_gates",
-                    "project_index_sync_output_worker_worktree",
-                    "project_index_query_output",
+                    "project_index_finalize_output_context",
                 ],
             },
             {
@@ -6634,13 +6691,13 @@ def _fast_lane_workflow_policy() -> dict[str, Any]:
                 "boundary": "read_only_verification_lifecycle",
                 "roles": ["verification"],
                 "operations": [
-                    "project_index_sync_input_read_worktree",
+                    "project_index_prepare_input_context",
                     "workflow_create_if_absent",
                     "workflow_register_task_strict_index",
                     "workflow_ready",
                     "host_spawn_exact_route",
                     "workflow_claim_with_host_target",
-                    "project_index_query_input",
+                    "worker_consume_index_context",
                     "run_all_green_target_gates",
                     "workflow_artifact_register_completion_receipt_at_input_snapshot",
                     "workflow_complete_with_completion_receipt_hash",
@@ -6656,7 +6713,7 @@ def _fast_lane_workflow_policy() -> dict[str, Any]:
                     "reuse_predecessor_dispatch_context",
                     "issue_new_dispatch_receipt_and_token",
                     "reject_old_epoch_receipt_and_token",
-                    "reestablish_current_input_query_and_required_write_evidence",
+                    "rebind_input_index_context_once",
                 ],
             },
             {
@@ -6670,7 +6727,7 @@ def _fast_lane_workflow_policy() -> dict[str, Any]:
                     "issue_new_dispatch_receipt_and_token",
                     "reject_old_epoch_receipt_and_token",
                     "verify_workspace_matches_bound_output_snapshot",
-                    "reregister_new_lease_output_query_and_verification_evidence",
+                    "rebind_output_index_context_once",
                     "continue_host_attested_completion_without_new_input_checkpoint",
                 ],
             },
@@ -6685,7 +6742,233 @@ def _fast_lane_workflow_policy() -> dict[str, Any]:
         "mid_item_status_polling": False,
         "recovery_status_reads": "start_or_recovery_boundary_only",
         "release_tool_available": False,
+        "index_protocol": {
+            "schema": "team-efficiency/fast-lane-index-protocol-v1",
+            "owner": "host",
+            "assignment_field": "index_context",
+            "preparation": "one_bounded_packet_per_assignment",
+            "input_query": "once_at_dispatch_boundary",
+            "output_query": "once_at_terminal_boundary",
+            "worker_action": "consume_only",
+            "worker_operations": [],
+            "mid_item_polling": False,
+            "missing_context_action": "stop",
+        },
+        "dispatch_protocol": {
+            "schema": "team-efficiency/fast-lane-dispatch-protocol-v1",
+            "tool": "collaboration.spawn_agent",
+            "model_source": "assignment.host_dispatch.model",
+            "reasoning_effort_source": "assignment.host_dispatch.reasoning_effort",
+            "inherit_current_session_model": False,
+            "require_explicit_route": True,
+            "missing_route_action": "reject",
+        },
+        "cross_session_protocol": {
+            "schema": "team-efficiency/fast-lane-cross-session-protocol-v1",
+            "projection_field": "cross_session_dispatch_projection",
+            "selection_authority": "compiler",
+            "trigger_status": "external_session_required",
+            "trigger_action": "dispatch_all",
+            "target": "independent_codex_session",
+            "not_required_action": "dispatch_none",
+            "blocked_action": "stop",
+            "llm_choice": False,
+        },
     }
+
+
+def _fast_lane_index_context(
+    validated: Mapping[str, Any],
+    unit: Mapping[str, Any],
+    role: str,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one host-owned, bounded index packet for an assignment.
+
+    The packet gives the host enough anchors to perform the required index
+    work once at the dispatch/terminal boundaries.  The worker consumes the
+    packet and never has to invent a query or poll the index during an item.
+    """
+
+    task_id = _task_id(unit["task_id"], "index context.task_id")
+    read_context = next(
+        (
+            item
+            for item in validated["read_contexts"]
+            if item["task_id"] == task_id and item["role"] == role
+        ),
+        None,
+    )
+    scope = (
+        list(unit.get("write_scope", []))
+        if role == "execution"
+        else ([] if read_context is None else list(read_context["read_scope"]))
+    )
+    task_node_ids = list(context["task_node_ids"])
+    contract_node_ids = list(context["contract_node_ids"])
+    input_snapshot_id = context["workspace_input_snapshot_id"]
+    host_prepared = bool(scope or task_node_ids or contract_node_ids)
+    query = {
+        "mode": "graph" if task_node_ids or contract_node_ids else "lexical",
+        "max_nodes": 32,
+        "max_depth": 1,
+        "source_lines": 12,
+        "byte_budget": 32768,
+    }
+    packet = {
+        "schema": "team-efficiency/fast-lane-index-context-v1",
+        "mode": "host_prepared" if host_prepared else "not_required",
+        "task_id": task_id,
+        "role": role,
+        "dispatch_context_hash": context["context_hash"],
+        "input_snapshot_id": input_snapshot_id,
+        "scope": scope,
+        "anchors": {
+            "task_node_ids": task_node_ids,
+            "contract_node_ids": contract_node_ids,
+        },
+        "query": query,
+        "input_query": {
+            "action": "query_once",
+            "required": input_snapshot_id is not None,
+            "when": "dispatch_boundary",
+        },
+        "output_query": {
+            "action": "query_once",
+            "required": role == "execution" and input_snapshot_id is not None,
+            "when": "terminal_boundary",
+        },
+        "worker": {
+            "action": "consume_only" if host_prepared else "skip",
+            "mid_item_polling": False,
+            "prohibited_operations": (
+                [
+                    "project_index_register",
+                    "project_index_sync",
+                    "project_index_status",
+                    "project_index_query",
+                ]
+                if host_prepared
+                else []
+            ),
+        },
+    }
+    packet["context_hash"] = _sha256_json(packet)
+    _exact_keys(packet, _FAST_LANE_INDEX_CONTEXT_FIELDS, "index context")
+    return packet
+
+
+def _validated_fast_lane_index_context(
+    value: object, field: str = "index context"
+) -> dict[str, Any]:
+    """Validate a projected index packet before it crosses a session boundary."""
+
+    packet = _mapping(value, field)
+    _exact_keys(packet, _FAST_LANE_INDEX_CONTEXT_FIELDS, field)
+    if packet["schema"] != "team-efficiency/fast-lane-index-context-v1":
+        raise ValueError("index context schema is invalid")
+    mode = _text(packet["mode"], f"{field}.mode", maximum=32)
+    if mode not in {"host_prepared", "not_required"}:
+        raise ValueError("index context mode is invalid")
+    task_id = _task_id(packet["task_id"], f"{field}.task_id")
+    role = _text(packet["role"], f"{field}.role", maximum=32)
+    dispatch_context_hash = _hash(
+        packet["dispatch_context_hash"], f"{field}.dispatch_context_hash"
+    )
+    snapshot = _fast_lane_optional_hash(
+        packet["input_snapshot_id"], f"{field}.input_snapshot_id"
+    )
+    scope = _normalised_scopes(packet["scope"], f"{field}.scope")
+    anchors = _mapping(packet["anchors"], f"{field}.anchors")
+    _exact_keys(anchors, frozenset({"task_node_ids", "contract_node_ids"}), field)
+    normalized_anchors = {
+        "task_node_ids": _fast_lane_hash_list(
+            anchors["task_node_ids"], f"{field}.anchors.task_node_ids"
+        ),
+        "contract_node_ids": _fast_lane_hash_list(
+            anchors["contract_node_ids"], f"{field}.anchors.contract_node_ids"
+        ),
+    }
+    query = _mapping(packet["query"], f"{field}.query")
+    _exact_keys(
+        query,
+        frozenset({"mode", "max_nodes", "max_depth", "source_lines", "byte_budget"}),
+        f"{field}.query",
+    )
+    query_mode = _text(query["mode"], f"{field}.query.mode", maximum=16)
+    if query_mode not in {"graph", "lexical"}:
+        raise ValueError("index query mode is invalid")
+    for name, lower, upper in (
+        ("max_nodes", 1, MAX_GRAPH_NODES),
+        ("max_depth", 0, 8),
+        ("source_lines", 0, 64),
+        ("byte_budget", 1, 32768),
+    ):
+        number = query[name]
+        if type(number) is not int or not lower <= number <= upper:
+            raise ValueError("index query bound is invalid")
+    normalized_query = {name: query[name] for name in query}
+    query_steps: dict[str, dict[str, Any]] = {}
+    for name in ("input_query", "output_query"):
+        step = _mapping(packet[name], f"{field}.{name}")
+        _exact_keys(step, frozenset({"action", "required", "when"}), f"{field}.{name}")
+        action = _text(step["action"], f"{field}.{name}.action", maximum=32)
+        when = _text(step["when"], f"{field}.{name}.when", maximum=32)
+        if action != "query_once" or when not in {
+            "dispatch_boundary",
+            "terminal_boundary",
+        } or type(step["required"]) is not bool:
+            raise ValueError("index query step is invalid")
+        query_steps[name] = {
+            "action": action,
+            "required": step["required"],
+            "when": when,
+        }
+    worker = _mapping(packet["worker"], f"{field}.worker")
+    _exact_keys(
+        worker,
+        frozenset({"action", "mid_item_polling", "prohibited_operations"}),
+        f"{field}.worker",
+    )
+    worker_action = _text(worker["action"], f"{field}.worker.action", maximum=32)
+    if worker_action not in {"consume_only", "skip"} or type(
+        worker["mid_item_polling"]
+    ) is not bool:
+        raise ValueError("index worker policy is invalid")
+    prohibited_values = _bounded_records(
+        worker["prohibited_operations"],
+        f"{field}.worker.prohibited_operations",
+        maximum=8,
+    )
+    prohibited_operations = [
+        _label(item, f"{field}.worker.prohibited_operations[{index}]")
+        for index, item in enumerate(prohibited_values)
+    ]
+    if len(set(prohibited_operations)) != len(prohibited_operations):
+        raise ValueError("index worker operations contain duplicates")
+    normalized = {
+        "schema": packet["schema"],
+        "mode": mode,
+        "task_id": task_id,
+        "role": role,
+        "dispatch_context_hash": dispatch_context_hash,
+        "input_snapshot_id": snapshot,
+        "scope": scope,
+        "anchors": normalized_anchors,
+        "query": normalized_query,
+        "input_query": query_steps["input_query"],
+        "output_query": query_steps["output_query"],
+        "worker": {
+            "action": worker_action,
+            "mid_item_polling": worker["mid_item_polling"],
+            "prohibited_operations": prohibited_operations,
+        },
+    }
+    expected_hash = _sha256_json(normalized)
+    if _hash(packet["context_hash"], f"{field}.context_hash") != expected_hash:
+        raise ValueError("index context hash is invalid")
+    normalized["context_hash"] = expected_hash
+    return normalized
 
 
 def _fast_lane_assignment_output(
@@ -6733,6 +7016,10 @@ def _fast_lane_assignment_output(
     write_scope = list(unit.get("write_scope", []))
     completed = _fast_lane_completed_ids(validated["scheduler_state"])
     role_target = target if role in {"execution", "verification"} else None
+    host_dispatch = _fast_lane_host_dispatch(
+        assignment["model"], assignment["reasoning_effort"]
+    )
+    index_context = _fast_lane_index_context(validated, unit, role, context)
     output: dict[str, Any] = {
         "slot_id": assignment["slot_id"],
         "action": "retain",
@@ -6748,6 +7035,8 @@ def _fast_lane_assignment_output(
         "role": role,
         "model": assignment["model"],
         "reasoning_effort": assignment["reasoning_effort"],
+        "host_dispatch": host_dispatch,
+        "index_context": index_context,
         "routing_context_hash": assignment["routing_context_hash"],
         "routing_result_hash": assignment["routing_result_hash"],
         "task_fingerprint": assignment["task_fingerprint"],
@@ -7540,9 +7829,30 @@ def _fast_lane_cross_session_projection(
         global_free_after_local_starts: int | None = None,
     ) -> dict[str, Any]:
         normalized_assignments = [dict(item) for item in assignments]
+        dispatch_policy = {
+            "schema": "team-efficiency/fast-lane-cross-session-policy-v1",
+            "selection_authority": "compiler",
+            "action": (
+                "dispatch_all"
+                if status == "external_session_required"
+                else ("dispatch_none" if status == "not_required" else "stop")
+            ),
+            "target": (
+                "independent_codex_session"
+                if status == "external_session_required"
+                else "none"
+            ),
+            "llm_choice": False,
+        }
+        _exact_keys(
+            dispatch_policy,
+            _FAST_LANE_CROSS_SESSION_DISPATCH_POLICY_FIELDS,
+            "cross-session dispatch policy",
+        )
         projection = {
             "schema": "team-efficiency/fast-lane-cross-session-dispatch-projection-v2",
             "status": status,
+            "dispatch_policy": dispatch_policy,
             "source_plan_hash": source_plan_hash,
             "workflow_id_hash": workflow_id_hash,
             "local_capacity": len(FAST_LANE_SLOT_IDS),
@@ -7694,6 +8004,15 @@ def _fast_lane_cross_session_projection(
                 or not 10 <= route["routing_safety_floor_rank"] <= 110
             ):
                 raise ValueError("external assignment route is invalid")
+            index_context = _validated_fast_lane_index_context(
+                item.get("index_context"), "external assignment.index_context"
+            )
+            if (
+                index_context["task_id"] != task_id
+                or index_context["role"] != role
+                or index_context["dispatch_context_hash"] != context_hash
+            ):
+                raise ValueError("external assignment index context is not bound")
             predecessor = {
                 "schema": "team-efficiency/fast-lane-external-lease-predecessor-v1",
                 "source_plan_hash": source_plan_hash,
@@ -7725,6 +8044,8 @@ def _fast_lane_cross_session_projection(
                 "model": model,
                 "reasoning_effort": effort,
                 "route": route,
+                "host_dispatch": _fast_lane_host_dispatch(model, effort),
+                "index_context": index_context,
                 "context_hash": context_hash,
                 "lease_fencing_predecessor": predecessor,
                 "reason": "local_capacity_exhausted",

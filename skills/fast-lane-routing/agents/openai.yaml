@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fast Lane Routing"
+  short_description: "Make Fast Lane dispatch explicit and automatic"
+  default_prompt: "Use Fast Lane routing: honor explicit model, choose cross-session assignments mechanically, and consume one bounded index packet."

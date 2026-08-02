@@ -1,0 +1,4 @@
+interface:
+  display_name: "DevKit Overview"
+  short_description: "Navigate the 2718lab DevKit modules"
+  default_prompt: "Use the module map to select the smallest relevant DevKit skill, then follow its short contract."

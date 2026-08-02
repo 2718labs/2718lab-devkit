@@ -1738,6 +1738,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 assignments["FAST-LANE-ROUTINE"]["reasoning_effort"],
             ),
         )
+
         self.assertEqual(
             ("gpt-5.6-terra", "max"),
             (
@@ -1795,6 +1796,78 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual("gpt-5.6-sol", exceptional["model"])
         self.assertEqual("high", exceptional["reasoning_effort"])
         self.assertNotEqual("ultra", exceptional["reasoning_effort"])
+
+    def test_fast_lane_assignment_freezes_explicit_host_route(self) -> None:
+        helper = load_efficiency()
+        result = self.compile_fast_lane(
+            helper, self.fast_lane_schedule_request(helper), reasoning_effort="ultra"
+        )
+        assignment = next(
+            item for item in result["assignments"] if item["action"] == "start"
+        )
+
+        self.assertEqual(
+            {
+                "schema": "team-efficiency/fast-lane-host-dispatch-v1",
+                "kind": "codex.spawn_agent",
+                "model": assignment["model"],
+                "reasoning_effort": assignment["reasoning_effort"],
+                "inherit_current_session_model": False,
+                "require_explicit_route": True,
+                "missing_route_action": "reject",
+            },
+            assignment["host_dispatch"],
+        )
+
+    def test_fast_lane_assignment_prepares_one_bounded_index_context(self) -> None:
+        helper = load_efficiency()
+        result = self.compile_fast_lane(
+            helper, self.fast_lane_schedule_request(helper), reasoning_effort="ultra"
+        )
+        assignment = next(
+            item for item in result["assignments"] if item["action"] == "start"
+        )
+        index_context = assignment["index_context"]
+
+        self.assertEqual(
+            "team-efficiency/fast-lane-index-context-v1", index_context["schema"]
+        )
+        self.assertEqual("host_prepared", index_context["mode"])
+        self.assertEqual(
+            assignment["workspace_input_snapshot_id"],
+            index_context["input_snapshot_id"],
+        )
+        self.assertEqual(assignment["write_scope"], index_context["scope"])
+        self.assertEqual(
+            assignment["task_node_ids"], index_context["anchors"]["task_node_ids"]
+        )
+        self.assertEqual(
+            assignment["contract_node_ids"],
+            index_context["anchors"]["contract_node_ids"],
+        )
+        self.assertEqual("query_once", index_context["input_query"]["action"])
+        self.assertEqual("query_once", index_context["output_query"]["action"])
+        self.assertEqual("consume_only", index_context["worker"]["action"])
+        self.assertFalse(index_context["worker"]["mid_item_polling"])
+        self.assertEqual(
+            [
+                "project_index_register",
+                "project_index_sync",
+                "project_index_status",
+                "project_index_query",
+            ],
+            index_context["worker"]["prohibited_operations"],
+        )
+        self.assertEqual(
+            index_context["context_hash"],
+            helper._sha256_json(
+                {
+                    key: value
+                    for key, value in index_context.items()
+                    if key != "context_hash"
+                }
+            ),
+        )
 
     def test_fast_lane_consumes_attested_core_routes_and_fails_closed(self) -> None:
         helper = load_efficiency()
@@ -2945,6 +3018,9 @@ class TeamEfficiencyTests(unittest.TestCase):
                         "mid_item_status_polling",
                         "recovery_status_reads",
                         "release_tool_available",
+                        "index_protocol",
+                        "dispatch_protocol",
+                        "cross_session_protocol",
                     },
                     set(result["workflow_policy"]),
                 )
@@ -4608,7 +4684,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                         "boundary": "strict_writer_start",
                         "roles": ["execution"],
                         "operations": [
-                            "project_index_sync_input_worker_worktree",
+                            "project_index_prepare_input_context",
                             "workflow_create_if_absent",
                             "workflow_register_task_strict_index",
                             "workflow_ready",
@@ -4620,11 +4696,10 @@ class TeamEfficiencyTests(unittest.TestCase):
                         "boundary": "strict_writer_execution_and_completion_preparation",
                         "roles": ["execution"],
                         "operations": [
-                            "project_index_query_input",
+                            "worker_consume_index_context",
                             "worktree_checkpoint_create_before_first_write",
                             "native_scoped_write_and_target_gates",
-                            "project_index_sync_output_worker_worktree",
-                            "project_index_query_output",
+                            "project_index_finalize_output_context",
                         ],
                     },
                     {
@@ -4640,13 +4715,13 @@ class TeamEfficiencyTests(unittest.TestCase):
                         "boundary": "read_only_verification_lifecycle",
                         "roles": ["verification"],
                         "operations": [
-                            "project_index_sync_input_read_worktree",
+                            "project_index_prepare_input_context",
                             "workflow_create_if_absent",
                             "workflow_register_task_strict_index",
                             "workflow_ready",
                             "host_spawn_exact_route",
                             "workflow_claim_with_host_target",
-                            "project_index_query_input",
+                            "worker_consume_index_context",
                             "run_all_green_target_gates",
                             "workflow_artifact_register_completion_receipt_at_input_snapshot",
                             "workflow_complete_with_completion_receipt_hash",
@@ -4662,7 +4737,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                             "reuse_predecessor_dispatch_context",
                             "issue_new_dispatch_receipt_and_token",
                             "reject_old_epoch_receipt_and_token",
-                            "reestablish_current_input_query_and_required_write_evidence",
+                            "rebind_input_index_context_once",
                         ],
                     },
                     {
@@ -4676,7 +4751,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                             "issue_new_dispatch_receipt_and_token",
                             "reject_old_epoch_receipt_and_token",
                             "verify_workspace_matches_bound_output_snapshot",
-                            "reregister_new_lease_output_query_and_verification_evidence",
+                            "rebind_output_index_context_once",
                             "continue_host_attested_completion_without_new_input_checkpoint",
                         ],
                     },
@@ -4691,6 +4766,38 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "mid_item_status_polling": False,
                 "recovery_status_reads": "start_or_recovery_boundary_only",
                 "release_tool_available": False,
+                "index_protocol": {
+                    "schema": "team-efficiency/fast-lane-index-protocol-v1",
+                    "owner": "host",
+                    "assignment_field": "index_context",
+                    "preparation": "one_bounded_packet_per_assignment",
+                    "input_query": "once_at_dispatch_boundary",
+                    "output_query": "once_at_terminal_boundary",
+                    "worker_action": "consume_only",
+                    "worker_operations": [],
+                    "mid_item_polling": False,
+                    "missing_context_action": "stop",
+                },
+                "dispatch_protocol": {
+                    "schema": "team-efficiency/fast-lane-dispatch-protocol-v1",
+                    "tool": "collaboration.spawn_agent",
+                    "model_source": "assignment.host_dispatch.model",
+                    "reasoning_effort_source": "assignment.host_dispatch.reasoning_effort",
+                    "inherit_current_session_model": False,
+                    "require_explicit_route": True,
+                    "missing_route_action": "reject",
+                },
+                "cross_session_protocol": {
+                    "schema": "team-efficiency/fast-lane-cross-session-protocol-v1",
+                    "projection_field": "cross_session_dispatch_projection",
+                    "selection_authority": "compiler",
+                    "trigger_status": "external_session_required",
+                    "trigger_action": "dispatch_all",
+                    "target": "independent_codex_session",
+                    "not_required_action": "dispatch_none",
+                    "blocked_action": "stop",
+                    "llm_choice": False,
+                },
             },
             result["workflow_policy"],
         )
@@ -4715,6 +4822,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             "role",
             "model",
             "reasoning_effort",
+            "host_dispatch",
+            "index_context",
             "routing_context_hash",
             "routing_result_hash",
             "task_fingerprint",
@@ -6645,6 +6754,16 @@ class TeamEfficiencyTests(unittest.TestCase):
         projection = result["cross_session_dispatch_projection"]
         self.assertEqual(projection, repeated["cross_session_dispatch_projection"])
         self.assertEqual("external_session_required", projection["status"])
+        self.assertEqual(
+            {
+                "schema": "team-efficiency/fast-lane-cross-session-policy-v1",
+                "selection_authority": "compiler",
+                "action": "dispatch_all",
+                "target": "independent_codex_session",
+                "llm_choice": False,
+            },
+            projection["dispatch_policy"],
+        )
         self.assertEqual(3, projection["local_capacity"])
         self.assertEqual(0, projection["local_active_count"])
         self.assertEqual(6, projection["global_main_target"])
@@ -6665,6 +6784,24 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertEqual("external_session_required", assignment["action"])
             self.assertEqual("not_created", assignment["session_state"])
             self.assertTrue(assignment["worktree_required"])
+            self.assertEqual(
+                {
+                    "schema": "team-efficiency/fast-lane-host-dispatch-v1",
+                    "kind": "codex.spawn_agent",
+                    "model": assignment["model"],
+                    "reasoning_effort": assignment["reasoning_effort"],
+                    "inherit_current_session_model": False,
+                    "require_explicit_route": True,
+                    "missing_route_action": "reject",
+                },
+                assignment["host_dispatch"],
+            )
+            self.assertEqual(assignment["task_id"], assignment["index_context"]["task_id"])
+            self.assertEqual(assignment["role"], assignment["index_context"]["role"])
+            self.assertEqual(
+                assignment["context_hash"],
+                assignment["index_context"]["dispatch_context_hash"],
+            )
             self.assertEqual(
                 assignment["context_hash"],
                 assignment["lease_fencing_predecessor"]["context_hash"],
@@ -6725,6 +6862,9 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=under_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("not_required", under_capacity["status"])
+        self.assertEqual(
+            "dispatch_none", under_capacity["dispatch_policy"]["action"]
+        )
         self.assertEqual(0, under_capacity["external_agent_count"])
         self.assertIn("local_capacity_available", under_capacity["reason_codes"])
 
@@ -6751,6 +6891,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_lease_scope_bindings=lease_bindings,
         )["cross_session_dispatch_projection"]
         self.assertEqual("blocked", unavailable["status"])
+        self.assertEqual("stop", unavailable["dispatch_policy"]["action"])
         self.assertEqual(0, unavailable["external_agent_count"])
         self.assertIn("quota_usage_unknown", unavailable["reason_codes"])
 

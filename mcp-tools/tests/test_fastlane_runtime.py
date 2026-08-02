@@ -61,3 +61,12 @@ def test_fastlane_tool_never_spawns_or_executes() -> None:
     data = result["data"]
     assert data["schema"] == "team-efficiency/fast-lane-plan-v1"
     assert "host_actions" not in data
+    assert data["workflow_policy"]["dispatch_protocol"] == {
+        "schema": "team-efficiency/fast-lane-dispatch-protocol-v1",
+        "tool": "collaboration.spawn_agent",
+        "model_source": "assignment.host_dispatch.model",
+        "reasoning_effort_source": "assignment.host_dispatch.reasoning_effort",
+        "inherit_current_session_model": False,
+        "require_explicit_route": True,
+        "missing_route_action": "reject",
+    }

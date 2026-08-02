@@ -34,6 +34,14 @@ while preserving Terra and Sol safety floors without scheduler-side guessing.
 exceptional worker ceiling at `high`; prewarm is a read-only evidence role, not
 an execution role. Route receipts bind the dispatch event and historical core
 input so later lease/capability facts cannot rewrite an already-issued task.
+The rendered assignment's `host_dispatch.model` and
+`host_dispatch.reasoning_effort` are mandatory arguments to
+`collaboration.spawn_agent`; `inherit_current_session_model` is false and a
+missing route is rejected. The host never lets the active conversation (even
+if its UI says Luna) fill those arguments implicitly.
+Each assignment also carries one bounded `index_context`; the host prepares
+its input/output query at lifecycle boundaries and the worker only consumes the
+packet, with no index polling or hand-written query choreography.
 The host archives only after Sol acceptance and final evidence binding, and all
 task temporary roots stay below `D:\bun\tmp\codex\<project-or-thread>` rather
 than a C-drive temporary directory.

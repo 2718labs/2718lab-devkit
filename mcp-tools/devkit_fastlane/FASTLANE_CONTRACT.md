@@ -116,6 +116,25 @@ prewarm 始终是独立的只读证据角色，不能变为 execution。
 
 host 只消费 `action="start"` descriptor，绝不重新 spawn `action="retain"`；仅在终态事件后（only after a terminal event）refill，且没有安全有用的工作（no safe useful work）时必须如实保留 idle slot。不得按 commentary 更新轮询或补位（no commentary polling）。
 
+跨会话不是 LLM 的自由选择：当
+`cross_session_dispatch_projection.dispatch_policy.action="dispatch_all"` 且
+`target="independent_codex_session"` 时，host 必须机械地派发该 projection 的全部
+assignments；`dispatch_none` 不创建会话，`stop` 失败关闭。该 policy 的
+`selection_authority="compiler"`、`llm_choice=false` 固定不变。
+
+每个 assignment 还必须消费 `host_dispatch`。其中的 `model` 和
+`reasoning_effort` 是本次调用的显式参数，`inherit_current_session_model=false`、
+`require_explicit_route=true`；host 调用 `collaboration.spawn_agent` 时必须原样传入
+这两个值，缺失或改写就拒绝派发，不能让宿主从当前会话（例如 Luna）继承模型。
+
+索引由 host 在边界一次性准备：assignment 的 `index_context` 是有界的
+`team-efficiency/fast-lane-index-context-v1`，包含输入/输出 snapshot、写/读 scope、
+已知节点锚点和单次查询预算。host 在 dispatch boundary 做一次 input query，在
+terminal boundary 做一次 output query；worker 只消费 packet，不调用
+`project_index_register/sync/status/query`，也不做 item 内轮询。缺少 packet 或 hash
+不匹配时停止该 assignment。这样索引安全约束仍在，但不会把低价值的索引仪式交给
+LLM 自己编排。
+
 额度遥测优先由 host-private inherited-handle bridge 传递：先发送
 `kind="quota_snapshot_request"`（`host-quota-snapshot-request-v1`），再接收绑定同一
 `request_id` 的 `kind="quota_snapshot"`（`host-quota-snapshot-response-v1`）。响应内层必须是

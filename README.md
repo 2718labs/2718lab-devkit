@@ -51,7 +51,11 @@ build, and verification sections below describe the supported workflow.
 
 ## Overall workflow
 
-The short path is: configure the host, choose the MCP or Fast Lane entry,
+The default workflow is Fast Lane: configure the host, let `workflow-design`
+compile the bounded plan, and let `fast-lane-routing` execute explicit host
+dispatch. The short path is:
+
+configure the host, choose the MCP or Fast Lane entry,
 let the host execute only bounded actions, and close the lifecycle with
 terminal evidence, integration, acceptance, and archive.
 
@@ -80,6 +84,15 @@ flowchart TD
     B -->|MCP tools| C
     B -->|Fast Lane| F
 ```
+
+## Codex skill map
+
+The plugin keeps one short navigator (`skills/devkit-overview`) and one workflow
+designer (`skills/workflow-design`, default Fast Lane). Module manuals stay
+separate so a task loads only what it needs:
+
+`fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
+`mcp-server-dev` · `oss-repo-ops` · `python-engineering`.
 
 ## Documentation map
 
@@ -211,6 +224,14 @@ mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The public MCP entry is
 - Difficulty, risk, scope, verification cost, blocker severity, and available
   capacity select the route. The requested model and reasoning effort remain
   explicit and host-attested.
+- Each assignment renders a `host_dispatch` tuple for `collaboration.spawn_agent`;
+  the host must pass its exact `model` and `reasoning_effort` and must not inherit
+  the current conversation model. The same assignment carries one bounded
+  `index_context`: the host performs boundary queries once and the worker only
+  consumes the packet, without index polling or hand-written query choreography.
+- Cross-session selection is compiler-owned: a projection with
+  `dispatch_policy.action=dispatch_all` is dispatched to every listed isolated
+  session/worktree; the LLM is not asked to choose.
 - Three physical worker slots are partitioned into start/retain and honest
   idle records. Prewarm is read-only evidence work.
 - A free slot is refilled only after a validated terminal event. Commentary
