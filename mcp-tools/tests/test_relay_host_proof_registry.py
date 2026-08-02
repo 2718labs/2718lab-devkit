@@ -437,6 +437,7 @@ def test_attestor_neutralizes_replace_and_config_environment_overrides(
         "-m",
         "environment replacement",
     ).decode("ascii")
+    candidate_delta = _git_delta(repository, base_commit, merge_commit)
     # Use Git's portable replacement namespace.  A custom
     # ``GIT_REPLACE_REF_BASE`` is rejected by some Git for Windows builds
     # before the attestor is reached, which would test the runner rather than
@@ -460,7 +461,7 @@ def test_attestor_neutralizes_replace_and_config_environment_overrides(
     forged = _expectation_for(
         base_commit=base_commit,
         candidate_commit=merge_commit,
-        candidate_delta=_git_delta(repository, base_commit, merge_commit),
+        candidate_delta=candidate_delta,
         candidate_id="environment-merge",
     )
     target = _target(repository)
