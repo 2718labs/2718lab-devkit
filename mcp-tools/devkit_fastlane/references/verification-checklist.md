@@ -1,6 +1,6 @@
 # 交付前验证清单
 
-本文件配合 `SKILL.md` 第 4 步使用。按任务类型对号入座,逐条打勾;不能打勾的项不许说"完成"。可组合内置 `verification-before-completion`、`verify` 两个 skill 一起用(它们提供通用的验证流程,本文件是 2718lab 场景下的具体清单,不重复其内容)。
+本文件配合 `FASTLANE_CONTRACT.md` 使用。按任务类型对号入座,逐条打勾;不能打勾的项不许说"完成"。可组合内置 `verification-before-completion`、`verify` 两个 skill 一起用(它们提供通用的验证流程,本文件是 2718lab 场景下的具体清单,不重复其内容)。
 
 ## 代码改动
 

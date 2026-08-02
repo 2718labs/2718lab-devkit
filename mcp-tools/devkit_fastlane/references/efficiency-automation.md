@@ -63,7 +63,7 @@ ready wave up to declared capacity, using a stable task-id tie-break.
       "task_id": "ATLAS-12B-A",
       "goal": "Implement the bounded artifact",
       "output_boundary": "helper module",
-      "write_scope": ["skills/work-methodology/scripts/team_efficiency.py"],
+      "write_scope": ["mcp-tools/devkit_fastlane/scripts/team_efficiency.py"],
       "depends_on": [],
       "required_evidence": ["focused-helper-tests"],
       "complexity": "routine",

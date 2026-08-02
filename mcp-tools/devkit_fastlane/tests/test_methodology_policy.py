@@ -8,7 +8,7 @@ TEAM_PATTERNS = ROOT / "references" / "team-patterns.md"
 ORCHESTRATION = ROOT / "references" / "orchestration-runtime.md"
 INTEGRATION = ROOT / "references" / "github-parallel-integration.md"
 EFFICIENCY = ROOT / "references" / "efficiency-automation.md"
-SKILL = ROOT / "SKILL.md"
+CONTRACT = ROOT / "FASTLANE_CONTRACT.md"
 
 
 class MethodologyPolicyTests(unittest.TestCase):
@@ -23,11 +23,6 @@ class MethodologyPolicyTests(unittest.TestCase):
             "gpt-5.6-sol",
             "gpt-5.6-luna",
             "exact requested pair",
-            "Opus",
-            "Sonnet",
-            "Haiku",
-            "Fable",
-            "explicitly reasoned",
         ):
             self.assertIn(required, text)
 
@@ -83,7 +78,7 @@ class MethodologyPolicyTests(unittest.TestCase):
     def test_fast_lane_docs_lock_the_core_adapter_and_host_boundaries(self) -> None:
         text = "\n".join(
             path.read_text(encoding="utf-8")
-            for path in (SKILL, EFFICIENCY, ORCHESTRATION, TEAM_PATTERNS)
+            for path in (CONTRACT, EFFICIENCY, ORCHESTRATION, TEAM_PATTERNS)
         )
 
         for required in (

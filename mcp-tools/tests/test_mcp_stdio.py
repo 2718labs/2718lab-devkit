@@ -1,4 +1,4 @@
-"""Real stdio protocol tests for the locked 16-tool MCP server."""
+"""Real stdio protocol tests for the locked 17-tool MCP server."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ EXPECTED_TOOL_NAMES = {
     "atlas_render",
     "atlas_accept",
     "relay_compile",
+    "fastlane_compile",
     "relay_start",
     "relay_status",
     "relay_handoff",

@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import Callable, Iterable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -91,7 +91,7 @@ def _utc(value: object) -> datetime:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
     except ValueError as error:
         raise ValueError("timestamp is invalid") from error
-    if parsed.tzinfo != timezone.utc:
+    if parsed.tzinfo != UTC:
         raise ValueError("timestamp must be UTC")
     return parsed
 

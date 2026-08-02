@@ -1,9 +1,9 @@
 ---
-name: work-methodology
-description: Use when a 2718lab engineering task spans multiple files or agents, needs framework/API grounding, risks a context-heavy design document, or is approaching completion without fresh verification evidence.
+name: fastlane-runtime-contract
+description: Contract for the bounded Fast Lane compiler and its host execution boundary.
 ---
 
-# 2718lab 工程工作方法
+# 2718lab Fast Lane runtime 契约
 
 核心原则：给用户方向，给代理边界，给执行证据。不要让任何角色读取与自己无关的完整大文档。
 

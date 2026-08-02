@@ -29,23 +29,24 @@ build, and verification sections below describe the supported workflow.
 - Relay validates explicit work packages and exposes lifecycle state. Python
   returns structured host actions; the Codex host remains responsible for
   worktree bootstrap and agent dispatch.
-- The primary package is MCP-only: it exposes exactly 16 tools, no MCP prompts,
+- The primary package is MCP-only: it exposes exactly 17 tools, no MCP prompts,
   no MCP resources, no static prompt agents, and no model runner.
-- Fast Lane remains a pure local compiler in the work-methodology skill. It
-  selects explicit model/effort routes from bounded difficulty and host
-  capability evidence; it never spawns agents, edits Git, or runs commands.
+- Fast Lane is a pure MCP runtime compiler. It selects explicit model/effort
+  routes from bounded difficulty and host capability evidence; it never spawns
+  agents, edits Git, or runs commands. Host-private quota and lifecycle
+  attestations stay outside the public request.
 
 ## Module overview
 
 | Module | Responsibility | Start here |
 | --- | --- | --- |
-| [`mcp-tools/server.py`](mcp-tools/server.py) | stdio MCP entry point and the public 16-tool surface | [MCP surface](#exact-mcp-surface) |
+| [`mcp-tools/server.py`](mcp-tools/server.py) | stdio MCP entry point and the public 17-tool surface | [MCP surface](#exact-mcp-surface) |
 | [`mcp-tools/project_index/`](mcp-tools/project_index/) | workspace registration, bounded snapshots, status, and graph queries | [Project Index tools](#exact-mcp-surface) |
 | [`mcp-tools/devkit_atlas/`](mcp-tools/devkit_atlas/) | evidence graph queries, implementation packets, rendering, and acceptance projection | [Atlas tools](#exact-mcp-surface) |
 | [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | explicit work-package compilation and lifecycle host actions | [Relay tools](#exact-mcp-surface) |
 | [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | runtime paths, checkpoints, durable boundaries, and the private host bridge | [runtime and recovery](#runtime-data-and-recovery) |
-| [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | durable workflow, task, lease, and lifecycle state | [workflow lifecycle](skills/work-methodology/references/efficiency-automation.md#workflow-lifecycle-plan) |
-| [`skills/work-methodology/`](skills/work-methodology/) | deterministic routing/Fast Lane compiler, quota snapshot collection, contracts, and tests | [Fast Lane contract](skills/work-methodology/SKILL.md) |
+| [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | durable workflow, task, lease, and lifecycle state | [workflow lifecycle](mcp-tools/devkit_fastlane/references/efficiency-automation.md#workflow-lifecycle-plan) |
+| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | deterministic routing/Fast Lane compiler, quota snapshot collection, contracts, and tests | [Fast Lane contract](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
 | [`.codex-plugin/`](.codex-plugin/) | plugin manifest, artifact allowlist, and reproducible package builder | [artifact build](#build-the-primary-artifact) |
 
 ## Overall workflow
@@ -85,19 +86,19 @@ flowchart TD
 Use this page as the entry point, then follow the contract links instead of
 re-reading the whole repository:
 
-- [Work methodology and Fast Lane contract](skills/work-methodology/SKILL.md)
-- [Efficiency automation reference and CLI details](skills/work-methodology/references/efficiency-automation.md)
-- [Verification checklist](skills/work-methodology/references/verification-checklist.md)
-- [Work-package and task-card rules](skills/work-methodology/references/work-packages.md)
-- [Orchestration runtime contract](skills/work-methodology/references/orchestration-runtime.md)
-- [Team and lane patterns](skills/work-methodology/references/team-patterns.md)
+- [Fast Lane contract](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md)
+- [Efficiency automation reference and CLI details](mcp-tools/devkit_fastlane/references/efficiency-automation.md)
+- [Verification checklist](mcp-tools/devkit_fastlane/references/verification-checklist.md)
+- [Work-package and task-card rules](mcp-tools/devkit_fastlane/references/work-packages.md)
+- [Orchestration runtime contract](mcp-tools/devkit_fastlane/references/orchestration-runtime.md)
+- [Team and lane patterns](mcp-tools/devkit_fastlane/references/team-patterns.md)
 - [Ultra Fast Lane design](docs/superpowers/specs/2026-07-30-ultra-fast-lane-design.md)
 - [Codex-first tool/plugin design](docs/superpowers/specs/2026-07-31-codex-first-tool-plugin-design.md)
 - [Release history](CHANGELOG.md)
 
 For implementation entry points, see
-[the Fast Lane compiler](skills/work-methodology/scripts/team_efficiency.py) and
-[the live Codex quota producer](skills/work-methodology/scripts/codex_account_quota.py).
+[the Fast Lane compiler](mcp-tools/devkit_fastlane/scripts/team_efficiency.py) and
+[the host-only Codex quota producer](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py).
 
 ## Exact MCP surface
 
@@ -110,6 +111,7 @@ The public server name is 2718lab-devkit. Every result uses the bounded
 | Checkpoints | worktree_checkpoint_create, worktree_checkpoint_status, worktree_checkpoint_restore |
 | Atlas | atlas_query, atlas_prepare, atlas_render, atlas_accept |
 | Relay | relay_compile, relay_start, relay_status, relay_handoff, relay_integrate |
+| Fast Lane | fastlane_compile |
 
 The server has no prompt or resource surface. Tool inputs are structured and
 bounded; absolute worker paths, shell fragments, raw source, credentials,
@@ -146,18 +148,18 @@ tree. Choose an output directory outside the source tree:
     python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0-rc1.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
-project, and the six runtime trees selected by
+project, and the runtime files selected by
 .codex-plugin/main-artifact-allowlist.json. Its public runtime remains
-MCP-only; the ZIP also carries the minimal executable Fast Lane methodology
-subset: the work-methodology contract, required references and policy assets,
-the `team_efficiency.py` entry point, its routing and quota-balance modules,
-and the official-account quota producer. It deliberately excludes
+MCP-only; the ZIP also carries the Fast Lane contract, required references and
+policy assets, the `team_efficiency.py` compatibility entry point, its routing
+and quota-balance modules, and the host-only official-account quota producer.
+It deliberately excludes
 `agents/`, `commands/`, `hooks/`, Claude configuration, CI files, host-private
 state, prompts, static agents, and arbitrary repository files.
 
 Run Fast Lane through its executable entry point:
 
-    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 
 For live quota, add `--quota-input`, `--live-quota`, and an optional absolute
 `--quota-state-path <user-owned-cache-file>`. That user-configurable cache
@@ -189,8 +191,9 @@ after evidence, commit, integration, and acceptance have all succeeded.
 ## Deterministic Fast Lane
 
 The Fast Lane compiler is in
-skills/work-methodology/scripts/fastlane_routing.py and
-skills/work-methodology/scripts/team_efficiency.py.
+mcp-tools/devkit_fastlane/scripts/fastlane_routing.py and
+mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The public MCP entry is
+`fastlane_compile`; it returns inert descriptors only.
 
 - Ultra activates the compiler; lower efforts require the host's explicit
   enablement.
@@ -217,10 +220,10 @@ through `codex app-server --stdio`, binds the fresh signed snapshot to the
 quota request, and fails closed to `usage_unknown` on source, freshness, or
 signature errors:
 
-    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
+    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
 
 The detailed producer contract is in
-[codex_account_quota.py](skills/work-methodology/scripts/codex_account_quota.py).
+[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py).
 It never reads `auth.json`, cookies, or private HTTP endpoints; its sample
 cache path is user-configurable through `--quota-state-path` (for example, a
 project cache on another configured drive). If no path is supplied, it follows
@@ -253,7 +256,7 @@ The RC1 integration was verified with:
 
 The full regression result for the integrated tree was 1037 passed, 13
 skipped, and 40 subtests passed. The fresh-artifact stdio checks also verify
-the exact 16-tool inventory, empty prompt/resource lists, protocol-clean
+the exact 17-tool inventory, empty prompt/resource lists, protocol-clean
 stdout, normal and rejected calls, missing-host capability failure, and
 source-checkout independence.
 

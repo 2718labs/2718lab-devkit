@@ -66,6 +66,7 @@ TOOL_ANNOTATIONS: Final[dict[str, tuple[bool, bool, bool, bool]]] = {
     "atlas_render": (True, False, True, False),
     "atlas_accept": (False, False, True, False),
     "relay_compile": (True, False, True, False),
+    "fastlane_compile": (True, False, True, False),
     "relay_start": (False, False, True, False),
     "relay_status": (True, False, True, False),
     "relay_handoff": (False, False, False, False),

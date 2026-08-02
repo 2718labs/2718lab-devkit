@@ -20,7 +20,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "team_efficiency.py"
 ROUTING_SCRIPT = ROOT / "scripts" / "fastlane_routing.py"
-SKILL = ROOT / "SKILL.md"
+CONTRACT = ROOT / "FASTLANE_CONTRACT.md"
 sys.path.insert(0, str(ROOT.parents[1] / "mcp-tools"))
 
 from devkit_atlas import (  # noqa: E402
@@ -1181,7 +1181,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                 else workspace_input_snapshot_id
             ),
             "read_scope": (
-                ["skills/work-methodology/scripts/team_efficiency.py"]
+                ["mcp-tools/devkit_fastlane/scripts/team_efficiency.py"]
                 if read_scope is None
                 else read_scope
             ),
@@ -3429,7 +3429,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper,
             task_id=first_unit["task_id"],
             base_commit=base_commit,
-            write_scope=["skills/work-methodology/references/context-unrelated.md"],
+            write_scope=["mcp-tools/devkit_fastlane/references/context-unrelated.md"],
         )
         context_cases.append(("scope_mismatch", scope_mismatch))
 
@@ -4855,8 +4855,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             hashlib.sha256(payload).hexdigest(),
         )
 
-    def test_skill_documents_ultra_auto_policy(self) -> None:
-        document = SKILL.read_text(encoding="utf-8")
+    def test_contract_documents_ultra_auto_policy(self) -> None:
+        document = CONTRACT.read_text(encoding="utf-8")
 
         for expected in (
             "--host-status <fast-lane-host-status.json>",
@@ -4957,7 +4957,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             task_id="ATLAS-12B",
             base_commit="a" * 40,
             branch="feature/code-atlas-v1-team-efficiency",
-            write_scope=["skills/work-methodology/scripts/team_efficiency.py"],
+            write_scope=["mcp-tools/devkit_fastlane/scripts/team_efficiency.py"],
             repo=self.repo,
             project=project,
             worktree=worktree,
@@ -6264,7 +6264,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertEqual(self.resume_packet(), json.loads(output.getvalue()))
-        self.assertIn("efficiency-automation.md", SKILL.read_text(encoding="utf-8"))
+        self.assertIn("efficiency-automation.md", CONTRACT.read_text(encoding="utf-8"))
 
     def test_cli_decomposes_packet_and_episode_evidence_without_artifacts(
         self,

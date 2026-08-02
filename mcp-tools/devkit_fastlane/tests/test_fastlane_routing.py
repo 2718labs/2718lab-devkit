@@ -14,9 +14,13 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-CORE_PATH = ROOT / "skills" / "work-methodology" / "scripts" / "fastlane_routing.py"
+CORE_PATH = ROOT / "mcp-tools" / "devkit_fastlane" / "scripts" / "fastlane_routing.py"
 POLICY_PATH = (
-    ROOT / "skills" / "work-methodology" / "assets" / "fastlane-routing-policy-v3.json"
+    ROOT
+    / "mcp-tools"
+    / "devkit_fastlane"
+    / "assets"
+    / "fastlane-routing-policy-v3.json"
 )
 HASH_A = "sha256:" + ("a" * 64)
 HASH_B = "sha256:" + ("b" * 64)
@@ -740,7 +744,11 @@ def test_routing_core_ast_has_no_outbound_model_or_spawn_surface() -> None:
 
 def test_efficiency_automation_documents_exact_attested_dynamic_fallback() -> None:
     documentation = (
-        ROOT / "skills" / "work-methodology" / "references" / "efficiency-automation.md"
+        ROOT
+        / "mcp-tools"
+        / "devkit_fastlane"
+        / "references"
+        / "efficiency-automation.md"
     ).read_text(encoding="utf-8")
 
     assert "exact host-attested model/effort tuple" in documentation

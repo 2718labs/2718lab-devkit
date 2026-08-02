@@ -1,6 +1,6 @@
 # 接地纪律(不凭记忆写 API)
 
-本文件配合 `SKILL.md` 第 0 条第 1 款、第 2 步使用。核心原则:**训练记忆不是可信来源**,尤其是框架/库的具体签名、参数名、版本行为——记忆会过期、会和相似框架混淆、会自信地编造不存在的参数。
+本文件配合 `FASTLANE_CONTRACT.md` 使用。核心原则:**训练记忆不是可信来源**,尤其是框架/库的具体签名、参数名、版本行为——记忆会过期、会和相似框架混淆、会自信地编造不存在的参数。
 
 ## 1. 查证优先级表
 
@@ -34,8 +34,8 @@
 | 通用 Python 工程(代码质量/测试/打包) | `python-engineering` | `references/guidelines.md`(团队代码质量守则)、`references/toolchain-commands.md`(uv/ruff/pyright/pytest 命令速查)、`references/pyproject-reference.md`(打包与 [tool.*] 配置键) |
 | 开源仓库运营(许可证/版本/Release/CI/插件市场提交) | `oss-repo-ops` | `references/astrbot-market.md`(插件市场提交)、`references/release-workflow.md`(版本/tag/Release/CI)、`references/repo-hygiene.md`(README/LICENSE/CHANGELOG 卫生) |
 
-路由表本身会过期(sibling skill 增删文件),不确定时先读对应 skill 的 `SKILL.md` 顶部配套文件说明,以那里的实际列表为准。
+路由表本身会过期(sibling runtime 增删文件),不确定时先读 `FASTLANE_CONTRACT.md` 顶部配套文件说明,以那里的实际列表为准。
 
 ## 4. Progressive disclosure 纪律
 
-先读 `SKILL.md`,按它给的"何时读"提示决定要不要打开某个 `references/*.md`,**禁止一次性把所有 references 全读一遍**——大部分任务只需要命中一两份文件,全读是浪费上下文且稀释重点。这条纪律不止用于本 skill,读任何其他 2718lab skill 时都按此用法:SKILL.md 是索引,references 是按需展开的详情。
+先读 `FASTLANE_CONTRACT.md`,按它给的"何时读"提示决定要不要打开某个 `references/*.md`,**禁止一次性把所有 references 全读一遍**——大部分任务只需要命中一两份文件,全读是浪费上下文且稀释重点。契约是索引,references 是按需展开的详情。

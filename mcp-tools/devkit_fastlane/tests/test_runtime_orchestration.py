@@ -3,15 +3,14 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / "SKILL.md"
+CONTRACT = ROOT / "FASTLANE_CONTRACT.md"
 RUNTIME = ROOT / "references" / "orchestration-runtime.md"
 
 
 class RuntimeOrchestrationPolicyTests(unittest.TestCase):
     def test_multi_agent_work_prefers_executable_orchestrator(self) -> None:
-        text = SKILL.read_text(encoding="utf-8")
+        text = CONTRACT.read_text(encoding="utf-8")
 
         self.assertIn("多代理任务优先使用 `2718lab-tools` 的可执行编排", text)
         self.assertIn("DEGRADED_SKILL_ONLY", text)

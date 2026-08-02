@@ -24,23 +24,23 @@
 - Atlas 提供有边界的图查询、实现包准备、惰性渲染和持久化验收投影。
 - Relay 验证显式工作包并暴露生命周期状态。Python 只返回结构化宿主
   动作；工作树准备和 agent 调度仍由 Codex 宿主负责。
-- 主包是 MCP-only：精确暴露 16 个工具，不暴露 MCP prompts、MCP
+- 主包是 MCP-only：精确暴露 17 个工具，不暴露 MCP prompts、MCP
   resources、静态 prompt agent 或模型运行器。
-- Fast Lane 仍是 work-methodology skill 中的纯本地编译器。它根据有界
-  难度和宿主能力证据选择显式模型/推理级别，不创建 agent、不改 Git、
-  不执行命令。
+- Fast Lane 是 MCP runtime 中的纯本地编译器。它根据有界难度和宿主能力
+  证据选择显式模型/推理级别，不创建 agent、不改 Git、不执行命令；额度
+  和生命周期证明仍是宿主私有输入。
 
 ## 核心模块速览
 
 | 模块 | 作用 | 从哪里开始 |
 | --- | --- | --- |
-| [`mcp-tools/server.py`](mcp-tools/server.py) | stdio MCP 入口和公共 16 工具面 | [精确 MCP 面](#精确-mcp-面) |
+| [`mcp-tools/server.py`](mcp-tools/server.py) | stdio MCP 入口和公共 17 工具面 | [精确 MCP 面](#精确-mcp-面) |
 | [`mcp-tools/project_index/`](mcp-tools/project_index/) | 工作区注册、受限快照、状态和图查询 | [Project Index 工具](#精确-mcp-面) |
 | [`mcp-tools/devkit_atlas/`](mcp-tools/devkit_atlas/) | 证据图查询、实现包、渲染和验收投影 | [Atlas 工具](#精确-mcp-面) |
 | [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | 显式工作包编译和生命周期宿主动作 | [Relay 工具](#精确-mcp-面) |
 | [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | 运行时路径、checkpoint、持久边界和宿主私有 bridge | [运行时数据与恢复](#运行时数据与崩溃恢复) |
-| [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | 持久化 workflow、task、lease 和生命周期状态 | [workflow 生命周期](skills/work-methodology/references/efficiency-automation.md#workflow-lifecycle-plan) |
-| [`skills/work-methodology/`](skills/work-methodology/) | 确定性路由/Fast Lane 编译器、额度快照采集、契约和测试 | [Fast Lane 契约](skills/work-methodology/SKILL.md) |
+| [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | 持久化 workflow、task、lease 和生命周期状态 | [workflow 生命周期](mcp-tools/devkit_fastlane/references/efficiency-automation.md#workflow-lifecycle-plan) |
+| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | 确定性路由/Fast Lane 编译器、额度快照采集、契约和测试 | [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
 | [`.codex-plugin/`](.codex-plugin/) | 插件 manifest、产物 allowlist 和可复现构建器 | [构建主产物](#构建主产物) |
 
 ## 整体工作流
@@ -78,19 +78,19 @@ flowchart TD
 
 把本页作为入口，按契约跳转到需要的细节，不必重复阅读整个仓库：
 
-- [工作方法与 Fast Lane 契约](skills/work-methodology/SKILL.md)
-- [效率自动化参考与 CLI 细节](skills/work-methodology/references/efficiency-automation.md)
-- [验证清单](skills/work-methodology/references/verification-checklist.md)
-- [工作包与任务卡规则](skills/work-methodology/references/work-packages.md)
-- [编排运行时契约](skills/work-methodology/references/orchestration-runtime.md)
-- [团队与 lane 模式](skills/work-methodology/references/team-patterns.md)
+- [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md)
+- [效率自动化参考与 CLI 细节](mcp-tools/devkit_fastlane/references/efficiency-automation.md)
+- [验证清单](mcp-tools/devkit_fastlane/references/verification-checklist.md)
+- [工作包与任务卡规则](mcp-tools/devkit_fastlane/references/work-packages.md)
+- [编排运行时契约](mcp-tools/devkit_fastlane/references/orchestration-runtime.md)
+- [团队与 lane 模式](mcp-tools/devkit_fastlane/references/team-patterns.md)
 - [Ultra Fast Lane 设计](docs/superpowers/specs/2026-07-30-ultra-fast-lane-design.md)
 - [Codex-first 工具/插件设计](docs/superpowers/specs/2026-07-31-codex-first-tool-plugin-design.md)
 - [发布历史](CHANGELOG.md)
 
 实现入口见
-[Fast Lane 编译器](skills/work-methodology/scripts/team_efficiency.py) 和
-[实时 Codex 额度采集与快照模块](skills/work-methodology/scripts/codex_account_quota.py)。
+[Fast Lane 编译器](mcp-tools/devkit_fastlane/scripts/team_efficiency.py) 和
+[宿主专用 Codex 额度采集与快照模块](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)。
 
 ## 精确 MCP 面
 
@@ -103,6 +103,7 @@ flowchart TD
 | Checkpoint | worktree_checkpoint_create、worktree_checkpoint_status、worktree_checkpoint_restore |
 | Atlas | atlas_query、atlas_prepare、atlas_render、atlas_accept |
 | Relay | relay_compile、relay_start、relay_status、relay_handoff、relay_integrate |
+| Fast Lane | fastlane_compile |
 
 服务器没有 prompt 或 resource 面。工具输入是结构化且有界的；绝对工作
 者路径、Shell 片段、原始源码、凭据、无界命令输出和调用方伪造的验收证据
@@ -137,16 +138,16 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
     python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0-rc1.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
-.codex-plugin/main-artifact-allowlist.json 选中的六棵运行时目录树。它的
-公共运行面仍是 MCP-only；ZIP 同时携带可执行 Fast Lane 方法论的最小子集：
-work-methodology 契约、必需参考资料和策略 assets、`team_efficiency.py`
-入口、其路由与额度平衡模块，以及官方账号额度采集模块。它明确不包含
+.codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的公共运行面
+仍是 MCP-only；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
+`team_efficiency.py` 兼容入口、其路由与额度平衡模块，以及宿主专用官方账号
+额度采集模块。它明确不包含
 `agents/`、`commands/`、`hooks/`、Claude 配置、CI 文件、宿主私有状态、
 prompts、静态 agent 或任意仓库文件。
 
 Fast Lane 应通过以下可执行入口运行：
 
-    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 
 需要实时额度时，补充 `--quota-input`、`--live-quota`，并可选择提供绝对路径的
 `--quota-state-path <user-owned-cache-file>`。这个由用户配置的缓存只保存有界的
@@ -175,8 +176,9 @@ receipt 恢复。继续前先重新绑定有效的当前上下文。不得从聊
 ## 确定性 Fast Lane
 
 Fast Lane 编译器位于
-skills/work-methodology/scripts/fastlane_routing.py 和
-skills/work-methodology/scripts/team_efficiency.py。
+mcp-tools/devkit_fastlane/scripts/fastlane_routing.py 和
+mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
+`fastlane_compile`，只返回惰性描述符。
 
 - Ultra 会激活编译器；低于 Ultra 的 effort 需要宿主显式启用。
 - 难度、风险、范围、验证成本、阻塞严重度和可用容量共同选择路由。
@@ -197,10 +199,10 @@ skills/work-methodology/scripts/team_efficiency.py。
 `codex app-server --stdio` 读取主池和 Spark 池，把新鲜签名快照绑定到 quota request；
 来源、freshness 或签名异常时会失败关闭为 `usage_unknown`：
 
-    python skills/work-methodology/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
+    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
 
 详细的额度采集与快照契约见
-[codex_account_quota.py](skills/work-methodology/scripts/codex_account_quota.py)。它不会读取
+[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)。它不会读取
 `auth.json`、cookie 或私有 HTTP 接口；样本缓存路径由用户通过
 `--quota-state-path` 配置（例如其他已配置盘符上的项目缓存）。未提供时跟随
 `CODEX_TASK_TEMP`，不会静默回落到未批准的临时目录。
@@ -227,7 +229,7 @@ RC1 集成树已按以下命令完成验证：
     uv run --locked python -m compileall -q devkit_atlas devkit_runtime orchestrator project_index
 
 集成树全量回归结果为 1037 passed、13 skipped、40 个 subtests passed。
-全新产物 stdio 检查还验证了精确 16 工具清单、空 prompt/resource 列表、
+全新产物 stdio 检查还验证了精确 17 工具清单、空 prompt/resource 列表、
 协议干净的 stdout、正常和拒绝调用、缺失宿主能力时的失败关闭，以及不依赖
 源 checkout 的独立启动。
 

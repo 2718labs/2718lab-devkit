@@ -34,6 +34,7 @@ include = [
     "devkit_atlas",
     "devkit_relay",
     "devkit_runtime",
+    "devkit_fastlane",
     "orchestrator",
     "project_index",
     "server.py",
@@ -42,4 +43,4 @@ pythonVersion = "3.11"
 typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "devkit_fastlane/tests"]

@@ -116,7 +116,7 @@ Depends on: <ids 或 none>
 严格索引卡在注册时使用 `strict_index=true`，并在卡片验收中列出 `project_index_sync`、`project_index_query`、`trace_id`、`worktree_checkpoint_create`、`project_index_sync(bind_as="output")`、`workflow_artifact_register(kind="verification", snapshot_id=...)` 和 `workflow_complete`。遗留卡保持 `strict_index=false`；不要为此扩展用户 brief 或把细节复制进总文档。
 
 ```powershell
-python skills/work-methodology/scripts/validate_work_package.py <work-package>
+python mcp-tools/devkit_fastlane/scripts/validate_work_package.py <work-package>
 ```
 
 验证器检查文件存在性、上下文预算、必需章节、单 owner 和精确 write scope。它不替代业务测试。

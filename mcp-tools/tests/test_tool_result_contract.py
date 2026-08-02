@@ -176,6 +176,7 @@ def test_envelope_has_no_generic_fallbacks(value: object) -> None:
         ("atlas_render", (True, False, True, False)),
         ("atlas_accept", (False, False, True, False)),
         ("relay_compile", (True, False, True, False)),
+        ("fastlane_compile", (True, False, True, False)),
         ("relay_start", (False, False, True, False)),
         ("relay_status", (True, False, True, False)),
         ("relay_handoff", (False, False, False, False)),
@@ -184,7 +185,7 @@ def test_envelope_has_no_generic_fallbacks(value: object) -> None:
 )
 def test_annotation_table_is_exact(tool: str, expected: tuple[bool, ...]) -> None:
     assert TOOL_ANNOTATIONS[tool] == expected
-    assert len(TOOL_ANNOTATIONS) == 16
+    assert len(TOOL_ANNOTATIONS) == 17
 
 
 def test_index_projectors_are_closed_and_source_windows_never_include_text() -> None:
