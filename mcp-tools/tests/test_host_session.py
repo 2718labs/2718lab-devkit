@@ -86,6 +86,7 @@ def _snapshot(
     observed_at: str = "2023-11-14T22:13:20Z",
     valid_until: str = "2023-11-14T22:15:20Z",
     source_id_hash: str | None = None,
+    capacity_overrides: dict[str, object] | None = None,
 ) -> dict[str, object]:
     capacity = {
         "ledger_epoch": 7,
@@ -97,6 +98,8 @@ def _snapshot(
         "host_spark_cap": 1,
         "active_lease_set_hash": _HASH_PREFIX + "a" * 64,
     }
+    if capacity_overrides is not None:
+        capacity.update(capacity_overrides)
     source = {
         "kind": "codex_host_usage_snapshot",
         "source_id_hash": (
@@ -137,7 +140,14 @@ def _snapshot(
 
 
 def _attestation(
-    module: object, request_id: str, snapshot: dict[str, object], key: bytes
+    module: object,
+    request_id: str,
+    snapshot: dict[str, object],
+    key: bytes,
+    *,
+    account_id_hash: str = _HASH_PREFIX + "d" * 64,
+    main_limit_id: str = "codex",
+    spark_limit_id: str = "codex_bengalfox",
 ) -> object:
     source = snapshot["source"]
     assert isinstance(source, dict)
@@ -147,20 +157,60 @@ def _attestation(
     assert isinstance(key_id, str)
     return module.HostQuotaAttestation(
         request_id=request_id,
-        account_id_hash=_HASH_PREFIX + "d" * 64,
+        account_id_hash=account_id_hash,
         source_id_hash=source["source_id_hash"],
-        main_limit_id="codex",
-        spark_limit_id="codex_bengalfox",
+        main_limit_id=main_limit_id,
+        spark_limit_id=spark_limit_id,
         capacity_hash=_hash(capacity),
         snapshot_seq=snapshot["snapshot_seq"],
         evidence=QuotaSnapshotEvidence(
             snapshot=snapshot,
             key_id=key_id,
             _key=key,
-            account_id_hash=_HASH_PREFIX + "d" * 64,
+            account_id_hash=account_id_hash,
             plan_type="pro",
-            main_limit_id="codex",
-            spark_limit_id="codex_bengalfox",
+            main_limit_id=main_limit_id,
+            spark_limit_id=spark_limit_id,
+        ),
+    )
+
+
+def _quota_expectation(
+    module: object,
+    snapshot: dict[str, object],
+    *,
+    account_id_hash: str = _HASH_PREFIX + "d" * 64,
+    main_limit_id: str = "codex",
+    spark_limit_id: str = "codex_bengalfox",
+    snapshot_seq_high_water: int | None = None,
+) -> object:
+    snapshot_seq = snapshot["snapshot_seq"]
+    snapshot_capacity = snapshot["capacity"]
+    source = snapshot["source"]
+    assert isinstance(snapshot_seq, int)
+    assert isinstance(snapshot_capacity, dict)
+    assert isinstance(source, dict)
+    source_id_hash = source["source_id_hash"]
+    key_id = source["key_id"]
+    ledger_epoch = snapshot_capacity["ledger_epoch"]
+    active_lease_set_hash = snapshot_capacity["active_lease_set_hash"]
+    assert isinstance(source_id_hash, str)
+    assert isinstance(key_id, str)
+    assert isinstance(ledger_epoch, int)
+    assert isinstance(active_lease_set_hash, str)
+    return module.HostQuotaExpectation(
+        account_id_hash=account_id_hash,
+        source_id_hash=source_id_hash,
+        key_id=key_id,
+        main_limit_id=main_limit_id,
+        spark_limit_id=spark_limit_id,
+        capacity_hash=_hash(snapshot_capacity),
+        ledger_epoch=ledger_epoch,
+        active_lease_set_hash=active_lease_set_hash,
+        snapshot_seq_high_water=(
+            snapshot_seq - 1
+            if snapshot_seq_high_water is None
+            else snapshot_seq_high_water
         ),
     )
 
@@ -182,7 +232,7 @@ def _reply_once(
             },
         )
 
-    thread = threading.Thread(target=reply)
+    thread = threading.Thread(target=reply, daemon=True)
     thread.start()
     return thread
 
@@ -201,7 +251,9 @@ def test_host_session_without_an_inherited_bridge_never_resolves_quota() -> None
     assert resolved == []
 
 
-def test_host_session_from_environment_never_probes_or_falls_back_when_missing_or_invalid() -> None:
+def test_host_session_from_environment_never_probes_or_falls_back_when_missing_or_invalid() -> (
+    None
+):
     module = _host_session_module()
     resolved: list[object] = []
 
@@ -262,11 +314,14 @@ def test_declared_or_pending_route_data_never_becomes_a_scheduling_fact() -> Non
 
     assert declared[0].state is module.HostCapabilityState.DECLARED
     assert session.scheduling_facts(declared) == "NO_SAFE_WORK"
-    assert session.observe_execution(
-        {"clientThreadId": "pending-123", "model": "gpt-5.6-terra"},
-        predecessor=object(),
-        now=_NOW,
-    ) == "NO_SAFE_WORK"
+    assert (
+        session.observe_execution(
+            {"clientThreadId": "pending-123", "model": "gpt-5.6-terra"},
+            predecessor=object(),
+            now=_NOW,
+        )
+        == "NO_SAFE_WORK"
+    )
 
 
 def test_host_session_exports_only_exact_bridge_attested_model_effort_pairs() -> None:
@@ -304,6 +359,8 @@ def test_host_session_exports_only_exact_bridge_attested_model_effort_pairs() ->
     assert facts[0].state is module.HostCapabilityState.ATTESTED
     assert isinstance(scheduled, module.HostSchedulingFacts)
     assert scheduled.routes == (route,)
+    assert scheduled.binding_hash is not None
+    assert not hasattr(scheduled, "binding")
     assert rejected == "NO_SAFE_WORK"
 
 
@@ -323,6 +380,7 @@ def test_host_session_accepts_only_exact_same_process_attested_quota_evidence() 
         bridge=child,
         quota_evidence_resolver=resolve,
         clock=lambda: _NOW,
+        quota_expectation=_quota_expectation(module, snapshot),
     )
     thread = _reply_once(host, snapshot)
     try:
@@ -340,6 +398,245 @@ def test_host_session_accepts_only_exact_same_process_attested_quota_evidence() 
     assert len(resolver_calls) == 1
 
 
+def test_host_session_requires_a_trusted_quota_expectation_before_reading() -> None:
+    module = _host_session_module()
+    requests: list[str] = []
+    resolver_calls: list[str] = []
+
+    class QuotaTrapBridge:
+        is_available = True
+
+        def request_quota_snapshot(self, *, request_id: str) -> None:
+            requests.append(request_id)
+            raise AssertionError("quota request must not be sent without expectation")
+
+        def close(self) -> None:
+            return None
+
+    session = module.HostSession(
+        bridge=QuotaTrapBridge(),
+        quota_evidence_resolver=lambda request_id, _: resolver_calls.append(request_id),
+        clock=lambda: _NOW,
+    )
+
+    assert session.read_quota() == "NO_SAFE_WORK"
+    assert requests == []
+    assert resolver_calls == []
+
+
+def test_host_session_locks_the_expected_account_across_snapshot_sequences() -> None:
+    module = _host_session_module()
+    child, host = _pipe_pair()
+    key = b"q" * 32
+    first_snapshot = _snapshot(key=key, sequence=10)
+    second_snapshot = _snapshot(key=key, sequence=11)
+
+    def resolve(request_id: str, received: dict[str, object]) -> object:
+        account_id_hash = (
+            _HASH_PREFIX + "d" * 64
+            if received["snapshot_seq"] == 10
+            else _HASH_PREFIX + "e" * 64
+        )
+        return _attestation(
+            module,
+            request_id,
+            received,
+            key,
+            account_id_hash=account_id_hash,
+        )
+
+    session = module.HostSession(
+        bridge=child,
+        quota_evidence_resolver=resolve,
+        quota_expectation=_quota_expectation(
+            module, first_snapshot, snapshot_seq_high_water=9
+        ),
+        clock=lambda: _NOW,
+    )
+    first = _reply_once(host, first_snapshot)
+    try:
+        assert isinstance(session.read_quota(), module.HostQuotaFacts)
+        first.join(timeout=2)
+        second = _reply_once(host, second_snapshot)
+        assert session.read_quota() == "NO_SAFE_WORK"
+        second.join(timeout=2)
+        assert session.is_available is False
+    finally:
+        child.close()
+        host.close()
+
+
+def test_host_session_locks_the_exact_spark_pool_and_capacity_lease_set() -> None:
+    module = _host_session_module()
+    base_key = b"q" * 32
+    expected_snapshot = _snapshot(key=base_key, sequence=9)
+    cases = (
+        (
+            "foreign-spark-pool",
+            _snapshot(key=base_key, sequence=10),
+            {"spark_limit_id": "foreign-spark"},
+        ),
+        (
+            "foreign-ledger-epoch",
+            _snapshot(
+                key=base_key,
+                sequence=10,
+                capacity_overrides={"ledger_epoch": 999},
+            ),
+            {},
+        ),
+        (
+            "foreign-active-lease-set",
+            _snapshot(
+                key=base_key,
+                sequence=10,
+                capacity_overrides={"active_lease_set_hash": _HASH_PREFIX + "e" * 64},
+            ),
+            {},
+        ),
+    )
+    for _, snapshot, attestation_values in cases:
+        child, host = _pipe_pair()
+
+        def resolve(request_id: str, received: dict[str, object]) -> object:
+            return _attestation(
+                module,
+                request_id,
+                received,
+                base_key,
+                **attestation_values,
+            )
+
+        session = module.HostSession(
+            bridge=child,
+            quota_evidence_resolver=resolve,
+            quota_expectation=_quota_expectation(
+                module, expected_snapshot, snapshot_seq_high_water=9
+            ),
+            clock=lambda: _NOW,
+        )
+        thread = _reply_once(host, snapshot)
+        try:
+            assert session.read_quota() == "NO_SAFE_WORK"
+            thread.join(timeout=2)
+            assert session.is_available is False
+        finally:
+            child.close()
+            host.close()
+
+
+def test_host_session_rejects_a_self_consistent_source_key_rebind() -> None:
+    module = _host_session_module()
+    child, host = _pipe_pair()
+    first_key = b"q" * 32
+    second_key = b"r" * 32
+    first_snapshot = _snapshot(key=first_key, sequence=10)
+    second_snapshot = _snapshot(key=second_key, sequence=11)
+
+    def resolve(request_id: str, received: dict[str, object]) -> object:
+        key = first_key if received["snapshot_seq"] == 10 else second_key
+        return _attestation(module, request_id, received, key)
+
+    session = module.HostSession(
+        bridge=child,
+        quota_evidence_resolver=resolve,
+        quota_expectation=_quota_expectation(
+            module, first_snapshot, snapshot_seq_high_water=9
+        ),
+        clock=lambda: _NOW,
+    )
+    first = _reply_once(host, first_snapshot)
+    try:
+        assert isinstance(session.read_quota(), module.HostQuotaFacts)
+        first.join(timeout=2)
+        second = _reply_once(host, second_snapshot)
+        assert session.read_quota() == "NO_SAFE_WORK"
+        second.join(timeout=2)
+        assert session.is_available is False
+    finally:
+        child.close()
+        host.close()
+
+
+def test_host_session_rejects_snapshot_at_or_below_the_expected_high_water() -> None:
+    module = _host_session_module()
+    child, host = _pipe_pair()
+    key = b"q" * 32
+    snapshot = _snapshot(key=key, sequence=10)
+    session = module.HostSession(
+        bridge=child,
+        quota_evidence_resolver=lambda request_id, received: _attestation(
+            module, request_id, received, key
+        ),
+        quota_expectation=_quota_expectation(
+            module, snapshot, snapshot_seq_high_water=10
+        ),
+        clock=lambda: _NOW,
+    )
+    thread = _reply_once(host, snapshot)
+    try:
+        assert session.read_quota() == "NO_SAFE_WORK"
+        thread.join(timeout=2)
+        assert session.is_available is False
+    finally:
+        child.close()
+        host.close()
+
+
+def test_private_quota_evidence_and_attestation_reprs_redact_the_hmac_key() -> None:
+    module = _host_session_module()
+    key = b"very-secret-quota-key-1234567890"
+    snapshot = _snapshot(key=key)
+    evidence = QuotaSnapshotEvidence(
+        snapshot=snapshot,
+        key_id=snapshot["source"]["key_id"],
+        _key=key,
+        account_id_hash=_HASH_PREFIX + "d" * 64,
+        plan_type="pro",
+        main_limit_id="codex",
+        spark_limit_id="codex_bengalfox",
+    )
+    attestation = module.HostQuotaAttestation(
+        request_id="quota-repr",
+        account_id_hash=_HASH_PREFIX + "d" * 64,
+        source_id_hash=snapshot["source"]["source_id_hash"],
+        main_limit_id="codex",
+        spark_limit_id="codex_bengalfox",
+        capacity_hash=_hash(snapshot["capacity"]),
+        snapshot_seq=snapshot["snapshot_seq"],
+        evidence=evidence,
+    )
+
+    for rendered in (repr(evidence), repr(attestation)):
+        assert repr(key) not in rendered
+        assert key.hex() not in rendered
+
+
+def test_host_session_records_bounded_unavailable_capability_facts() -> None:
+    module = _host_session_module()
+    route = module.HostRoute(model="gpt-5.6-terra", effort="max")
+    session = module.HostSession(
+        bridge=None,
+        quota_evidence_resolver=lambda *_: None,
+        clock=lambda: _NOW,
+    )
+
+    assert (
+        session.attest_routes(binding=_binding(), routes=(route,), now=_NOW)
+        == "NO_SAFE_WORK"
+    )
+    unavailable = session.last_unavailable
+
+    assert isinstance(unavailable, module.HostUnavailableFacts)
+    assert unavailable.reason_code == "HOST_SESSION_UNAVAILABLE"
+    assert unavailable.bounds == (route,)
+    assert unavailable.facts[0].state is module.HostCapabilityState.UNAVAILABLE
+    assert unavailable.facts[0].route == route
+    assert unavailable.facts[0].attestation_hash is None
+    assert unavailable.facts[0].binding_hash is None
+    assert unavailable.facts[0].reason_code == "HOST_SESSION_UNAVAILABLE"
+
+
 def test_host_session_rejects_a_legal_snapshot_replay_then_freezes() -> None:
     module = _host_session_module()
     child, host = _pipe_pair()
@@ -355,6 +652,7 @@ def test_host_session_rejects_a_legal_snapshot_replay_then_freezes() -> None:
         bridge=child,
         quota_evidence_resolver=resolve,
         clock=lambda: _NOW,
+        quota_expectation=_quota_expectation(module, snapshot),
     )
     first = _reply_once(host, snapshot)
     try:
@@ -381,6 +679,7 @@ def test_host_session_rejects_a_quota_response_bound_to_a_different_request() ->
         bridge=child,
         quota_evidence_resolver=lambda *_: resolver_calls.append(object()),
         clock=lambda: _NOW,
+        quota_expectation=_quota_expectation(module, snapshot),
     )
     thread = _reply_once(host, snapshot, action_id="quota-foreign")
     try:
@@ -394,7 +693,9 @@ def test_host_session_rejects_a_quota_response_bound_to_a_different_request() ->
     assert resolver_calls == []
 
 
-def test_host_session_uses_the_injected_host_clock_for_future_and_stale_snapshots() -> None:
+def test_host_session_uses_the_injected_host_clock_for_future_and_stale_snapshots() -> (
+    None
+):
     module = _host_session_module()
     cases = (
         ("2023-11-14T22:13:21Z", "2023-11-14T22:15:21Z"),
@@ -418,6 +719,7 @@ def test_host_session_uses_the_injected_host_clock_for_future_and_stale_snapshot
             bridge=child,
             quota_evidence_resolver=resolve,
             clock=lambda: _NOW,
+            quota_expectation=_quota_expectation(module, snapshot),
         )
         thread = _reply_once(host, snapshot)
         try:
@@ -445,6 +747,7 @@ def test_host_session_rejects_equal_or_decreasing_snapshot_sequences() -> None:
         bridge=child,
         quota_evidence_resolver=resolve,
         clock=lambda: _NOW,
+        quota_expectation=_quota_expectation(module, first_snapshot),
     )
     first = _reply_once(host, first_snapshot)
     try:
@@ -478,6 +781,7 @@ def test_host_session_rejects_foreign_account_pool_or_capacity_attestations() ->
             bridge=child,
             quota_evidence_resolver=resolve,
             clock=lambda: _NOW,
+            quota_expectation=_quota_expectation(module, snapshot),
         )
         thread = _reply_once(host, snapshot)
         try:
@@ -501,6 +805,7 @@ def test_host_session_rejects_a_non_official_signed_quota_source() -> None:
         bridge=child,
         quota_evidence_resolver=resolve,
         clock=lambda: _NOW,
+        quota_expectation=_quota_expectation(module, snapshot),
     )
     thread = _reply_once(host, snapshot)
     try:
@@ -523,6 +828,7 @@ def test_host_session_freezes_permanently_after_private_transport_corruption() -
             bridge=child,
             quota_evidence_resolver=lambda *_: resolver_calls.append(object()),
             clock=lambda: _NOW,
+            quota_expectation=_quota_expectation(module, _snapshot(key=b"q" * 32)),
         )
 
         def reply() -> None:
@@ -574,7 +880,9 @@ def test_host_session_freezes_permanently_after_private_transport_corruption() -
         assert resolver_calls == []
 
 
-def test_host_session_observes_an_authenticated_terminal_without_executing_work() -> None:
+def test_host_session_observes_an_authenticated_terminal_without_executing_work() -> (
+    None
+):
     module = _host_session_module()
     child, host = _pipe_pair()
     route = module.HostRoute(model="gpt-5.6-terra", effort="max")
@@ -613,7 +921,9 @@ def test_host_session_observes_an_authenticated_terminal_without_executing_work(
         predecessor = child.send_operation(envelope=assignment, now=_NOW)
         received = host.receive_operation(
             now=_NOW,
-            expected=EnvelopeExpectation(kind="coordinator_assignment", binding=binding),
+            expected=EnvelopeExpectation(
+                kind="coordinator_assignment", binding=binding
+            ),
         )
         terminal = render_envelope(
             kind="worker_terminal_result",
@@ -634,11 +944,182 @@ def test_host_session_observes_an_authenticated_terminal_without_executing_work(
             facts[0], predecessor=predecessor, now=_NOW
         )
         scheduled = session.scheduling_facts((executed,))
+        replayed = session.observe_execution(
+            facts[0], predecessor=predecessor, now=_NOW
+        )
     finally:
         thread.join(timeout=2)
         child.close()
         host.close()
 
     assert executed.state is module.HostCapabilityState.EXECUTED
+    assert executed.binding_hash is not None
+    assert not hasattr(executed, "binding")
+    assert binding.assignment_token not in repr(executed)
     assert isinstance(scheduled, module.HostSchedulingFacts)
     assert scheduled.routes == (route,)
+    assert replayed == "NO_SAFE_WORK"
+
+
+def test_host_session_rejects_terminals_crossing_attested_binding_fields() -> None:
+    module = _host_session_module()
+    route = module.HostRoute(model="gpt-5.6-terra", effort="max")
+    reported_hash = _HASH_PREFIX + "f" * 64
+    mutations = (
+        lambda binding: replace(binding, task_id="task-2"),
+        lambda binding: replace(binding, lease_epoch=binding.lease_epoch + 1),
+        lambda binding: replace(binding, assignment_token=_HASH_PREFIX + "d" * 64),
+        lambda binding: replace(binding, dispatch_context_hash=_HASH_PREFIX + "e" * 64),
+        lambda binding: replace(binding, route_hash=_HASH_PREFIX + "f" * 64),
+    )
+    for mutate in mutations:
+        child, host = _pipe_pair()
+        attested_binding = _binding()
+        terminal_binding = mutate(attested_binding)
+
+        def capability_reply() -> None:
+            probe = host.receive_capability_probe(now=_NOW, expected=attested_binding)
+            host.send_capability_report(
+                probe=probe,
+                capability_hashes={
+                    name: reported_hash for name in probe.capability_names
+                },
+                now=_NOW,
+            )
+
+        thread = threading.Thread(target=capability_reply, daemon=True)
+        thread.start()
+        session = module.HostSession(
+            bridge=child,
+            quota_evidence_resolver=lambda *_: None,
+            clock=lambda: _NOW,
+        )
+        assignment = render_envelope(
+            kind="coordinator_assignment",
+            binding=terminal_binding,
+            payload={
+                "correlation_id": "operation-2",
+                "assignment": "assignment.verify",
+                "context": ["context.artifact-refs"],
+                "artifact_refs": [_HASH_PREFIX + "1" * 64],
+                "digest_refs": [_HASH_PREFIX + "2" * 64],
+            },
+            now=_NOW,
+        )
+        try:
+            facts = session.attest_routes(
+                binding=attested_binding, routes=(route,), now=_NOW
+            )
+            predecessor = child.send_operation(envelope=assignment, now=_NOW)
+            received = host.receive_operation(
+                now=_NOW,
+                expected=EnvelopeExpectation(
+                    kind="coordinator_assignment", binding=terminal_binding
+                ),
+            )
+            terminal = render_envelope(
+                kind="worker_terminal_result",
+                binding=terminal_binding,
+                payload={
+                    "correlation_id": "operation-2",
+                    "predecessor_hash": received.envelope_hash,
+                    "terminal": "succeeded",
+                    "result": ["result.verified"],
+                    "risk": [{"code": "none", "detail": "risk.none"}],
+                    "artifact_refs": [_HASH_PREFIX + "3" * 64],
+                    "digest_refs": [_HASH_PREFIX + "4" * 64],
+                },
+                now=_NOW,
+            )
+            host.send_terminal_result(envelope=terminal, predecessor=received, now=_NOW)
+
+            assert (
+                session.observe_execution(facts[0], predecessor=predecessor, now=_NOW)
+                == "NO_SAFE_WORK"
+            )
+            assert session.is_available is False
+        finally:
+            thread.join(timeout=2)
+            child.close()
+            host.close()
+
+
+def test_host_session_rejects_a_terminal_with_the_wrong_role() -> None:
+    module = _host_session_module()
+    child, host = _pipe_pair()
+    route = module.HostRoute(model="gpt-5.6-terra", effort="max")
+    binding = _binding()
+
+    def capability_reply() -> None:
+        probe = host.receive_capability_probe(now=_NOW, expected=binding)
+        host.send_capability_report(
+            probe=probe,
+            capability_hashes={
+                name: _HASH_PREFIX + "f" * 64 for name in probe.capability_names
+            },
+            now=_NOW,
+        )
+
+    thread = threading.Thread(target=capability_reply, daemon=True)
+    thread.start()
+    session = module.HostSession(
+        bridge=child,
+        quota_evidence_resolver=lambda *_: None,
+        clock=lambda: _NOW,
+    )
+    assignment = render_envelope(
+        kind="coordinator_assignment",
+        binding=binding,
+        payload={
+            "correlation_id": "operation-3",
+            "assignment": "assignment.verify",
+            "context": ["context.artifact-refs"],
+            "artifact_refs": [_HASH_PREFIX + "1" * 64],
+            "digest_refs": [_HASH_PREFIX + "2" * 64],
+        },
+        now=_NOW,
+    )
+    try:
+        facts = session.attest_routes(binding=binding, routes=(route,), now=_NOW)
+        predecessor = child.send_operation(envelope=assignment, now=_NOW)
+        received = host.receive_operation(
+            now=_NOW,
+            expected=EnvelopeExpectation(
+                kind="coordinator_assignment", binding=binding
+            ),
+        )
+        terminal = render_envelope(
+            kind="worker_terminal_result",
+            binding=binding,
+            payload={
+                "correlation_id": "operation-3",
+                "predecessor_hash": received.envelope_hash,
+                "terminal": "succeeded",
+                "result": ["result.verified"],
+                "risk": [{"code": "none", "detail": "risk.none"}],
+                "artifact_refs": [_HASH_PREFIX + "3" * 64],
+                "digest_refs": [_HASH_PREFIX + "4" * 64],
+            },
+            now=_NOW,
+        )
+        terminal["sender_role"] = "coordinator"
+        host._send_validated_private(
+            kind="operation_result",
+            action_id=received.task_id,
+            payload={
+                "schema": "2718lab-devkit/host-terminal-result-v1",
+                "correlation_id": received.correlation_id,
+                "envelope": terminal,
+                "envelope_hash": _HASH_PREFIX + "0" * 64,
+            },
+        )
+
+        assert (
+            session.observe_execution(facts[0], predecessor=predecessor, now=_NOW)
+            == "NO_SAFE_WORK"
+        )
+        assert session.is_available is False
+    finally:
+        thread.join(timeout=2)
+        child.close()
+        host.close()

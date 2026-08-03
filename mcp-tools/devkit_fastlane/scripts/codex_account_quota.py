@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self
@@ -52,9 +52,10 @@ def _canonical_json(value: object) -> str:
 
 
 def _hash(value: object) -> str:
-    return _HASH_PREFIX + hashlib.sha256(
-        _canonical_json(value).encode("utf-8")
-    ).hexdigest()
+    return (
+        _HASH_PREFIX
+        + hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+    )
 
 
 def _hash_bytes(value: bytes) -> str:
@@ -136,11 +137,21 @@ def _validate_capacity(capacity: Mapping[str, Any]) -> dict[str, Any]:
     if set(capacity) != expected:
         raise CodexQuotaError("quota capacity fields are invalid")
     result = dict(capacity)
-    _bounded_int(result["ledger_epoch"], field="ledger_epoch", minimum=0, maximum=2**63 - 1)
-    _bounded_int(result["global_main_active"], field="global_main_active", minimum=0, maximum=12)
-    _bounded_int(result["global_spark_active"], field="global_spark_active", minimum=0, maximum=1)
-    _bounded_int(result["host_main_active"], field="host_main_active", minimum=0, maximum=8)
-    _bounded_int(result["host_spark_active"], field="host_spark_active", minimum=0, maximum=1)
+    _bounded_int(
+        result["ledger_epoch"], field="ledger_epoch", minimum=0, maximum=2**63 - 1
+    )
+    _bounded_int(
+        result["global_main_active"], field="global_main_active", minimum=0, maximum=12
+    )
+    _bounded_int(
+        result["global_spark_active"], field="global_spark_active", minimum=0, maximum=1
+    )
+    _bounded_int(
+        result["host_main_active"], field="host_main_active", minimum=0, maximum=8
+    )
+    _bounded_int(
+        result["host_spark_active"], field="host_spark_active", minimum=0, maximum=1
+    )
     _bounded_int(result["host_main_cap"], field="host_main_cap", minimum=0, maximum=8)
     _bounded_int(result["host_spark_cap"], field="host_spark_cap", minimum=0, maximum=1)
     if not _is_hash(result["active_lease_set_hash"]):
@@ -152,7 +163,9 @@ class _JsonlSession:
     """Small bounded JSONL RPC client with no shell and no secret logging."""
 
     def __init__(self, command: Sequence[str], *, timeout_seconds: float) -> None:
-        if not command or any(not isinstance(item, str) or not item for item in command):
+        if not command or any(
+            not isinstance(item, str) or not item for item in command
+        ):
             raise CodexQuotaError("app-server command is invalid")
         if not 0.1 <= timeout_seconds <= 30:
             raise CodexQuotaError("app-server timeout is invalid")
@@ -220,7 +233,9 @@ class _JsonlSession:
         except (BrokenPipeError, OSError) as error:
             raise CodexQuotaError("app-server protocol write failed") from error
 
-    def request(self, method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    def request(
+        self, method: str, params: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]:
         request_id = self._next_id
         self._next_id += 1
         request: dict[str, Any] = {"method": method, "id": request_id}
@@ -262,7 +277,7 @@ class QuotaSnapshotEvidence:
 
     snapshot: Mapping[str, Any]
     key_id: str
-    _key: bytes
+    _key: bytes = field(repr=False)
     account_id_hash: str
     plan_type: str
     main_limit_id: str
@@ -377,7 +392,9 @@ class CodexQuotaProvider:
     @staticmethod
     def _pool_values(entry: Mapping[str, Any], *, field: str) -> tuple[int, int, int]:
         primary = _mapping(entry.get("primary"), f"{field}.primary")
-        used_ppm = _percent_to_ppm(primary.get("usedPercent"), field=f"{field}.usedPercent")
+        used_ppm = _percent_to_ppm(
+            primary.get("usedPercent"), field=f"{field}.usedPercent"
+        )
         window = _bounded_int(
             primary.get("windowDurationMins"),
             field=f"{field}.windowDurationMins",
@@ -397,7 +414,9 @@ class CodexQuotaProvider:
         now_epoch = float(self._now())
         if not math.isfinite(now_epoch) or now_epoch <= 0:
             raise CodexQuotaError("quota observation time is invalid")
-        with _JsonlSession(self._command, timeout_seconds=self._timeout_seconds) as session:
+        with _JsonlSession(
+            self._command, timeout_seconds=self._timeout_seconds
+        ) as session:
             initialize = session.request(
                 "initialize",
                 {
@@ -432,12 +451,22 @@ class CodexQuotaProvider:
             limits, limit_id="", limit_name=_SPARK_LIMIT_NAME
         )
         main_used, main_window, main_reset = self._pool_values(main_entry, field="main")
-        spark_used, spark_window, spark_reset = self._pool_values(spark_entry, field="spark")
+        spark_used, spark_window, spark_reset = self._pool_values(
+            spark_entry, field="spark"
+        )
         main_period = _hash(
-            {"limit_id": main_limit_id, "window_duration_mins": main_window, "resets_at": main_reset}
+            {
+                "limit_id": main_limit_id,
+                "window_duration_mins": main_window,
+                "resets_at": main_reset,
+            }
         )
         spark_period = _hash(
-            {"limit_id": spark_limit_id, "window_duration_mins": spark_window, "resets_at": spark_reset}
+            {
+                "limit_id": spark_limit_id,
+                "window_duration_mins": spark_window,
+                "resets_at": spark_reset,
+            }
         )
         previous = self._read_cache()
         main_delta = self._sample_delta(
@@ -454,7 +483,9 @@ class CodexQuotaProvider:
             now_epoch=now_epoch,
             previous=previous,
         )
-        previous_seq = previous.get("snapshot_seq") if isinstance(previous, Mapping) else None
+        previous_seq = (
+            previous.get("snapshot_seq") if isinstance(previous, Mapping) else None
+        )
         snapshot_seq = int(now_epoch * 1000)
         if type(previous_seq) is int:
             snapshot_seq = max(snapshot_seq, previous_seq + 1)
@@ -524,12 +555,17 @@ class CodexQuotaProvider:
 
 def _normalized_request_hash(request: Mapping[str, Any]) -> str:
     body = {key: value for key, value in request.items() if key != "request_hash"}
-    for field, key in (("candidates", "candidate_id"), ("receipts", "receipt_hash")):
-        values = body.get(field)
+    for collection_name, key in (
+        ("candidates", "candidate_id"),
+        ("receipts", "receipt_hash"),
+    ):
+        values = body.get(collection_name)
         if isinstance(values, list):
-            body[field] = sorted(
+            body[collection_name] = sorted(
                 values,
-                key=lambda value: str(value.get(key, "")) if isinstance(value, Mapping) else "",
+                key=lambda value: (
+                    str(value.get(key, "")) if isinstance(value, Mapping) else ""
+                ),
             )
     return _hash(body)
 

@@ -15,7 +15,7 @@ import math
 import re
 import secrets
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -34,6 +34,11 @@ from .host_bridge import (
 _NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 _HASH_PREFIX: Final = "sha256:"
 _IDENTIFIER: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_REASON_SESSION_UNAVAILABLE: Final = "HOST_SESSION_UNAVAILABLE"
+_REASON_QUOTA_EXPECTATION_UNAVAILABLE: Final = "HOST_QUOTA_EXPECTATION_UNAVAILABLE"
+_REASON_QUOTA_UNAVAILABLE: Final = "HOST_QUOTA_UNAVAILABLE"
+_REASON_CAPABILITY_UNAVAILABLE: Final = "HOST_CAPABILITY_UNAVAILABLE"
+_REASON_EXECUTION_EVIDENCE_UNAVAILABLE: Final = "HOST_EXECUTION_EVIDENCE_UNAVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -47,7 +52,22 @@ class HostQuotaAttestation:
     spark_limit_id: str
     capacity_hash: str
     snapshot_seq: int
-    evidence: QuotaSnapshotEvidence
+    evidence: QuotaSnapshotEvidence = field(repr=False)
+
+
+@dataclass(frozen=True)
+class HostQuotaExpectation:
+    """Trusted constructor-time identities that a quota session cannot rebind."""
+
+    account_id_hash: str
+    source_id_hash: str
+    key_id: str
+    main_limit_id: str
+    spark_limit_id: str
+    capacity_hash: str
+    ledger_epoch: int
+    active_lease_set_hash: str
+    snapshot_seq_high_water: int
 
 
 @dataclass(frozen=True)
@@ -89,13 +109,33 @@ class HostCapabilityFact:
     capability_id: str
     state: HostCapabilityState
     attestation_hash: str | None
+    binding_hash: str | None
+    reason_code: str | None
 
 
 @dataclass(frozen=True)
 class HostSchedulingFacts:
     """Exact pairs that a scheduler may consume without a fallback decision."""
 
+    binding_hash: str
     routes: tuple[HostRoute, ...]
+
+
+@dataclass(frozen=True)
+class HostUnavailableFacts:
+    """Bounded non-sensitive explanation for a failed capability admission."""
+
+    reason_code: str
+    bounds: tuple[HostRoute, ...]
+    facts: tuple[HostCapabilityFact, ...]
+
+
+@dataclass(frozen=True)
+class _CapabilityRecord:
+    """Process-private binding retained for terminal validation only."""
+
+    fact: HostCapabilityFact
+    binding: host_envelopes.EnvelopeBinding = field(repr=False)
 
 
 QuotaEvidenceResolver: TypeAlias = Callable[
@@ -112,10 +152,15 @@ class HostSession:
         bridge: InheritedHandleHostBridge | None,
         quota_evidence_resolver: QuotaEvidenceResolver,
         clock: Callable[[], float],
+        quota_expectation: HostQuotaExpectation | None = None,
     ) -> None:
         self._bridge = bridge
         self._quota_evidence_resolver = quota_evidence_resolver
         self._clock = clock
+        try:
+            self._quota_expectation = _normalize_quota_expectation(quota_expectation)
+        except (TypeError, ValueError):
+            self._quota_expectation = None
         self._closed = False
         self._frozen = (
             bridge is None
@@ -124,8 +169,14 @@ class HostSession:
             or not bridge.is_available
         )
         self._seen_snapshot_hashes: set[str] = set()
-        self._last_snapshot_seq: int | None = None
-        self._attested_capabilities: dict[str, HostCapabilityFact] = {}
+        self._last_snapshot_seq: int | None = (
+            None
+            if self._quota_expectation is None
+            else self._quota_expectation.snapshot_seq_high_water
+        )
+        self._attested_capabilities: dict[tuple[str, str], _CapabilityRecord] = {}
+        self._consumed_predecessors: set[tuple[str, str, str, str, str]] = set()
+        self._last_unavailable: HostUnavailableFacts | None = None
 
     @classmethod
     def from_environment(
@@ -135,6 +186,7 @@ class HostSession:
         platform: str | None,
         quota_evidence_resolver: QuotaEvidenceResolver,
         clock: Callable[[], float],
+        quota_expectation: HostQuotaExpectation | None = None,
     ) -> HostSession:
         """Accept only the configured inherited bridge selector, never a fallback."""
 
@@ -149,6 +201,7 @@ class HostSession:
             bridge=bridge,
             quota_evidence_resolver=quota_evidence_resolver,
             clock=clock,
+            quota_expectation=quota_expectation,
         )
 
     @property
@@ -161,6 +214,12 @@ class HostSession:
             and self._bridge is not None
             and self._bridge.is_available
         )
+
+    @property
+    def last_unavailable(self) -> HostUnavailableFacts | None:
+        """Expose only bounded, bearer-free capability unavailability facts."""
+
+        return self._last_unavailable
 
     def close(self) -> None:
         """Close the owned private transport once; no session can be revived."""
@@ -176,6 +235,10 @@ class HostSession:
         """Return one fresh, fully bound quota fact set or ``NO_SAFE_WORK``."""
 
         if not self.is_available:
+            self._record_unavailable((), _REASON_SESSION_UNAVAILABLE)
+            return _NO_SAFE_WORK
+        if self._quota_expectation is None:
+            self._record_unavailable((), _REASON_QUOTA_EXPECTATION_UNAVAILABLE)
             return _NO_SAFE_WORK
         bridge = self._bridge
         assert bridge is not None
@@ -194,6 +257,7 @@ class HostSession:
                 attestation=attestation,
             )
         except Exception:
+            self._record_unavailable((), _REASON_QUOTA_UNAVAILABLE)
             self._freeze()
             return _NO_SAFE_WORK
         return facts
@@ -213,6 +277,8 @@ class HostSession:
                 capability_id=_route_capability_id(route),
                 state=HostCapabilityState.DECLARED,
                 attestation_hash=None,
+                binding_hash=None,
+                reason_code=None,
             )
             for route in normalized
         )
@@ -226,12 +292,14 @@ class HostSession:
     ) -> tuple[HostCapabilityFact, ...] | str:
         """Return only exact bridge-attested pairs; no local model fallback exists."""
 
+        declared = self.declare_routes(routes)
+        bounds = tuple(fact.route for fact in declared)
         if not self.is_available:
+            self._record_unavailable(bounds, _REASON_SESSION_UNAVAILABLE)
             return _NO_SAFE_WORK
         bridge = self._bridge
         assert bridge is not None
         try:
-            declared = self.declare_routes(routes)
             if not declared:
                 raise ValueError("route declarations are invalid")
             probe = bridge.send_capability_probe(
@@ -241,21 +309,33 @@ class HostSession:
             )
             report = bridge.receive_capability_report(probe=probe, now=now)
             reported_hashes = _mapping(report["capability_hashes"])
+            binding_hash = _binding_hash(probe.binding, now=now)
             facts = tuple(
                 HostCapabilityFact(
                     route=fact.route,
                     capability_id=fact.capability_id,
                     state=HostCapabilityState.ATTESTED,
-                    attestation_hash=_required_hash(reported_hashes[fact.capability_id]),
+                    attestation_hash=_required_hash(
+                        reported_hashes[fact.capability_id]
+                    ),
+                    binding_hash=binding_hash,
+                    reason_code=None,
                 )
                 for fact in declared
             )
         except Exception:
+            self._record_unavailable(bounds, _REASON_CAPABILITY_UNAVAILABLE)
             self._freeze()
             return _NO_SAFE_WORK
-        self._attested_capabilities = {
-            fact.capability_id: fact for fact in facts
-        }
+        self._attested_capabilities.update(
+            {
+                _capability_key(fact): _CapabilityRecord(
+                    fact=fact,
+                    binding=probe.binding,
+                )
+                for fact in facts
+            }
+        )
         return facts
 
     def scheduling_facts(
@@ -263,12 +343,15 @@ class HostSession:
     ) -> HostSchedulingFacts | str:
         """Expose the exact attested tuples or fail closed without substituting one."""
 
+        bounds = _route_bounds_from_facts(facts)
         if not self.is_available:
+            self._record_unavailable(bounds, _REASON_SESSION_UNAVAILABLE)
             return _NO_SAFE_WORK
         try:
-            if type(facts) not in {tuple, list} or not facts:
+            if not isinstance(facts, (tuple, list)) or not facts:
                 raise ValueError("capability facts are invalid")
             verified: list[HostRoute] = []
+            expected_binding_hash: str | None = None
             for fact in facts:
                 if type(fact) is not HostCapabilityFact:
                     raise ValueError("capability fact is invalid")
@@ -277,11 +360,23 @@ class HostSession:
                     HostCapabilityState.EXECUTED,
                 }:
                     raise ValueError("capability fact is not attested")
-                if self._attested_capabilities.get(fact.capability_id) != fact:
+                if fact.binding_hash is None:
+                    raise ValueError("capability binding is unavailable")
+                if expected_binding_hash is None:
+                    expected_binding_hash = fact.binding_hash
+                elif fact.binding_hash != expected_binding_hash:
+                    raise ValueError("capability bindings are mixed")
+                record = self._attested_capabilities.get(_capability_key(fact))
+                if record is None or record.fact != fact:
                     raise ValueError("capability fact is foreign")
                 verified.append(fact.route)
-            return HostSchedulingFacts(routes=tuple(verified))
+            assert expected_binding_hash is not None
+            return HostSchedulingFacts(
+                binding_hash=expected_binding_hash,
+                routes=tuple(verified),
+            )
         except Exception:
+            self._record_unavailable(bounds, _REASON_CAPABILITY_UNAVAILABLE)
             self._freeze()
             return _NO_SAFE_WORK
 
@@ -294,7 +389,9 @@ class HostSession:
     ) -> HostCapabilityFact | str:
         """Observe a bridge-terminal receipt; this adapter never executes work."""
 
+        bounds = _route_bounds_from_facts((fact,))
         if not self.is_available:
+            self._record_unavailable(bounds, _REASON_SESSION_UNAVAILABLE)
             return _NO_SAFE_WORK
         bridge = self._bridge
         assert bridge is not None
@@ -302,21 +399,50 @@ class HostSession:
             if (
                 type(fact) is not HostCapabilityFact
                 or fact.state is not HostCapabilityState.ATTESTED
-                or self._attested_capabilities.get(fact.capability_id) != fact
                 or type(predecessor) is not OperationReceipt
             ):
                 raise ValueError("execution evidence is invalid")
-            bridge.receive_terminal_result(predecessor=predecessor, now=now)
+            record = self._attested_capabilities.get(_capability_key(fact))
+            if (
+                record is None
+                or record.fact != fact
+                or predecessor.kind != "coordinator_assignment"
+                or predecessor.task_id != record.binding.task_id
+                or predecessor.binding != record.binding
+                or _predecessor_key(predecessor, now=now) in self._consumed_predecessors
+            ):
+                raise ValueError("execution binding is invalid")
+            terminal = bridge.receive_terminal_result(
+                predecessor=predecessor,
+                now=now,
+                expected=host_envelopes.EnvelopeExpectation(
+                    kind="worker_terminal_result",
+                    binding=record.binding,
+                ),
+            )
+            terminal_payload = _mapping(terminal["payload"])
+            if (
+                terminal_payload.get("correlation_id") != predecessor.correlation_id
+                or terminal_payload.get("predecessor_hash") != predecessor.envelope_hash
+            ):
+                raise ValueError("terminal predecessor is invalid")
             executed = HostCapabilityFact(
                 route=fact.route,
                 capability_id=fact.capability_id,
                 state=HostCapabilityState.EXECUTED,
                 attestation_hash=fact.attestation_hash,
+                binding_hash=fact.binding_hash,
+                reason_code=None,
             )
         except Exception:
+            self._record_unavailable(bounds, _REASON_EXECUTION_EVIDENCE_UNAVAILABLE)
             self._freeze()
             return _NO_SAFE_WORK
-        self._attested_capabilities[executed.capability_id] = executed
+        self._consumed_predecessors.add(_predecessor_key(predecessor, now=now))
+        self._attested_capabilities[_capability_key(executed)] = _CapabilityRecord(
+            fact=executed,
+            binding=record.binding,
+        )
         return executed
 
     def _verify_quota(
@@ -326,12 +452,17 @@ class HostSession:
         snapshot: Mapping[str, object],
         attestation: HostQuotaAttestation | None,
     ) -> HostQuotaFacts:
+        expectation = self._quota_expectation
+        if expectation is None:
+            raise ValueError("quota expectation is unavailable")
         if type(attestation) is not HostQuotaAttestation:
             raise ValueError("quota attestation is unavailable")
         evidence = attestation.evidence
         if type(evidence) is not QuotaSnapshotEvidence:
             raise ValueError("quota evidence is unavailable")
-        if attestation.request_id != request_id or dict(evidence.snapshot) != dict(snapshot):
+        if attestation.request_id != request_id or dict(evidence.snapshot) != dict(
+            snapshot
+        ):
             raise ValueError("quota evidence is not request-bound")
         evaluation_time = _utc_z(_trusted_clock(self._clock))
         verified, _ = _verified_snapshot(
@@ -346,15 +477,24 @@ class HostSession:
         if (
             attestation.source_id_hash != source.get("source_id_hash")
             or source.get("source_id_hash") != _OFFICIAL_QUOTA_SOURCE_ID_HASH
+            or attestation.source_id_hash != expectation.source_id_hash
             or evidence.key_id != source.get("key_id")
+            or evidence.key_id != expectation.key_id
             or not _is_hash(attestation.account_id_hash)
             or attestation.account_id_hash != evidence.account_id_hash
+            or attestation.account_id_hash != expectation.account_id_hash
             or attestation.main_limit_id != evidence.main_limit_id
             or attestation.spark_limit_id != evidence.spark_limit_id
             or attestation.main_limit_id != "codex"
+            or attestation.main_limit_id != expectation.main_limit_id
             or not isinstance(attestation.spark_limit_id, str)
             or not attestation.spark_limit_id
+            or attestation.spark_limit_id != expectation.spark_limit_id
             or attestation.capacity_hash != _hash(capacity)
+            or _hash(capacity) != expectation.capacity_hash
+            or capacity.get("ledger_epoch") != expectation.ledger_epoch
+            or capacity.get("active_lease_set_hash")
+            != expectation.active_lease_set_hash
             or attestation.snapshot_seq != snapshot_seq
         ):
             raise ValueError("quota evidence binding is invalid")
@@ -374,6 +514,29 @@ class HostSession:
             snapshot_hash=snapshot_hash,
             snapshot_seq=snapshot_seq,
             snapshot=_readonly_mapping(verified),
+        )
+
+    def _record_unavailable(
+        self,
+        routes: tuple[HostRoute, ...] | list[HostRoute],
+        reason_code: str,
+    ) -> None:
+        bounds = _bounded_routes(routes)
+        facts = tuple(
+            HostCapabilityFact(
+                route=route,
+                capability_id=_route_capability_id(route),
+                state=HostCapabilityState.UNAVAILABLE,
+                attestation_hash=None,
+                binding_hash=None,
+                reason_code=reason_code,
+            )
+            for route in bounds
+        )
+        self._last_unavailable = HostUnavailableFacts(
+            reason_code=reason_code,
+            bounds=bounds,
+            facts=facts,
         )
 
     def _freeze(self) -> None:
@@ -410,6 +573,45 @@ def _required_positive_int(value: object) -> int:
     return value
 
 
+def _required_nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("expected non-negative integer")
+    return value
+
+
+def _normalize_quota_expectation(
+    value: HostQuotaExpectation | None,
+) -> HostQuotaExpectation | None:
+    if value is None:
+        return None
+    if type(value) is not HostQuotaExpectation:
+        raise ValueError("quota expectation is invalid")
+    if (
+        not _is_hash(value.account_id_hash)
+        or not _is_hash(value.source_id_hash)
+        or not _is_hash(value.key_id)
+        or value.main_limit_id != "codex"
+        or type(value.spark_limit_id) is not str
+        or _IDENTIFIER.fullmatch(value.spark_limit_id) is None
+        or not _is_hash(value.capacity_hash)
+        or not _is_hash(value.active_lease_set_hash)
+    ):
+        raise ValueError("quota expectation identity is invalid")
+    ledger_epoch = _required_nonnegative_int(value.ledger_epoch)
+    snapshot_seq_high_water = _required_nonnegative_int(value.snapshot_seq_high_water)
+    return HostQuotaExpectation(
+        account_id_hash=value.account_id_hash,
+        source_id_hash=value.source_id_hash,
+        key_id=value.key_id,
+        main_limit_id=value.main_limit_id,
+        spark_limit_id=value.spark_limit_id,
+        capacity_hash=value.capacity_hash,
+        ledger_epoch=ledger_epoch,
+        active_lease_set_hash=value.active_lease_set_hash,
+        snapshot_seq_high_water=snapshot_seq_high_water,
+    )
+
+
 def _trusted_clock(clock: Callable[[], float]) -> float:
     value = float(clock())
     if not math.isfinite(value) or value <= 0:
@@ -426,26 +628,29 @@ def _utc_z(value: float) -> str:
 
 
 def _hash(value: object) -> str:
-    return _HASH_PREFIX + hashlib.sha256(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    return (
+        _HASH_PREFIX
+        + hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
-_OFFICIAL_QUOTA_SOURCE_ID_HASH: Final = _hash(
-    "codex-app-server-account-rate-limits"
-)
+_OFFICIAL_QUOTA_SOURCE_ID_HASH: Final = _hash("codex-app-server-account-rate-limits")
 
 
 def _readonly_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     def freeze(item: object) -> object:
         if isinstance(item, Mapping):
-            return MappingProxyType({str(key): freeze(value) for key, value in item.items()})
+            return MappingProxyType(
+                {str(key): freeze(value) for key, value in item.items()}
+            )
         if isinstance(item, list):
             return tuple(freeze(child) for child in item)
         return item
@@ -455,10 +660,56 @@ def _readonly_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return frozen
 
 
+def _bounded_routes(value: object) -> tuple[HostRoute, ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    try:
+        return _normalized_routes(value)
+    except (TypeError, ValueError):
+        return ()
+
+
+def _route_bounds_from_facts(value: object) -> tuple[HostRoute, ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    routes = [
+        fact.route
+        for fact in value
+        if type(fact) is HostCapabilityFact and type(fact.route) is HostRoute
+    ]
+    return _bounded_routes(routes)
+
+
+def _capability_key(
+    fact: HostCapabilityFact,
+) -> tuple[str, str]:
+    if type(fact) is not HostCapabilityFact or fact.binding_hash is None:
+        raise ValueError("capability binding is unavailable")
+    return fact.capability_id, fact.binding_hash
+
+
+def _binding_hash(binding: host_envelopes.EnvelopeBinding, *, now: int) -> str:
+    return _hash(host_envelopes.binding_mapping(binding, now=now))
+
+
+def _predecessor_key(
+    predecessor: OperationReceipt,
+    *,
+    now: int,
+) -> tuple[str, str, str, str, str]:
+    return (
+        predecessor.kind,
+        predecessor.task_id,
+        predecessor.correlation_id,
+        predecessor.envelope_hash,
+        _binding_hash(predecessor.binding, now=now),
+    )
+
+
 def _normalized_routes(
-    routes: tuple[HostRoute, ...] | list[HostRoute],
+    routes: object,
 ) -> tuple[HostRoute, ...]:
-    if type(routes) not in {tuple, list} or not routes or len(routes) > 16:
+    if not isinstance(routes, (tuple, list)) or not routes or len(routes) > 16:
         raise ValueError("route declarations are invalid")
     normalized: list[HostRoute] = []
     for route in routes:
@@ -479,9 +730,14 @@ def _normalized_routes(
 
 
 def _route_capability_id(route: HostRoute) -> str:
-    return "route-" + hashlib.sha256(
-        _canonical_json({"model": route.model, "effort": route.effort}).encode("utf-8")
-    ).hexdigest()
+    return (
+        "route-"
+        + hashlib.sha256(
+            _canonical_json({"model": route.model, "effort": route.effort}).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+    )
 
 
 def _canonical_json(value: object) -> str:
@@ -496,11 +752,13 @@ def _canonical_json(value: object) -> str:
 
 __all__ = [
     "HostQuotaAttestation",
+    "HostQuotaExpectation",
     "HostQuotaFacts",
     "HostCapabilityFact",
     "HostCapabilityState",
     "HostRoute",
     "HostSchedulingFacts",
+    "HostUnavailableFacts",
     "HostSession",
     "QuotaEvidenceResolver",
 ]
