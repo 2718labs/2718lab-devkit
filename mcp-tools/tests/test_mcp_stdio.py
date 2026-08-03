@@ -109,7 +109,15 @@ def test_stdio_initialize_lists_exact_tools_and_returns_a_v1_result(tmp_path) ->
             "UV_CACHE_DIR": str(task_root / "uv-cache"),
         }
     )
-    child_environment.pop("CODEX_HOME", None)
+    for inherited in (
+        "CODEX_HOME",
+        "CODEX_PROJECT_ROOT",
+        "CODEX_WORKSPACE_ROOT",
+        "CODEX_PROJECT_ID",
+        "CODEX_WORKSPACE_ID",
+        "CODEX_THREAD_ID",
+    ):
+        child_environment.pop(inherited, None)
     server_path = Path(__file__).resolve().parents[1] / "server.py"
     parameters = StdioServerParameters(
         command=sys.executable,
@@ -169,6 +177,11 @@ def test_extracted_primary_artifact_starts_without_source_checkout_dependency(
         "PYTHONHOME",
         "UV_PROJECT_ENVIRONMENT",
         "VIRTUAL_ENV",
+        "CODEX_PROJECT_ROOT",
+        "CODEX_WORKSPACE_ROOT",
+        "CODEX_PROJECT_ID",
+        "CODEX_WORKSPACE_ID",
+        "CODEX_THREAD_ID",
     ):
         child_environment.pop(inherited, None)
     child_environment.update(

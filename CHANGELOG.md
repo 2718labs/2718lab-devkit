@@ -2,9 +2,34 @@
 
 All notable changes to 2718lab DevKit are documented here.
 
-The project follows Keep a Changelog conventions. Tagged versions are
-published by the repository release workflow after the CI and artifact checks
-pass.
+The project follows Keep a Changelog conventions. GitHub Releases for tagged
+versions are published by the repository release workflow after the CI and
+artifact checks pass.
+
+## [1.0.0-rc2] - 2026-08-03
+
+### Added
+
+- Added a tag-driven release gate that rechecks the primary-artifact contract
+  and Windows Fast Lane contracts before publishing.
+- Added retained GitHub Actions artifacts and checksums for both the primary
+  MCP ZIP and the independently buildable AstrBot wheel and source
+  distribution.
+
+### Changed
+
+- Bumped the MCP-only plugin and AstrBot companion package together to RC2.
+- Reduced the optional Codex skill surface to concise module manuals; runtime
+  dispatch, policy, and validation remain in the MCP package.
+- Pinned release-workflow Actions to audited full commit SHAs and prevented the
+  publish checkout from persisting its token.
+
+### Fixed
+
+- Marked release-candidate tags as GitHub prereleases rather than ordinary
+  releases.
+- Bound release metadata validation to the AstrBot package version as well as
+  the primary plugin and MCP runtime versions.
 
 ## [1.0.0-rc1] - 2026-08-02
 
