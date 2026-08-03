@@ -274,12 +274,12 @@ class HostSession:
             if not self.is_available or not self._has_fresh_quota:
                 return _NO_SAFE_WORK
             try:
-                facts = provider(preparation_id)
+                provider(preparation_id)
             except Exception:
                 return _NO_SAFE_WORK
-            handle = _CompilerEvidenceHandle()
-            self._compiler_evidence[handle] = facts
-            return handle
+            # No typed, session-owned compiler material exists yet.  A provider
+            # result is therefore untrusted mutable input, even behind a handle.
+            return _NO_SAFE_WORK
 
     def consume_compiler_evidence(self, evidence: object) -> object | str:
         """Exchange a session-issued handle once, rejecting public substitutes."""
