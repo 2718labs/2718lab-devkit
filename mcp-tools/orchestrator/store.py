@@ -315,7 +315,7 @@ class AcceptedCodeTaskEvidence:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 9
+    _SCHEMA_VERSION = 10
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
@@ -405,6 +405,9 @@ class SQLiteStore:
         )
         batch_payload = _canonical_payload_json(self._external_batch_payload(batch))
         grant_payload = _canonical_payload_json(self._external_grant_payload(grant))
+        descriptor_payload_hash = _payload_hash(descriptor_payload)
+        batch_payload_hash = _payload_hash(batch_payload)
+        grant_payload_hash = _payload_hash(grant_payload)
         outbox_payload = _canonical_payload_json(
             {
                 "availability": self._EXTERNAL_BOOTSTRAP_AVAILABILITY,
@@ -414,6 +417,14 @@ class SQLiteStore:
             }
         )
         with self._transaction() as cursor:
+            batch_exists = cursor.execute(
+                "SELECT 1 FROM external_bootstrap_batches WHERE batch_hash = ?",
+                (batch.batch_hash,),
+            ).fetchone() is not None
+            grant_exists = cursor.execute(
+                "SELECT 1 FROM external_dispatch_grants WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone() is not None
             self._require_external_payload(
                 cursor,
                 "external_bootstrap_descriptors",
@@ -484,7 +495,7 @@ class SQLiteStore:
                 (
                     descriptor.descriptor_hash,
                     descriptor_payload,
-                    _payload_hash(descriptor_payload),
+                    descriptor_payload_hash,
                     created_at,
                 ),
             )
@@ -500,7 +511,7 @@ class SQLiteStore:
                     batch.descriptor_hash,
                     batch.idempotency_key,
                     batch_payload,
-                    _payload_hash(batch_payload),
+                    batch_payload_hash,
                     batch.state.value,
                     batch.availability,
                     batch.expires_at,
@@ -569,7 +580,7 @@ class SQLiteStore:
                     grant.batch_hash,
                     grant.assignment_hash,
                     grant_payload,
-                    _payload_hash(grant_payload),
+                    grant_payload_hash,
                     grant.state.value,
                     grant.availability,
                     grant.expires_at,
@@ -588,6 +599,31 @@ class SQLiteStore:
                     grant.batch_hash,
                     grant.assignment_hash,
                 ),
+            )
+            self._insert_or_require_external_commitment(
+                cursor,
+                "external_bootstrap_batch_commitments",
+                {
+                    "batch_hash": batch.batch_hash,
+                    "descriptor_hash": descriptor.descriptor_hash,
+                    "descriptor_payload_hash": descriptor_payload_hash,
+                    "batch_payload_hash": batch_payload_hash,
+                },
+                parent_exists=batch_exists,
+            )
+            self._insert_or_require_external_commitment(
+                cursor,
+                "external_dispatch_grant_commitments",
+                {
+                    "grant_id": grant.grant_id,
+                    "descriptor_hash": descriptor.descriptor_hash,
+                    "batch_hash": batch.batch_hash,
+                    "assignment_hash": grant.assignment_hash,
+                    "descriptor_payload_hash": descriptor_payload_hash,
+                    "batch_payload_hash": batch_payload_hash,
+                    "grant_payload_hash": grant_payload_hash,
+                },
+                parent_exists=grant_exists,
             )
             outbox_row = cursor.execute(
                 "SELECT * FROM external_bootstrap_outbox WHERE batch_hash = ?",
@@ -5046,7 +5082,71 @@ class SQLiteStore:
                 item.assignment_hash == grant.assignment_hash for item in batch.items
             ):
                 raise ValueError("grant does not bind a batch assignment")
-        except (KeyError, TypeError, ValueError, ExternalDispatchGrantError) as error:
+            descriptor_payload_hash = _payload_hash(
+                _canonical_payload_json(self._external_descriptor_payload(descriptor))
+            )
+            batch_payload_hash = _payload_hash(
+                _canonical_payload_json(self._external_batch_payload(batch))
+            )
+            grant_payload_hash = _payload_hash(grant_payload)
+            batch_commitment = executor.execute(
+                """
+                SELECT * FROM external_bootstrap_batch_commitments
+                WHERE batch_hash = ?
+                """,
+                (batch.batch_hash,),
+            ).fetchone()
+            grant_commitment = executor.execute(
+                """
+                SELECT * FROM external_dispatch_grant_commitments
+                WHERE grant_id = ?
+                """,
+                (grant.grant_id,),
+            ).fetchone()
+            expected_batch_commitment = {
+                "batch_hash": batch.batch_hash,
+                "descriptor_hash": descriptor.descriptor_hash,
+                "descriptor_payload_hash": descriptor_payload_hash,
+                "batch_payload_hash": batch_payload_hash,
+            }
+            expected_grant_commitment = {
+                "grant_id": grant.grant_id,
+                "descriptor_hash": descriptor.descriptor_hash,
+                "batch_hash": batch.batch_hash,
+                "assignment_hash": grant.assignment_hash,
+                "descriptor_payload_hash": descriptor_payload_hash,
+                "batch_payload_hash": batch_payload_hash,
+                "grant_payload_hash": grant_payload_hash,
+            }
+            if (
+                batch_commitment is None
+                or grant_commitment is None
+                or any(
+                    str(batch_commitment[field]) != value
+                    for field, value in expected_batch_commitment.items()
+                )
+                or any(
+                    str(grant_commitment[field]) != value
+                    for field, value in expected_grant_commitment.items()
+                )
+                or any(
+                    str(batch_commitment[field]) != str(grant_commitment[field])
+                    for field in (
+                        "batch_hash",
+                        "descriptor_hash",
+                        "descriptor_payload_hash",
+                        "batch_payload_hash",
+                    )
+                )
+            ):
+                raise ValueError("external bootstrap commitment chain is absent or mismatched")
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            sqlite3.DatabaseError,
+            ExternalDispatchGrantError,
+        ) as error:
             if isinstance(error, ExternalDispatchGrantError):
                 raise
             raise ExternalDispatchGrantError(
@@ -5117,6 +5217,33 @@ class SQLiteStore:
             raise ExternalBootstrapConflictError("grant is not bound to descriptor batch assignment")
 
     @staticmethod
+    def _insert_or_require_external_commitment(
+        cursor: sqlite3.Cursor,
+        table: str,
+        values: Mapping[str, str],
+        *,
+        parent_exists: bool,
+    ) -> None:
+        identity_column, identity = next(iter(values.items()))
+        row = cursor.execute(
+            f"SELECT * FROM {table} WHERE {identity_column} = ?", (identity,)
+        ).fetchone()
+        if row is None:
+            if parent_exists:
+                raise ExternalBootstrapConflictError(
+                    "legacy external bootstrap record lacks a commitment"
+                )
+            columns = tuple(values)
+            cursor.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            )
+            return
+        if any(str(row[column]) != value for column, value in values.items()):
+            raise ExternalBootstrapConflictError("external bootstrap commitment conflicts")
+
+    @staticmethod
     def _require_external_payload(
         cursor: sqlite3.Cursor,
         table: str,
@@ -5152,6 +5279,293 @@ class SQLiteStore:
             str(row["availability"]),
             None if row["consumed_at"] is None else str(row["consumed_at"]),
         )
+
+    @classmethod
+    def _preflight_external_bootstrap_rows(cls, cursor: sqlite3.Cursor) -> None:
+        """Reject raw bootstrap drift before a schema migration can rewrite it."""
+        try:
+            descriptor_hashes = {
+                cls._preflight_external_descriptor_row(row)
+                for row in cursor.execute(
+                    "SELECT * FROM external_bootstrap_descriptors"
+                ).fetchall()
+            }
+            item_payloads_by_batch: dict[str, list[dict[str, object]]] = {}
+            for row in cursor.execute(
+                """
+                SELECT * FROM external_bootstrap_batch_items
+                ORDER BY batch_hash, item_index
+                """
+            ).fetchall():
+                batch_hash, payload = cls._preflight_external_batch_item_row(row)
+                item_payloads_by_batch.setdefault(batch_hash, []).append(payload)
+
+            batches: dict[str, tuple[str, str, frozenset[str]]] = {}
+            for row in cursor.execute(
+                "SELECT * FROM external_bootstrap_batches"
+            ).fetchall():
+                batch_hash, descriptor_hash, expires_at, assignment_hashes = (
+                    cls._preflight_external_batch_row(
+                        row,
+                        item_payloads_by_batch.pop(str(row["batch_hash"]), []),
+                    )
+                )
+                if descriptor_hash not in descriptor_hashes:
+                    raise ValueError("batch references an absent descriptor")
+                batches[batch_hash] = (
+                    descriptor_hash,
+                    expires_at,
+                    frozenset(assignment_hashes),
+                )
+            if item_payloads_by_batch:
+                raise ValueError("batch item references an absent batch")
+
+            for row in cursor.execute(
+                "SELECT * FROM external_dispatch_grants"
+            ).fetchall():
+                cls._preflight_external_grant_row(row, batches, descriptor_hashes)
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            ExternalDispatchGrantError,
+        ) as error:
+            raise ExternalBootstrapConflictError(
+                "stored external bootstrap rows are not migration-safe"
+            ) from error
+
+    @classmethod
+    def _preflight_external_descriptor_row(cls, row: sqlite3.Row) -> str:
+        payload = cls._preflight_external_payload_from_row(row)
+        expected_fields = {
+            "commit_hash",
+            "common_dir_hash",
+            "descriptor_hash",
+            "project_hash",
+            "ref_hash",
+            "repository_hash",
+            "source_hash",
+            "task_root_hash",
+            "tree_hash",
+        }
+        if set(payload) != expected_fields or any(
+            type(payload[field]) is not str for field in expected_fields
+        ):
+            raise ValueError("descriptor payload shape is invalid")
+        descriptor = ExternalSourceDescriptor(
+            descriptor_hash=payload["descriptor_hash"],
+            source_hash=payload["source_hash"],
+            repository_hash=payload["repository_hash"],
+            common_dir_hash=payload["common_dir_hash"],
+            project_hash=payload["project_hash"],
+            task_root_hash=payload["task_root_hash"],
+            ref_hash=payload["ref_hash"],
+            commit_hash=payload["commit_hash"],
+            tree_hash=payload["tree_hash"],
+        )
+        if str(row["descriptor_hash"]) != descriptor.descriptor_hash:
+            raise ValueError("descriptor identity differs from its payload")
+        for value in cls._external_descriptor_payload(descriptor).values():
+            if cls._SHA256_IDENTIFIER_PATTERN.fullmatch(str(value)) is None:
+                raise ValueError("descriptor hash is outside the bounded schema")
+        return descriptor.descriptor_hash
+
+    @classmethod
+    def _preflight_external_batch_item_row(
+        cls, row: sqlite3.Row
+    ) -> tuple[str, dict[str, object]]:
+        payload = cls._preflight_external_payload_from_row(row)
+        legacy_fields = {
+            "assignment_hash",
+            "item_index",
+            "lease_epoch",
+            "plan_hash",
+            "predecessor_hash",
+            "projection_hash",
+            "quota_hash",
+            "route_hash",
+            "task_id",
+            "workflow_id",
+        }
+        current_fields = legacy_fields | {
+            "index_hash",
+            "lease_hash",
+            "task_hash",
+            "workflow_hash",
+        }
+        if set(payload) not in (legacy_fields, current_fields):
+            raise ValueError("batch item payload shape is invalid")
+        if (
+            type(payload["item_index"]) is not int
+            or type(payload["lease_epoch"]) is not int
+            or payload["item_index"] < 0
+            or payload["lease_epoch"] < 0
+            or type(payload["workflow_id"]) is not str
+            or type(payload["task_id"]) is not str
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
+                payload["workflow_id"]
+            )
+            is None
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(payload["task_id"])
+            is None
+        ):
+            raise ValueError("batch item identifiers are invalid")
+        for field, value in payload.items():
+            if field.endswith("_hash") and (
+                type(value) is not str
+                or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None
+            ):
+                raise ValueError("batch item hash is outside the bounded schema")
+        if (
+            type(row["batch_hash"]) is not str
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(row["batch_hash"]) is None
+            or type(row["item_index"]) is not int
+            or row["item_index"] != payload["item_index"]
+            or type(row["assignment_hash"]) is not str
+            or row["assignment_hash"] != payload["assignment_hash"]
+        ):
+            raise ValueError("batch item row differs from its payload")
+        return row["batch_hash"], payload
+
+    @classmethod
+    def _preflight_external_batch_row(
+        cls,
+        row: sqlite3.Row,
+        item_payloads: list[dict[str, object]],
+    ) -> tuple[str, str, str, set[str]]:
+        payload = cls._preflight_external_payload_from_row(row)
+        expected_fields = {
+            "availability",
+            "batch_hash",
+            "descriptor_hash",
+            "expires_at",
+            "idempotency_key",
+            "items",
+            "state",
+        }
+        if set(payload) != expected_fields or type(payload["items"]) is not list:
+            raise ValueError("batch payload shape is invalid")
+        if any(
+            type(payload[field]) is not str
+            for field in expected_fields - {"items"}
+        ):
+            raise ValueError("batch payload values are invalid")
+        if (
+            payload["state"] != ExternalBootstrapState.PENDING.value
+            or payload["availability"] != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload["batch_hash"])
+            is None
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload["descriptor_hash"])
+            is None
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
+                payload["idempotency_key"]
+            )
+            is None
+        ):
+            raise ValueError("batch payload binding is invalid")
+        _utc_timestamp(payload["expires_at"])
+        if any(
+            str(row[field]) != payload[field]
+            for field in (
+                "batch_hash",
+                "descriptor_hash",
+                "idempotency_key",
+                "expires_at",
+                "state",
+                "availability",
+            )
+        ):
+            raise ValueError("batch row differs from its payload")
+        if (
+            not item_payloads
+            or len(item_payloads) > cls._MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS
+            or payload["items"] != item_payloads
+        ):
+            raise ValueError("batch items differ from their rows")
+        item_indexes = [item["item_index"] for item in item_payloads]
+        assignment_hashes = {str(item["assignment_hash"]) for item in item_payloads}
+        if item_indexes != list(range(len(item_payloads))) or len(
+            assignment_hashes
+        ) != len(item_payloads):
+            raise ValueError("batch item ordering or bindings are invalid")
+        return (
+            payload["batch_hash"],
+            payload["descriptor_hash"],
+            payload["expires_at"],
+            assignment_hashes,
+        )
+
+    @classmethod
+    def _preflight_external_grant_row(
+        cls,
+        row: sqlite3.Row,
+        batches: Mapping[str, tuple[str, str, frozenset[str]]],
+        descriptor_hashes: set[str],
+    ) -> None:
+        payload = cls._preflight_external_payload_from_row(row)
+        expected_fields = {
+            "assignment_hash",
+            "availability",
+            "batch_hash",
+            "descriptor_hash",
+            "expires_at",
+            "grant_id",
+            "state",
+        }
+        if set(payload) != expected_fields or any(
+            type(payload[field]) is not str for field in expected_fields
+        ):
+            raise ValueError("grant payload shape is invalid")
+        if (
+            payload["state"] != ExternalBootstrapState.PENDING.value
+            or payload["availability"] != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(payload["grant_id"])
+            is None
+            or any(
+                cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload[field]) is None
+                for field in ("assignment_hash", "batch_hash", "descriptor_hash")
+            )
+        ):
+            raise ValueError("grant payload binding is invalid")
+        _utc_timestamp(payload["expires_at"])
+        if any(
+            str(row[field]) != payload[field]
+            for field in (
+                "grant_id",
+                "descriptor_hash",
+                "batch_hash",
+                "assignment_hash",
+                "expires_at",
+                "state",
+                "availability",
+            )
+        ):
+            raise ValueError("grant row differs from its payload")
+        batch = batches.get(payload["batch_hash"])
+        if (
+            payload["descriptor_hash"] not in descriptor_hashes
+            or batch is None
+            or batch[0] != payload["descriptor_hash"]
+            or batch[1] != payload["expires_at"]
+            or payload["assignment_hash"] not in batch[2]
+        ):
+            raise ValueError("grant does not bind its raw batch")
+
+    @staticmethod
+    def _preflight_external_payload_from_row(row: sqlite3.Row) -> dict[str, object]:
+        payload_json = row["payload_json"]
+        payload_hash = row["payload_hash"]
+        if type(payload_json) is not str or type(payload_hash) is not str:
+            raise ValueError("external payload storage types are invalid")
+        payload = json.loads(payload_json)
+        if (
+            not isinstance(payload, dict)
+            or payload_json != _canonical_payload_json(payload)
+            or payload_hash != _payload_hash(payload_json)
+        ):
+            raise ValueError("external payload JSON or hash is invalid")
+        return payload
 
     @staticmethod
     def _canonicalize_external_bootstrap_expiries(cursor: sqlite3.Cursor) -> None:
@@ -5553,8 +5967,43 @@ class SQLiteStore:
                     ON external_dispatch_grant_bindings(
                         batch_hash, assignment_hash, descriptor_hash, grant_id
                     );
+                CREATE TABLE IF NOT EXISTS external_bootstrap_batch_commitments (
+                    batch_hash TEXT PRIMARY KEY
+                        REFERENCES external_bootstrap_batches(batch_hash),
+                    descriptor_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_descriptors(descriptor_hash),
+                    descriptor_payload_hash TEXT NOT NULL,
+                    batch_payload_hash TEXT NOT NULL,
+                    FOREIGN KEY (batch_hash, descriptor_hash)
+                        REFERENCES external_bootstrap_batches(batch_hash, descriptor_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_bootstrap_batch_commitments_descriptor
+                    ON external_bootstrap_batch_commitments(
+                        descriptor_hash, descriptor_payload_hash, batch_payload_hash
+                    );
+                CREATE TABLE IF NOT EXISTS external_dispatch_grant_commitments (
+                    grant_id TEXT PRIMARY KEY
+                        REFERENCES external_dispatch_grants(grant_id),
+                    descriptor_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_descriptors(descriptor_hash),
+                    batch_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_batches(batch_hash),
+                    assignment_hash TEXT NOT NULL,
+                    descriptor_payload_hash TEXT NOT NULL,
+                    batch_payload_hash TEXT NOT NULL,
+                    grant_payload_hash TEXT NOT NULL,
+                    FOREIGN KEY (batch_hash, descriptor_hash)
+                        REFERENCES external_bootstrap_batches(batch_hash, descriptor_hash),
+                    FOREIGN KEY (batch_hash, assignment_hash)
+                        REFERENCES external_bootstrap_batch_items(batch_hash, assignment_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_dispatch_grant_commitments_batch
+                    ON external_dispatch_grant_commitments(
+                        batch_hash, assignment_hash, descriptor_hash, grant_id
+                    );
                 """,
             )
+            self._preflight_external_bootstrap_rows(cursor)
             self._canonicalize_external_bootstrap_expiries(cursor)
             cursor.execute(
                 """

@@ -123,7 +123,7 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         self.assertNotIn("bearer", persisted.lower())
 
     def test_schema_upgrade_exposes_external_bootstrap_tables(self) -> None:
-        self.assertEqual(self.store.schema_version(), 9)
+        self.assertEqual(self.store.schema_version(), 10)
         table_names = {
             str(row[0])
             for row in self.store._connection.execute(
@@ -137,6 +137,8 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
                 "external_bootstrap_outbox",
                 "external_dispatch_grants",
                 "external_dispatch_grant_bindings",
+                "external_bootstrap_batch_commitments",
+                "external_dispatch_grant_commitments",
             }.issubset(table_names)
         )
 
@@ -426,6 +428,56 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
             ).fetchone()["consumed_at"]
         )
 
+    def test_self_consistent_descriptor_mutation_is_rejected_by_commitment_chain(
+        self,
+    ) -> None:
+        descriptor, batch, grant = self._records(
+            batch_label="self-consistent-descriptor-mutation"
+        )
+        self.store.admit_external_bootstrap(descriptor, batch, grant)
+        payload_json = self.store._connection.execute(
+            "SELECT payload_json FROM external_bootstrap_descriptors "
+            "WHERE descriptor_hash = ?",
+            (descriptor.descriptor_hash,),
+        ).fetchone()["payload_json"]
+        payload = json.loads(payload_json)
+        payload["source_hash"] = _hash("tampered-source")
+        tampered_payload_json = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        tampered_payload_hash = "sha256:" + hashlib.sha256(
+            tampered_payload_json.encode("utf-8")
+        ).hexdigest()
+        self.store._connection.execute(
+            """
+            UPDATE external_bootstrap_descriptors
+            SET payload_json = ?, payload_hash = ?
+            WHERE descriptor_hash = ?
+            """,
+            (
+                tampered_payload_json,
+                tampered_payload_hash,
+                descriptor.descriptor_hash,
+            ),
+        )
+
+        with self.assertRaises(ExternalDispatchGrantError):
+            self.store.get_external_dispatch_grant(grant.grant_id)
+        with self.assertRaises(ExternalDispatchGrantError):
+            self.store.consume_external_dispatch_grant(
+                grant.grant_id,
+                descriptor_hash=descriptor.descriptor_hash,
+                batch_hash=batch.batch_hash,
+                assignment_hash=grant.assignment_hash,
+                now="2026-08-03T00:00:00+00:00",
+            )
+        self.assertIsNone(
+            self.store._connection.execute(
+                "SELECT consumed_at FROM external_dispatch_grants WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()["consumed_at"]
+        )
+
     def test_batch_payload_or_hash_mismatch_rejects_read_and_consumption(self) -> None:
         descriptor, batch, grant = self._records(batch_label="corrupt-batch")
         self.store.admit_external_bootstrap(descriptor, batch, grant)
@@ -455,6 +507,195 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
             ).fetchone()["consumed_at"]
         )
 
+    def test_v8_batch_physical_descriptor_hash_mismatch_rolls_back_before_bindings(
+        self,
+    ) -> None:
+        descriptor, batch, grant = self._records(
+            batch_label="v8-physical-descriptor-mismatch",
+            grant_id="v8-physical-descriptor-mismatch-grant",
+        )
+        other_descriptor, other_batch, other_grant = self._records(
+            descriptor_label="v8-other-descriptor",
+            batch_label="v8-other-batch",
+            grant_id="v8-other-grant",
+        )
+        self.store.admit_external_bootstrap(descriptor, batch, grant)
+        self.store.admit_external_bootstrap(
+            other_descriptor, other_batch, other_grant
+        )
+        self.store.close()
+
+        connection = sqlite3.connect(self.database)
+        try:
+            for table in (
+                "external_dispatch_grant_bindings",
+                "external_bootstrap_batch_commitments",
+                "external_dispatch_grant_commitments",
+            ):
+                connection.execute(f"DROP TABLE IF EXISTS {table}")
+            connection.execute(
+                "UPDATE schema_metadata SET value = '8' WHERE key = 'schema_version'"
+            )
+            connection.execute(
+                """
+                UPDATE external_bootstrap_batches
+                SET descriptor_hash = ?
+                WHERE batch_hash = ?
+                """,
+                (other_descriptor.descriptor_hash, batch.batch_hash),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened: SQLiteStore | None = None
+        try:
+            with self.assertRaises(ExternalBootstrapConflictError):
+                reopened = SQLiteStore(self.database)
+        finally:
+            if reopened is not None:
+                reopened.close()
+
+        connection = sqlite3.connect(self.database)
+        try:
+            schema_version = connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            persisted_descriptor_hash = connection.execute(
+                """
+                SELECT descriptor_hash FROM external_bootstrap_batches
+                WHERE batch_hash = ?
+                """,
+                (batch.batch_hash,),
+            ).fetchone()[0]
+            table_names = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual("8", schema_version)
+        self.assertEqual(other_descriptor.descriptor_hash, persisted_descriptor_hash)
+        self.assertFalse(
+            {
+                "external_dispatch_grant_bindings",
+                "external_bootstrap_batch_commitments",
+                "external_dispatch_grant_commitments",
+            }
+            & table_names
+        )
+
+    def test_v8_descriptor_item_and_grant_raw_mismatches_roll_back_before_bindings(
+        self,
+    ) -> None:
+        for target in ("descriptor", "item", "grant"):
+            with self.subTest(target=target):
+                with tempfile.TemporaryDirectory() as directory:
+                    database = Path(directory) / "orchestrator.sqlite3"
+                    store = SQLiteStore(database)
+                    descriptor, batch, grant = self._records(
+                        batch_label=f"v8-raw-{target}",
+                        grant_id=f"v8-raw-{target}-grant",
+                    )
+                    store.admit_external_bootstrap(descriptor, batch, grant)
+                    store.close()
+
+                    connection = sqlite3.connect(database)
+                    try:
+                        for table in (
+                            "external_dispatch_grant_bindings",
+                            "external_bootstrap_batch_commitments",
+                            "external_dispatch_grant_commitments",
+                        ):
+                            connection.execute(f"DROP TABLE IF EXISTS {table}")
+                        connection.execute(
+                            "UPDATE schema_metadata SET value = '8' "
+                            "WHERE key = 'schema_version'"
+                        )
+                        if target == "descriptor":
+                            payload_json = connection.execute(
+                                """
+                                SELECT payload_json FROM external_bootstrap_descriptors
+                                WHERE descriptor_hash = ?
+                                """,
+                                (descriptor.descriptor_hash,),
+                            ).fetchone()[0]
+                            payload = json.loads(payload_json)
+                            payload["descriptor_hash"] = _hash(
+                                "v8-raw-descriptor-payload"
+                            )
+                            tampered_payload_json = json.dumps(
+                                payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=True,
+                            )
+                            connection.execute(
+                                """
+                                UPDATE external_bootstrap_descriptors
+                                SET payload_json = ?, payload_hash = ?
+                                WHERE descriptor_hash = ?
+                                """,
+                                (
+                                    tampered_payload_json,
+                                    "sha256:"
+                                    + hashlib.sha256(
+                                        tampered_payload_json.encode("utf-8")
+                                    ).hexdigest(),
+                                    descriptor.descriptor_hash,
+                                ),
+                            )
+                        elif target == "item":
+                            connection.execute(
+                                """
+                                UPDATE external_bootstrap_batch_items
+                                SET assignment_hash = ?
+                                WHERE batch_hash = ? AND item_index = 0
+                                """,
+                                (_hash("v8-raw-item-column"), batch.batch_hash),
+                            )
+                        else:
+                            connection.execute(
+                                """
+                                UPDATE external_dispatch_grants
+                                SET assignment_hash = ?
+                                WHERE grant_id = ?
+                                """,
+                                (_hash("v8-raw-grant-column"), grant.grant_id),
+                            )
+                        connection.commit()
+                    finally:
+                        connection.close()
+
+                    with self.assertRaises(ExternalBootstrapConflictError):
+                        SQLiteStore(database)
+
+                    connection = sqlite3.connect(database)
+                    try:
+                        schema_version = connection.execute(
+                            "SELECT value FROM schema_metadata "
+                            "WHERE key = 'schema_version'"
+                        ).fetchone()[0]
+                        table_names = {
+                            row[0]
+                            for row in connection.execute(
+                                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                            )
+                        }
+                    finally:
+                        connection.close()
+                    self.assertEqual("8", schema_version)
+                    self.assertFalse(
+                        {
+                            "external_dispatch_grant_bindings",
+                            "external_bootstrap_batch_commitments",
+                            "external_dispatch_grant_commitments",
+                        }
+                        & table_names
+                    )
+
     def test_v8_expiry_column_payload_hash_mismatch_fails_open_without_rewrite(
         self,
     ) -> None:
@@ -481,7 +722,12 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
             raw_payload_json = json.dumps(
                 payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             )
-            connection.execute("DROP TABLE external_dispatch_grant_bindings")
+            for table in (
+                "external_dispatch_grant_bindings",
+                "external_bootstrap_batch_commitments",
+                "external_dispatch_grant_commitments",
+            ):
+                connection.execute(f"DROP TABLE IF EXISTS {table}")
             connection.execute(
                 "UPDATE schema_metadata SET value = '8' WHERE key = 'schema_version'"
             )
@@ -526,7 +772,9 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         self.assertEqual(payload_hash, persisted_hash)
         self.assertEqual("8", schema_version)
 
-    def test_valid_v8_offset_expiry_migrates_to_canonical_binding(self) -> None:
+    def test_valid_v8_offset_expiry_is_retained_but_fails_closed_without_v10_commitments(
+        self,
+    ) -> None:
         descriptor, batch, grant = self._records(
             batch_label="v8-valid-expiry",
             expires_at="2026-08-03T08:00:00+08:00",
@@ -538,7 +786,12 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         raw_expiry = "2026-08-03T08:00:00+08:00"
         connection = sqlite3.connect(self.database)
         try:
-            connection.execute("DROP TABLE external_dispatch_grant_bindings")
+            for table in (
+                "external_dispatch_grant_bindings",
+                "external_bootstrap_batch_commitments",
+                "external_dispatch_grant_commitments",
+            ):
+                connection.execute(f"DROP TABLE IF EXISTS {table}")
             connection.execute(
                 "UPDATE schema_metadata SET value = '8' WHERE key = 'schema_version'"
             )
@@ -572,18 +825,33 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
 
         reopened = SQLiteStore(self.database)
         try:
-            migrated = reopened.get_external_dispatch_grant(grant.grant_id)
-            self.assertIsNotNone(migrated)
-            assert migrated is not None
-            self.assertEqual("2026-08-03T00:00:00+00:00", migrated.expires_at)
+            self.assertEqual(10, reopened.schema_version())
+            self.assertEqual(
+                "2026-08-03T00:00:00+00:00",
+                reopened._connection.execute(
+                    """
+                    SELECT expires_at FROM external_dispatch_grants
+                    WHERE grant_id = ?
+                    """,
+                    (grant.grant_id,),
+                ).fetchone()["expires_at"],
+            )
+            with self.assertRaises(ExternalDispatchGrantError):
+                reopened.get_external_dispatch_grant(grant.grant_id)
             with self.assertRaises(ExternalDispatchGrantError):
                 reopened.consume_external_dispatch_grant(
                     grant.grant_id,
                     descriptor_hash=descriptor.descriptor_hash,
                     batch_hash=batch.batch_hash,
                     assignment_hash=grant.assignment_hash,
-                    now="2026-08-03T00:00:01+00:00",
+                    now="2026-08-02T23:59:59+00:00",
                 )
+            self.assertIsNone(
+                reopened._connection.execute(
+                    "SELECT consumed_at FROM external_dispatch_grants WHERE grant_id = ?",
+                    (grant.grant_id,),
+                ).fetchone()["consumed_at"]
+            )
         finally:
             reopened.close()
 
@@ -607,7 +875,12 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         }
         connection = sqlite3.connect(self.database)
         try:
-            connection.execute("DROP TABLE external_dispatch_grant_bindings")
+            for table in (
+                "external_dispatch_grant_bindings",
+                "external_bootstrap_batch_commitments",
+                "external_dispatch_grant_commitments",
+            ):
+                connection.execute(f"DROP TABLE IF EXISTS {table}")
             connection.execute(
                 "UPDATE schema_metadata SET value = '8' WHERE key = 'schema_version'"
             )
@@ -668,7 +941,7 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
 
         reopened = SQLiteStore(self.database)
         try:
-            self.assertEqual(9, reopened.schema_version())
+            self.assertEqual(10, reopened.schema_version())
             persisted_item_json = reopened._connection.execute(
                 """
                 SELECT payload_json FROM external_bootstrap_batch_items
