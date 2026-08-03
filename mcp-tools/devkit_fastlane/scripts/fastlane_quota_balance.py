@@ -595,7 +595,9 @@ def _v2_spark_binding_kind(
             raise ValueError("alternate binding fields are invalid")
         if binding["schema"] != "2718lab-devkit/spark-alternate-binding-v1":
             raise ValueError("alternate binding schema is invalid")
-        unsigned = {key: value for key, value in binding.items() if key != "binding_hash"}
+        unsigned = {
+            key: value for key, value in binding.items() if key != "binding_hash"
+        }
         if not _is_hash(binding["binding_hash"]) or binding["binding_hash"] != _hash(
             unsigned
         ):
@@ -603,9 +605,7 @@ def _v2_spark_binding_kind(
         if binding["binding_hash"] not in trusted_alternate_bindings:
             raise PermissionError("alternate binding is untrusted")
         binding_route = _mapping(binding["route"])
-        if set(binding_route) != {"lane", "model", "effort"} or dict(
-            binding_route
-        ) != {
+        if set(binding_route) != {"lane", "model", "effort"} or dict(binding_route) != {
             "lane": route["lane"],
             "model": route["model"],
             "effort": route["effort"],
@@ -1108,9 +1108,7 @@ def compile_quota_balance_v2(
         value for value in verified_lease_scope_bindings if _is_hash(value)
     }
     trusted_alternate_bindings = {
-        value
-        for value in verified_spark_alternate_binding_hashes
-        if _is_hash(value)
+        value for value in verified_spark_alternate_binding_hashes if _is_hash(value)
     }
     valid_candidates: list[Mapping[str, Any]] = []
     route_hashes: list[str] = []
@@ -1197,10 +1195,8 @@ def compile_quota_balance_v2(
         selected, selected_kind = spark_candidates[0]
         if int(capacity["host_spark_cap"]) < 1:
             reasons.append("spark_cap_hold")
-        elif (
-            selected_kind == "alternate"
-            and int(capacity["host_spark_cap"])
-            != int(alternate_limits["required_local_slot_count"])
+        elif selected_kind == "alternate" and int(capacity["host_spark_cap"]) != int(
+            alternate_limits["required_local_slot_count"]
         ):
             reasons.append("spark_alternate_slot_hold")
         elif int(capacity["global_spark_active"]) >= int(

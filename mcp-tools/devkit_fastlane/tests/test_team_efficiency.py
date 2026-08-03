@@ -1067,9 +1067,10 @@ class TeamEfficiencyTests(unittest.TestCase):
         the real compiler directly with the exact host inputs.
         """
 
-        if "index_evidence" not in inspect.signature(
-            helper.compile_fast_lane
-        ).parameters:
+        if (
+            "index_evidence"
+            not in inspect.signature(helper.compile_fast_lane).parameters
+        ):
             return self.compile_fast_lane(
                 helper,
                 request,
@@ -1106,7 +1107,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         effective_status = (
             default_status if host_status is None else copy.deepcopy(host_status)
         )
-        effective_status.setdefault("routing_context", default_status["routing_context"])
+        effective_status.setdefault(
+            "routing_context", default_status["routing_context"]
+        )
         status = helper._validated_fast_lane_host_status(effective_status)
         validated = helper._validated_fast_lane_request(
             copy.deepcopy(request),
@@ -2234,9 +2237,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual("active", valid["status"])
         starts = [item for item in valid["assignments"] if item["action"] == "start"]
         self.assertTrue(starts)
-        evidence_by_token = {
-            record["assignment_token"]: record for record in evidence
-        }
+        evidence_by_token = {record["assignment_token"]: record for record in evidence}
         for assignment in starts:
             self.assertEqual(
                 evidence_by_token[assignment["assignment_token"]],
@@ -7723,7 +7724,9 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertEqual("external_session_required", assignment["action"])
             self.assertEqual("not_created", assignment["session_state"])
             self.assertTrue(assignment["worktree_required"])
-            self.assertEqual("index-evidence-v1", assignment["index_evidence"]["schema"])
+            self.assertEqual(
+                "index-evidence-v1", assignment["index_evidence"]["schema"]
+            )
             self.assertEqual(
                 assignment["assignment_token"],
                 assignment["index_evidence"]["assignment_token"],

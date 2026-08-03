@@ -7608,7 +7608,9 @@ def _validated_fast_lane_index_evidence(
     role = _text(record["role"], f"{field}.role", maximum=32)
     if role not in _FAST_LANE_ROLES:
         raise ValueError("index evidence role is invalid")
-    issued_at_utc_z = _text(record["issued_at_utc_z"], f"{field}.issued_at_utc_z", maximum=32)
+    issued_at_utc_z = _text(
+        record["issued_at_utc_z"], f"{field}.issued_at_utc_z", maximum=32
+    )
     expires_at_utc_z = _text(
         record["expires_at_utc_z"], f"{field}.expires_at_utc_z", maximum=32
     )
@@ -7667,9 +7669,7 @@ def _fast_lane_index_evidence_binding(
     assignment_token = _hash(
         assignment["assignment_token"], f"{field}.assignment_token"
     )
-    dispatch_context_hash = _hash(
-        assignment["context_hash"], f"{field}.context_hash"
-    )
+    dispatch_context_hash = _hash(assignment["context_hash"], f"{field}.context_hash")
     workspace_input_snapshot_id = _hash(
         assignment["workspace_input_snapshot_id"],
         f"{field}.workspace_input_snapshot_id",
@@ -8741,8 +8741,7 @@ def _fast_lane_cross_session_projection(
                 index_context["task_id"] != task_id
                 or index_context["role"] != role
                 or index_context["dispatch_context_hash"] != context_hash
-                or index_context["input_snapshot_id"]
-                != workspace_input_snapshot_id
+                or index_context["input_snapshot_id"] != workspace_input_snapshot_id
             ):
                 raise ValueError("external assignment index context is not bound")
             predecessor = {

@@ -473,8 +473,7 @@ class QuotaBalanceTests(unittest.TestCase):
                 for candidate in candidates
                 if isinstance(candidate, dict)
                 and isinstance(binding := candidate.get("spark_binding"), dict)
-                and binding.get("schema")
-                == "2718lab-devkit/spark-alternate-binding-v1"
+                and binding.get("schema") == "2718lab-devkit/spark-alternate-binding-v1"
             }
         return quota.compile_quota_balance_v2(
             request,
