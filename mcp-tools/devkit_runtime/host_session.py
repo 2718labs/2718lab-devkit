@@ -154,19 +154,19 @@ class _CompilerEvidenceHandle:
         return "<HostCompilerEvidenceHandle redacted>"
 
 
-class _CompilerMaterialToken:
-    """Opaque one-shot identity retained by the issuing host session."""
+@dataclass(frozen=True)
+class _CompilerInvocationBinding:
+    """Trusted, session-owned compiler fields resolved before provider admission."""
 
-    __slots__ = ()
+    request_hash: str
+    reasoning_effort: str
+    verified_route_result_hashes: tuple[str, ...]
+    verified_lease_scope_bindings: tuple[str, ...]
 
 
-class _CompilerProviderMaterial:
-    """Opaque zero-field acknowledgement emitted only by ``bind``."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "<HostCompilerProviderMaterial redacted>"
+CompilerInvocationResolver: TypeAlias = Callable[
+    [str], _CompilerInvocationBinding | None
+]
 
 
 @dataclass(frozen=True)
@@ -185,71 +185,12 @@ class _CompilerInvocation:
     snapshot_seq: int
     quota_binding_hash: str
     binding_hash: str
-    _owner: object = field(repr=False, compare=False)
-    _material_token: object | None = field(default=None, repr=False, compare=False)
 
 
 class _CompilerPreparation:
-    """Provider-only capability for creating one exact private invocation."""
+    """A zero-field marker that a provider can only return unchanged."""
 
-    __slots__ = (
-        "_owner",
-        "_preparation_id",
-        "_issued_at",
-        "_expires_at",
-        "_quota_binding_hash",
-        "_material_token",
-        "_register_material",
-        "_bound_material",
-    )
-
-    def __init__(
-        self,
-        *,
-        owner: object,
-        preparation_id: str,
-        issued_at: float,
-        expires_at: float,
-        quota_binding_hash: str,
-        material_token: _CompilerMaterialToken,
-        register_material: Callable[..., _CompilerProviderMaterial],
-    ) -> None:
-        self._owner = owner
-        self._preparation_id = preparation_id
-        self._issued_at = issued_at
-        self._expires_at = expires_at
-        self._quota_binding_hash = quota_binding_hash
-        self._material_token = material_token
-        self._register_material = register_material
-        self._bound_material: _CompilerProviderMaterial | None = None
-
-    def bind(
-        self,
-        *,
-        request_hash: str,
-        reasoning_effort: str,
-        verified_route_result_hashes: tuple[str, ...],
-        verified_lease_scope_bindings: tuple[str, ...],
-    ) -> _CompilerProviderMaterial:
-        """Register immutable facts and return the sole opaque provider material."""
-
-        if self._bound_material is not None:
-            raise ValueError("compiler preparation was already bound")
-        if (
-            not _is_hash(request_hash)
-            or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
-            or not _strict_hash_tuple(verified_route_result_hashes)
-            or not _strict_hash_tuple(verified_lease_scope_bindings)
-        ):
-            raise ValueError("compiler invocation binding is invalid")
-        material = self._register_material(
-            request_hash=request_hash,
-            reasoning_effort=reasoning_effort,
-            verified_route_result_hashes=verified_route_result_hashes,
-            verified_lease_scope_bindings=verified_lease_scope_bindings,
-        )
-        self._bound_material = material
-        return material
+    __slots__ = ()
 
 
 class HostSession:
@@ -263,24 +204,26 @@ class HostSession:
         clock: Callable[[], float],
         quota_expectation: HostQuotaExpectation | None = None,
         compiler_evidence_provider: CompilerEvidenceProvider | None = None,
+        compiler_invocation_resolver: CompilerInvocationResolver | None = None,
     ) -> None:
         self._bridge = bridge
         self._quota_evidence_resolver = quota_evidence_resolver
         self._compiler_evidence_provider = (
             compiler_evidence_provider if callable(compiler_evidence_provider) else None
         )
+        self._compiler_invocation_resolver = (
+            compiler_invocation_resolver
+            if callable(compiler_invocation_resolver)
+            else None
+        )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
-        self._compiler_materials: dict[
-            _CompilerProviderMaterial, _CompilerInvocation
-        ] = {}
-        self._compiler_material_tokens: set[_CompilerMaterialToken] = set()
+        self._compiler_materials: dict[_CompilerPreparation, _CompilerInvocation] = {}
         self._burned_preparation_ids: set[str] = set()
         self._has_fresh_quota = False
         self._fresh_quota: HostQuotaFacts | None = None
         self._fresh_quota_issued_at: float | None = None
         self._fresh_quota_valid_until: float | None = None
-        self._compiler_owner = object()
         self._clock = clock
         self._last_trusted_clock: float | None = None
         try:
@@ -361,7 +304,6 @@ class HostSession:
             self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
             self._compiler_materials.clear()
-            self._compiler_material_tokens.clear()
         if self._bridge is not None:
             self._bridge.close()
 
@@ -372,10 +314,12 @@ class HostSession:
 
         with self._compiler_evidence_lock:
             provider = self._compiler_evidence_provider
+            binding_resolver = self._compiler_invocation_resolver
             if (
                 self._closed
                 or self._frozen
                 or provider is None
+                or binding_resolver is None
                 or not isinstance(preparation_id, str)
                 or _IDENTIFIER.fullmatch(preparation_id) is None
             ):
@@ -416,134 +360,58 @@ class HostSession:
                     "spark_limit_id": quota.spark_limit_id,
                 }
             )
-            snapshot_hash = quota.snapshot_hash
-            snapshot_seq = quota.snapshot_seq
-            material_token = _CompilerMaterialToken()
-            self._compiler_material_tokens.add(material_token)
-
-            def register_material(
-                *,
-                request_hash: str,
-                reasoning_effort: str,
-                verified_route_result_hashes: tuple[str, ...],
-                verified_lease_scope_bindings: tuple[str, ...],
-            ) -> _CompilerProviderMaterial:
-                return self._register_compiler_material(
-                    material_token=material_token,
-                    preparation_id=preparation_id,
-                    issued_at=issued_at,
-                    expires_at=expires_at,
-                    snapshot_hash=snapshot_hash,
-                    snapshot_seq=snapshot_seq,
-                    quota_binding_hash=quota_binding_hash,
-                    request_hash=request_hash,
-                    reasoning_effort=reasoning_effort,
-                    verified_route_result_hashes=verified_route_result_hashes,
-                    verified_lease_scope_bindings=verified_lease_scope_bindings,
+            try:
+                binding = _normalized_compiler_invocation_binding(
+                    binding_resolver(preparation_id)
                 )
-
-            preparation = _CompilerPreparation(
-                owner=self._compiler_owner,
+            except Exception:
+                return _NO_SAFE_WORK
+            preparation = _CompilerPreparation()
+            self._compiler_materials[preparation] = _CompilerInvocation(
+                schema="2718lab-devkit/compiler-invocation-v1",
                 preparation_id=preparation_id,
+                request_hash=binding.request_hash,
+                reasoning_effort=binding.reasoning_effort,
+                verified_route_result_hashes=binding.verified_route_result_hashes,
+                verified_lease_scope_bindings=binding.verified_lease_scope_bindings,
                 issued_at=issued_at,
                 expires_at=expires_at,
+                snapshot_hash=quota.snapshot_hash,
+                snapshot_seq=quota.snapshot_seq,
                 quota_binding_hash=quota_binding_hash,
-                material_token=material_token,
-                register_material=register_material,
+                binding_hash=_hash(
+                    {
+                        "expires_at": expires_at,
+                        "issued_at": issued_at,
+                        "preparation_id": preparation_id,
+                        "quota_binding_hash": quota_binding_hash,
+                        "reasoning_effort": binding.reasoning_effort,
+                        "request_hash": binding.request_hash,
+                        "route_result_hashes": binding.verified_route_result_hashes,
+                        "schema": "2718lab-devkit/compiler-invocation-v1",
+                        "lease_scope_bindings": binding.verified_lease_scope_bindings,
+                    }
+                ),
             )
             try:
                 provider_material = provider(preparation)
             except Exception:
-                self._discard_compiler_material(material_token)
+                self._compiler_materials.pop(preparation, None)
                 return _NO_SAFE_WORK
             if (
                 self._closed
                 or self._frozen
                 or not self.is_available
-                or material_token not in self._compiler_material_tokens
-                or type(provider_material) is not _CompilerProviderMaterial
+                or provider_material is not preparation
             ):
-                self._discard_compiler_material(material_token)
+                self._compiler_materials.pop(preparation, None)
                 return _NO_SAFE_WORK
-            material = self._compiler_materials.pop(provider_material, None)
-            if (
-                material is None
-                or material._owner is not self._compiler_owner
-                or material._material_token is not material_token
-            ):
-                self._discard_compiler_material(material_token)
+            material = self._compiler_materials.pop(preparation, None)
+            if material is None:
                 return _NO_SAFE_WORK
-            self._discard_compiler_material(material_token)
             evidence = _CompilerEvidenceHandle()
             self._compiler_evidence[evidence] = material
             return evidence
-
-    def _register_compiler_material(
-        self,
-        *,
-        material_token: _CompilerMaterialToken,
-        preparation_id: str,
-        issued_at: float,
-        expires_at: float,
-        snapshot_hash: str,
-        snapshot_seq: int,
-        quota_binding_hash: str,
-        request_hash: str,
-        reasoning_effort: str,
-        verified_route_result_hashes: tuple[str, ...],
-        verified_lease_scope_bindings: tuple[str, ...],
-    ) -> _CompilerProviderMaterial:
-        """Store canonical facts before an untrusted provider can mutate its marker."""
-
-        if (
-            self._closed
-            or self._frozen
-            or not self.is_available
-            or material_token not in self._compiler_material_tokens
-            or not _is_hash(request_hash)
-            or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
-            or not _strict_hash_tuple(verified_route_result_hashes)
-            or not _strict_hash_tuple(verified_lease_scope_bindings)
-        ):
-            raise ValueError("compiler invocation binding is unavailable")
-        material = _CompilerProviderMaterial()
-        self._compiler_materials[material] = _CompilerInvocation(
-            schema="2718lab-devkit/compiler-invocation-v1",
-            preparation_id=preparation_id,
-            request_hash=request_hash,
-            reasoning_effort=reasoning_effort,
-            verified_route_result_hashes=verified_route_result_hashes,
-            verified_lease_scope_bindings=verified_lease_scope_bindings,
-            issued_at=issued_at,
-            expires_at=expires_at,
-            snapshot_hash=snapshot_hash,
-            snapshot_seq=snapshot_seq,
-            quota_binding_hash=quota_binding_hash,
-            binding_hash=_hash(
-                {
-                    "expires_at": expires_at,
-                    "issued_at": issued_at,
-                    "preparation_id": preparation_id,
-                    "quota_binding_hash": quota_binding_hash,
-                    "reasoning_effort": reasoning_effort,
-                    "request_hash": request_hash,
-                    "route_result_hashes": verified_route_result_hashes,
-                    "schema": "2718lab-devkit/compiler-invocation-v1",
-                    "lease_scope_bindings": verified_lease_scope_bindings,
-                },
-            ),
-            _owner=self._compiler_owner,
-            _material_token=material_token,
-        )
-        return material
-
-    def _discard_compiler_material(self, material_token: _CompilerMaterialToken) -> None:
-        """Invalidate one pending binding and every registry entry it owns."""
-
-        self._compiler_material_tokens.discard(material_token)
-        for material, invocation in tuple(self._compiler_materials.items()):
-            if invocation._material_token is material_token:
-                del self._compiler_materials[material]
 
     def consume_compiler_evidence(self, evidence: object) -> object | str:
         """Exchange a session-issued handle once, rejecting public substitutes."""
@@ -892,7 +760,6 @@ class HostSession:
             self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
             self._compiler_materials.clear()
-            self._compiler_material_tokens.clear()
         if self._bridge is not None:
             self._bridge.close()
 
@@ -952,6 +819,26 @@ def _strict_hash_tuple(value: object) -> bool:
         and all(_is_hash(item) for item in value)
         and tuple(sorted(value)) == value
         and len(set(value)) == len(value)
+    )
+
+
+def _normalized_compiler_invocation_binding(
+    value: object,
+) -> _CompilerInvocationBinding:
+    if type(value) is not _CompilerInvocationBinding:
+        raise ValueError("compiler invocation binding is unavailable")
+    if (
+        not _is_hash(value.request_hash)
+        or value.reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
+        or not _strict_hash_tuple(value.verified_route_result_hashes)
+        or not _strict_hash_tuple(value.verified_lease_scope_bindings)
+    ):
+        raise ValueError("compiler invocation binding is invalid")
+    return _CompilerInvocationBinding(
+        request_hash=value.request_hash,
+        reasoning_effort=value.reasoning_effort,
+        verified_route_result_hashes=value.verified_route_result_hashes,
+        verified_lease_scope_bindings=value.verified_lease_scope_bindings,
     )
 
 
