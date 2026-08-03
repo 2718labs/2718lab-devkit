@@ -23,7 +23,9 @@ def load_provider():
 
 
 def load_balance():
-    spec = importlib.util.spec_from_file_location("fastlane_quota_balance", BALANCE_SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "fastlane_quota_balance", BALANCE_SCRIPT
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load quota balance: {BALANCE_SCRIPT}")
     module = importlib.util.module_from_spec(spec)
@@ -78,7 +80,11 @@ def fake_server_code(
                         "resetsAt": 1786162042,
                     },
                     "secondary": None,
-                    "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+                    "credits": {
+                        "hasCredits": False,
+                        "unlimited": False,
+                        "balance": "0",
+                    },
                     "planType": "pro",
                 },
                 "codex_bengalfox": {
@@ -119,7 +125,9 @@ for raw in sys.stdin:
 
 class CodexAccountQuotaTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = Path(tempfile.mkdtemp(prefix="quota-provider-", dir="D:/bun/tmp/codex"))
+        self.temp = Path(
+            tempfile.mkdtemp(prefix="quota-provider-", dir="D:/bun/tmp/codex")
+        )
 
     def tearDown(self) -> None:
         for path in sorted(self.temp.rglob("*"), reverse=True):
@@ -137,7 +145,9 @@ class CodexAccountQuotaTests(unittest.TestCase):
             now=lambda: 1786100000.0,
         )
 
-    def test_reads_official_jsonl_and_builds_verifiable_main_and_spark_snapshot(self) -> None:
+    def test_reads_official_jsonl_and_builds_verifiable_main_and_spark_snapshot(
+        self,
+    ) -> None:
         provider = self.provider()
         evidence = provider.read(capacity=CAPACITY)
 
@@ -192,7 +202,9 @@ class CodexAccountQuotaTests(unittest.TestCase):
         }
         attached = module.attach_snapshot(request, evidence)
         self.assertEqual(evidence.snapshot, attached["snapshot"])
-        self.assertEqual(balance._normalized_request_hash(attached), attached["request_hash"])
+        self.assertEqual(
+            balance._normalized_request_hash(attached), attached["request_hash"]
+        )
         self.assertNotIn("key", attached)
         self.assertNotIn("secret", attached)
 
@@ -213,7 +225,10 @@ class CodexAccountQuotaTests(unittest.TestCase):
 
     def test_state_cache_accepts_explicit_user_configured_g_drive_path(self) -> None:
         module = load_provider()
-        module.CodexQuotaProvider(state_path=Path("G:/2718lab-devkit/quota-cache.json"))
+        module.CodexQuotaProvider(
+            command=[sys.executable, "-c", ""],
+            state_path=Path("G:/2718lab-devkit/quota-cache.json"),
+        )
 
     def test_state_cache_rejects_unapproved_c_drive_temp_path(self) -> None:
         module = load_provider()

@@ -42,6 +42,9 @@ def test_release_workflow_runs_mcp_runtime_on_its_windows_contract() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
+    continuous_integration = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
 
     assert (
         "  mcp-runtime:\n"
@@ -49,6 +52,10 @@ def test_release_workflow_runs_mcp_runtime_on_its_windows_contract() -> None:
         "    needs: metadata\n"
         "    runs-on: windows-latest"
     ) in workflow
+    mcp_runtime = workflow.split("\n  quality:", maxsplit=1)[0]
+    ci_mcp_runtime = continuous_integration.split("\n  astrbot-extension:", maxsplit=1)[
+        0
+    ]
     for required in (
         "Configure MCP task-local runtime storage",
         '"CODEX_TASK_TEMP=$root"',
@@ -57,3 +64,8 @@ def test_release_workflow_runs_mcp_runtime_on_its_windows_contract() -> None:
         "needs: [metadata, mcp-runtime, quality, fast-lane]",
     ):
         assert required in workflow
+    fixture_repo = (
+        "D:\\bun\\tmp\\codex\\2718-devkit\\worktrees\\atlas12b-team-efficiency"
+    )
+    assert fixture_repo in mcp_runtime
+    assert fixture_repo in ci_mcp_runtime
