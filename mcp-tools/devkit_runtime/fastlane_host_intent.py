@@ -17,6 +17,7 @@ NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 
 _SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v1"
 _PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v1"
+_HOST_PRIVATE_TRUST_STATE: Final = "host-private-verified-v1"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _GIT_OBJECT_PATTERN: Final = re.compile(r"[0-9a-f]{40}\Z")
 _IDENTIFIER_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
@@ -165,6 +166,64 @@ class HostCapabilityFact:
 
 
 @dataclass(frozen=True, slots=True)
+class HostCapabilityExpectation:
+    """A capability fact independently attested by the future Host verifier."""
+
+    model: str
+    reasoning_effort: str
+    state: str
+    attestation_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class HostExecutionExpectation:
+    """Host-private authorization input; this pure module never creates or verifies it."""
+
+    verifier_key_id: str
+    trust_state: str
+    receipt_hash: str
+    verified_at_epoch: int
+    expires_at_epoch: int
+    expected_intent_hash: str
+    projection_hash: str
+    source_plan_hash: str
+    workflow_hash: str
+    assignment_id: str
+    assignment_token: str
+    predecessor_hash: str
+    task_id: str
+    role: str
+    model: str
+    reasoning_effort: str
+    routing_context_hash: str
+    routing_result_hash: str
+    session_scope: str
+    inherit_current_session_model: bool
+    require_explicit_route: bool
+    capability_facts: tuple[HostCapabilityExpectation, ...]
+    quota_snapshot_hash: str
+    quota_decision_hash: str
+    quota_evidence_hash: str
+    ledger_epoch: int
+    active_lease_set_hash: str
+    task_packet_hash: str
+    input_packet_hash: str
+    index_packet_hash: str
+    project_id: str
+    registered_project_id: str
+    repository: str
+    common_dir: str
+    source_ref: str
+    source_commit: str
+    source_tree: str
+    create_request_hash: str
+    operation_id: str
+    lease_owner: str
+    lease_epoch: int
+    lease_fencing_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class HostExecutionIntent:
     """The only successful result of pure Fast Lane intent validation."""
 
@@ -184,6 +243,8 @@ class HostExecutionIntent:
     routing_context_hash: str
     routing_result_hash: str
     session_scope: str
+    inherit_current_session_model: bool
+    require_explicit_route: bool
     route_binding_hash: str
     host_capability_facts: tuple[HostCapabilityFact, ...]
     quota_snapshot_hash: str
@@ -215,14 +276,18 @@ class HostExecutionIntent:
 
 def validate_host_execution_intent(
     candidate: object,
+    *,
+    expectation: object | None = None,
 ) -> HostExecutionIntent | Literal["NO_SAFE_WORK"]:
-    """Return an immutable bound intent, or fail closed without side effects."""
+    """Return a Host-authorized intent, or fail closed without side effects."""
 
     try:
         accepted = _validate(candidate)
+        if accepted is None or not _matches_host_expectation(accepted, expectation):
+            return NO_SAFE_WORK
     except Exception:
         return NO_SAFE_WORK
-    return accepted if accepted is not None else NO_SAFE_WORK
+    return accepted
 
 
 def _validate(candidate: object) -> HostExecutionIntent | None:
@@ -242,7 +307,9 @@ def _validate(candidate: object) -> HostExecutionIntent | None:
     ):
         return None
 
-    assignment = _bound_mapping(root["assignment"], _ASSIGNMENT_KEYS, "assignment_binding_hash")
+    assignment = _bound_mapping(
+        root["assignment"], _ASSIGNMENT_KEYS, "assignment_binding_hash"
+    )
     route = _bound_mapping(root["route"], _ROUTE_KEYS, "route_binding_hash")
     quota = _bound_mapping(root["quota"], _QUOTA_KEYS, "quota_binding_hash")
     packets = _bound_mapping(root["packets"], _PACKET_KEYS, "packet_binding_hash")
@@ -274,6 +341,8 @@ def _validate(candidate: object) -> HostExecutionIntent | None:
         routing_context_hash,
         routing_result_hash,
         session_scope,
+        inherit_current_session_model,
+        require_explicit_route,
         route_binding_hash,
     ) = validated_route
     (
@@ -408,6 +477,8 @@ def _validate(candidate: object) -> HostExecutionIntent | None:
         routing_context_hash=routing_context_hash,
         routing_result_hash=routing_result_hash,
         session_scope=session_scope,
+        inherit_current_session_model=inherit_current_session_model,
+        require_explicit_route=require_explicit_route,
         route_binding_hash=route_binding_hash,
         host_capability_facts=capability_facts,
         quota_snapshot_hash=quota_snapshot_hash,
@@ -440,27 +511,27 @@ def _validate(candidate: object) -> HostExecutionIntent | None:
 
 def _validate_route(
     route: dict[str, object],
-) -> tuple[str, str, str, str, str, str] | None:
+) -> tuple[str, str, str, str, str, bool, bool, str] | None:
     model = _valid_model(route, "model")
     reasoning_effort = _text(route, "reasoning_effort")
     routing_context_hash = _valid_hash(route, "routing_context_hash")
     routing_result_hash = _valid_hash(route, "routing_result_hash")
     session_scope = _text(route, "session_scope")
+    inherit_current_session_model = _bool(route, "inherit_current_session_model")
+    require_explicit_route = _bool(route, "require_explicit_route")
     route_binding_hash = _valid_hash(route, "route_binding_hash")
     if (
         model is None
         or reasoning_effort not in _VALID_EFFORTS
         or routing_context_hash is None
         or routing_result_hash is None
-        or session_scope not in {"local", "external"}
+        or session_scope != "external"
+        or inherit_current_session_model is not False
+        or require_explicit_route is not True
         or route_binding_hash is None
-        or _bool(route, "inherit_current_session_model") is not False
-        or _bool(route, "require_explicit_route") is not True
     ):
         return None
-    if session_scope == "external" and (
-        reasoning_effort == "ultra" or "spark" in model.casefold()
-    ):
+    if reasoning_effort == "ultra" or "spark" in model.casefold():
         return None
     return (
         model,
@@ -468,6 +539,8 @@ def _validate_route(
         routing_context_hash,
         routing_result_hash,
         session_scope,
+        inherit_current_session_model,
+        require_explicit_route,
         route_binding_hash,
     )
 
@@ -478,7 +551,7 @@ def _validate_quota(
     snapshot_hash = _valid_hash(quota, "snapshot_hash")
     decision_hash = _valid_hash(quota, "decision_hash")
     evidence_hash = _valid_hash(quota, "evidence_hash")
-    ledger_epoch = _non_negative_int(quota, "ledger_epoch")
+    ledger_epoch = _positive_int(quota, "ledger_epoch")
     active_lease_set_hash = _valid_hash(quota, "active_lease_set_hash")
     quota_binding_hash = _valid_hash(quota, "quota_binding_hash")
     if (
@@ -555,7 +628,7 @@ def _validate_predecessor(
     predecessor_hash = _valid_hash(predecessor, "predecessor_hash")
     task_id = _valid_identifier(predecessor, "task_id")
     role = _valid_identifier(predecessor, "role")
-    lease_epoch = _non_negative_int(predecessor, "lease_epoch")
+    lease_epoch = _positive_int(predecessor, "lease_epoch")
     if (
         predecessor_hash is None
         or task_id is None
@@ -638,6 +711,143 @@ def _has_attested_capability(
     )
 
 
+def _matches_host_expectation(
+    intent: HostExecutionIntent,
+    expectation: object | None,
+) -> bool:
+    if type(expectation) is not HostExecutionExpectation:
+        return False
+    trusted_expectation = cast(HostExecutionExpectation, expectation)
+    if not _is_trusted_expectation(trusted_expectation):
+        return False
+    expected_capability_facts = tuple(
+        HostCapabilityExpectation(
+            model=fact.model,
+            reasoning_effort=fact.reasoning_effort,
+            state=fact.state,
+            attestation_hash=fact.attestation_hash,
+        )
+        for fact in intent.host_capability_facts
+    )
+    return (
+        trusted_expectation.expected_intent_hash == intent.intent_hash
+        and trusted_expectation.projection_hash == intent.projection_hash
+        and trusted_expectation.source_plan_hash == intent.source_plan_hash
+        and trusted_expectation.workflow_hash == intent.workflow_hash
+        and trusted_expectation.assignment_id == intent.assignment_id
+        and trusted_expectation.assignment_token == intent.assignment_token
+        and trusted_expectation.predecessor_hash == intent.predecessor_hash
+        and trusted_expectation.task_id == intent.task_id
+        and trusted_expectation.role == intent.role
+        and trusted_expectation.model == intent.model
+        and trusted_expectation.reasoning_effort == intent.reasoning_effort
+        and trusted_expectation.routing_context_hash == intent.routing_context_hash
+        and trusted_expectation.routing_result_hash == intent.routing_result_hash
+        and trusted_expectation.session_scope == intent.session_scope
+        and trusted_expectation.inherit_current_session_model
+        == intent.inherit_current_session_model
+        and trusted_expectation.require_explicit_route == intent.require_explicit_route
+        and trusted_expectation.capability_facts == expected_capability_facts
+        and trusted_expectation.quota_snapshot_hash == intent.quota_snapshot_hash
+        and trusted_expectation.quota_decision_hash == intent.quota_decision_hash
+        and trusted_expectation.quota_evidence_hash == intent.quota_evidence_hash
+        and trusted_expectation.ledger_epoch == intent.ledger_epoch
+        and trusted_expectation.active_lease_set_hash == intent.active_lease_set_hash
+        and trusted_expectation.task_packet_hash == intent.task_packet_hash
+        and trusted_expectation.input_packet_hash == intent.input_packet_hash
+        and trusted_expectation.index_packet_hash == intent.index_packet_hash
+        and trusted_expectation.project_id == intent.project_id
+        and trusted_expectation.registered_project_id == intent.registered_project_id
+        and trusted_expectation.repository == intent.repository
+        and trusted_expectation.common_dir == intent.common_dir
+        and trusted_expectation.source_ref == intent.source_ref
+        and trusted_expectation.source_commit == intent.source_commit
+        and trusted_expectation.source_tree == intent.source_tree
+        and trusted_expectation.create_request_hash == intent.create_request_hash
+        and trusted_expectation.operation_id == intent.operation_id
+        and trusted_expectation.lease_owner == intent.lease_owner
+        and trusted_expectation.lease_epoch == intent.lease_epoch
+        and trusted_expectation.lease_fencing_token == intent.lease_fencing_token
+    )
+
+
+def _is_trusted_expectation(expectation: HostExecutionExpectation) -> bool:
+    if (
+        expectation.trust_state != _HOST_PRIVATE_TRUST_STATE
+        or not _is_identifier_value(expectation.verifier_key_id)
+        or not _is_hash_value(expectation.receipt_hash)
+        or not _is_positive_int_value(expectation.verified_at_epoch)
+        or not _is_positive_int_value(expectation.expires_at_epoch)
+        or expectation.expires_at_epoch <= expectation.verified_at_epoch
+        or not _is_hash_value(expectation.expected_intent_hash)
+    ):
+        return False
+    if not _capability_expectations_are_valid(expectation.capability_facts):
+        return False
+    hash_values = (
+        expectation.projection_hash,
+        expectation.source_plan_hash,
+        expectation.workflow_hash,
+        expectation.assignment_id,
+        expectation.assignment_token,
+        expectation.predecessor_hash,
+        expectation.routing_context_hash,
+        expectation.routing_result_hash,
+        expectation.quota_snapshot_hash,
+        expectation.quota_decision_hash,
+        expectation.quota_evidence_hash,
+        expectation.active_lease_set_hash,
+        expectation.task_packet_hash,
+        expectation.input_packet_hash,
+        expectation.index_packet_hash,
+        expectation.create_request_hash,
+        expectation.lease_fencing_token,
+    )
+    return (
+        all(_is_hash_value(value) for value in hash_values)
+        and _is_identifier_value(expectation.task_id)
+        and _is_identifier_value(expectation.role)
+        and _is_model_value(expectation.model)
+        and expectation.reasoning_effort in _VALID_EFFORTS
+        and expectation.session_scope == "external"
+        and expectation.inherit_current_session_model is False
+        and expectation.require_explicit_route is True
+        and _is_positive_int_value(expectation.ledger_epoch)
+        and _is_identifier_value(expectation.project_id)
+        and _is_identifier_value(expectation.registered_project_id)
+        and expectation.project_id == expectation.registered_project_id
+        and _canonical_repository(_as_text(expectation.repository)) is not None
+        and _canonical_common_dir(_as_text(expectation.common_dir)) is not None
+        and _canonical_ref(_as_text(expectation.source_ref)) is not None
+        and _git_object_id(_as_text(expectation.source_commit)) is not None
+        and _git_object_id(_as_text(expectation.source_tree)) is not None
+        and _is_identifier_value(expectation.operation_id)
+        and _is_identifier_value(expectation.lease_owner)
+        and _is_positive_int_value(expectation.lease_epoch)
+    )
+
+
+def _capability_expectations_are_valid(value: object) -> bool:
+    if type(value) is not tuple or not 1 <= len(value) <= 16:
+        return False
+    seen_routes: set[tuple[str, str]] = set()
+    for fact in value:
+        if type(fact) is not HostCapabilityExpectation:
+            return False
+        expected_fact = cast(HostCapabilityExpectation, fact)
+        route_key = (expected_fact.model, expected_fact.reasoning_effort)
+        if (
+            not _is_model_value(expected_fact.model)
+            or expected_fact.reasoning_effort not in _VALID_EFFORTS
+            or expected_fact.state != "attested"
+            or not _is_hash_value(expected_fact.attestation_hash)
+            or route_key in seen_routes
+        ):
+            return False
+        seen_routes.add(route_key)
+    return True
+
+
 def _validate_packets(
     packets: dict[str, object],
     *,
@@ -670,7 +880,7 @@ def _validate_lease(
         _valid_identifier(lease, "owner") is not None
         and _valid_hash(lease, "fencing_token") is not None
         and _valid_hash(lease, "lease_binding_hash") is not None
-        and _non_negative_int(lease, "epoch") == lease_epoch
+        and _positive_int(lease, "epoch") == lease_epoch
         and lease["assignment_id"] == assignment_id
         and lease["assignment_token"] == assignment_token
         and lease["predecessor_hash"] == predecessor_hash
@@ -752,6 +962,34 @@ def _non_negative_int(mapping: dict[str, object], field: str) -> int | None:
     return cast(int, value)
 
 
+def _positive_int(mapping: dict[str, object], field: str) -> int | None:
+    value = _non_negative_int(mapping, field)
+    return value if value is not None and value > 0 else None
+
+
+def _as_text(value: object) -> str | None:
+    return value if type(value) is str else None
+
+
+def _is_hash_value(value: object) -> bool:
+    text = _as_text(value)
+    return text is not None and _HASH_PATTERN.fullmatch(text) is not None
+
+
+def _is_identifier_value(value: object) -> bool:
+    text = _as_text(value)
+    return text is not None and _IDENTIFIER_PATTERN.fullmatch(text) is not None
+
+
+def _is_model_value(value: object) -> bool:
+    text = _as_text(value)
+    return text is not None and _is_identifier_value(text) and text.startswith("gpt-")
+
+
+def _is_positive_int_value(value: object) -> bool:
+    return type(value) is int and 0 < value <= 2**63 - 1
+
+
 def _valid_hash(mapping: dict[str, object], field: str) -> str | None:
     value = _text(mapping, field)
     return value if value is not None and _HASH_PATTERN.fullmatch(value) else None
@@ -776,7 +1014,9 @@ def _canonical_repository(value: str | None) -> str | None:
         or "//" in value
         or "/../" in value
         or value.endswith("/..")
-        or any(not _IDENTIFIER_PATTERN.fullmatch(segment) for segment in value.split("/"))
+        or any(
+            not _IDENTIFIER_PATTERN.fullmatch(segment) for segment in value.split("/")
+        )
     ):
         return None
     return value
@@ -802,7 +1042,9 @@ def _canonical_ref(value: str | None) -> str | None:
         or "//" in value
         or "/../" in value
         or value.endswith("/..")
-        or any(not _IDENTIFIER_PATTERN.fullmatch(segment) for segment in value.split("/"))
+        or any(
+            not _IDENTIFIER_PATTERN.fullmatch(segment) for segment in value.split("/")
+        )
     ):
         return None
     return value

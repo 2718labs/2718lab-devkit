@@ -36,16 +36,16 @@ def _canonical_hash(value: object) -> str:
 
 
 def _with_binding(value: dict[str, Any], binding_field: str) -> dict[str, Any]:
-    bound = copy.deepcopy(value)
-    bound[binding_field] = _canonical_hash(bound)
-    return bound
+    unbound = copy.deepcopy(value)
+    unbound.pop(binding_field, None)
+    unbound[binding_field] = _canonical_hash(unbound)
+    return unbound
 
 
 def _refresh_root(candidate: dict[str, Any]) -> None:
-    without_intent_hash = {
-        key: value for key, value in candidate.items() if key != "intent_hash"
-    }
-    candidate["intent_hash"] = _canonical_hash(without_intent_hash)
+    refreshed = _with_binding(candidate, "intent_hash")
+    candidate.clear()
+    candidate.update(refreshed)
 
 
 def _intent(
@@ -194,15 +194,120 @@ def _module() -> Any:
     return importlib.import_module(MODULE_NAME)
 
 
-def _assert_rejected(candidate: object) -> None:
+def _require_expectation_api(module: Any) -> None:
+    assert (
+        "expectation"
+        in inspect.signature(module.validate_host_execution_intent).parameters
+    )
+    assert hasattr(module, "HostExecutionExpectation")
+    assert hasattr(module, "HostCapabilityExpectation")
+
+
+def _expectation(
+    module: Any,
+    candidate: dict[str, Any],
+    *,
+    trust_state: str = "host-private-verified-v1",
+    verified_at_epoch: int = 100,
+    expires_at_epoch: int = 200,
+) -> Any:
+    _require_expectation_api(module)
+    assignment = candidate["assignment"]
+    predecessor = assignment["predecessor"]
+    route = candidate["route"]
+    quota = candidate["quota"]
+    packets = candidate["packets"]
+    source = candidate["source"]
+    create = candidate["create"]
+    lease = candidate["lease"]
+    capability_facts = tuple(
+        module.HostCapabilityExpectation(
+            model=fact["model"],
+            reasoning_effort=fact["reasoning_effort"],
+            state=fact["state"],
+            attestation_hash=fact["attestation_hash"],
+        )
+        for fact in candidate["capability_facts"]
+    )
+    return module.HostExecutionExpectation(
+        verifier_key_id="desktop-host-private-key",
+        trust_state=trust_state,
+        receipt_hash=_hash("detached-host-receipt"),
+        verified_at_epoch=verified_at_epoch,
+        expires_at_epoch=expires_at_epoch,
+        expected_intent_hash=candidate["intent_hash"],
+        projection_hash=candidate["projection_hash"],
+        source_plan_hash=candidate["source_plan_hash"],
+        workflow_hash=candidate["workflow_hash"],
+        assignment_id=assignment["assignment_id"],
+        assignment_token=assignment["assignment_token"],
+        predecessor_hash=predecessor["predecessor_hash"],
+        task_id=predecessor["task_id"],
+        role=predecessor["role"],
+        model=route["model"],
+        reasoning_effort=route["reasoning_effort"],
+        routing_context_hash=route["routing_context_hash"],
+        routing_result_hash=route["routing_result_hash"],
+        session_scope=route["session_scope"],
+        inherit_current_session_model=route["inherit_current_session_model"],
+        require_explicit_route=route["require_explicit_route"],
+        capability_facts=capability_facts,
+        quota_snapshot_hash=quota["snapshot_hash"],
+        quota_decision_hash=quota["decision_hash"],
+        quota_evidence_hash=quota["evidence_hash"],
+        ledger_epoch=quota["ledger_epoch"],
+        active_lease_set_hash=quota["active_lease_set_hash"],
+        task_packet_hash=packets["task_packet_hash"],
+        input_packet_hash=packets["input_packet_hash"],
+        index_packet_hash=packets["index_packet_hash"],
+        project_id=source["project_id"],
+        registered_project_id=source["registered_project_id"],
+        repository=source["repository"],
+        common_dir=source["common_dir"],
+        source_ref=source["ref"],
+        source_commit=source["commit"],
+        source_tree=source["tree"],
+        create_request_hash=create["request_hash"],
+        operation_id=create["operation_id"],
+        lease_owner=lease["owner"],
+        lease_epoch=lease["epoch"],
+        lease_fencing_token=lease["fencing_token"],
+    )
+
+
+def _validate(candidate: object, expectation: object) -> Any:
     module = _module()
-    assert module.validate_host_execution_intent(candidate) is module.NO_SAFE_WORK
+    _require_expectation_api(module)
+    return module.validate_host_execution_intent(candidate, expectation=expectation)
 
 
-def test_accepts_a_fully_bound_explicit_intent_as_an_immutable_typed_value() -> None:
+def _assert_rejected(candidate: object, expectation: object) -> None:
+    module = _module()
+    assert _validate(candidate, expectation) is module.NO_SAFE_WORK
+
+
+def _refresh_predecessor_and_assignment(candidate: dict[str, Any]) -> str:
+    assignment = candidate["assignment"]
+    assignment["predecessor"] = _with_binding(
+        assignment["predecessor"],
+        "predecessor_hash",
+    )
+    assignment = _with_binding(assignment, "assignment_binding_hash")
+    candidate["assignment"] = assignment
+    return assignment["predecessor"]["predecessor_hash"]
+
+
+def test_rejects_a_candidate_without_a_host_private_expectation() -> None:
     module = _module()
 
-    accepted = module.validate_host_execution_intent(_intent())
+    assert module.validate_host_execution_intent(_intent()) is module.NO_SAFE_WORK
+
+
+def test_accepts_a_host_bound_explicit_intent_as_an_immutable_typed_value() -> None:
+    module = _module()
+    candidate = _intent()
+
+    accepted = _validate(candidate, _expectation(module, candidate))
 
     assert isinstance(accepted, module.HostExecutionIntent)
     assert accepted.model == "gpt-5.6-terra"
@@ -221,7 +326,9 @@ def test_accepts_a_fully_bound_explicit_intent_as_an_immutable_typed_value() -> 
         ("unexpected_field", lambda intent: intent.__setitem__("extra", "nope")),
         (
             "repository_mismatch",
-            lambda intent: intent["source"].__setitem__("repository", "github.com/other/repo"),
+            lambda intent: intent["source"].__setitem__(
+                "repository", "github.com/other/repo"
+            ),
         ),
         (
             "ref_mismatch",
@@ -237,11 +344,15 @@ def test_accepts_a_fully_bound_explicit_intent_as_an_immutable_typed_value() -> 
         ),
         (
             "assignment_token_mismatch",
-            lambda intent: intent["assignment"].__setitem__("assignment_token", _hash("other-token")),
+            lambda intent: intent["assignment"].__setitem__(
+                "assignment_token", _hash("other-token")
+            ),
         ),
         (
             "quota_evidence_mismatch",
-            lambda intent: intent["quota"].__setitem__("evidence_hash", _hash("other-evidence")),
+            lambda intent: intent["quota"].__setitem__(
+                "evidence_hash", _hash("other-evidence")
+            ),
         ),
         (
             "ledger_epoch_mismatch",
@@ -249,15 +360,21 @@ def test_accepts_a_fully_bound_explicit_intent_as_an_immutable_typed_value() -> 
         ),
         (
             "lease_fencing_mismatch",
-            lambda intent: intent["lease"].__setitem__("fencing_token", _hash("other-fencing")),
+            lambda intent: intent["lease"].__setitem__(
+                "fencing_token", _hash("other-fencing")
+            ),
         ),
         (
             "unregistered_project_identity",
-            lambda intent: intent["source"].__setitem__("registered_project_id", "unknown-project"),
+            lambda intent: intent["source"].__setitem__(
+                "registered_project_id", "unknown-project"
+            ),
         ),
         (
             "inherited_model",
-            lambda intent: intent["route"].__setitem__("inherit_current_session_model", True),
+            lambda intent: intent["route"].__setitem__(
+                "inherit_current_session_model", True
+            ),
         ),
         (
             "implicit_effort",
@@ -269,42 +386,160 @@ def test_rejects_malformed_or_tampered_evidence(
     label: str,
     mutate: Any,
 ) -> None:
-    intent = _intent()
-    mutate(intent)
-    _refresh_root(intent)
+    module = _module()
+    baseline = _intent()
+    candidate = copy.deepcopy(baseline)
+    mutate(candidate)
+    _refresh_root(candidate)
 
-    _assert_rejected(intent)
-
-
-def test_rejects_a_rebound_source_that_no_longer_matches_create_request() -> None:
-    intent = _intent()
-    intent["source"]["repository"] = "github.com/other/repo"
-    intent["source"] = _with_binding(intent["source"], "source_binding_hash")
-    _refresh_root(intent)
-
-    _assert_rejected(intent)
+    _assert_rejected(candidate, _expectation(module, baseline))
 
 
-def test_rejects_a_rebound_predecessor_that_no_longer_matches_quota() -> None:
-    intent = _intent()
-    intent["assignment"]["predecessor"]["quota_decision_hash"] = _hash("other-decision")
-    intent["assignment"]["predecessor"] = _with_binding(
-        intent["assignment"]["predecessor"],
-        "predecessor_hash",
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("repository", "github.com/attacker/other-repo"),
+        ("ref", "refs/heads/attacker"),
+        ("commit", "0" * 40),
+        ("tree", "1" * 40),
+    ],
+)
+def test_rejects_a_fully_rebound_source_mutation_against_host_expectation(
+    field: str,
+    replacement: str,
+) -> None:
+    module = _module()
+    baseline = _intent()
+    candidate = copy.deepcopy(baseline)
+    candidate["source"][field] = replacement
+    candidate["create"][field] = replacement
+    candidate["source"] = _with_binding(candidate["source"], "source_binding_hash")
+    candidate["create"] = _with_binding(candidate["create"], "create_binding_hash")
+    _refresh_root(candidate)
+
+    assert candidate["intent_hash"] != baseline["intent_hash"]
+    _assert_rejected(candidate, _expectation(module, baseline))
+
+
+def test_rejects_a_fully_rebound_assignment_token_mutation_against_host_expectation() -> (
+    None
+):
+    module = _module()
+    baseline = _intent()
+    candidate = copy.deepcopy(baseline)
+    assignment_token = _hash("attacker-assignment-token")
+    candidate["assignment"]["assignment_token"] = assignment_token
+    candidate["assignment"]["predecessor"]["assignment_token"] = assignment_token
+    candidate["packets"]["assignment_token"] = assignment_token
+    candidate["lease"]["assignment_token"] = assignment_token
+    candidate["create"]["assignment_token"] = assignment_token
+    predecessor_hash = _refresh_predecessor_and_assignment(candidate)
+    candidate["lease"]["predecessor_hash"] = predecessor_hash
+    candidate["packets"] = _with_binding(candidate["packets"], "packet_binding_hash")
+    candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
+    candidate["create"] = _with_binding(candidate["create"], "create_binding_hash")
+    _refresh_root(candidate)
+
+    assert candidate["intent_hash"] != baseline["intent_hash"]
+    _assert_rejected(candidate, _expectation(module, baseline))
+
+
+def test_rejects_a_fully_rebound_quota_ledger_mutation_against_host_expectation() -> (
+    None
+):
+    module = _module()
+    baseline = _intent()
+    candidate = copy.deepcopy(baseline)
+    candidate["quota"]["ledger_epoch"] = 12
+    candidate["quota"] = _with_binding(candidate["quota"], "quota_binding_hash")
+    candidate["assignment"]["predecessor"]["ledger_epoch"] = 12
+    predecessor_hash = _refresh_predecessor_and_assignment(candidate)
+    candidate["lease"]["ledger_epoch"] = 12
+    candidate["lease"]["predecessor_hash"] = predecessor_hash
+    candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
+    _refresh_root(candidate)
+
+    assert candidate["intent_hash"] != baseline["intent_hash"]
+    _assert_rejected(candidate, _expectation(module, baseline))
+
+
+def test_rejects_a_fully_rebound_route_and_capability_attack_against_host_expectation() -> (
+    None
+):
+    module = _module()
+    baseline = _intent()
+    candidate = copy.deepcopy(baseline)
+    candidate["route"]["model"] = "gpt-attacker"
+    candidate["capability_facts"][0]["model"] = "gpt-attacker"
+    candidate["route"] = _with_binding(candidate["route"], "route_binding_hash")
+    candidate["capability_facts"][0] = _with_binding(
+        candidate["capability_facts"][0],
+        "capability_binding_hash",
     )
-    intent["assignment"] = _with_binding(intent["assignment"], "assignment_binding_hash")
-    _refresh_root(intent)
+    _refresh_root(candidate)
 
-    _assert_rejected(intent)
+    assert candidate["intent_hash"] != baseline["intent_hash"]
+    _assert_rejected(candidate, _expectation(module, baseline))
 
 
-def test_rejects_a_rebound_lease_that_no_longer_matches_predecessor() -> None:
-    intent = _intent()
-    intent["lease"]["epoch"] = 18
-    intent["lease"] = _with_binding(intent["lease"], "lease_binding_hash")
-    _refresh_root(intent)
+def test_rejects_a_fully_rebound_lease_fence_mutation_against_host_expectation() -> (
+    None
+):
+    module = _module()
+    baseline = _intent()
+    candidate = copy.deepcopy(baseline)
+    fencing_token = _hash("attacker-fencing-token")
+    candidate["lease"]["fencing_token"] = fencing_token
+    candidate["create"]["lease_fencing_token"] = fencing_token
+    candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
+    candidate["create"] = _with_binding(candidate["create"], "create_binding_hash")
+    _refresh_root(candidate)
 
-    _assert_rejected(intent)
+    assert candidate["intent_hash"] != baseline["intent_hash"]
+    _assert_rejected(candidate, _expectation(module, baseline))
+
+
+def test_rejects_zero_lease_epoch_even_when_candidate_and_expectation_match() -> None:
+    module = _module()
+    candidate = _intent()
+    candidate["assignment"]["predecessor"]["lease_epoch"] = 0
+    predecessor_hash = _refresh_predecessor_and_assignment(candidate)
+    candidate["lease"]["epoch"] = 0
+    candidate["lease"]["predecessor_hash"] = predecessor_hash
+    candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
+    _refresh_root(candidate)
+
+    _assert_rejected(candidate, _expectation(module, candidate))
+
+
+@pytest.mark.parametrize(
+    ("trust_state", "verified_at_epoch", "expires_at_epoch"),
+    [
+        ("untrusted", 100, 200),
+        ("host-private-verified-v1", 100, 100),
+        ("host-private-verified-v1", 0, 200),
+    ],
+)
+def test_rejects_untrusted_or_expired_host_expectation(
+    trust_state: str,
+    verified_at_epoch: int,
+    expires_at_epoch: int,
+) -> None:
+    module = _module()
+    candidate = _intent()
+    expectation = _expectation(
+        module,
+        candidate,
+        trust_state=trust_state,
+        verified_at_epoch=verified_at_epoch,
+        expires_at_epoch=expires_at_epoch,
+    )
+
+    _assert_rejected(candidate, expectation)
+
+
+def test_rejects_a_non_expectation_context() -> None:
+    _assert_rejected(_intent(), {"trust_state": "host-private-verified-v1"})
 
 
 @pytest.mark.parametrize(
@@ -314,26 +549,34 @@ def test_rejects_a_rebound_lease_that_no_longer_matches_predecessor() -> None:
         ("gpt-5.6-terra", "ultra"),
     ],
 )
-def test_rejects_external_spark_or_ultra(
+def test_rejects_spark_or_ultra_even_when_host_expectation_matches(
     model: str,
     reasoning_effort: str,
 ) -> None:
-    _assert_rejected(_intent(model=model, reasoning_effort=reasoning_effort))
-
-
-def test_luna_max_requires_an_explicit_attested_capability_fact() -> None:
-    _assert_rejected(
-        _intent(
-            model="gpt-5.6-luna",
-            reasoning_effort="max",
-            capability_state="declared",
-        )
-    )
-
     module = _module()
-    accepted = module.validate_host_execution_intent(
-        _intent(model="gpt-5.6-luna", reasoning_effort="max")
+    candidate = _intent(model=model, reasoning_effort=reasoning_effort)
+
+    _assert_rejected(candidate, _expectation(module, candidate))
+
+
+def test_rejects_non_external_session_even_when_host_expectation_matches() -> None:
+    module = _module()
+    candidate = _intent(session_scope="local")
+
+    _assert_rejected(candidate, _expectation(module, candidate))
+
+
+def test_luna_max_requires_an_explicit_attested_host_capability_fact() -> None:
+    module = _module()
+    rejected = _intent(
+        model="gpt-5.6-luna",
+        reasoning_effort="max",
+        capability_state="declared",
     )
+    _assert_rejected(rejected, _expectation(module, rejected))
+
+    candidate = _intent(model="gpt-5.6-luna", reasoning_effort="max")
+    accepted = _validate(candidate, _expectation(module, candidate))
     assert isinstance(accepted, module.HostExecutionIntent)
     assert accepted.model == "gpt-5.6-luna"
     assert accepted.reasoning_effort == "max"
