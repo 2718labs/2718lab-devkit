@@ -1329,43 +1329,131 @@ def test_host_session_compiler_evidence_fails_closed_without_provider() -> None:
     )
 
 
-def test_host_session_issued_compiler_evidence_consumes_once() -> None:
-    module = _host_session_module()
-    public_facts = {"provider": "facts"}
-    provider_calls: list[str] = []
+def _fresh_quota_session_for_compiler_evidence(
+    module: object,
+    *,
+    provider: object,
+) -> tuple[object, InheritedHandleHostBridge, InheritedHandleHostBridge]:
+    """Return a live session with one independently attested quota snapshot."""
+
+    child, host = _pipe_pair()
+    key = b"q" * 32
+    snapshot = _snapshot(key=key)
     session = module.HostSession(
-        bridge=None,
-        quota_evidence_resolver=lambda *_: None,
-        compiler_evidence_provider=lambda preparation_id: (
-            provider_calls.append(preparation_id) or public_facts
+        bridge=child,
+        quota_evidence_resolver=lambda request_id, received: _attestation(
+            module, request_id, received, key
         ),
+        quota_expectation=_quota_expectation(module, snapshot),
+        compiler_evidence_provider=provider,
         clock=lambda: _NOW,
     )
+    reply = _reply_once(host, snapshot)
+    try:
+        assert isinstance(session.read_quota(), module.HostQuotaFacts)
+    finally:
+        reply.join(timeout=2)
+    return session, child, host
 
-    evidence = session.prepare_compiler_evidence(preparation_id="prep-2")
 
-    assert provider_calls == ["prep-2"]
-    assert evidence is not public_facts
-    assert session.consume_compiler_evidence(evidence) is public_facts
-    assert session.consume_compiler_evidence(evidence) == "NO_SAFE_WORK"
-
-
-def test_host_session_compiler_evidence_rejects_public_facts_and_dict_substitutes(
-) -> None:
+def test_host_session_compiler_evidence_requires_fresh_quota_before_provider() -> None:
     module = _host_session_module()
-    public_facts = {"provider": "facts"}
+    provider_calls: list[str] = []
+    child, host = _pipe_pair()
     session = module.HostSession(
-        bridge=None,
+        bridge=child,
         quota_evidence_resolver=lambda *_: None,
-        compiler_evidence_provider=lambda _: public_facts,
+        compiler_evidence_provider=lambda preparation_id: provider_calls.append(
+            preparation_id
+        )
+        or object(),
         clock=lambda: _NOW,
     )
 
-    evidence = session.prepare_compiler_evidence(preparation_id="prep-3")
+    try:
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-no-quota")
+            == "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
 
-    assert session.consume_compiler_evidence(public_facts) == "NO_SAFE_WORK"
-    assert (
-        session.consume_compiler_evidence({"preparation_id": "prep-3"})
-        == "NO_SAFE_WORK"
+    assert provider_calls == []
+
+
+def test_host_session_compiler_evidence_rejects_untrusted_mutable_material_without_lineage() -> None:
+    module = _host_session_module()
+    raw_secret = "compiler-bearer-never-public"
+    mutable_material = {
+        "index": {"trusted": True, "expires_at": _NOW + 60},
+        "terminal": {"trusted": True},
+        "secret": raw_secret,
+    }
+    provider_calls: list[str] = []
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module,
+        provider=lambda preparation_id: provider_calls.append(preparation_id)
+        or mutable_material,
     )
-    assert session.consume_compiler_evidence(evidence) is public_facts
+
+    try:
+        result = session.prepare_compiler_evidence(preparation_id="prep-no-lineage")
+        mutable_material["secret"] = "mutated-after-provider-return"
+    finally:
+        child.close()
+        host.close()
+
+    assert result == "NO_SAFE_WORK"
+    assert provider_calls == ["prep-no-lineage"]
+    assert raw_secret not in repr(result)
+
+
+def test_host_session_compiler_evidence_burns_preparation_after_provider_failure() -> None:
+    module = _host_session_module()
+    provider_calls: list[str] = []
+
+    def provider(preparation_id: str) -> object:
+        provider_calls.append(preparation_id)
+        if len(provider_calls) == 1:
+            raise RuntimeError("provider internal failure")
+        return object()
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-burned")
+            == "NO_SAFE_WORK"
+        )
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-burned")
+            == "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
+
+    assert provider_calls == ["prep-burned"]
+
+
+def test_host_session_compiler_evidence_freeze_clears_and_denies_preparation() -> None:
+    module = _host_session_module()
+    provider_calls: list[str] = []
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module,
+        provider=lambda preparation_id: provider_calls.append(preparation_id)
+        or object(),
+    )
+    try:
+        session._freeze()
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-frozen")
+            == "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
+
+    assert provider_calls == []
