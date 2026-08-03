@@ -57,6 +57,20 @@ def test_codeql_runs_for_python_on_pull_requests_and_main() -> None:
     assert "@v4" not in workflow
 
 
+def test_checkout_is_pinned_to_the_node24_v5_release_everywhere() -> None:
+    checkout_ref = "actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8"
+    for relative_path in (
+        ".github/workflows/ci.yml",
+        ".github/workflows/codeql.yml",
+        ".github/workflows/release.yml",
+    ):
+        workflow = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert checkout_ref in workflow, relative_path
+        assert (
+            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" not in workflow
+        )
+
+
 def test_dependency_review_checks_pull_request_dependency_changes() -> None:
     workflow = (ROOT / ".github" / "workflows" / "dependency-review.yml").read_text(
         encoding="utf-8"

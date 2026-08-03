@@ -29,7 +29,7 @@ def test_release_workflow_requires_a_main_dispatch_before_it_creates_a_tag() -> 
         "mcp-tools/tests/test_primary_artifact.py",
         "mcp-tools/devkit_fastlane",
         "uv==0.11.28",
-        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+        "actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8",
         "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "${ARTIFACT}.sha256",
