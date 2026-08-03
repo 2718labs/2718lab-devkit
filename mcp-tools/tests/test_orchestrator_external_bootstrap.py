@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -392,6 +394,309 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         ).fetchone()["payload_json"]
         for field in required_hashes:
             self.assertIn(field, payload)
+
+    def test_descriptor_payload_or_hash_mismatch_rejects_read_and_consumption(
+        self,
+    ) -> None:
+        descriptor, batch, grant = self._records(batch_label="corrupt-descriptor")
+        self.store.admit_external_bootstrap(descriptor, batch, grant)
+        self.store._connection.execute(
+            """
+            UPDATE external_bootstrap_descriptors
+            SET payload_json = ?, payload_hash = ?
+            WHERE descriptor_hash = ?
+            """,
+            ("{}", "sha256:" + "f" * 64, descriptor.descriptor_hash),
+        )
+
+        with self.assertRaises(ExternalDispatchGrantError):
+            self.store.get_external_dispatch_grant(grant.grant_id)
+        with self.assertRaises(ExternalDispatchGrantError):
+            self.store.consume_external_dispatch_grant(
+                grant.grant_id,
+                descriptor_hash=descriptor.descriptor_hash,
+                batch_hash=batch.batch_hash,
+                assignment_hash=grant.assignment_hash,
+                now="2026-08-03T00:00:00+00:00",
+            )
+        self.assertIsNone(
+            self.store._connection.execute(
+                "SELECT consumed_at FROM external_dispatch_grants WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()["consumed_at"]
+        )
+
+    def test_batch_payload_or_hash_mismatch_rejects_read_and_consumption(self) -> None:
+        descriptor, batch, grant = self._records(batch_label="corrupt-batch")
+        self.store.admit_external_bootstrap(descriptor, batch, grant)
+        self.store._connection.execute(
+            """
+            UPDATE external_bootstrap_batches
+            SET payload_json = ?, payload_hash = ?
+            WHERE batch_hash = ?
+            """,
+            ("{}", "sha256:" + "e" * 64, batch.batch_hash),
+        )
+
+        with self.assertRaises(ExternalDispatchGrantError):
+            self.store.get_external_dispatch_grant(grant.grant_id)
+        with self.assertRaises(ExternalDispatchGrantError):
+            self.store.consume_external_dispatch_grant(
+                grant.grant_id,
+                descriptor_hash=descriptor.descriptor_hash,
+                batch_hash=batch.batch_hash,
+                assignment_hash=grant.assignment_hash,
+                now="2026-08-03T00:00:00+00:00",
+            )
+        self.assertIsNone(
+            self.store._connection.execute(
+                "SELECT consumed_at FROM external_dispatch_grants WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()["consumed_at"]
+        )
+
+    def test_v8_expiry_column_payload_hash_mismatch_fails_open_without_rewrite(
+        self,
+    ) -> None:
+        descriptor, batch, grant = self._records(
+            batch_label="v8-raw-expiry",
+            expires_at="2026-08-03T08:00:00+08:00",
+            grant_id="v8-raw-expiry-grant",
+        )
+        self.store.admit_external_bootstrap(descriptor, batch, grant)
+        self.store.close()
+
+        raw_expiry = "2026-08-03T08:00:00+08:00"
+        connection = sqlite3.connect(self.database)
+        try:
+            payload_json, payload_hash = connection.execute(
+                """
+                SELECT payload_json, payload_hash FROM external_bootstrap_batches
+                WHERE batch_hash = ?
+                """,
+                (batch.batch_hash,),
+            ).fetchone()
+            payload = json.loads(payload_json)
+            payload["expires_at"] = raw_expiry
+            raw_payload_json = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            connection.execute("DROP TABLE external_dispatch_grant_bindings")
+            connection.execute(
+                "UPDATE schema_metadata SET value = '8' WHERE key = 'schema_version'"
+            )
+            connection.execute(
+                """
+                UPDATE external_bootstrap_batches
+                SET expires_at = ?, payload_json = ?
+                WHERE batch_hash = ?
+                """,
+                (raw_expiry, raw_payload_json, batch.batch_hash),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened: SQLiteStore | None = None
+        try:
+            with self.assertRaises(ExternalBootstrapConflictError):
+                reopened = SQLiteStore(self.database)
+        finally:
+            if reopened is not None:
+                reopened.close()
+
+        connection = sqlite3.connect(self.database)
+        try:
+            persisted_expiry, persisted_payload, persisted_hash, schema_version = (
+                connection.execute(
+                    """
+                    SELECT batch.expires_at, batch.payload_json, batch.payload_hash,
+                           schema.value
+                    FROM external_bootstrap_batches AS batch
+                    JOIN schema_metadata AS schema ON schema.key = 'schema_version'
+                    WHERE batch.batch_hash = ?
+                    """,
+                    (batch.batch_hash,),
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+        self.assertEqual(raw_expiry, persisted_expiry)
+        self.assertEqual(raw_payload_json, persisted_payload)
+        self.assertEqual(payload_hash, persisted_hash)
+        self.assertEqual("8", schema_version)
+
+    def test_valid_v8_offset_expiry_migrates_to_canonical_binding(self) -> None:
+        descriptor, batch, grant = self._records(
+            batch_label="v8-valid-expiry",
+            expires_at="2026-08-03T08:00:00+08:00",
+            grant_id="v8-valid-expiry-grant",
+        )
+        self.store.admit_external_bootstrap(descriptor, batch, grant)
+        self.store.close()
+
+        raw_expiry = "2026-08-03T08:00:00+08:00"
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute("DROP TABLE external_dispatch_grant_bindings")
+            connection.execute(
+                "UPDATE schema_metadata SET value = '8' WHERE key = 'schema_version'"
+            )
+            for table, identity_column, identity in (
+                ("external_bootstrap_batches", "batch_hash", batch.batch_hash),
+                ("external_dispatch_grants", "grant_id", grant.grant_id),
+            ):
+                payload_json = connection.execute(
+                    f"SELECT payload_json FROM {table} WHERE {identity_column} = ?",
+                    (identity,),
+                ).fetchone()[0]
+                payload = json.loads(payload_json)
+                payload["expires_at"] = raw_expiry
+                raw_payload_json = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                )
+                raw_payload_hash = "sha256:" + hashlib.sha256(
+                    raw_payload_json.encode("utf-8")
+                ).hexdigest()
+                connection.execute(
+                    f"""
+                    UPDATE {table}
+                    SET expires_at = ?, payload_json = ?, payload_hash = ?
+                    WHERE {identity_column} = ?
+                    """,
+                    (raw_expiry, raw_payload_json, raw_payload_hash, identity),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened = SQLiteStore(self.database)
+        try:
+            migrated = reopened.get_external_dispatch_grant(grant.grant_id)
+            self.assertIsNotNone(migrated)
+            assert migrated is not None
+            self.assertEqual("2026-08-03T00:00:00+00:00", migrated.expires_at)
+            with self.assertRaises(ExternalDispatchGrantError):
+                reopened.consume_external_dispatch_grant(
+                    grant.grant_id,
+                    descriptor_hash=descriptor.descriptor_hash,
+                    batch_hash=batch.batch_hash,
+                    assignment_hash=grant.assignment_hash,
+                    now="2026-08-03T00:00:01+00:00",
+                )
+        finally:
+            reopened.close()
+
+    def test_authentic_c53_v8_item_is_retained_but_fails_closed_without_v9_hashes(
+        self,
+    ) -> None:
+        descriptor, batch, grant = self._records(
+            batch_label="c53-v8-item",
+            expires_at="2026-08-03T08:00:00+08:00",
+            grant_id="c53-v8-grant",
+        )
+        self.store.admit_external_bootstrap(descriptor, batch, grant)
+        self.store.close()
+
+        raw_expiry = "2026-08-03T08:00:00+08:00"
+        missing_v9_hashes = {
+            "index_hash",
+            "workflow_hash",
+            "task_hash",
+            "lease_hash",
+        }
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute("DROP TABLE external_dispatch_grant_bindings")
+            connection.execute(
+                "UPDATE schema_metadata SET value = '8' WHERE key = 'schema_version'"
+            )
+            item_payload_json = connection.execute(
+                """
+                SELECT payload_json FROM external_bootstrap_batch_items
+                WHERE batch_hash = ? AND item_index = 0
+                """,
+                (batch.batch_hash,),
+            ).fetchone()[0]
+            item_payload = json.loads(item_payload_json)
+            for field in missing_v9_hashes:
+                item_payload.pop(field)
+            legacy_item_json = json.dumps(
+                item_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            legacy_item_hash = "sha256:" + hashlib.sha256(
+                legacy_item_json.encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                """
+                UPDATE external_bootstrap_batch_items
+                SET payload_json = ?, payload_hash = ?
+                WHERE batch_hash = ? AND item_index = 0
+                """,
+                (legacy_item_json, legacy_item_hash, batch.batch_hash),
+            )
+            for table, identity_column, identity in (
+                ("external_bootstrap_batches", "batch_hash", batch.batch_hash),
+                ("external_dispatch_grants", "grant_id", grant.grant_id),
+            ):
+                payload_json = connection.execute(
+                    f"SELECT payload_json FROM {table} WHERE {identity_column} = ?",
+                    (identity,),
+                ).fetchone()[0]
+                payload = json.loads(payload_json)
+                payload["expires_at"] = raw_expiry
+                if table == "external_bootstrap_batches":
+                    for field in missing_v9_hashes:
+                        payload["items"][0].pop(field)
+                legacy_payload_json = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                )
+                legacy_payload_hash = "sha256:" + hashlib.sha256(
+                    legacy_payload_json.encode("utf-8")
+                ).hexdigest()
+                connection.execute(
+                    f"""
+                    UPDATE {table}
+                    SET expires_at = ?, payload_json = ?, payload_hash = ?
+                    WHERE {identity_column} = ?
+                    """,
+                    (raw_expiry, legacy_payload_json, legacy_payload_hash, identity),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened = SQLiteStore(self.database)
+        try:
+            self.assertEqual(9, reopened.schema_version())
+            persisted_item_json = reopened._connection.execute(
+                """
+                SELECT payload_json FROM external_bootstrap_batch_items
+                WHERE batch_hash = ? AND item_index = 0
+                """,
+                (batch.batch_hash,),
+            ).fetchone()["payload_json"]
+            self.assertTrue(
+                missing_v9_hashes.isdisjoint(json.loads(persisted_item_json))
+            )
+            with self.assertRaises(ExternalDispatchGrantError):
+                reopened.get_external_dispatch_grant(grant.grant_id)
+            with self.assertRaises(ExternalDispatchGrantError):
+                reopened.consume_external_dispatch_grant(
+                    grant.grant_id,
+                    descriptor_hash=descriptor.descriptor_hash,
+                    batch_hash=batch.batch_hash,
+                    assignment_hash=grant.assignment_hash,
+                    now="2026-08-03T00:00:00+00:00",
+                )
+            self.assertIsNone(
+                reopened._connection.execute(
+                    "SELECT consumed_at FROM external_dispatch_grants WHERE grant_id = ?",
+                    (grant.grant_id,),
+                ).fetchone()["consumed_at"]
+            )
+        finally:
+            reopened.close()
 
     def test_concurrent_consumers_admit_exactly_one_winner(self) -> None:
         descriptor, batch, grant = self._records()

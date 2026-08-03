@@ -351,7 +351,12 @@ class SQLiteStore:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        try:
+            self._create_schema()
+        except BaseException:
+            self._connection.close()
+            self._connection = None  # type: ignore[assignment]
+            raise
 
     def close(self) -> None:
         """Close the underlying database connection."""
@@ -4867,6 +4872,119 @@ class SQLiteStore:
                 "external bootstrap batch item binding is corrupt"
             ) from error
 
+    @classmethod
+    def _external_descriptor_from_row(
+        cls, row: sqlite3.Row
+    ) -> ExternalSourceDescriptor:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                raise ValueError("descriptor payload must be an object")
+            descriptor = ExternalSourceDescriptor(
+                descriptor_hash=str(payload["descriptor_hash"]),
+                source_hash=str(payload["source_hash"]),
+                repository_hash=str(payload["repository_hash"]),
+                common_dir_hash=str(payload["common_dir_hash"]),
+                project_hash=str(payload["project_hash"]),
+                task_root_hash=str(payload["task_root_hash"]),
+                ref_hash=str(payload["ref_hash"]),
+                commit_hash=str(payload["commit_hash"]),
+                tree_hash=str(payload["tree_hash"]),
+            )
+            canonical_payload = _canonical_payload_json(
+                cls._external_descriptor_payload(descriptor)
+            )
+            if (
+                str(row["descriptor_hash"]) != descriptor.descriptor_hash
+                or str(row["payload_json"]) != canonical_payload
+                or str(row["payload_hash"]) != _payload_hash(canonical_payload)
+            ):
+                raise ValueError("descriptor payload binding differs from its row")
+            for label, value in cls._external_descriptor_payload(descriptor).items():
+                if cls._SHA256_IDENTIFIER_PATTERN.fullmatch(str(value)) is None:
+                    raise ValueError(f"{label} is not a sha256 identifier")
+            return descriptor
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ExternalDispatchGrantError(
+                "external source descriptor binding is corrupt"
+            ) from error
+
+    @classmethod
+    def _external_batch_from_row(
+        cls,
+        row: sqlite3.Row,
+        items: tuple[ExternalBootstrapBatchItem, ...],
+    ) -> ExternalBootstrapBatch:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                raise ValueError("batch payload must be an object")
+            batch = ExternalBootstrapBatch(
+                batch_hash=str(payload["batch_hash"]),
+                descriptor_hash=str(payload["descriptor_hash"]),
+                idempotency_key=str(payload["idempotency_key"]),
+                items=items,
+                expires_at=str(payload["expires_at"]),
+                state=ExternalBootstrapState(str(payload["state"])),
+                availability=str(payload["availability"]),
+            )
+            canonical_payload = _canonical_payload_json(
+                cls._external_batch_payload(batch)
+            )
+            if (
+                str(row["batch_hash"]) != batch.batch_hash
+                or str(row["descriptor_hash"]) != batch.descriptor_hash
+                or str(row["idempotency_key"]) != batch.idempotency_key
+                or str(row["expires_at"]) != batch.expires_at
+                or str(row["state"]) != batch.state.value
+                or str(row["availability"]) != batch.availability
+                or str(row["payload_json"]) != canonical_payload
+                or str(row["payload_hash"]) != _payload_hash(canonical_payload)
+                or batch.expires_at != _utc_timestamp(batch.expires_at)
+                or batch.state is not ExternalBootstrapState.PENDING
+                or batch.availability != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+                or not items
+                or len(items) > cls._MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS
+                or tuple(item.item_index for item in items) != tuple(range(len(items)))
+                or len({item.assignment_hash for item in items}) != len(items)
+            ):
+                raise ValueError("batch payload binding differs from its row")
+            if (
+                cls._SHA256_IDENTIFIER_PATTERN.fullmatch(batch.batch_hash) is None
+                or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(batch.descriptor_hash)
+                is None
+                or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
+                    batch.idempotency_key
+                )
+                is None
+            ):
+                raise ValueError("batch identifiers are outside the bounded schema")
+            for item in items:
+                cls._validate_external_batch_item_from_read(item)
+            return batch
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ExternalDispatchGrantError(
+                "external bootstrap batch binding is corrupt"
+            ) from error
+
+    @classmethod
+    def _validate_external_batch_item_from_read(
+        cls, item: ExternalBootstrapBatchItem
+    ) -> None:
+        if (
+            isinstance(item.lease_epoch, bool)
+            or item.lease_epoch < 0
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(item.workflow_id)
+            is None
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(item.task_id) is None
+        ):
+            raise ValueError("batch item identifiers are outside the bounded schema")
+        for label, value in cls._external_batch_item_payload(item).items():
+            if str(label).endswith("_hash") and (
+                cls._SHA256_IDENTIFIER_PATTERN.fullmatch(str(value)) is None
+            ):
+                raise ValueError(f"{label} is not a sha256 identifier")
+
     def _validate_external_grant_binding_at_read(
         self, row: sqlite3.Row, *, cursor: sqlite3.Cursor | None = None
     ) -> None:
@@ -4894,31 +5012,40 @@ class SQLiteStore:
                 )
             ):
                 raise ValueError("grant composite binding is absent or mismatched")
-            batch = executor.execute(
-                """
-                SELECT descriptor_hash, expires_at, state, availability
-                FROM external_bootstrap_batches WHERE batch_hash = ?
-                """,
+            descriptor_row = executor.execute(
+                "SELECT * FROM external_bootstrap_descriptors WHERE descriptor_hash = ?",
+                (grant.descriptor_hash,),
+            ).fetchone()
+            if descriptor_row is None:
+                raise ValueError("grant does not bind a descriptor")
+            descriptor = self._external_descriptor_from_row(descriptor_row)
+            batch_row = executor.execute(
+                "SELECT * FROM external_bootstrap_batches WHERE batch_hash = ?",
                 (grant.batch_hash,),
             ).fetchone()
-            if (
-                batch is None
-                or str(batch["descriptor_hash"]) != grant.descriptor_hash
-                or str(batch["expires_at"]) != canonical_expiry
-                or str(batch["state"]) != ExternalBootstrapState.PENDING.value
-                or str(batch["availability"]) != self._EXTERNAL_BOOTSTRAP_AVAILABILITY
-            ):
-                raise ValueError("grant does not bind the canonical batch")
-            item_row = executor.execute(
+            item_rows = executor.execute(
                 """
                 SELECT * FROM external_bootstrap_batch_items
-                WHERE batch_hash = ? AND assignment_hash = ?
+                WHERE batch_hash = ? ORDER BY item_index
                 """,
-                (grant.batch_hash, grant.assignment_hash),
-            ).fetchone()
-            if item_row is None:
+                (grant.batch_hash,),
+            ).fetchall()
+            if batch_row is None:
+                raise ValueError("grant does not bind a batch")
+            batch = self._external_batch_from_row(
+                batch_row,
+                tuple(self._external_batch_item_from_row(item_row) for item_row in item_rows),
+            )
+            if (
+                descriptor.descriptor_hash != grant.descriptor_hash
+                or batch.descriptor_hash != descriptor.descriptor_hash
+                or batch.expires_at != canonical_expiry
+            ):
+                raise ValueError("grant does not bind the canonical batch")
+            if not any(
+                item.assignment_hash == grant.assignment_hash for item in batch.items
+            ):
                 raise ValueError("grant does not bind a batch assignment")
-            self._external_batch_item_from_row(item_row)
         except (KeyError, TypeError, ValueError, ExternalDispatchGrantError) as error:
             if isinstance(error, ExternalDispatchGrantError):
                 raise
@@ -5033,14 +5160,25 @@ class SQLiteStore:
             ("external_dispatch_grants", "grant_id"),
         ):
             rows = cursor.execute(
-                f"SELECT {identity_column}, payload_json FROM {table}"
+                f"SELECT {identity_column}, expires_at, payload_json, payload_hash FROM {table}"
             ).fetchall()
             for row in rows:
                 try:
                     payload = json.loads(str(row["payload_json"]))
                     if not isinstance(payload, dict):
                         raise ValueError("payload must be an object")
-                    payload["expires_at"] = _utc_timestamp(str(payload["expires_at"]))
+                    raw_expiry = payload["expires_at"]
+                    if not isinstance(raw_expiry, str):
+                        raise ValueError("expiry must be a string")
+                    raw_payload_json = _canonical_payload_json(payload)
+                    if (
+                        str(row["expires_at"]) != raw_expiry
+                        or str(row["payload_json"]) != raw_payload_json
+                        or str(row["payload_hash"])
+                        != _payload_hash(raw_payload_json)
+                    ):
+                        raise ValueError("raw expiry column, payload, and hash disagree")
+                    payload["expires_at"] = _utc_timestamp(raw_expiry)
                     canonical_payload = _canonical_payload_json(payload)
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                     raise ExternalBootstrapConflictError(
