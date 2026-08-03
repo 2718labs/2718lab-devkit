@@ -6,6 +6,31 @@ The project follows Keep a Changelog conventions. GitHub Releases for tagged
 versions are published by the repository release workflow after the CI and
 artifact checks pass.
 
+## [1.0.0-rc3] - 2026-08-03
+
+### Added
+
+- Added bounded Spark/Luna/main-pool routing, index-evidence bindings, private
+  Host-session envelopes, and durable external-bootstrap descriptors.
+
+### Changed
+
+- Bound opaque compiler evidence to session and quota validity; external
+  bootstrap persistence now uses schema v10 content commitments and composite
+  bindings.
+
+### Fixed
+
+- Removed reachable compiler marker material and reject forged, expired, or
+  unattested Host intent. The primary artifact now ships every versioned Fast
+  Lane policy asset required at runtime.
+
+### Security
+
+- Host execution remains a fail-closed preview: without a Desktop Host-private
+  verifier, no external session, worktree, or automatic cross-session dispatch
+  is authorized.
+
 ## [1.0.0-rc2] - 2026-08-03
 
 ### Added

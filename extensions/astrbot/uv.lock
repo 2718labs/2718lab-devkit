@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "2718lab-devkit-astrbot"
-version = "1.0.0rc2"
+version = "1.0.0rc3"
 source = { editable = "." }
 
 [package.dev-dependencies]

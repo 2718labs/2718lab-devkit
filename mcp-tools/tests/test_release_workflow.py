@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_release_workflow_builds_and_retains_rc2_prerelease_package() -> None:
+def test_release_workflow_builds_and_retains_rc3_prerelease_package() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )

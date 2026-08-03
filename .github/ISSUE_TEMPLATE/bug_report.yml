@@ -28,7 +28,7 @@ body:
     id: version
     attributes:
       label: DevKit version
-      placeholder: "v1.0.0-rc2"
+      placeholder: "v1.0.0-rc3"
     validations:
       required: true
 

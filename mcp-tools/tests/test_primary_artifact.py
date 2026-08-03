@@ -35,7 +35,9 @@ EXPECTED_FILES = (
     "mcp-tools/devkit_fastlane/__init__.py",
     "mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md",
     "mcp-tools/devkit_fastlane/assets/fastlane-quota-balance-policy-v1.json",
+    "mcp-tools/devkit_fastlane/assets/fastlane-quota-balance-policy-v2.json",
     "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v3.json",
+    "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v4.json",
     "mcp-tools/devkit_fastlane/references/efficiency-automation.md",
     "mcp-tools/devkit_fastlane/references/grounding-discipline.md",
     "mcp-tools/devkit_fastlane/references/orchestration-runtime.md",
@@ -204,7 +206,7 @@ def test_primary_mcp_config_exports_only_locked_bridge_and_context_variables() -
         assert forbidden not in serialized
 
 
-def test_python_project_and_lock_use_pep440_rc2_metadata() -> None:
+def test_python_project_and_lock_use_pep440_rc3_metadata() -> None:
     project_path = ROOT / "mcp-tools" / "pyproject.toml"
     lock_path = ROOT / "mcp-tools" / "uv.lock"
     assert project_path.is_file(), "missing independently runnable MCP project"
@@ -212,14 +214,14 @@ def test_python_project_and_lock_use_pep440_rc2_metadata() -> None:
 
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == "1.0.0rc2"
+    assert project["project"]["version"] == "1.0.0rc3"
     assert project["project"]["dependencies"] == ["mcp[cli]>=1,<2"]
     assert "devkit_atlas" in project["tool"]["pyright"]["include"]
     assert "devkit_runtime" in project["tool"]["pyright"]["include"]
     assert "code_atlas" not in project["tool"]["pyright"]["include"]
     lock_text = lock_path.read_text(encoding="utf-8")
     assert 'name = "2718lab-devkit-mcp"' in lock_text
-    assert 'version = "1.0.0rc2"' in lock_text
+    assert 'version = "1.0.0rc3"' in lock_text
 
 
 def test_two_builds_are_byte_identical_with_normalized_zip_metadata(

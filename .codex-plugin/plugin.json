@@ -1,6 +1,6 @@
 {
   "name": "2718lab-devkit",
-  "version": "1.0.0-rc2",
+  "version": "1.0.0-rc3",
   "description": "Local MCP server for developer workflow coordination, indexing, and evidence handling.",
   "author": {
     "name": "2718lab",
