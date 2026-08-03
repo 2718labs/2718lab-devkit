@@ -17,12 +17,3 @@ updates:
       mcp-python-dependencies:
         patterns:
           - "*"
-
-  - package-ecosystem: "pip"
-    directory: "/extensions/astrbot"
-    schedule:
-      interval: "weekly"
-    groups:
-      astrbot-extension-dependencies:
-        patterns:
-          - "*"

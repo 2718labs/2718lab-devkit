@@ -1,0 +1,14 @@
+# Repository-owned Gemini Code Assist review policy. Authentication remains in
+# the Google/GitHub app connection; this file intentionally contains no token.
+have_fun: false
+memory_config:
+  disabled: false
+code_review:
+  disable: false
+  comment_severity_threshold: MEDIUM
+  max_review_comments: 12
+  pull_request_opened:
+    help: false
+    summary: true
+    code_review: true
+    include_drafts: false

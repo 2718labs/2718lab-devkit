@@ -85,9 +85,9 @@ flowchart TD
 
 本地插件包含可选的、仅供查阅的 Codex 说明书 bundle：一个短总览
 （`skills/devkit-overview`）、一个工作流设计说明书
-（`skills/workflow-design`，默认 Fast Lane 策略）和七份独立模块说明书。按需加载：
+（`skills/workflow-design`，默认 Fast Lane 策略）和六份独立模块说明书。按需加载：
 
-`fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
+`fast-lane-routing` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`。
 
 Skills 是说明书，不是 MCP 工具或可执行的 prompt surface。它们不含 slash command、
@@ -103,6 +103,8 @@ agent profile、脚手架模板、校验器或调度代码，并且刻意不进�
 - [工作包与任务卡规则](mcp-tools/devkit_fastlane/references/work-packages.md)
 - [编排运行时契约](mcp-tools/devkit_fastlane/references/orchestration-runtime.md)
 - [团队与 lane 模式](mcp-tools/devkit_fastlane/references/team-patterns.md)
+- [仓库自动化与审查](docs/governance/repository-automation.md)
+- [参与贡献](CONTRIBUTING.md) · [安全报告](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md)
 - [历史设计记录](docs/superpowers/README.md)：仅供追溯，可能提及已退出的组件，
   不是当前实现契约。
 - [发布历史](CHANGELOG.md)
@@ -290,8 +292,8 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 本仓库代表版本化的 v1.0.0-rc4 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
-和锁定依赖为准。由 tag 触发的发布工作流只会在声明的 gates 通过后发布匹配的
-GitHub Release。
+和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
+后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。
 
 ## 许可证
 

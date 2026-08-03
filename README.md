@@ -95,10 +95,10 @@ flowchart TD
 
 The local plugin includes an optional, documentation-only Codex manual bundle:
 one short navigator (`skills/devkit-overview`), one workflow-design manual
-(`skills/workflow-design`, default Fast Lane policy), and seven separate
+(`skills/workflow-design`, default Fast Lane policy), and six separate
 module manuals. A task loads only the manual it needs:
 
-`fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
+`fast-lane-routing` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`.
 
 These skills are reference manuals, not MCP tools or executable prompt surfaces.
@@ -116,6 +116,8 @@ re-reading the whole repository:
 - [Work-package and task-card rules](mcp-tools/devkit_fastlane/references/work-packages.md)
 - [Orchestration runtime contract](mcp-tools/devkit_fastlane/references/orchestration-runtime.md)
 - [Team and lane patterns](mcp-tools/devkit_fastlane/references/team-patterns.md)
+- [Repository automation and review](docs/governance/repository-automation.md)
+- [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) · [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Historical design records](docs/superpowers/README.md) — context only; they can mention
   retired components and are not the current implementation contract.
 - [Release history](CHANGELOG.md)
@@ -334,9 +336,9 @@ freeze a transient regression count.
 
 This repository represents the versioned v1.0.0-rc4 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
-artifact allowlist, and locked dependency set. The tag-triggered release
-workflow publishes the matching GitHub Release only after the declared gates
-pass.
+artifact allowlist, and locked dependency set. A maintainer dispatches Release
+from current `main`; it validates all declared gates, creates the annotated tag,
+and publishes the matching GitHub Release. Pushing a tag alone does not publish.
 
 ## License
 

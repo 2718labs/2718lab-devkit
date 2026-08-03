@@ -1,0 +1,3 @@
+# One accountable maintainer owns every active path. Enforce this file through
+# the repository ruleset rather than treating it as a substitute for reviews.
+* @Ayleovelle

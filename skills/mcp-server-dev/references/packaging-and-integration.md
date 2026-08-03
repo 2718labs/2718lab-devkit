@@ -96,4 +96,3 @@ Codex 插件只通过插件根目录的 `.mcp.json` 声明 MCP server，不执�
 
 - 通用 Python 工程(测试、typing、异步、项目布局)→ `python-engineering`。
 - GitHub 发布、CI、版本流程 → `oss-repo-ops`。
-- 给 AstrBot 写插件(哪怕插件内部调用 MCP client)→ `astrbot-plugin-dev`,本文件不管这块。
