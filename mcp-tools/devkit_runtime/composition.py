@@ -24,6 +24,7 @@ class RuntimeAvailability:
 
     capability_broker: bool
     integration_attestor: bool
+    host_session: bool
 
 
 class RuntimeRoot:
@@ -37,6 +38,7 @@ class RuntimeRoot:
         adapter_factories: RuntimeAdapterFactories | None = None,
         capability_broker: object | None = None,
         integration_attestor: object | None = None,
+        host_session: object | None = None,
     ) -> None:
         self._config = config
         self._uow_factory = uow_factory
@@ -44,6 +46,7 @@ class RuntimeRoot:
         self._tool_results = ToolResultAdapter()
         self._capability_broker = capability_broker
         self._integration_attestor = integration_attestor
+        self._host_session = host_session
         self._process_id = os.getpid()
         self._closed = False
 
@@ -55,10 +58,12 @@ class RuntimeRoot:
             return RuntimeAvailability(
                 capability_broker=False,
                 integration_attestor=False,
+                host_session=False,
             )
         return RuntimeAvailability(
             capability_broker=_provider_is_available(self._capability_broker),
             integration_attestor=_provider_is_available(self._integration_attestor),
+            host_session=_provider_is_available(self._host_session),
         )
 
     def open_uow(self, *, read_only: bool) -> RuntimeUnitOfWork:
@@ -90,7 +95,11 @@ class RuntimeRoot:
         self._closed = True
         closed_ids: set[int] = set()
         first_error: Exception | None = None
-        for provider in (self._capability_broker, self._integration_attestor):
+        for provider in (
+            self._capability_broker,
+            self._integration_attestor,
+            self._host_session,
+        ):
             if provider is None or id(provider) in closed_ids:
                 continue
             closed_ids.add(id(provider))

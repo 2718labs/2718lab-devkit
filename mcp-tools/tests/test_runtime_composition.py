@@ -401,6 +401,41 @@ def test_runtime_root_reports_absent_optional_providers(tmp_path: Path) -> None:
     assert root.availability.integration_attestor is False
 
 
+def test_runtime_root_keeps_private_host_session_lifecycle_outside_uow(
+    tmp_path: Path,
+) -> None:
+    class HostSession:
+        is_available = True
+
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "data"),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+    session = HostSession()
+    root = RuntimeRoot(
+        config,
+        uow_factory=lambda **_: object(),
+        host_session=session,
+    )
+
+    assert root.availability.host_session is True
+    assert root.open_uow(read_only=True) is not session
+    root.shutdown()
+    root.shutdown()
+
+    assert session.closed == 1
+
+
 def test_runtime_root_shutdown_closes_every_provider_before_reraising(
     tmp_path: Path,
 ) -> None:

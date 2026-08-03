@@ -263,6 +263,7 @@ class QuotaSnapshotEvidence:
     snapshot: Mapping[str, Any]
     key_id: str
     _key: bytes
+    account_id_hash: str
     plan_type: str
     main_limit_id: str
     spark_limit_id: str
@@ -283,10 +284,13 @@ class CodexQuotaProvider:
         executable: str | None = None,
         timeout_seconds: float = 8.0,
         state_path: Path | None = None,
+        memory_only: bool = False,
         now: Callable[[], float] | None = None,
     ) -> None:
         if command is not None and executable is not None:
             raise CodexQuotaError("command and executable are mutually exclusive")
+        if type(memory_only) is not bool:
+            raise CodexQuotaError("memory-only mode is invalid")
         if command is None:
             if executable is not None:
                 command = [executable, "app-server", "--stdio"]
@@ -294,7 +298,8 @@ class CodexQuotaProvider:
                 command = _default_command()
         self._command = list(command)
         self._timeout_seconds = timeout_seconds
-        self._state_path = _validate_state_path(state_path)
+        self._memory_only = memory_only
+        self._state_path = None if memory_only else _validate_state_path(state_path)
         self._now = now or time.time
 
     def _read_cache(self) -> Mapping[str, Any] | None:
@@ -414,6 +419,10 @@ class CodexQuotaProvider:
             account = account_details
         if account.get("type") != "chatgpt":
             raise CodexQuotaError("Codex account is not ChatGPT-managed")
+        account_id = account.get("id")
+        if not isinstance(account_id, str) or not account_id:
+            raise CodexQuotaError("Codex account identity is unavailable")
+        account_id_hash = _hash({"account_id": account_id})
         plan_type = account.get("planType")
         if not isinstance(plan_type, str) or not plan_type:
             raise CodexQuotaError("Codex account plan is unavailable")
@@ -506,6 +515,7 @@ class CodexQuotaProvider:
             snapshot=snapshot,
             key_id=key_id,
             _key=key,
+            account_id_hash=account_id_hash,
             plan_type=plan_type,
             main_limit_id=main_limit_id,
             spark_limit_id=spark_limit_id,
