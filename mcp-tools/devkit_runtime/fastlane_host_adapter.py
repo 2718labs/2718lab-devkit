@@ -18,7 +18,6 @@ from typing import Final
 from .host_session import HostCapabilityFact, HostQuotaFacts, HostSession
 
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
-_CONSTRUCTION_CAPABILITY: Final = object()
 _HASH: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _LABEL: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _TRANSFER_ROLES: Final = {
@@ -31,35 +30,12 @@ _SCHEDULER_ROLES: Final = frozenset(
 )
 
 
-class VerifiedHostFacts:
-    """Internal marker that is deliberately never issued by this revision.
-
-    The module-global marker is not a HostSession-owned proof.  A future
-    positive seam must instead consume a HostSession private identity-ledger
-    capability; this class does not claim to provide one.
-    """
-
-    __slots__ = ("_capability",)
-
-    def __init__(self, capability: object = None) -> None:
-        if capability is not _CONSTRUCTION_CAPABILITY:
-            raise TypeError("VerifiedHostFacts requires an internal marker")
-        self._capability = capability
-
-
-def _is_verified_host_facts(value: object) -> bool:
-    return (
-        type(value) is VerifiedHostFacts
-        and getattr(value, "_capability", None) is _CONSTRUCTION_CAPABILITY
-    )
-
-
 def prepare_verified_host_facts(
     session: object,
     *,
     capability_facts: Sequence[HostCapabilityFact] | object,
     quota_facts: object,
-) -> VerifiedHostFacts | str:
+) -> str:
     """Accept no substitute for a future session-owned compiler capability.
 
     This boundary intentionally does not call ``read_quota``, ask the host for
@@ -86,9 +62,7 @@ def compile_fast_lane_with_host_facts(
 ) -> str:
     """Return only ``NO_SAFE_WORK`` until the private quota seam exists."""
 
-    del request, reasoning_effort
-    if not _is_verified_host_facts(verified_host_facts):
-        return NO_SAFE_WORK
+    del request, reasoning_effort, verified_host_facts
     return NO_SAFE_WORK
 
 
@@ -154,11 +128,16 @@ def _digest(value: object) -> str | None:
 
 
 def _digest_list(value: object, *, maximum: int) -> list[str] | None:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+    try:
+        if not isinstance(value, Sequence) or isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return None
+        if len(value) > maximum:
+            return None
+        normalized = [_digest(item) for item in value]
+    except Exception:
         return None
-    if len(value) > maximum:
-        return None
-    normalized = [_digest(item) for item in value]
     if any(item is None for item in normalized):
         return None
     digests = [item for item in normalized if item is not None]

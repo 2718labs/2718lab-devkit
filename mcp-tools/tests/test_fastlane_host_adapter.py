@@ -4,6 +4,7 @@ import ast
 import importlib
 import inspect
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -32,11 +33,11 @@ def test_adapter_fails_closed_when_verified_host_facts_are_missing() -> None:
     )
 
 
-def test_verified_host_facts_cannot_be_constructed_from_public_values() -> None:
+def test_adapter_exposes_no_forgeable_verified_host_facts_marker() -> None:
     adapter = _adapter()
 
-    with pytest.raises(TypeError):
-        adapter.VerifiedHostFacts()
+    assert not hasattr(adapter, "VerifiedHostFacts")
+    assert not hasattr(adapter, "_CONSTRUCTION_CAPABILITY")
 
 
 def test_unverified_quota_values_cannot_bootstrap_verified_host_facts() -> None:
@@ -152,6 +153,32 @@ def test_role_transfer_rejects_raw_or_path_like_content() -> None:
     assert (
         adapter.project_role_transfer(
             **{**common, "artifact_hashes": (r"D:\\private\\raw.log",)}
+        )
+        == adapter.NO_SAFE_WORK
+    )
+
+
+def test_role_transfer_fails_closed_when_hash_sequence_raises() -> None:
+    adapter = _adapter()
+
+    class ExplodingSequence(Sequence[str]):
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int) -> str:
+            del index
+            raise RuntimeError("untrusted sequence iteration")
+
+    assert (
+        adapter.project_role_transfer(
+            kind="worker_to_coordinator",
+            task_id="FAST-LANE-ADAPTER",
+            role="execution",
+            assignment_token=_hash("a"),
+            context_hash=_hash("b"),
+            summary_hash=_hash("c"),
+            artifact_hashes=ExplodingSequence(),
+            digest_hashes=(_hash("e"),),
         )
         == adapter.NO_SAFE_WORK
     )
