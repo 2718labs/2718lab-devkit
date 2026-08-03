@@ -12,6 +12,9 @@ artifact checks pass.
 
 - Added a tag-driven release gate that rechecks the primary-artifact contract
   and Windows Fast Lane contracts before publishing.
+- Added a Windows MCP runtime gate with the same task-local environment
+  contract used by CI; Linux continues to validate AstrBot and the primary
+  artifact contract.
 - Added retained GitHub Actions artifacts and checksums for both the primary
   MCP ZIP and the independently buildable AstrBot wheel and source
   distribution.

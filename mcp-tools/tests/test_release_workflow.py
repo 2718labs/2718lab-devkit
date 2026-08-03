@@ -36,3 +36,24 @@ def test_release_workflow_builds_and_retains_rc2_prerelease_package() -> None:
         "release_args+=(--prerelease)",
     ):
         assert required in workflow
+
+
+def test_release_workflow_runs_mcp_runtime_on_its_windows_contract() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "  mcp-runtime:\n"
+        "    name: Re-run MCP runtime\n"
+        "    needs: metadata\n"
+        "    runs-on: windows-latest"
+    ) in workflow
+    for required in (
+        "Configure MCP task-local runtime storage",
+        '"CODEX_TASK_TEMP=$root"',
+        "\"UV_CACHE_DIR=$(Join-Path $root 'uv-cache')\"",
+        "      - name: Check MCP runtime\n        shell: bash\n        run: |",
+        "needs: [metadata, mcp-runtime, quality, fast-lane]",
+    ):
+        assert required in workflow
