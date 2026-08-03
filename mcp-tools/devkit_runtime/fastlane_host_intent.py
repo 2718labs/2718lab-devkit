@@ -17,7 +17,6 @@ NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 
 _SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v1"
 _PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v1"
-_HOST_PRIVATE_TRUST_STATE: Final = "host-private-verified-v1"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _GIT_OBJECT_PATTERN: Final = re.compile(r"[0-9a-f]{40}\Z")
 _IDENTIFIER_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
@@ -155,8 +154,8 @@ _LEASE_KEYS: Final = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class HostCapabilityFact:
-    """A capability assertion carried by the intent, not a live Host query."""
+class ParsedHostCapabilityFact:
+    """A capability claim parsed from a candidate, without Host verification."""
 
     model: str
     reasoning_effort: str
@@ -167,7 +166,7 @@ class HostCapabilityFact:
 
 @dataclass(frozen=True, slots=True)
 class HostCapabilityExpectation:
-    """A capability fact independently attested by the future Host verifier."""
+    """A public capability field set used only for non-authorizing comparison."""
 
     model: str
     reasoning_effort: str
@@ -176,15 +175,10 @@ class HostCapabilityExpectation:
 
 
 @dataclass(frozen=True, slots=True)
-class HostExecutionExpectation:
-    """Host-private authorization input; this pure module never creates or verifies it."""
+class HostExecutionExpectationProjection:
+    """A non-authorizing, public fieldwise comparison projection."""
 
-    verifier_key_id: str
-    trust_state: str
-    receipt_hash: str
-    verified_at_epoch: int
-    expires_at_epoch: int
-    expected_intent_hash: str
+    candidate_intent_hash: str
     projection_hash: str
     source_plan_hash: str
     workflow_hash: str
@@ -224,8 +218,8 @@ class HostExecutionExpectation:
 
 
 @dataclass(frozen=True, slots=True)
-class HostExecutionIntent:
-    """The only successful result of pure Fast Lane intent validation."""
+class ParsedHostExecutionIntent:
+    """A structurally valid candidate parsed without Host authorization."""
 
     schema: str
     intent_hash: str
@@ -246,7 +240,7 @@ class HostExecutionIntent:
     inherit_current_session_model: bool
     require_explicit_route: bool
     route_binding_hash: str
-    host_capability_facts: tuple[HostCapabilityFact, ...]
+    parsed_capability_facts: tuple[ParsedHostCapabilityFact, ...]
     quota_snapshot_hash: str
     quota_decision_hash: str
     quota_evidence_hash: str
@@ -278,19 +272,30 @@ def validate_host_execution_intent(
     candidate: object,
     *,
     expectation: object | None = None,
-) -> HostExecutionIntent | Literal["NO_SAFE_WORK"]:
-    """Return a Host-authorized intent, or fail closed without side effects."""
+) -> Literal["NO_SAFE_WORK"]:
+    """Fail closed until a Desktop Host-private verifier is available.
+
+    Public Python data, including a self-consistent parsed candidate and a
+    matching comparison projection, cannot authorize Fast Lane execution.
+    """
+
+    del candidate, expectation
+    return NO_SAFE_WORK
+
+
+def parse_host_execution_intent(
+    candidate: object,
+) -> ParsedHostExecutionIntent | Literal["NO_SAFE_WORK"]:
+    """Parse a candidate structurally; the result is never an authorization."""
 
     try:
-        accepted = _validate(candidate)
-        if accepted is None or not _matches_host_expectation(accepted, expectation):
-            return NO_SAFE_WORK
+        parsed = _parse(candidate)
     except Exception:
         return NO_SAFE_WORK
-    return accepted
+    return parsed if parsed is not None else NO_SAFE_WORK
 
 
-def _validate(candidate: object) -> HostExecutionIntent | None:
+def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
     root = _bound_mapping(candidate, _ROOT_KEYS, "intent_hash")
     if root is None or _text(root, "schema") != _SCHEMA:
         return None
@@ -398,7 +403,7 @@ def _validate(candidate: object) -> HostExecutionIntent | None:
     task_id, role, predecessor_hash, lease_epoch = validated_predecessor
 
     capability_facts = _validate_capability_facts(root["capability_facts"])
-    if capability_facts is None or not _has_attested_capability(
+    if capability_facts is None or not _has_candidate_capability_claim(
         capability_facts,
         model,
         reasoning_effort,
@@ -460,7 +465,7 @@ def _validate(candidate: object) -> HostExecutionIntent | None:
     ):
         return None
 
-    return HostExecutionIntent(
+    return ParsedHostExecutionIntent(
         schema=_SCHEMA,
         intent_hash=intent_hash,
         projection_hash=projection_hash,
@@ -480,7 +485,7 @@ def _validate(candidate: object) -> HostExecutionIntent | None:
         inherit_current_session_model=inherit_current_session_model,
         require_explicit_route=require_explicit_route,
         route_binding_hash=route_binding_hash,
-        host_capability_facts=capability_facts,
+        parsed_capability_facts=capability_facts,
         quota_snapshot_hash=quota_snapshot_hash,
         quota_decision_hash=quota_decision_hash,
         quota_evidence_hash=quota_evidence_hash,
@@ -656,10 +661,12 @@ def _validate_predecessor(
 
 def _validate_capability_facts(
     value: object,
-) -> tuple[HostCapabilityFact, ...] | None:
+) -> tuple[ParsedHostCapabilityFact, ...] | None:
+    """Parse candidate-provided capability claim vocabulary without verifying it."""
+
     if type(value) is not list or not 1 <= len(value) <= 16:
         return None
-    facts: list[HostCapabilityFact] = []
+    facts: list[ParsedHostCapabilityFact] = []
     seen_routes: set[tuple[str, str]] = set()
     for raw_fact in value:
         fact = _bound_mapping(
@@ -687,7 +694,7 @@ def _validate_capability_facts(
             return None
         seen_routes.add(route_key)
         facts.append(
-            HostCapabilityFact(
+            ParsedHostCapabilityFact(
                 model=model,
                 reasoning_effort=reasoning_effort,
                 state=state,
@@ -698,8 +705,8 @@ def _validate_capability_facts(
     return tuple(facts)
 
 
-def _has_attested_capability(
-    facts: tuple[HostCapabilityFact, ...],
+def _has_candidate_capability_claim(
+    facts: tuple[ParsedHostCapabilityFact, ...],
     model: str,
     reasoning_effort: str,
 ) -> bool:
@@ -711,14 +718,20 @@ def _has_attested_capability(
     )
 
 
-def _matches_host_expectation(
-    intent: HostExecutionIntent,
-    expectation: object | None,
+def matches_host_execution_expectation(
+    parsed: object,
+    expectation: object,
 ) -> bool:
-    if type(expectation) is not HostExecutionExpectation:
+    """Compare public fields exactly; a match is never an authorization."""
+
+    if (
+        type(parsed) is not ParsedHostExecutionIntent
+        or type(expectation) is not HostExecutionExpectationProjection
+    ):
         return False
-    trusted_expectation = cast(HostExecutionExpectation, expectation)
-    if not _is_trusted_expectation(trusted_expectation):
+    parsed_intent = cast(ParsedHostExecutionIntent, parsed)
+    expectation_projection = cast(HostExecutionExpectationProjection, expectation)
+    if not _is_expectation_projection(expectation_projection):
         return False
     expected_capability_facts = tuple(
         HostCapabilityExpectation(
@@ -727,64 +740,69 @@ def _matches_host_expectation(
             state=fact.state,
             attestation_hash=fact.attestation_hash,
         )
-        for fact in intent.host_capability_facts
+        for fact in parsed_intent.parsed_capability_facts
     )
     return (
-        trusted_expectation.expected_intent_hash == intent.intent_hash
-        and trusted_expectation.projection_hash == intent.projection_hash
-        and trusted_expectation.source_plan_hash == intent.source_plan_hash
-        and trusted_expectation.workflow_hash == intent.workflow_hash
-        and trusted_expectation.assignment_id == intent.assignment_id
-        and trusted_expectation.assignment_token == intent.assignment_token
-        and trusted_expectation.predecessor_hash == intent.predecessor_hash
-        and trusted_expectation.task_id == intent.task_id
-        and trusted_expectation.role == intent.role
-        and trusted_expectation.model == intent.model
-        and trusted_expectation.reasoning_effort == intent.reasoning_effort
-        and trusted_expectation.routing_context_hash == intent.routing_context_hash
-        and trusted_expectation.routing_result_hash == intent.routing_result_hash
-        and trusted_expectation.session_scope == intent.session_scope
-        and trusted_expectation.inherit_current_session_model
-        == intent.inherit_current_session_model
-        and trusted_expectation.require_explicit_route == intent.require_explicit_route
-        and trusted_expectation.capability_facts == expected_capability_facts
-        and trusted_expectation.quota_snapshot_hash == intent.quota_snapshot_hash
-        and trusted_expectation.quota_decision_hash == intent.quota_decision_hash
-        and trusted_expectation.quota_evidence_hash == intent.quota_evidence_hash
-        and trusted_expectation.ledger_epoch == intent.ledger_epoch
-        and trusted_expectation.active_lease_set_hash == intent.active_lease_set_hash
-        and trusted_expectation.task_packet_hash == intent.task_packet_hash
-        and trusted_expectation.input_packet_hash == intent.input_packet_hash
-        and trusted_expectation.index_packet_hash == intent.index_packet_hash
-        and trusted_expectation.project_id == intent.project_id
-        and trusted_expectation.registered_project_id == intent.registered_project_id
-        and trusted_expectation.repository == intent.repository
-        and trusted_expectation.common_dir == intent.common_dir
-        and trusted_expectation.source_ref == intent.source_ref
-        and trusted_expectation.source_commit == intent.source_commit
-        and trusted_expectation.source_tree == intent.source_tree
-        and trusted_expectation.create_request_hash == intent.create_request_hash
-        and trusted_expectation.operation_id == intent.operation_id
-        and trusted_expectation.lease_owner == intent.lease_owner
-        and trusted_expectation.lease_epoch == intent.lease_epoch
-        and trusted_expectation.lease_fencing_token == intent.lease_fencing_token
+        expectation_projection.candidate_intent_hash == parsed_intent.intent_hash
+        and expectation_projection.projection_hash == parsed_intent.projection_hash
+        and expectation_projection.source_plan_hash == parsed_intent.source_plan_hash
+        and expectation_projection.workflow_hash == parsed_intent.workflow_hash
+        and expectation_projection.assignment_id == parsed_intent.assignment_id
+        and expectation_projection.assignment_token == parsed_intent.assignment_token
+        and expectation_projection.predecessor_hash == parsed_intent.predecessor_hash
+        and expectation_projection.task_id == parsed_intent.task_id
+        and expectation_projection.role == parsed_intent.role
+        and expectation_projection.model == parsed_intent.model
+        and expectation_projection.reasoning_effort == parsed_intent.reasoning_effort
+        and expectation_projection.routing_context_hash
+        == parsed_intent.routing_context_hash
+        and expectation_projection.routing_result_hash
+        == parsed_intent.routing_result_hash
+        and expectation_projection.session_scope == parsed_intent.session_scope
+        and expectation_projection.inherit_current_session_model
+        == parsed_intent.inherit_current_session_model
+        and expectation_projection.require_explicit_route
+        == parsed_intent.require_explicit_route
+        and expectation_projection.capability_facts == expected_capability_facts
+        and expectation_projection.quota_snapshot_hash
+        == parsed_intent.quota_snapshot_hash
+        and expectation_projection.quota_decision_hash
+        == parsed_intent.quota_decision_hash
+        and expectation_projection.quota_evidence_hash
+        == parsed_intent.quota_evidence_hash
+        and expectation_projection.ledger_epoch == parsed_intent.ledger_epoch
+        and expectation_projection.active_lease_set_hash
+        == parsed_intent.active_lease_set_hash
+        and expectation_projection.task_packet_hash == parsed_intent.task_packet_hash
+        and expectation_projection.input_packet_hash == parsed_intent.input_packet_hash
+        and expectation_projection.index_packet_hash == parsed_intent.index_packet_hash
+        and expectation_projection.project_id == parsed_intent.project_id
+        and expectation_projection.registered_project_id
+        == parsed_intent.registered_project_id
+        and expectation_projection.repository == parsed_intent.repository
+        and expectation_projection.common_dir == parsed_intent.common_dir
+        and expectation_projection.source_ref == parsed_intent.source_ref
+        and expectation_projection.source_commit == parsed_intent.source_commit
+        and expectation_projection.source_tree == parsed_intent.source_tree
+        and expectation_projection.create_request_hash
+        == parsed_intent.create_request_hash
+        and expectation_projection.operation_id == parsed_intent.operation_id
+        and expectation_projection.lease_owner == parsed_intent.lease_owner
+        and expectation_projection.lease_epoch == parsed_intent.lease_epoch
+        and expectation_projection.lease_fencing_token
+        == parsed_intent.lease_fencing_token
     )
 
 
-def _is_trusted_expectation(expectation: HostExecutionExpectation) -> bool:
-    if (
-        expectation.trust_state != _HOST_PRIVATE_TRUST_STATE
-        or not _is_identifier_value(expectation.verifier_key_id)
-        or not _is_hash_value(expectation.receipt_hash)
-        or not _is_positive_int_value(expectation.verified_at_epoch)
-        or not _is_positive_int_value(expectation.expires_at_epoch)
-        or expectation.expires_at_epoch <= expectation.verified_at_epoch
-        or not _is_hash_value(expectation.expected_intent_hash)
-    ):
-        return False
+def _is_expectation_projection(
+    expectation: HostExecutionExpectationProjection,
+) -> bool:
+    """Validate comparison fields without simulating a Host trust decision."""
+
     if not _capability_expectations_are_valid(expectation.capability_facts):
         return False
     hash_values = (
+        expectation.candidate_intent_hash,
         expectation.projection_hash,
         expectation.source_plan_hash,
         expectation.workflow_hash,

@@ -7,7 +7,7 @@ import importlib
 import inspect
 import json
 import sys
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,11 @@ if str(MCP_TOOLS_ROOT) not in sys.path:
     sys.path.insert(0, str(MCP_TOOLS_ROOT))
 
 MODULE_NAME = "devkit_runtime.fastlane_host_intent"
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpiredPublicExpectation:
+    expires_at_epoch: int = 0
 
 
 def _hash(seed: str) -> str:
@@ -194,24 +199,22 @@ def _module() -> Any:
     return importlib.import_module(MODULE_NAME)
 
 
-def _require_expectation_api(module: Any) -> None:
+def _require_non_authorizing_api(module: Any) -> None:
     assert (
         "expectation"
         in inspect.signature(module.validate_host_execution_intent).parameters
     )
-    assert hasattr(module, "HostExecutionExpectation")
+    assert hasattr(module, "ParsedHostExecutionIntent")
+    assert hasattr(module, "ParsedHostCapabilityFact")
+    assert hasattr(module, "HostExecutionExpectationProjection")
     assert hasattr(module, "HostCapabilityExpectation")
+    assert hasattr(module, "parse_host_execution_intent")
+    assert hasattr(module, "matches_host_execution_expectation")
+    assert not hasattr(module, "HostExecutionIntent")
 
 
-def _expectation(
-    module: Any,
-    candidate: dict[str, Any],
-    *,
-    trust_state: str = "host-private-verified-v1",
-    verified_at_epoch: int = 100,
-    expires_at_epoch: int = 200,
-) -> Any:
-    _require_expectation_api(module)
+def _expectation(module: Any, candidate: dict[str, Any]) -> Any:
+    _require_non_authorizing_api(module)
     assignment = candidate["assignment"]
     predecessor = assignment["predecessor"]
     route = candidate["route"]
@@ -229,13 +232,8 @@ def _expectation(
         )
         for fact in candidate["capability_facts"]
     )
-    return module.HostExecutionExpectation(
-        verifier_key_id="desktop-host-private-key",
-        trust_state=trust_state,
-        receipt_hash=_hash("detached-host-receipt"),
-        verified_at_epoch=verified_at_epoch,
-        expires_at_epoch=expires_at_epoch,
-        expected_intent_hash=candidate["intent_hash"],
+    return module.HostExecutionExpectationProjection(
+        candidate_intent_hash=candidate["intent_hash"],
         projection_hash=candidate["projection_hash"],
         source_plan_hash=candidate["source_plan_hash"],
         workflow_hash=candidate["workflow_hash"],
@@ -275,15 +273,29 @@ def _expectation(
     )
 
 
-def _validate(candidate: object, expectation: object) -> Any:
+def _parse(candidate: object) -> Any:
     module = _module()
-    _require_expectation_api(module)
-    return module.validate_host_execution_intent(candidate, expectation=expectation)
+    _require_non_authorizing_api(module)
+    return module.parse_host_execution_intent(candidate)
 
 
-def _assert_rejected(candidate: object, expectation: object) -> None:
+def _matches(parsed: object, expectation: object) -> bool:
     module = _module()
-    assert _validate(candidate, expectation) is module.NO_SAFE_WORK
+    _require_non_authorizing_api(module)
+    return module.matches_host_execution_expectation(parsed, expectation)
+
+
+def _assert_parse_rejected(candidate: object) -> None:
+    module = _module()
+    assert _parse(candidate) is module.NO_SAFE_WORK
+
+
+def _assert_hard_gate(candidate: object, expectation: object | None = None) -> None:
+    module = _module()
+    assert (
+        module.validate_host_execution_intent(candidate, expectation=expectation)
+        is module.NO_SAFE_WORK
+    )
 
 
 def _refresh_predecessor_and_assignment(candidate: dict[str, Any]) -> str:
@@ -297,26 +309,36 @@ def _refresh_predecessor_and_assignment(candidate: dict[str, Any]) -> str:
     return assignment["predecessor"]["predecessor_hash"]
 
 
-def test_rejects_a_candidate_without_a_host_private_expectation() -> None:
-    module = _module()
-
-    assert module.validate_host_execution_intent(_intent()) is module.NO_SAFE_WORK
-
-
-def test_accepts_a_host_bound_explicit_intent_as_an_immutable_typed_value() -> None:
+def test_public_validation_is_hard_gated_for_every_public_expectation() -> None:
     module = _module()
     candidate = _intent()
+    expectation = _expectation(module, candidate)
+    parsed = _parse(candidate)
 
-    accepted = _validate(candidate, _expectation(module, candidate))
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert _matches(parsed, expectation)
+    _assert_hard_gate(candidate)
+    _assert_hard_gate(candidate, expectation)
+    _assert_hard_gate(candidate, _ExpiredPublicExpectation())
+    _assert_hard_gate(candidate, {"public": "expectation"})
+    _assert_hard_gate(candidate, object())
 
-    assert isinstance(accepted, module.HostExecutionIntent)
-    assert accepted.model == "gpt-5.6-terra"
-    assert accepted.reasoning_effort == "high"
-    assert accepted.assignment_id == _hash("assignment-id")
-    assert accepted.source_commit == "f4d5b6cadad052cf84d3055e438816f93e919ccb"
-    assert accepted.host_capability_facts[0].state == "attested"
+
+def test_parse_and_fieldwise_match_are_immutable_but_non_authorizing() -> None:
+    module = _module()
+    candidate = _intent()
+    parsed = _parse(candidate)
+
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert parsed.model == "gpt-5.6-terra"
+    assert parsed.reasoning_effort == "high"
+    assert parsed.assignment_id == _hash("assignment-id")
+    assert parsed.source_commit == "f4d5b6cadad052cf84d3055e438816f93e919ccb"
+    assert parsed.parsed_capability_facts[0].state == "attested"
+    assert _matches(parsed, _expectation(module, candidate))
+    _assert_hard_gate(candidate, _expectation(module, candidate))
     with pytest.raises(FrozenInstanceError):
-        accepted.model = "gpt-5.6-luna"
+        parsed.model = "gpt-5.6-luna"
 
 
 @pytest.mark.parametrize(
@@ -382,17 +404,15 @@ def test_accepts_a_host_bound_explicit_intent_as_an_immutable_typed_value() -> N
         ),
     ],
 )
-def test_rejects_malformed_or_tampered_evidence(
+def test_parser_rejects_malformed_or_tampered_evidence(
     label: str,
     mutate: Any,
 ) -> None:
-    module = _module()
-    baseline = _intent()
-    candidate = copy.deepcopy(baseline)
+    candidate = _intent()
     mutate(candidate)
     _refresh_root(candidate)
 
-    _assert_rejected(candidate, _expectation(module, baseline))
+    _assert_parse_rejected(candidate)
 
 
 @pytest.mark.parametrize(
@@ -404,7 +424,7 @@ def test_rejects_malformed_or_tampered_evidence(
         ("tree", "1" * 40),
     ],
 )
-def test_rejects_a_fully_rebound_source_mutation_against_host_expectation(
+def test_parser_accepts_but_matcher_differentiates_a_fully_rebound_source_mutation(
     field: str,
     replacement: str,
 ) -> None:
@@ -416,14 +436,14 @@ def test_rejects_a_fully_rebound_source_mutation_against_host_expectation(
     candidate["source"] = _with_binding(candidate["source"], "source_binding_hash")
     candidate["create"] = _with_binding(candidate["create"], "create_binding_hash")
     _refresh_root(candidate)
+    parsed = _parse(candidate)
 
-    assert candidate["intent_hash"] != baseline["intent_hash"]
-    _assert_rejected(candidate, _expectation(module, baseline))
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert not _matches(parsed, _expectation(module, baseline))
+    _assert_hard_gate(candidate, _expectation(module, baseline))
 
 
-def test_rejects_a_fully_rebound_assignment_token_mutation_against_host_expectation() -> (
-    None
-):
+def test_parser_accepts_but_matcher_differentiates_a_rebound_assignment_token() -> None:
     module = _module()
     baseline = _intent()
     candidate = copy.deepcopy(baseline)
@@ -439,14 +459,14 @@ def test_rejects_a_fully_rebound_assignment_token_mutation_against_host_expectat
     candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
     candidate["create"] = _with_binding(candidate["create"], "create_binding_hash")
     _refresh_root(candidate)
+    parsed = _parse(candidate)
 
-    assert candidate["intent_hash"] != baseline["intent_hash"]
-    _assert_rejected(candidate, _expectation(module, baseline))
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert not _matches(parsed, _expectation(module, baseline))
+    _assert_hard_gate(candidate, _expectation(module, baseline))
 
 
-def test_rejects_a_fully_rebound_quota_ledger_mutation_against_host_expectation() -> (
-    None
-):
+def test_parser_accepts_but_matcher_differentiates_a_rebound_quota_ledger() -> None:
     module = _module()
     baseline = _intent()
     candidate = copy.deepcopy(baseline)
@@ -458,12 +478,14 @@ def test_rejects_a_fully_rebound_quota_ledger_mutation_against_host_expectation(
     candidate["lease"]["predecessor_hash"] = predecessor_hash
     candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
     _refresh_root(candidate)
+    parsed = _parse(candidate)
 
-    assert candidate["intent_hash"] != baseline["intent_hash"]
-    _assert_rejected(candidate, _expectation(module, baseline))
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert not _matches(parsed, _expectation(module, baseline))
+    _assert_hard_gate(candidate, _expectation(module, baseline))
 
 
-def test_rejects_a_fully_rebound_route_and_capability_attack_against_host_expectation() -> (
+def test_parser_accepts_but_matcher_differentiates_gpt_attacker_route_and_fact() -> (
     None
 ):
     module = _module()
@@ -477,14 +499,14 @@ def test_rejects_a_fully_rebound_route_and_capability_attack_against_host_expect
         "capability_binding_hash",
     )
     _refresh_root(candidate)
+    parsed = _parse(candidate)
 
-    assert candidate["intent_hash"] != baseline["intent_hash"]
-    _assert_rejected(candidate, _expectation(module, baseline))
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert not _matches(parsed, _expectation(module, baseline))
+    _assert_hard_gate(candidate, _expectation(module, baseline))
 
 
-def test_rejects_a_fully_rebound_lease_fence_mutation_against_host_expectation() -> (
-    None
-):
+def test_parser_accepts_but_matcher_differentiates_a_rebound_lease_fence() -> None:
     module = _module()
     baseline = _intent()
     candidate = copy.deepcopy(baseline)
@@ -494,13 +516,14 @@ def test_rejects_a_fully_rebound_lease_fence_mutation_against_host_expectation()
     candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
     candidate["create"] = _with_binding(candidate["create"], "create_binding_hash")
     _refresh_root(candidate)
+    parsed = _parse(candidate)
 
-    assert candidate["intent_hash"] != baseline["intent_hash"]
-    _assert_rejected(candidate, _expectation(module, baseline))
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert not _matches(parsed, _expectation(module, baseline))
+    _assert_hard_gate(candidate, _expectation(module, baseline))
 
 
-def test_rejects_zero_lease_epoch_even_when_candidate_and_expectation_match() -> None:
-    module = _module()
+def test_parser_rejects_zero_lease_epoch() -> None:
     candidate = _intent()
     candidate["assignment"]["predecessor"]["lease_epoch"] = 0
     predecessor_hash = _refresh_predecessor_and_assignment(candidate)
@@ -509,37 +532,7 @@ def test_rejects_zero_lease_epoch_even_when_candidate_and_expectation_match() ->
     candidate["lease"] = _with_binding(candidate["lease"], "lease_binding_hash")
     _refresh_root(candidate)
 
-    _assert_rejected(candidate, _expectation(module, candidate))
-
-
-@pytest.mark.parametrize(
-    ("trust_state", "verified_at_epoch", "expires_at_epoch"),
-    [
-        ("untrusted", 100, 200),
-        ("host-private-verified-v1", 100, 100),
-        ("host-private-verified-v1", 0, 200),
-    ],
-)
-def test_rejects_untrusted_or_expired_host_expectation(
-    trust_state: str,
-    verified_at_epoch: int,
-    expires_at_epoch: int,
-) -> None:
-    module = _module()
-    candidate = _intent()
-    expectation = _expectation(
-        module,
-        candidate,
-        trust_state=trust_state,
-        verified_at_epoch=verified_at_epoch,
-        expires_at_epoch=expires_at_epoch,
-    )
-
-    _assert_rejected(candidate, expectation)
-
-
-def test_rejects_a_non_expectation_context() -> None:
-    _assert_rejected(_intent(), {"trust_state": "host-private-verified-v1"})
+    _assert_parse_rejected(candidate)
 
 
 @pytest.mark.parametrize(
@@ -549,40 +542,34 @@ def test_rejects_a_non_expectation_context() -> None:
         ("gpt-5.6-terra", "ultra"),
     ],
 )
-def test_rejects_spark_or_ultra_even_when_host_expectation_matches(
+def test_parser_rejects_spark_or_ultra(
     model: str,
     reasoning_effort: str,
 ) -> None:
-    module = _module()
-    candidate = _intent(model=model, reasoning_effort=reasoning_effort)
-
-    _assert_rejected(candidate, _expectation(module, candidate))
+    _assert_parse_rejected(_intent(model=model, reasoning_effort=reasoning_effort))
 
 
-def test_rejects_non_external_session_even_when_host_expectation_matches() -> None:
-    module = _module()
-    candidate = _intent(session_scope="local")
-
-    _assert_rejected(candidate, _expectation(module, candidate))
+def test_parser_rejects_non_external_session() -> None:
+    _assert_parse_rejected(_intent(session_scope="local"))
 
 
-def test_luna_max_requires_an_explicit_attested_host_capability_fact() -> None:
+def test_luna_max_parses_and_matches_but_still_cannot_be_admitted() -> None:
     module = _module()
     rejected = _intent(
         model="gpt-5.6-luna",
         reasoning_effort="max",
         capability_state="declared",
     )
-    _assert_rejected(rejected, _expectation(module, rejected))
+    _assert_parse_rejected(rejected)
 
     candidate = _intent(model="gpt-5.6-luna", reasoning_effort="max")
-    accepted = _validate(candidate, _expectation(module, candidate))
-    assert isinstance(accepted, module.HostExecutionIntent)
-    assert accepted.model == "gpt-5.6-luna"
-    assert accepted.reasoning_effort == "max"
+    parsed = _parse(candidate)
+    assert isinstance(parsed, module.ParsedHostExecutionIntent)
+    assert _matches(parsed, _expectation(module, candidate))
+    _assert_hard_gate(candidate, _expectation(module, candidate))
 
 
-def test_validator_has_no_thread_worktree_process_network_or_host_api_surface() -> None:
+def test_module_has_no_host_authorization_or_side_effect_surface() -> None:
     module = _module()
     tree = ast.parse(inspect.getsource(module))
     imported_modules = {
@@ -607,6 +594,7 @@ def test_validator_has_no_thread_worktree_process_network_or_host_api_surface() 
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
 
+    assert not hasattr(module, "HostExecutionIntent")
     assert imported_modules.isdisjoint(
         {
             "devkit_runtime.fastlane_host_adapter",
