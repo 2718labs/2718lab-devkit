@@ -1290,9 +1290,18 @@ def _short_task_temp_target(
     )
 
 
-def _projected_python_cache_path_length(cache_prefix: Path, worktree: Path) -> int:
+def _projected_python_cache_path_length(
+    cache_prefix: Path,
+    worktree: Path,
+    *,
+    write_scope: Sequence[str] = (),
+) -> int:
     projected_paths: list[Path] = []
-    for source_relative in _PYTHON_CACHE_REPRESENTATIVE_SOURCES:
+    source_relatives = (
+        *_PYTHON_CACHE_REPRESENTATIVE_SOURCES,
+        *(Path(scope) for scope in write_scope),
+    )
+    for source_relative in source_relatives:
         source = worktree / source_relative
         drive = source.drive.rstrip(":") or "drive"
         projected_paths.append(
@@ -1305,10 +1314,17 @@ def _projected_python_cache_path_length(cache_prefix: Path, worktree: Path) -> i
     return max(len(str(path)) for path in projected_paths)
 
 
-def _enforce_python_cache_path_budget(cache_prefix: Path, worktree: Path) -> None:
-    if _projected_python_cache_path_length(cache_prefix, worktree) > (
-        MAX_PYTHON_CACHE_PATH_LENGTH
-    ):
+def _enforce_python_cache_path_budget(
+    cache_prefix: Path,
+    worktree: Path,
+    *,
+    write_scope: Sequence[str],
+) -> None:
+    if _projected_python_cache_path_length(
+        cache_prefix,
+        worktree,
+        write_scope=write_scope,
+    ) > (MAX_PYTHON_CACHE_PATH_LENGTH):
         raise ValueError("configured fast-lane task root is not approved")
 
 
@@ -1376,7 +1392,11 @@ def build_bootstrap_plan(
         project=normalized_project,
         write_scope=normalized_scope,
     )
-    _enforce_python_cache_path_budget(temp_path / "p", worktree_path)
+    _enforce_python_cache_path_budget(
+        temp_path / "p",
+        worktree_path,
+        write_scope=normalized_scope,
+    )
 
     command_argv = [
         "git",

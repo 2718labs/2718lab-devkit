@@ -5739,6 +5739,19 @@ class TeamEfficiencyTests(unittest.TestCase):
             ):
                 helper.build_bootstrap_plan(**target)
 
+    def test_bootstrap_rejects_a_legal_write_scope_that_exceeds_python_cache_budget(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        target = self.bootstrap_kwargs()
+        target["write_scope"] = ["pkg/" + "a" * 246 + ".py"]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "configured fast-lane task root is not approved",
+        ):
+            helper.build_bootstrap_plan(**target)
+
     def test_bootstrap_rejects_an_invalid_configured_fastlane_task_root(self) -> None:
         helper = load_efficiency()
         file_root = self.temp / "configured-root-file"
