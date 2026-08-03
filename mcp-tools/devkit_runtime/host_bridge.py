@@ -39,6 +39,7 @@ _MAX_FRAME_BYTES: Final = 65_536
 _MAX_CAPABILITY_PACKET_BYTES: Final = 8 * 1024
 _MAX_OPERATION_PACKET_BYTES: Final = 40 * 1024
 _MAX_PROOF_CONTINUATION_BYTES: Final = 2 * 1024
+_MAX_TERMINAL_OPERATION_TOMBSTONES: Final = 256
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _ENDPOINT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -189,6 +190,9 @@ class InheritedHandleHostBridge:
         self._received_capability_probes: set[str] = set()
         self._pending_operations: dict[str, OperationReceipt] = {}
         self._received_operations: dict[str, OperationReceipt] = {}
+        self._terminal_operation_tombstones: dict[
+            tuple[str, str, str, str, str, str], int
+        ] = {}
         self._closed = False
 
     @classmethod
@@ -569,7 +573,7 @@ class InheritedHandleHostBridge:
             _validate_private_packet_size(payload, _MAX_OPERATION_PACKET_BYTES)
         except host_envelopes.HostEnvelopeError as error:
             raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID") from error
-        if receipt.envelope_hash in self._pending_operations:
+        if self._operation_is_registered_or_tombstoned(receipt, now=now):
             raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
         self._send_validated_private(
             kind="operation_request", action_id=receipt.task_id, payload=payload
@@ -588,7 +592,7 @@ class InheritedHandleHostBridge:
         try:
             message = self._receive_private()
             receipt = _parse_operation_request(message, now=now, expected=expected)
-            if receipt.envelope_hash in self._received_operations:
+            if self._operation_is_registered_or_tombstoned(receipt, now=now):
                 raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
         except host_envelopes.HostEnvelopeError as error:
             self._poison()
@@ -623,6 +627,9 @@ class InheritedHandleHostBridge:
             )
             if registered_predecessor != normalized_predecessor:
                 raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+            self._ensure_terminal_operation_tombstone_capacity(
+                normalized_predecessor, now=now
+            )
             payload = {
                 "schema": _TERMINAL_RESULT_SCHEMA,
                 "correlation_id": normalized_predecessor.correlation_id,
@@ -637,6 +644,7 @@ class InheritedHandleHostBridge:
             action_id=normalized_predecessor.task_id,
             payload=payload,
         )
+        self._remember_terminal_operation(normalized_predecessor, now=now)
         del self._received_operations[normalized_predecessor.envelope_hash]
 
     def receive_terminal_result(
@@ -656,6 +664,9 @@ class InheritedHandleHostBridge:
         )
         if registered_predecessor != normalized_predecessor:
             raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+        self._ensure_terminal_operation_tombstone_capacity(
+            normalized_predecessor, now=now
+        )
         try:
             message = self._receive_private()
             envelope = _parse_terminal_result(
@@ -670,6 +681,7 @@ class InheritedHandleHostBridge:
         except HostBridgeError:
             self._poison()
             raise
+        self._remember_terminal_operation(normalized_predecessor, now=now)
         del self._pending_operations[normalized_predecessor.envelope_hash]
         return envelope
 
@@ -940,6 +952,57 @@ class InheritedHandleHostBridge:
 
         self.close()
 
+    def _operation_is_registered_or_tombstoned(
+        self, receipt: OperationReceipt, *, now: int
+    ) -> bool:
+        """Reject duplicate or rebound operations without retaining envelope content."""
+
+        self._prune_terminal_operation_tombstones(now=now)
+        identity = _operation_replay_identity(receipt)
+        return (
+            any(
+                _operation_replay_identity(existing) == identity
+                for existing in self._pending_operations.values()
+            )
+            or any(
+                _operation_replay_identity(existing) == identity
+                for existing in self._received_operations.values()
+            )
+            or any(
+                _operation_replay_identity_from_key(key) == identity
+                for key in self._terminal_operation_tombstones
+            )
+        )
+
+    def _ensure_terminal_operation_tombstone_capacity(
+        self, receipt: OperationReceipt, *, now: int
+    ) -> None:
+        self._prune_terminal_operation_tombstones(now=now)
+        key = _operation_replay_key(receipt)
+        if (
+            key in self._terminal_operation_tombstones
+            or len(self._terminal_operation_tombstones)
+            >= _MAX_TERMINAL_OPERATION_TOMBSTONES
+        ):
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+
+    def _remember_terminal_operation(
+        self, receipt: OperationReceipt, *, now: int
+    ) -> None:
+        self._ensure_terminal_operation_tombstone_capacity(receipt, now=now)
+        self._terminal_operation_tombstones[_operation_replay_key(receipt)] = (
+            receipt.binding.expires_at
+        )
+
+    def _prune_terminal_operation_tombstones(self, *, now: int) -> None:
+        expired = [
+            key
+            for key, expires_at in self._terminal_operation_tombstones.items()
+            if expires_at <= now
+        ]
+        for key in expired:
+            del self._terminal_operation_tombstones[key]
+
     def _ensure_open(self) -> None:
         if self._closed or self._read_fd < 0 or self._write_fd < 0:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
@@ -1122,6 +1185,34 @@ def _operation_receipt(
         envelope_hash=host_envelopes.envelope_hash(normalized, now=now),
         binding=binding,
     )
+
+
+def _operation_replay_key(
+    receipt: OperationReceipt,
+) -> tuple[str, str, str, str, str, str]:
+    """Retain only opaque operation, assignment, context, and envelope identities."""
+
+    return (
+        receipt.kind,
+        receipt.task_id,
+        receipt.correlation_id,
+        receipt.binding.assignment_token,
+        receipt.binding.dispatch_context_hash,
+        receipt.envelope_hash,
+    )
+
+
+def _operation_replay_identity(
+    receipt: OperationReceipt,
+) -> tuple[str, str, str, str, str]:
+    key = _operation_replay_key(receipt)
+    return key[:-1]
+
+
+def _operation_replay_identity_from_key(
+    key: tuple[str, str, str, str, str, str],
+) -> tuple[str, str, str, str, str]:
+    return key[:-1]
 
 
 def _normalize_operation_receipt(value: OperationReceipt, *, now: int) -> OperationReceipt:

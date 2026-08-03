@@ -49,11 +49,12 @@ _MAX_ARTIFACT_REFS: Final = 16
 _MAX_DIGEST_REFS: Final = 32
 _MAX_RISKS: Final = 8
 _FORBIDDEN_TEXT_CHARACTERS: Final = frozenset(
-    {"$", "%", "=", "{", "}", "[", "]", "\\", "`", "<", ">", "(", ")"}
+    {"$", "%", "=", "{", "}", "[", "]", "\\", "/", "`", "<", ">", "(", ")"}
 )
 _FORBIDDEN_TEXT = re.compile(
-    r"(?i)(?:\b(?:bearer|authorization|api[_-]?key|secret|transcript|"
-    r"conversation|chat)\b|\b(?:os\.environ|process\.env)\b|"
+    r"(?i)(?:\b(?:bearer|authorization|api[_-]?key|secret|capability|proof|"
+    r"token|credential|transcript|conversation|chat)\b|"
+    r"\b(?:os\.environ|process\.env)\b|"
     r"\b(?:user|assistant|system)\s*:|"
     r"\b(?:export|set)\s+[A-Za-z_][A-Za-z0-9_]*=|"
     r"\b[A-Z][A-Z0-9_]{2,}=|(?:[A-Za-z]:[\\/]|\\\\|^/)|"

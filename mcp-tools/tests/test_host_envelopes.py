@@ -237,6 +237,50 @@ def test_envelope_rejects_transcript_bearer_environment_paths_source_and_long_te
     assert caught.value.code == "HOST_ENVELOPE_INVALID"
 
 
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    [
+        ("coordinator_assignment", "assignment"),
+        ("coordinator_assignment", "context"),
+        ("worker_terminal_result", "result"),
+        ("worker_terminal_result", "risk.detail"),
+        ("peer_evidence_handoff", "dependency"),
+        ("peer_evidence_handoff", "evidence"),
+    ],
+)
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "read /private/host/file.txt",
+        "capability private-value",
+        "proof private-value",
+        "token private-value",
+    ],
+)
+def test_envelope_rejects_sensitive_text_in_each_permitted_text_field(
+    kind: str, field: str, unsafe_text: str
+) -> None:
+    module = _envelopes()
+    if kind == "coordinator_assignment":
+        payload = _assignment_payload()
+    elif kind == "worker_terminal_result":
+        payload = _terminal_payload()
+    else:
+        payload = _peer_payload()
+
+    if field == "assignment":
+        payload["assignment"] = unsafe_text
+    elif field == "risk.detail":
+        payload["risk"] = [{"code": "none", "detail": unsafe_text}]
+    else:
+        payload[field] = [unsafe_text]
+
+    with pytest.raises(module.HostEnvelopeError) as caught:
+        _render(module, kind, payload)
+
+    assert caught.value.code == "HOST_ENVELOPE_INVALID"
+
+
 def test_envelope_rejects_collection_limit_overruns() -> None:
     module = _envelopes()
     cases = []
@@ -378,6 +422,72 @@ def test_private_bridge_capability_and_operation_packets_are_hash_bound() -> Non
             now=_NOW,
             expected=terminal_expectation,
         ) == terminal
+    finally:
+        child.close()
+        host.close()
+
+
+@pytest.mark.parametrize("replay_mode", ["exact", "rebound"])
+def test_private_bridge_rejects_post_terminal_operation_replay(
+    replay_mode: str,
+) -> None:
+    module = _envelopes()
+    child, host = _pipe_pair()
+    assignment = _render(module, "coordinator_assignment", _assignment_payload())
+    try:
+        first_sent = child.send_operation(envelope=assignment, now=_NOW)
+        first_received = host.receive_operation(now=_NOW)
+        terminal = _render(
+            module,
+            "worker_terminal_result",
+            _terminal_payload(
+                correlation_id=first_received.correlation_id,
+                predecessor_hash=first_received.envelope_hash,
+            ),
+        )
+        host.send_terminal_result(
+            envelope=terminal, predecessor=first_received, now=_NOW
+        )
+        assert child.receive_terminal_result(predecessor=first_sent, now=_NOW) == terminal
+
+        replay_assignment = assignment
+        if replay_mode == "rebound":
+            replay_binding = module.EnvelopeBinding(
+                task_id=_TASK_ID,
+                lease_epoch=7,
+                assignment_token=_TOKEN,
+                dispatch_context_hash=_CONTEXT_HASH,
+                route_hash="sha256:" + "f" * 64,
+                expires_at=_NOW + 60,
+            )
+            replay_assignment = module.render_envelope(
+                kind="coordinator_assignment",
+                binding=replay_binding,
+                payload=_assignment_payload(),
+                now=_NOW,
+            )
+
+        with pytest.raises(HostBridgeError) as local_replay:
+            child.send_operation(envelope=replay_assignment, now=_NOW)
+        assert local_replay.value.code == "HOST_BRIDGE_ENVELOPE_INVALID"
+        assert child.is_available is True
+        assert host.is_available is True
+
+        _inject_authenticated_frame(
+            child,
+            kind="operation_request",
+            action_id=_TASK_ID,
+            payload={
+                "schema": "2718lab-devkit/host-operation-request-v1",
+                "correlation_id": replay_assignment["payload"]["correlation_id"],
+                "envelope": replay_assignment,
+                "envelope_hash": module.envelope_hash(replay_assignment, now=_NOW),
+            },
+        )
+        with pytest.raises(HostBridgeError) as remote_replay:
+            host.receive_operation(now=_NOW)
+        assert remote_replay.value.code == "HOST_BRIDGE_ENVELOPE_INVALID"
+        assert host.is_available is False
     finally:
         child.close()
         host.close()
