@@ -283,8 +283,10 @@ class HostSession:
         self._has_fresh_quota = False
         self._fresh_quota: HostQuotaFacts | None = None
         self._fresh_quota_issued_at: float | None = None
+        self._fresh_quota_valid_until: float | None = None
         self._compiler_owner = object()
         self._clock = clock
+        self._last_trusted_clock: float | None = None
         try:
             self._quota_expectation = _normalize_quota_expectation(quota_expectation)
         except (TypeError, ValueError):
@@ -360,6 +362,7 @@ class HostSession:
             self._has_fresh_quota = False
             self._fresh_quota = None
             self._fresh_quota_issued_at = None
+            self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
             self._compiler_material_tokens.clear()
         if self._bridge is not None:
@@ -385,16 +388,25 @@ class HostSession:
             self._burned_preparation_ids.add(preparation_id)
             quota = self._fresh_quota
             issued_at = self._fresh_quota_issued_at
-            if not self.is_available or not self._has_fresh_quota or quota is None or issued_at is None:
+            valid_until = self._fresh_quota_valid_until
+            if (
+                not self.is_available
+                or not self._has_fresh_quota
+                or quota is None
+                or issued_at is None
+                or valid_until is None
+            ):
                 return _NO_SAFE_WORK
             try:
-                now = _trusted_clock(self._clock)
+                now = self._read_trusted_clock()
             except (TypeError, ValueError):
                 return _NO_SAFE_WORK
             self._has_fresh_quota = False
             self._fresh_quota = None
             self._fresh_quota_issued_at = None
-            if now > issued_at + 120:
+            self._fresh_quota_valid_until = None
+            expires_at = min(issued_at + 120, valid_until)
+            if now >= expires_at:
                 return _NO_SAFE_WORK
             quota_binding_hash = _hash(
                 {
@@ -413,7 +425,7 @@ class HostSession:
                 owner=self._compiler_owner,
                 preparation_id=preparation_id,
                 issued_at=issued_at,
-                expires_at=issued_at + 120,
+                expires_at=expires_at,
                 quota_binding_hash=quota_binding_hash,
                 material_token=material_token,
             )
@@ -437,13 +449,13 @@ class HostSession:
                 verified_route_result_hashes=provider_material.verified_route_result_hashes,
                 verified_lease_scope_bindings=provider_material.verified_lease_scope_bindings,
                 issued_at=issued_at,
-                expires_at=issued_at + 120,
+                expires_at=expires_at,
                 snapshot_hash=quota.snapshot_hash,
                 snapshot_seq=quota.snapshot_seq,
                 quota_binding_hash=quota_binding_hash,
                 binding_hash=_hash(
                     {
-                        "expires_at": issued_at + 120,
+                        "expires_at": expires_at,
                         "issued_at": issued_at,
                         "preparation_id": preparation_id,
                         "quota_binding_hash": quota_binding_hash,
@@ -464,12 +476,22 @@ class HostSession:
         """Exchange a session-issued handle once, rejecting public substitutes."""
 
         with self._compiler_evidence_lock:
-            if self._closed or type(evidence) is not _CompilerEvidenceHandle:
+            if (
+                self._closed
+                or self._frozen
+                or type(evidence) is not _CompilerEvidenceHandle
+            ):
+                return _NO_SAFE_WORK
+            material = self._compiler_evidence.pop(evidence, None)
+            if material is None:
                 return _NO_SAFE_WORK
             try:
-                return self._compiler_evidence.pop(evidence)
-            except KeyError:
+                now = self._read_trusted_clock()
+            except (TypeError, ValueError):
                 return _NO_SAFE_WORK
+            if now >= material.expires_at:
+                return _NO_SAFE_WORK
+            return material
 
     def read_quota(self) -> HostQuotaFacts | str:
         """Return one fresh, fully bound quota fact set or ``NO_SAFE_WORK``."""
@@ -496,13 +518,19 @@ class HostSession:
                 snapshot=transport_snapshot,
                 attestation=attestation,
             )
+            issued_at = self._read_trusted_clock()
+            valid_until = _valid_until_timestamp(facts.snapshot)
         except Exception:
             self._record_unavailable((), _REASON_QUOTA_UNAVAILABLE)
             self._freeze()
             return _NO_SAFE_WORK
-        self._has_fresh_quota = True
-        self._fresh_quota = facts
-        self._fresh_quota_issued_at = _trusted_clock(self._clock)
+        with self._compiler_evidence_lock:
+            if self._closed or self._frozen or not self.is_available:
+                return _NO_SAFE_WORK
+            self._has_fresh_quota = True
+            self._fresh_quota = facts
+            self._fresh_quota_issued_at = issued_at
+            self._fresh_quota_valid_until = valid_until
         return facts
 
     def declare_routes(
@@ -707,7 +735,7 @@ class HostSession:
             snapshot
         ):
             raise ValueError("quota evidence is not request-bound")
-        evaluation_time = _utc_z(_trusted_clock(self._clock))
+        evaluation_time = _utc_z(self._read_trusted_clock())
         verified, _ = _verified_snapshot(
             snapshot,
             trusted_key_resolver=evidence.key_resolver,
@@ -788,9 +816,23 @@ class HostSession:
             self._has_fresh_quota = False
             self._fresh_quota = None
             self._fresh_quota_issued_at = None
+            self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
+
+    def _read_trusted_clock(self) -> float:
+        """Read one finite, non-regressing timestamp from the trusted host clock."""
+
+        with self._compiler_evidence_lock:
+            value = _trusted_clock(self._clock)
+            if (
+                self._last_trusted_clock is not None
+                and value < self._last_trusted_clock
+            ):
+                raise ValueError("trusted host clock regressed")
+            self._last_trusted_clock = value
+            return value
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -876,6 +918,22 @@ def _trusted_clock(clock: Callable[[], float]) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError("trusted host clock is invalid")
     return value
+
+
+def _valid_until_timestamp(snapshot: Mapping[str, Any]) -> float:
+    value = snapshot.get("valid_until_utc_z")
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError("signed quota validity is invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValueError("signed quota validity is invalid") from error
+    if parsed.tzinfo != UTC:
+        raise ValueError("signed quota validity is invalid")
+    timestamp = parsed.timestamp()
+    if not math.isfinite(timestamp):
+        raise ValueError("signed quota validity is invalid")
+    return timestamp
 
 
 def _utc_z(value: float) -> str:
