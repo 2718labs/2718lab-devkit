@@ -1394,10 +1394,10 @@ def test_host_session_compiler_evidence_rejects_untrusted_mutable_material_witho
         "terminal": {"trusted": True},
         "secret": raw_secret,
     }
-    provider_calls: list[str] = []
+    provider_calls: list[object] = []
     session, child, host = _fresh_quota_session_for_compiler_evidence(
         module,
-        provider=lambda preparation_id: provider_calls.append(preparation_id)
+        provider=lambda preparation: provider_calls.append(preparation)
         or mutable_material,
     )
 
@@ -1409,16 +1409,16 @@ def test_host_session_compiler_evidence_rejects_untrusted_mutable_material_witho
         host.close()
 
     assert result == "NO_SAFE_WORK"
-    assert provider_calls == ["prep-no-lineage"]
+    assert len(provider_calls) == 1
     assert raw_secret not in repr(result)
 
 
 def test_host_session_compiler_evidence_burns_preparation_after_provider_failure() -> None:
     module = _host_session_module()
-    provider_calls: list[str] = []
+    provider_calls: list[object] = []
 
-    def provider(preparation_id: str) -> object:
-        provider_calls.append(preparation_id)
+    def provider(preparation: object) -> object:
+        provider_calls.append(preparation)
         if len(provider_calls) == 1:
             raise RuntimeError("provider internal failure")
         return object()
@@ -1439,7 +1439,7 @@ def test_host_session_compiler_evidence_burns_preparation_after_provider_failure
         child.close()
         host.close()
 
-    assert provider_calls == ["prep-burned"]
+    assert len(provider_calls) == 1
 
 
 def test_host_session_compiler_evidence_freeze_clears_and_denies_preparation() -> None:

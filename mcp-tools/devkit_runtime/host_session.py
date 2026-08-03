@@ -142,7 +142,7 @@ class _CapabilityRecord:
 QuotaEvidenceResolver: TypeAlias = Callable[
     [str, Mapping[str, object]], HostQuotaAttestation | None
 ]
-CompilerEvidenceProvider: TypeAlias = Callable[[str], object]
+CompilerEvidenceProvider: TypeAlias = Callable[["_CompilerPreparation"], object]
 
 
 class _CompilerEvidenceHandle:
@@ -152,6 +152,114 @@ class _CompilerEvidenceHandle:
 
     def __repr__(self) -> str:
         return "<HostCompilerEvidenceHandle redacted>"
+
+
+@dataclass(frozen=True)
+class _CompilerInvocation:
+    """One redacted compiler invocation bound to its issuing host session."""
+
+    schema: str
+    preparation_id: str
+    request_hash: str
+    reasoning_effort: str
+    verified_route_result_hashes: tuple[str, ...]
+    verified_lease_scope_bindings: tuple[str, ...]
+    issued_at: float
+    expires_at: float
+    snapshot_hash: str
+    snapshot_seq: int
+    quota_binding_hash: str
+    binding_hash: str
+    _owner: object = field(repr=False, compare=False)
+
+
+class _CompilerPreparation:
+    """Provider-only capability for creating one exact private invocation."""
+
+    __slots__ = (
+        "_owner",
+        "_preparation_id",
+        "_quota",
+        "_issued_at",
+        "_expires_at",
+        "_bound",
+    )
+
+    def __init__(
+        self,
+        *,
+        owner: object,
+        preparation_id: str,
+        quota: HostQuotaFacts,
+        issued_at: float,
+        expires_at: float,
+    ) -> None:
+        self._owner = owner
+        self._preparation_id = preparation_id
+        self._quota = quota
+        self._issued_at = issued_at
+        self._expires_at = expires_at
+        self._bound = False
+
+    def bind(
+        self,
+        *,
+        request_hash: str,
+        reasoning_effort: str,
+        verified_route_result_hashes: tuple[str, ...],
+        verified_lease_scope_bindings: tuple[str, ...],
+    ) -> _CompilerInvocation:
+        """Return the sole immutable material form a provider may create."""
+
+        if self._bound:
+            raise ValueError("compiler preparation was already bound")
+        self._bound = True
+        if (
+            not _is_hash(request_hash)
+            or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
+            or not _strict_hash_tuple(verified_route_result_hashes)
+            or not _strict_hash_tuple(verified_lease_scope_bindings)
+        ):
+            raise ValueError("compiler invocation binding is invalid")
+        quota_binding_hash = _hash(
+            {
+                "account_id_hash": self._quota.account_id_hash,
+                "main_limit_id": self._quota.main_limit_id,
+                "request_id": self._quota.request_id,
+                "snapshot_hash": self._quota.snapshot_hash,
+                "snapshot_seq": self._quota.snapshot_seq,
+                "source_id_hash": self._quota.source_id_hash,
+                "spark_limit_id": self._quota.spark_limit_id,
+            }
+        )
+        binding_hash = _hash(
+            {
+                "expires_at": self._expires_at,
+                "issued_at": self._issued_at,
+                "preparation_id": self._preparation_id,
+                "quota_binding_hash": quota_binding_hash,
+                "reasoning_effort": reasoning_effort,
+                "request_hash": request_hash,
+                "route_result_hashes": verified_route_result_hashes,
+                "schema": "2718lab-devkit/compiler-invocation-v1",
+                "lease_scope_bindings": verified_lease_scope_bindings,
+            }
+        )
+        return _CompilerInvocation(
+            schema="2718lab-devkit/compiler-invocation-v1",
+            preparation_id=self._preparation_id,
+            request_hash=request_hash,
+            reasoning_effort=reasoning_effort,
+            verified_route_result_hashes=verified_route_result_hashes,
+            verified_lease_scope_bindings=verified_lease_scope_bindings,
+            issued_at=self._issued_at,
+            expires_at=self._expires_at,
+            snapshot_hash=self._quota.snapshot_hash,
+            snapshot_seq=self._quota.snapshot_seq,
+            quota_binding_hash=quota_binding_hash,
+            binding_hash=binding_hash,
+            _owner=self._owner,
+        )
 
 
 class HostSession:
@@ -172,9 +280,12 @@ class HostSession:
             compiler_evidence_provider if callable(compiler_evidence_provider) else None
         )
         self._compiler_evidence_lock = RLock()
-        self._compiler_evidence: dict[_CompilerEvidenceHandle, object] = {}
+        self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
         self._burned_preparation_ids: set[str] = set()
         self._has_fresh_quota = False
+        self._fresh_quota: HostQuotaFacts | None = None
+        self._fresh_quota_issued_at: float | None = None
+        self._compiler_owner = object()
         self._clock = clock
         try:
             self._quota_expectation = _normalize_quota_expectation(quota_expectation)
@@ -249,6 +360,8 @@ class HostSession:
             self._closed = True
             self._frozen = True
             self._has_fresh_quota = False
+            self._fresh_quota = None
+            self._fresh_quota_issued_at = None
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -271,15 +384,40 @@ class HostSession:
             if preparation_id in self._burned_preparation_ids:
                 return _NO_SAFE_WORK
             self._burned_preparation_ids.add(preparation_id)
-            if not self.is_available or not self._has_fresh_quota:
+            quota = self._fresh_quota
+            issued_at = self._fresh_quota_issued_at
+            if not self.is_available or not self._has_fresh_quota or quota is None or issued_at is None:
                 return _NO_SAFE_WORK
             try:
-                provider(preparation_id)
+                now = _trusted_clock(self._clock)
+            except (TypeError, ValueError):
+                return _NO_SAFE_WORK
+            self._has_fresh_quota = False
+            self._fresh_quota = None
+            self._fresh_quota_issued_at = None
+            if now > issued_at + 120:
+                return _NO_SAFE_WORK
+            try:
+                material = provider(
+                    _CompilerPreparation(
+                        owner=self._compiler_owner,
+                        preparation_id=preparation_id,
+                        quota=quota,
+                        issued_at=issued_at,
+                        expires_at=issued_at + 120,
+                    )
+                )
             except Exception:
                 return _NO_SAFE_WORK
-            # No typed, session-owned compiler material exists yet.  A provider
-            # result is therefore untrusted mutable input, even behind a handle.
-            return _NO_SAFE_WORK
+            if (
+                type(material) is not _CompilerInvocation
+                or material._owner is not self._compiler_owner
+                or material.preparation_id != preparation_id
+            ):
+                return _NO_SAFE_WORK
+            evidence = _CompilerEvidenceHandle()
+            self._compiler_evidence[evidence] = material
+            return evidence
 
     def consume_compiler_evidence(self, evidence: object) -> object | str:
         """Exchange a session-issued handle once, rejecting public substitutes."""
@@ -322,6 +460,8 @@ class HostSession:
             self._freeze()
             return _NO_SAFE_WORK
         self._has_fresh_quota = True
+        self._fresh_quota = facts
+        self._fresh_quota_issued_at = _trusted_clock(self._clock)
         return facts
 
     def declare_routes(
@@ -605,6 +745,8 @@ class HostSession:
         with self._compiler_evidence_lock:
             self._frozen = True
             self._has_fresh_quota = False
+            self._fresh_quota = None
+            self._fresh_quota_issued_at = None
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -642,6 +784,17 @@ def _required_nonnegative_int(value: object) -> int:
     if type(value) is not int or value < 0:
         raise ValueError("expected non-negative integer")
     return value
+
+
+def _strict_hash_tuple(value: object) -> bool:
+    return (
+        type(value) is tuple
+        and bool(value)
+        and len(value) <= 16
+        and all(_is_hash(item) for item in value)
+        and tuple(sorted(value)) == value
+        and len(set(value)) == len(value)
+    )
 
 
 def _normalize_quota_expectation(
