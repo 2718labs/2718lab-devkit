@@ -160,6 +160,15 @@ class _CompilerMaterialToken:
     __slots__ = ()
 
 
+class _CompilerProviderMaterial:
+    """Opaque zero-field acknowledgement emitted only by ``bind``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<HostCompilerProviderMaterial redacted>"
+
+
 @dataclass(frozen=True)
 class _CompilerInvocation:
     """One redacted compiler invocation bound to its issuing host session."""
@@ -190,6 +199,7 @@ class _CompilerPreparation:
         "_expires_at",
         "_quota_binding_hash",
         "_material_token",
+        "_register_material",
         "_bound_material",
     )
 
@@ -202,6 +212,7 @@ class _CompilerPreparation:
         expires_at: float,
         quota_binding_hash: str,
         material_token: _CompilerMaterialToken,
+        register_material: Callable[..., _CompilerProviderMaterial],
     ) -> None:
         self._owner = owner
         self._preparation_id = preparation_id
@@ -209,7 +220,8 @@ class _CompilerPreparation:
         self._expires_at = expires_at
         self._quota_binding_hash = quota_binding_hash
         self._material_token = material_token
-        self._bound_material: _CompilerInvocation | None = None
+        self._register_material = register_material
+        self._bound_material: _CompilerProviderMaterial | None = None
 
     def bind(
         self,
@@ -218,8 +230,8 @@ class _CompilerPreparation:
         reasoning_effort: str,
         verified_route_result_hashes: tuple[str, ...],
         verified_lease_scope_bindings: tuple[str, ...],
-    ) -> _CompilerInvocation:
-        """Return the sole immutable material form a provider may create."""
+    ) -> _CompilerProviderMaterial:
+        """Register immutable facts and return the sole opaque provider material."""
 
         if self._bound_material is not None:
             raise ValueError("compiler preparation was already bound")
@@ -230,33 +242,14 @@ class _CompilerPreparation:
             or not _strict_hash_tuple(verified_lease_scope_bindings)
         ):
             raise ValueError("compiler invocation binding is invalid")
-        material = _CompilerInvocation(
-            schema="2718lab-devkit/compiler-invocation-v1",
-            preparation_id=self._preparation_id,
+        material = self._register_material(
             request_hash=request_hash,
             reasoning_effort=reasoning_effort,
             verified_route_result_hashes=verified_route_result_hashes,
             verified_lease_scope_bindings=verified_lease_scope_bindings,
-            issued_at=self._issued_at,
-            expires_at=self._expires_at,
-            snapshot_hash="",
-            snapshot_seq=0,
-            quota_binding_hash=self._quota_binding_hash,
-            binding_hash="",
-            _owner=self._owner,
-            _material_token=self._material_token,
         )
         self._bound_material = material
         return material
-
-    def accepts(self, material: object) -> bool:
-        """Accept only the exact material emitted by this preparation."""
-
-        return (
-            material is self._bound_material
-            and type(material) is _CompilerInvocation
-            and material._material_token is self._material_token
-        )
 
 
 class HostSession:
@@ -278,6 +271,9 @@ class HostSession:
         )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
+        self._compiler_materials: dict[
+            _CompilerProviderMaterial, _CompilerInvocation
+        ] = {}
         self._compiler_material_tokens: set[_CompilerMaterialToken] = set()
         self._burned_preparation_ids: set[str] = set()
         self._has_fresh_quota = False
@@ -364,6 +360,7 @@ class HostSession:
             self._fresh_quota_issued_at = None
             self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
+            self._compiler_materials.clear()
             self._compiler_material_tokens.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -419,8 +416,32 @@ class HostSession:
                     "spark_limit_id": quota.spark_limit_id,
                 }
             )
+            snapshot_hash = quota.snapshot_hash
+            snapshot_seq = quota.snapshot_seq
             material_token = _CompilerMaterialToken()
             self._compiler_material_tokens.add(material_token)
+
+            def register_material(
+                *,
+                request_hash: str,
+                reasoning_effort: str,
+                verified_route_result_hashes: tuple[str, ...],
+                verified_lease_scope_bindings: tuple[str, ...],
+            ) -> _CompilerProviderMaterial:
+                return self._register_compiler_material(
+                    material_token=material_token,
+                    preparation_id=preparation_id,
+                    issued_at=issued_at,
+                    expires_at=expires_at,
+                    snapshot_hash=snapshot_hash,
+                    snapshot_seq=snapshot_seq,
+                    quota_binding_hash=quota_binding_hash,
+                    request_hash=request_hash,
+                    reasoning_effort=reasoning_effort,
+                    verified_route_result_hashes=verified_route_result_hashes,
+                    verified_lease_scope_bindings=verified_lease_scope_bindings,
+                )
+
             preparation = _CompilerPreparation(
                 owner=self._compiler_owner,
                 preparation_id=preparation_id,
@@ -428,49 +449,101 @@ class HostSession:
                 expires_at=expires_at,
                 quota_binding_hash=quota_binding_hash,
                 material_token=material_token,
+                register_material=register_material,
             )
             try:
                 provider_material = provider(preparation)
             except Exception:
-                self._compiler_material_tokens.discard(material_token)
+                self._discard_compiler_material(material_token)
                 return _NO_SAFE_WORK
             if (
-                material_token not in self._compiler_material_tokens
-                or not preparation.accepts(provider_material)
+                self._closed
+                or self._frozen
+                or not self.is_available
+                or material_token not in self._compiler_material_tokens
+                or type(provider_material) is not _CompilerProviderMaterial
             ):
-                self._compiler_material_tokens.discard(material_token)
+                self._discard_compiler_material(material_token)
                 return _NO_SAFE_WORK
-            self._compiler_material_tokens.remove(material_token)
-            material = _CompilerInvocation(
-                schema="2718lab-devkit/compiler-invocation-v1",
-                preparation_id=preparation_id,
-                request_hash=provider_material.request_hash,
-                reasoning_effort=provider_material.reasoning_effort,
-                verified_route_result_hashes=provider_material.verified_route_result_hashes,
-                verified_lease_scope_bindings=provider_material.verified_lease_scope_bindings,
-                issued_at=issued_at,
-                expires_at=expires_at,
-                snapshot_hash=quota.snapshot_hash,
-                snapshot_seq=quota.snapshot_seq,
-                quota_binding_hash=quota_binding_hash,
-                binding_hash=_hash(
-                    {
-                        "expires_at": expires_at,
-                        "issued_at": issued_at,
-                        "preparation_id": preparation_id,
-                        "quota_binding_hash": quota_binding_hash,
-                        "reasoning_effort": provider_material.reasoning_effort,
-                        "request_hash": provider_material.request_hash,
-                        "route_result_hashes": provider_material.verified_route_result_hashes,
-                        "schema": "2718lab-devkit/compiler-invocation-v1",
-                        "lease_scope_bindings": provider_material.verified_lease_scope_bindings,
-                    }
-                ),
-                _owner=self._compiler_owner,
-            )
+            material = self._compiler_materials.pop(provider_material, None)
+            if (
+                material is None
+                or material._owner is not self._compiler_owner
+                or material._material_token is not material_token
+            ):
+                self._discard_compiler_material(material_token)
+                return _NO_SAFE_WORK
+            self._discard_compiler_material(material_token)
             evidence = _CompilerEvidenceHandle()
             self._compiler_evidence[evidence] = material
             return evidence
+
+    def _register_compiler_material(
+        self,
+        *,
+        material_token: _CompilerMaterialToken,
+        preparation_id: str,
+        issued_at: float,
+        expires_at: float,
+        snapshot_hash: str,
+        snapshot_seq: int,
+        quota_binding_hash: str,
+        request_hash: str,
+        reasoning_effort: str,
+        verified_route_result_hashes: tuple[str, ...],
+        verified_lease_scope_bindings: tuple[str, ...],
+    ) -> _CompilerProviderMaterial:
+        """Store canonical facts before an untrusted provider can mutate its marker."""
+
+        if (
+            self._closed
+            or self._frozen
+            or not self.is_available
+            or material_token not in self._compiler_material_tokens
+            or not _is_hash(request_hash)
+            or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
+            or not _strict_hash_tuple(verified_route_result_hashes)
+            or not _strict_hash_tuple(verified_lease_scope_bindings)
+        ):
+            raise ValueError("compiler invocation binding is unavailable")
+        material = _CompilerProviderMaterial()
+        self._compiler_materials[material] = _CompilerInvocation(
+            schema="2718lab-devkit/compiler-invocation-v1",
+            preparation_id=preparation_id,
+            request_hash=request_hash,
+            reasoning_effort=reasoning_effort,
+            verified_route_result_hashes=verified_route_result_hashes,
+            verified_lease_scope_bindings=verified_lease_scope_bindings,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            snapshot_hash=snapshot_hash,
+            snapshot_seq=snapshot_seq,
+            quota_binding_hash=quota_binding_hash,
+            binding_hash=_hash(
+                {
+                    "expires_at": expires_at,
+                    "issued_at": issued_at,
+                    "preparation_id": preparation_id,
+                    "quota_binding_hash": quota_binding_hash,
+                    "reasoning_effort": reasoning_effort,
+                    "request_hash": request_hash,
+                    "route_result_hashes": verified_route_result_hashes,
+                    "schema": "2718lab-devkit/compiler-invocation-v1",
+                    "lease_scope_bindings": verified_lease_scope_bindings,
+                },
+            ),
+            _owner=self._compiler_owner,
+            _material_token=material_token,
+        )
+        return material
+
+    def _discard_compiler_material(self, material_token: _CompilerMaterialToken) -> None:
+        """Invalidate one pending binding and every registry entry it owns."""
+
+        self._compiler_material_tokens.discard(material_token)
+        for material, invocation in tuple(self._compiler_materials.items()):
+            if invocation._material_token is material_token:
+                del self._compiler_materials[material]
 
     def consume_compiler_evidence(self, evidence: object) -> object | str:
         """Exchange a session-issued handle once, rejecting public substitutes."""
@@ -818,6 +891,8 @@ class HostSession:
             self._fresh_quota_issued_at = None
             self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
+            self._compiler_materials.clear()
+            self._compiler_material_tokens.clear()
         if self._bridge is not None:
             self._bridge.close()
 

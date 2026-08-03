@@ -1780,6 +1780,145 @@ def test_host_session_compiler_preparation_never_exposes_raw_quota_facts() -> No
     assert exposed == {}
 
 
+def test_host_session_compiler_evidence_ignores_post_bind_provider_mutation() -> None:
+    """Provider-side mutation after bind cannot change canonical invocation facts."""
+
+    module = _host_session_module()
+    original_request_hash = _HASH_PREFIX + "1" * 64
+    mutated_request_hash = _HASH_PREFIX + "9" * 64
+    provider_materials: list[object] = []
+
+    def provider(preparation: object) -> object:
+        material = preparation.bind(
+            request_hash=original_request_hash,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+        try:
+            object.__setattr__(material, "request_hash", mutated_request_hash)
+        except AttributeError:
+            pass
+        provider_materials.append(material)
+        return material
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        handle = session.prepare_compiler_evidence(preparation_id="prep-post-bind")
+        invocation = session.consume_compiler_evidence(handle)
+    finally:
+        child.close()
+        host.close()
+
+    assert handle != "NO_SAFE_WORK"
+    assert invocation.request_hash == original_request_hash
+    assert len(provider_materials) == 1
+    assert not hasattr(provider_materials[0], "__dict__")
+    assert not hasattr(provider_materials[0], "request_hash")
+
+
+def test_host_session_compiler_evidence_rejects_forgery_with_preparation_owner_token() -> (
+    None
+):
+    """Preparation-owned implementation identities cannot register forged material."""
+
+    module = _host_session_module()
+
+    def provider(preparation: object) -> object:
+        forged = module._CompilerInvocation(
+            schema="2718lab-devkit/compiler-invocation-v1",
+            preparation_id="prep-owner-token-forgery",
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+            issued_at=_NOW,
+            expires_at=_NOW + 120,
+            snapshot_hash=_HASH_PREFIX + "4" * 64,
+            snapshot_seq=1,
+            quota_binding_hash=_HASH_PREFIX + "5" * 64,
+            binding_hash=_HASH_PREFIX + "6" * 64,
+            _owner=preparation._owner,
+            _material_token=preparation._material_token,
+        )
+        preparation._bound_material = forged
+        return forged
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        result = session.prepare_compiler_evidence(
+            preparation_id="prep-owner-token-forgery"
+        )
+        registry = dict(session._compiler_evidence)
+        pending_tokens = set(session._compiler_material_tokens)
+    finally:
+        child.close()
+        host.close()
+
+    assert result == "NO_SAFE_WORK"
+    assert registry == {}
+    assert pending_tokens == set()
+
+
+def test_host_session_compiler_evidence_freeze_during_provider_clears_pending_material() -> (
+    None
+):
+    """A provider-triggered freeze cannot publish a handle or retain material state."""
+
+    module = _host_session_module()
+    issued: list[object] = []
+    session: object
+
+    def provider(preparation: object) -> object:
+        material = preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+        issued.append(material)
+        session._freeze()
+        return material
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        result = session.prepare_compiler_evidence(preparation_id="prep-provider-freeze")
+        assert result == "NO_SAFE_WORK"
+        state = {
+            "closed": session._closed,
+            "frozen": session._frozen,
+            "has_fresh_quota": session._has_fresh_quota,
+            "fresh_quota": session._fresh_quota,
+            "fresh_quota_issued_at": session._fresh_quota_issued_at,
+            "fresh_quota_valid_until": session._fresh_quota_valid_until,
+            "evidence": dict(session._compiler_evidence),
+            "materials": dict(session._compiler_materials),
+            "pending_tokens": set(session._compiler_material_tokens),
+        }
+    finally:
+        child.close()
+        host.close()
+
+    assert len(issued) == 1
+    assert state == {
+        "closed": False,
+        "frozen": True,
+        "has_fresh_quota": False,
+        "fresh_quota": None,
+        "fresh_quota_issued_at": None,
+        "fresh_quota_valid_until": None,
+        "evidence": {},
+        "materials": {},
+        "pending_tokens": set(),
+    }
+
+
 def test_host_session_compiler_evidence_handle_expires_at_now_plus_121() -> None:
     """A valid session-issued handle cannot be consumed after its 120-second TTL."""
 
