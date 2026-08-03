@@ -235,6 +235,10 @@ class ExternalBootstrapBatchItem:
     predecessor_hash: str
     quota_hash: str
     route_hash: str
+    index_hash: str
+    workflow_hash: str
+    task_hash: str
+    lease_hash: str
 
 
 @dataclass(frozen=True)
