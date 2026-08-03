@@ -624,7 +624,7 @@ class SQLiteStoreRoleEnvelopeSchemaTests(unittest.TestCase):
         fresh = SQLiteStore(fresh_database)
         self.addCleanup(legacy.close)
         self.addCleanup(fresh.close)
-        self.assertEqual(7, legacy.schema_version())
+        self.assertEqual(10, legacy.schema_version())
         expected_index = "idx_role_envelopes_envelope_hash"
         for store in (legacy, fresh):
             indexes = {
