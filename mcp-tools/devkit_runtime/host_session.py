@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from threading import RLock
 from types import MappingProxyType
 from typing import Any, Final, TypeAlias
 
@@ -141,6 +142,16 @@ class _CapabilityRecord:
 QuotaEvidenceResolver: TypeAlias = Callable[
     [str, Mapping[str, object]], HostQuotaAttestation | None
 ]
+CompilerEvidenceProvider: TypeAlias = Callable[[str], object]
+
+
+class _CompilerEvidenceHandle:
+    """Opaque session-issued reference for one compiler-evidence exchange."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<HostCompilerEvidenceHandle redacted>"
 
 
 class HostSession:
@@ -153,9 +164,15 @@ class HostSession:
         quota_evidence_resolver: QuotaEvidenceResolver,
         clock: Callable[[], float],
         quota_expectation: HostQuotaExpectation | None = None,
+        compiler_evidence_provider: CompilerEvidenceProvider | None = None,
     ) -> None:
         self._bridge = bridge
         self._quota_evidence_resolver = quota_evidence_resolver
+        self._compiler_evidence_provider = (
+            compiler_evidence_provider if callable(compiler_evidence_provider) else None
+        )
+        self._compiler_evidence_lock = RLock()
+        self._compiler_evidence: dict[_CompilerEvidenceHandle, object] = {}
         self._clock = clock
         try:
             self._quota_expectation = _normalize_quota_expectation(quota_expectation)
@@ -224,12 +241,47 @@ class HostSession:
     def close(self) -> None:
         """Close the owned private transport once; no session can be revived."""
 
-        if self._closed:
-            return
-        self._closed = True
-        self._frozen = True
+        with self._compiler_evidence_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._frozen = True
+            self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
+
+    def prepare_compiler_evidence(
+        self, *, preparation_id: str
+    ) -> _CompilerEvidenceHandle | str:
+        """Issue one opaque handle for compiler facts held only by this session."""
+
+        with self._compiler_evidence_lock:
+            provider = self._compiler_evidence_provider
+            if (
+                self._closed
+                or provider is None
+                or not isinstance(preparation_id, str)
+                or _IDENTIFIER.fullmatch(preparation_id) is None
+            ):
+                return _NO_SAFE_WORK
+            try:
+                facts = provider(preparation_id)
+            except Exception:
+                return _NO_SAFE_WORK
+            handle = _CompilerEvidenceHandle()
+            self._compiler_evidence[handle] = facts
+            return handle
+
+    def consume_compiler_evidence(self, evidence: object) -> object | str:
+        """Exchange a session-issued handle once, rejecting public substitutes."""
+
+        with self._compiler_evidence_lock:
+            if self._closed or type(evidence) is not _CompilerEvidenceHandle:
+                return _NO_SAFE_WORK
+            try:
+                return self._compiler_evidence.pop(evidence)
+            except KeyError:
+                return _NO_SAFE_WORK
 
     def read_quota(self) -> HostQuotaFacts | str:
         """Return one fresh, fully bound quota fact set or ``NO_SAFE_WORK``."""
