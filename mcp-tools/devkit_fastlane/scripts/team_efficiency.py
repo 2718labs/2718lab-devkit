@@ -36,6 +36,11 @@ MAX_FAST_LANE_ROUTE_REQUEST_BYTES = 32 * 1024
 MAX_FAST_LANE_HOST_STATUS_BYTES = 3 * 1024 * 1024
 FAST_LANE_SLOT_IDS = ("slot-1", "slot-2", "slot-3")
 MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS = 9
+MAX_FAST_LANE_INDEX_EVIDENCE_RECORDS = (
+    len(FAST_LANE_SLOT_IDS) + MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS
+)
+MAX_FAST_LANE_INDEX_EVIDENCE_TTL_SECONDS = 120
+MAX_FAST_LANE_INDEX_EVIDENCE_MAX_AGE_SECONDS = 120
 FAST_LANE_REASONING_EFFORTS = frozenset(
     {"low", "medium", "high", "xhigh", "max", "ultra"}
 )
@@ -51,6 +56,7 @@ _TASK_ID = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|FLR1-[0-9a-f]{24})$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _GIT_ID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _SHA256 = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+_UTC_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _PATH_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _ENDPOINT = re.compile(
@@ -498,6 +504,7 @@ _FAST_LANE_EXTERNAL_ASSIGNMENT_FIELDS = frozenset(
     {
         "schema",
         "assignment_id",
+        "assignment_token",
         "action",
         "session_state",
         "worktree_required",
@@ -509,6 +516,8 @@ _FAST_LANE_EXTERNAL_ASSIGNMENT_FIELDS = frozenset(
         "route",
         "host_dispatch",
         "index_context",
+        "index_evidence",
+        "workspace_input_snapshot_id",
         "context_hash",
         "lease_fencing_predecessor",
         "reason",
@@ -523,6 +532,23 @@ _FAST_LANE_HOST_DISPATCH_FIELDS = frozenset(
         "inherit_current_session_model",
         "require_explicit_route",
         "missing_route_action",
+    }
+)
+_FAST_LANE_INDEX_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema",
+        "task_id",
+        "role",
+        "assignment_token",
+        "dispatch_context_hash",
+        "index_context_hash",
+        "workspace_input_snapshot_id",
+        "query_trace_id",
+        "query_receipt_hash",
+        "redacted_artifact_hash",
+        "issued_at_utc_z",
+        "expires_at_utc_z",
+        "evidence_hash",
     }
 )
 _FAST_LANE_INDEX_CONTEXT_FIELDS = frozenset(
@@ -7424,6 +7450,138 @@ def _validated_fast_lane_index_context(
     return normalized
 
 
+def _fast_lane_utc_z(value: object, field: str) -> datetime:
+    text = _text(value, field, maximum=32)
+    if not _UTC_Z.fullmatch(text):
+        raise ValueError(f"{field} is invalid")
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError as error:
+        raise ValueError(f"{field} is invalid") from error
+
+
+def _fast_lane_trusted_index_evidence_hashes(
+    value: Iterable[str],
+) -> frozenset[str]:
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("trusted index evidence hashes must be iterable")
+    try:
+        values = list(value)
+    except TypeError as error:
+        raise TypeError("trusted index evidence hashes must be iterable") from error
+    if len(values) > MAX_FAST_LANE_INDEX_EVIDENCE_RECORDS:
+        raise ValueError("trusted index evidence hashes exceed their bound")
+    hashes = [
+        _hash(item, f"trusted index evidence hashes[{index}]")
+        for index, item in enumerate(values)
+    ]
+    if len(set(hashes)) != len(hashes):
+        raise ValueError("trusted index evidence hashes contain duplicates")
+    return frozenset(hashes)
+
+
+def _validated_fast_lane_index_evidence(
+    value: object,
+    *,
+    trusted_hashes: frozenset[str],
+    evaluation_time: datetime,
+    field: str,
+) -> dict[str, Any]:
+    record = _mapping(value, field)
+    _exact_keys(record, _FAST_LANE_INDEX_EVIDENCE_FIELDS, field)
+    if record["schema"] != "index-evidence-v1":
+        raise ValueError("index evidence schema is invalid")
+    task_id = _task_id(record["task_id"], f"{field}.task_id")
+    role = _text(record["role"], f"{field}.role", maximum=32)
+    if role not in _FAST_LANE_ROLES:
+        raise ValueError("index evidence role is invalid")
+    issued_at_utc_z = _text(record["issued_at_utc_z"], f"{field}.issued_at_utc_z", maximum=32)
+    expires_at_utc_z = _text(
+        record["expires_at_utc_z"], f"{field}.expires_at_utc_z", maximum=32
+    )
+    issued = _fast_lane_utc_z(issued_at_utc_z, f"{field}.issued_at_utc_z")
+    expires = _fast_lane_utc_z(expires_at_utc_z, f"{field}.expires_at_utc_z")
+    if not issued <= evaluation_time < expires:
+        raise ValueError("index evidence is stale")
+    if (expires - issued).total_seconds() > MAX_FAST_LANE_INDEX_EVIDENCE_TTL_SECONDS:
+        raise ValueError("index evidence ttl exceeds its bound")
+    if (
+        evaluation_time - issued
+    ).total_seconds() > MAX_FAST_LANE_INDEX_EVIDENCE_MAX_AGE_SECONDS:
+        raise ValueError("index evidence age exceeds its bound")
+    normalized = {
+        "schema": record["schema"],
+        "task_id": task_id,
+        "role": role,
+        "assignment_token": _hash(
+            record["assignment_token"], f"{field}.assignment_token"
+        ),
+        "dispatch_context_hash": _hash(
+            record["dispatch_context_hash"], f"{field}.dispatch_context_hash"
+        ),
+        "index_context_hash": _hash(
+            record["index_context_hash"], f"{field}.index_context_hash"
+        ),
+        "workspace_input_snapshot_id": _hash(
+            record["workspace_input_snapshot_id"],
+            f"{field}.workspace_input_snapshot_id",
+        ),
+        "query_trace_id": _hash(record["query_trace_id"], f"{field}.query_trace_id"),
+        "query_receipt_hash": _hash(
+            record["query_receipt_hash"], f"{field}.query_receipt_hash"
+        ),
+        "redacted_artifact_hash": _hash(
+            record["redacted_artifact_hash"], f"{field}.redacted_artifact_hash"
+        ),
+        "issued_at_utc_z": issued_at_utc_z,
+        "expires_at_utc_z": expires_at_utc_z,
+    }
+    evidence_hash = _hash(record["evidence_hash"], f"{field}.evidence_hash")
+    if evidence_hash != _sha256_json(normalized):
+        raise ValueError("index evidence hash is invalid")
+    if evidence_hash not in trusted_hashes:
+        raise ValueError("index evidence is untrusted")
+    return {**normalized, "evidence_hash": evidence_hash}
+
+
+def _fast_lane_index_evidence_binding(
+    assignment: Mapping[str, Any], field: str
+) -> dict[str, str]:
+    task_id = _task_id(assignment["task_id"], f"{field}.task_id")
+    role = _text(assignment["role"], f"{field}.role", maximum=32)
+    if role not in _FAST_LANE_ROLES:
+        raise ValueError("index evidence assignment role is invalid")
+    assignment_token = _hash(
+        assignment["assignment_token"], f"{field}.assignment_token"
+    )
+    dispatch_context_hash = _hash(
+        assignment["context_hash"], f"{field}.context_hash"
+    )
+    workspace_input_snapshot_id = _hash(
+        assignment["workspace_input_snapshot_id"],
+        f"{field}.workspace_input_snapshot_id",
+    )
+    index_context = _validated_fast_lane_index_context(
+        assignment["index_context"], f"{field}.index_context"
+    )
+    if (
+        index_context["mode"] != "host_prepared"
+        or index_context["task_id"] != task_id
+        or index_context["role"] != role
+        or index_context["dispatch_context_hash"] != dispatch_context_hash
+        or index_context["input_snapshot_id"] != workspace_input_snapshot_id
+    ):
+        raise ValueError("index evidence assignment is not host prepared")
+    return {
+        "task_id": task_id,
+        "role": role,
+        "assignment_token": assignment_token,
+        "dispatch_context_hash": dispatch_context_hash,
+        "index_context_hash": index_context["context_hash"],
+        "workspace_input_snapshot_id": workspace_input_snapshot_id,
+    }
+
+
 def _fast_lane_assignment_output(
     validated: Mapping[str, Any], assignment: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -7547,7 +7705,6 @@ def _fast_lane_queue_item(
             "slot_id",
             "action",
             "assignment_epoch",
-            "assignment_token",
             "dispatch_receipt",
         }
     }
@@ -8432,6 +8589,9 @@ def _fast_lane_cross_session_projection(
             context_hash = _hash(
                 item["context_hash"], "external assignment.context_hash"
             )
+            assignment_token = _hash(
+                item["assignment_token"], "external assignment.assignment_token"
+            )
             route = {
                 "model": model,
                 "reasoning_effort": effort,
@@ -8460,10 +8620,16 @@ def _fast_lane_cross_session_projection(
             index_context = _validated_fast_lane_index_context(
                 item.get("index_context"), "external assignment.index_context"
             )
+            workspace_input_snapshot_id = _hash(
+                item["workspace_input_snapshot_id"],
+                "external assignment.workspace_input_snapshot_id",
+            )
             if (
                 index_context["task_id"] != task_id
                 or index_context["role"] != role
                 or index_context["dispatch_context_hash"] != context_hash
+                or index_context["input_snapshot_id"]
+                != workspace_input_snapshot_id
             ):
                 raise ValueError("external assignment index context is not bound")
             predecessor = {
@@ -8488,6 +8654,7 @@ def _fast_lane_cross_session_projection(
             )
             assignment = {
                 "schema": "team-efficiency/fast-lane-external-session-assignment-v1",
+                "assignment_token": assignment_token,
                 "action": "external_session_required",
                 "session_state": "not_created",
                 "worktree_required": True,
@@ -8499,6 +8666,8 @@ def _fast_lane_cross_session_projection(
                 "route": route,
                 "host_dispatch": _fast_lane_host_dispatch(model, effort),
                 "index_context": index_context,
+                "index_evidence": None,
+                "workspace_input_snapshot_id": workspace_input_snapshot_id,
                 "context_hash": context_hash,
                 "lease_fencing_predecessor": predecessor,
                 "reason": "local_capacity_exhausted",
@@ -8549,6 +8718,226 @@ def _apply_fast_lane_cross_session_projection(
     return updated
 
 
+def _fast_lane_index_evidence_fail_closed(result: Mapping[str, Any]) -> dict[str, Any]:
+    projection = _mapping(
+        result["cross_session_dispatch_projection"],
+        "cross-session dispatch projection",
+    )
+    blocked_policy = {
+        "schema": "team-efficiency/fast-lane-cross-session-policy-v1",
+        "selection_authority": "compiler",
+        "action": "stop",
+        "target": "none",
+        "llm_choice": False,
+    }
+    _exact_keys(
+        blocked_policy,
+        _FAST_LANE_CROSS_SESSION_DISPATCH_POLICY_FIELDS,
+        "cross-session dispatch policy",
+    )
+    blocked_projection = {
+        **projection,
+        "status": "blocked",
+        "dispatch_policy": blocked_policy,
+        "external_agent_count": 0,
+        "external_assignment_ids": [],
+        "assignments": [],
+        "reason_codes": ["index_evidence_invalid"],
+    }
+    blocked_projection["projection_hash"] = _sha256_json(
+        {
+            key: value
+            for key, value in blocked_projection.items()
+            if key != "projection_hash"
+        }
+    )
+    _exact_keys(
+        blocked_projection,
+        _FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS,
+        "cross-session dispatch projection",
+    )
+    main_lane = _mapping(result["main_lane"], "fast-lane main lane")
+    blocked = {
+        **result,
+        "status": "blocked",
+        "decision_code": "NO_SAFE_WORK",
+        "main_lane": {**main_lane, "next_action": None},
+        "assignments": [],
+        "ready_queue": [],
+        "review_queue": [],
+        "prewarm_queue": [],
+        "design_queue": [],
+        "idle_slots": _fast_lane_idle_slots("INDEX_EVIDENCE_INVALID"),
+        "cross_session_dispatch_projection": blocked_projection,
+    }
+    blocked["plan_hash"] = _sha256_json(
+        {key: value for key, value in blocked.items() if key != "plan_hash"}
+    )
+    _exact_keys(blocked, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    if len(_json_bytes(blocked)) > MAX_MANIFEST_BYTES:
+        raise ValueError("fast-lane plan exceeds its byte budget")
+    return blocked
+
+
+def _fast_lane_apply_index_evidence(
+    result: Mapping[str, Any],
+    *,
+    index_evidence: Sequence[Mapping[str, Any]] | None,
+    trusted_index_evidence_hashes: Iterable[str],
+    index_evaluation_time_utc_z: str | None,
+) -> dict[str, Any]:
+    assignments_value = result["assignments"]
+    if not isinstance(assignments_value, Sequence) or isinstance(
+        assignments_value, (str, bytes, bytearray)
+    ):
+        raise TypeError("fast-lane assignments are invalid")
+    assignments = [
+        _mapping(value, f"fast-lane assignments[{index}]")
+        for index, value in enumerate(assignments_value)
+    ]
+    projection = _mapping(
+        result["cross_session_dispatch_projection"],
+        "cross-session dispatch projection",
+    )
+    external_value = projection["assignments"]
+    if not isinstance(external_value, Sequence) or isinstance(
+        external_value, (str, bytes, bytearray)
+    ):
+        raise TypeError("external session assignments are invalid")
+    external_assignments = [
+        _mapping(value, f"external session assignments[{index}]")
+        for index, value in enumerate(external_value)
+    ]
+    expected: list[tuple[str, int, dict[str, str]]] = []
+    for index, assignment in enumerate(assignments):
+        if assignment.get("action") == "start":
+            expected.append(
+                (
+                    "local",
+                    index,
+                    _fast_lane_index_evidence_binding(
+                        assignment, f"fast-lane assignments[{index}]"
+                    ),
+                )
+            )
+    if projection["status"] == "external_session_required":
+        for index, assignment in enumerate(external_assignments):
+            if assignment.get("action") != "external_session_required":
+                raise ValueError("external index evidence assignment is invalid")
+            expected.append(
+                (
+                    "external",
+                    index,
+                    _fast_lane_index_evidence_binding(
+                        assignment, f"external session assignments[{index}]"
+                    ),
+                )
+            )
+    elif external_assignments:
+        raise ValueError("inactive external assignment is invalid")
+
+    if index_evidence is None:
+        records_value: list[Mapping[str, Any]] = []
+    elif not isinstance(index_evidence, Sequence) or isinstance(
+        index_evidence, (str, bytes, bytearray)
+    ):
+        raise TypeError("index evidence must be a list")
+    else:
+        records_value = list(index_evidence)
+    if len(records_value) > MAX_FAST_LANE_INDEX_EVIDENCE_RECORDS:
+        raise ValueError("index evidence exceeds its bound")
+    if not expected:
+        if records_value:
+            raise ValueError("index evidence is unknown")
+        return dict(result)
+    if index_evaluation_time_utc_z is None:
+        raise ValueError("index evidence evaluation time is missing")
+    evaluation_time = _fast_lane_utc_z(
+        index_evaluation_time_utc_z, "index evidence evaluation time"
+    )
+    trusted_hashes = _fast_lane_trusted_index_evidence_hashes(
+        trusted_index_evidence_hashes
+    )
+    if len(records_value) != len(expected):
+        raise ValueError("index evidence is incomplete")
+    records: dict[str, dict[str, Any]] = {}
+    for index, value in enumerate(records_value):
+        record = _validated_fast_lane_index_evidence(
+            value,
+            trusted_hashes=trusted_hashes,
+            evaluation_time=evaluation_time,
+            field=f"index evidence[{index}]",
+        )
+        token = record["assignment_token"]
+        if token in records:
+            raise ValueError("index evidence contains duplicate assignment tokens")
+        records[token] = record
+    expected_by_token: dict[str, tuple[str, int, dict[str, str]]] = {}
+    for expected_item in expected:
+        token = expected_item[2]["assignment_token"]
+        if token in expected_by_token:
+            raise ValueError("index evidence assignments contain duplicate tokens")
+        expected_by_token[token] = expected_item
+    if set(records) != set(expected_by_token):
+        raise ValueError("index evidence does not exactly bind executable assignments")
+    for token, (_, _, binding) in expected_by_token.items():
+        record = records[token]
+        if any(record[field] != value for field, value in binding.items()):
+            raise ValueError("index evidence is cross-bound")
+
+    bound_assignments = [dict(assignment) for assignment in assignments]
+    bound_external = [dict(assignment) for assignment in external_assignments]
+    for kind, index, binding in expected:
+        if kind == "local":
+            bound_assignments[index]["index_evidence"] = records[
+                binding["assignment_token"]
+            ]
+            continue
+        bound = {
+            **bound_external[index],
+            "index_evidence": records[binding["assignment_token"]],
+        }
+        bound["assignment_id"] = _sha256_json(
+            {key: value for key, value in bound.items() if key != "assignment_id"}
+        )
+        _exact_keys(
+            bound, _FAST_LANE_EXTERNAL_ASSIGNMENT_FIELDS, "external session assignment"
+        )
+        bound_external[index] = bound
+    bound_projection = {
+        **projection,
+        "external_agent_count": len(bound_external),
+        "external_assignment_ids": [
+            assignment["assignment_id"] for assignment in bound_external
+        ],
+        "assignments": bound_external,
+    }
+    bound_projection["projection_hash"] = _sha256_json(
+        {
+            key: value
+            for key, value in bound_projection.items()
+            if key != "projection_hash"
+        }
+    )
+    _exact_keys(
+        bound_projection,
+        _FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS,
+        "cross-session dispatch projection",
+    )
+    bound = {
+        **result,
+        "assignments": bound_assignments,
+        "cross_session_dispatch_projection": bound_projection,
+    }
+    bound["plan_hash"] = _sha256_json(
+        {key: value for key, value in bound.items() if key != "plan_hash"}
+    )
+    _exact_keys(bound, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    if len(_json_bytes(bound)) > MAX_MANIFEST_BYTES:
+        raise ValueError("fast-lane plan exceeds its byte budget")
+    return bound
+
+
 def compile_fast_lane(
     request: Mapping[str, Any],
     *,
@@ -8560,6 +8949,9 @@ def compile_fast_lane(
     quota_evaluation_time_utc_z: str | None = None,
     quota_verified_route_result_hashes: Iterable[str] = (),
     quota_verified_lease_scope_bindings: Iterable[str] = (),
+    index_evidence: Sequence[Mapping[str, Any]] | None = None,
+    trusted_index_evidence_hashes: Iterable[str] = (),
+    index_evaluation_time_utc_z: str | None = None,
 ) -> dict[str, Any]:
     activation = _fast_lane_activation(reasoning_effort, enable)
     status = (
@@ -8628,13 +9020,22 @@ def compile_fast_lane(
             quota_request=quota_request,
             quota_decision=decision,
         )
-    return _apply_fast_lane_cross_session_projection(
+    result = _apply_fast_lane_cross_session_projection(
         result,
         reference_result=reference_result,
         host_status=status,
         occupancy=occupancy,
         quota_evidence=quota_evidence,
     )
+    try:
+        return _fast_lane_apply_index_evidence(
+            result,
+            index_evidence=index_evidence,
+            trusted_index_evidence_hashes=trusted_index_evidence_hashes,
+            index_evaluation_time_utc_z=index_evaluation_time_utc_z,
+        )
+    except (KeyError, TypeError, ValueError):
+        return _fast_lane_index_evidence_fail_closed(result)
 
 
 def _read_json(path_text: str, *, maximum: int) -> Any:

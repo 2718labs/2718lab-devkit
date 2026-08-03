@@ -6,6 +6,7 @@ import copy
 import hashlib
 import hmac
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -1004,6 +1005,11 @@ class TeamEfficiencyTests(unittest.TestCase):
         reasoning_effort: str,
         enable: bool = False,
         host_status: dict[str, object] | None = None,
+        quota_request: dict[str, object] | None = None,
+        quota_trusted_key_resolver=None,
+        quota_evaluation_time_utc_z: str | None = None,
+        quota_verified_route_result_hashes=(),
+        quota_verified_lease_scope_bindings=(),
     ) -> dict[str, object]:
         default_status = self.fast_lane_host_status(helper, request)
         if host_status is None:
@@ -1013,12 +1019,261 @@ class TeamEfficiencyTests(unittest.TestCase):
             effective_status.setdefault(
                 "routing_context", default_status["routing_context"]
             )
+        index_evidence = self.fast_lane_index_evidence(
+            helper,
+            request,
+            host_status=effective_status,
+            reasoning_effort=reasoning_effort,
+            enable=enable,
+            quota_request=quota_request,
+            quota_trusted_key_resolver=quota_trusted_key_resolver,
+            quota_evaluation_time_utc_z=quota_evaluation_time_utc_z,
+            quota_verified_route_result_hashes=quota_verified_route_result_hashes,
+            quota_verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+        )
         return helper.compile_fast_lane(
             request,
             reasoning_effort=reasoning_effort,
             enable=enable,
             host_status=effective_status,
+            quota_request=quota_request,
+            quota_trusted_key_resolver=quota_trusted_key_resolver,
+            quota_evaluation_time_utc_z=quota_evaluation_time_utc_z,
+            quota_verified_route_result_hashes=quota_verified_route_result_hashes,
+            quota_verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+            index_evidence=index_evidence,
+            trusted_index_evidence_hashes={
+                str(record["evidence_hash"]) for record in index_evidence
+            },
+            index_evaluation_time_utc_z="2026-08-03T12:00:00Z",
         )
+
+    def compile_fast_lane_with_index_evidence(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        index_evidence: list[dict[str, object]],
+        trusted_index_evidence_hashes: set[str],
+        index_evaluation_time_utc_z: str,
+        reasoning_effort: str = "ultra",
+        enable: bool = False,
+    ) -> dict[str, object]:
+        """Call the compiler's host-only index-evidence ingress.
+
+        The compatibility branch exists only to make the first RED assert the
+        old compiler's unsafe behavior rather than turn a missing keyword-only
+        ingress into a test harness error.  The feature branch always invokes
+        the real compiler directly with the exact host inputs.
+        """
+
+        if "index_evidence" not in inspect.signature(
+            helper.compile_fast_lane
+        ).parameters:
+            return self.compile_fast_lane(
+                helper,
+                request,
+                reasoning_effort=reasoning_effort,
+                enable=enable,
+            )
+        return helper.compile_fast_lane(
+            request,
+            reasoning_effort=reasoning_effort,
+            enable=enable,
+            host_status=self.fast_lane_host_status(helper, request),
+            index_evidence=index_evidence,
+            trusted_index_evidence_hashes=trusted_index_evidence_hashes,
+            index_evaluation_time_utc_z=index_evaluation_time_utc_z,
+        )
+
+    def fast_lane_index_evidence_draft(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        host_status: dict[str, object] | None = None,
+        reasoning_effort: str = "ultra",
+        enable: bool = False,
+        quota_request: dict[str, object] | None = None,
+        quota_trusted_key_resolver=None,
+        quota_evaluation_time_utc_z: str | None = None,
+        quota_verified_route_result_hashes=(),
+        quota_verified_lease_scope_bindings=(),
+    ) -> dict[str, object]:
+        """Render the same inert compiler draft the host binds before dispatch."""
+
+        default_status = self.fast_lane_host_status(helper, request)
+        effective_status = (
+            default_status if host_status is None else copy.deepcopy(host_status)
+        )
+        effective_status.setdefault("routing_context", default_status["routing_context"])
+        status = helper._validated_fast_lane_host_status(effective_status)
+        validated = helper._validated_fast_lane_request(
+            copy.deepcopy(request),
+            host_routing_context=status["routing_context"],
+        )
+        occupancy = helper._fast_lane_host_slot_occupancy_audit(
+            workflow_id=status["workflow_id"],
+            source_plan_hash=validated["source_plan_hash"],
+            phase=validated["scheduler_state"]["phase"],
+            running_assignments=validated["scheduler_state"]["running_assignments"],
+            host_bindings=status["host_bindings"],
+            current_leases=status["current_leases"],
+        )
+        scheduler_state = validated["scheduler_state"]
+        active_slots = set(occupancy["active_slot_ids"])
+        filtered_assignments = [
+            assignment
+            for assignment in scheduler_state["running_assignments"]
+            if assignment["slot_id"] in active_slots
+        ]
+        if len(filtered_assignments) != len(scheduler_state["running_assignments"]):
+            validated = {
+                **validated,
+                "scheduler_state": {
+                    **scheduler_state,
+                    "running_assignments": filtered_assignments,
+                },
+            }
+        result = helper._render_fast_lane_plan(
+            validated, helper._fast_lane_activation(reasoning_effort, enable)
+        )
+        result = {
+            **result,
+            "refill_plan": {
+                **result["refill_plan"],
+                "occupancy_audit": occupancy,
+            },
+        }
+        result["plan_hash"] = helper._sha256_json(
+            {key: value for key, value in result.items() if key != "plan_hash"}
+        )
+        reference_result = result
+        quota_evidence = helper._fast_lane_main_capacity_evidence(
+            quota_request,
+            trusted_key_resolver=quota_trusted_key_resolver,
+            evaluation_time_utc_z=quota_evaluation_time_utc_z,
+            verified_route_result_hashes=quota_verified_route_result_hashes,
+            verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+        )
+        if quota_request is not None:
+            quota_decision = helper._fast_lane_quota_decision(
+                quota_request,
+                trusted_key_resolver=quota_trusted_key_resolver,
+                evaluation_time_utc_z=quota_evaluation_time_utc_z,
+                verified_route_result_hashes=quota_verified_route_result_hashes,
+                verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+            )
+            result = helper._apply_fast_lane_quota_balance(
+                result,
+                quota_request=quota_request,
+                quota_decision=quota_decision,
+            )
+        return helper._apply_fast_lane_cross_session_projection(
+            result,
+            reference_result=reference_result,
+            host_status=status,
+            occupancy=occupancy,
+            quota_evidence=quota_evidence,
+        )
+
+    def fast_lane_index_evidence(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        host_status: dict[str, object] | None = None,
+        reasoning_effort: str = "ultra",
+        enable: bool = False,
+        quota_request: dict[str, object] | None = None,
+        quota_trusted_key_resolver=None,
+        quota_evaluation_time_utc_z: str | None = None,
+        quota_verified_route_result_hashes=(),
+        quota_verified_lease_scope_bindings=(),
+        issued_at_utc_z: str = "2026-08-03T11:59:00Z",
+        expires_at_utc_z: str = "2026-08-03T12:01:00Z",
+    ) -> list[dict[str, object]]:
+        """Build bounded host evidence from the compiler's inert draft only."""
+
+        draft = self.fast_lane_index_evidence_draft(
+            helper,
+            request,
+            host_status=host_status,
+            reasoning_effort=reasoning_effort,
+            enable=enable,
+            quota_request=quota_request,
+            quota_trusted_key_resolver=quota_trusted_key_resolver,
+            quota_evaluation_time_utc_z=quota_evaluation_time_utc_z,
+            quota_verified_route_result_hashes=quota_verified_route_result_hashes,
+            quota_verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+        )
+        records: list[dict[str, object]] = []
+        assignments = [
+            assignment
+            for assignment in draft["assignments"]
+            if assignment["action"] == "start"
+        ]
+        projection = draft["cross_session_dispatch_projection"]
+        if projection["status"] == "external_session_required":
+            assignments.extend(projection["assignments"])
+        for assignment in assignments:
+            index_context = assignment["index_context"]
+            record: dict[str, object] = {
+                "schema": "index-evidence-v1",
+                "task_id": assignment["task_id"],
+                "role": assignment["role"],
+                "assignment_token": assignment["assignment_token"],
+                "dispatch_context_hash": assignment["context_hash"],
+                "index_context_hash": index_context["context_hash"],
+                "workspace_input_snapshot_id": assignment[
+                    "workspace_input_snapshot_id"
+                ],
+                "query_trace_id": helper._sha256_json(
+                    {
+                        "kind": "project-index-query-trace",
+                        "assignment_token": assignment["assignment_token"],
+                    }
+                ),
+                "query_receipt_hash": helper._sha256_json(
+                    {
+                        "kind": "project-index-query-receipt",
+                        "assignment_token": assignment["assignment_token"],
+                    }
+                ),
+                "redacted_artifact_hash": helper._sha256_json(
+                    {
+                        "kind": "project-index-redacted-artifact",
+                        "assignment_token": assignment["assignment_token"],
+                    }
+                ),
+                "issued_at_utc_z": issued_at_utc_z,
+                "expires_at_utc_z": expires_at_utc_z,
+            }
+            record["evidence_hash"] = helper._sha256_json(record)
+            records.append(record)
+        return records
+
+    def rehashed_fast_lane_index_evidence(
+        self, helper, record: dict[str, object]
+    ) -> dict[str, object]:
+        normalized = copy.deepcopy(record)
+        normalized.pop("evidence_hash")
+        normalized["evidence_hash"] = helper._sha256_json(normalized)
+        return normalized
+
+    def assert_fast_lane_index_evidence_fail_closed(
+        self, result: dict[str, object]
+    ) -> None:
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual([], result["assignments"])
+        self.assertEqual([], result["ready_queue"])
+        self.assertEqual([], result["review_queue"])
+        self.assertEqual([], result["prewarm_queue"])
+        self.assertEqual([], result["design_queue"])
+        projection = result["cross_session_dispatch_projection"]
+        self.assertEqual("blocked", projection["status"])
+        self.assertEqual([], projection["assignments"])
 
     def fully_bound_fast_lane_manual_request(self, helper) -> dict[str, object]:
         request = self.fast_lane_contexts_empty_request(helper)
@@ -1880,6 +2135,114 @@ class TeamEfficiencyTests(unittest.TestCase):
             ),
         )
 
+    def test_fast_lane_requires_exact_trusted_host_index_evidence(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        evaluation_time = "2026-08-03T12:00:00Z"
+        evidence = self.fast_lane_index_evidence(helper, request)
+
+        def hashes(records: list[dict[str, object]]) -> set[str]:
+            return {str(record["evidence_hash"]) for record in records}
+
+        def altered(
+            *,
+            record_index: int = 0,
+            rehash: bool = True,
+            **changes: object,
+        ) -> list[dict[str, object]]:
+            records = copy.deepcopy(evidence)
+            records[record_index].update(changes)
+            if rehash:
+                records[record_index] = self.rehashed_fast_lane_index_evidence(
+                    helper, records[record_index]
+                )
+            return records
+
+        token_swapped = altered(
+            assignment_token=helper._sha256_json({"assignment": "other"})
+        )
+        context_swapped = altered(
+            dispatch_context_hash=helper._sha256_json({"context": "other"})
+        )
+        snapshot_swapped = altered(
+            workspace_input_snapshot_id=helper._sha256_json({"snapshot": "other"})
+        )
+        receipt_swapped = altered(
+            query_receipt_hash=helper._sha256_json({"receipt": "other"})
+        )
+        expired = altered(
+            issued_at_utc_z="2026-08-03T11:58:00Z",
+            expires_at_utc_z=evaluation_time,
+        )
+        future = altered(
+            issued_at_utc_z="2026-08-03T12:00:01Z",
+            expires_at_utc_z="2026-08-03T12:01:00Z",
+        )
+        overlong = altered(
+            issued_at_utc_z="2026-08-03T11:58:00Z",
+            expires_at_utc_z="2026-08-03T12:00:01Z",
+        )
+        self_hashed_forgery = altered(
+            rehash=False,
+            redacted_artifact_hash=helper._sha256_json({"artifact": "forged"}),
+        )
+        unknown = altered(
+            task_id="FAST-LANE-UNKNOWN",
+            assignment_token=helper._sha256_json({"assignment": "unknown"}),
+        )
+        duplicate = [*copy.deepcopy(evidence), copy.deepcopy(evidence[0])]
+        cases = (
+            ("missing", [], set()),
+            ("token_swapped", token_swapped, hashes(token_swapped)),
+            ("context_swapped", context_swapped, hashes(context_swapped)),
+            ("snapshot_swapped", snapshot_swapped, hashes(snapshot_swapped)),
+            ("receipt_swapped_untrusted", receipt_swapped, hashes(evidence)),
+            ("expired_at_evaluation", expired, hashes(expired)),
+            ("future", future, hashes(future)),
+            ("overlong", overlong, hashes(overlong)),
+            ("self_hash_forgery", self_hashed_forgery, hashes(evidence)),
+            ("self_consistent_untrusted", evidence, set()),
+            ("duplicate", duplicate, hashes(duplicate)),
+            ("unknown_extra", [*copy.deepcopy(evidence), unknown[0]], hashes(unknown)),
+        )
+        for name, records, trusted_hashes in cases:
+            with self.subTest(case=name):
+                result = self.compile_fast_lane_with_index_evidence(
+                    helper,
+                    request,
+                    index_evidence=records,
+                    trusted_index_evidence_hashes=trusted_hashes,
+                    index_evaluation_time_utc_z=evaluation_time,
+                )
+                self.assert_fast_lane_index_evidence_fail_closed(result)
+
+        self.assertEqual(
+            120,
+            getattr(helper, "MAX_FAST_LANE_INDEX_EVIDENCE_TTL_SECONDS", 120),
+        )
+        self.assertEqual(
+            120,
+            getattr(helper, "MAX_FAST_LANE_INDEX_EVIDENCE_MAX_AGE_SECONDS", 120),
+        )
+        valid = self.compile_fast_lane_with_index_evidence(
+            helper,
+            request,
+            index_evidence=evidence,
+            trusted_index_evidence_hashes=hashes(evidence),
+            index_evaluation_time_utc_z=evaluation_time,
+        )
+        self.assertEqual("active", valid["status"])
+        starts = [item for item in valid["assignments"] if item["action"] == "start"]
+        self.assertTrue(starts)
+        evidence_by_token = {
+            record["assignment_token"]: record for record in evidence
+        }
+        for assignment in starts:
+            self.assertEqual(
+                evidence_by_token[assignment["assignment_token"]],
+                assignment.get("index_evidence"),
+            )
+
     def test_fast_lane_consumes_attested_core_routes_and_fails_closed(self) -> None:
         helper = load_efficiency()
         request = self.fast_lane_schedule_request(helper)
@@ -2733,8 +3096,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertEqual("", errors)
         result = json.loads(output)
-        self.assertEqual("active", result["status"])
-        self.assertTrue(result["assignments"])
+        self.assert_fast_lane_index_evidence_fail_closed(result)
         self.assertTrue(
             all(
                 assignment["reasoning_effort"] != "ultra"
@@ -4934,6 +5296,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "reasoning_effort",
             "host_dispatch",
             "index_context",
+            "index_evidence",
             "routing_context_hash",
             "routing_result_hash",
             "task_fingerprint",
@@ -6841,9 +7204,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             reasoning_effort="ultra",
             host_status=host_status,
         )
-        self.assertTrue(
-            any(item["action"] == "start" for item in legacy["assignments"])
-        )
+        self.assert_fast_lane_index_evidence_fail_closed(legacy)
 
         enforced = helper.compile_fast_lane(
             request,
@@ -7150,7 +7511,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         ]
         request = self.fast_lane_request(helper, work_package=work_package)
         host_status = self.fast_lane_host_status(helper, request)
-        local = helper.compile_fast_lane(
+        local = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7163,7 +7525,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.fast_lane_signed_quota_request(helper, local_starts)
         )
 
-        result = helper.compile_fast_lane(
+        result = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7173,7 +7536,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_route_result_hashes=route_hashes,
             quota_verified_lease_scope_bindings=lease_bindings,
         )
-        repeated = helper.compile_fast_lane(
+        repeated = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7217,6 +7581,15 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertEqual("external_session_required", assignment["action"])
             self.assertEqual("not_created", assignment["session_state"])
             self.assertTrue(assignment["worktree_required"])
+            self.assertEqual("index-evidence-v1", assignment["index_evidence"]["schema"])
+            self.assertEqual(
+                assignment["assignment_token"],
+                assignment["index_evidence"]["assignment_token"],
+            )
+            self.assertEqual(
+                assignment["workspace_input_snapshot_id"],
+                assignment["index_evidence"]["workspace_input_snapshot_id"],
+            )
             self.assertEqual(
                 {
                     "schema": "team-efficiency/fast-lane-host-dispatch-v1",
@@ -7273,7 +7646,8 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         under_capacity_request = request_with_units(2)
         under_capacity_host = self.fast_lane_host_status(helper, under_capacity_request)
-        under_capacity_local = helper.compile_fast_lane(
+        under_capacity_local = self.compile_fast_lane(
+            helper,
             under_capacity_request,
             reasoning_effort="ultra",
             host_status=under_capacity_host,
@@ -7286,7 +7660,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         under_quota, under_resolver, under_routes, under_bindings = (
             self.fast_lane_signed_quota_request(helper, under_capacity_starts)
         )
-        under_capacity = helper.compile_fast_lane(
+        under_capacity = self.compile_fast_lane(
+            helper,
             under_capacity_request,
             reasoning_effort="ultra",
             host_status=under_capacity_host,
@@ -7303,7 +7678,8 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         request = request_with_units(6)
         host_status = self.fast_lane_host_status(helper, request)
-        local = helper.compile_fast_lane(
+        local = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7314,7 +7690,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         quota_request, resolver, route_hashes, lease_bindings = (
             self.fast_lane_signed_quota_request(helper, local_starts)
         )
-        unavailable = helper.compile_fast_lane(
+        unavailable = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7335,7 +7712,8 @@ class TeamEfficiencyTests(unittest.TestCase):
                 valid_until_utc_z="2026-08-01T15:09:30Z",
             )
         )
-        stale = helper.compile_fast_lane(
+        stale = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7357,7 +7735,8 @@ class TeamEfficiencyTests(unittest.TestCase):
                 global_main_active=1,
             )
         )
-        fenced = helper.compile_fast_lane(
+        fenced = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7389,7 +7768,8 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         over_bound_request = request_with_units(13)
         over_bound_host = self.fast_lane_host_status(helper, over_bound_request)
-        over_bound_local = helper.compile_fast_lane(
+        over_bound_local = self.compile_fast_lane(
+            helper,
             over_bound_request,
             reasoning_effort="ultra",
             host_status=over_bound_host,
@@ -7405,7 +7785,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             over_bound_routes,
             over_bound_bindings,
         ) = self.fast_lane_signed_quota_request(helper, over_bound_starts)
-        over_bound = helper.compile_fast_lane(
+        over_bound = self.compile_fast_lane(
+            helper,
             over_bound_request,
             reasoning_effort="ultra",
             host_status=over_bound_host,
