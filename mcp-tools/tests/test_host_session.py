@@ -1314,3 +1314,58 @@ def test_host_session_rejects_a_terminal_with_the_wrong_role() -> None:
         thread.join(timeout=2)
         child.close()
         host.close()
+
+
+def test_host_session_compiler_evidence_fails_closed_without_provider() -> None:
+    module = _host_session_module()
+    session = module.HostSession(
+        bridge=None,
+        quota_evidence_resolver=lambda *_: None,
+        clock=lambda: _NOW,
+    )
+
+    assert (
+        session.prepare_compiler_evidence(preparation_id="prep-1") == "NO_SAFE_WORK"
+    )
+
+
+def test_host_session_issued_compiler_evidence_consumes_once() -> None:
+    module = _host_session_module()
+    public_facts = {"provider": "facts"}
+    provider_calls: list[str] = []
+    session = module.HostSession(
+        bridge=None,
+        quota_evidence_resolver=lambda *_: None,
+        compiler_evidence_provider=lambda preparation_id: (
+            provider_calls.append(preparation_id) or public_facts
+        ),
+        clock=lambda: _NOW,
+    )
+
+    evidence = session.prepare_compiler_evidence(preparation_id="prep-2")
+
+    assert provider_calls == ["prep-2"]
+    assert evidence is not public_facts
+    assert session.consume_compiler_evidence(evidence) is public_facts
+    assert session.consume_compiler_evidence(evidence) == "NO_SAFE_WORK"
+
+
+def test_host_session_compiler_evidence_rejects_public_facts_and_dict_substitutes(
+) -> None:
+    module = _host_session_module()
+    public_facts = {"provider": "facts"}
+    session = module.HostSession(
+        bridge=None,
+        quota_evidence_resolver=lambda *_: None,
+        compiler_evidence_provider=lambda _: public_facts,
+        clock=lambda: _NOW,
+    )
+
+    evidence = session.prepare_compiler_evidence(preparation_id="prep-3")
+
+    assert session.consume_compiler_evidence(public_facts) == "NO_SAFE_WORK"
+    assert (
+        session.consume_compiler_evidence({"preparation_id": "prep-3"})
+        == "NO_SAFE_WORK"
+    )
+    assert session.consume_compiler_evidence(evidence) is public_facts
