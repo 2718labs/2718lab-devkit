@@ -112,7 +112,8 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         self.assertEqual(stored_grant.state, ExternalBootstrapState.PENDING)
         self.assertEqual(stored_grant.availability, "HOST_API_UNAVAILABLE")
         persisted = "\n".join(
-            str(row[0]) for row in self.store._connection.execute(
+            str(row[0])
+            for row in self.store._connection.execute(
                 "SELECT payload_json FROM external_bootstrap_descriptors "
                 "UNION ALL SELECT payload_json FROM external_bootstrap_batches "
                 "UNION ALL SELECT payload_json FROM external_bootstrap_outbox "
@@ -215,7 +216,9 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
             assignment_hash=expired_grant.assignment_hash,
             expires_at=expired_grant.expires_at,
         )
-        self.store.admit_external_bootstrap(expired_descriptor, expired_batch, expired_grant)
+        self.store.admit_external_bootstrap(
+            expired_descriptor, expired_batch, expired_grant
+        )
         with self.assertRaises(ExternalDispatchGrantError):
             self.store.consume_external_dispatch_grant(
                 expired_grant.grant_id,
@@ -445,9 +448,10 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         tampered_payload_json = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         )
-        tampered_payload_hash = "sha256:" + hashlib.sha256(
-            tampered_payload_json.encode("utf-8")
-        ).hexdigest()
+        tampered_payload_hash = (
+            "sha256:"
+            + hashlib.sha256(tampered_payload_json.encode("utf-8")).hexdigest()
+        )
         self.store._connection.execute(
             """
             UPDATE external_bootstrap_descriptors
@@ -520,9 +524,7 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
             grant_id="v8-other-grant",
         )
         self.store.admit_external_bootstrap(descriptor, batch, grant)
-        self.store.admit_external_bootstrap(
-            other_descriptor, other_batch, other_grant
-        )
+        self.store.admit_external_bootstrap(other_descriptor, other_batch, other_grant)
         self.store.close()
 
         connection = sqlite3.connect(self.database)
@@ -808,9 +810,10 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
                 raw_payload_json = json.dumps(
                     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
                 )
-                raw_payload_hash = "sha256:" + hashlib.sha256(
-                    raw_payload_json.encode("utf-8")
-                ).hexdigest()
+                raw_payload_hash = (
+                    "sha256:"
+                    + hashlib.sha256(raw_payload_json.encode("utf-8")).hexdigest()
+                )
                 connection.execute(
                     f"""
                     UPDATE {table}
@@ -897,9 +900,9 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
             legacy_item_json = json.dumps(
                 item_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             )
-            legacy_item_hash = "sha256:" + hashlib.sha256(
-                legacy_item_json.encode("utf-8")
-            ).hexdigest()
+            legacy_item_hash = (
+                "sha256:" + hashlib.sha256(legacy_item_json.encode("utf-8")).hexdigest()
+            )
             connection.execute(
                 """
                 UPDATE external_bootstrap_batch_items
@@ -924,9 +927,10 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
                 legacy_payload_json = json.dumps(
                     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
                 )
-                legacy_payload_hash = "sha256:" + hashlib.sha256(
-                    legacy_payload_json.encode("utf-8")
-                ).hexdigest()
+                legacy_payload_hash = (
+                    "sha256:"
+                    + hashlib.sha256(legacy_payload_json.encode("utf-8")).hexdigest()
+                )
                 connection.execute(
                     f"""
                     UPDATE {table}
