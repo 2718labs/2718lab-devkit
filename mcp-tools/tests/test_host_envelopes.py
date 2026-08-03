@@ -281,6 +281,66 @@ def test_envelope_rejects_sensitive_text_in_each_permitted_text_field(
     assert caught.value.code == "HOST_ENVELOPE_INVALID"
 
 
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    [
+        ("coordinator_assignment", "assignment"),
+        ("coordinator_assignment", "context"),
+        ("worker_terminal_result", "result"),
+        ("worker_terminal_result", "risk.detail"),
+        ("peer_evidence_handoff", "dependency"),
+        ("peer_evidence_handoff", "evidence"),
+    ],
+)
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "environment HOME private-value",
+        "sk-proj-synthetic-private-value",
+        "x" * 512,
+    ],
+)
+def test_envelope_rejects_unverifiable_or_environment_sensitive_text_in_each_field(
+    kind: str, field: str, unsafe_text: str
+) -> None:
+    module = _envelopes()
+    if kind == "coordinator_assignment":
+        payload = _assignment_payload()
+    elif kind == "worker_terminal_result":
+        payload = _terminal_payload()
+    else:
+        payload = _peer_payload()
+
+    if field == "assignment":
+        payload["assignment"] = unsafe_text
+    elif field == "risk.detail":
+        payload["risk"] = [{"code": "none", "detail": unsafe_text}]
+    else:
+        payload[field] = [unsafe_text]
+
+    with pytest.raises(module.HostEnvelopeError) as caught:
+        _render(module, kind, payload)
+
+    assert caught.value.code == "HOST_ENVELOPE_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("coordinator_assignment", _assignment_payload()),
+        ("worker_terminal_result", _terminal_payload()),
+        ("peer_evidence_handoff", _peer_payload()),
+    ],
+)
+def test_envelope_accepts_opaque_sha256_reference_fields(
+    kind: str, payload: dict[str, object]
+) -> None:
+    module = _envelopes()
+    envelope = _render(module, kind, payload)
+
+    assert module.validate_envelope(envelope, now=_NOW) == envelope
+
+
 def test_envelope_rejects_collection_limit_overruns() -> None:
     module = _envelopes()
     cases = []

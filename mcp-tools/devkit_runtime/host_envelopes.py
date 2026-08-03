@@ -53,7 +53,8 @@ _FORBIDDEN_TEXT_CHARACTERS: Final = frozenset(
 )
 _FORBIDDEN_TEXT = re.compile(
     r"(?i)(?:\b(?:bearer|authorization|api[_-]?key|secret|capability|proof|"
-    r"token|credential|transcript|conversation|chat)\b|"
+    r"token|credential|environment|env|home|transcript|conversation|chat)\b|"
+    r"\bsk-proj-[a-z0-9_-]+|"
     r"\b(?:os\.environ|process\.env)\b|"
     r"\b(?:user|assistant|system)\s*:|"
     r"\b(?:export|set)\s+[A-Za-z_][A-Za-z0-9_]*=|"
@@ -442,7 +443,7 @@ def _validate_text(value: object) -> None:
     except UnicodeError:
         _invalid()
     if (
-        byte_length > _MAX_TEXT_BYTES
+        byte_length >= _MAX_TEXT_BYTES
         or any(character in value for character in ("\r", "\n", "\t"))
         or any(character in value for character in _FORBIDDEN_TEXT_CHARACTERS)
         or _FORBIDDEN_TEXT.search(value) is not None
