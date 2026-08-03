@@ -154,6 +154,12 @@ class _CompilerEvidenceHandle:
         return "<HostCompilerEvidenceHandle redacted>"
 
 
+class _CompilerMaterialToken:
+    """Opaque one-shot identity retained by the issuing host session."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True)
 class _CompilerInvocation:
     """One redacted compiler invocation bound to its issuing host session."""
@@ -171,6 +177,7 @@ class _CompilerInvocation:
     quota_binding_hash: str
     binding_hash: str
     _owner: object = field(repr=False, compare=False)
+    _material_token: object | None = field(default=None, repr=False, compare=False)
 
 
 class _CompilerPreparation:
@@ -179,10 +186,11 @@ class _CompilerPreparation:
     __slots__ = (
         "_owner",
         "_preparation_id",
-        "_quota",
         "_issued_at",
         "_expires_at",
-        "_bound",
+        "_quota_binding_hash",
+        "_material_token",
+        "_bound_material",
     )
 
     def __init__(
@@ -190,16 +198,18 @@ class _CompilerPreparation:
         *,
         owner: object,
         preparation_id: str,
-        quota: HostQuotaFacts,
         issued_at: float,
         expires_at: float,
+        quota_binding_hash: str,
+        material_token: _CompilerMaterialToken,
     ) -> None:
         self._owner = owner
         self._preparation_id = preparation_id
-        self._quota = quota
         self._issued_at = issued_at
         self._expires_at = expires_at
-        self._bound = False
+        self._quota_binding_hash = quota_binding_hash
+        self._material_token = material_token
+        self._bound_material: _CompilerInvocation | None = None
 
     def bind(
         self,
@@ -211,9 +221,8 @@ class _CompilerPreparation:
     ) -> _CompilerInvocation:
         """Return the sole immutable material form a provider may create."""
 
-        if self._bound:
+        if self._bound_material is not None:
             raise ValueError("compiler preparation was already bound")
-        self._bound = True
         if (
             not _is_hash(request_hash)
             or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
@@ -221,31 +230,7 @@ class _CompilerPreparation:
             or not _strict_hash_tuple(verified_lease_scope_bindings)
         ):
             raise ValueError("compiler invocation binding is invalid")
-        quota_binding_hash = _hash(
-            {
-                "account_id_hash": self._quota.account_id_hash,
-                "main_limit_id": self._quota.main_limit_id,
-                "request_id": self._quota.request_id,
-                "snapshot_hash": self._quota.snapshot_hash,
-                "snapshot_seq": self._quota.snapshot_seq,
-                "source_id_hash": self._quota.source_id_hash,
-                "spark_limit_id": self._quota.spark_limit_id,
-            }
-        )
-        binding_hash = _hash(
-            {
-                "expires_at": self._expires_at,
-                "issued_at": self._issued_at,
-                "preparation_id": self._preparation_id,
-                "quota_binding_hash": quota_binding_hash,
-                "reasoning_effort": reasoning_effort,
-                "request_hash": request_hash,
-                "route_result_hashes": verified_route_result_hashes,
-                "schema": "2718lab-devkit/compiler-invocation-v1",
-                "lease_scope_bindings": verified_lease_scope_bindings,
-            }
-        )
-        return _CompilerInvocation(
+        material = _CompilerInvocation(
             schema="2718lab-devkit/compiler-invocation-v1",
             preparation_id=self._preparation_id,
             request_hash=request_hash,
@@ -254,11 +239,23 @@ class _CompilerPreparation:
             verified_lease_scope_bindings=verified_lease_scope_bindings,
             issued_at=self._issued_at,
             expires_at=self._expires_at,
-            snapshot_hash=self._quota.snapshot_hash,
-            snapshot_seq=self._quota.snapshot_seq,
-            quota_binding_hash=quota_binding_hash,
-            binding_hash=binding_hash,
+            snapshot_hash="",
+            snapshot_seq=0,
+            quota_binding_hash=self._quota_binding_hash,
+            binding_hash="",
             _owner=self._owner,
+            _material_token=self._material_token,
+        )
+        self._bound_material = material
+        return material
+
+    def accepts(self, material: object) -> bool:
+        """Accept only the exact material emitted by this preparation."""
+
+        return (
+            material is self._bound_material
+            and type(material) is _CompilerInvocation
+            and material._material_token is self._material_token
         )
 
 
@@ -281,6 +278,7 @@ class HostSession:
         )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
+        self._compiler_material_tokens: set[_CompilerMaterialToken] = set()
         self._burned_preparation_ids: set[str] = set()
         self._has_fresh_quota = False
         self._fresh_quota: HostQuotaFacts | None = None
@@ -363,6 +361,7 @@ class HostSession:
             self._fresh_quota = None
             self._fresh_quota_issued_at = None
             self._compiler_evidence.clear()
+            self._compiler_material_tokens.clear()
         if self._bridge is not None:
             self._bridge.close()
 
@@ -397,24 +396,66 @@ class HostSession:
             self._fresh_quota_issued_at = None
             if now > issued_at + 120:
                 return _NO_SAFE_WORK
+            quota_binding_hash = _hash(
+                {
+                    "account_id_hash": quota.account_id_hash,
+                    "main_limit_id": quota.main_limit_id,
+                    "request_id": quota.request_id,
+                    "snapshot_hash": quota.snapshot_hash,
+                    "snapshot_seq": quota.snapshot_seq,
+                    "source_id_hash": quota.source_id_hash,
+                    "spark_limit_id": quota.spark_limit_id,
+                }
+            )
+            material_token = _CompilerMaterialToken()
+            self._compiler_material_tokens.add(material_token)
+            preparation = _CompilerPreparation(
+                owner=self._compiler_owner,
+                preparation_id=preparation_id,
+                issued_at=issued_at,
+                expires_at=issued_at + 120,
+                quota_binding_hash=quota_binding_hash,
+                material_token=material_token,
+            )
             try:
-                material = provider(
-                    _CompilerPreparation(
-                        owner=self._compiler_owner,
-                        preparation_id=preparation_id,
-                        quota=quota,
-                        issued_at=issued_at,
-                        expires_at=issued_at + 120,
-                    )
-                )
+                provider_material = provider(preparation)
             except Exception:
+                self._compiler_material_tokens.discard(material_token)
                 return _NO_SAFE_WORK
             if (
-                type(material) is not _CompilerInvocation
-                or material._owner is not self._compiler_owner
-                or material.preparation_id != preparation_id
+                material_token not in self._compiler_material_tokens
+                or not preparation.accepts(provider_material)
             ):
+                self._compiler_material_tokens.discard(material_token)
                 return _NO_SAFE_WORK
+            self._compiler_material_tokens.remove(material_token)
+            material = _CompilerInvocation(
+                schema="2718lab-devkit/compiler-invocation-v1",
+                preparation_id=preparation_id,
+                request_hash=provider_material.request_hash,
+                reasoning_effort=provider_material.reasoning_effort,
+                verified_route_result_hashes=provider_material.verified_route_result_hashes,
+                verified_lease_scope_bindings=provider_material.verified_lease_scope_bindings,
+                issued_at=issued_at,
+                expires_at=issued_at + 120,
+                snapshot_hash=quota.snapshot_hash,
+                snapshot_seq=quota.snapshot_seq,
+                quota_binding_hash=quota_binding_hash,
+                binding_hash=_hash(
+                    {
+                        "expires_at": issued_at + 120,
+                        "issued_at": issued_at,
+                        "preparation_id": preparation_id,
+                        "quota_binding_hash": quota_binding_hash,
+                        "reasoning_effort": provider_material.reasoning_effort,
+                        "request_hash": provider_material.request_hash,
+                        "route_result_hashes": provider_material.verified_route_result_hashes,
+                        "schema": "2718lab-devkit/compiler-invocation-v1",
+                        "lease_scope_bindings": provider_material.verified_lease_scope_bindings,
+                    }
+                ),
+                _owner=self._compiler_owner,
+            )
             evidence = _CompilerEvidenceHandle()
             self._compiler_evidence[evidence] = material
             return evidence
