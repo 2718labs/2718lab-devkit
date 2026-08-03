@@ -15,7 +15,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from devkit_fastlane.scripts.codex_account_quota import QuotaSnapshotEvidence
+from devkit_fastlane.scripts.codex_account_quota import (
+    CodexQuotaProvider,
+    QuotaSnapshotEvidence,
+)
 from devkit_runtime.host_bridge import InheritedHandleHostBridge
 from devkit_runtime.host_envelopes import (
     EnvelopeBinding,
@@ -39,6 +42,61 @@ def _canonical(value: object) -> str:
 
 def _hash(value: object) -> str:
     return _HASH_PREFIX + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _official_quota_jsonl_server_code() -> str:
+    payload = {
+        "account": {
+            "id": "account-test",
+            "planType": "pro",
+            "requiresOpenaiAuth": True,
+            "type": "chatgpt",
+        },
+        "limits": {
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "resetsAt": 1_786_162_042,
+                    "usedPercent": 50,
+                    "windowDurationMins": 10_080,
+                },
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "resetsAt": 1_786_162_042,
+                        "usedPercent": 50,
+                        "windowDurationMins": 10_080,
+                    },
+                },
+                "codex_bengalfox": {
+                    "limitId": "codex_bengalfox",
+                    "limitName": "GPT-5.3-Codex-Spark",
+                    "primary": {
+                        "resetsAt": 1_786_171_853,
+                        "usedPercent": 16,
+                        "windowDurationMins": 10_080,
+                    },
+                },
+            },
+        },
+    }
+    encoded = json.dumps(payload, separators=(",", ":"))
+    return (
+        "import json\n"
+        "import sys\n"
+        f"payload = json.loads({encoded!r})\n"
+        "for raw in sys.stdin:\n"
+        "    message = json.loads(raw)\n"
+        "    method = message.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({'id': message['id'], 'result': {'userAgent': 'fake'}}), flush=True)\n"
+        "    elif method == 'account/read':\n"
+        "        print(json.dumps({'id': message['id'], 'result': payload['account']}), flush=True)\n"
+        "    elif method == 'account/rateLimits/read':\n"
+        "        print(json.dumps({'id': message['id'], 'result': payload['limits']}), flush=True)\n"
+    )
 
 
 def _host_session_module() -> object:
@@ -172,6 +230,32 @@ def _attestation(
             main_limit_id=main_limit_id,
             spark_limit_id=spark_limit_id,
         ),
+    )
+
+
+def _attestation_from_provider_evidence(
+    module: object,
+    request_id: str,
+    evidence: QuotaSnapshotEvidence,
+) -> object:
+    snapshot = dict(evidence.snapshot)
+    source = snapshot["source"]
+    capacity = snapshot["capacity"]
+    snapshot_seq = snapshot["snapshot_seq"]
+    assert isinstance(source, dict)
+    assert isinstance(capacity, dict)
+    assert isinstance(snapshot_seq, int)
+    source_id_hash = source["source_id_hash"]
+    assert isinstance(source_id_hash, str)
+    return module.HostQuotaAttestation(
+        request_id=request_id,
+        account_id_hash=evidence.account_id_hash,
+        source_id_hash=source_id_hash,
+        main_limit_id=evidence.main_limit_id,
+        spark_limit_id=evidence.spark_limit_id,
+        capacity_hash=_hash(capacity),
+        snapshot_seq=snapshot_seq,
+        evidence=evidence,
     )
 
 
@@ -396,6 +480,113 @@ def test_host_session_accepts_only_exact_same_process_attested_quota_evidence() 
     assert facts.main_limit_id == "codex"
     assert facts.spark_limit_id == "codex_bengalfox"
     assert len(resolver_calls) == 1
+
+
+def test_host_session_accepts_successive_provider_snapshots_with_one_session_key() -> (
+    None
+):
+    module = _host_session_module()
+    capacity = {
+        "ledger_epoch": 7,
+        "global_main_active": 1,
+        "global_spark_active": 0,
+        "host_main_active": 1,
+        "host_spark_active": 0,
+        "host_main_cap": 3,
+        "host_spark_cap": 1,
+        "active_lease_set_hash": _HASH_PREFIX + "a" * 64,
+    }
+    times = iter((float(_NOW), float(_NOW) + 0.001))
+    provider = CodexQuotaProvider(
+        command=[sys.executable, "-c", _official_quota_jsonl_server_code()],
+        memory_only=True,
+        now=lambda: next(times),
+    )
+    first_evidence = provider.read(capacity=capacity)
+    second_evidence = provider.read(capacity=capacity)
+    first_snapshot = dict(first_evidence.snapshot)
+    second_snapshot = dict(second_evidence.snapshot)
+
+    assert first_evidence.key_id == second_evidence.key_id
+    assert first_snapshot["snapshot_seq"] < second_snapshot["snapshot_seq"]
+
+    evidence_by_snapshot_hash = {
+        first_snapshot["snapshot_hash"]: first_evidence,
+        second_snapshot["snapshot_hash"]: second_evidence,
+    }
+
+    def resolve(request_id: str, received: dict[str, object]) -> object:
+        snapshot_hash = received["snapshot_hash"]
+        evidence = evidence_by_snapshot_hash.get(snapshot_hash)
+        assert evidence is not None
+        assert dict(evidence.snapshot) == received
+        return _attestation_from_provider_evidence(module, request_id, evidence)
+
+    child, host = _pipe_pair()
+    session = module.HostSession(
+        bridge=child,
+        quota_evidence_resolver=resolve,
+        quota_expectation=_quota_expectation(
+            module,
+            first_snapshot,
+            account_id_hash=first_evidence.account_id_hash,
+            main_limit_id=first_evidence.main_limit_id,
+            spark_limit_id=first_evidence.spark_limit_id,
+        ),
+        clock=lambda: _NOW,
+    )
+    first_reply = _reply_once(host, first_snapshot)
+    try:
+        first_facts = session.read_quota()
+        first_reply.join(timeout=2)
+        second_reply = _reply_once(host, second_snapshot)
+        second_facts = session.read_quota()
+        second_reply.join(timeout=2)
+    finally:
+        child.close()
+        host.close()
+
+    assert isinstance(first_facts, module.HostQuotaFacts)
+    assert isinstance(second_facts, module.HostQuotaFacts)
+    assert first_facts.snapshot_seq < second_facts.snapshot_seq
+
+    next_times = iter((float(_NOW),))
+    next_provider = CodexQuotaProvider(
+        command=[sys.executable, "-c", _official_quota_jsonl_server_code()],
+        memory_only=True,
+        now=lambda: next(next_times),
+    )
+    next_evidence = next_provider.read(capacity=capacity)
+    next_snapshot = dict(next_evidence.snapshot)
+
+    assert next_evidence.key_id != first_evidence.key_id
+
+    next_child, next_host = _pipe_pair()
+    next_session = module.HostSession(
+        bridge=next_child,
+        quota_evidence_resolver=lambda request_id, received: (
+            _attestation_from_provider_evidence(module, request_id, next_evidence)
+            if dict(next_evidence.snapshot) == received
+            else None
+        ),
+        quota_expectation=_quota_expectation(
+            module,
+            next_snapshot,
+            account_id_hash=next_evidence.account_id_hash,
+            main_limit_id=next_evidence.main_limit_id,
+            spark_limit_id=next_evidence.spark_limit_id,
+        ),
+        clock=lambda: _NOW,
+    )
+    next_reply = _reply_once(next_host, next_snapshot)
+    try:
+        next_facts = next_session.read_quota()
+        next_reply.join(timeout=2)
+    finally:
+        next_child.close()
+        next_host.close()
+
+    assert isinstance(next_facts, module.HostQuotaFacts)
 
 
 def test_host_session_requires_a_trusted_quota_expectation_before_reading() -> None:

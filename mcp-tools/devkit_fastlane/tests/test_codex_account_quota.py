@@ -179,6 +179,35 @@ class CodexAccountQuotaTests(unittest.TestCase):
         )
         self.assertEqual(evidence.snapshot, verified)
 
+    def test_provider_keeps_the_hmac_key_private_and_stable_per_instance(self) -> None:
+        module = load_provider()
+        times = iter((1786100000.0, 1786100000.001))
+        provider = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code()],
+            memory_only=True,
+            now=lambda: next(times),
+        )
+        first = provider.read(capacity=CAPACITY)
+        second = provider.read(capacity=CAPACITY)
+        next_provider = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code()],
+            memory_only=True,
+            now=lambda: 1786100000.0,
+        )
+        next_evidence = next_provider.read(capacity=CAPACITY)
+        cached_provider = self.provider()
+        cached_evidence = cached_provider.read(capacity=CAPACITY)
+        cache_contents = (self.temp / "sample-cache.json").read_text(encoding="utf-8")
+
+        self.assertEqual(first.key_id, second.key_id)
+        self.assertNotEqual(first.key_id, next_evidence.key_id)
+        self.assertIsNone(provider._state_path)
+        self.assertNotIn(repr(first._key), repr(first))
+        self.assertNotIn(first._key.hex(), repr(first))
+        self.assertNotIn(repr(cached_evidence._key), cache_contents)
+        self.assertNotIn(cached_evidence._key.hex(), cache_contents)
+        self.assertNotIn(cached_evidence.key_id, cache_contents)
+
     def test_spark_label_must_be_exact(self) -> None:
         module = load_provider()
         provider = module.CodexQuotaProvider(
@@ -332,7 +361,9 @@ class CodexAccountQuotaTests(unittest.TestCase):
         self.assertEqual(0, evidence.snapshot["main"]["delta_ppm_300s"])
         self.assertIsNone(provider._state_path)
 
-    def test_memory_only_provider_does_not_treat_prior_slope_as_live_truth(self) -> None:
+    def test_memory_only_provider_does_not_treat_prior_slope_as_live_truth(
+        self,
+    ) -> None:
         module = load_provider()
         cache_path = self.temp / "memory-only-slope.json"
         first = module.CodexQuotaProvider(

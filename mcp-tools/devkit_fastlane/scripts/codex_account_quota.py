@@ -316,6 +316,8 @@ class CodexQuotaProvider:
         self._memory_only = memory_only
         self._state_path = None if memory_only else _validate_state_path(state_path)
         self._now = now or time.time
+        self._session_hmac_key: bytes | None = None
+        self._session_hmac_key_id: str | None = None
 
     def _read_cache(self) -> Mapping[str, Any] | None:
         if self._state_path is None:
@@ -342,6 +344,18 @@ class CodexQuotaProvider:
             temporary.replace(self._state_path)
         except OSError as error:
             raise CodexQuotaError("quota sample cache could not be written") from error
+
+    def _session_signing_key(self) -> tuple[bytes, str]:
+        key = self._session_hmac_key
+        key_id = self._session_hmac_key_id
+        if key is None and key_id is None:
+            key = secrets.token_bytes(32)
+            key_id = _hash_bytes(key)
+            self._session_hmac_key = key
+            self._session_hmac_key_id = key_id
+        if type(key) is not bytes or type(key_id) is not str:
+            raise CodexQuotaError("quota session signing key is unavailable")
+        return key, key_id
 
     def _sample_delta(
         self,
@@ -493,8 +507,7 @@ class CodexQuotaProvider:
             "kind": _SOURCE_KIND,
             "source_id_hash": _hash("codex-app-server-account-rate-limits"),
         }
-        key = secrets.token_bytes(32)
-        key_id = _hash_bytes(key)
+        key, key_id = self._session_signing_key()
         source["key_id"] = key_id
         observed = _utc_z(now_epoch)
         valid_until = _utc_z(now_epoch + _SNAPSHOT_TTL_SECONDS)
