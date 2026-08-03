@@ -218,7 +218,6 @@ class HostSession:
         )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
-        self._compiler_materials: dict[_CompilerPreparation, _CompilerInvocation] = {}
         self._burned_preparation_ids: set[str] = set()
         self._has_fresh_quota = False
         self._fresh_quota: HostQuotaFacts | None = None
@@ -303,7 +302,6 @@ class HostSession:
             self._fresh_quota_issued_at = None
             self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
-            self._compiler_materials.clear()
         if self._bridge is not None:
             self._bridge.close()
 
@@ -367,7 +365,7 @@ class HostSession:
             except Exception:
                 return _NO_SAFE_WORK
             preparation = _CompilerPreparation()
-            self._compiler_materials[preparation] = _CompilerInvocation(
+            material = _CompilerInvocation(
                 schema="2718lab-devkit/compiler-invocation-v1",
                 preparation_id=preparation_id,
                 request_hash=binding.request_hash,
@@ -393,21 +391,24 @@ class HostSession:
                     }
                 ),
             )
+            material_state = _compiler_invocation_state(material)
             try:
                 provider_material = provider(preparation)
             except Exception:
-                self._compiler_materials.pop(preparation, None)
+                return _NO_SAFE_WORK
+            try:
+                material_is_unchanged = (
+                    _compiler_invocation_state(material) == material_state
+                )
+            except Exception:
                 return _NO_SAFE_WORK
             if (
                 self._closed
                 or self._frozen
                 or not self.is_available
                 or provider_material is not preparation
+                or not material_is_unchanged
             ):
-                self._compiler_materials.pop(preparation, None)
-                return _NO_SAFE_WORK
-            material = self._compiler_materials.pop(preparation, None)
-            if material is None:
                 return _NO_SAFE_WORK
             evidence = _CompilerEvidenceHandle()
             self._compiler_evidence[evidence] = material
@@ -759,7 +760,6 @@ class HostSession:
             self._fresh_quota_issued_at = None
             self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
-            self._compiler_materials.clear()
         if self._bridge is not None:
             self._bridge.close()
 
@@ -839,6 +839,25 @@ def _normalized_compiler_invocation_binding(
         reasoning_effort=value.reasoning_effort,
         verified_route_result_hashes=value.verified_route_result_hashes,
         verified_lease_scope_bindings=value.verified_lease_scope_bindings,
+    )
+
+
+def _compiler_invocation_state(value: _CompilerInvocation) -> tuple[object, ...]:
+    """Capture every canonical field before a provider callback can run."""
+
+    return (
+        value.schema,
+        value.preparation_id,
+        value.request_hash,
+        value.reasoning_effort,
+        value.verified_route_result_hashes,
+        value.verified_lease_scope_bindings,
+        value.issued_at,
+        value.expires_at,
+        value.snapshot_hash,
+        value.snapshot_seq,
+        value.quota_binding_hash,
+        value.binding_hash,
     )
 
 

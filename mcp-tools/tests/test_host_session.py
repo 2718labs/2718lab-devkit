@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import hmac
 import importlib
@@ -1830,20 +1831,20 @@ def test_host_session_compiler_evidence_rejects_unregistered_preparation_marker(
             preparation_id="prep-marker-forgery"
         )
         registry = dict(session._compiler_evidence)
-        pending_materials = dict(session._compiler_materials)
+        has_marker_registry = hasattr(session, "_compiler_materials")
     finally:
         child.close()
         host.close()
 
     assert result == "NO_SAFE_WORK"
     assert registry == {}
-    assert pending_materials == {}
+    assert has_marker_registry is False
 
 
-def test_host_session_compiler_evidence_freeze_during_provider_clears_pending_material() -> (
+def test_host_session_compiler_evidence_freeze_during_provider_does_not_publish_material() -> (
     None
 ):
-    """A provider-triggered freeze cannot publish a handle or retain material state."""
+    """A provider-triggered freeze cannot publish a handle or retain evidence state."""
 
     module = _host_session_module()
     issued: list[object] = []
@@ -1869,7 +1870,6 @@ def test_host_session_compiler_evidence_freeze_during_provider_clears_pending_ma
             "fresh_quota_issued_at": session._fresh_quota_issued_at,
             "fresh_quota_valid_until": session._fresh_quota_valid_until,
             "evidence": dict(session._compiler_evidence),
-            "materials": dict(session._compiler_materials),
         }
     finally:
         child.close()
@@ -1884,7 +1884,6 @@ def test_host_session_compiler_evidence_freeze_during_provider_clears_pending_ma
         "fresh_quota_issued_at": None,
         "fresh_quota_valid_until": None,
         "evidence": {},
-        "materials": {},
     }
 
 
@@ -1903,10 +1902,10 @@ def test_host_session_compiler_preparation_has_no_session_reachability_or_mutabl
             id(session): "session",
             id(session._quota_evidence_resolver): "quota_resolver",
             id(session._bridge): "bridge",
-            id(session._compiler_materials): "registry",
         }
         assert not hasattr(session, "_compiler_owner")
         assert not hasattr(session, "_compiler_material_tokens")
+        assert not hasattr(session, "_compiler_materials")
 
         reachable: set[str] = set()
         seen: set[int] = set()
@@ -1978,6 +1977,48 @@ def test_host_session_compiler_preparation_has_no_session_reachability_or_mutabl
         "reachable": set(),
         "corrupted": (),
     }
+
+
+def test_host_session_compiler_preparation_gc_referrers_cannot_publish_mutated_invocation() -> (
+    None
+):
+    """A provider cannot discover a marker-keyed canonical invocation through GC."""
+
+    module = _host_session_module()
+    mutated_request_hash = _HASH_PREFIX + "9" * 64
+    provider_state: dict[str, object] = {}
+
+    def provider(preparation: object) -> object:
+        altered: list[object] = []
+        for referrer in gc.get_referrers(preparation):
+            if type(referrer) is not dict:
+                continue
+            candidate = referrer.get(preparation)
+            if type(candidate) is module._CompilerInvocation:
+                object.__setattr__(candidate, "request_hash", mutated_request_hash)
+                altered.append(candidate)
+        provider_state["altered"] = tuple(altered)
+        return preparation if altered else object()
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        result = session.prepare_compiler_evidence(preparation_id="prep-gc-referrers")
+        published = dict(session._compiler_evidence)
+        consumed = (
+            session.consume_compiler_evidence(result)
+            if result != "NO_SAFE_WORK"
+            else "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
+
+    assert result == "NO_SAFE_WORK"
+    assert published == {}
+    assert consumed == "NO_SAFE_WORK"
+    assert provider_state == {"altered": ()}
 
 
 def test_host_session_compiler_evidence_handle_expires_at_now_plus_121() -> None:
