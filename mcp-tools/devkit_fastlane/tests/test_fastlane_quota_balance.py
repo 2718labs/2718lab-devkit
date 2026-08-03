@@ -76,6 +76,7 @@ def sign(value: object) -> str:
 
 
 POLICY_HASH = hash_value(POLICY)
+POLICY_V2_PATH = ROOT / "assets" / "fastlane-quota-balance-policy-v2.json"
 KEY_ID = digest_text("quota-balance-test-key-id")
 SOURCE_ID = digest_text("quota-balance-host-a")
 PERIOD_ID = digest_text("quota-balance-period-a")
@@ -239,6 +240,82 @@ def make_request(
     return payload
 
 
+def policy_v2_hash() -> str:
+    assert POLICY_V2_PATH.exists(), "the v2 quota policy asset is absent"
+    return hash_value(json.loads(POLICY_V2_PATH.read_text(encoding="utf-8")))
+
+
+def make_v2_normal_spark_alternate(label: str) -> dict[str, object]:
+    candidate = make_candidate(
+        label,
+        pool="spark",
+        lane="spark",
+        model="gpt-5.3-codex-spark",
+        effort="medium",
+    )
+    candidate["capability_binding_hash"] = digest_text(f"capability-{label}")
+    candidate["context_binding_hash"] = digest_text(f"context-{label}")
+    route_lock = candidate["route_lock"]
+    assert isinstance(route_lock, dict)
+    binding: dict[str, object] = {
+        "schema": "2718lab-devkit/spark-alternate-binding-v1",
+        "route": {
+            "lane": route_lock["lane"],
+            "model": route_lock["model"],
+            "effort": route_lock["effort"],
+        },
+        "capability_hash": candidate["capability_binding_hash"],
+        "task_hash": candidate["task_key"],
+        "lease_epoch": candidate["task_lease_epoch"],
+        "context_hash": candidate["context_binding_hash"],
+        "scope_hash": candidate["write_scope_hash"],
+    }
+    binding["binding_hash"] = hash_value(binding)
+    candidate["spark_binding"] = binding
+    return candidate
+
+
+def make_v2_static_spark_strike(label: str) -> dict[str, object]:
+    candidate = make_candidate(
+        label,
+        pool="spark",
+        lane="spark",
+        model="gpt-5.3-codex-spark",
+        effort="medium",
+        spark_binding={
+            "spark_proof_hash": digest_text(f"proof-{label}"),
+            "parent_main_route_hash": digest_text(f"parent-route-{label}"),
+            "parent_admission_id": digest_text(f"parent-admission-{label}"),
+            "writer_handoff_hash": digest_text(f"writer-handoff-{label}"),
+        },
+    )
+    candidate["capability_binding_hash"] = digest_text(f"capability-{label}")
+    candidate["context_binding_hash"] = digest_text(f"context-{label}")
+    return candidate
+
+
+def make_v2_request(
+    *,
+    snapshot: dict[str, object] | None = None,
+    candidates: list[dict[str, object]] | None = None,
+    receipts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema": "2718lab-devkit/fastlane-quota-balance-request-v2",
+        "policy_hash": policy_v2_hash(),
+        "snapshot": make_snapshot() if snapshot is None else snapshot,
+        "candidates": (
+            [make_v2_normal_spark_alternate("default")]
+            if candidates is None
+            else candidates
+        ),
+        "receipts": [] if receipts is None else receipts,
+        "prior_audit_hash": None,
+    }
+    payload["request_hash"] = request_hash(payload)
+    return payload
+
+
 def make_receipt(
     candidate: dict[str, object],
     snapshot: dict[str, object],
@@ -364,6 +441,48 @@ class QuotaBalanceTests(unittest.TestCase):
             evaluation_time_utc_z=EVALUATION_TIME,
             verified_route_result_hashes=route_hashes,
             verified_lease_scope_bindings=lease_bindings,
+        )
+
+    def compile_v2(
+        self,
+        quota,
+        request: dict[str, object],
+        *,
+        route_hashes: set[str] | None = None,
+        lease_bindings: set[str] | None = None,
+        alternate_bindings: set[str] | None = None,
+    ) -> dict[str, object]:
+        candidates = request.get("candidates", [])
+        assert isinstance(candidates, list)
+        if route_hashes is None:
+            route_hashes = {
+                candidate["route_lock"]["result_hash"]
+                for candidate in candidates
+                if isinstance(candidate, dict)
+                and isinstance(candidate.get("route_lock"), dict)
+            }
+        if lease_bindings is None:
+            lease_bindings = {
+                lease_scope_binding(candidate)
+                for candidate in candidates
+                if isinstance(candidate, dict)
+            }
+        if alternate_bindings is None:
+            alternate_bindings = {
+                binding["binding_hash"]
+                for candidate in candidates
+                if isinstance(candidate, dict)
+                and isinstance(binding := candidate.get("spark_binding"), dict)
+                and binding.get("schema")
+                == "2718lab-devkit/spark-alternate-binding-v1"
+            }
+        return quota.compile_quota_balance_v2(
+            request,
+            trusted_key_resolver=self.resolver,
+            evaluation_time_utc_z=EVALUATION_TIME,
+            verified_route_result_hashes=route_hashes,
+            verified_lease_scope_bindings=lease_bindings,
+            verified_spark_alternate_binding_hashes=alternate_bindings,
         )
 
     def test_q01_tight_quota_preserves_the_routed_model_and_effort(self) -> None:
@@ -647,6 +766,75 @@ class QuotaBalanceTests(unittest.TestCase):
         )
         self.assertEqual(left["decision_hash"], right["decision_hash"])
         self.assertEqual(left["audit_event_hash"], right["audit_event_hash"])
+
+    def test_q19_v2_normal_alternate_uses_spark_at_51_main_20_spark(self) -> None:
+        quota = load_quota_module()
+        alternate = make_v2_normal_spark_alternate("q19")
+
+        decision = self.compile_v2(
+            quota,
+            make_v2_request(
+                snapshot=make_snapshot(main_used=510000, spark_used=200000),
+                candidates=[alternate],
+            ),
+        )
+
+        self.assertEqual([alternate["candidate_id"]], decision["spark_proposal_ids"])
+        self.assertIn("spark_alternate_headroom", decision["reason_codes"])
+
+    def test_q20_v2_normal_alternate_holds_inside_deadband(self) -> None:
+        quota = load_quota_module()
+        alternate = make_v2_normal_spark_alternate("q20")
+
+        decision = self.compile_v2(
+            quota,
+            make_v2_request(
+                snapshot=make_snapshot(main_used=510000, spark_used=470000),
+                candidates=[alternate],
+            ),
+        )
+
+        self.assertEqual([], decision["spark_proposal_ids"])
+        self.assertIn("spark_deadband_hold", decision["reason_codes"])
+
+    def test_q21_v2_strike_prioritizes_over_normal_alternate_and_caps_one_card(
+        self,
+    ) -> None:
+        quota = load_quota_module()
+        normal = make_v2_normal_spark_alternate("a-normal")
+        strike = make_v2_static_spark_strike("z-strike")
+
+        decision = self.compile_v2(
+            quota,
+            make_v2_request(
+                snapshot=make_snapshot(main_used=510000, spark_used=200000),
+                candidates=[normal, strike],
+            ),
+        )
+
+        self.assertEqual([strike["candidate_id"]], decision["spark_proposal_ids"])
+        self.assertEqual(1, len(decision["spark_proposal_ids"]))
+        self.assertIn("spark_static_priority", decision["reason_codes"])
+
+    def test_q22_v2_tampered_normal_binding_cannot_propose_spark(self) -> None:
+        quota = load_quota_module()
+        alternate = make_v2_normal_spark_alternate("q22")
+        binding = alternate["spark_binding"]
+        assert isinstance(binding, dict)
+        original_binding_hash = binding["binding_hash"]
+        binding["context_hash"] = digest_text("tampered-context")
+
+        decision = self.compile_v2(
+            quota,
+            make_v2_request(
+                snapshot=make_snapshot(main_used=510000, spark_used=200000),
+                candidates=[alternate],
+            ),
+            alternate_bindings={original_binding_hash},
+        )
+
+        self.assertEqual([], decision["spark_proposal_ids"])
+        self.assertIn("spark_alternate_binding_invalid", decision["reason_codes"])
 
     def test_q12_quota_compiler_has_no_forbidden_side_effect_surface(self) -> None:
         quota = load_quota_module()

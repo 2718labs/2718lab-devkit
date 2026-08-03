@@ -17,6 +17,11 @@ _POLICY_PATH = (
     / "assets"
     / "fastlane-quota-balance-policy-v1.json"
 )
+_POLICY_PATH_V2 = (
+    Path(__file__).resolve().parents[1]
+    / "assets"
+    / "fastlane-quota-balance-policy-v2.json"
+)
 _HASH_PREFIX = "sha256:"
 _MAX_CANDIDATES = 8
 _MAX_REASON_CODES = 16
@@ -111,6 +116,49 @@ def _policy() -> Mapping[str, Any]:
     return policy
 
 
+def _policy_v2() -> Mapping[str, Any]:
+    try:
+        value = json.loads(_POLICY_PATH_V2.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("quota policy asset is unavailable") from error
+    policy = _mapping(value)
+    if set(policy) != {"schema", "version", "main", "spark", "spark_alternate"}:
+        raise ValueError("quota policy has unsupported fields")
+    if policy["schema"] != "2718lab-devkit/fastlane-quota-balance-policy-v2":
+        raise ValueError("quota policy schema is invalid")
+    if policy["version"] != 2:
+        raise ValueError("quota policy version is invalid")
+    main = _mapping(policy["main"])
+    spark = _mapping(policy["spark"])
+    alternate = _mapping(policy["spark_alternate"])
+    if set(main) != {
+        "normal_used_lt_ppm",
+        "normal_slope_lt_ppm_300s",
+        "warm_used_lt_ppm",
+        "warm_slope_lt_ppm_300s",
+        "tight_used_lt_ppm",
+        "tight_slope_lt_ppm_300s",
+        "critical_used_lt_ppm",
+        "normal_target",
+        "warm_target",
+        "tight_target",
+        "critical_target",
+        "paused_target",
+    }:
+        raise ValueError("quota main policy is invalid")
+    if set(spark) != {
+        "usage_deadband_ppm",
+        "slope_deadband_ppm_300s",
+        "absolute_cap_ppm",
+        "global_concurrency_cap",
+        "host_concurrency_cap",
+    }:
+        raise ValueError("quota spark policy is invalid")
+    if alternate != {"required_local_slot_count": 1, "single_card_cap": 1}:
+        raise ValueError("quota spark alternate policy is invalid")
+    return policy
+
+
 def _normalized_request_hash(request: Mapping[str, Any]) -> str:
     body = {key: value for key, value in request.items() if key != "request_hash"}
     candidates = body.get("candidates")
@@ -176,6 +224,11 @@ def _base_decision(
     policy_hash: str | None = None,
     prior_audit_hash: str | None = None,
     receipt_hashes: Iterable[str] = (),
+    result_schema: str = "2718lab-devkit/fastlane-quota-balance-result-v1",
+    authorization_schema: str = (
+        "2718lab-devkit/fastlane-quota-balance-authorization-v1"
+    ),
+    audit_schema: str = "2718lab-devkit/quota-audit-event-v1",
 ) -> dict[str, Any]:
     main_proposals = sorted(set(main_proposal_ids))
     spark_proposals = sorted(set(spark_proposal_ids))
@@ -184,7 +237,7 @@ def _base_decision(
     routes = sorted(set(route_lock_hashes))
     reasons = sorted(set(reason_codes))[:_MAX_REASON_CODES]
     authorization = {
-        "schema": "2718lab-devkit/fastlane-quota-balance-authorization-v1",
+        "schema": authorization_schema,
         "policy_hash": policy_hash,
         "snapshot_hash": snapshot_hash,
         "ledger_epoch": ledger_epoch,
@@ -197,7 +250,7 @@ def _base_decision(
     }
     decision_hash = _hash(authorization)
     audit = {
-        "schema": "2718lab-devkit/quota-audit-event-v1",
+        "schema": audit_schema,
         "policy_hash": policy_hash,
         "snapshot_hash": snapshot_hash,
         "ledger_epoch": ledger_epoch,
@@ -214,7 +267,7 @@ def _base_decision(
         "decision_hash": decision_hash,
     }
     return {
-        "schema": "2718lab-devkit/fastlane-quota-balance-result-v1",
+        "schema": result_schema,
         "status": status,
         "snapshot_hash": snapshot_hash,
         "ledger_epoch": ledger_epoch,
@@ -251,6 +304,41 @@ def _fail_closed(
             if _is_hash(request.get("prior_audit_hash"))
             else None
         ),
+    )
+
+
+def _fail_closed_v2(
+    request: Mapping[str, Any],
+    *,
+    policy_hash: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    return _base_decision(
+        status="usage_unknown",
+        snapshot_hash=None,
+        ledger_epoch=None,
+        main_pressure="unknown",
+        global_main_target=6,
+        held_candidate_ids=_candidate_ids(request.get("candidates")),
+        reason_codes=(reason,),
+        policy_hash=policy_hash,
+        prior_audit_hash=(
+            request.get("prior_audit_hash")
+            if _is_hash(request.get("prior_audit_hash"))
+            else None
+        ),
+        result_schema="2718lab-devkit/fastlane-quota-balance-result-v2",
+        authorization_schema="2718lab-devkit/fastlane-quota-balance-authorization-v2",
+        audit_schema="2718lab-devkit/quota-audit-event-v2",
+    )
+
+
+def _base_decision_v2(**kwargs: Any) -> dict[str, Any]:
+    return _base_decision(
+        result_schema="2718lab-devkit/fastlane-quota-balance-result-v2",
+        authorization_schema="2718lab-devkit/fastlane-quota-balance-authorization-v2",
+        audit_schema="2718lab-devkit/quota-audit-event-v2",
+        **kwargs,
     )
 
 
@@ -476,6 +564,162 @@ def _valid_spark_binding(candidate: Mapping[str, Any]) -> bool:
     }:
         return False
     return all(_is_hash(binding[key]) for key in binding)
+
+
+def _v2_spark_binding_kind(
+    candidate: Mapping[str, Any], *, trusted_alternate_bindings: set[str]
+) -> tuple[str | None, str | None]:
+    route = _mapping(candidate["route_lock"])
+    if (
+        candidate["pool"] != "spark"
+        or route["lane"] != "spark"
+        or route["model"] != "gpt-5.3-codex-spark"
+        or route["effort"] not in {"low", "medium", "high", "xhigh"}
+    ):
+        return None, "spark_alternate_binding_invalid"
+    if _valid_spark_binding(candidate):
+        return "static", None
+    try:
+        binding = _mapping(candidate["spark_binding"])
+        expected = {
+            "schema",
+            "route",
+            "capability_hash",
+            "task_hash",
+            "lease_epoch",
+            "context_hash",
+            "scope_hash",
+            "binding_hash",
+        }
+        if set(binding) != expected:
+            raise ValueError("alternate binding fields are invalid")
+        if binding["schema"] != "2718lab-devkit/spark-alternate-binding-v1":
+            raise ValueError("alternate binding schema is invalid")
+        unsigned = {key: value for key, value in binding.items() if key != "binding_hash"}
+        if not _is_hash(binding["binding_hash"]) or binding["binding_hash"] != _hash(
+            unsigned
+        ):
+            raise ValueError("alternate binding hash is invalid")
+        if binding["binding_hash"] not in trusted_alternate_bindings:
+            raise PermissionError("alternate binding is untrusted")
+        binding_route = _mapping(binding["route"])
+        if set(binding_route) != {"lane", "model", "effort"} or dict(
+            binding_route
+        ) != {
+            "lane": route["lane"],
+            "model": route["model"],
+            "effort": route["effort"],
+        }:
+            raise ValueError("alternate route binding is invalid")
+        for key in (
+            "capability_hash",
+            "task_hash",
+            "context_hash",
+            "scope_hash",
+        ):
+            if not _is_hash(binding[key]):
+                raise ValueError("alternate binding hash is invalid")
+        if (
+            type(binding["lease_epoch"]) is not int
+            or binding["lease_epoch"] != candidate["task_lease_epoch"]
+            or binding["capability_hash"] != candidate["capability_binding_hash"]
+            or binding["task_hash"] != candidate["task_key"]
+            or binding["context_hash"] != candidate["context_binding_hash"]
+            or binding["scope_hash"] != candidate["write_scope_hash"]
+        ):
+            raise ValueError("alternate binding does not match candidate")
+    except (KeyError, TypeError, ValueError, PermissionError):
+        return None, "spark_alternate_binding_invalid"
+    return "alternate", None
+
+
+def _candidate_v2(
+    value: object,
+    *,
+    trusted_routes: set[str],
+    trusted_bindings: set[str],
+    trusted_alternate_bindings: set[str],
+) -> tuple[Mapping[str, Any] | None, str | None]:
+    try:
+        candidate = _mapping(value)
+        expected = {
+            "candidate_id",
+            "workflow_key",
+            "task_key",
+            "pool",
+            "scheduler_role",
+            "route_lock",
+            "task_lease_epoch",
+            "assignment_epoch",
+            "assignment_token",
+            "host_id_hash",
+            "local_slot_id",
+            "write_scope_hash",
+            "input_snapshot_id",
+            "capability_binding_hash",
+            "context_binding_hash",
+            "spark_binding",
+        }
+        if set(candidate) != expected:
+            raise ValueError("candidate fields are invalid")
+        for field in (
+            "candidate_id",
+            "workflow_key",
+            "task_key",
+            "assignment_token",
+            "host_id_hash",
+            "write_scope_hash",
+            "input_snapshot_id",
+            "capability_binding_hash",
+            "context_binding_hash",
+        ):
+            if not _is_hash(candidate[field]):
+                raise ValueError("candidate hash is invalid")
+        if candidate["pool"] not in {"main", "spark"}:
+            raise ValueError("candidate pool is invalid")
+        if not isinstance(candidate["scheduler_role"], str) or not isinstance(
+            candidate["local_slot_id"], str
+        ):
+            raise TypeError("candidate label is invalid")
+        _int(candidate["task_lease_epoch"], minimum=1, maximum=2**31 - 1)
+        _int(candidate["assignment_epoch"], minimum=1, maximum=2**31 - 1)
+        route = _mapping(candidate["route_lock"])
+        if set(route) != {
+            "result_hash",
+            "task_fingerprint",
+            "lane",
+            "model",
+            "effort",
+            "safety_floor_rank",
+        }:
+            raise ValueError("candidate route is invalid")
+        if not _is_hash(route["result_hash"]) or not _is_hash(
+            route["task_fingerprint"]
+        ):
+            raise ValueError("candidate route hash is invalid")
+        _int(route["safety_floor_rank"], minimum=10, maximum=110)
+        if (
+            not isinstance(route["lane"], str)
+            or not isinstance(route["model"], str)
+            or not isinstance(route["effort"], str)
+        ):
+            raise TypeError("candidate route label is invalid")
+        if _candidate_binding_hash(candidate) not in trusted_bindings:
+            return None, "lease_scope_binding_invalid"
+        if route["result_hash"] not in trusted_routes:
+            return None, "quota_receipt_invalid"
+        if candidate["pool"] == "main":
+            if candidate["spark_binding"] is not None:
+                return None, "quota_receipt_invalid"
+            return candidate, None
+        kind, reason = _v2_spark_binding_kind(
+            candidate, trusted_alternate_bindings=trusted_alternate_bindings
+        )
+        if kind is None:
+            return None, reason
+        return candidate, None
+    except (KeyError, TypeError, ValueError):
+        return None, "quota_receipt_invalid"
 
 
 def _receipt_matches(
@@ -779,6 +1023,265 @@ def compile_quota_balance(
         reasons.append("quota_receipt_invalid")
     all_ids = _candidate_ids(source["candidates"])
     return _base_decision(
+        status="resolved",
+        snapshot_hash=str(snapshot["snapshot_hash"]),
+        ledger_epoch=int(capacity["ledger_epoch"]),
+        main_pressure=pressure,
+        global_main_target=target,
+        main_proposal_ids=main_proposals,
+        spark_proposal_ids=spark_proposals,
+        admitted_candidate_ids=admitted,
+        held_candidate_ids=(
+            candidate_id for candidate_id in all_ids if candidate_id not in admitted
+        ),
+        route_lock_hashes=route_hashes,
+        reason_codes=reasons,
+        policy_hash=policy_hash,
+        prior_audit_hash=(
+            source.get("prior_audit_hash")
+            if _is_hash(source.get("prior_audit_hash"))
+            else None
+        ),
+        receipt_hashes=receipt_hashes,
+    )
+
+
+def compile_quota_balance_v2(
+    request: Mapping[str, Any],
+    *,
+    trusted_key_resolver: HashResolver,
+    evaluation_time_utc_z: str,
+    verified_route_result_hashes: Iterable[str],
+    verified_lease_scope_bindings: Iterable[str],
+    verified_spark_alternate_binding_hashes: Iterable[str],
+) -> dict[str, Any]:
+    """Compile v2 quota proposals with a bounded normal Spark alternate."""
+
+    try:
+        source = _mapping(request)
+    except (TypeError, ValueError):
+        return _base_decision_v2(
+            status="rejected",
+            snapshot_hash=None,
+            ledger_epoch=None,
+            main_pressure="unknown",
+            global_main_target=6,
+            reason_codes=("quota_usage_unknown",),
+        )
+    policy = _policy_v2()
+    policy_hash = _hash(policy)
+    if (
+        source.get("schema") != "2718lab-devkit/fastlane-quota-balance-request-v2"
+        or source.get("policy_hash") != policy_hash
+        or not isinstance(source.get("candidates"), list)
+        or not isinstance(source.get("receipts"), list)
+        or len(source["candidates"]) > _MAX_CANDIDATES
+        or len(source["receipts"]) > _MAX_CANDIDATES
+        or source.get("request_hash") != _normalized_request_hash(source)
+    ):
+        return _fail_closed_v2(
+            source, policy_hash=policy_hash, reason="quota_usage_unknown"
+        )
+    try:
+        snapshot, evaluation = _verified_snapshot(
+            source.get("snapshot"),
+            trusted_key_resolver=trusted_key_resolver,
+            evaluation_time_utc_z=evaluation_time_utc_z,
+        )
+    except TimeoutError:
+        return _fail_closed_v2(
+            source, policy_hash=policy_hash, reason="quota_snapshot_stale"
+        )
+    except PermissionError:
+        return _fail_closed_v2(
+            source, policy_hash=policy_hash, reason="quota_snapshot_untrusted"
+        )
+    except (KeyError, TypeError, ValueError):
+        return _fail_closed_v2(
+            source, policy_hash=policy_hash, reason="quota_usage_unknown"
+        )
+
+    trusted_routes = {
+        value for value in verified_route_result_hashes if _is_hash(value)
+    }
+    trusted_bindings = {
+        value for value in verified_lease_scope_bindings if _is_hash(value)
+    }
+    trusted_alternate_bindings = {
+        value
+        for value in verified_spark_alternate_binding_hashes
+        if _is_hash(value)
+    }
+    valid_candidates: list[Mapping[str, Any]] = []
+    route_hashes: list[str] = []
+    reasons: list[str] = []
+    seen_ids: set[str] = set()
+    for raw_candidate in source["candidates"]:
+        candidate, reason = _candidate_v2(
+            raw_candidate,
+            trusted_routes=trusted_routes,
+            trusted_bindings=trusted_bindings,
+            trusted_alternate_bindings=trusted_alternate_bindings,
+        )
+        if candidate is None:
+            if reason is not None:
+                reasons.append(reason)
+            continue
+        candidate_id = str(candidate["candidate_id"])
+        if candidate_id in seen_ids:
+            reasons.append("quota_receipt_invalid")
+            continue
+        seen_ids.add(candidate_id)
+        valid_candidates.append(candidate)
+        route_hashes.append(str(_mapping(candidate["route_lock"])["result_hash"]))
+    valid_candidates.sort(key=lambda item: str(item["candidate_id"]))
+
+    pressure, target = _main_pressure(snapshot, policy)
+    capacity = _mapping(snapshot["capacity"])
+    main_candidates = [
+        candidate
+        for candidate in valid_candidates
+        if candidate["pool"] == "main"
+        and _mapping(candidate["route_lock"])["lane"] in {"luna", "terra", "sol"}
+        and candidate["spark_binding"] is None
+    ]
+    main_proposals: list[str] = []
+    if pressure == "paused":
+        reasons.append("quota_main_paused")
+    else:
+        global_free = max(0, target - int(capacity["global_main_active"]))
+        host_free = max(
+            0,
+            min(_LOCAL_SCHEDULER_CAP, int(capacity["host_main_cap"]))
+            - int(capacity["host_main_active"]),
+        )
+        grant_count = min(global_free, host_free, len(main_candidates))
+        main_proposals = [
+            str(candidate["candidate_id"])
+            for candidate in main_candidates[:grant_count]
+        ]
+        if main_candidates and global_free == 0:
+            reasons.append("quota_global_capacity_exhausted")
+        if main_candidates and host_free == 0:
+            reasons.append("quota_host_capacity_exhausted")
+    reasons.append(f"quota_main_{pressure}")
+
+    spark_proposals: list[str] = []
+    spark_candidates: list[tuple[Mapping[str, Any], str]] = []
+    for candidate in valid_candidates:
+        if candidate["pool"] != "spark":
+            continue
+        kind, reason = _v2_spark_binding_kind(
+            candidate, trusted_alternate_bindings=trusted_alternate_bindings
+        )
+        if kind is None:
+            if reason is not None:
+                reasons.append(reason)
+            continue
+        spark_candidates.append((candidate, kind))
+    spark_candidates.sort(
+        key=lambda item: (
+            0 if item[1] == "static" else 1,
+            str(item[0]["candidate_id"]),
+        )
+    )
+    if spark_candidates:
+        spark = _mapping(snapshot["spark"])
+        main = _mapping(snapshot["main"])
+        spark_limits = _mapping(policy["spark"])
+        alternate_limits = _mapping(policy["spark_alternate"])
+        has_static = any(kind == "static" for _, kind in spark_candidates)
+        has_alternate = any(kind == "alternate" for _, kind in spark_candidates)
+        if has_static and has_alternate:
+            reasons.append("spark_static_priority")
+        selected, selected_kind = spark_candidates[0]
+        if (
+            selected_kind == "alternate"
+            and int(capacity["host_spark_cap"])
+            != int(alternate_limits["required_local_slot_count"])
+        ):
+            reasons.append("spark_alternate_slot_hold")
+        elif int(capacity["global_spark_active"]) >= int(
+            spark_limits["global_concurrency_cap"]
+        ) or int(capacity["host_spark_active"]) >= int(
+            spark_limits["host_concurrency_cap"]
+        ):
+            reasons.append("spark_cap_hold")
+        elif int(main["used_ppm"]) - int(spark["used_ppm"]) <= int(
+            spark_limits["usage_deadband_ppm"]
+        ):
+            reasons.append("spark_deadband_hold")
+        elif int(main["delta_ppm_300s"]) - int(spark["delta_ppm_300s"]) < -int(
+            spark_limits["slope_deadband_ppm_300s"]
+        ):
+            reasons.append("spark_slope_hold")
+        elif int(spark["used_ppm"]) >= min(
+            int(spark_limits["absolute_cap_ppm"]),
+            int(main["used_ppm"]) + int(spark_limits["usage_deadband_ppm"]),
+        ):
+            reasons.append("spark_cap_hold")
+        else:
+            cap = int(alternate_limits["single_card_cap"])
+            spark_proposals = [str(selected["candidate_id"])][:cap]
+            reasons.append(
+                "spark_follow_lag"
+                if selected_kind == "static"
+                else "spark_alternate_headroom"
+            )
+
+    provisional = _base_decision_v2(
+        status="resolved",
+        snapshot_hash=str(snapshot["snapshot_hash"]),
+        ledger_epoch=int(capacity["ledger_epoch"]),
+        main_pressure=pressure,
+        global_main_target=target,
+        main_proposal_ids=main_proposals,
+        spark_proposal_ids=spark_proposals,
+        held_candidate_ids=_candidate_ids(source["candidates"]),
+        route_lock_hashes=route_hashes,
+        reason_codes=reasons,
+        policy_hash=policy_hash,
+        prior_audit_hash=(
+            source.get("prior_audit_hash")
+            if _is_hash(source.get("prior_audit_hash"))
+            else None
+        ),
+    )
+    proposed_ids = set(main_proposals) | set(spark_proposals)
+    candidate_by_id = {
+        str(candidate["candidate_id"]): candidate for candidate in valid_candidates
+    }
+    admitted: list[str] = []
+    receipt_hashes: list[str] = []
+    invalid_receipt = False
+    for receipt in source["receipts"]:
+        if not isinstance(receipt, Mapping):
+            invalid_receipt = True
+            continue
+        candidate_id = receipt.get("candidate_id")
+        candidate = candidate_by_id.get(str(candidate_id))
+        if candidate is None or str(candidate_id) not in proposed_ids:
+            invalid_receipt = True
+            continue
+        valid, receipt_hash = _receipt_matches(
+            receipt,
+            candidate=candidate,
+            snapshot=snapshot,
+            decision_hash=str(provisional["decision_hash"]),
+            evaluation=evaluation,
+            trusted_key_resolver=trusted_key_resolver,
+        )
+        if not valid or receipt_hash is None or str(candidate_id) in admitted:
+            invalid_receipt = True
+            continue
+        admitted.append(str(candidate_id))
+        receipt_hashes.append(receipt_hash)
+    if proposed_ids and len(admitted) < len(proposed_ids):
+        reasons.append("quota_receipt_required")
+    if invalid_receipt:
+        reasons.append("quota_receipt_invalid")
+    all_ids = _candidate_ids(source["candidates"])
+    return _base_decision_v2(
         status="resolved",
         snapshot_hash=str(snapshot["snapshot_hash"]),
         ledger_epoch=int(capacity["ledger_epoch"]),
