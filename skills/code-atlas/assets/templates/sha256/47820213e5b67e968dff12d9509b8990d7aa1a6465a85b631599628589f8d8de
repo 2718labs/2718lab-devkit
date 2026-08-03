@@ -1,2 +1,0 @@
-if not (${predicate_expression}):
-    raise ${exception_expression}

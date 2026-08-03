@@ -32,7 +32,7 @@ AstrBot 本体(`AstrBotDevs/AstrBot`)采用 **AGPL-3.0** 许可证。AGPL 相比
 
 ### 1.5 LICENSE 全文来源
 
-LICENSE 文件的完整法律文本**只能从 `assets/templates/LICENSE-AGPL-3.0`(默认)或 `assets/templates/LICENSE-MIT`(破例时)复制**,禁止凭记忆手打或改写措辞——许可证条款的准确性直接影响法律效力,任何"大概意思对"的复述都不可接受。
+LICENSE 文件的完整法律文本**只能从选定许可证的官方发布源或目标仓库已核验的原文复制**，禁止凭记忆手打或改写措辞——许可证条款的准确性直接影响法律效力，任何"大概意思对"的复述都不可接受。
 
 ## 2. README 逐段写作指引
 
@@ -72,4 +72,4 @@ AstrBot 支持多个 IM 平台适配器(QQ、Telegram、微信、Discord 等),�
 - **`_conf_schema.json` 校验过**:schema 写错会导致插件直接加载失败(框架层面抛异常),必须在提交前用 JSON 解析器验证过一次。
 - **无其他框架 API 混入**:这是 `astrbot-plugin-dev` skill 反复强调的高频错误(误用 `nonebot`/`koishi`/`telebot` 等其他框架的 API),PR 阶段的 checklist 是最后一道防线。
 
-具体模板文件见 `assets/templates/ISSUE_TEMPLATE/` 与 `assets/templates/PULL_REQUEST_TEMPLATE.md`。
+Issue 和 PR 的字段应按目标仓库的维护需求编写；不要假定存在捆绑模板。

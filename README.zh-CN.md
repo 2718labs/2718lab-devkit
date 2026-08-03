@@ -78,17 +78,17 @@ flowchart TD
     B -->|Fast Lane| F
 ```
 
-## Codex skill 导航
+## Codex 说明书导航
 
-本地插件安装态包含可选的 Codex skill bundle：一个短总览
-（`skills/devkit-overview`）和一个工作流设计入口
-（`skills/workflow-design`，默认 Fast Lane）。模块说明书彼此独立，按需加载：
+本地插件包含可选的、仅供查阅的 Codex 说明书 bundle：一个短总览
+（`skills/devkit-overview`）、一个工作流设计说明书
+（`skills/workflow-design`，默认 Fast Lane 策略）和七份独立模块说明书。按需加载：
 
 `fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`。
 
-Skills 是说明书，不是 MCP 工具。只有任务已被限定为 2718lab DevKit 时才加载；
-它们刻意不进入 MCP-only 主 ZIP。
+Skills 是说明书，不是 MCP 工具或可执行的 prompt surface。它们不含 slash command、
+agent profile、脚手架模板、校验器或调度代码，并且刻意不进入 MCP-only 主 ZIP。
 
 ## 文档导航
 

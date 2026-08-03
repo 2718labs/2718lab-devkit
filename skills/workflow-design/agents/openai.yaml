@@ -1,4 +1,0 @@
-interface:
-  display_name: "Workflow Design"
-  short_description: "Design bounded work through the default Fast Lane"
-  default_prompt: "Design this task with the default Fast Lane: score it, partition disjoint work, and route explicit models with fail-closed evidence."

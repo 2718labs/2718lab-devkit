@@ -1,2 +1,0 @@
-def ${test_name}() -> None:
-    ${test_body}

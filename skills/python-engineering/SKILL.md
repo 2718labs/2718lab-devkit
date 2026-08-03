@@ -1,32 +1,13 @@
 ---
 name: python-engineering
-description: Set up, modify, review, test, package, or lint a Python repository through an explicitly scoped 2718lab DevKit task. Use for pyproject.toml, uv/uv.lock, ruff, pyright, pytest, pre-commit, layout, dependencies, and CI tooling; never load it for an unrelated project.
+description: Reference manual for Python project layout, uv dependencies, static checks, tests, packaging, and CI conventions. Use only for documentation; it does not create environments, run tools, or modify a project.
 ---
 
-# Python 工程基线
+# Python Engineering Manual
 
-范围门：只对当前 DevKit 任务应用这些工程约束；不要把项目配置、缓存或验证结果带入其他项目。
+Read [pyproject reference](references/pyproject-reference.md),
+[toolchain commands](references/toolchain-commands.md), and
+[engineering guidelines](references/guidelines.md) for the relevant constraint.
 
-这是 Python 工具链的短说明书；详细配置按需读取：
-
-- `references/pyproject-reference.md`：配置键、PEP 440 和构建后端。
-- `references/toolchain-commands.md`：uv/ruff/pyright/pytest/pre-commit/CI 命令。
-- `references/guidelines.md`：工程评审条款；`assets/templates/`：起步文件。
-- `scripts/validate_project.py`：项目结构与配置自检。
-
-## 硬约束
-
-1. 依赖和环境只用 `uv add/remove/sync/lock/run/build`；锁文件随依赖变更更新，
-   不在 uv 项目里混用 pip/poetry/conda 或手写新 requirements。
-2. lint/format 用 ruff；类型检查用 pyright；测试放 `tests/test_*.py`。配置键先查
-   reference，不凭记忆把 mypy 配置写进 pyright。
-3. 可发布/可 import 的库使用 `src/<package>/`；应用脚本可 flat-layout；`.venv/` 不进 git，
-   `uv.lock` 进 git；版本遵循合法 PEP 440，禁止裸连字符预发布或 `v` 前缀。
-4. 公共 API 写类型，文件和命令保持可复现；避免无理由精确钉死依赖。
-
-## 交付
-
-运行 `python scripts/validate_project.py <repo>`，再执行 `uv lock --check`、
-`uv run ruff check`、`uv run pyright`、`uv run pytest`（按仓库配置取舍）。发布、tag、Release
-转到 `oss-repo-ops`；AstrBot 专属布局转到 `astrbot-plugin-dev`；MCP 协议细节转到
-`mcp-server-dev`。
+This manual is intentionally non-executable. Apply the target repository's
+declared commands and validation policy rather than relying on a bundled script.

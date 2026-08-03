@@ -7,6 +7,6 @@ components; those references are historical provenance, not supported runtime
 configuration.
 
 For the current system, start with the repository README, then use the Fast
-Lane contract and references under `mcp-tools/devkit_fastlane/`. The installed
-Codex skill bundle is documented under `skills/` and is scoped to explicit
-2718lab DevKit work only.
+Lane contract and references under `mcp-tools/devkit_fastlane/`. The optional
+Codex bundle under `skills/` contains short manuals only and is scoped to
+explicit 2718lab DevKit work.

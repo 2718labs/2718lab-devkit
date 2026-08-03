@@ -351,7 +351,7 @@ async def terminate(self):
 
 9.1 **[要求]** 本地开发环境统一:clone AstrBot 本体,插件仓库 clone 到 `AstrBot/data/plugins/` 下开发;开启 `ASTRBOT_RELOAD=1` 环境变量启用 watchfiles 热重载(需安装 watchfiles),或在 WebUI 手动「重载插件」。
 
-9.2 **[强制]** 每次发版前过一遍「真实加载测试」——这正是插件市场 CI 的做法(集合仓库 `scripts/validate_plugins/run.py`:隔离环境安装 requirements 后用 `PluginManager.load()` 实际加载,失败即 fail):
+9.2 **[强制]** 每次发版前过一遍「真实加载测试」——这正是插件市场 CI 的做法：在隔离环境安装 requirements 后用 `PluginManager.load()` 实际加载，失败即 fail：
 
 - 干净环境(新虚拟环境或 Docker)安装目标 AstrBot 版本;
 - 安装插件 → 启动 → 确认无加载报错;
@@ -534,7 +534,7 @@ class ExamplePlugin(Star):
 - 官方文档:插件开发指南 https://docs.astrbot.app/dev/star/plugin-new.html 、最小实例/事件/发消息/配置/存储/会话控制/调用 AI/国际化/Pages/文转图等子页(docs.astrbot.app/dev/star/guides/*)、发布插件 https://docs.astrbot.app/dev/star/plugin-publish.html 、旧版完整指南 https://docs.astrbot.app/dev/star/plugin.html
 - 源码(AstrBotDevs/AstrBot,v4.25.1):`astrbot/core/star/`(base.py、star.py、star_manager.py、star_handler.py、star_tools.py、context.py、updator.py、register/、filter/)、`astrbot/core/pipeline/`(context_utils.py、star_request.py、waking_check/stage.py)、`astrbot/api/*`、pyproject.toml、CONTRIBUTING.md
 - 插件模板:https://github.com/Soulter/helloworld
-- 插件市场与审核:https://plugins.astrbot.app 、AstrBotDevs/AstrBot_Plugins_Collection(plugins.json、scripts/validate_plugins/run.py、.github/workflows/validate*.yml、ISSUE_TEMPLATE/PLUGIN_PUBLISH.yml)
+- 插件市场与审核:https://plugins.astrbot.app 、AstrBotDevs/AstrBot_Plugins_Collection（plugins.json、加载验证 CI、.github/workflows/validate*.yml、ISSUE_TEMPLATE/PLUGIN_PUBLISH.yml）
 - 社区实践样本:anka-afk/astrbot_plugin_meme_manager、menglimi/astrbot_plugin_private_companion
 
 > 维护说明:本规范由团队集中维护,随 AstrBot 大版本更新复审;条款与官方文档冲突时,以官方最新文档为准并回改本规范。

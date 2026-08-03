@@ -87,18 +87,19 @@ flowchart TD
     B -->|Fast Lane| F
 ```
 
-## Codex skill map
+## Codex manual map
 
-The local plugin install includes an optional Codex skill bundle: one short
-navigator (`skills/devkit-overview`) and one workflow designer
-(`skills/workflow-design`, default Fast Lane). Module manuals stay separate so
-a task loads only what it needs:
+The local plugin includes an optional, documentation-only Codex manual bundle:
+one short navigator (`skills/devkit-overview`), one workflow-design manual
+(`skills/workflow-design`, default Fast Lane policy), and seven separate
+module manuals. A task loads only the manual it needs:
 
 `fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`.
 
-Skills are instructions, not MCP tools. They load only after a task is scoped
-to 2718lab DevKit and are deliberately excluded from the MCP-only primary ZIP.
+These skills are reference manuals, not MCP tools or executable prompt surfaces.
+They contain no slash commands, agent profiles, starter templates, validators,
+or dispatch code; they are deliberately excluded from the MCP-only primary ZIP.
 
 ## Documentation map
 

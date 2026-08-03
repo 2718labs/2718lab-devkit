@@ -1,4 +1,0 @@
-interface:
-  display_name: "Fast Lane Routing"
-  short_description: "Consume compiler-mandated Fast Lane dispatch safely"
-  default_prompt: "Use Fast Lane routing: honor the explicit model, let a trusted host consume compiler-mandated cross-session assignments, and consume one bounded index packet."

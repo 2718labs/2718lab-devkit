@@ -1,8 +1,0 @@
-@mcp.tool(annotations=_READ_ONLY)
-def ${tool_name}(${parameter_name}: str) -> dict[str, Any]:
-    """${docstring}"""
-
-    def operation() -> Any:
-        return ${service_expression}
-
-    return _safe_call(operation)
