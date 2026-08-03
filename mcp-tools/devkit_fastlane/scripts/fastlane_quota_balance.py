@@ -1195,7 +1195,9 @@ def compile_quota_balance_v2(
         if has_static and has_alternate:
             reasons.append("spark_static_priority")
         selected, selected_kind = spark_candidates[0]
-        if (
+        if int(capacity["host_spark_cap"]) < 1:
+            reasons.append("spark_cap_hold")
+        elif (
             selected_kind == "alternate"
             and int(capacity["host_spark_cap"])
             != int(alternate_limits["required_local_slot_count"])

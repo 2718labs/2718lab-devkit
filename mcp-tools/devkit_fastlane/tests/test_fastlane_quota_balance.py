@@ -836,6 +836,33 @@ class QuotaBalanceTests(unittest.TestCase):
         self.assertEqual([], decision["spark_proposal_ids"])
         self.assertIn("spark_alternate_binding_invalid", decision["reason_codes"])
 
+    def test_q23_v2_zero_host_spark_capacity_holds_static_and_normal_candidates(
+        self,
+    ) -> None:
+        quota = load_quota_module()
+        candidates = (
+            make_v2_static_spark_strike("q23-static"),
+            make_v2_normal_spark_alternate("q23-normal"),
+        )
+
+        for candidate in candidates:
+            with self.subTest(candidate=candidate["candidate_id"]):
+                decision = self.compile_v2(
+                    quota,
+                    make_v2_request(
+                        snapshot=make_snapshot(
+                            main_used=510000,
+                            spark_used=200000,
+                            host_spark_cap=0,
+                            host_spark_active=0,
+                        ),
+                        candidates=[candidate],
+                    ),
+                )
+
+                self.assertEqual([], decision["spark_proposal_ids"])
+                self.assertIn("spark_cap_hold", decision["reason_codes"])
+
     def test_q12_quota_compiler_has_no_forbidden_side_effect_surface(self) -> None:
         quota = load_quota_module()
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
