@@ -823,6 +823,14 @@ class OrchestratorService:
     ) -> dict[str, Any]:
         """Durably hand off one bounded role packet without a host-side send."""
 
+        if (
+            not isinstance(ttl_seconds, int)
+            or isinstance(ttl_seconds, bool)
+            or not 0 < ttl_seconds <= self._max_ttl_seconds
+        ):
+            raise ServiceError(
+                "TTL_INVALID", "message TTL is outside the permitted range"
+            )
         try:
             direction_value = RoleEnvelopeDirection(direction)
         except (TypeError, ValueError) as error:

@@ -769,14 +769,24 @@ class SQLiteStore:
                     f"artifact is not owned by sender: {artifact_hash!r}"
                 )
             artifact_size = int(artifact["size"])
-            self._require_message_quota(
+            recipient_lease = cursor.execute(
+                """
+                SELECT epoch FROM leases
+                WHERE task_id = ? AND expires_at > ?
+                """,
+                (recipient_task_id, now_utc),
+            ).fetchone()
+            self._require_durable_mailbox_quota(
                 cursor,
-                workflow_id,
-                recipient_task_id,
-                now_utc,
-                artifact_size,
-                max_count,
-                max_bytes,
+                workflow_id=workflow_id,
+                recipient_task_id=recipient_task_id,
+                recipient_epoch=(
+                    int(recipient_lease["epoch"]) if recipient_lease is not None else None
+                ),
+                now=now_utc,
+                incoming_bytes=artifact_size,
+                max_count=max_count,
+                max_bytes=max_bytes,
             )
             created_at = now_utc
             expires_at = (
@@ -974,12 +984,13 @@ class SQLiteStore:
                 sender_task_id=sender_task_id,
                 payload=payload,
             )
-            self._require_role_envelope_quota(
+            self._require_durable_mailbox_quota(
                 cursor,
                 workflow_id=workflow_id,
                 recipient_task_id=recipient_task_id,
+                recipient_epoch=recipient_epoch,
                 now=now_utc,
-                reference_bytes=reference_bytes,
+                incoming_bytes=reference_bytes,
                 max_count=max_count,
                 max_bytes=max_bytes,
             )
@@ -3449,38 +3460,72 @@ class SQLiteStore:
         return total
 
     @staticmethod
-    def _require_role_envelope_quota(
+    def _require_durable_mailbox_quota(
         cursor: sqlite3.Cursor,
         *,
         workflow_id: str,
         recipient_task_id: str,
+        recipient_epoch: int | None,
         now: str,
-        reference_bytes: int,
+        incoming_bytes: int,
         max_count: int,
         max_bytes: int,
     ) -> None:
-        for recipient_filter in (True, False):
-            if recipient_filter:
-                query = """
-                    SELECT COUNT(*) AS count, COALESCE(SUM(reference_bytes), 0) AS bytes
+        """Apply one transactionally serialized quota across both mailbox tables."""
+
+        scopes = (
+            (
+                """
+                SELECT COUNT(*) AS count, COALESCE(SUM(item_bytes), 0) AS bytes
+                FROM (
+                    SELECT artifacts.size AS item_bytes
+                    FROM messages
+                    JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
+                    WHERE messages.workflow_id = ? AND messages.recipient_task_id = ?
+                        AND messages.acknowledged_at IS NULL AND messages.expires_at > ?
+                    UNION ALL
+                    SELECT reference_bytes AS item_bytes
                     FROM role_envelopes
-                    WHERE workflow_id = ? AND recipient_task_id = ?
+                    WHERE workflow_id = ? AND recipient_task_id = ? AND recipient_epoch = ?
                         AND acknowledged_at IS NULL AND expires_at > ?
+                )
+                """,
+                (
+                    workflow_id,
+                    recipient_task_id,
+                    now,
+                    workflow_id,
+                    recipient_task_id,
+                    recipient_epoch,
+                    now,
+                ),
+            ),
+            (
                 """
-                parameters = (workflow_id, recipient_task_id, now)
-            else:
-                query = """
-                    SELECT COUNT(*) AS count, COALESCE(SUM(reference_bytes), 0) AS bytes
+                SELECT COUNT(*) AS count, COALESCE(SUM(item_bytes), 0) AS bytes
+                FROM (
+                    SELECT artifacts.size AS item_bytes
+                    FROM messages
+                    JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
+                    WHERE messages.workflow_id = ?
+                        AND messages.acknowledged_at IS NULL AND messages.expires_at > ?
+                    UNION ALL
+                    SELECT reference_bytes AS item_bytes
                     FROM role_envelopes
-                    WHERE workflow_id = ? AND acknowledged_at IS NULL AND expires_at > ?
-                """
-                parameters = (workflow_id, now)
+                    WHERE workflow_id = ?
+                        AND acknowledged_at IS NULL AND expires_at > ?
+                )
+                """,
+                (workflow_id, now, workflow_id, now),
+            ),
+        )
+        for query, parameters in scopes:
             usage = cursor.execute(query, parameters).fetchone()
             if (
                 int(usage["count"]) + 1 > max_count
-                or int(usage["bytes"]) + reference_bytes > max_bytes
+                or int(usage["bytes"]) + incoming_bytes > max_bytes
             ):
-                raise QuotaExceededError("role envelope quota exceeded")
+                raise QuotaExceededError("durable mailbox quota exceeded")
 
     @staticmethod
     def _role_envelope_cursor(
@@ -3525,40 +3570,6 @@ class SQLiteStore:
         if row is None:
             raise MailboxForbiddenError("mailbox cursor is not owned by this recipient")
         return int(row["sequence"])
-
-    @staticmethod
-    def _require_message_quota(
-        cursor: sqlite3.Cursor,
-        workflow_id: str,
-        recipient_task_id: str,
-        now: str,
-        artifact_size: int,
-        max_count: int,
-        max_bytes: int,
-    ) -> None:
-        for recipient_filter in (True, False):
-            if recipient_filter:
-                query = """
-                    SELECT COUNT(*) AS count, COALESCE(SUM(artifacts.size), 0) AS bytes
-                    FROM messages JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
-                    WHERE messages.workflow_id = ? AND messages.recipient_task_id = ?
-                        AND messages.acknowledged_at IS NULL AND messages.expires_at > ?
-                    """
-                parameters = (workflow_id, recipient_task_id, now)
-            else:
-                query = """
-                    SELECT COUNT(*) AS count, COALESCE(SUM(artifacts.size), 0) AS bytes
-                    FROM messages JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
-                    WHERE messages.workflow_id = ? AND messages.acknowledged_at IS NULL
-                        AND messages.expires_at > ?
-                    """
-                parameters = (workflow_id, now)
-            usage = cursor.execute(query, parameters).fetchone()
-            if (
-                int(usage["count"]) + 1 > max_count
-                or int(usage["bytes"]) + artifact_size > max_bytes
-            ):
-                raise QuotaExceededError("mailbox quota exceeded")
 
     @staticmethod
     def _append_event_in_transaction(

@@ -19,6 +19,7 @@ from orchestrator.store import (
     MailboxForbiddenError,
     MessageExpiredError,
     QuotaExceededError,
+    RoleEnvelopeInvalidError,
     SQLiteStore,
     TTLInvalidError,
 )
@@ -323,7 +324,7 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
         self.store.close()
         self._temporary_directory.cleanup()
 
-    def _assignment_kwargs(self) -> dict[str, object]:
+    def _assignment_kwargs(self, *, correlation_id: str = "assignment-one") -> dict[str, object]:
         return {
             "recipient_epoch": self.worker_one_lease.epoch,
             "direction": "coordinator_to_worker",
@@ -332,7 +333,7 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
             "assignment_token": self._hash("assignment token"),
             "dispatch_context_hash": self._hash("dispatch context"),
             "route_provenance_hash": self._hash("route provenance"),
-            "correlation_id": "assignment-one",
+            "correlation_id": correlation_id,
             "ttl_seconds": 30,
             "task_card_hash": self.worker_one.card_hash,
             "contract_hashes": (self._hash("contract"),),
@@ -352,14 +353,16 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
         cases = (
             ("assignment_token", "Bearer SHOULD NEVER PERSIST"),
             ("dispatch_context_hash", "ENV=TOP_SECRET"),
+            ("route_provenance_hash", "route=RAW_SECRET"),
             ("task_card_hash", "RAW TRANSCRIPT MUST NEVER PERSIST"),
+            ("contract_hashes", ("RAW CONTRACT SOURCE BODY",)),
             ("index_evidence_hashes", ("C:\\absolute\\source-body.txt",)),
         )
         for field, value in cases:
             with self.subTest(field=field):
                 arguments = self._assignment_kwargs()
                 arguments[field] = value
-                with self.assertRaises(Exception) as captured:
+                with self.assertRaises(RoleEnvelopeInvalidError) as captured:
                     self.store.enqueue_role_envelope(
                         self.workflow.id,
                         "coordinator",
@@ -371,6 +374,155 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
                 self.assertEqual("ROLE_ENVELOPE_INVALID", captured.exception.code)
                 self.assertEqual(0, self._role_row_count())
                 self.assertEqual((), self.store.list_events(self.workflow.id))
+
+    def test_terminal_sensitive_fields_each_reject_without_a_new_row_or_event(self) -> None:
+        self.store.enqueue_role_envelope(
+            self.workflow.id,
+            "coordinator",
+            "worker-one",
+            "coordinator-owner",
+            self.coordinator_lease.epoch,
+            **self._assignment_kwargs(correlation_id="terminal-prerequisite"),
+        )
+        terminal_result = self._hash("terminal result")
+        worker_evidence = self._hash("worker evidence")
+        for content_hash, safe_path in (
+            (terminal_result, "evidence/terminal-result.json"),
+            (worker_evidence, "evidence/worker-evidence.json"),
+        ):
+            self.store.register_task_artifact(
+                "worker-one",
+                "worker-one-owner",
+                self.worker_one_lease.epoch,
+                kind="evidence",
+                content_hash=content_hash,
+                safe_path=safe_path,
+                size=16,
+                redaction_version="r1",
+                now=self._NOW,
+            )
+        baseline_rows = self._role_row_count()
+        baseline_events = len(self.store.list_events(self.workflow.id))
+        base = {
+            "recipient_epoch": self.coordinator_lease.epoch,
+            "direction": "worker_to_coordinator",
+            "sender_role": "worker",
+            "recipient_role": "coordinator",
+            "assignment_token": self._hash("assignment token"),
+            "dispatch_context_hash": self._hash("dispatch context"),
+            "route_provenance_hash": self._hash("route provenance"),
+            "ttl_seconds": 30,
+            "terminal_result_hash": terminal_result,
+            "evidence_hashes": (worker_evidence,),
+            "risk_items": (),
+            "max_count": 4,
+            "max_bytes": 64,
+            "now": self._NOW,
+        }
+        cases = (
+            ("terminal_result_hash", "RAW TERMINAL SOURCE BODY"),
+            ("evidence_hashes", ("C:\\absolute\\worker-evidence.txt",)),
+            (
+                "risk_items",
+                (
+                    {
+                        "code": "RISK_RAW",
+                        "severity": "high",
+                        "evidence_hash": "Bearer risk evidence must not persist",
+                    },
+                ),
+            ),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                arguments = dict(base)
+                arguments["correlation_id"] = f"terminal-sensitive-{field}"
+                arguments[field] = value
+                with self.assertRaises(RoleEnvelopeInvalidError) as captured:
+                    self.store.enqueue_role_envelope(
+                        self.workflow.id,
+                        "worker-one",
+                        "coordinator",
+                        "worker-one-owner",
+                        self.worker_one_lease.epoch,
+                        **arguments,
+                    )
+                self.assertEqual("ROLE_ENVELOPE_INVALID", captured.exception.code)
+                self.assertEqual(baseline_rows, self._role_row_count())
+                self.assertEqual(baseline_events, len(self.store.list_events(self.workflow.id)))
+
+    def test_peer_sensitive_fields_each_reject_without_a_new_row_or_event(self) -> None:
+        self.store.enqueue_role_envelope(
+            self.workflow.id,
+            "coordinator",
+            "worker-one",
+            "coordinator-owner",
+            self.coordinator_lease.epoch,
+            **self._assignment_kwargs(correlation_id="peer-prerequisite"),
+        )
+        worker_evidence = self._hash("peer worker evidence")
+        worker_dependency = self._hash("peer worker dependency")
+        for content_hash, safe_path in (
+            (worker_evidence, "evidence/peer-worker-evidence.json"),
+            (worker_dependency, "evidence/peer-worker-dependency.json"),
+        ):
+            self.store.register_task_artifact(
+                "worker-one",
+                "worker-one-owner",
+                self.worker_one_lease.epoch,
+                kind="evidence",
+                content_hash=content_hash,
+                safe_path=safe_path,
+                size=16,
+                redaction_version="r1",
+                now=self._NOW,
+            )
+        capability = next(
+            peer.capability
+            for peer in self.store.list_authorized_peers(self.workflow.id, "worker-one")
+            if peer.task_id == "worker-two"
+        )
+        baseline_rows = self._role_row_count()
+        baseline_events = len(self.store.list_events(self.workflow.id))
+        base = {
+            "recipient_epoch": self.worker_two_lease.epoch,
+            "direction": "peer_to_peer",
+            "sender_role": "worker",
+            "recipient_role": "worker",
+            "assignment_token": self._hash("assignment token"),
+            "dispatch_context_hash": self._hash("dispatch context"),
+            "route_provenance_hash": self._hash("route provenance"),
+            "ttl_seconds": 30,
+            "evidence_hashes": (worker_evidence,),
+            "dependency_hashes": (worker_dependency,),
+            "coordinator_task_id": "coordinator",
+            "coordinator_epoch": self.coordinator_lease.epoch,
+            "capability": capability,
+            "max_count": 4,
+            "max_bytes": 64,
+            "now": self._NOW,
+        }
+        cases = (
+            ("evidence_hashes", ("RAW PEER EVIDENCE BODY",)),
+            ("dependency_hashes", ("C:\\absolute\\dependency-source.txt",)),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                arguments = dict(base)
+                arguments["correlation_id"] = f"peer-sensitive-{field}"
+                arguments[field] = value
+                with self.assertRaises(RoleEnvelopeInvalidError) as captured:
+                    self.store.enqueue_role_envelope(
+                        self.workflow.id,
+                        "worker-one",
+                        "worker-two",
+                        "worker-one-owner",
+                        self.worker_one_lease.epoch,
+                        **arguments,
+                    )
+                self.assertEqual("ROLE_ENVELOPE_INVALID", captured.exception.code)
+                self.assertEqual(baseline_rows, self._role_row_count())
+                self.assertEqual(baseline_events, len(self.store.list_events(self.workflow.id)))
 
     def test_wrong_peer_capability_fails_without_a_new_role_envelope(self) -> None:
         assignment = self.store.enqueue_role_envelope(

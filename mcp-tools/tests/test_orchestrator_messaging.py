@@ -6,9 +6,11 @@ import json
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier
 
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 if str(MCP_TOOLS) not in sys.path:
@@ -18,7 +20,7 @@ from temp_support import task_scratch  # noqa: E402
 
 from orchestrator.models import Task, Workflow, WorkflowKind  # noqa: E402
 from orchestrator.service import OrchestratorService, ServiceError  # noqa: E402
-from orchestrator.store import SQLiteStore  # noqa: E402
+from orchestrator.store import QuotaExceededError, SQLiteStore  # noqa: E402
 
 
 class OrchestratorMessagingTests(unittest.TestCase):
@@ -712,6 +714,22 @@ class RoleScopedEnvelopeServiceTests(unittest.TestCase):
             now=self.now.isoformat(),
         )
 
+    def _legacy_message_to_worker_one(
+        self, correlation_id: str, *, ttl: int = 30
+    ) -> dict[str, object]:
+        return self.service.send_message(
+            "roles",
+            "coordinator",
+            "worker-one",
+            owner=self.coordinator_lease.owner,
+            epoch=self.coordinator_lease.epoch,
+            correlation_id=correlation_id,
+            artifact_hash=self.coordinator_index,
+            metadata={"kind": "legacy"},
+            ttl_seconds=ttl,
+            now=self.now.isoformat(),
+        )
+
     def _terminal(
         self,
         worker_id: str,
@@ -1148,6 +1166,217 @@ class RoleScopedEnvelopeServiceTests(unittest.TestCase):
                 risk_items=eight_risks + (eight_risks[0],),
             )
         self.assertEqual("ROLE_ENVELOPE_INVALID", captured.exception.code)
+
+    def test_role_envelope_ttl_honors_configured_limit_without_writes(self) -> None:
+        self._workflow()
+        role_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM role_envelopes"
+        ).fetchone()[0]
+        event_count = len(self.store.list_events("roles"))
+        with self.assertRaises(ServiceError) as captured:
+            self._assignment(
+                "worker-one",
+                self.worker_one_lease,
+                correlation_id="ttl-over-configured-limit",
+                ttl=61,
+            )
+        self.assertEqual("TTL_INVALID", captured.exception.code)
+        self.assertEqual(
+            role_count,
+            self.store._connection.execute("SELECT COUNT(*) FROM role_envelopes").fetchone()[0],
+        )
+        self.assertEqual(event_count, len(self.store.list_events("roles")))
+
+    def test_legacy_and_role_envelopes_share_exact_recipient_count_and_byte_quotas(
+        self,
+    ) -> None:
+        self._workflow()
+        self.service = OrchestratorService(
+            self.store,
+            evidence_root="evidence-root",
+            mailbox_count_limit=1,
+            mailbox_byte_limit=64,
+            max_ttl_seconds=60,
+        )
+        legacy = self._legacy_message_to_worker_one("legacy-count-first")
+        with self.assertRaises(ServiceError) as captured:
+            self._assignment(
+                "worker-one", self.worker_one_lease, correlation_id="role-count-after-legacy"
+            )
+        self.assertEqual("QUOTA_EXCEEDED", captured.exception.code)
+        self.service.ack_message(
+            "roles",
+            "worker-one",
+            str(legacy["delivery_id"]),
+            owner=self.worker_one_lease.owner,
+            epoch=self.worker_one_lease.epoch,
+            now=self.now.isoformat(),
+        )
+        assignment = self._assignment(
+            "worker-one", self.worker_one_lease, correlation_id="role-count-first"
+        )
+        with self.assertRaises(ServiceError) as captured:
+            self._legacy_message_to_worker_one("legacy-count-after-role")
+        self.assertEqual("QUOTA_EXCEEDED", captured.exception.code)
+        self.service.ack_role_envelope(
+            "roles",
+            "worker-one",
+            assignment["delivery_id"],
+            owner=self.worker_one_lease.owner,
+            epoch=self.worker_one_lease.epoch,
+            recipient_role="worker",
+            now=self.now.isoformat(),
+        )
+
+        self.service = OrchestratorService(
+            self.store,
+            evidence_root="evidence-root",
+            mailbox_count_limit=4,
+            mailbox_byte_limit=32,
+            max_ttl_seconds=60,
+        )
+        legacy = self._legacy_message_to_worker_one("legacy-byte-at-limit")
+        assignment = self._assignment(
+            "worker-one", self.worker_one_lease, correlation_id="role-byte-at-limit"
+        )
+        self.service.ack_message(
+            "roles",
+            "worker-one",
+            str(legacy["delivery_id"]),
+            owner=self.worker_one_lease.owner,
+            epoch=self.worker_one_lease.epoch,
+            now=self.now.isoformat(),
+        )
+        self.service.ack_role_envelope(
+            "roles",
+            "worker-one",
+            assignment["delivery_id"],
+            owner=self.worker_one_lease.owner,
+            epoch=self.worker_one_lease.epoch,
+            recipient_role="worker",
+            now=self.now.isoformat(),
+        )
+
+        self.service = OrchestratorService(
+            self.store,
+            evidence_root="evidence-root",
+            mailbox_count_limit=4,
+            mailbox_byte_limit=31,
+            max_ttl_seconds=60,
+        )
+        legacy = self._legacy_message_to_worker_one("legacy-byte-over-limit")
+        with self.assertRaises(ServiceError) as captured:
+            self._assignment(
+                "worker-one", self.worker_one_lease, correlation_id="role-byte-after-legacy"
+            )
+        self.assertEqual("QUOTA_EXCEEDED", captured.exception.code)
+        self.service.ack_message(
+            "roles",
+            "worker-one",
+            str(legacy["delivery_id"]),
+            owner=self.worker_one_lease.owner,
+            epoch=self.worker_one_lease.epoch,
+            now=self.now.isoformat(),
+        )
+        assignment = self._assignment(
+            "worker-one", self.worker_one_lease, correlation_id="role-byte-over-limit"
+        )
+        with self.assertRaises(ServiceError) as captured:
+            self._legacy_message_to_worker_one("legacy-byte-after-role")
+        self.assertEqual("QUOTA_EXCEEDED", captured.exception.code)
+        self.service.ack_role_envelope(
+            "roles",
+            "worker-one",
+            assignment["delivery_id"],
+            owner=self.worker_one_lease.owner,
+            epoch=self.worker_one_lease.epoch,
+            recipient_role="worker",
+            now=self.now.isoformat(),
+        )
+
+    def test_shared_mailbox_quota_serializes_legacy_and_role_writers(self) -> None:
+        self._workflow()
+        capability = next(
+            peer["capability"]
+            for peer in self.service.peers("roles", "coordinator")
+            if peer["task_id"] == "worker-one"
+        )
+        worker_one_card_hash = self.store.get_task("worker-one").card_hash
+        barrier = Barrier(2)
+
+        def enqueue_legacy() -> tuple[str, str]:
+            store = SQLiteStore(self.database)
+            try:
+                barrier.wait(timeout=10)
+                store.enqueue_message(
+                    "roles",
+                    "coordinator",
+                    "worker-one",
+                    self.coordinator_lease.owner,
+                    self.coordinator_lease.epoch,
+                    capability=capability,
+                    correlation_id="concurrent-legacy",
+                    artifact_hash=self.coordinator_index,
+                    metadata={"kind": "legacy"},
+                    ttl_seconds=30,
+                    max_count=2,
+                    max_bytes=16,
+                    now=self.now.isoformat(),
+                )
+                return ("legacy", "ok")
+            except QuotaExceededError:
+                return ("legacy", "quota")
+            finally:
+                store.close()
+
+        def enqueue_role() -> tuple[str, str]:
+            store = SQLiteStore(self.database)
+            try:
+                barrier.wait(timeout=10)
+                store.enqueue_role_envelope(
+                    "roles",
+                    "coordinator",
+                    "worker-one",
+                    self.coordinator_lease.owner,
+                    self.coordinator_lease.epoch,
+                    recipient_epoch=self.worker_one_lease.epoch,
+                    direction="coordinator_to_worker",
+                    sender_role="coordinator",
+                    recipient_role="worker",
+                    assignment_token=self.assignment_token,
+                    dispatch_context_hash=self.context_hash,
+                    route_provenance_hash=self.route_hash,
+                    correlation_id="concurrent-role",
+                    ttl_seconds=30,
+                    task_card_hash=worker_one_card_hash,
+                    contract_hashes=(self.contract_hash,),
+                    index_evidence_hashes=(self.coordinator_index,),
+                    max_count=2,
+                    max_bytes=16,
+                    now=self.now.isoformat(),
+                )
+                return ("role", "ok")
+            except QuotaExceededError:
+                return ("role", "quota")
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(
+                future.result(timeout=15)
+                for future in (
+                    executor.submit(enqueue_legacy),
+                    executor.submit(enqueue_role),
+                )
+            )
+        self.assertEqual({"ok", "quota"}, {outcome for _, outcome in results})
+        message_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE workflow_id = ?", ("roles",)
+        ).fetchone()[0]
+        role_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM role_envelopes WHERE workflow_id = ?", ("roles",)
+        ).fetchone()[0]
+        self.assertEqual(1, message_count + role_count)
 
     def test_expiry_idempotency_limits_and_archive_errno_17_are_block_records_only(self) -> None:
         self._workflow()
