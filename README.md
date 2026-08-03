@@ -1,15 +1,17 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — MCP-only v1.0.0-rc4
+# 2718lab DevKit — Codex + MCP v1.0.0-rc4
 
 [![version](https://img.shields.io/badge/version-v1.0.0--rc4-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-2718lab DevKit is a local, stdio-only MCP server for bounded project indexing,
-Atlas evidence, Relay lifecycle coordination, and deterministic Fast Lane
-planning. This repository carries the versioned v1.0.0-rc4 package. The
-checked-in manifest and allowlist define the public package surface; the install,
-build, and verification sections below describe the supported workflow.
+2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
+runtime for bounded project indexing, Atlas evidence, Relay lifecycle
+coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
+of reference manuals. This repository carries the versioned v1.0.0-rc4 package.
+The checked-in manifest and allowlist define the executable runtime surface;
+the manual map, install, build, and verification sections below describe the
+supported workflow.
 
 RC4 retains a fail-closed Host-contract preview. It does not create Desktop
 sessions: without a Host-private verifier, intent admission returns
@@ -33,8 +35,11 @@ sessions: without a Host-private verifier, intent admission returns
 - Relay validates explicit work packages and exposes lifecycle state. Python
   returns structured host actions; the Codex host remains responsible for
   worktree bootstrap and agent dispatch.
-- The primary package is MCP-only: it exposes exactly 17 tools, no MCP prompts,
-  no MCP resources, no static prompt agents, and no model runner.
+- The executable MCP runtime exposes exactly 17 tools, no MCP prompts, no MCP
+  resources, no static prompt agents, and no model runner.
+- The optional Codex Skill bundle is part of DevKit's documentation surface. It
+  provides short, module-specific manuals without becoming a second runtime or
+  an executable prompt/agent surface.
 - Fast Lane is a pure MCP runtime compiler. It selects explicit model/effort
   routes from bounded difficulty and host capability evidence; it never spawns
   agents, edits Git, or runs commands. Host-private quota and lifecycle
@@ -93,17 +98,20 @@ flowchart TD
 
 ## Codex manual map
 
-The local plugin includes an optional, documentation-only Codex manual bundle:
-one short navigator (`skills/devkit-overview`), one workflow-design manual
-(`skills/workflow-design`, default Fast Lane policy), and six separate
-module manuals. A task loads only the manual it needs:
+DevKit deliberately has two separate surfaces: the MCP runtime performs
+bounded tool work, while the local plugin includes an optional,
+documentation-only Codex manual bundle. The bundle has one short navigator
+(`skills/devkit-overview`), one workflow-design manual (`skills/workflow-design`,
+default Fast Lane policy), and six separate module manuals. A task loads only
+the manual it needs:
 
 `fast-lane-routing` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`.
 
 These skills are reference manuals, not MCP tools or executable prompt surfaces.
 They contain no slash commands, agent profiles, starter templates, validators,
-or dispatch code; they are deliberately excluded from the MCP-only primary ZIP.
+or dispatch code. The lean runtime ZIP deliberately excludes them, but that
+packaging boundary does not make DevKit a runtime-only product.
 
 ## Documentation map
 
@@ -179,13 +187,13 @@ tree. Choose an output directory outside the source tree:
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
-.codex-plugin/main-artifact-allowlist.json. Its public runtime remains
-MCP-only; the ZIP also carries the Fast Lane contract, required references and
-policy assets, the `team_efficiency.py` compatibility entry point, its routing
-and quota-balance modules, and the host-only official-account quota producer.
-It deliberately excludes the optional skill bundle, command helpers, hooks,
-CI files, host-private state, prompts, static agents, and arbitrary repository
-files.
+.codex-plugin/main-artifact-allowlist.json. Its executable runtime surface is
+the MCP server; the ZIP also carries the Fast Lane contract, required references
+and policy assets, the `team_efficiency.py` compatibility entry point, its
+routing and quota-balance modules, and the host-only official-account quota
+producer. It deliberately excludes the optional Skill manual bundle, command
+helpers, hooks, CI files, host-private state, prompts, static agents, and
+arbitrary repository files.
 
 Run Fast Lane through its executable entry point:
 

@@ -11,7 +11,8 @@ only after the CI and artifact checks pass.
 ### Changed
 
 - Removed the retired AstrBot extension, its dedicated manual, and its
-  packaging/release/CI paths. DevKit is now one Codex-first MCP product.
+  packaging/release/CI paths. DevKit is now one Codex-first product with an
+  MCP runtime and a documentation-only Skill manual bundle.
 - Replaced tag-push publication with a maintainer-dispatched release gate that
   validates current `main`, creates an annotated tag only after its gates, and
   can safely resume an exact tag that has no release or only a draft release.

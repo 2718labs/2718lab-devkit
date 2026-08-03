@@ -1,8 +1,9 @@
 # Contributing to 2718lab DevKit
 
-Thanks for improving the MCP runtime and its contracts. This repository is
-Codex-first and MCP-only: contributions must not add a second host runtime,
-prompt-agent surface, credentials, or unchecked local state.
+Thanks for improving the MCP runtime, its contracts, and the compact Skill
+manuals. This repository is Codex-first: contributions must not add a second
+executable host runtime, prompt-agent surface, credentials, or unchecked local
+state. Skills remain concise documentation manuals rather than a second runtime.
 
 ## Before opening a pull request
 

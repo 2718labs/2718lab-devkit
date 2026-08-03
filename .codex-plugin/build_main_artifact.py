@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the deterministic MCP-only primary plugin artifact."""
+"""Build the deterministic MCP runtime primary plugin artifact."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     """Parse the standalone artifact builder command line."""
 
     parser = argparse.ArgumentParser(
-        description="Build the MCP-only primary plugin artifact."
+        description="Build the MCP runtime primary plugin artifact."
     )
     parser.add_argument(
         "--root",
