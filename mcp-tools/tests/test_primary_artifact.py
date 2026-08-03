@@ -206,7 +206,7 @@ def test_primary_mcp_config_exports_only_locked_bridge_and_context_variables() -
         assert forbidden not in serialized
 
 
-def test_python_project_and_lock_use_pep440_rc3_metadata() -> None:
+def test_python_project_and_lock_use_pep440_rc4_metadata() -> None:
     project_path = ROOT / "mcp-tools" / "pyproject.toml"
     lock_path = ROOT / "mcp-tools" / "uv.lock"
     assert project_path.is_file(), "missing independently runnable MCP project"
@@ -214,14 +214,14 @@ def test_python_project_and_lock_use_pep440_rc3_metadata() -> None:
 
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == "1.0.0rc3"
+    assert project["project"]["version"] == "1.0.0rc4"
     assert project["project"]["dependencies"] == ["mcp[cli]>=1,<2"]
     assert "devkit_atlas" in project["tool"]["pyright"]["include"]
     assert "devkit_runtime" in project["tool"]["pyright"]["include"]
     assert "code_atlas" not in project["tool"]["pyright"]["include"]
     lock_text = lock_path.read_text(encoding="utf-8")
     assert 'name = "2718lab-devkit-mcp"' in lock_text
-    assert 'version = "1.0.0rc3"' in lock_text
+    assert 'version = "1.0.0rc4"' in lock_text
 
 
 def test_two_builds_are_byte_identical_with_normalized_zip_metadata(

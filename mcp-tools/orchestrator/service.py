@@ -848,7 +848,9 @@ class OrchestratorService:
                 None,
             )
             if capability is None:
-                raise ServiceError("PEER_FORBIDDEN", "recipient is not an authorized peer")
+                raise ServiceError(
+                    "PEER_FORBIDDEN", "recipient is not an authorized peer"
+                )
         envelope = self._call(
             self._store.enqueue_role_envelope,
             workflow_id,
@@ -904,7 +906,9 @@ class OrchestratorService:
             limit=limit,
             now=now,
         )
-        return {"entries": tuple(self._role_envelope_projection(item) for item in envelopes)}
+        return {
+            "entries": tuple(self._role_envelope_projection(item) for item in envelopes)
+        }
 
     def ack_role_envelope(
         self,

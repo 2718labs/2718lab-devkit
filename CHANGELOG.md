@@ -6,6 +6,14 @@ The project follows Keep a Changelog conventions. GitHub Releases for tagged
 versions are published by the repository release workflow after the CI and
 artifact checks pass.
 
+## [1.0.0-rc4] - 2026-08-03
+
+### Fixed
+
+- Normalized the Fast Lane source and regression-test formatting with the
+  Ruff 0.16.1 version enforced by the tag-driven release gate. This is a
+  formatting-only release correction with no runtime behavior change.
+
 ## [1.0.0-rc3] - 2026-08-03
 
 ### Added
