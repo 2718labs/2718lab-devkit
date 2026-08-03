@@ -39,9 +39,9 @@ gh release create v1.2.0 \
 
 第 4 步的 `sed` 提取逻辑仅作为示例(从 CHANGELOG 里截取当前版本段落到下一个 `## [` 之前);实际是否需要这么精确取决于 CHANGELOG 格式是否规整,更简单的做法是手动把对应段落粘贴进 `--notes`。
 
-## 3. CI YAML 全文 + 逐行注释
+## 3. CI YAML 示例 + 逐行注释
 
-`assets/templates/ci.yml` 的完整内容(与 SKILL.md 里的核心 job 一致,这里补充逐行说明):
+以下是可按目标仓库调整的最小 CI 示例；它不是可直接复制的捆绑模板：
 
 ```yaml
 name: CI
@@ -71,7 +71,8 @@ jobs:
 2. 如果 `metadata.yaml` 的 `version` 落后于已经打出的 tag:更新 `metadata.yaml`,提交一个新 commit(不要改历史 tag 指向的内容,tag 应该不可变)。
 3. 如果 tag 落后于 `metadata.yaml`(改了 version 但忘记打 tag/发 Release):按第 2 节的命令序列补打 tag、发 Release。
 4. 如果三者都不一致且历史比较混乱:以 `metadata.yaml` 当前值为基准,重新走一遍完整发布流程(改 CHANGELOG → commit → tag → push → Release),把这次作为新的"正确起点",不要试图去修正历史上已经错误发布的旧 tag。
-5. 修复后运行 `scripts/check_release.py`,确认脚本里的"tag 与 metadata.yaml version 一致"检查项通过。
+5. 修复后使用目标仓库自己的发布检查（CI 或明确的本地命令）核验 tag 与
+   `metadata.yaml` version 一致；若没有自动检查，记录人工核验的依据。
 
 ## 5. `astrbot_version` 下界抬升的判断
 

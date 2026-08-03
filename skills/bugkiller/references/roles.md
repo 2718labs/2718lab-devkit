@@ -1,22 +1,20 @@
 # Roles and Routing
 
-Sol is the primary coordinator: architecture, task decomposition, dispatch,
-review, integration, and final acceptance. A task's explicit card and
-host-reported capabilities determine routing; no dispatcher may guess a host
-capability or substitute a model/reasoning level.
+This is a vocabulary reference, not a registry of installable agent profiles.
+The host chooses model, reasoning effort, session capacity, and eligibility
+from verified capabilities and the bounded task record.
 
-| Role | Model / reasoning | Scope |
-| --- | --- | --- |
-| Sol coordinator (`bugkiller-sol-coordinator`) | `gpt-5.6-sol` / `high` | Design, dispatch, review, ordered integration, and acceptance. |
-| Terra High (`bugkiller-terra-investigator`) | `gpt-5.6-terra` / `high` | Routine/bounded coding, tests, debugging, documentation, investigation, and validation. |
-| Terra Max | `gpt-5.6-terra` / `max` | Moderately complex/harder implementation, integration, refactoring, security-sensitive work, and difficult regressions. |
-| Sol High (`bugkiller-sol-escalation`) | `gpt-5.6-sol` / `high` | Explicit exceptional bounded execution or deep investigation. |
-| Luna | unavailable | Do not spawn Luna and do not label a substitute as Luna. |
-Workers accept only their exact scope and return a candidate commit plus
-evidence to Sol. No execution worker may accept its own task or broaden write
-scope. Parallel tasks require disjoint active scopes; same-path work queues
-behind the active owner.
+| Responsibility | Scope |
+| --- | --- |
+| Coordinator | Design, task decomposition, review, ordered integration, and acceptance. |
+| Implementation worker | A bounded change, focused tests, debugging, documentation, or validation. |
+| Independent reviewer | Adversarial evidence review with no overlapping write scope. |
 
-`spawn_agent` exposes available Codex host model choices, but availability is a
-reported capability fact rather than authorization. Luna's unavailable state
-is final for the current route.
+Workers accept only their exact scope and return a candidate change plus
+evidence to the accepting coordinator. No execution worker may accept its own
+task or broaden write scope. Parallel tasks require disjoint active scopes;
+same-path work queues behind the active owner.
+
+Availability is a reported host capability fact rather than authorization.
+Missing or stale routing evidence must fail closed instead of inferring a
+substitute.

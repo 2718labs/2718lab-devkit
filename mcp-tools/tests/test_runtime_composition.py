@@ -32,6 +32,107 @@ def test_runtime_config_load_prefers_plugin_data_without_writing(
     assert not codex_home.exists()
 
 
+def test_runtime_config_scopes_shared_plugin_data_by_project_root(
+    tmp_path: Path,
+) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    scratch_base = tmp_path / "scratch"
+    scratch_base.mkdir()
+    project_a = tmp_path / "AstrContinuum"
+    project_b = tmp_path / "2718-devkit"
+    project_a.mkdir()
+    project_b.mkdir()
+
+    config_a = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(plugin_data),
+            "CODEX_TASK_TEMP": str(scratch_base),
+            "CODEX_PROJECT_ROOT": str(project_a),
+            "CODEX_THREAD_ID": "thread-a",
+        }
+    )
+    config_b = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(plugin_data),
+            "CODEX_TASK_TEMP": str(scratch_base),
+            "CODEX_PROJECT_ROOT": str(project_b),
+            "CODEX_THREAD_ID": "thread-b",
+        }
+    )
+
+    assert config_a.data_root != config_b.data_root
+    assert config_a.scratch_root != config_b.scratch_root
+    assert config_a.data_root.parent == config_b.data_root.parent
+    assert config_a.data_root.parent.name == "scoped-v1"
+    assert config_a.data_root.is_relative_to(plugin_data)
+    assert config_b.data_root.is_relative_to(plugin_data)
+    assert config_a.scratch_root.is_relative_to(scratch_base)
+    assert config_b.scratch_root.is_relative_to(scratch_base)
+
+
+def test_runtime_config_uses_thread_scope_when_project_root_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    scratch_base = tmp_path / "scratch"
+    scratch_base.mkdir()
+
+    config_a = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(plugin_data),
+            "CODEX_TASK_TEMP": str(scratch_base),
+            "CODEX_THREAD_ID": "thread-a",
+        }
+    )
+    config_b = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(plugin_data),
+            "CODEX_TASK_TEMP": str(scratch_base),
+            "CODEX_THREAD_ID": "thread-b",
+        }
+    )
+
+    assert config_a.data_root != config_b.data_root
+    assert config_a.scratch_root != config_b.scratch_root
+
+
+def test_runtime_config_rejects_untrusted_project_scope(tmp_path: Path) -> None:
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    data_file = tmp_path / "not-a-directory"
+    data_file.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(RuntimeConfigError) as relative:
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "data"),
+                "CODEX_TASK_TEMP": str(scratch_root),
+                "CODEX_PROJECT_ROOT": "relative-project",
+            }
+        )
+    assert relative.value.code == "DATA_ROOT_INVALID"
+
+    with pytest.raises(RuntimeConfigError) as file_scope:
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "data"),
+                "CODEX_TASK_TEMP": str(scratch_root),
+                "CODEX_PROJECT_ROOT": str(data_file),
+            }
+        )
+    assert file_scope.value.code == "PROJECT_SCOPE_INVALID"
+
+    with pytest.raises(RuntimeConfigError) as invalid_id:
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "data"),
+                "CODEX_TASK_TEMP": str(scratch_root),
+                "CODEX_THREAD_ID": "thread\\nsecret",
+            }
+        )
+    assert invalid_id.value.code == "PROJECT_SCOPE_INVALID"
+
+
 def test_runtime_config_rejects_relative_data_root() -> None:
     with pytest.raises(RuntimeConfigError) as caught:
         RuntimeConfig.load(environ={"PLUGIN_DATA": "relative-plugin-data"})

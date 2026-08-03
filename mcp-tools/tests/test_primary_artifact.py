@@ -32,19 +32,20 @@ EXPECTED_FILES = (
     "mcp-tools/pyproject.toml",
     "mcp-tools/server.py",
     "mcp-tools/uv.lock",
-    "skills/work-methodology/SKILL.md",
-    "skills/work-methodology/assets/fastlane-quota-balance-policy-v1.json",
-    "skills/work-methodology/assets/fastlane-routing-policy-v3.json",
-    "skills/work-methodology/references/efficiency-automation.md",
-    "skills/work-methodology/references/grounding-discipline.md",
-    "skills/work-methodology/references/orchestration-runtime.md",
-    "skills/work-methodology/references/team-patterns.md",
-    "skills/work-methodology/references/verification-checklist.md",
-    "skills/work-methodology/references/work-packages.md",
-    "skills/work-methodology/scripts/codex_account_quota.py",
-    "skills/work-methodology/scripts/fastlane_quota_balance.py",
-    "skills/work-methodology/scripts/fastlane_routing.py",
-    "skills/work-methodology/scripts/team_efficiency.py",
+    "mcp-tools/devkit_fastlane/__init__.py",
+    "mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md",
+    "mcp-tools/devkit_fastlane/assets/fastlane-quota-balance-policy-v1.json",
+    "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v3.json",
+    "mcp-tools/devkit_fastlane/references/efficiency-automation.md",
+    "mcp-tools/devkit_fastlane/references/grounding-discipline.md",
+    "mcp-tools/devkit_fastlane/references/orchestration-runtime.md",
+    "mcp-tools/devkit_fastlane/references/team-patterns.md",
+    "mcp-tools/devkit_fastlane/references/verification-checklist.md",
+    "mcp-tools/devkit_fastlane/references/work-packages.md",
+    "mcp-tools/devkit_fastlane/scripts/codex_account_quota.py",
+    "mcp-tools/devkit_fastlane/scripts/fastlane_quota_balance.py",
+    "mcp-tools/devkit_fastlane/scripts/fastlane_routing.py",
+    "mcp-tools/devkit_fastlane/scripts/team_efficiency.py",
 )
 EXPECTED_TREES = (
     "mcp-tools/bugkiller",
@@ -54,9 +55,15 @@ EXPECTED_TREES = (
     "mcp-tools/orchestrator",
     "mcp-tools/project_index",
 )
-EXPECTED_BRIDGE_SELECTORS = (
+EXPECTED_ENV_VARS = (
     "CODEX_DEVKIT_HOST_BRIDGE_FD",
     "CODEX_DEVKIT_HOST_BRIDGE_HANDLE",
+    "CODEX_PROJECT_ROOT",
+    "CODEX_WORKSPACE_ROOT",
+    "CODEX_PROJECT_ID",
+    "CODEX_WORKSPACE_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_FASTLANE_TASK_ROOT",
 )
 
 
@@ -175,7 +182,7 @@ def test_primary_allowlist_is_explicit_and_runtime_only() -> None:
         assert excluded not in serialized
 
 
-def test_primary_mcp_config_exports_only_locked_bridge_selectors() -> None:
+def test_primary_mcp_config_exports_only_locked_bridge_and_context_variables() -> None:
     configuration = json.loads(MCP_CONFIG.read_text(encoding="utf-8"))
 
     assert set(configuration) == {"mcpServers"}
@@ -183,7 +190,7 @@ def test_primary_mcp_config_exports_only_locked_bridge_selectors() -> None:
     assert set(servers) == {"2718lab-devkit"}
     server = servers["2718lab-devkit"]
     assert set(server) == {"command", "args", "cwd", "env_vars"}
-    assert tuple(server["env_vars"]) == EXPECTED_BRIDGE_SELECTORS
+    assert tuple(server["env_vars"]) == EXPECTED_ENV_VARS
     serialized = json.dumps(configuration, ensure_ascii=False).casefold()
     for forbidden in (
         "bugkiller_home",
@@ -197,7 +204,7 @@ def test_primary_mcp_config_exports_only_locked_bridge_selectors() -> None:
         assert forbidden not in serialized
 
 
-def test_python_project_and_lock_use_pep440_rc1_metadata() -> None:
+def test_python_project_and_lock_use_pep440_rc2_metadata() -> None:
     project_path = ROOT / "mcp-tools" / "pyproject.toml"
     lock_path = ROOT / "mcp-tools" / "uv.lock"
     assert project_path.is_file(), "missing independently runnable MCP project"
@@ -205,14 +212,14 @@ def test_python_project_and_lock_use_pep440_rc1_metadata() -> None:
 
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == "1.0.0rc1"
+    assert project["project"]["version"] == "1.0.0rc2"
     assert project["project"]["dependencies"] == ["mcp[cli]>=1,<2"]
     assert "devkit_atlas" in project["tool"]["pyright"]["include"]
     assert "devkit_runtime" in project["tool"]["pyright"]["include"]
     assert "code_atlas" not in project["tool"]["pyright"]["include"]
     lock_text = lock_path.read_text(encoding="utf-8")
     assert 'name = "2718lab-devkit-mcp"' in lock_text
-    assert 'version = "1.0.0rc1"' in lock_text
+    assert 'version = "1.0.0rc2"' in lock_text
 
 
 def test_two_builds_are_byte_identical_with_normalized_zip_metadata(
@@ -604,7 +611,9 @@ def test_linux_publisher_allows_expected_write_before_identity_check(
 
     backend = builder.get_secure_backend()
     with backend.open_root(plugin_root) as source_root:
-        with backend.open_output_parent(output_parent, source_root=source_root) as publisher:
+        with backend.open_output_parent(
+            output_parent, source_root=source_root
+        ) as publisher:
             private_zip = publisher.create_zip_temp()
             private_zip.write(b"deterministic payload\n")
             publisher.publish("artifact.zip")

@@ -1,4 +1,4 @@
-"""The locked 16-tool stdio surface for the 2718lab DevKit runtime."""
+"""The locked 17-tool stdio surface for the 2718lab DevKit runtime."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from devkit_fastlane import compile_fast_lane
 from devkit_relay.compiler import compile_plan
 from devkit_relay.service import RelayService
 from devkit_runtime.composition import RuntimeRoot
@@ -20,6 +21,7 @@ from devkit_runtime.tool_result import (
     TOOL_ANNOTATIONS,
     ResultContractError,
     envelope_failure,
+    envelope_success,
     result_from_exception,
 )
 from devkit_runtime.uow import RuntimeUnitOfWork
@@ -246,7 +248,11 @@ def _runtime_failure(
     error: RuntimeConfigError | RelayRuntimeError,
 ) -> dict[str, object]:
     if isinstance(error, RuntimeConfigError):
-        if error.code in {"DATA_ROOT_INVALID", "DATA_ROOT_UNAVAILABLE"}:
+        if error.code in {
+            "DATA_ROOT_INVALID",
+            "DATA_ROOT_UNAVAILABLE",
+            "PROJECT_SCOPE_INVALID",
+        }:
             return _failure(error.code)
         return _failure("INTERNAL_ERROR")
     if error.code == "RELAY_STORAGE_ERROR":
@@ -688,6 +694,48 @@ def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
         operation=lambda uow: compile_plan(payload, registry_resolver=uow.registry),
         invalid_code="RELAY_REQUEST_INVALID",
     )
+
+
+@mcp.tool(annotations=_tool_annotations("fastlane_compile"))
+def fastlane_compile(
+    request: dict[str, object],
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] = "ultra",
+    enable: bool = False,
+) -> dict[str, object]:
+    """Compile inert Fast Lane descriptors without receiving host-private evidence.
+
+    The host remains responsible for quota attestations, worktree/lease fencing,
+    model dispatch, terminal receipts, and execution.  This MCP boundary only
+    validates and renders the deterministic local scheduling plan.
+    """
+
+    if type(request) is not dict or type(enable) is not bool:
+        return _failure("FASTLANE_REQUEST_INVALID")
+    try:
+        plan = compile_fast_lane(
+            request,
+            reasoning_effort=reasoning_effort,
+            enable=enable,
+        )
+        return envelope_success(_fastlane_public_value(plan))
+    except ResultContractError:
+        return _failure("INTERNAL_ERROR")
+    except (TypeError, ValueError):
+        return _failure("FASTLANE_REQUEST_INVALID")
+
+
+def _fastlane_public_value(value: object) -> object:
+    """Remove compiler-only null sentinels before the no-null MCP envelope."""
+
+    if type(value) is dict:
+        return {
+            key: _fastlane_public_value(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if type(value) is list:
+        return [_fastlane_public_value(item) for item in value if item is not None]
+    return value
 
 
 @mcp.tool(annotations=_tool_annotations("relay_start"))

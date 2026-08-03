@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-node_modules/
-.DS_Store
-*.log
-.idea/
-.vscode/

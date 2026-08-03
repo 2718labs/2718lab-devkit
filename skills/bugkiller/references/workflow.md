@@ -1,8 +1,10 @@
 # Workflow and Durable Peer Delivery
 
-Sol advances a task through `NEW -> TRIAGED -> PATCHING -> VERIFYING ->
-SOL_REVIEW -> INTEGRATING -> CI_GATE -> RELEASE_GATE`. A worker can provide
-evidence but cannot move its own result to accepted or released.
+The coordinator advances a task through `NEW -> TRIAGED -> PATCHING -> VERIFYING ->
+SOL_REVIEW -> INTEGRATING -> CI_GATE -> RELEASE_GATE`. `SOL_REVIEW` is the
+stable name of the independent terminal-review stage; it does not mandate Sol
+for every task. A worker can provide evidence but cannot move its own result to
+accepted or released.
 
 ## Strict local write gate
 
@@ -10,12 +12,13 @@ For a strict task use this evidence order:
 `project_index_sync -> strict_index=true -> project_index_query -> trace_id ->
 worktree_checkpoint_create -> project_index_sync(bind_as="output") ->
 project_index_query -> trace_id -> workflow_artifact_register(kind="verification", snapshot_id=...)`.
-Sol reviews the candidate evidence before `workflow_complete`.
+The coordinator checks the candidate evidence, with an independent review when
+the route requires it, before `workflow_complete`.
 
 ## GitHub-style local integration
 
 Use `task card + base revision -> isolated task branch/worktree -> scoped
-commit + evidence -> Sol review -> ordered integration/rebase -> CI gate ->
+commit + evidence -> independent review when routed -> ordered integration/rebase -> CI gate ->
 release gate`. This local protocol does not authorize a remote push, pull
 request, network action, or release publication. Workers must not merge or
 rebase a sibling task.

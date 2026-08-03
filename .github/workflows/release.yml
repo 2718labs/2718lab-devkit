@@ -21,15 +21,16 @@ jobs:
     outputs:
       tag: ${{ steps.validate.outputs.tag }}
       version: ${{ steps.validate.outputs.version }}
+      prerelease: ${{ steps.validate.outputs.prerelease }}
     steps:
       - name: Check out tagged revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
@@ -68,35 +69,64 @@ jobs:
                   f"mcp-tools version {mcp_version!r} does not match {version!r}"
               )
 
+          with Path("extensions/astrbot/pyproject.toml").open("rb") as handle:
+              astrbot_version = tomllib.load(handle)["project"]["version"]
+          if pep440(astrbot_version) != pep440(version):
+              raise SystemExit(
+                  f"extensions/astrbot version {astrbot_version!r} "
+                  f"does not match {version!r}"
+              )
+
           changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
           if not re.search(rf"^## \[v?{re.escape(version)}\]", changelog, re.M):
               raise SystemExit(f"CHANGELOG.md has no entry for {version}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"tag={tag}\nversion={version}\n")
+              output.write(
+                  f"tag={tag}\nversion={version}\n"
+                  f"prerelease={str('-' in version).lower()}\n"
+              )
           print(f"validated release {tag}")
           PY
 
-  quality:
-    name: Re-run release quality gates
+  mcp-runtime:
+    name: Re-run MCP runtime
     needs: metadata
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: mcp-tools
     steps:
       - name: Check out tagged revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.metadata.outputs.tag }}
 
+      - name: Configure MCP task-local runtime storage
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-release\mcp-runtime'
+          New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'uv-cache') | Out-Null
+          @(
+            "CODEX_TASK_TEMP=$root"
+            "TEMP=$(Join-Path $root 'tmp')"
+            "TMP=$(Join-Path $root 'tmp')"
+            "TMPDIR=$(Join-Path $root 'tmp')"
+            "PYTHONPYCACHEPREFIX=$(Join-Path $root 'pycache')"
+            "UV_CACHE_DIR=$(Join-Path $root 'uv-cache')"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
       - name: Install uv
-        run: python -m pip install --disable-pip-version-check uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.28
 
       - name: Check MCP runtime
-        working-directory: mcp-tools
+        shell: bash
         run: |
           uv lock --check
           uv sync --locked --all-groups
@@ -118,6 +148,24 @@ jobs:
           uv run --locked python -m py_compile server.py
           uv run --locked pytest -q
 
+  quality:
+    name: Re-run AstrBot and Linux artifact gates
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.28
+
       - name: Check AstrBot extension
         working-directory: extensions/astrbot
         run: |
@@ -128,23 +176,97 @@ jobs:
           uv run --locked pyright
           uv run --locked pytest -q
 
+      - name: Check Linux primary artifact contract
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          python -m pytest -q mcp-tools/tests/test_primary_artifact.py
+
+  fast-lane:
+    name: Re-run Fast Lane contracts
+    needs: metadata
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: mcp-tools/devkit_fastlane
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Configure task-local runtime storage
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-release\fast-lane'
+          New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'pip-cache') | Out-Null
+          New-Item -ItemType Directory -Force -Path 'D:\bun\tmp\codex\2718-devkit\worktrees\atlas12b-team-efficiency' | Out-Null
+          @(
+            "CODEX_TASK_TEMP=$root"
+            "TEMP=$(Join-Path $root 'tmp')"
+            "TMP=$(Join-Path $root 'tmp')"
+            "TMPDIR=$(Join-Path $root 'tmp')"
+            "PYTHONPYCACHEPREFIX=$(Join-Path $root 'pycache')"
+            "PIP_CACHE_DIR=$(Join-Path $root 'pip-cache')"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Fast Lane test tools
+        run: python -m pip install --disable-pip-version-check pytest ruff==0.16.1
+
+      - name: Ruff check
+        run: >-
+          python -m ruff check --select E,F --ignore E501
+          scripts/team_efficiency.py
+          scripts/fastlane_quota_balance.py
+          tests/test_team_efficiency.py
+          tests/test_fastlane_quota_balance.py
+
+      - name: Ruff format check
+        run: >-
+          python -m ruff format --check
+          scripts/team_efficiency.py
+          scripts/fastlane_quota_balance.py
+          tests/test_team_efficiency.py
+          tests/test_fastlane_quota_balance.py
+
+      - name: Syntax check
+        run: >-
+          python -m py_compile
+          scripts/team_efficiency.py
+          scripts/fastlane_quota_balance.py
+
+      - name: Test
+        run: >-
+          python -m pytest -q
+          tests/test_team_efficiency.py
+          tests/test_fastlane_quota_balance.py
+
   publish:
     name: Build and publish GitHub Release
-    needs: [metadata, quality]
+    needs: [metadata, mcp-runtime, quality, fast-lane]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Check out tagged revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.metadata.outputs.tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
+
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.28
 
       - name: Build allowlisted artifact
         id: build
@@ -161,6 +283,89 @@ jobs:
           unzip -t "${output}"
           sha256sum "${output}" | tee "${output}.sha256"
           echo "path=${output}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload primary release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: 2718lab-devkit-primary-${{ needs.metadata.outputs.version }}
+          path: |
+            ${{ steps.build.outputs.path }}
+            ${{ steps.build.outputs.path }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build AstrBot extension distributions
+        id: astrbot
+        working-directory: extensions/astrbot
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          output="${RUNNER_TEMP}/astrbot-dist"
+          uv build --no-create-gitignore --out-dir "${output}"
+          test -n "$(find "${output}" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$(find "${output}" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          checksum="${RUNNER_TEMP}/2718lab-devkit-astrbot-${RELEASE_VERSION}.sha256"
+          sha256sum "${output}"/*.whl "${output}"/*.tar.gz | tee "${checksum}"
+          echo "dir=${output}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate AstrBot release distributions
+        working-directory: extensions/astrbot
+        shell: bash
+        env:
+          ASTRBOT_DIR: ${{ steps.astrbot.outputs.dir }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          directory = Path(os.environ["ASTRBOT_DIR"])
+          release_version = os.environ["RELEASE_VERSION"]
+          pep440_version = release_version.replace("-", "")
+          wheels = sorted(directory.glob("*.whl"))
+          sources = sorted(directory.glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sources) != 1:
+              raise SystemExit("expected exactly one wheel and one source distribution")
+
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              wheel_members = set(wheel.namelist())
+              if "devkit_astrbot/__init__.py" not in wheel_members:
+                  raise SystemExit("wheel misses devkit_astrbot package")
+              wheel_metadata = next(
+                  name for name in wheel_members if name.endswith(".dist-info/METADATA")
+              )
+              if f"Version: {pep440_version}" not in wheel.read(wheel_metadata).decode():
+                  raise SystemExit("wheel metadata version mismatch")
+
+          with tarfile.open(sources[0]) as source:
+              source_members = source.getnames()
+              if not any(
+                  name.endswith("/src/devkit_astrbot/__init__.py")
+                  for name in source_members
+              ):
+                  raise SystemExit("source distribution misses devkit_astrbot package")
+              metadata = next(name for name in source_members if name.endswith("/PKG-INFO"))
+              content = source.extractfile(metadata)
+              if content is None or f"Version: {pep440_version}" not in content.read().decode():
+                  raise SystemExit("source distribution metadata version mismatch")
+          print("validated AstrBot wheel and source distribution")
+          PY
+
+      - name: Upload AstrBot release distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: 2718lab-devkit-astrbot-${{ needs.metadata.outputs.version }}
+          path: |
+            ${{ steps.astrbot.outputs.dir }}/*.whl
+            ${{ steps.astrbot.outputs.dir }}/*.tar.gz
+            ${{ steps.astrbot.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Extract release notes
         env:
@@ -184,10 +389,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           ARTIFACT: ${{ steps.build.outputs.path }}
+          ASTRBOT_DIR: ${{ steps.astrbot.outputs.dir }}
+          ASTRBOT_CHECKSUM: ${{ steps.astrbot.outputs.checksum }}
+          RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
+          set -euo pipefail
+          release_args=()
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
           gh release create "${RELEASE_TAG}" \
             "${ARTIFACT}" \
             "${ARTIFACT}.sha256" \
+            "${ASTRBOT_DIR}"/*.whl \
+            "${ASTRBOT_DIR}"/*.tar.gz \
+            "${ASTRBOT_CHECKSUM}" \
             --verify-tag \
             --title "${RELEASE_TAG}" \
-            --notes-file "${RUNNER_TEMP}/release-notes.md"
+            --notes-file "${RUNNER_TEMP}/release-notes.md" \
+            "${release_args[@]}"

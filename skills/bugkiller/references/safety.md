@@ -6,4 +6,4 @@ Before a write or external action, honor the task card's exact scope and the hos
 
 Language profiles use existing manifests and locks only: Python uses the existing `python -m pytest` without silent installs; JS/TS selects one unambiguous lockfile and treats lifecycle scripts as tainted; Rust isolates `CARGO_TARGET_DIR`; Go runs target tests before `go test ./...`.
 
-`DEGRADED_SKILL_ONLY` means MCP or host-injected peer messaging is unavailable. Keep the task serial, do not fabricate lease, mailbox, delivery, acknowledgement, or authorization state, and do not widen the task card to compensate. `DEGRADED_TRIAGE` is narrower: it records Terra's permitted low-risk fallback when Luna is unavailable.
+`DEGRADED_SKILL_ONLY` means MCP or host-injected peer messaging is unavailable. Keep the task serial, do not fabricate lease, mailbox, delivery, acknowledgement, or authorization state, and do not widen the task card to compensate. `DEGRADED_TRIAGE` is narrower: it records Bugkiller's permitted Terra low-risk fallback when Luna is unavailable for that separate profile; it does not override an independently attested Fast Lane Luna route.

@@ -1,4 +1,0 @@
-interface:
-  display_name: Bugkiller
-  short_description: Sol-coordinated, evidence-backed local bug workflow.
-  default_prompt: Coordinate this bug through the assigned card, local routing policy, scoped worktree, and durable evidence handoff.

@@ -1,4 +1,4 @@
-"""Locked public contract tests for the production 16-tool MCP server."""
+"""Locked public contract tests for the production 17-tool MCP server."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ EXPECTED_TOOL_NAMES = frozenset(
         "atlas_render",
         "atlas_accept",
         "relay_compile",
+        "fastlane_compile",
         "relay_start",
         "relay_status",
         "relay_handoff",
@@ -89,6 +90,7 @@ EXPECTED_PARAMETERS = {
     "atlas_render": ("workspace_id", "snapshot_id", "packet_id", "bindings"),
     "atlas_accept": ("workflow_id", "code_task_id", "acceptance_id", "ingestion_key"),
     "relay_compile": ("request",),
+    "fastlane_compile": ("request", "reasoning_effort", "enable"),
     "relay_start": ("request",),
     "relay_status": ("workflow_id",),
     "relay_handoff": ("request",),
@@ -104,7 +106,7 @@ def _properties(tool: object) -> dict[str, object]:
     return dict(getattr(tool, "inputSchema")["properties"])
 
 
-def test_public_server_exposes_exact_locked_sixteen_tool_surface() -> None:
+def test_public_server_exposes_exact_locked_seventeen_tool_surface() -> None:
     tools = _tools()
 
     assert server.mcp.name == "2718lab-devkit"
@@ -159,6 +161,7 @@ def test_tool_signatures_and_top_level_input_schemas_are_exact() -> None:
             "ingestion_key",
         },
         "relay_compile": {"request"},
+        "fastlane_compile": {"request"},
         "relay_start": {"request"},
         "relay_status": {"workflow_id"},
         "relay_handoff": {"request"},
