@@ -83,7 +83,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             store = SQLiteStore(database)
             try:
-                self.assertEqual(6, store.schema_version())
+                self.assertEqual(10, store.schema_version())
                 self.assertEqual(
                     {"task_kind", "intent_id", "language", "framework"},
                     {
@@ -114,7 +114,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             restarted = SQLiteStore(database)
             try:
-                self.assertEqual(6, restarted.schema_version())
+                self.assertEqual(10, restarted.schema_version())
                 self.assertEqual(
                     Task(
                         "code-task",
@@ -213,7 +213,7 @@ class TypedTaskStoreTests(unittest.TestCase):
 
             reopened = SQLiteStore(database)
             try:
-                self.assertEqual(6, reopened.schema_version())
+                self.assertEqual(10, reopened.schema_version())
                 self.assertEqual(
                     Task("legacy-task", "workflow-1", "legacy", "owner", version=2),
                     reopened.get_task("legacy-task"),

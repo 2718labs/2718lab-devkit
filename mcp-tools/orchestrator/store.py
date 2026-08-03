@@ -14,7 +14,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -22,6 +22,16 @@ from .models import (
     AtlasOutboxItem,
     AtlasOutboxState,
     CodeTaskAcceptance,
+    ExternalBootstrapBatch,
+    ExternalBootstrapBatchItem,
+    ExternalBootstrapOutboxItem,
+    ExternalBootstrapState,
+    ExternalDispatchGrant,
+    ExternalSourceDescriptor,
+    HostOperationReceipt,
+    RoleEnvelope,
+    RoleEnvelopeDirection,
+    RoleRiskItem,
     Task,
     TaskKind,
     TaskState,
@@ -139,8 +149,32 @@ class CorrelationConflictError(StoreError):
     code = "CORRELATION_CONFLICT"
 
 
+class RoleEnvelopeInvalidError(StoreError):
+    code = "ROLE_ENVELOPE_INVALID"
+
+
+class RoleEnvelopeForbiddenError(StoreError):
+    code = "ROLE_ENVELOPE_FORBIDDEN"
+
+
+class HostOperationConflictError(StoreError):
+    code = "HOST_OPERATION_CONFLICT"
+
+
 class HostTargetInvalidError(StoreError):
     code = "HOST_TARGET_INVALID"
+
+
+class ExternalBootstrapConflictError(StoreError):
+    """Raised when a hash-bound external bootstrap identity is reused differently."""
+
+    code = "EXTERNAL_BOOTSTRAP_CONFLICT"
+
+
+class ExternalDispatchGrantError(StoreError):
+    """Raised when a one-shot external dispatch grant is expired or not bound."""
+
+    code = "EXTERNAL_DISPATCH_GRANT_FORBIDDEN"
 
 
 class StrictIndexError(StoreError):
@@ -281,7 +315,7 @@ class AcceptedCodeTaskEvidence:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 6
+    _SCHEMA_VERSION = 10
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
@@ -292,6 +326,12 @@ class SQLiteStore:
     _MAX_SAFE_OUTBOX_REASON_COUNT = 8
     _MAX_CODE_TASK_EVIDENCE_ITEMS = 32
     _MAX_CODE_TASK_ACCEPTANCE_LIST = 100
+    _MAX_ROLE_REFERENCE_COUNT = 32
+    _MAX_ROLE_RISK_ITEMS = 8
+    _MAX_ROLE_TOKEN_LENGTH = 256
+    _MAX_ROLE_CORRELATION_LENGTH = 128
+    _ROLE_ENVELOPE_SCHEMA_VERSION = "durable-role-envelope/v1"
+    _HOST_ARCHIVE_RECEIPT_SCHEMA_VERSION = "host-archive-receipt/v1"
     _EVIDENCE_BINDING_SCHEMA_VERSION = "acceptance-evidence-binding/v1"
     _EVIDENCE_BINDING_EVENT_TYPE = "code_task_evidence_binding"
     _RECEIPT_ATTESTATION_SCHEMA_VERSION = "code-task-receipt-attestation/v1"
@@ -299,6 +339,11 @@ class SQLiteStore:
     _SAFE_ACCEPTANCE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
     _SHA256_IDENTIFIER_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
     _SAFE_OUTBOX_CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+    _SAFE_ROLE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+    _SAFE_RISK_CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+    _ROLE_RISK_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
+    _EXTERNAL_BOOTSTRAP_AVAILABILITY = "HOST_API_UNAVAILABLE"
+    _MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS = 9
 
     def __init__(self, database: str | Path) -> None:
         self._connection = sqlite3.connect(str(database), isolation_level=None)
@@ -306,7 +351,12 @@ class SQLiteStore:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        try:
+            self._create_schema()
+        except BaseException:
+            self._connection.close()
+            self._connection = None  # type: ignore[assignment]
+            raise
 
     def close(self) -> None:
         """Close the underlying database connection."""
@@ -327,6 +377,332 @@ class SQLiteStore:
 
     def foreign_keys_enabled(self) -> bool:
         return bool(self._connection.execute("PRAGMA foreign_keys").fetchone()[0])
+
+    def admit_external_bootstrap(
+        self,
+        descriptor: ExternalSourceDescriptor,
+        batch: ExternalBootstrapBatch,
+        grant: ExternalDispatchGrant,
+        *,
+        now: str | None = None,
+    ) -> tuple[
+        ExternalSourceDescriptor,
+        ExternalBootstrapBatch,
+        ExternalBootstrapOutboxItem,
+        ExternalDispatchGrant,
+    ]:
+        """Atomically retain one hash-only bootstrap descriptor, outbox and grant.
+
+        This repository-only boundary deliberately creates no Host work and leaves
+        every durable record pending with ``HOST_API_UNAVAILABLE``.
+        """
+        created_at = _utc_timestamp(now) if now is not None else _utc_now()
+        batch = replace(batch, expires_at=_utc_timestamp(batch.expires_at))
+        grant = replace(grant, expires_at=_utc_timestamp(grant.expires_at))
+        self._validate_external_bootstrap_records(descriptor, batch, grant)
+        descriptor_payload = _canonical_payload_json(
+            self._external_descriptor_payload(descriptor)
+        )
+        batch_payload = _canonical_payload_json(self._external_batch_payload(batch))
+        grant_payload = _canonical_payload_json(self._external_grant_payload(grant))
+        descriptor_payload_hash = _payload_hash(descriptor_payload)
+        batch_payload_hash = _payload_hash(batch_payload)
+        grant_payload_hash = _payload_hash(grant_payload)
+        outbox_payload = _canonical_payload_json(
+            {
+                "availability": self._EXTERNAL_BOOTSTRAP_AVAILABILITY,
+                "batch_hash": batch.batch_hash,
+                "descriptor_hash": descriptor.descriptor_hash,
+                "state": ExternalBootstrapState.PENDING.value,
+            }
+        )
+        with self._transaction() as cursor:
+            batch_exists = cursor.execute(
+                "SELECT 1 FROM external_bootstrap_batches WHERE batch_hash = ?",
+                (batch.batch_hash,),
+            ).fetchone() is not None
+            grant_exists = cursor.execute(
+                "SELECT 1 FROM external_dispatch_grants WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone() is not None
+            self._require_external_payload(
+                cursor,
+                "external_bootstrap_descriptors",
+                "descriptor_hash",
+                descriptor.descriptor_hash,
+                descriptor_payload,
+            )
+            self._require_external_payload(
+                cursor,
+                "external_bootstrap_batches",
+                "batch_hash",
+                batch.batch_hash,
+                batch_payload,
+            )
+            self._require_external_payload(
+                cursor,
+                "external_dispatch_grants",
+                "grant_id",
+                grant.grant_id,
+                grant_payload,
+            )
+            existing_idempotency = cursor.execute(
+                "SELECT batch_hash FROM external_bootstrap_batches WHERE idempotency_key = ?",
+                (batch.idempotency_key,),
+            ).fetchone()
+            if (
+                existing_idempotency is not None
+                and str(existing_idempotency["batch_hash"]) != batch.batch_hash
+            ):
+                raise ExternalBootstrapConflictError("bootstrap idempotency binding conflicts")
+            existing_grant_binding = cursor.execute(
+                """
+                SELECT grant_id FROM external_dispatch_grants
+                WHERE descriptor_hash = ? AND batch_hash = ? AND assignment_hash = ?
+                """,
+                (
+                    grant.descriptor_hash,
+                    grant.batch_hash,
+                    grant.assignment_hash,
+                ),
+            ).fetchone()
+            if (
+                existing_grant_binding is not None
+                and str(existing_grant_binding["grant_id"]) != grant.grant_id
+            ):
+                raise ExternalBootstrapConflictError("external dispatch grant binding conflicts")
+            existing_composite_binding = cursor.execute(
+                "SELECT * FROM external_dispatch_grant_bindings WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()
+            if existing_composite_binding is not None and any(
+                str(existing_composite_binding[field]) != value
+                for field, value in (
+                    ("descriptor_hash", grant.descriptor_hash),
+                    ("batch_hash", grant.batch_hash),
+                    ("assignment_hash", grant.assignment_hash),
+                )
+            ):
+                raise ExternalBootstrapConflictError(
+                    "external dispatch grant composite binding conflicts"
+                )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO external_bootstrap_descriptors
+                    (descriptor_hash, payload_json, payload_hash, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    descriptor.descriptor_hash,
+                    descriptor_payload,
+                    descriptor_payload_hash,
+                    created_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO external_bootstrap_batches
+                    (batch_hash, descriptor_hash, idempotency_key, payload_json,
+                     payload_hash, state, availability, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch.batch_hash,
+                    batch.descriptor_hash,
+                    batch.idempotency_key,
+                    batch_payload,
+                    batch_payload_hash,
+                    batch.state.value,
+                    batch.availability,
+                    batch.expires_at,
+                    created_at,
+                ),
+            )
+            for item in batch.items:
+                item_payload = _canonical_payload_json(self._external_batch_item_payload(item))
+                row = cursor.execute(
+                    """
+                    SELECT payload_json FROM external_bootstrap_batch_items
+                    WHERE batch_hash = ? AND item_index = ?
+                    """,
+                    (batch.batch_hash, item.item_index),
+                ).fetchone()
+                if row is not None and str(row["payload_json"]) != item_payload:
+                    raise ExternalBootstrapConflictError("bootstrap batch item conflicts")
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO external_bootstrap_batch_items
+                        (batch_hash, item_index, assignment_hash, payload_json, payload_hash)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        batch.batch_hash,
+                        item.item_index,
+                        item.assignment_hash,
+                        item_payload,
+                        _payload_hash(item_payload),
+                    ),
+                )
+            self._require_external_payload(
+                cursor,
+                "external_bootstrap_outbox",
+                "batch_hash",
+                batch.batch_hash,
+                outbox_payload,
+            )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO external_bootstrap_outbox
+                    (batch_hash, descriptor_hash, payload_json, payload_hash, state,
+                     availability, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch.batch_hash,
+                    descriptor.descriptor_hash,
+                    outbox_payload,
+                    _payload_hash(outbox_payload),
+                    ExternalBootstrapState.PENDING.value,
+                    self._EXTERNAL_BOOTSTRAP_AVAILABILITY,
+                    created_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO external_dispatch_grants
+                    (grant_id, descriptor_hash, batch_hash, assignment_hash, payload_json,
+                     payload_hash, state, availability, expires_at, consumed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    grant.grant_id,
+                    grant.descriptor_hash,
+                    grant.batch_hash,
+                    grant.assignment_hash,
+                    grant_payload,
+                    grant_payload_hash,
+                    grant.state.value,
+                    grant.availability,
+                    grant.expires_at,
+                    created_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO external_dispatch_grant_bindings
+                    (grant_id, descriptor_hash, batch_hash, assignment_hash)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    grant.grant_id,
+                    grant.descriptor_hash,
+                    grant.batch_hash,
+                    grant.assignment_hash,
+                ),
+            )
+            self._insert_or_require_external_commitment(
+                cursor,
+                "external_bootstrap_batch_commitments",
+                {
+                    "batch_hash": batch.batch_hash,
+                    "descriptor_hash": descriptor.descriptor_hash,
+                    "descriptor_payload_hash": descriptor_payload_hash,
+                    "batch_payload_hash": batch_payload_hash,
+                },
+                parent_exists=batch_exists,
+            )
+            self._insert_or_require_external_commitment(
+                cursor,
+                "external_dispatch_grant_commitments",
+                {
+                    "grant_id": grant.grant_id,
+                    "descriptor_hash": descriptor.descriptor_hash,
+                    "batch_hash": batch.batch_hash,
+                    "assignment_hash": grant.assignment_hash,
+                    "descriptor_payload_hash": descriptor_payload_hash,
+                    "batch_payload_hash": batch_payload_hash,
+                    "grant_payload_hash": grant_payload_hash,
+                },
+                parent_exists=grant_exists,
+            )
+            outbox_row = cursor.execute(
+                "SELECT * FROM external_bootstrap_outbox WHERE batch_hash = ?",
+                (batch.batch_hash,),
+            ).fetchone()
+            grant_row = cursor.execute(
+                "SELECT * FROM external_dispatch_grants WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()
+            self._validate_external_grant_binding_at_read(grant_row, cursor=cursor)
+        return descriptor, batch, self._external_outbox_from_row(outbox_row), self._external_grant_from_row(grant_row)
+
+    def get_external_dispatch_grant(self, grant_id: str) -> ExternalDispatchGrant | None:
+        row = self._connection.execute(
+            "SELECT * FROM external_dispatch_grants WHERE grant_id = ?", (grant_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        self._validate_external_grant_binding_at_read(row)
+        return self._external_grant_from_row(row)
+
+    def consume_external_dispatch_grant(
+        self,
+        grant_id: str,
+        *,
+        descriptor_hash: str,
+        batch_hash: str,
+        assignment_hash: str,
+        now: str | None = None,
+    ) -> ExternalDispatchGrant:
+        """Atomically consume a grant once after exact hash binding verification."""
+        consumed_at = _utc_timestamp(now) if now is not None else _utc_now()
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE external_dispatch_grants
+                SET consumed_at = ?
+                WHERE grant_id = ? AND descriptor_hash = ? AND batch_hash = ?
+                  AND assignment_hash = ? AND consumed_at IS NULL AND expires_at > ?
+                  AND state = ? AND availability = ?
+                  AND EXISTS (
+                      SELECT 1 FROM external_dispatch_grant_bindings AS binding
+                      WHERE binding.grant_id = external_dispatch_grants.grant_id
+                        AND binding.descriptor_hash = external_dispatch_grants.descriptor_hash
+                        AND binding.batch_hash = external_dispatch_grants.batch_hash
+                        AND binding.assignment_hash = external_dispatch_grants.assignment_hash
+                  )
+                """,
+                (
+                    consumed_at,
+                    grant_id,
+                    descriptor_hash,
+                    batch_hash,
+                    assignment_hash,
+                    consumed_at,
+                    ExternalBootstrapState.PENDING.value,
+                    self._EXTERNAL_BOOTSTRAP_AVAILABILITY,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ExternalDispatchGrantError("external dispatch grant is expired, replayed, or unbound")
+            row = cursor.execute(
+                "SELECT * FROM external_dispatch_grants WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+            self._validate_external_grant_binding_at_read(row, cursor=cursor)
+        return self._external_grant_from_row(row)
+
+    def external_bootstrap_counts(self) -> tuple[int, int, int, int]:
+        """Return descriptor, batch, outbox and grant counts for repository checks."""
+        tables = (
+            "external_bootstrap_descriptors",
+            "external_bootstrap_batches",
+            "external_bootstrap_outbox",
+            "external_dispatch_grants",
+        )
+        return tuple(
+            int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in tables
+        )  # type: ignore[return-value]
 
     def create_workflow(self, workflow: Workflow) -> Workflow:
         with self._transaction() as cursor:
@@ -744,14 +1120,24 @@ class SQLiteStore:
                     f"artifact is not owned by sender: {artifact_hash!r}"
                 )
             artifact_size = int(artifact["size"])
-            self._require_message_quota(
+            recipient_lease = cursor.execute(
+                """
+                SELECT epoch FROM leases
+                WHERE task_id = ? AND expires_at > ?
+                """,
+                (recipient_task_id, now_utc),
+            ).fetchone()
+            self._require_durable_mailbox_quota(
                 cursor,
-                workflow_id,
-                recipient_task_id,
-                now_utc,
-                artifact_size,
-                max_count,
-                max_bytes,
+                workflow_id=workflow_id,
+                recipient_task_id=recipient_task_id,
+                recipient_epoch=(
+                    int(recipient_lease["epoch"]) if recipient_lease is not None else None
+                ),
+                now=now_utc,
+                incoming_bytes=artifact_size,
+                max_count=max_count,
+                max_bytes=max_bytes,
             )
             created_at = now_utc
             expires_at = (
@@ -790,6 +1176,446 @@ class SQLiteStore:
                 "SELECT * FROM messages WHERE sequence = ?", (sequence,)
             ).fetchone()
         return self._message_from_row(message)
+
+    def enqueue_role_envelope(
+        self,
+        workflow_id: str,
+        sender_task_id: str,
+        recipient_task_id: str,
+        owner: str,
+        epoch: int,
+        *,
+        recipient_epoch: int,
+        direction: RoleEnvelopeDirection | str,
+        sender_role: str,
+        recipient_role: str,
+        assignment_token: str,
+        dispatch_context_hash: str,
+        route_provenance_hash: str,
+        correlation_id: str,
+        ttl_seconds: int,
+        task_card_hash: str = "",
+        contract_hashes: tuple[str, ...] = (),
+        index_evidence_hashes: tuple[str, ...] = (),
+        terminal_result_hash: str = "",
+        evidence_hashes: tuple[str, ...] = (),
+        dependency_hashes: tuple[str, ...] = (),
+        risk_items: tuple[RoleRiskItem | Mapping[str, str], ...] = (),
+        coordinator_task_id: str | None = None,
+        coordinator_epoch: int | None = None,
+        capability: str | None = None,
+        now: str | None = None,
+        max_count: int,
+        max_bytes: int,
+    ) -> RoleEnvelope:
+        """Persist one exact, transcript-free role envelope under both lease fences."""
+
+        now_utc = _utc_timestamp(now) if now is not None else _utc_now()
+        if (
+            not isinstance(ttl_seconds, int)
+            or isinstance(ttl_seconds, bool)
+            or not 0 < ttl_seconds <= self._MAX_MESSAGE_TTL_SECONDS
+        ):
+            raise TTLInvalidError("message TTL is outside the permitted range")
+        if max_count < 1 or max_bytes < 1:
+            raise QuotaExceededError("message quotas must be positive")
+        direction_value = self._role_direction(direction)
+        expires_at = (
+            datetime.fromisoformat(now_utc) + timedelta(seconds=ttl_seconds)
+        ).isoformat()
+        with self._transaction() as cursor:
+            self._require_current_lease(cursor, sender_task_id, owner, epoch, now=now_utc)
+            self._require_task_in_workflow(
+                cursor, workflow_id, sender_task_id, RoleEnvelopeForbiddenError
+            )
+            self._require_task_in_workflow(
+                cursor, workflow_id, recipient_task_id, RoleEnvelopeForbiddenError
+            )
+            self._require_current_recipient_lease(
+                cursor, recipient_task_id, recipient_epoch, now=now_utc
+            )
+            coordinator_id, coordinator_lease_epoch = self._role_coordinator_binding(
+                cursor,
+                workflow_id=workflow_id,
+                direction=direction_value,
+                sender_task_id=sender_task_id,
+                sender_epoch=epoch,
+                recipient_task_id=recipient_task_id,
+                recipient_epoch=recipient_epoch,
+                coordinator_task_id=coordinator_task_id,
+                coordinator_epoch=coordinator_epoch,
+                now=now_utc,
+            )
+            self._require_role_task_roles(
+                cursor,
+                sender_task_id=sender_task_id,
+                sender_role=sender_role,
+                recipient_task_id=recipient_task_id,
+                recipient_role=recipient_role,
+                direction=direction_value,
+            )
+            recipient_capability_hash = ""
+            if direction_value is RoleEnvelopeDirection.PEER_TO_PEER:
+                recipient_capability_hash = self._require_role_peer_capability(
+                    cursor,
+                    workflow_id=workflow_id,
+                    sender_task_id=sender_task_id,
+                    recipient_task_id=recipient_task_id,
+                    capability=capability,
+                )
+            elif capability is not None:
+                raise CapabilityInvalidError(
+                    "a capability is valid only for a peer role envelope"
+                )
+            payload = self._role_envelope_payload(
+                direction=direction_value,
+                workflow_id=workflow_id,
+                sender_task_id=sender_task_id,
+                sender_role=sender_role,
+                sender_epoch=epoch,
+                recipient_task_id=recipient_task_id,
+                recipient_role=recipient_role,
+                recipient_epoch=recipient_epoch,
+                coordinator_task_id=coordinator_id,
+                coordinator_epoch=coordinator_lease_epoch,
+                assignment_token=assignment_token,
+                dispatch_context_hash=dispatch_context_hash,
+                route_provenance_hash=route_provenance_hash,
+                correlation_id=correlation_id,
+                task_card_hash=task_card_hash,
+                contract_hashes=contract_hashes,
+                index_evidence_hashes=index_evidence_hashes,
+                terminal_result_hash=terminal_result_hash,
+                evidence_hashes=evidence_hashes,
+                dependency_hashes=dependency_hashes,
+                risk_items=risk_items,
+                recipient_capability_hash=recipient_capability_hash,
+                issued_at=now_utc,
+                expires_at=expires_at,
+            )
+            payload_json = _canonical_payload_json(payload)
+            envelope_hash = _payload_hash(payload_json)
+            existing = cursor.execute(
+                """
+                SELECT * FROM role_envelopes
+                WHERE workflow_id = ? AND sender_task_id = ? AND recipient_task_id = ?
+                    AND correlation_id = ?
+                """,
+                (workflow_id, sender_task_id, recipient_task_id, correlation_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["envelope_hash"]) == envelope_hash:
+                    return self._role_envelope_from_row(existing)
+                raise CorrelationConflictError(
+                    "correlation id is already bound to another role envelope"
+                )
+            self._require_role_direction_references(
+                cursor,
+                direction=direction_value,
+                workflow_id=workflow_id,
+                sender_task_id=sender_task_id,
+                recipient_task_id=recipient_task_id,
+                payload=payload,
+            )
+            if direction_value is not RoleEnvelopeDirection.COORDINATOR_TO_WORKER:
+                self._require_live_role_assignment(
+                    cursor,
+                    workflow_id=workflow_id,
+                    worker_task_id=sender_task_id,
+                    worker_epoch=epoch,
+                    coordinator_task_id=coordinator_id,
+                    coordinator_epoch=coordinator_lease_epoch,
+                    assignment_token_hash=str(payload["assignment_token_hash"]),
+                    dispatch_context_hash=dispatch_context_hash,
+                    route_provenance_hash=route_provenance_hash,
+                    now=now_utc,
+                )
+            reference_bytes = self._role_reference_bytes(
+                cursor,
+                sender_task_id=sender_task_id,
+                payload=payload,
+            )
+            self._require_durable_mailbox_quota(
+                cursor,
+                workflow_id=workflow_id,
+                recipient_task_id=recipient_task_id,
+                recipient_epoch=recipient_epoch,
+                now=now_utc,
+                incoming_bytes=reference_bytes,
+                max_count=max_count,
+                max_bytes=max_bytes,
+            )
+            delivery_id = uuid.uuid4().hex
+            cursor.execute(
+                """
+                INSERT INTO role_envelopes (
+                    delivery_id, workflow_id, sender_task_id, recipient_task_id, direction,
+                    sender_role, recipient_role, sender_epoch, recipient_epoch, correlation_id,
+                    assignment_token_hash, dispatch_context_hash, route_provenance_hash,
+                    coordinator_task_id, coordinator_epoch, correlation_fence_hash, payload_json,
+                    envelope_hash, reference_bytes, issued_at, expires_at, delivery_state,
+                    acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    delivery_id,
+                    workflow_id,
+                    sender_task_id,
+                    recipient_task_id,
+                    direction_value.value,
+                    sender_role,
+                    recipient_role,
+                    epoch,
+                    recipient_epoch,
+                    correlation_id,
+                    payload["assignment_token_hash"],
+                    dispatch_context_hash,
+                    route_provenance_hash,
+                    coordinator_id,
+                    coordinator_lease_epoch,
+                    payload["correlation_fence_hash"],
+                    payload_json,
+                    envelope_hash,
+                    reference_bytes,
+                    now_utc,
+                    expires_at,
+                    "pending",
+                ),
+            )
+            sequence = int(cursor.lastrowid)
+            self._append_event_in_transaction(
+                cursor,
+                workflow_id,
+                sender_task_id,
+                "role_envelope_enqueued",
+                f"delivery={delivery_id};envelope={envelope_hash}",
+            )
+            row = cursor.execute(
+                "SELECT * FROM role_envelopes WHERE sequence = ?", (sequence,)
+            ).fetchone()
+        return self._role_envelope_from_row(row)
+
+    def read_role_inbox(
+        self,
+        workflow_id: str,
+        recipient_task_id: str,
+        owner: str,
+        epoch: int,
+        *,
+        recipient_role: str,
+        cursor: str | None = None,
+        limit: int = 50,
+        now: str | None = None,
+    ) -> tuple[RoleEnvelope, ...]:
+        """Read only unexpired role envelopes for the live recipient lease epoch."""
+
+        now_utc = _utc_timestamp(now) if now is not None else _utc_now()
+        bounded_limit = min(max(1, limit), self._MAX_INBOX_LIMIT)
+        with self._transaction() as transaction:
+            self._require_current_lease(
+                transaction, recipient_task_id, owner, epoch, now=now_utc
+            )
+            self._require_task_in_workflow(
+                transaction, workflow_id, recipient_task_id, MailboxForbiddenError
+            )
+            role_row = transaction.execute(
+                "SELECT owner_role FROM tasks WHERE id = ?", (recipient_task_id,)
+            ).fetchone()
+            if role_row is None or str(role_row["owner_role"]) != recipient_role:
+                raise RoleEnvelopeForbiddenError("recipient role is not authoritative")
+            after_sequence = self._role_envelope_cursor(
+                transaction, workflow_id, recipient_task_id, cursor
+            )
+            rows = transaction.execute(
+                """
+                SELECT * FROM role_envelopes
+                WHERE workflow_id = ? AND recipient_task_id = ? AND recipient_epoch = ?
+                    AND sequence > ? AND acknowledged_at IS NULL AND expires_at > ?
+                ORDER BY sequence
+                LIMIT ?
+                """,
+                (
+                    workflow_id,
+                    recipient_task_id,
+                    epoch,
+                    after_sequence,
+                    now_utc,
+                    bounded_limit,
+                ),
+            ).fetchall()
+        return tuple(self._role_envelope_from_row(row) for row in rows)
+
+    def ack_role_envelope(
+        self,
+        workflow_id: str,
+        recipient_task_id: str,
+        owner: str,
+        epoch: int,
+        delivery_id: str,
+        *,
+        recipient_role: str,
+        now: str | None = None,
+    ) -> RoleEnvelope:
+        """Acknowledge a role envelope without removing its durable audit row."""
+
+        now_utc = _utc_timestamp(now) if now is not None else _utc_now()
+        with self._transaction() as cursor:
+            self._require_current_lease(
+                cursor, recipient_task_id, owner, epoch, now=now_utc
+            )
+            self._require_task_in_workflow(
+                cursor, workflow_id, recipient_task_id, MailboxForbiddenError
+            )
+            row = cursor.execute(
+                "SELECT owner_role FROM tasks WHERE id = ?", (recipient_task_id,)
+            ).fetchone()
+            if row is None or str(row["owner_role"]) != recipient_role:
+                raise RoleEnvelopeForbiddenError("recipient role is not authoritative")
+            envelope = cursor.execute(
+                """
+                SELECT * FROM role_envelopes
+                WHERE delivery_id = ? AND workflow_id = ? AND recipient_task_id = ?
+                    AND recipient_epoch = ?
+                """,
+                (delivery_id, workflow_id, recipient_task_id, epoch),
+            ).fetchone()
+            if envelope is None:
+                raise MailboxForbiddenError(
+                    f"role envelope does not belong to recipient: {delivery_id!r}"
+                )
+            if envelope["acknowledged_at"] is not None:
+                return self._role_envelope_from_row(envelope)
+            if str(envelope["expires_at"]) <= now_utc:
+                raise MessageExpiredError(f"role envelope is expired: {delivery_id!r}")
+            cursor.execute(
+                """
+                UPDATE role_envelopes
+                SET delivery_state = ?, acknowledged_at = ?
+                WHERE delivery_id = ? AND acknowledged_at IS NULL
+                """,
+                ("acknowledged", now_utc, delivery_id),
+            )
+            envelope = cursor.execute(
+                "SELECT * FROM role_envelopes WHERE delivery_id = ?", (delivery_id,)
+            ).fetchone()
+        return self._role_envelope_from_row(envelope)
+
+    def record_host_archive_result(
+        self,
+        workflow_id: str,
+        task_id: str,
+        owner: str,
+        epoch: int,
+        *,
+        operation_id: str,
+        assignment_token: str,
+        dispatch_context_hash: str,
+        route_provenance_hash: str,
+        coordinator_task_id: str,
+        coordinator_epoch: int,
+        errno: int,
+        now: str | None = None,
+    ) -> HostOperationReceipt:
+        """Record an archive report only; this never invokes a host or task transition."""
+
+        now_utc = _utc_timestamp(now) if now is not None else _utc_now()
+        if not isinstance(errno, int) or isinstance(errno, bool):
+            raise RoleEnvelopeInvalidError("archive errno must be an integer")
+        if not self._safe_role_identifier(operation_id):
+            raise RoleEnvelopeInvalidError("archive operation id is not safe")
+        assignment_token_hash = self._assignment_token_hash(assignment_token)
+        self._require_role_hash(dispatch_context_hash, "dispatch context hash")
+        self._require_role_hash(route_provenance_hash, "route provenance hash")
+        status_code = (
+            "HOST_ARCHIVE_OS_ERROR_17" if errno == 17 else "HOST_ARCHIVE_REPORTED"
+        )
+        outcome = "blocked" if errno == 17 else "reported"
+        receipt_payload = {
+            "schema_version": self._HOST_ARCHIVE_RECEIPT_SCHEMA_VERSION,
+            "workflow_id": workflow_id,
+            "task_id": task_id,
+            "operation": "archive",
+            "operation_id": operation_id,
+            "lease_epoch": epoch,
+            "assignment_token_hash": assignment_token_hash,
+            "dispatch_context_hash": dispatch_context_hash,
+            "route_provenance_hash": route_provenance_hash,
+            "coordinator_task_id": coordinator_task_id,
+            "coordinator_epoch": coordinator_epoch,
+            "errno": errno,
+            "status_code": status_code,
+            "outcome": outcome,
+        }
+        receipt_hash = _payload_hash(_canonical_payload_json(receipt_payload))
+        with self._transaction() as cursor:
+            self._require_current_lease(cursor, task_id, owner, epoch, now=now_utc)
+            self._require_task_in_workflow(
+                cursor, workflow_id, task_id, RoleEnvelopeForbiddenError
+            )
+            task = cursor.execute(
+                "SELECT owner_role FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None or str(task["owner_role"]) != "worker":
+                raise RoleEnvelopeForbiddenError("archive report is not owned by a worker")
+            existing = cursor.execute(
+                "SELECT * FROM host_operation_receipts WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["receipt_hash"]) == receipt_hash:
+                    return self._host_operation_receipt_from_row(existing)
+                raise HostOperationConflictError("archive operation id was reused")
+            self._require_live_role_assignment(
+                cursor,
+                workflow_id=workflow_id,
+                worker_task_id=task_id,
+                worker_epoch=epoch,
+                coordinator_task_id=coordinator_task_id,
+                coordinator_epoch=coordinator_epoch,
+                assignment_token_hash=assignment_token_hash,
+                dispatch_context_hash=dispatch_context_hash,
+                route_provenance_hash=route_provenance_hash,
+                now=now_utc,
+            )
+            cursor.execute(
+                """
+                INSERT INTO host_operation_receipts (
+                    operation_id, workflow_id, task_id, operation, lease_epoch,
+                    assignment_token_hash, dispatch_context_hash, route_provenance_hash,
+                    coordinator_task_id, coordinator_epoch, errno, status_code, outcome,
+                    receipt_hash, reported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    workflow_id,
+                    task_id,
+                    "archive",
+                    epoch,
+                    assignment_token_hash,
+                    dispatch_context_hash,
+                    route_provenance_hash,
+                    coordinator_task_id,
+                    coordinator_epoch,
+                    errno,
+                    status_code,
+                    outcome,
+                    receipt_hash,
+                    now_utc,
+                ),
+            )
+            self._append_event_in_transaction(
+                cursor,
+                workflow_id,
+                task_id,
+                "host_archive_reported",
+                f"operation={operation_id};status={status_code}",
+            )
+            row = cursor.execute(
+                "SELECT * FROM host_operation_receipts WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        return self._host_operation_receipt_from_row(row)
 
     def read_inbox(
         self,
@@ -2526,6 +3352,554 @@ class SQLiteStore:
             (peer_id, relationships[peer_id]) for peer_id in sorted(relationships)
         )
 
+    @classmethod
+    def _role_direction(
+        cls, value: RoleEnvelopeDirection | str
+    ) -> RoleEnvelopeDirection:
+        try:
+            return RoleEnvelopeDirection(value)
+        except (TypeError, ValueError) as error:
+            raise RoleEnvelopeInvalidError("role envelope direction is not supported") from error
+
+    @classmethod
+    def _safe_role_identifier(cls, value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and bool(value)
+            and len(value) <= cls._MAX_ROLE_TOKEN_LENGTH
+            and cls._SAFE_ROLE_IDENTIFIER_PATTERN.fullmatch(value) is not None
+        )
+
+    @classmethod
+    def _require_role_hash(cls, value: object, label: str) -> str:
+        if not isinstance(value, str) or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None:
+            raise RoleEnvelopeInvalidError(f"{label} must be a sha256 reference")
+        return value
+
+    @classmethod
+    def _assignment_token_hash(cls, value: object) -> str:
+        """Accept only a content-addressed assignment token, never a bearer value."""
+
+        return cls._require_role_hash(value, "assignment token")
+
+    @classmethod
+    def _role_hashes(cls, value: object, label: str) -> tuple[str, ...]:
+        if not isinstance(value, tuple) or len(value) > cls._MAX_ROLE_REFERENCE_COUNT:
+            raise RoleEnvelopeInvalidError(f"{label} is outside the bounded schema")
+        hashes = tuple(cls._require_role_hash(item, label) for item in value)
+        if len(set(hashes)) != len(hashes):
+            raise RoleEnvelopeInvalidError(f"{label} contains duplicate references")
+        return hashes
+
+    @classmethod
+    def _role_risk_items(
+        cls, value: object
+    ) -> tuple[RoleRiskItem, ...]:
+        if not isinstance(value, tuple) or len(value) > cls._MAX_ROLE_RISK_ITEMS:
+            raise RoleEnvelopeInvalidError("risk items are outside the bounded schema")
+        items: list[RoleRiskItem] = []
+        for item in value:
+            if isinstance(item, RoleRiskItem):
+                code, severity, evidence_hash = (
+                    item.code,
+                    item.severity,
+                    item.evidence_hash,
+                )
+            elif isinstance(item, Mapping) and set(item) == {
+                "code",
+                "severity",
+                "evidence_hash",
+            }:
+                code = item["code"]
+                severity = item["severity"]
+                evidence_hash = item["evidence_hash"]
+            else:
+                raise RoleEnvelopeInvalidError("risk item schema is not exact")
+            if (
+                not isinstance(code, str)
+                or cls._SAFE_RISK_CODE_PATTERN.fullmatch(code) is None
+                or not isinstance(severity, str)
+                or severity not in cls._ROLE_RISK_SEVERITIES
+            ):
+                raise RoleEnvelopeInvalidError("risk item is not a bounded reference")
+            items.append(
+                RoleRiskItem(code, severity, cls._require_role_hash(evidence_hash, "risk evidence"))
+            )
+        if len({item.code for item in items}) != len(items):
+            raise RoleEnvelopeInvalidError("risk item codes must be unique")
+        return tuple(items)
+
+    def _role_coordinator_binding(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        workflow_id: str,
+        direction: RoleEnvelopeDirection,
+        sender_task_id: str,
+        sender_epoch: int,
+        recipient_task_id: str,
+        recipient_epoch: int,
+        coordinator_task_id: str | None,
+        coordinator_epoch: int | None,
+        now: str,
+    ) -> tuple[str, int]:
+        if direction is RoleEnvelopeDirection.COORDINATOR_TO_WORKER:
+            if coordinator_task_id not in (None, sender_task_id) or coordinator_epoch not in (
+                None,
+                sender_epoch,
+            ):
+                raise RoleEnvelopeInvalidError("coordinator binding does not match sender")
+            return sender_task_id, sender_epoch
+        if direction is RoleEnvelopeDirection.WORKER_TO_COORDINATOR:
+            if coordinator_task_id not in (None, recipient_task_id) or coordinator_epoch not in (
+                None,
+                recipient_epoch,
+            ):
+                raise RoleEnvelopeInvalidError("coordinator binding does not match recipient")
+            return recipient_task_id, recipient_epoch
+        if (
+            not self._safe_role_identifier(coordinator_task_id)
+            or not isinstance(coordinator_epoch, int)
+            or isinstance(coordinator_epoch, bool)
+            or coordinator_epoch < 1
+        ):
+            raise RoleEnvelopeInvalidError("peer envelope needs an exact coordinator binding")
+        self._require_task_in_workflow(
+            cursor, workflow_id, coordinator_task_id, RoleEnvelopeForbiddenError
+        )
+        self._require_current_recipient_lease(
+            cursor, coordinator_task_id, coordinator_epoch, now=now
+        )
+        row = cursor.execute(
+            "SELECT owner_role FROM tasks WHERE id = ?", (coordinator_task_id,)
+        ).fetchone()
+        if row is None or str(row["owner_role"]) != "coordinator":
+            raise RoleEnvelopeForbiddenError("peer coordinator is not authoritative")
+        return coordinator_task_id, coordinator_epoch
+
+    @classmethod
+    def _require_role_task_roles(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        sender_task_id: str,
+        sender_role: str,
+        recipient_task_id: str,
+        recipient_role: str,
+        direction: RoleEnvelopeDirection,
+    ) -> None:
+        expected = {
+            RoleEnvelopeDirection.COORDINATOR_TO_WORKER: ("coordinator", "worker"),
+            RoleEnvelopeDirection.WORKER_TO_COORDINATOR: ("worker", "coordinator"),
+            RoleEnvelopeDirection.PEER_TO_PEER: ("worker", "worker"),
+        }[direction]
+        if (sender_role, recipient_role) != expected:
+            raise RoleEnvelopeInvalidError("role direction does not match sender and recipient")
+        rows = cursor.execute(
+            "SELECT id, owner_role FROM tasks WHERE id IN (?, ?)",
+            (sender_task_id, recipient_task_id),
+        ).fetchall()
+        roles = {str(row["id"]): str(row["owner_role"]) for row in rows}
+        if roles.get(sender_task_id) != sender_role or roles.get(recipient_task_id) != recipient_role:
+            raise RoleEnvelopeForbiddenError("task role is not authoritative")
+
+    @staticmethod
+    def _require_current_recipient_lease(
+        cursor: sqlite3.Cursor, task_id: str, epoch: int, *, now: str
+    ) -> None:
+        if not isinstance(epoch, int) or isinstance(epoch, bool):
+            raise StaleLeaseError(f"lease is stale for task {task_id!r}")
+        row = cursor.execute(
+            "SELECT epoch, expires_at FROM leases WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if (
+            row is None
+            or int(row["epoch"]) != epoch
+            or str(row["expires_at"]) <= now
+        ):
+            raise StaleLeaseError(f"lease is stale for task {task_id!r}")
+
+    def _require_role_peer_capability(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        workflow_id: str,
+        sender_task_id: str,
+        recipient_task_id: str,
+        capability: str | None,
+    ) -> str:
+        relationship = dict(
+            self._peer_relationships(cursor, workflow_id, sender_task_id)
+        ).get(recipient_task_id)
+        if relationship is None:
+            raise PeerForbiddenError("task is not an authorized peer")
+        row = cursor.execute(
+            """
+            SELECT capability FROM peer_capabilities
+            WHERE workflow_id = ? AND sender_task_id = ? AND recipient_task_id = ?
+                AND relationship = ?
+            """,
+            (workflow_id, sender_task_id, recipient_task_id, relationship),
+        ).fetchone()
+        if (
+            row is None
+            or not isinstance(capability, str)
+            or not secrets.compare_digest(str(row["capability"]), capability)
+        ):
+            raise CapabilityInvalidError("delivery capability is not valid for this peer")
+        return _payload_hash(capability)
+
+    def _role_envelope_payload(
+        self,
+        *,
+        direction: RoleEnvelopeDirection,
+        workflow_id: str,
+        sender_task_id: str,
+        sender_role: str,
+        sender_epoch: int,
+        recipient_task_id: str,
+        recipient_role: str,
+        recipient_epoch: int,
+        coordinator_task_id: str,
+        coordinator_epoch: int,
+        assignment_token: str,
+        dispatch_context_hash: str,
+        route_provenance_hash: str,
+        correlation_id: str,
+        task_card_hash: str,
+        contract_hashes: tuple[str, ...],
+        index_evidence_hashes: tuple[str, ...],
+        terminal_result_hash: str,
+        evidence_hashes: tuple[str, ...],
+        dependency_hashes: tuple[str, ...],
+        risk_items: tuple[RoleRiskItem | Mapping[str, str], ...],
+        recipient_capability_hash: str,
+        issued_at: str,
+        expires_at: str,
+    ) -> dict[str, object]:
+        if (
+            not self._safe_role_identifier(workflow_id)
+            or not self._safe_role_identifier(sender_task_id)
+            or not self._safe_role_identifier(recipient_task_id)
+            or not self._safe_role_identifier(coordinator_task_id)
+            or not self._safe_role_identifier(correlation_id)
+            or len(correlation_id) > self._MAX_ROLE_CORRELATION_LENGTH
+            or not isinstance(sender_epoch, int)
+            or isinstance(sender_epoch, bool)
+            or sender_epoch < 1
+            or not isinstance(recipient_epoch, int)
+            or isinstance(recipient_epoch, bool)
+            or recipient_epoch < 1
+            or not isinstance(coordinator_epoch, int)
+            or isinstance(coordinator_epoch, bool)
+            or coordinator_epoch < 1
+        ):
+            raise RoleEnvelopeInvalidError("role envelope binding is not safe")
+        assignment_token_hash = self._assignment_token_hash(assignment_token)
+        self._require_role_hash(dispatch_context_hash, "dispatch context hash")
+        self._require_role_hash(route_provenance_hash, "route provenance hash")
+        card_hash = ""
+        if task_card_hash:
+            card_hash = self._require_role_hash(task_card_hash, "task card hash")
+        contracts = self._role_hashes(contract_hashes, "contract references")
+        index_evidence = self._role_hashes(index_evidence_hashes, "index evidence")
+        evidence = self._role_hashes(evidence_hashes, "evidence references")
+        dependencies = self._role_hashes(dependency_hashes, "dependency references")
+        terminal = ""
+        if terminal_result_hash:
+            terminal = self._require_role_hash(terminal_result_hash, "terminal result")
+        risks = self._role_risk_items(risk_items)
+        if not {risk.evidence_hash for risk in risks}.issubset(set(evidence)):
+            raise RoleEnvelopeInvalidError("risk evidence must be an envelope evidence reference")
+        if direction is RoleEnvelopeDirection.COORDINATOR_TO_WORKER:
+            if (
+                not card_hash
+                or not contracts
+                or not index_evidence
+                or terminal
+                or evidence
+                or dependencies
+                or risks
+                or recipient_capability_hash
+            ):
+                raise RoleEnvelopeInvalidError("coordinator envelope schema is not exact")
+        elif direction is RoleEnvelopeDirection.WORKER_TO_COORDINATOR:
+            if (
+                card_hash
+                or contracts
+                or index_evidence
+                or not terminal
+                or not evidence
+                or dependencies
+                or recipient_capability_hash
+            ):
+                raise RoleEnvelopeInvalidError("worker envelope schema is not exact")
+        elif (
+            card_hash
+            or contracts
+            or index_evidence
+            or terminal
+            or not evidence
+            or not dependencies
+            or risks
+            or not recipient_capability_hash
+        ):
+            raise RoleEnvelopeInvalidError("peer envelope schema is not exact")
+        fence_payload = {
+            "schema_version": self._ROLE_ENVELOPE_SCHEMA_VERSION,
+            "workflow_id": workflow_id,
+            "sender_task_id": sender_task_id,
+            "recipient_task_id": recipient_task_id,
+            "correlation_id": correlation_id,
+            "assignment_token_hash": assignment_token_hash,
+            "dispatch_context_hash": dispatch_context_hash,
+            "route_provenance_hash": route_provenance_hash,
+            "coordinator_task_id": coordinator_task_id,
+            "coordinator_epoch": coordinator_epoch,
+            "recipient_capability_hash": recipient_capability_hash,
+        }
+        correlation_fence_hash = _payload_hash(_canonical_payload_json(fence_payload))
+        return {
+            "schema_version": self._ROLE_ENVELOPE_SCHEMA_VERSION,
+            "direction": direction.value,
+            "workflow_id": workflow_id,
+            "sender_task_id": sender_task_id,
+            "sender_role": sender_role,
+            "sender_epoch": sender_epoch,
+            "recipient_task_id": recipient_task_id,
+            "recipient_role": recipient_role,
+            "recipient_epoch": recipient_epoch,
+            "coordinator_task_id": coordinator_task_id,
+            "coordinator_epoch": coordinator_epoch,
+            "correlation_id": correlation_id,
+            "assignment_token_hash": assignment_token_hash,
+            "dispatch_context_hash": dispatch_context_hash,
+            "route_provenance_hash": route_provenance_hash,
+            "correlation_fence_hash": correlation_fence_hash,
+            "task_card_hash": card_hash,
+            "contract_hashes": list(contracts),
+            "index_evidence_hashes": list(index_evidence),
+            "terminal_result_hash": terminal,
+            "evidence_hashes": list(evidence),
+            "dependency_hashes": list(dependencies),
+            "recipient_capability_hash": recipient_capability_hash,
+            "risk_items": [
+                {
+                    "code": risk.code,
+                    "severity": risk.severity,
+                    "evidence_hash": risk.evidence_hash,
+                }
+                for risk in risks
+            ],
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+        }
+
+    def _require_role_direction_references(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        direction: RoleEnvelopeDirection,
+        workflow_id: str,
+        sender_task_id: str,
+        recipient_task_id: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        if direction is not RoleEnvelopeDirection.COORDINATOR_TO_WORKER:
+            return
+        card = cursor.execute(
+            "SELECT card_hash FROM task_cards WHERE task_id = ?", (recipient_task_id,)
+        ).fetchone()
+        if card is None or str(card["card_hash"]) != payload["task_card_hash"]:
+            raise RoleEnvelopeForbiddenError("task card reference is not recipient-bound")
+        allowed_contracts = {
+            str(row["contract_hash"])
+            for row in cursor.execute(
+                "SELECT contract_hash FROM task_contract_subscriptions WHERE task_id = ?",
+                (recipient_task_id,),
+            ).fetchall()
+        }
+        requested_contracts = tuple(str(item) for item in payload["contract_hashes"])
+        if not requested_contracts or not set(requested_contracts).issubset(allowed_contracts):
+            raise RoleEnvelopeForbiddenError("contract references are not recipient-bound")
+
+    def _require_live_role_assignment(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        workflow_id: str,
+        worker_task_id: str,
+        worker_epoch: int,
+        coordinator_task_id: str,
+        coordinator_epoch: int,
+        assignment_token_hash: str,
+        dispatch_context_hash: str,
+        route_provenance_hash: str,
+        now: str,
+    ) -> None:
+        self._require_task_in_workflow(
+            cursor, workflow_id, coordinator_task_id, RoleEnvelopeForbiddenError
+        )
+        coordinator = cursor.execute(
+            "SELECT owner_role FROM tasks WHERE id = ?", (coordinator_task_id,)
+        ).fetchone()
+        if coordinator is None or str(coordinator["owner_role"]) != "coordinator":
+            raise RoleEnvelopeForbiddenError("coordinator role is not authoritative")
+        self._require_current_recipient_lease(
+            cursor, coordinator_task_id, coordinator_epoch, now=now
+        )
+        row = cursor.execute(
+            """
+            SELECT 1 FROM role_envelopes
+            WHERE direction = ? AND workflow_id = ? AND sender_task_id = ?
+                AND recipient_task_id = ? AND sender_role = ? AND recipient_role = ?
+                AND sender_epoch = ? AND recipient_epoch = ?
+                AND assignment_token_hash = ? AND dispatch_context_hash = ?
+                AND route_provenance_hash = ? AND expires_at > ?
+            """,
+            (
+                RoleEnvelopeDirection.COORDINATOR_TO_WORKER.value,
+                workflow_id,
+                coordinator_task_id,
+                worker_task_id,
+                "coordinator",
+                "worker",
+                coordinator_epoch,
+                worker_epoch,
+                assignment_token_hash,
+                dispatch_context_hash,
+                route_provenance_hash,
+                now,
+            ),
+        ).fetchone()
+        if row is None:
+            raise RoleEnvelopeForbiddenError("no live coordinator assignment matches envelope")
+
+    def _role_reference_bytes(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        sender_task_id: str,
+        payload: Mapping[str, object],
+    ) -> int:
+        references = {
+            *tuple(str(item) for item in payload["index_evidence_hashes"]),
+            *tuple(str(item) for item in payload["evidence_hashes"]),
+            *tuple(str(item) for item in payload["dependency_hashes"]),
+        }
+        terminal_result_hash = str(payload["terminal_result_hash"])
+        if terminal_result_hash:
+            references.add(terminal_result_hash)
+        if not references:
+            raise RoleEnvelopeInvalidError("role envelope requires artifact references")
+        total = 0
+        for content_hash in sorted(references):
+            row = cursor.execute(
+                """
+                SELECT artifacts.size, artifacts.redaction_version
+                FROM artifacts
+                JOIN artifact_owners ON artifact_owners.content_hash = artifacts.content_hash
+                WHERE artifacts.content_hash = ? AND artifact_owners.task_id = ?
+                """,
+                (content_hash, sender_task_id),
+            ).fetchone()
+            if row is None or not row["redaction_version"]:
+                raise ArtifactNotOwnedError(
+                    f"artifact is not owned by sender: {content_hash!r}"
+                )
+            total += int(row["size"])
+        return total
+
+    @staticmethod
+    def _require_durable_mailbox_quota(
+        cursor: sqlite3.Cursor,
+        *,
+        workflow_id: str,
+        recipient_task_id: str,
+        recipient_epoch: int | None,
+        now: str,
+        incoming_bytes: int,
+        max_count: int,
+        max_bytes: int,
+    ) -> None:
+        """Apply one transactionally serialized quota across both mailbox tables."""
+
+        scopes = (
+            (
+                """
+                SELECT COUNT(*) AS count, COALESCE(SUM(item_bytes), 0) AS bytes
+                FROM (
+                    SELECT artifacts.size AS item_bytes
+                    FROM messages
+                    JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
+                    WHERE messages.workflow_id = ? AND messages.recipient_task_id = ?
+                        AND messages.acknowledged_at IS NULL AND messages.expires_at > ?
+                    UNION ALL
+                    SELECT reference_bytes AS item_bytes
+                    FROM role_envelopes
+                    WHERE workflow_id = ? AND recipient_task_id = ? AND recipient_epoch = ?
+                        AND acknowledged_at IS NULL AND expires_at > ?
+                )
+                """,
+                (
+                    workflow_id,
+                    recipient_task_id,
+                    now,
+                    workflow_id,
+                    recipient_task_id,
+                    recipient_epoch,
+                    now,
+                ),
+            ),
+            (
+                """
+                SELECT COUNT(*) AS count, COALESCE(SUM(item_bytes), 0) AS bytes
+                FROM (
+                    SELECT artifacts.size AS item_bytes
+                    FROM messages
+                    JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
+                    WHERE messages.workflow_id = ?
+                        AND messages.acknowledged_at IS NULL AND messages.expires_at > ?
+                    UNION ALL
+                    SELECT reference_bytes AS item_bytes
+                    FROM role_envelopes
+                    WHERE workflow_id = ?
+                        AND acknowledged_at IS NULL AND expires_at > ?
+                )
+                """,
+                (workflow_id, now, workflow_id, now),
+            ),
+        )
+        for query, parameters in scopes:
+            usage = cursor.execute(query, parameters).fetchone()
+            if (
+                int(usage["count"]) + 1 > max_count
+                or int(usage["bytes"]) + incoming_bytes > max_bytes
+            ):
+                raise QuotaExceededError("durable mailbox quota exceeded")
+
+    @staticmethod
+    def _role_envelope_cursor(
+        cursor: sqlite3.Cursor,
+        workflow_id: str,
+        recipient_task_id: str,
+        value: str | None,
+    ) -> int:
+        if value is None:
+            return 0
+        if value.isdecimal():
+            return int(value)
+        row = cursor.execute(
+            """
+            SELECT sequence FROM role_envelopes
+            WHERE delivery_id = ? AND workflow_id = ? AND recipient_task_id = ?
+            """,
+            (value, workflow_id, recipient_task_id),
+        ).fetchone()
+        if row is None:
+            raise MailboxForbiddenError("role inbox cursor is not recipient-owned")
+        return int(row["sequence"])
+
     @staticmethod
     def _message_cursor(
         cursor: sqlite3.Cursor,
@@ -2547,40 +3921,6 @@ class SQLiteStore:
         if row is None:
             raise MailboxForbiddenError("mailbox cursor is not owned by this recipient")
         return int(row["sequence"])
-
-    @staticmethod
-    def _require_message_quota(
-        cursor: sqlite3.Cursor,
-        workflow_id: str,
-        recipient_task_id: str,
-        now: str,
-        artifact_size: int,
-        max_count: int,
-        max_bytes: int,
-    ) -> None:
-        for recipient_filter in (True, False):
-            if recipient_filter:
-                query = """
-                    SELECT COUNT(*) AS count, COALESCE(SUM(artifacts.size), 0) AS bytes
-                    FROM messages JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
-                    WHERE messages.workflow_id = ? AND messages.recipient_task_id = ?
-                        AND messages.acknowledged_at IS NULL AND messages.expires_at > ?
-                    """
-                parameters = (workflow_id, recipient_task_id, now)
-            else:
-                query = """
-                    SELECT COUNT(*) AS count, COALESCE(SUM(artifacts.size), 0) AS bytes
-                    FROM messages JOIN artifacts ON artifacts.content_hash = messages.artifact_hash
-                    WHERE messages.workflow_id = ? AND messages.acknowledged_at IS NULL
-                        AND messages.expires_at > ?
-                    """
-                parameters = (workflow_id, now)
-            usage = cursor.execute(query, parameters).fetchone()
-            if (
-                int(usage["count"]) + 1 > max_count
-                or int(usage["bytes"]) + artifact_size > max_bytes
-            ):
-                raise QuotaExceededError("mailbox quota exceeded")
 
     @staticmethod
     def _append_event_in_transaction(
@@ -3451,6 +4791,827 @@ class SQLiteStore:
             int(row["fallback_count"]),
         )
 
+    @classmethod
+    def _validate_external_hash(cls, value: str, label: str) -> None:
+        if (
+            not isinstance(value, str)
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None
+        ):
+            raise ExternalBootstrapConflictError(f"{label} must be a sha256 identifier")
+
+    @classmethod
+    def _validate_external_identifier(cls, value: str, label: str) -> None:
+        if (
+            not isinstance(value, str)
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(value) is None
+        ):
+            raise ExternalBootstrapConflictError(f"{label} is outside the bounded schema")
+
+    @classmethod
+    def _external_descriptor_payload(
+        cls, descriptor: ExternalSourceDescriptor
+    ) -> dict[str, object]:
+        return {
+            "commit_hash": descriptor.commit_hash,
+            "common_dir_hash": descriptor.common_dir_hash,
+            "descriptor_hash": descriptor.descriptor_hash,
+            "project_hash": descriptor.project_hash,
+            "ref_hash": descriptor.ref_hash,
+            "repository_hash": descriptor.repository_hash,
+            "source_hash": descriptor.source_hash,
+            "task_root_hash": descriptor.task_root_hash,
+            "tree_hash": descriptor.tree_hash,
+        }
+
+    @classmethod
+    def _external_batch_item_payload(
+        cls, item: ExternalBootstrapBatchItem
+    ) -> dict[str, object]:
+        return {
+            "assignment_hash": item.assignment_hash,
+            "index_hash": item.index_hash,
+            "item_index": item.item_index,
+            "lease_epoch": item.lease_epoch,
+            "lease_hash": item.lease_hash,
+            "plan_hash": item.plan_hash,
+            "predecessor_hash": item.predecessor_hash,
+            "projection_hash": item.projection_hash,
+            "quota_hash": item.quota_hash,
+            "route_hash": item.route_hash,
+            "task_id": item.task_id,
+            "task_hash": item.task_hash,
+            "workflow_id": item.workflow_id,
+            "workflow_hash": item.workflow_hash,
+        }
+
+    @classmethod
+    def _external_batch_payload(cls, batch: ExternalBootstrapBatch) -> dict[str, object]:
+        return {
+            "availability": batch.availability,
+            "batch_hash": batch.batch_hash,
+            "descriptor_hash": batch.descriptor_hash,
+            "expires_at": batch.expires_at,
+            "idempotency_key": batch.idempotency_key,
+            "items": [cls._external_batch_item_payload(item) for item in batch.items],
+            "state": batch.state.value,
+        }
+
+    @classmethod
+    def _external_grant_payload(cls, grant: ExternalDispatchGrant) -> dict[str, object]:
+        return {
+            "assignment_hash": grant.assignment_hash,
+            "availability": grant.availability,
+            "batch_hash": grant.batch_hash,
+            "descriptor_hash": grant.descriptor_hash,
+            "expires_at": grant.expires_at,
+            "grant_id": grant.grant_id,
+            "state": grant.state.value,
+        }
+
+    @classmethod
+    def _external_batch_item_from_row(
+        cls, row: sqlite3.Row
+    ) -> ExternalBootstrapBatchItem:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                raise ValueError("item payload must be an object")
+            item = ExternalBootstrapBatchItem(
+                item_index=int(payload["item_index"]),
+                workflow_id=str(payload["workflow_id"]),
+                task_id=str(payload["task_id"]),
+                lease_epoch=int(payload["lease_epoch"]),
+                plan_hash=str(payload["plan_hash"]),
+                projection_hash=str(payload["projection_hash"]),
+                assignment_hash=str(payload["assignment_hash"]),
+                predecessor_hash=str(payload["predecessor_hash"]),
+                quota_hash=str(payload["quota_hash"]),
+                route_hash=str(payload["route_hash"]),
+                index_hash=str(payload["index_hash"]),
+                workflow_hash=str(payload["workflow_hash"]),
+                task_hash=str(payload["task_hash"]),
+                lease_hash=str(payload["lease_hash"]),
+            )
+            canonical_payload = _canonical_payload_json(
+                cls._external_batch_item_payload(item)
+            )
+            if (
+                str(row["payload_json"]) != canonical_payload
+                or str(row["payload_hash"]) != _payload_hash(canonical_payload)
+                or int(row["item_index"]) != item.item_index
+                or str(row["assignment_hash"]) != item.assignment_hash
+            ):
+                raise ValueError("item payload binding differs from its row")
+            return item
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ExternalDispatchGrantError(
+                "external bootstrap batch item binding is corrupt"
+            ) from error
+
+    @classmethod
+    def _external_descriptor_from_row(
+        cls, row: sqlite3.Row
+    ) -> ExternalSourceDescriptor:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                raise ValueError("descriptor payload must be an object")
+            descriptor = ExternalSourceDescriptor(
+                descriptor_hash=str(payload["descriptor_hash"]),
+                source_hash=str(payload["source_hash"]),
+                repository_hash=str(payload["repository_hash"]),
+                common_dir_hash=str(payload["common_dir_hash"]),
+                project_hash=str(payload["project_hash"]),
+                task_root_hash=str(payload["task_root_hash"]),
+                ref_hash=str(payload["ref_hash"]),
+                commit_hash=str(payload["commit_hash"]),
+                tree_hash=str(payload["tree_hash"]),
+            )
+            canonical_payload = _canonical_payload_json(
+                cls._external_descriptor_payload(descriptor)
+            )
+            if (
+                str(row["descriptor_hash"]) != descriptor.descriptor_hash
+                or str(row["payload_json"]) != canonical_payload
+                or str(row["payload_hash"]) != _payload_hash(canonical_payload)
+            ):
+                raise ValueError("descriptor payload binding differs from its row")
+            for label, value in cls._external_descriptor_payload(descriptor).items():
+                if cls._SHA256_IDENTIFIER_PATTERN.fullmatch(str(value)) is None:
+                    raise ValueError(f"{label} is not a sha256 identifier")
+            return descriptor
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ExternalDispatchGrantError(
+                "external source descriptor binding is corrupt"
+            ) from error
+
+    @classmethod
+    def _external_batch_from_row(
+        cls,
+        row: sqlite3.Row,
+        items: tuple[ExternalBootstrapBatchItem, ...],
+    ) -> ExternalBootstrapBatch:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                raise ValueError("batch payload must be an object")
+            batch = ExternalBootstrapBatch(
+                batch_hash=str(payload["batch_hash"]),
+                descriptor_hash=str(payload["descriptor_hash"]),
+                idempotency_key=str(payload["idempotency_key"]),
+                items=items,
+                expires_at=str(payload["expires_at"]),
+                state=ExternalBootstrapState(str(payload["state"])),
+                availability=str(payload["availability"]),
+            )
+            canonical_payload = _canonical_payload_json(
+                cls._external_batch_payload(batch)
+            )
+            if (
+                str(row["batch_hash"]) != batch.batch_hash
+                or str(row["descriptor_hash"]) != batch.descriptor_hash
+                or str(row["idempotency_key"]) != batch.idempotency_key
+                or str(row["expires_at"]) != batch.expires_at
+                or str(row["state"]) != batch.state.value
+                or str(row["availability"]) != batch.availability
+                or str(row["payload_json"]) != canonical_payload
+                or str(row["payload_hash"]) != _payload_hash(canonical_payload)
+                or batch.expires_at != _utc_timestamp(batch.expires_at)
+                or batch.state is not ExternalBootstrapState.PENDING
+                or batch.availability != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+                or not items
+                or len(items) > cls._MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS
+                or tuple(item.item_index for item in items) != tuple(range(len(items)))
+                or len({item.assignment_hash for item in items}) != len(items)
+            ):
+                raise ValueError("batch payload binding differs from its row")
+            if (
+                cls._SHA256_IDENTIFIER_PATTERN.fullmatch(batch.batch_hash) is None
+                or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(batch.descriptor_hash)
+                is None
+                or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
+                    batch.idempotency_key
+                )
+                is None
+            ):
+                raise ValueError("batch identifiers are outside the bounded schema")
+            for item in items:
+                cls._validate_external_batch_item_from_read(item)
+            return batch
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ExternalDispatchGrantError(
+                "external bootstrap batch binding is corrupt"
+            ) from error
+
+    @classmethod
+    def _validate_external_batch_item_from_read(
+        cls, item: ExternalBootstrapBatchItem
+    ) -> None:
+        if (
+            isinstance(item.lease_epoch, bool)
+            or item.lease_epoch < 0
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(item.workflow_id)
+            is None
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(item.task_id) is None
+        ):
+            raise ValueError("batch item identifiers are outside the bounded schema")
+        for label, value in cls._external_batch_item_payload(item).items():
+            if str(label).endswith("_hash") and (
+                cls._SHA256_IDENTIFIER_PATTERN.fullmatch(str(value)) is None
+            ):
+                raise ValueError(f"{label} is not a sha256 identifier")
+
+    def _validate_external_grant_binding_at_read(
+        self, row: sqlite3.Row, *, cursor: sqlite3.Cursor | None = None
+    ) -> None:
+        executor = self._connection if cursor is None else cursor
+        try:
+            grant = self._external_grant_from_row(row)
+            canonical_expiry = _utc_timestamp(grant.expires_at)
+            grant_payload = _canonical_payload_json(self._external_grant_payload(grant))
+            if (
+                grant.expires_at != canonical_expiry
+                or str(row["payload_json"]) != grant_payload
+                or str(row["payload_hash"]) != _payload_hash(grant_payload)
+            ):
+                raise ValueError("grant payload is not canonical")
+            binding = executor.execute(
+                "SELECT * FROM external_dispatch_grant_bindings WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()
+            if binding is None or any(
+                str(binding[field]) != value
+                for field, value in (
+                    ("descriptor_hash", grant.descriptor_hash),
+                    ("batch_hash", grant.batch_hash),
+                    ("assignment_hash", grant.assignment_hash),
+                )
+            ):
+                raise ValueError("grant composite binding is absent or mismatched")
+            descriptor_row = executor.execute(
+                "SELECT * FROM external_bootstrap_descriptors WHERE descriptor_hash = ?",
+                (grant.descriptor_hash,),
+            ).fetchone()
+            if descriptor_row is None:
+                raise ValueError("grant does not bind a descriptor")
+            descriptor = self._external_descriptor_from_row(descriptor_row)
+            batch_row = executor.execute(
+                "SELECT * FROM external_bootstrap_batches WHERE batch_hash = ?",
+                (grant.batch_hash,),
+            ).fetchone()
+            item_rows = executor.execute(
+                """
+                SELECT * FROM external_bootstrap_batch_items
+                WHERE batch_hash = ? ORDER BY item_index
+                """,
+                (grant.batch_hash,),
+            ).fetchall()
+            if batch_row is None:
+                raise ValueError("grant does not bind a batch")
+            batch = self._external_batch_from_row(
+                batch_row,
+                tuple(self._external_batch_item_from_row(item_row) for item_row in item_rows),
+            )
+            if (
+                descriptor.descriptor_hash != grant.descriptor_hash
+                or batch.descriptor_hash != descriptor.descriptor_hash
+                or batch.expires_at != canonical_expiry
+            ):
+                raise ValueError("grant does not bind the canonical batch")
+            if not any(
+                item.assignment_hash == grant.assignment_hash for item in batch.items
+            ):
+                raise ValueError("grant does not bind a batch assignment")
+            descriptor_payload_hash = _payload_hash(
+                _canonical_payload_json(self._external_descriptor_payload(descriptor))
+            )
+            batch_payload_hash = _payload_hash(
+                _canonical_payload_json(self._external_batch_payload(batch))
+            )
+            grant_payload_hash = _payload_hash(grant_payload)
+            batch_commitment = executor.execute(
+                """
+                SELECT * FROM external_bootstrap_batch_commitments
+                WHERE batch_hash = ?
+                """,
+                (batch.batch_hash,),
+            ).fetchone()
+            grant_commitment = executor.execute(
+                """
+                SELECT * FROM external_dispatch_grant_commitments
+                WHERE grant_id = ?
+                """,
+                (grant.grant_id,),
+            ).fetchone()
+            expected_batch_commitment = {
+                "batch_hash": batch.batch_hash,
+                "descriptor_hash": descriptor.descriptor_hash,
+                "descriptor_payload_hash": descriptor_payload_hash,
+                "batch_payload_hash": batch_payload_hash,
+            }
+            expected_grant_commitment = {
+                "grant_id": grant.grant_id,
+                "descriptor_hash": descriptor.descriptor_hash,
+                "batch_hash": batch.batch_hash,
+                "assignment_hash": grant.assignment_hash,
+                "descriptor_payload_hash": descriptor_payload_hash,
+                "batch_payload_hash": batch_payload_hash,
+                "grant_payload_hash": grant_payload_hash,
+            }
+            if (
+                batch_commitment is None
+                or grant_commitment is None
+                or any(
+                    str(batch_commitment[field]) != value
+                    for field, value in expected_batch_commitment.items()
+                )
+                or any(
+                    str(grant_commitment[field]) != value
+                    for field, value in expected_grant_commitment.items()
+                )
+                or any(
+                    str(batch_commitment[field]) != str(grant_commitment[field])
+                    for field in (
+                        "batch_hash",
+                        "descriptor_hash",
+                        "descriptor_payload_hash",
+                        "batch_payload_hash",
+                    )
+                )
+            ):
+                raise ValueError("external bootstrap commitment chain is absent or mismatched")
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            sqlite3.DatabaseError,
+            ExternalDispatchGrantError,
+        ) as error:
+            if isinstance(error, ExternalDispatchGrantError):
+                raise
+            raise ExternalDispatchGrantError(
+                "external dispatch grant binding is corrupt"
+            ) from error
+
+    @classmethod
+    def _validate_external_bootstrap_records(
+        cls,
+        descriptor: ExternalSourceDescriptor,
+        batch: ExternalBootstrapBatch,
+        grant: ExternalDispatchGrant,
+    ) -> None:
+        if not isinstance(descriptor, ExternalSourceDescriptor):
+            raise ExternalBootstrapConflictError("external descriptor is invalid")
+        for label, value in cls._external_descriptor_payload(descriptor).items():
+            cls._validate_external_hash(value, str(label))
+        if (
+            not isinstance(batch, ExternalBootstrapBatch)
+            or batch.state is not ExternalBootstrapState.PENDING
+            or batch.availability != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+            or not batch.items
+            or len(batch.items) > cls._MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS
+        ):
+            raise ExternalBootstrapConflictError("external bootstrap batch is not pending")
+        cls._validate_external_hash(batch.batch_hash, "batch_hash")
+        cls._validate_external_hash(batch.descriptor_hash, "descriptor_hash")
+        cls._validate_external_identifier(batch.idempotency_key, "idempotency_key")
+        if batch.descriptor_hash != descriptor.descriptor_hash:
+            raise ExternalBootstrapConflictError("batch does not bind the descriptor")
+        _utc_timestamp(batch.expires_at)
+        assignment_hashes: set[str] = set()
+        for position, item in enumerate(batch.items):
+            if (
+                not isinstance(item, ExternalBootstrapBatchItem)
+                or isinstance(item.item_index, bool)
+                or item.item_index != position
+                or isinstance(item.lease_epoch, bool)
+                or item.lease_epoch < 0
+            ):
+                raise ExternalBootstrapConflictError("batch item ordering or lease is invalid")
+            cls._validate_external_identifier(item.workflow_id, "workflow_id")
+            cls._validate_external_identifier(item.task_id, "task_id")
+            for label, value in cls._external_batch_item_payload(item).items():
+                if str(label).endswith("_hash"):
+                    cls._validate_external_hash(value, str(label))
+            if item.assignment_hash in assignment_hashes:
+                raise ExternalBootstrapConflictError("batch assignment hashes must be unique")
+            assignment_hashes.add(item.assignment_hash)
+        if (
+            not isinstance(grant, ExternalDispatchGrant)
+            or grant.state is not ExternalBootstrapState.PENDING
+            or grant.availability != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+            or grant.consumed_at is not None
+        ):
+            raise ExternalBootstrapConflictError("external dispatch grant is not pending")
+        cls._validate_external_identifier(grant.grant_id, "grant_id")
+        for label, value in cls._external_grant_payload(grant).items():
+            if str(label).endswith("_hash"):
+                cls._validate_external_hash(value, str(label))
+        _utc_timestamp(grant.expires_at)
+        if (
+            grant.descriptor_hash != descriptor.descriptor_hash
+            or grant.batch_hash != batch.batch_hash
+            or grant.expires_at != batch.expires_at
+            or grant.assignment_hash not in assignment_hashes
+        ):
+            raise ExternalBootstrapConflictError("grant is not bound to descriptor batch assignment")
+
+    @staticmethod
+    def _insert_or_require_external_commitment(
+        cursor: sqlite3.Cursor,
+        table: str,
+        values: Mapping[str, str],
+        *,
+        parent_exists: bool,
+    ) -> None:
+        identity_column, identity = next(iter(values.items()))
+        row = cursor.execute(
+            f"SELECT * FROM {table} WHERE {identity_column} = ?", (identity,)
+        ).fetchone()
+        if row is None:
+            if parent_exists:
+                raise ExternalBootstrapConflictError(
+                    "legacy external bootstrap record lacks a commitment"
+                )
+            columns = tuple(values)
+            cursor.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            )
+            return
+        if any(str(row[column]) != value for column, value in values.items()):
+            raise ExternalBootstrapConflictError("external bootstrap commitment conflicts")
+
+    @staticmethod
+    def _require_external_payload(
+        cursor: sqlite3.Cursor,
+        table: str,
+        identity_column: str,
+        identity: str,
+        payload_json: str,
+    ) -> None:
+        row = cursor.execute(
+            f"SELECT payload_json FROM {table} WHERE {identity_column} = ?", (identity,)
+        ).fetchone()
+        if row is not None and str(row["payload_json"]) != payload_json:
+            raise ExternalBootstrapConflictError("external bootstrap binding conflicts")
+
+    @staticmethod
+    def _external_outbox_from_row(row: sqlite3.Row) -> ExternalBootstrapOutboxItem:
+        return ExternalBootstrapOutboxItem(
+            str(row["batch_hash"]),
+            str(row["descriptor_hash"]),
+            ExternalBootstrapState(str(row["state"])),
+            str(row["availability"]),
+            str(row["created_at"]),
+        )
+
+    @staticmethod
+    def _external_grant_from_row(row: sqlite3.Row) -> ExternalDispatchGrant:
+        return ExternalDispatchGrant(
+            str(row["grant_id"]),
+            str(row["descriptor_hash"]),
+            str(row["batch_hash"]),
+            str(row["assignment_hash"]),
+            str(row["expires_at"]),
+            ExternalBootstrapState(str(row["state"])),
+            str(row["availability"]),
+            None if row["consumed_at"] is None else str(row["consumed_at"]),
+        )
+
+    @classmethod
+    def _preflight_external_bootstrap_rows(cls, cursor: sqlite3.Cursor) -> None:
+        """Reject raw bootstrap drift before a schema migration can rewrite it."""
+        try:
+            descriptor_hashes = {
+                cls._preflight_external_descriptor_row(row)
+                for row in cursor.execute(
+                    "SELECT * FROM external_bootstrap_descriptors"
+                ).fetchall()
+            }
+            item_payloads_by_batch: dict[str, list[dict[str, object]]] = {}
+            for row in cursor.execute(
+                """
+                SELECT * FROM external_bootstrap_batch_items
+                ORDER BY batch_hash, item_index
+                """
+            ).fetchall():
+                batch_hash, payload = cls._preflight_external_batch_item_row(row)
+                item_payloads_by_batch.setdefault(batch_hash, []).append(payload)
+
+            batches: dict[str, tuple[str, str, frozenset[str]]] = {}
+            for row in cursor.execute(
+                "SELECT * FROM external_bootstrap_batches"
+            ).fetchall():
+                batch_hash, descriptor_hash, expires_at, assignment_hashes = (
+                    cls._preflight_external_batch_row(
+                        row,
+                        item_payloads_by_batch.pop(str(row["batch_hash"]), []),
+                    )
+                )
+                if descriptor_hash not in descriptor_hashes:
+                    raise ValueError("batch references an absent descriptor")
+                batches[batch_hash] = (
+                    descriptor_hash,
+                    expires_at,
+                    frozenset(assignment_hashes),
+                )
+            if item_payloads_by_batch:
+                raise ValueError("batch item references an absent batch")
+
+            for row in cursor.execute(
+                "SELECT * FROM external_dispatch_grants"
+            ).fetchall():
+                cls._preflight_external_grant_row(row, batches, descriptor_hashes)
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            ExternalDispatchGrantError,
+        ) as error:
+            raise ExternalBootstrapConflictError(
+                "stored external bootstrap rows are not migration-safe"
+            ) from error
+
+    @classmethod
+    def _preflight_external_descriptor_row(cls, row: sqlite3.Row) -> str:
+        payload = cls._preflight_external_payload_from_row(row)
+        expected_fields = {
+            "commit_hash",
+            "common_dir_hash",
+            "descriptor_hash",
+            "project_hash",
+            "ref_hash",
+            "repository_hash",
+            "source_hash",
+            "task_root_hash",
+            "tree_hash",
+        }
+        if set(payload) != expected_fields or any(
+            type(payload[field]) is not str for field in expected_fields
+        ):
+            raise ValueError("descriptor payload shape is invalid")
+        descriptor = ExternalSourceDescriptor(
+            descriptor_hash=payload["descriptor_hash"],
+            source_hash=payload["source_hash"],
+            repository_hash=payload["repository_hash"],
+            common_dir_hash=payload["common_dir_hash"],
+            project_hash=payload["project_hash"],
+            task_root_hash=payload["task_root_hash"],
+            ref_hash=payload["ref_hash"],
+            commit_hash=payload["commit_hash"],
+            tree_hash=payload["tree_hash"],
+        )
+        if str(row["descriptor_hash"]) != descriptor.descriptor_hash:
+            raise ValueError("descriptor identity differs from its payload")
+        for value in cls._external_descriptor_payload(descriptor).values():
+            if cls._SHA256_IDENTIFIER_PATTERN.fullmatch(str(value)) is None:
+                raise ValueError("descriptor hash is outside the bounded schema")
+        return descriptor.descriptor_hash
+
+    @classmethod
+    def _preflight_external_batch_item_row(
+        cls, row: sqlite3.Row
+    ) -> tuple[str, dict[str, object]]:
+        payload = cls._preflight_external_payload_from_row(row)
+        legacy_fields = {
+            "assignment_hash",
+            "item_index",
+            "lease_epoch",
+            "plan_hash",
+            "predecessor_hash",
+            "projection_hash",
+            "quota_hash",
+            "route_hash",
+            "task_id",
+            "workflow_id",
+        }
+        current_fields = legacy_fields | {
+            "index_hash",
+            "lease_hash",
+            "task_hash",
+            "workflow_hash",
+        }
+        if set(payload) not in (legacy_fields, current_fields):
+            raise ValueError("batch item payload shape is invalid")
+        if (
+            type(payload["item_index"]) is not int
+            or type(payload["lease_epoch"]) is not int
+            or payload["item_index"] < 0
+            or payload["lease_epoch"] < 0
+            or type(payload["workflow_id"]) is not str
+            or type(payload["task_id"]) is not str
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
+                payload["workflow_id"]
+            )
+            is None
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(payload["task_id"])
+            is None
+        ):
+            raise ValueError("batch item identifiers are invalid")
+        for field, value in payload.items():
+            if field.endswith("_hash") and (
+                type(value) is not str
+                or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None
+            ):
+                raise ValueError("batch item hash is outside the bounded schema")
+        if (
+            type(row["batch_hash"]) is not str
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(row["batch_hash"]) is None
+            or type(row["item_index"]) is not int
+            or row["item_index"] != payload["item_index"]
+            or type(row["assignment_hash"]) is not str
+            or row["assignment_hash"] != payload["assignment_hash"]
+        ):
+            raise ValueError("batch item row differs from its payload")
+        return row["batch_hash"], payload
+
+    @classmethod
+    def _preflight_external_batch_row(
+        cls,
+        row: sqlite3.Row,
+        item_payloads: list[dict[str, object]],
+    ) -> tuple[str, str, str, set[str]]:
+        payload = cls._preflight_external_payload_from_row(row)
+        expected_fields = {
+            "availability",
+            "batch_hash",
+            "descriptor_hash",
+            "expires_at",
+            "idempotency_key",
+            "items",
+            "state",
+        }
+        if set(payload) != expected_fields or type(payload["items"]) is not list:
+            raise ValueError("batch payload shape is invalid")
+        if any(
+            type(payload[field]) is not str
+            for field in expected_fields - {"items"}
+        ):
+            raise ValueError("batch payload values are invalid")
+        if (
+            payload["state"] != ExternalBootstrapState.PENDING.value
+            or payload["availability"] != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload["batch_hash"])
+            is None
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload["descriptor_hash"])
+            is None
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
+                payload["idempotency_key"]
+            )
+            is None
+        ):
+            raise ValueError("batch payload binding is invalid")
+        _utc_timestamp(payload["expires_at"])
+        if any(
+            str(row[field]) != payload[field]
+            for field in (
+                "batch_hash",
+                "descriptor_hash",
+                "idempotency_key",
+                "expires_at",
+                "state",
+                "availability",
+            )
+        ):
+            raise ValueError("batch row differs from its payload")
+        if (
+            not item_payloads
+            or len(item_payloads) > cls._MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS
+            or payload["items"] != item_payloads
+        ):
+            raise ValueError("batch items differ from their rows")
+        item_indexes = [item["item_index"] for item in item_payloads]
+        assignment_hashes = {str(item["assignment_hash"]) for item in item_payloads}
+        if item_indexes != list(range(len(item_payloads))) or len(
+            assignment_hashes
+        ) != len(item_payloads):
+            raise ValueError("batch item ordering or bindings are invalid")
+        return (
+            payload["batch_hash"],
+            payload["descriptor_hash"],
+            payload["expires_at"],
+            assignment_hashes,
+        )
+
+    @classmethod
+    def _preflight_external_grant_row(
+        cls,
+        row: sqlite3.Row,
+        batches: Mapping[str, tuple[str, str, frozenset[str]]],
+        descriptor_hashes: set[str],
+    ) -> None:
+        payload = cls._preflight_external_payload_from_row(row)
+        expected_fields = {
+            "assignment_hash",
+            "availability",
+            "batch_hash",
+            "descriptor_hash",
+            "expires_at",
+            "grant_id",
+            "state",
+        }
+        if set(payload) != expected_fields or any(
+            type(payload[field]) is not str for field in expected_fields
+        ):
+            raise ValueError("grant payload shape is invalid")
+        if (
+            payload["state"] != ExternalBootstrapState.PENDING.value
+            or payload["availability"] != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(payload["grant_id"])
+            is None
+            or any(
+                cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload[field]) is None
+                for field in ("assignment_hash", "batch_hash", "descriptor_hash")
+            )
+        ):
+            raise ValueError("grant payload binding is invalid")
+        _utc_timestamp(payload["expires_at"])
+        if any(
+            str(row[field]) != payload[field]
+            for field in (
+                "grant_id",
+                "descriptor_hash",
+                "batch_hash",
+                "assignment_hash",
+                "expires_at",
+                "state",
+                "availability",
+            )
+        ):
+            raise ValueError("grant row differs from its payload")
+        batch = batches.get(payload["batch_hash"])
+        if (
+            payload["descriptor_hash"] not in descriptor_hashes
+            or batch is None
+            or batch[0] != payload["descriptor_hash"]
+            or batch[1] != payload["expires_at"]
+            or payload["assignment_hash"] not in batch[2]
+        ):
+            raise ValueError("grant does not bind its raw batch")
+
+    @staticmethod
+    def _preflight_external_payload_from_row(row: sqlite3.Row) -> dict[str, object]:
+        payload_json = row["payload_json"]
+        payload_hash = row["payload_hash"]
+        if type(payload_json) is not str or type(payload_hash) is not str:
+            raise ValueError("external payload storage types are invalid")
+        payload = json.loads(payload_json)
+        if (
+            not isinstance(payload, dict)
+            or payload_json != _canonical_payload_json(payload)
+            or payload_hash != _payload_hash(payload_json)
+        ):
+            raise ValueError("external payload JSON or hash is invalid")
+        return payload
+
+    @staticmethod
+    def _canonicalize_external_bootstrap_expiries(cursor: sqlite3.Cursor) -> None:
+        for table, identity_column in (
+            ("external_bootstrap_batches", "batch_hash"),
+            ("external_dispatch_grants", "grant_id"),
+        ):
+            rows = cursor.execute(
+                f"SELECT {identity_column}, expires_at, payload_json, payload_hash FROM {table}"
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                    if not isinstance(payload, dict):
+                        raise ValueError("payload must be an object")
+                    raw_expiry = payload["expires_at"]
+                    if not isinstance(raw_expiry, str):
+                        raise ValueError("expiry must be a string")
+                    raw_payload_json = _canonical_payload_json(payload)
+                    if (
+                        str(row["expires_at"]) != raw_expiry
+                        or str(row["payload_json"]) != raw_payload_json
+                        or str(row["payload_hash"])
+                        != _payload_hash(raw_payload_json)
+                    ):
+                        raise ValueError("raw expiry column, payload, and hash disagree")
+                    payload["expires_at"] = _utc_timestamp(raw_expiry)
+                    canonical_payload = _canonical_payload_json(payload)
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise ExternalBootstrapConflictError(
+                        "stored external bootstrap expiry is not canonicalizable"
+                    ) from error
+                cursor.execute(
+                    f"""
+                    UPDATE {table}
+                    SET expires_at = ?, payload_json = ?, payload_hash = ?
+                    WHERE {identity_column} = ?
+                    """,
+                    (
+                        str(payload["expires_at"]),
+                        canonical_payload,
+                        _payload_hash(canonical_payload),
+                        str(row[identity_column]),
+                    ),
+                )
+
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
             _execute_schema_statements(
@@ -3674,7 +5835,190 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_recipient_inbox
                     ON messages(workflow_id, recipient_task_id, sequence);
+                CREATE TABLE IF NOT EXISTS role_envelopes (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    delivery_id TEXT NOT NULL UNIQUE,
+                    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                    sender_task_id TEXT NOT NULL REFERENCES tasks(id),
+                    recipient_task_id TEXT NOT NULL REFERENCES tasks(id),
+                    direction TEXT NOT NULL CHECK (direction IN (
+                        'coordinator_to_worker', 'worker_to_coordinator', 'peer_to_peer'
+                    )),
+                    sender_role TEXT NOT NULL,
+                    recipient_role TEXT NOT NULL,
+                    sender_epoch INTEGER NOT NULL,
+                    recipient_epoch INTEGER NOT NULL,
+                    correlation_id TEXT NOT NULL,
+                    assignment_token_hash TEXT NOT NULL,
+                    dispatch_context_hash TEXT NOT NULL,
+                    route_provenance_hash TEXT NOT NULL,
+                    coordinator_task_id TEXT NOT NULL REFERENCES tasks(id),
+                    coordinator_epoch INTEGER NOT NULL,
+                    correlation_fence_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    envelope_hash TEXT NOT NULL,
+                    reference_bytes INTEGER NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    UNIQUE (workflow_id, sender_task_id, recipient_task_id, correlation_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_role_envelopes_recipient_inbox
+                    ON role_envelopes(workflow_id, recipient_task_id, sequence);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_role_envelopes_envelope_hash
+                    ON role_envelopes(envelope_hash) WHERE envelope_hash IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS host_operation_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    operation TEXT NOT NULL CHECK (operation = 'archive'),
+                    lease_epoch INTEGER NOT NULL,
+                    assignment_token_hash TEXT NOT NULL,
+                    dispatch_context_hash TEXT NOT NULL,
+                    route_provenance_hash TEXT NOT NULL,
+                    coordinator_task_id TEXT NOT NULL REFERENCES tasks(id),
+                    coordinator_epoch INTEGER NOT NULL,
+                    errno INTEGER NOT NULL,
+                    status_code TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK (outcome IN ('blocked', 'reported')),
+                    receipt_hash TEXT NOT NULL,
+                    reported_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_host_operation_receipts_task
+                    ON host_operation_receipts(workflow_id, task_id, operation_id);
+                CREATE TABLE IF NOT EXISTS external_bootstrap_descriptors (
+                    descriptor_hash TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS external_bootstrap_batches (
+                    batch_hash TEXT PRIMARY KEY,
+                    descriptor_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_descriptors(descriptor_hash),
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK (state = 'pending'),
+                    availability TEXT NOT NULL CHECK (availability = 'HOST_API_UNAVAILABLE'),
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_bootstrap_batches_descriptor
+                    ON external_bootstrap_batches(descriptor_hash, created_at, batch_hash);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_external_bootstrap_batches_binding
+                    ON external_bootstrap_batches(batch_hash, descriptor_hash);
+                CREATE TABLE IF NOT EXISTS external_bootstrap_batch_items (
+                    batch_hash TEXT NOT NULL REFERENCES external_bootstrap_batches(batch_hash),
+                    item_index INTEGER NOT NULL CHECK (item_index >= 0),
+                    assignment_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    PRIMARY KEY (batch_hash, item_index),
+                    UNIQUE (batch_hash, assignment_hash)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_external_bootstrap_batch_items_binding
+                    ON external_bootstrap_batch_items(batch_hash, assignment_hash);
+                CREATE TABLE IF NOT EXISTS external_bootstrap_outbox (
+                    batch_hash TEXT PRIMARY KEY
+                        REFERENCES external_bootstrap_batches(batch_hash),
+                    descriptor_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_descriptors(descriptor_hash),
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK (state = 'pending'),
+                    availability TEXT NOT NULL CHECK (availability = 'HOST_API_UNAVAILABLE'),
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_bootstrap_outbox_pending
+                    ON external_bootstrap_outbox(state, created_at, batch_hash);
+                CREATE TABLE IF NOT EXISTS external_dispatch_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    descriptor_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_descriptors(descriptor_hash),
+                    batch_hash TEXT NOT NULL REFERENCES external_bootstrap_batches(batch_hash),
+                    assignment_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK (state = 'pending'),
+                    availability TEXT NOT NULL CHECK (availability = 'HOST_API_UNAVAILABLE'),
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (descriptor_hash, batch_hash, assignment_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_dispatch_grants_pending
+                    ON external_dispatch_grants(batch_hash, assignment_hash, expires_at)
+                    WHERE consumed_at IS NULL;
+                CREATE TABLE IF NOT EXISTS external_dispatch_grant_bindings (
+                    grant_id TEXT PRIMARY KEY
+                        REFERENCES external_dispatch_grants(grant_id),
+                    descriptor_hash TEXT NOT NULL,
+                    batch_hash TEXT NOT NULL,
+                    assignment_hash TEXT NOT NULL,
+                    FOREIGN KEY (batch_hash, descriptor_hash)
+                        REFERENCES external_bootstrap_batches(batch_hash, descriptor_hash),
+                    FOREIGN KEY (batch_hash, assignment_hash)
+                        REFERENCES external_bootstrap_batch_items(batch_hash, assignment_hash),
+                    UNIQUE (descriptor_hash, batch_hash, assignment_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_dispatch_grant_bindings_batch
+                    ON external_dispatch_grant_bindings(
+                        batch_hash, assignment_hash, descriptor_hash, grant_id
+                    );
+                CREATE TABLE IF NOT EXISTS external_bootstrap_batch_commitments (
+                    batch_hash TEXT PRIMARY KEY
+                        REFERENCES external_bootstrap_batches(batch_hash),
+                    descriptor_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_descriptors(descriptor_hash),
+                    descriptor_payload_hash TEXT NOT NULL,
+                    batch_payload_hash TEXT NOT NULL,
+                    FOREIGN KEY (batch_hash, descriptor_hash)
+                        REFERENCES external_bootstrap_batches(batch_hash, descriptor_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_bootstrap_batch_commitments_descriptor
+                    ON external_bootstrap_batch_commitments(
+                        descriptor_hash, descriptor_payload_hash, batch_payload_hash
+                    );
+                CREATE TABLE IF NOT EXISTS external_dispatch_grant_commitments (
+                    grant_id TEXT PRIMARY KEY
+                        REFERENCES external_dispatch_grants(grant_id),
+                    descriptor_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_descriptors(descriptor_hash),
+                    batch_hash TEXT NOT NULL
+                        REFERENCES external_bootstrap_batches(batch_hash),
+                    assignment_hash TEXT NOT NULL,
+                    descriptor_payload_hash TEXT NOT NULL,
+                    batch_payload_hash TEXT NOT NULL,
+                    grant_payload_hash TEXT NOT NULL,
+                    FOREIGN KEY (batch_hash, descriptor_hash)
+                        REFERENCES external_bootstrap_batches(batch_hash, descriptor_hash),
+                    FOREIGN KEY (batch_hash, assignment_hash)
+                        REFERENCES external_bootstrap_batch_items(batch_hash, assignment_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_dispatch_grant_commitments_batch
+                    ON external_dispatch_grant_commitments(
+                        batch_hash, assignment_hash, descriptor_hash, grant_id
+                    );
                 """,
+            )
+            self._preflight_external_bootstrap_rows(cursor)
+            self._canonicalize_external_bootstrap_expiries(cursor)
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO external_dispatch_grant_bindings
+                    (grant_id, descriptor_hash, batch_hash, assignment_hash)
+                SELECT grant.grant_id, grant.descriptor_hash, grant.batch_hash,
+                       grant.assignment_hash
+                FROM external_dispatch_grants AS grant
+                JOIN external_bootstrap_batches AS batch
+                    ON batch.batch_hash = grant.batch_hash
+                   AND batch.descriptor_hash = grant.descriptor_hash
+                JOIN external_bootstrap_batch_items AS item
+                    ON item.batch_hash = grant.batch_hash
+                   AND item.assignment_hash = grant.assignment_hash
+                """
             )
             columns = {
                 str(row["name"])
@@ -3848,6 +6192,126 @@ class SQLiteStore:
             str(row["delivery_state"]),
             None if row["acknowledged_at"] is None else str(row["acknowledged_at"]),
         )
+
+    def _role_envelope_from_row(self, row: sqlite3.Row) -> RoleEnvelope:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                raise TypeError("role payload is not an object")
+            if payload.get("schema_version") != self._ROLE_ENVELOPE_SCHEMA_VERSION:
+                raise ValueError("role payload schema is not current")
+            if _payload_hash(_canonical_payload_json(payload)) != str(row["envelope_hash"]):
+                raise ValueError("role envelope hash is corrupt")
+            direction = RoleEnvelopeDirection(str(row["direction"]))
+            bindings = {
+                "direction": direction.value,
+                "workflow_id": str(row["workflow_id"]),
+                "sender_task_id": str(row["sender_task_id"]),
+                "sender_role": str(row["sender_role"]),
+                "sender_epoch": int(row["sender_epoch"]),
+                "recipient_task_id": str(row["recipient_task_id"]),
+                "recipient_role": str(row["recipient_role"]),
+                "recipient_epoch": int(row["recipient_epoch"]),
+                "coordinator_task_id": str(row["coordinator_task_id"]),
+                "coordinator_epoch": int(row["coordinator_epoch"]),
+                "correlation_id": str(row["correlation_id"]),
+                "assignment_token_hash": str(row["assignment_token_hash"]),
+                "dispatch_context_hash": str(row["dispatch_context_hash"]),
+                "route_provenance_hash": str(row["route_provenance_hash"]),
+                "correlation_fence_hash": str(row["correlation_fence_hash"]),
+                "issued_at": str(row["issued_at"]),
+                "expires_at": str(row["expires_at"]),
+            }
+            if any(payload.get(key) != value for key, value in bindings.items()):
+                raise ValueError("role envelope bindings are corrupt")
+            contracts = tuple(str(item) for item in payload["contract_hashes"])
+            index_evidence = tuple(str(item) for item in payload["index_evidence_hashes"])
+            evidence = tuple(str(item) for item in payload["evidence_hashes"])
+            dependencies = tuple(str(item) for item in payload["dependency_hashes"])
+            risks = self._role_risk_items(tuple(payload["risk_items"]))
+            if (
+                tuple(payload["contract_hashes"]) != contracts
+                or tuple(payload["index_evidence_hashes"]) != index_evidence
+                or tuple(payload["evidence_hashes"]) != evidence
+                or tuple(payload["dependency_hashes"]) != dependencies
+            ):
+                raise ValueError("role references are corrupt")
+            return RoleEnvelope(
+                str(row["delivery_id"]),
+                int(row["sequence"]),
+                direction,
+                str(row["workflow_id"]),
+                str(row["sender_task_id"]),
+                str(row["sender_role"]),
+                int(row["sender_epoch"]),
+                str(row["recipient_task_id"]),
+                str(row["recipient_role"]),
+                int(row["recipient_epoch"]),
+                str(row["correlation_id"]),
+                str(row["assignment_token_hash"]),
+                str(row["dispatch_context_hash"]),
+                str(row["route_provenance_hash"]),
+                str(row["coordinator_task_id"]),
+                int(row["coordinator_epoch"]),
+                str(row["correlation_fence_hash"]),
+                str(payload["task_card_hash"]),
+                contracts,
+                index_evidence,
+                str(payload["terminal_result_hash"]),
+                evidence,
+                dependencies,
+                str(payload["recipient_capability_hash"]),
+                risks,
+                str(row["issued_at"]),
+                str(row["expires_at"]),
+                str(row["delivery_state"]),
+                None if row["acknowledged_at"] is None else str(row["acknowledged_at"]),
+                str(row["envelope_hash"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RoleEnvelopeInvalidError("durable role envelope is corrupt") from error
+
+    def _host_operation_receipt_from_row(
+        self, row: sqlite3.Row
+    ) -> HostOperationReceipt:
+        try:
+            payload = {
+                "schema_version": self._HOST_ARCHIVE_RECEIPT_SCHEMA_VERSION,
+                "workflow_id": str(row["workflow_id"]),
+                "task_id": str(row["task_id"]),
+                "operation": str(row["operation"]),
+                "operation_id": str(row["operation_id"]),
+                "lease_epoch": int(row["lease_epoch"]),
+                "assignment_token_hash": str(row["assignment_token_hash"]),
+                "dispatch_context_hash": str(row["dispatch_context_hash"]),
+                "route_provenance_hash": str(row["route_provenance_hash"]),
+                "coordinator_task_id": str(row["coordinator_task_id"]),
+                "coordinator_epoch": int(row["coordinator_epoch"]),
+                "errno": int(row["errno"]),
+                "status_code": str(row["status_code"]),
+                "outcome": str(row["outcome"]),
+            }
+            if _payload_hash(_canonical_payload_json(payload)) != str(row["receipt_hash"]):
+                raise ValueError("host operation receipt hash is corrupt")
+            return HostOperationReceipt(
+                str(row["operation_id"]),
+                str(row["workflow_id"]),
+                str(row["task_id"]),
+                str(row["operation"]),
+                int(row["lease_epoch"]),
+                str(row["assignment_token_hash"]),
+                str(row["dispatch_context_hash"]),
+                str(row["route_provenance_hash"]),
+                str(row["coordinator_task_id"]),
+                int(row["coordinator_epoch"]),
+                int(row["errno"]),
+                str(row["status_code"]),
+                str(row["outcome"]),
+                str(row["receipt_hash"]),
+                str(row["reported_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise HostOperationConflictError("durable host operation receipt is corrupt") from error
 
     @staticmethod
     def _last_lease_epoch(cursor: sqlite3.Cursor, task_id: str) -> int:

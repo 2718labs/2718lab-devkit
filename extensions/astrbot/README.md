@@ -5,7 +5,7 @@ checking AstrBot plugins. Its runtime uses only the Python standard library.
 Importing `devkit_astrbot` does not import AstrBot, start a plugin, discover an
 AstrBot data directory, or access a network service.
 
-Current release: `1.0.0-rc2`.
+Current release: `1.0.0-rc4`.
 
 The shipped templates are inert text. They are written only after an explicit
 `scaffold` command to a caller-selected directory.

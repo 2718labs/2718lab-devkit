@@ -30,8 +30,16 @@ GATE_EVIDENCE_SCHEMA: Final = "2718lab-devkit/gate-evidence-identity-v1"
 POLICY_SCHEMA: Final = "2718lab-devkit/fastlane-routing-policy-v3"
 RESULT_SCHEMA: Final = "2718lab-devkit/fastlane-routing-result-v3"
 FINGERPRINT_SCHEMA: Final = "2718lab-devkit/task-route-fingerprint-v1"
+REQUEST_SCHEMA_V4: Final = "2718lab-devkit/fastlane-routing-request-v4"
+TASK_SCHEMA_V4: Final = "2718lab-devkit/task-routing-profile-v4"
+POLICY_SCHEMA_V4: Final = "2718lab-devkit/fastlane-routing-policy-v4"
+RESULT_SCHEMA_V4: Final = "2718lab-devkit/fastlane-routing-result-v4"
+FINGERPRINT_SCHEMA_V4: Final = "2718lab-devkit/task-route-fingerprint-v4"
 POLICY_PATH: Final = (
     Path(__file__).resolve().parents[1] / "assets" / "fastlane-routing-policy-v3.json"
+)
+POLICY_PATH_V4: Final = (
+    Path(__file__).resolve().parents[1] / "assets" / "fastlane-routing-policy-v4.json"
 )
 
 MAX_31: Final = (2**31) - 1
@@ -636,6 +644,150 @@ def policy_hash(policy: Mapping[str, Any]) -> str:
     return _hash_json(policy)
 
 
+def _v4_as_v3_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
+    converted = {
+        key: value for key, value in policy.items() if key != "spark_alternate"
+    }
+    converted["schema"] = POLICY_SCHEMA
+    converted["version"] = 3
+    return converted
+
+
+def _validate_policy_v4(policy: object) -> dict[str, Any]:
+    value = _policy_mapping(policy, "policy")
+    expected = frozenset(
+        {
+            "schema",
+            "version",
+            "registry",
+            "spark",
+            "spark_alternate",
+            "score_bands",
+            "score",
+            "role_floors",
+            "risk_floors",
+            "limits",
+            "reason_codes",
+        }
+    )
+    _exact_keys(value, expected, "policy")
+    if value.get("schema") != POLICY_SCHEMA_V4 or value.get("version") != 4:
+        raise RoutingError("invalid_schema", "policy schema/version is invalid")
+    _validate_policy(_v4_as_v3_policy(value))
+
+    alternate = _mapping(value["spark_alternate"], "policy spark alternate")
+    _exact_keys(
+        alternate,
+        frozenset(
+            {
+                "lane",
+                "model",
+                "required_entitlement",
+                "maximum_write_scope_count",
+                "required_write_scope_breadth",
+                "allowed_verification_costs",
+                "required_local_slot_count",
+                "allowed_efforts",
+                "effort_bands",
+            }
+        ),
+        "policy spark alternate",
+    )
+    if (
+        alternate["lane"] != "spark"
+        or alternate["model"] != "gpt-5.3-codex-spark"
+        or alternate["required_entitlement"] != "spark_preview"
+        or alternate["maximum_write_scope_count"] != 1
+        or alternate["required_write_scope_breadth"] != "single_file"
+        or alternate["required_local_slot_count"] != 1
+    ):
+        raise RoutingError("invalid_schema", "policy spark alternate is invalid")
+    verification_costs = _normalise_list(
+        alternate["allowed_verification_costs"],
+        "policy spark alternate verification costs",
+        _string,
+        2,
+    )
+    if set(verification_costs) != {"none", "focused"}:
+        raise RoutingError(
+            "invalid_schema", "policy spark alternate verification costs are invalid"
+        )
+    allowed_efforts = _normalise_list(
+        alternate["allowed_efforts"],
+        "policy spark alternate efforts",
+        _string,
+        4,
+    )
+    if set(allowed_efforts) != {"low", "medium", "high", "xhigh"}:
+        raise RoutingError("invalid_schema", "policy spark alternate efforts are invalid")
+    raw_bands = alternate["effort_bands"]
+    if type(raw_bands) is not list or len(raw_bands) != 4:
+        raise RoutingError("invalid_bounds", "policy spark alternate effort bands are invalid")
+    expected_minimum = 0
+    for index, raw_band in enumerate(raw_bands):
+        band = _mapping(raw_band, f"policy spark alternate effort band[{index}]")
+        _exact_keys(
+            band,
+            frozenset({"minimum", "maximum", "effort"}),
+            "policy spark alternate effort band",
+        )
+        minimum = _integer(
+            band["minimum"], "policy spark alternate band minimum", 0, 80
+        )
+        maximum = _integer(
+            band["maximum"], "policy spark alternate band maximum", 0, 80
+        )
+        effort = _enum(
+            band["effort"], frozenset(allowed_efforts), "policy spark alternate band"
+        )
+        if minimum != expected_minimum or maximum < minimum:
+            raise RoutingError(
+                "invalid_schema", "policy spark alternate effort band order is invalid"
+            )
+        if effort != ("low", "medium", "high", "xhigh")[index]:
+            raise RoutingError(
+                "invalid_schema", "policy spark alternate effort progression is invalid"
+            )
+        expected_minimum = maximum + 1
+    if expected_minimum != 81:
+        raise RoutingError(
+            "invalid_schema", "policy spark alternate effort bands do not cover 0..80"
+        )
+    required_reasons = {
+        "spark_alternate_eligible",
+        "spark_alternate_capability_unavailable",
+        "spark_alternate_slot_unavailable",
+        "spark_alternate_scope_not_bounded",
+        "spark_alternate_verification_unbounded",
+        "spark_alternate_high_risk",
+        "spark_alternate_sol_floor",
+        "spark_alternate_baseline_unavailable",
+    }
+    if not required_reasons.issubset(value["reason_codes"]):
+        raise RoutingError(
+            "invalid_schema", "policy spark alternate reason registry is incomplete"
+        )
+    return dict(value)
+
+
+def load_policy_v4(path: Path | None = None) -> dict[str, Any]:
+    """Load the closed v4 alternate-routing policy without dispatching work."""
+
+    policy_path = path or POLICY_PATH_V4
+    try:
+        raw = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RoutingError("invalid_schema", "policy asset cannot be parsed") from error
+    return _validate_policy_v4(raw)
+
+
+def policy_hash_v4(policy: Mapping[str, Any]) -> str:
+    """Return the v4 alternate-policy hash after strict validation."""
+
+    _validate_policy_v4(policy)
+    return _hash_json(policy)
+
+
 def _pair_by_rank(policy: Mapping[str, Any], rank: int) -> dict[str, Any]:
     for raw_pair in policy["registry"]:
         pair = _mapping(raw_pair, "policy pair")
@@ -1107,6 +1259,106 @@ def _normalise_request(value: object, policy: Mapping[str, Any]) -> dict[str, An
     }
 
 
+def _v4_host_for_v3(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    host = dict(value)
+    raw_models = host.get("models")
+    if not isinstance(raw_models, list):
+        return host
+    models: list[object] = []
+    for raw_model in raw_models:
+        if not isinstance(raw_model, Mapping):
+            models.append(raw_model)
+            continue
+        model = dict(raw_model)
+        if model.get("model_id") == "gpt-5.3-codex-spark":
+            raw_efforts = model.get("efforts")
+            if isinstance(raw_efforts, list):
+                model["efforts"] = ["medium"] if "medium" in raw_efforts else []
+        models.append(model)
+    host["models"] = models
+    return host
+
+
+def _normalise_host_v4(value: object, policy: Mapping[str, Any]) -> dict[str, Any]:
+    v3_policy = _v4_as_v3_policy(policy)
+    normalised = _normalise_host(_v4_host_for_v3(value), v3_policy)
+    host = _mapping(value, "host_capabilities")
+    raw_models = host["models"]
+    if not isinstance(raw_models, list):
+        raise RoutingError("invalid_bounds", "host models are out of bounds")
+    alternate = _mapping(policy["spark_alternate"], "policy spark alternate")
+    allowed_efforts = frozenset(alternate["allowed_efforts"])
+    actual_spark_efforts: list[str] | None = None
+    for index, raw_model in enumerate(raw_models):
+        model = _mapping(raw_model, f"host.models[{index}]")
+        if model.get("model_id") != "gpt-5.3-codex-spark":
+            continue
+        efforts = _normalise_list(
+            model.get("efforts"), "host Spark model efforts", _string, 4
+        )
+        if any(effort not in allowed_efforts for effort in efforts):
+            raise RoutingError(
+                "unknown_model_effort", "host reports an unregistered Spark effort"
+            )
+        actual_spark_efforts = efforts
+    if actual_spark_efforts is None:
+        return normalised
+    models: list[dict[str, Any]] = []
+    for raw_model in normalised["models"]:
+        model = dict(_mapping(raw_model, "host model"))
+        if model["model_id"] == "gpt-5.3-codex-spark":
+            model["efforts"] = actual_spark_efforts
+        models.append(model)
+    return {**normalised, "models": models}
+
+
+def _v4_request_as_v3(
+    request: Mapping[str, Any], v3_policy: Mapping[str, Any]
+) -> dict[str, Any]:
+    converted = dict(request)
+    converted["schema"] = REQUEST_SCHEMA
+    converted["policy_hash"] = policy_hash(v3_policy)
+    task = request.get("task")
+    if isinstance(task, Mapping):
+        converted_task = dict(task)
+        converted_task["schema"] = TASK_SCHEMA
+        converted["task"] = converted_task
+    converted["host_capabilities"] = _v4_host_for_v3(
+        request.get("host_capabilities")
+    )
+    return converted
+
+
+def _normalise_request_v4(value: object, policy: Mapping[str, Any]) -> dict[str, Any]:
+    request = _mapping(value, "request")
+    _exact_keys(request, REQUEST_FIELDS, "request")
+    if request["schema"] != REQUEST_SCHEMA_V4:
+        raise RoutingError("invalid_schema", "request schema is invalid")
+    request_bytes = len(_canonical_json(request).encode("utf-8"))
+    maximum_request_bytes = _mapping(policy["limits"], "policy limits")[
+        "maximum_request_bytes"
+    ]
+    if request_bytes > maximum_request_bytes:
+        raise RoutingError("invalid_bounds", "request exceeds the 32 KiB bound")
+    if _hash(request["policy_hash"], "request.policy_hash") != policy_hash_v4(policy):
+        raise RoutingError("invalid_policy_hash", "request binds a different policy")
+    v3_policy = _v4_as_v3_policy(policy)
+    parsed = _normalise_request(_v4_request_as_v3(request, v3_policy), v3_policy)
+    task = dict(_mapping(parsed["task"], "task"))
+    task["schema"] = TASK_SCHEMA_V4
+    return {
+        **parsed,
+        "schema": REQUEST_SCHEMA_V4,
+        "policy_hash": request["policy_hash"],
+        "task": task,
+        "host_capabilities": _normalise_host_v4(
+            request["host_capabilities"], policy
+        ),
+    }
+
+
 def task_fingerprint(request: Mapping[str, Any]) -> str:
     """Hash the normalized v3 identity, deliberately excluding legacy labels."""
 
@@ -1117,6 +1369,32 @@ def task_fingerprint(request: Mapping[str, Any]) -> str:
     return _hash_json(
         {
             "schema": FINGERPRINT_SCHEMA,
+            "policy_hash": request["policy_hash"],
+            "task": request["task"],
+            "dependency_state_hash": dependency["dependency_state_hash"],
+            "owned_scope_state_hash": scope["owned_scope_hash"],
+            "host_capability_hash": _hash_json(host),
+            "epochs": {
+                "graph_epoch": dependency["graph_epoch"],
+                "scope_epoch": scope["scope_epoch"],
+                "capability_epoch": host["capability_epoch"],
+                "route_epoch": scheduler["route_epoch"],
+                "override_epoch": scheduler["override_epoch"],
+                "recovery_epoch": scheduler["recovery_epoch"],
+                "lease_epoch": scheduler["lease_epoch"],
+            },
+        }
+    )
+
+
+def _task_fingerprint_v4(request: Mapping[str, Any]) -> str:
+    dependency = _mapping(request["dependency_state"], "dependency_state")
+    scope = _mapping(request["scope_state"], "scope_state")
+    scheduler = _mapping(request["scheduler_facts"], "scheduler_facts")
+    host = _mapping(request["host_capabilities"], "host_capabilities")
+    return _hash_json(
+        {
+            "schema": FINGERPRINT_SCHEMA_V4,
             "policy_hash": request["policy_hash"],
             "task": request["task"],
             "dependency_state_hash": dependency["dependency_state_hash"],
@@ -1765,6 +2043,249 @@ def route(
         return _terminal_result(request, status="rejected", reason=error.code)
     except (KeyError, TypeError, ValueError):
         return _terminal_result(request, status="rejected", reason="invalid_schema")
+
+
+def _spark_alternate_pair(
+    policy: Mapping[str, Any], score: int, floor_rank: int
+) -> dict[str, str]:
+    alternate = _mapping(policy["spark_alternate"], "policy spark alternate")
+    envelope = max(score, floor_rank)
+    for raw_band in alternate["effort_bands"]:
+        band = _mapping(raw_band, "policy spark alternate effort band")
+        if int(band["minimum"]) <= envelope <= int(band["maximum"]):
+            return {
+                "lane": str(alternate["lane"]),
+                "model": str(alternate["model"]),
+                "effort": str(band["effort"]),
+            }
+    raise RoutingError(
+        "invalid_schema", "policy spark alternate has no effort for the envelope"
+    )
+
+
+def _spark_alternate_reason(
+    request: Mapping[str, Any],
+    *,
+    effective_role: str,
+    effective_access: str,
+    score: int,
+    floor_rank: int,
+    policy: Mapping[str, Any],
+) -> str | None:
+    task = _mapping(request["task"], "task")
+    host = _mapping(request["host_capabilities"], "host_capabilities")
+    alternate = _mapping(policy["spark_alternate"], "policy spark alternate")
+    if floor_rank > 80:
+        return "spark_alternate_sol_floor"
+    if any(
+        bool(task[field])
+        for field in (
+            "cross_module",
+            "database_work",
+            "migration",
+            "security_sensitive",
+            "destructive",
+            "external_boundary",
+            "architecture_conflict",
+            "design_ambiguity",
+        )
+    ):
+        return "spark_alternate_high_risk"
+    if effective_role != "execution" or effective_access != "workspace_write":
+        return "spark_alternate_scope_not_bounded"
+    if (
+        not task["narrow_decoupling_eligible"]
+        or not 1
+        <= int(task["write_scope_count"])
+        <= int(alternate["maximum_write_scope_count"])
+        or task["write_scope_breadth"]
+        != alternate["required_write_scope_breadth"]
+    ):
+        return "spark_alternate_scope_not_bounded"
+    if task["verification_cost"] not in alternate["allowed_verification_costs"]:
+        return "spark_alternate_verification_unbounded"
+    if host["model_slot_limits"]["spark"] != alternate["required_local_slot_count"]:
+        return "spark_alternate_slot_unavailable"
+    pair = _spark_alternate_pair(policy, score, floor_rank)
+    if (
+        alternate["required_entitlement"] not in host["entitlements"]
+        or not _host_reports_exact(host, pair)
+    ):
+        return "spark_alternate_capability_unavailable"
+    return None
+
+
+def _spark_alternate_binding(
+    request: Mapping[str, Any], pair: Mapping[str, Any]
+) -> dict[str, Any]:
+    task = _mapping(request["task"], "task")
+    scheduler = _mapping(request["scheduler_facts"], "scheduler_facts")
+    scope = _mapping(request["scope_state"], "scope_state")
+    host = _mapping(request["host_capabilities"], "host_capabilities")
+    binding = {
+        "schema": "2718lab-devkit/spark-alternate-binding-v1",
+        "route": _route_view(pair),
+        "capability_hash": _hash_json(host),
+        "task_hash": _hash_json(task),
+        "lease_epoch": scheduler["lease_epoch"],
+        "context_hash": _hash_json(scheduler),
+        "scope_hash": scope["owned_scope_hash"],
+    }
+    return {**binding, "binding_hash": _hash_json(binding)}
+
+
+def _terminal_result_v4(
+    raw_request: object,
+    *,
+    status: str,
+    reason: str,
+    parsed: Mapping[str, Any] | None = None,
+    fingerprint: str | None = None,
+    score: int = 0,
+    score_components: Sequence[Mapping[str, Any]] = (),
+    safety_floor: Mapping[str, Any] | None = None,
+    effective_role: str | None = None,
+    effective_access: str | None = None,
+    capability_resolution: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = _terminal_result(
+        raw_request,
+        status=status,
+        reason=reason,
+        parsed=parsed,
+        fingerprint=fingerprint,
+        score=score,
+        score_components=score_components,
+        safety_floor=safety_floor,
+        effective_role=effective_role,
+        effective_access=effective_access,
+        capability_resolution=capability_resolution,
+    )
+    result["schema"] = RESULT_SCHEMA_V4
+    result["spark_alternate"] = None
+    result["render_hash"] = _hash_json(
+        {key: value for key, value in result.items() if key != "render_hash"}
+    )
+    return result
+
+
+def route_v4(
+    request: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any] | None = None,
+    cache: RouteCache | None = None,
+    trusted_authorization_evidence_hashes: Iterable[str] = (),
+    trusted_override_receipt_hashes: Iterable[str] = (),
+    trusted_evidence_hashes: Iterable[str] = (),
+    coordinator_endpoint_hash: str | None = None,
+    compatibility_floor: int | None = None,
+) -> dict[str, Any]:
+    """Compile a v4 Spark alternate without replacing its baseline route."""
+
+    parsed: dict[str, Any] | None = None
+    fingerprint: str | None = None
+    try:
+        active_policy = (
+            _validate_policy_v4(policy) if policy is not None else load_policy_v4()
+        )
+        parsed = _normalise_request_v4(request, active_policy)
+        fingerprint = _task_fingerprint_v4(parsed)
+        task = _mapping(parsed["task"], "task")
+        if cache is not None:
+            cached = cache.get(task["task_id"], fingerprint)
+            if cached is not None:
+                return _public_result(cached)
+
+        v3_policy = _v4_as_v3_policy(active_policy)
+        baseline = route(
+            _v4_request_as_v3(request, v3_policy),
+            policy=v3_policy,
+            trusted_authorization_evidence_hashes=trusted_authorization_evidence_hashes,
+            trusted_override_receipt_hashes=trusted_override_receipt_hashes,
+            trusted_evidence_hashes=trusted_evidence_hashes,
+            coordinator_endpoint_hash=coordinator_endpoint_hash,
+            compatibility_floor=compatibility_floor,
+        )
+        result = dict(baseline)
+        result["schema"] = RESULT_SCHEMA_V4
+        result["policy_hash"] = parsed["policy_hash"]
+        result["task_fingerprint"] = fingerprint
+        result["spark_alternate"] = None
+
+        route_value = result.get("route")
+        is_static_spark = (
+            isinstance(route_value, Mapping) and route_value.get("lane") == "spark"
+        )
+        reason_codes = result.get("reason_codes")
+        if not isinstance(reason_codes, list) or not all(
+            isinstance(code, str) for code in reason_codes
+        ):
+            raise RoutingError("invalid_schema", "baseline reason codes are invalid")
+        if is_static_spark:
+            result["reason_codes"] = reason_codes
+        elif result.get("status") != "resolved" or not isinstance(route_value, Mapping):
+            result["reason_codes"] = [
+                *[code for code in reason_codes if not code.startswith("spark_")],
+                "spark_alternate_baseline_unavailable",
+            ]
+        else:
+            safety_floor = _mapping(result.get("safety_floor"), "safety_floor")
+            score = result.get("score")
+            if type(score) is not int:
+                raise RoutingError("invalid_schema", "baseline score is invalid")
+            alternate_reason = _spark_alternate_reason(
+                parsed,
+                effective_role=str(result.get("effective_role")),
+                effective_access=str(result.get("access")),
+                score=score,
+                floor_rank=int(safety_floor["rank"]),
+                policy=active_policy,
+            )
+            result["reason_codes"] = [
+                code for code in reason_codes if not code.startswith("spark_")
+            ]
+            if alternate_reason is None:
+                pair = _spark_alternate_pair(
+                    active_policy, score, int(safety_floor["rank"])
+                )
+                result["spark_alternate"] = {
+                    "route": _route_view(pair),
+                    "binding": _spark_alternate_binding(parsed, pair),
+                }
+                result["reason_codes"].append("spark_alternate_eligible")
+            else:
+                result["reason_codes"].append(alternate_reason)
+
+        result["reason_codes"] = list(dict.fromkeys(result["reason_codes"]))
+        result["_computed_event_seq"] = _mapping(
+            parsed["scheduler_facts"], "scheduler_facts"
+        )["event_seq"]
+        result["render_hash"] = _hash_json(
+            {
+                key: value
+                for key, value in result.items()
+                if key not in {"render_hash", "_computed_event_seq"}
+            }
+        )
+        if cache is not None:
+            cache.put(result)
+        return _public_result(result)
+    except RoutingError as error:
+        return _terminal_result_v4(
+            request,
+            status="rejected",
+            reason=error.code,
+            parsed=parsed,
+            fingerprint=fingerprint,
+        )
+    except (KeyError, TypeError, ValueError):
+        return _terminal_result_v4(
+            request,
+            status="rejected",
+            reason="invalid_schema",
+            parsed=parsed,
+            fingerprint=fingerprint,
+        )
 
 
 def _utc_z(value: object, field: str) -> str:

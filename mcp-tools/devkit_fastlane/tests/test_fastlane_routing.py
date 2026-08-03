@@ -22,6 +22,13 @@ POLICY_PATH = (
     / "assets"
     / "fastlane-routing-policy-v3.json"
 )
+POLICY_V4_PATH = (
+    ROOT
+    / "mcp-tools"
+    / "devkit_fastlane"
+    / "assets"
+    / "fastlane-routing-policy-v4.json"
+)
 HASH_A = "sha256:" + ("a" * 64)
 HASH_B = "sha256:" + ("b" * 64)
 HASH_C = "sha256:" + ("c" * 64)
@@ -48,6 +55,11 @@ def _load_core() -> Any:
 def _policy_hash() -> str:
     assert POLICY_PATH.exists(), "the v3 routing policy asset is absent"
     return _canonical_hash(json.loads(POLICY_PATH.read_text(encoding="utf-8")))
+
+
+def _policy_v4_hash() -> str:
+    assert POLICY_V4_PATH.exists(), "the v4 routing policy asset is absent"
+    return _canonical_hash(json.loads(POLICY_V4_PATH.read_text(encoding="utf-8")))
 
 
 def _request() -> dict[str, object]:
@@ -139,6 +151,16 @@ def _request() -> dict[str, object]:
     }
 
 
+def _request_v4() -> dict[str, object]:
+    request = _request()
+    request["schema"] = "2718lab-devkit/fastlane-routing-request-v4"
+    request["policy_hash"] = _policy_v4_hash()
+    task = request["task"]
+    assert isinstance(task, dict)
+    task["schema"] = "2718lab-devkit/task-routing-profile-v4"
+    return request
+
+
 def _all_capabilities() -> dict[str, object]:
     return {
         "schema": "2718lab-devkit/host-capabilities-v1",
@@ -212,6 +234,22 @@ def _spark_request() -> dict[str, object]:
                 "prior_spark_attempts": 0,
                 "evidence_hash": "sha256:" + ("e" * 64),
             },
+        }
+    )
+    return request
+
+
+def _normal_spark_alternate_request_v4() -> dict[str, object]:
+    request = _request_v4()
+    request["host_capabilities"] = _all_capabilities()
+    task = request["task"]
+    assert isinstance(task, dict)
+    task.update(
+        {
+            "write_scope_count": 1,
+            "write_scope_breadth": "single_file",
+            "verification_cost": "focused",
+            "narrow_decoupling_eligible": True,
         }
     )
     return request
@@ -597,6 +635,152 @@ def test_spark_requires_the_complete_conjunction_and_exact_entitlement() -> None
 
     assert fallback["route"]["model"] != "gpt-5.3-codex-spark"
     assert "spark_entitlement_unavailable" in fallback["reason_codes"]
+
+
+def test_v4_normal_bounded_task_exposes_an_alternate_without_replacing_baseline() -> (
+    None
+):
+    core = _load_core()
+
+    result = core.route_v4(_normal_spark_alternate_request_v4())
+
+    assert result["schema"] == "2718lab-devkit/fastlane-routing-result-v4"
+    assert result["route"] == {
+        "lane": "luna",
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+    }
+    alternate = result["spark_alternate"]
+    assert alternate["route"] == {
+        "lane": "spark",
+        "model": "gpt-5.3-codex-spark",
+        "effort": "medium",
+    }
+    binding = alternate["binding"]
+    assert set(binding) == {
+        "schema",
+        "route",
+        "capability_hash",
+        "task_hash",
+        "lease_epoch",
+        "context_hash",
+        "scope_hash",
+        "binding_hash",
+    }
+    assert not (set(binding) & {"parent_main_route_hash", "parent_admission_id"})
+    assert "spark_alternate_eligible" in result["reason_codes"]
+
+
+def test_v4_normal_alternate_fails_closed_for_capability_sol_and_high_risk() -> None:
+    core = _load_core()
+
+    unavailable = _normal_spark_alternate_request_v4()
+    unavailable["host_capabilities"] = _request()["host_capabilities"]
+    unavailable_result = core.route_v4(unavailable)
+    assert unavailable_result["route"]["lane"] == "luna"
+    assert unavailable_result["spark_alternate"] is None
+    assert "spark_alternate_capability_unavailable" in unavailable_result["reason_codes"]
+
+    sol_floor = _normal_spark_alternate_request_v4()
+    sol_task = sol_floor["task"]
+    assert isinstance(sol_task, dict)
+    sol_task["architecture_conflict"] = True
+    sol_result = core.route_v4(sol_floor)
+    assert sol_result["spark_alternate"] is None
+    assert "spark_alternate_sol_floor" in sol_result["reason_codes"]
+
+    high_risk = _normal_spark_alternate_request_v4()
+    high_risk_task = high_risk["task"]
+    assert isinstance(high_risk_task, dict)
+    high_risk_task["security_sensitive"] = True
+    high_risk_result = core.route_v4(high_risk)
+    assert high_risk_result["spark_alternate"] is None
+    assert "spark_alternate_high_risk" in high_risk_result["reason_codes"]
+
+
+def test_v4_normal_alternate_effort_tracks_its_bounded_difficulty_without_fallback() -> (
+    None
+):
+    core = _load_core()
+    request = _normal_spark_alternate_request_v4()
+    task = request["task"]
+    host = request["host_capabilities"]
+    assert isinstance(task, dict)
+    assert isinstance(host, dict)
+    task.update(
+        {
+            "critical_path": True,
+            "criticality": "high",
+            "downstream_critical_count": 6,
+        }
+    )
+    models = host["models"]
+    assert isinstance(models, list)
+    spark = models[0]
+    assert isinstance(spark, dict)
+    spark["efforts"] = ["medium", "high"]
+
+    result = core.route_v4(request)
+
+    assert result["spark_alternate"]["route"]["effort"] == "high"
+
+    no_exact_effort = deepcopy(request)
+    no_exact_host = no_exact_effort["host_capabilities"]
+    assert isinstance(no_exact_host, dict)
+    no_exact_models = no_exact_host["models"]
+    assert isinstance(no_exact_models, list)
+    no_exact_spark = no_exact_models[0]
+    assert isinstance(no_exact_spark, dict)
+    no_exact_spark["efforts"] = ["medium"]
+    no_exact_result = core.route_v4(no_exact_effort)
+    assert no_exact_result["route"]["lane"] != "spark"
+    assert no_exact_result["spark_alternate"] is None
+    assert "spark_alternate_capability_unavailable" in no_exact_result["reason_codes"]
+
+
+def test_v3_route_replay_remains_byte_exact_under_the_v4_compiler() -> None:
+    core = _load_core()
+
+    assert core.route(_request()) == {
+        "schema": "2718lab-devkit/fastlane-routing-result-v3",
+        "status": "resolved",
+        "task_id": "TASK-1",
+        "task_fingerprint": (
+            "sha256:1c55dedf60f0d6828c2f110ed5482fe16a861d0f8d8d3a4ff97dde6b0691116f"
+        ),
+        "policy_hash": (
+            "sha256:4bc7fc5239d9d2992dc84822da7ba9de4d31b98505679001738fd0b2f03b51ca"
+        ),
+        "score": 8,
+        "score_components": [{"code": "role_execution", "points": 8}],
+        "safety_floor": {
+            "rank": 20,
+            "lane": "luna",
+            "model": "gpt-5.6-luna",
+            "effort": "medium",
+        },
+        "effective_role": "execution",
+        "access": "workspace_write",
+        "route": {
+            "lane": "luna",
+            "model": "gpt-5.6-luna",
+            "effort": "medium",
+        },
+        "capability_resolution": {
+            "state": "preferred",
+            "requested": {
+                "lane": "luna",
+                "model": "gpt-5.6-luna",
+                "effort": "medium",
+            },
+            "attestation_reason": "exact_attested",
+        },
+        "reason_codes": ["floor_role", "score_luna_low", "spark_not_severe"],
+        "override_receipt_hash": None,
+        "render_hash": (
+            "sha256:6cb366998624b30017c9489e6cd4d77280d19b26f0185b5b3be0d1894238a1f6"
+        ),
+    }
 
 
 def _legacy(*, complexity: str | None, route: str | None) -> dict[str, object]:

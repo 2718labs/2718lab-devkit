@@ -399,7 +399,7 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
 
         migrated = SQLiteStore(legacy_database)
         try:
-            self.assertEqual(6, migrated.schema_version())
+            self.assertEqual(10, migrated.schema_version())
             table_names = {
                 str(row["name"])
                 for row in migrated._connection.execute(
@@ -434,7 +434,7 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM events WHERE task_id = ?", ("legacy-v5-task",)
             ).fetchone()[0]
 
-            self.assertEqual(6, migrated.schema_version())
+            self.assertEqual(10, migrated.schema_version())
             self.assertIn("workspace_id", columns)
             self.assertEqual("D:/legacy-secret-workspace", row["workspace_root"])
             self.assertEqual("", row["workspace_id"])
@@ -507,7 +507,7 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
 
         reopened = SQLiteStore(legacy_database)
         try:
-            self.assertEqual(6, reopened.schema_version())
+            self.assertEqual(10, reopened.schema_version())
             with self.assertRaises(StrictIndexError):
                 reopened.get_index_binding("legacy-v5-task")
         finally:

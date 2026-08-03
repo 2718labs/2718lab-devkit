@@ -17,18 +17,29 @@ import os
 import re
 import stat
 import struct
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final
+
+from . import host_envelopes
 
 _FRAME_SCHEMA: Final = "2718lab-devkit/host-bridge-v1"
 _QUOTA_REQUEST_SCHEMA: Final = "2718lab-devkit/host-quota-snapshot-request-v1"
 _QUOTA_RESPONSE_SCHEMA: Final = "2718lab-devkit/host-quota-snapshot-response-v1"
 _QUOTA_SNAPSHOT_SCHEMA: Final = "2718lab-devkit/host-quota-snapshot-v1"
+_CAPABILITY_PROBE_SCHEMA: Final = "2718lab-devkit/host-capability-probe-v1"
+_CAPABILITY_REPORT_SCHEMA: Final = "2718lab-devkit/host-capability-report-v1"
+_OPERATION_REQUEST_SCHEMA: Final = "2718lab-devkit/host-operation-request-v1"
+_TERMINAL_RESULT_SCHEMA: Final = "2718lab-devkit/host-terminal-result-v1"
+_PROOF_CONTINUATION_SCHEMA: Final = "2718lab-devkit/host-proof-continuation-v1"
 _FRAME_FIELDS: Final = frozenset(
     {"schema", "kind", "action_id", "session_nonce", "sequence", "payload", "mac"}
 )
 _MAX_FRAME_BYTES: Final = 65_536
+_MAX_CAPABILITY_PACKET_BYTES: Final = 8 * 1024
+_MAX_OPERATION_PACKET_BYTES: Final = 40 * 1024
+_MAX_PROOF_CONTINUATION_BYTES: Final = 2 * 1024
+_MAX_TERMINAL_OPERATION_TOMBSTONES: Final = 256
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _ENDPOINT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -45,6 +56,30 @@ _MESSAGE_KINDS: Final = frozenset(
         "proof_result",
         "quota_snapshot_request",
         "quota_snapshot",
+        "capability_probe",
+        "capability_report",
+        "operation_request",
+        "operation_result",
+        "proof_continuation",
+    }
+)
+_VALIDATED_PRIVATE_KINDS: Final = frozenset(
+    {
+        "capability_probe",
+        "capability_report",
+        "operation_request",
+        "operation_result",
+        "proof_continuation",
+    }
+)
+_BINDING_FIELDS: Final = frozenset(
+    {
+        "task_id",
+        "lease_epoch",
+        "assignment_token",
+        "dispatch_context_hash",
+        "route_hash",
+        "expires_at",
     }
 )
 
@@ -80,6 +115,26 @@ class PrivateHostMessage:
             "PrivateHostMessage("
             f"kind={self.kind!r}, action_id={self.action_id!r}, sequence={self.sequence!r})"
         )
+
+
+@dataclass(frozen=True)
+class CapabilityProbe:
+    """A hash-bound, bearer-free request for named host capabilities."""
+
+    binding: host_envelopes.EnvelopeBinding
+    capability_names: tuple[str, ...]
+    probe_hash: str
+
+
+@dataclass(frozen=True)
+class OperationReceipt:
+    """Predecessor receipt a terminal result must bind exactly."""
+
+    kind: str
+    task_id: str
+    correlation_id: str
+    envelope_hash: str
+    binding: host_envelopes.EnvelopeBinding
 
 
 @dataclass
@@ -131,6 +186,13 @@ class InheritedHandleHostBridge:
         self._next_out = 1
         self._next_in = 1
         self._deliveries: dict[str, _CapabilityDelivery] = {}
+        self._pending_capability_probes: set[str] = set()
+        self._received_capability_probes: set[str] = set()
+        self._pending_operations: dict[str, OperationReceipt] = {}
+        self._received_operations: dict[str, OperationReceipt] = {}
+        self._terminal_operation_tombstones: dict[
+            tuple[str, str, str, str, str, str], int
+        ] = {}
         self._closed = False
 
     @classmethod
@@ -378,6 +440,306 @@ class InheritedHandleHostBridge:
             self._poison()
             raise
 
+    def send_capability_probe(
+        self,
+        *,
+        binding: host_envelopes.EnvelopeBinding | Mapping[str, object],
+        capability_names: Sequence[str],
+        now: int,
+    ) -> CapabilityProbe:
+        """Request named capability identities without transmitting a bearer."""
+
+        try:
+            normalized_binding = _normalize_bridge_binding(binding, now=now)
+            normalized_names = _normalize_capability_names(capability_names)
+            payload = _capability_probe_payload(normalized_binding, normalized_names)
+            _validate_private_packet_size(payload, _MAX_CAPABILITY_PACKET_BYTES)
+            probe = CapabilityProbe(
+                binding=normalized_binding,
+                capability_names=normalized_names,
+                probe_hash=_private_payload_hash(payload),
+            )
+        except host_envelopes.HostEnvelopeError as error:
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID") from error
+        if probe.probe_hash in self._pending_capability_probes:
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+        self._send_validated_private(
+            kind="capability_probe", action_id=probe.binding.task_id, payload=payload
+        )
+        self._pending_capability_probes.add(probe.probe_hash)
+        return probe
+
+    def receive_capability_probe(
+        self,
+        *,
+        now: int,
+        expected: host_envelopes.EnvelopeBinding | Mapping[str, object] | None = None,
+    ) -> CapabilityProbe:
+        """Receive one exact, hash-bound capability probe and consume its sequence."""
+
+        expected_binding: host_envelopes.EnvelopeBinding | None = None
+        try:
+            if expected is not None:
+                expected_binding = _normalize_bridge_binding(expected, now=now)
+            message = self._receive_private()
+            probe = _parse_capability_probe(message, now=now)
+            if expected_binding is not None and probe.binding != expected_binding:
+                raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+            if probe.probe_hash in self._received_capability_probes:
+                raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+        except host_envelopes.HostEnvelopeError as error:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID") from error
+        except HostBridgeError:
+            self._poison()
+            raise
+        self._received_capability_probes.add(probe.probe_hash)
+        return probe
+
+    def send_capability_report(
+        self,
+        *,
+        probe: CapabilityProbe,
+        capability_hashes: Mapping[str, str],
+        now: int,
+    ) -> None:
+        """Return only content hashes for exactly the requested capabilities."""
+
+        try:
+            normalized_probe = _normalize_probe(probe, now=now)
+            normalized_hashes = _normalize_capability_hashes(
+                capability_hashes, normalized_probe.capability_names
+            )
+            if normalized_probe.probe_hash not in self._received_capability_probes:
+                raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+            payload = {
+                "schema": _CAPABILITY_REPORT_SCHEMA,
+                **host_envelopes.binding_mapping(normalized_probe.binding, now=now),
+                "probe_hash": normalized_probe.probe_hash,
+                "capability_hashes": normalized_hashes,
+            }
+            _validate_private_packet_size(payload, _MAX_CAPABILITY_PACKET_BYTES)
+        except host_envelopes.HostEnvelopeError as error:
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID") from error
+        self._send_validated_private(
+            kind="capability_report",
+            action_id=normalized_probe.binding.task_id,
+            payload=payload,
+        )
+        self._received_capability_probes.remove(normalized_probe.probe_hash)
+
+    def receive_capability_report(
+        self, *, probe: CapabilityProbe, now: int
+    ) -> dict[str, object]:
+        """Receive a report bound to one still-pending probe, exactly once."""
+
+        try:
+            expected_probe = _normalize_probe(probe, now=now)
+        except host_envelopes.HostEnvelopeError as error:
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID") from error
+        if expected_probe.probe_hash not in self._pending_capability_probes:
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+        try:
+            message = self._receive_private()
+            report = _parse_capability_report(message, probe=expected_probe, now=now)
+        except host_envelopes.HostEnvelopeError as error:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID") from error
+        except HostBridgeError:
+            self._poison()
+            raise
+        self._pending_capability_probes.remove(expected_probe.probe_hash)
+        return report
+
+    def send_operation(
+        self, *, envelope: Mapping[str, object], now: int
+    ) -> OperationReceipt:
+        """Send a validated assignment or peer handoff as a private operation."""
+
+        try:
+            normalized = host_envelopes.validate_envelope(envelope, now=now)
+            if normalized["kind"] not in {
+                "coordinator_assignment",
+                "peer_evidence_handoff",
+            }:
+                raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+            receipt = _operation_receipt(normalized, now=now)
+            payload = {
+                "schema": _OPERATION_REQUEST_SCHEMA,
+                "correlation_id": receipt.correlation_id,
+                "envelope": normalized,
+                "envelope_hash": receipt.envelope_hash,
+            }
+            _validate_private_packet_size(payload, _MAX_OPERATION_PACKET_BYTES)
+        except host_envelopes.HostEnvelopeError as error:
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID") from error
+        if self._operation_is_registered_or_tombstoned(receipt, now=now):
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+        self._send_validated_private(
+            kind="operation_request", action_id=receipt.task_id, payload=payload
+        )
+        self._pending_operations[receipt.envelope_hash] = receipt
+        return receipt
+
+    def receive_operation(
+        self,
+        *,
+        now: int,
+        expected: host_envelopes.EnvelopeExpectation | None = None,
+    ) -> OperationReceipt:
+        """Receive one validated operation and retain its predecessor receipt."""
+
+        try:
+            message = self._receive_private()
+            receipt = _parse_operation_request(message, now=now, expected=expected)
+            if self._operation_is_registered_or_tombstoned(receipt, now=now):
+                raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+        except host_envelopes.HostEnvelopeError as error:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID") from error
+        except HostBridgeError:
+            self._poison()
+            raise
+        self._received_operations[receipt.envelope_hash] = receipt
+        return receipt
+
+    def send_terminal_result(
+        self,
+        *,
+        envelope: Mapping[str, object],
+        predecessor: OperationReceipt,
+        now: int,
+    ) -> None:
+        """Send a terminal result tied to one consumed operation predecessor."""
+
+        try:
+            normalized = host_envelopes.validate_envelope(envelope, now=now)
+            if normalized["kind"] != "worker_terminal_result":
+                raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+            normalized_predecessor = _normalize_operation_receipt(predecessor, now=now)
+            if normalized_predecessor.kind != "coordinator_assignment":
+                raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+            _assert_terminal_predecessor(
+                normalized, normalized_predecessor, now=now
+            )
+            registered_predecessor = self._received_operations.get(
+                normalized_predecessor.envelope_hash
+            )
+            if registered_predecessor != normalized_predecessor:
+                raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+            self._ensure_terminal_operation_tombstone_capacity(
+                normalized_predecessor, now=now
+            )
+            payload = {
+                "schema": _TERMINAL_RESULT_SCHEMA,
+                "correlation_id": normalized_predecessor.correlation_id,
+                "envelope": normalized,
+                "envelope_hash": host_envelopes.envelope_hash(normalized, now=now),
+            }
+            _validate_private_packet_size(payload, _MAX_OPERATION_PACKET_BYTES)
+        except host_envelopes.HostEnvelopeError as error:
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID") from error
+        self._send_validated_private(
+            kind="operation_result",
+            action_id=normalized_predecessor.task_id,
+            payload=payload,
+        )
+        self._remember_terminal_operation(normalized_predecessor, now=now)
+        del self._received_operations[normalized_predecessor.envelope_hash]
+
+    def receive_terminal_result(
+        self,
+        *,
+        predecessor: OperationReceipt,
+        now: int,
+        expected: host_envelopes.EnvelopeExpectation | None = None,
+    ) -> dict[str, object]:
+        """Receive an exact terminal result tied to one pending operation."""
+
+        normalized_predecessor = _normalize_operation_receipt(predecessor, now=now)
+        if normalized_predecessor.kind != "coordinator_assignment":
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+        registered_predecessor = self._pending_operations.get(
+            normalized_predecessor.envelope_hash
+        )
+        if registered_predecessor != normalized_predecessor:
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+        self._ensure_terminal_operation_tombstone_capacity(
+            normalized_predecessor, now=now
+        )
+        try:
+            message = self._receive_private()
+            envelope = _parse_terminal_result(
+                message,
+                predecessor=normalized_predecessor,
+                now=now,
+                expected=expected,
+            )
+        except host_envelopes.HostEnvelopeError as error:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID") from error
+        except HostBridgeError:
+            self._poison()
+            raise
+        self._remember_terminal_operation(normalized_predecessor, now=now)
+        del self._pending_operations[normalized_predecessor.envelope_hash]
+        return envelope
+
+    def send_proof_continuation(
+        self,
+        *,
+        proof_id: str,
+        continuation_id: str,
+        previous_digest: str,
+        reference: str,
+    ) -> None:
+        """Send an opaque, hash-bound proof continuation instead of proof bytes."""
+
+        _validate_proof_id(proof_id)
+        _validate_action_id(continuation_id)
+        _validate_proof_id(previous_digest)
+        _validate_proof_id(reference)
+        unsigned = {
+            "schema": _PROOF_CONTINUATION_SCHEMA,
+            "proof_id": proof_id,
+            "continuation_id": continuation_id,
+            "previous_digest": previous_digest,
+            "reference": reference,
+        }
+        payload = {
+            **unsigned,
+            "continuation_hash": _private_payload_hash(unsigned),
+        }
+        _validate_private_packet_size(payload, _MAX_PROOF_CONTINUATION_BYTES)
+        self._send_validated_private(
+            kind="proof_continuation", action_id="proof", payload=payload
+        )
+
+    def receive_proof_continuation(
+        self,
+        *,
+        proof_id: str,
+        continuation_id: str,
+        previous_digest: str,
+    ) -> dict[str, str]:
+        """Receive only the expected opaque reference and its chained digest."""
+
+        _validate_proof_id(proof_id)
+        _validate_action_id(continuation_id)
+        _validate_proof_id(previous_digest)
+        try:
+            message = self._receive_private()
+            continuation = _parse_proof_continuation(
+                message,
+                proof_id=proof_id,
+                continuation_id=continuation_id,
+                previous_digest=previous_digest,
+            )
+        except HostBridgeError:
+            self._poison()
+            raise
+        return continuation
+
     def register_proof(self, proof_id: str, proof: Mapping[str, object]) -> None:
         """Forward a full integration proof only over the private bridge."""
 
@@ -405,6 +767,22 @@ class InheritedHandleHostBridge:
     ) -> None:
         """Write one canonical authenticated frame to the inherited handle."""
 
+        if kind in _VALIDATED_PRIVATE_KINDS:
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        self._send_private(kind=kind, action_id=action_id, payload=payload)
+
+    def _send_validated_private(
+        self, *, kind: str, action_id: str, payload: Mapping[str, object]
+    ) -> None:
+        """Write a packet only after its typed private validator has succeeded."""
+
+        if kind not in _VALIDATED_PRIVATE_KINDS:
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        self._send_private(kind=kind, action_id=action_id, payload=payload)
+
+    def _send_private(
+        self, *, kind: str, action_id: str, payload: Mapping[str, object]
+    ) -> None:
         if kind not in _MESSAGE_KINDS or kind == "session_open":
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
         _validate_action_id(action_id)
@@ -433,7 +811,16 @@ class InheritedHandleHostBridge:
         self._next_out += 1
 
     def receive(self) -> PrivateHostMessage:
-        """Read and validate exactly one authenticated private frame."""
+        """Read only legacy private messages; typed packets need typed receivers."""
+
+        message = self._receive_private()
+        if message.kind in _VALIDATED_PRIVATE_KINDS:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
+        return message
+
+    def _receive_private(self) -> PrivateHostMessage:
+        """Read one framed message for a typed private validator."""
 
         self._ensure_open()
         try:
@@ -565,9 +952,443 @@ class InheritedHandleHostBridge:
 
         self.close()
 
+    def _operation_is_registered_or_tombstoned(
+        self, receipt: OperationReceipt, *, now: int
+    ) -> bool:
+        """Reject duplicate or rebound operations without retaining envelope content."""
+
+        self._prune_terminal_operation_tombstones(now=now)
+        identity = _operation_replay_identity(receipt)
+        return (
+            any(
+                _operation_replay_identity(existing) == identity
+                for existing in self._pending_operations.values()
+            )
+            or any(
+                _operation_replay_identity(existing) == identity
+                for existing in self._received_operations.values()
+            )
+            or any(
+                _operation_replay_identity_from_key(key) == identity
+                for key in self._terminal_operation_tombstones
+            )
+        )
+
+    def _ensure_terminal_operation_tombstone_capacity(
+        self, receipt: OperationReceipt, *, now: int
+    ) -> None:
+        self._prune_terminal_operation_tombstones(now=now)
+        key = _operation_replay_key(receipt)
+        if (
+            key in self._terminal_operation_tombstones
+            or len(self._terminal_operation_tombstones)
+            >= _MAX_TERMINAL_OPERATION_TOMBSTONES
+        ):
+            raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+
+    def _remember_terminal_operation(
+        self, receipt: OperationReceipt, *, now: int
+    ) -> None:
+        self._ensure_terminal_operation_tombstone_capacity(receipt, now=now)
+        self._terminal_operation_tombstones[_operation_replay_key(receipt)] = (
+            receipt.binding.expires_at
+        )
+
+    def _prune_terminal_operation_tombstones(self, *, now: int) -> None:
+        expired = [
+            key
+            for key, expires_at in self._terminal_operation_tombstones.items()
+            if expires_at <= now
+        ]
+        for key in expired:
+            del self._terminal_operation_tombstones[key]
+
     def _ensure_open(self) -> None:
         if self._closed or self._read_fd < 0 or self._write_fd < 0:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+
+
+def _normalize_bridge_binding(
+    value: host_envelopes.EnvelopeBinding | Mapping[str, object], *, now: int
+) -> host_envelopes.EnvelopeBinding:
+    if type(value) is host_envelopes.EnvelopeBinding:
+        host_envelopes.binding_mapping(value, now=now)
+        return value
+    if type(value) is dict:
+        return host_envelopes.validate_binding_mapping(value, now=now)
+    raise host_envelopes.HostEnvelopeError("HOST_ENVELOPE_INVALID")
+
+
+def _normalize_capability_names(value: object) -> tuple[str, ...]:
+    if type(value) is not list and type(value) is not tuple:
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    if not value or len(value) > 16:
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    normalized: list[str] = []
+    for name in value:
+        if type(name) is not str or _IDENTIFIER.fullmatch(name) is None:
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+        normalized.append(name)
+    if len(set(normalized)) != len(normalized):
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    return tuple(sorted(normalized))
+
+
+def _normalize_capability_hashes(
+    value: object, capability_names: tuple[str, ...]
+) -> dict[str, str]:
+    if type(value) is not dict or set(value) != set(capability_names):
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    normalized: dict[str, str] = {}
+    for name in capability_names:
+        capability_hash = value.get(name)
+        if type(capability_hash) is not str or _DIGEST.fullmatch(capability_hash) is None:
+            raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+        normalized[name] = capability_hash
+    return dict(sorted(normalized.items()))
+
+
+def _capability_probe_payload(
+    binding: host_envelopes.EnvelopeBinding, capability_names: tuple[str, ...]
+) -> dict[str, object]:
+    return {
+        "schema": _CAPABILITY_PROBE_SCHEMA,
+        "task_id": binding.task_id,
+        "lease_epoch": binding.lease_epoch,
+        "assignment_token": binding.assignment_token,
+        "dispatch_context_hash": binding.dispatch_context_hash,
+        "route_hash": binding.route_hash,
+        "expires_at": binding.expires_at,
+        "capability_names": list(capability_names),
+    }
+
+
+def _normalize_probe(probe: CapabilityProbe, *, now: int) -> CapabilityProbe:
+    if type(probe) is not CapabilityProbe:
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    binding = _normalize_bridge_binding(probe.binding, now=now)
+    capability_names = _normalize_capability_names(probe.capability_names)
+    payload = _capability_probe_payload(binding, capability_names)
+    expected_hash = _private_payload_hash(payload)
+    if (
+        type(probe.probe_hash) is not str
+        or _DIGEST.fullmatch(probe.probe_hash) is None
+        or not hmac.compare_digest(probe.probe_hash, expected_hash)
+    ):
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    return CapabilityProbe(
+        binding=binding,
+        capability_names=capability_names,
+        probe_hash=expected_hash,
+    )
+
+
+def _parse_capability_probe(
+    message: PrivateHostMessage, *, now: int
+) -> CapabilityProbe:
+    payload = message.payload
+    if (
+        message.kind != "capability_probe"
+        or set(payload)
+        != {
+            "schema",
+            "task_id",
+            "lease_epoch",
+            "assignment_token",
+            "dispatch_context_hash",
+            "route_hash",
+            "expires_at",
+            "capability_names",
+        }
+        or payload.get("schema") != _CAPABILITY_PROBE_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    binding = host_envelopes.validate_binding_mapping(
+        {field: payload[field] for field in _BINDING_FIELDS}, now=now
+    )
+    capability_names = _normalize_capability_names(payload["capability_names"])
+    normalized_payload = _capability_probe_payload(binding, capability_names)
+    if message.action_id != binding.task_id or payload != normalized_payload:
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    _validate_private_packet_size(payload, _MAX_CAPABILITY_PACKET_BYTES)
+    return CapabilityProbe(
+        binding=binding,
+        capability_names=capability_names,
+        probe_hash=_private_payload_hash(normalized_payload),
+    )
+
+
+def _parse_capability_report(
+    message: PrivateHostMessage, *, probe: CapabilityProbe, now: int
+) -> dict[str, object]:
+    payload = message.payload
+    if (
+        message.kind != "capability_report"
+        or set(payload)
+        != {
+            "schema",
+            "task_id",
+            "lease_epoch",
+            "assignment_token",
+            "dispatch_context_hash",
+            "route_hash",
+            "expires_at",
+            "probe_hash",
+            "capability_hashes",
+        }
+        or payload.get("schema") != _CAPABILITY_REPORT_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    binding = host_envelopes.validate_binding_mapping(
+        {field: payload[field] for field in _BINDING_FIELDS}, now=now
+    )
+    capability_hashes = _normalize_capability_hashes(
+        payload["capability_hashes"], probe.capability_names
+    )
+    normalized = {
+        "schema": _CAPABILITY_REPORT_SCHEMA,
+        **host_envelopes.binding_mapping(binding, now=now),
+        "probe_hash": probe.probe_hash,
+        "capability_hashes": capability_hashes,
+    }
+    if (
+        message.action_id != probe.binding.task_id
+        or binding != probe.binding
+        or type(payload["probe_hash"]) is not str
+        or not hmac.compare_digest(payload["probe_hash"], probe.probe_hash)
+        or payload != normalized
+    ):
+        raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
+    _validate_private_packet_size(payload, _MAX_CAPABILITY_PACKET_BYTES)
+    return normalized
+
+
+def _operation_receipt(
+    envelope: Mapping[str, object], *, now: int
+) -> OperationReceipt:
+    normalized = host_envelopes.validate_envelope(envelope, now=now)
+    payload = normalized["payload"]
+    assert type(payload) is dict
+    correlation_id = payload["correlation_id"]
+    kind = normalized["kind"]
+    task_id = normalized["task_id"]
+    assert type(correlation_id) is str
+    assert type(kind) is str
+    assert type(task_id) is str
+    binding = host_envelopes.validate_binding_mapping(
+        {field: normalized[field] for field in _BINDING_FIELDS}, now=now
+    )
+    return OperationReceipt(
+        kind=kind,
+        task_id=task_id,
+        correlation_id=correlation_id,
+        envelope_hash=host_envelopes.envelope_hash(normalized, now=now),
+        binding=binding,
+    )
+
+
+def _operation_replay_key(
+    receipt: OperationReceipt,
+) -> tuple[str, str, str, str, str, str]:
+    """Retain only opaque operation, assignment, context, and envelope identities."""
+
+    return (
+        receipt.kind,
+        receipt.task_id,
+        receipt.correlation_id,
+        receipt.binding.assignment_token,
+        receipt.binding.dispatch_context_hash,
+        receipt.envelope_hash,
+    )
+
+
+def _operation_replay_identity(
+    receipt: OperationReceipt,
+) -> tuple[str, str, str, str, str]:
+    key = _operation_replay_key(receipt)
+    return key[:-1]
+
+
+def _operation_replay_identity_from_key(
+    key: tuple[str, str, str, str, str, str],
+) -> tuple[str, str, str, str, str]:
+    return key[:-1]
+
+
+def _normalize_operation_receipt(value: OperationReceipt, *, now: int) -> OperationReceipt:
+    if type(value) is not OperationReceipt:
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    if value.kind not in {"coordinator_assignment", "peer_evidence_handoff"}:
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    _validate_action_id(value.task_id)
+    _validate_action_id(value.correlation_id)
+    if type(value.envelope_hash) is not str or _DIGEST.fullmatch(value.envelope_hash) is None:
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    try:
+        binding = _normalize_bridge_binding(value.binding, now=now)
+    except host_envelopes.HostEnvelopeError as error:
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID") from error
+    if binding.task_id != value.task_id:
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    return OperationReceipt(
+        kind=value.kind,
+        task_id=value.task_id,
+        correlation_id=value.correlation_id,
+        envelope_hash=value.envelope_hash,
+        binding=binding,
+    )
+
+
+def _parse_operation_request(
+    message: PrivateHostMessage,
+    *,
+    now: int,
+    expected: host_envelopes.EnvelopeExpectation | None,
+) -> OperationReceipt:
+    payload = message.payload
+    envelope_value = payload.get("envelope")
+    correlation_id = payload.get("correlation_id")
+    received_envelope_hash = payload.get("envelope_hash")
+    if (
+        message.kind != "operation_request"
+        or set(payload) != {"schema", "correlation_id", "envelope", "envelope_hash"}
+        or payload.get("schema") != _OPERATION_REQUEST_SCHEMA
+        or type(envelope_value) is not dict
+        or type(correlation_id) is not str
+        or type(received_envelope_hash) is not str
+    ):
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    envelope = host_envelopes.validate_envelope(
+        envelope_value, now=now, expected=expected
+    )
+    if envelope["kind"] not in {"coordinator_assignment", "peer_evidence_handoff"}:
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    receipt = _operation_receipt(envelope, now=now)
+    if (
+        message.action_id != receipt.task_id
+        or not hmac.compare_digest(correlation_id, receipt.correlation_id)
+        or not hmac.compare_digest(received_envelope_hash, receipt.envelope_hash)
+    ):
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    _validate_private_packet_size(payload, _MAX_OPERATION_PACKET_BYTES)
+    return receipt
+
+
+def _assert_terminal_predecessor(
+    envelope: Mapping[str, object], predecessor: OperationReceipt, *, now: int
+) -> None:
+    payload = envelope["payload"]
+    task_id = envelope["task_id"]
+    assert type(payload) is dict
+    assert type(task_id) is str
+    predecessor_binding = host_envelopes.binding_mapping(predecessor.binding, now=now)
+    if (
+        task_id != predecessor.task_id
+        or payload.get("correlation_id") != predecessor.correlation_id
+        or payload.get("predecessor_hash") != predecessor.envelope_hash
+        or any(envelope[field] != value for field, value in predecessor_binding.items())
+    ):
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+
+
+def _parse_terminal_result(
+    message: PrivateHostMessage,
+    *,
+    predecessor: OperationReceipt,
+    now: int,
+    expected: host_envelopes.EnvelopeExpectation | None,
+) -> dict[str, object]:
+    payload = message.payload
+    envelope_value = payload.get("envelope")
+    correlation_id = payload.get("correlation_id")
+    received_envelope_hash = payload.get("envelope_hash")
+    if (
+        message.kind != "operation_result"
+        or set(payload) != {"schema", "correlation_id", "envelope", "envelope_hash"}
+        or payload.get("schema") != _TERMINAL_RESULT_SCHEMA
+        or type(envelope_value) is not dict
+        or type(correlation_id) is not str
+        or type(received_envelope_hash) is not str
+    ):
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    envelope = host_envelopes.validate_envelope(
+        envelope_value, now=now, expected=expected
+    )
+    if envelope["kind"] != "worker_terminal_result":
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    _assert_terminal_predecessor(envelope, predecessor, now=now)
+    expected_envelope_hash = host_envelopes.envelope_hash(envelope, now=now)
+    if (
+        message.action_id != predecessor.task_id
+        or not hmac.compare_digest(correlation_id, predecessor.correlation_id)
+        or not hmac.compare_digest(received_envelope_hash, expected_envelope_hash)
+    ):
+        raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
+    _validate_private_packet_size(payload, _MAX_OPERATION_PACKET_BYTES)
+    return envelope
+
+
+def _parse_proof_continuation(
+    message: PrivateHostMessage,
+    *,
+    proof_id: str,
+    continuation_id: str,
+    previous_digest: str,
+) -> dict[str, str]:
+    payload = message.payload
+    if (
+        message.kind != "proof_continuation"
+        or set(payload)
+        != {
+            "schema",
+            "proof_id",
+            "continuation_id",
+            "previous_digest",
+            "reference",
+            "continuation_hash",
+        }
+        or payload.get("schema") != _PROOF_CONTINUATION_SCHEMA
+        or message.action_id != "proof"
+        or payload.get("proof_id") != proof_id
+        or payload.get("continuation_id") != continuation_id
+        or payload.get("previous_digest") != previous_digest
+    ):
+        raise HostBridgeError("HOST_BRIDGE_PROOF_CONTINUATION_INVALID")
+    reference = payload.get("reference")
+    continuation_hash = payload.get("continuation_hash")
+    if (
+        type(reference) is not str
+        or _DIGEST.fullmatch(reference) is None
+        or type(continuation_hash) is not str
+        or _DIGEST.fullmatch(continuation_hash) is None
+    ):
+        raise HostBridgeError("HOST_BRIDGE_PROOF_CONTINUATION_INVALID")
+    unsigned = {
+        "schema": _PROOF_CONTINUATION_SCHEMA,
+        "proof_id": proof_id,
+        "continuation_id": continuation_id,
+        "previous_digest": previous_digest,
+        "reference": reference,
+    }
+    if not hmac.compare_digest(continuation_hash, _private_payload_hash(unsigned)):
+        raise HostBridgeError("HOST_BRIDGE_PROOF_CONTINUATION_INVALID")
+    _validate_private_packet_size(payload, _MAX_PROOF_CONTINUATION_BYTES)
+    return {
+        "proof_id": proof_id,
+        "continuation_id": continuation_id,
+        "previous_digest": previous_digest,
+        "reference": reference,
+        "continuation_hash": continuation_hash,
+    }
+
+
+def _private_payload_hash(payload: Mapping[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+
+
+def _validate_private_packet_size(payload: Mapping[str, object], maximum: int) -> None:
+    if len(_canonical_bytes(payload)) > maximum:
+        raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
 
 
 def _assert_private_duplex_ipc_descriptor(descriptor: int, *, platform: str) -> None:

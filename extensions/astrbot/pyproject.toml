@@ -1,6 +1,6 @@
 [project]
 name = "2718lab-devkit-astrbot"
-version = "1.0.0rc2"
+version = "1.0.0rc4"
 description = "Standalone AstrBot plugin scaffolding and static validation."
 readme = "README.md"
 authors = [{ name = "2718lab" }]

@@ -620,6 +620,58 @@ def test_inherited_handle_bridge_rejects_bad_frame_mac_and_sequence() -> None:
         host.close()
 
 
+def test_inherited_handle_bridge_rejects_replayed_capability_probe_sequence() -> None:
+    child, host = _pipe_pair()
+    try:
+        child.send_capability_probe(
+            binding={
+                "task_id": "task-1",
+                "lease_epoch": 7,
+                "assignment_token": "sha256:" + "a" * 64,
+                "dispatch_context_hash": "sha256:" + "b" * 64,
+                "route_hash": "sha256:" + "c" * 64,
+                "expires_at": 1_700_000_060,
+            },
+            capability_names=("artifact-read",),
+            now=1_700_000_000,
+        )
+        host.receive_capability_probe(now=1_700_000_000)
+
+        replay = InheritedHandleHostBridge.from_file_descriptors(
+            read_fd=os.dup(host._read_fd),
+            write_fd=os.dup(child._write_fd),
+            session_key=b"k" * 32,
+            session_nonce=b"relay-host-bridge-nonce",
+        )
+        try:
+            replay._write_complete(
+                replay._frame_bytes(
+                    kind="capability_probe",
+                    action_id="task-1",
+                    sequence=replay._next_out,
+                    payload={
+                        "schema": "2718lab-devkit/host-capability-probe-v1",
+                        "task_id": "task-1",
+                        "lease_epoch": 7,
+                        "assignment_token": "sha256:" + "a" * 64,
+                        "dispatch_context_hash": "sha256:" + "b" * 64,
+                        "route_hash": "sha256:" + "c" * 64,
+                        "expires_at": 1_700_000_060,
+                        "capability_names": ["artifact-read"],
+                    },
+                )
+            )
+            with pytest.raises(HostBridgeError) as caught:
+                host.receive()
+            assert caught.value.code == "HOST_BRIDGE_SEQUENCE_INVALID"
+            assert host.is_available is False
+        finally:
+            replay.close()
+    finally:
+        child.close()
+        host.close()
+
+
 def test_production_registry_resolver_requires_current_verified_packet_binding() -> (
     None
 ):

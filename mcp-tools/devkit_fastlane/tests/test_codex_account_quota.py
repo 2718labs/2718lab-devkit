@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "codex_account_quota.py"
@@ -51,12 +52,14 @@ def fake_server_code(
     *,
     spark_label: str = "GPT-5.3-Codex-Spark",
     nested_account: bool = False,
+    account_id: str | None = "account-test",
+    account_type: str = "chatgpt",
     main_used: int = 50,
     spark_used: int = 16,
 ) -> str:
     payload = {
         "account": {
-            "type": "chatgpt",
+            "type": account_type,
             "planType": "pro",
             "requiresOpenaiAuth": True,
         },
@@ -103,6 +106,8 @@ def fake_server_code(
             },
         },
     }
+    if account_id is not None:
+        payload["account"]["id"] = account_id
     if nested_account:
         payload["account"] = {
             "account": payload["account"],
@@ -152,6 +157,7 @@ class CodexAccountQuotaTests(unittest.TestCase):
     def test_reads_official_jsonl_and_builds_verifiable_main_and_spark_snapshot(
         self,
     ) -> None:
+        module = load_provider()
         provider = self.provider()
         evidence = provider.read(capacity=CAPACITY)
 
@@ -160,6 +166,9 @@ class CodexAccountQuotaTests(unittest.TestCase):
         self.assertEqual(160000, evidence.snapshot["spark"]["used_ppm"])
         self.assertEqual("codex", evidence.main_limit_id)
         self.assertEqual("codex_bengalfox", evidence.spark_limit_id)
+        self.assertEqual(
+            module._hash({"account_id": "account-test"}), evidence.account_id_hash
+        )
         self.assertTrue(evidence.key_resolver(evidence.key_id))
 
         balance = load_balance()
@@ -170,6 +179,35 @@ class CodexAccountQuotaTests(unittest.TestCase):
         )
         self.assertEqual(evidence.snapshot, verified)
 
+    def test_provider_keeps_the_hmac_key_private_and_stable_per_instance(self) -> None:
+        module = load_provider()
+        times = iter((1786100000.0, 1786100000.001))
+        provider = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code()],
+            memory_only=True,
+            now=lambda: next(times),
+        )
+        first = provider.read(capacity=CAPACITY)
+        second = provider.read(capacity=CAPACITY)
+        next_provider = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code()],
+            memory_only=True,
+            now=lambda: 1786100000.0,
+        )
+        next_evidence = next_provider.read(capacity=CAPACITY)
+        cached_provider = self.provider()
+        cached_evidence = cached_provider.read(capacity=CAPACITY)
+        cache_contents = (self.temp / "sample-cache.json").read_text(encoding="utf-8")
+
+        self.assertEqual(first.key_id, second.key_id)
+        self.assertNotEqual(first.key_id, next_evidence.key_id)
+        self.assertIsNone(provider._state_path)
+        self.assertNotIn(repr(first._key), repr(first))
+        self.assertNotIn(first._key.hex(), repr(first))
+        self.assertNotIn(repr(cached_evidence._key), cache_contents)
+        self.assertNotIn(cached_evidence._key.hex(), cache_contents)
+        self.assertNotIn(cached_evidence.key_id, cache_contents)
+
     def test_spark_label_must_be_exact(self) -> None:
         module = load_provider()
         provider = module.CodexQuotaProvider(
@@ -177,6 +215,36 @@ class CodexAccountQuotaTests(unittest.TestCase):
             state_path=self.temp / "sample-cache.json",
             now=lambda: 1786100000.0,
         )
+        with self.assertRaises(module.CodexQuotaError):
+            provider.read(capacity=CAPACITY)
+
+    def test_account_identity_is_required_before_a_snapshot_is_trusted(self) -> None:
+        module = load_provider()
+        provider = module.CodexQuotaProvider(
+            command=[
+                sys.executable,
+                "-c",
+                fake_server_code(account_id=None),
+            ],
+            state_path=self.temp / "missing-account-cache.json",
+            now=lambda: 1786100000.0,
+        )
+
+        with self.assertRaises(module.CodexQuotaError):
+            provider.read(capacity=CAPACITY)
+
+    def test_non_chatgpt_account_is_rejected_without_a_fallback_pool(self) -> None:
+        module = load_provider()
+        provider = module.CodexQuotaProvider(
+            command=[
+                sys.executable,
+                "-c",
+                fake_server_code(account_type="api"),
+            ],
+            state_path=self.temp / "wrong-account-cache.json",
+            now=lambda: 1786100000.0,
+        )
+
         with self.assertRaises(module.CodexQuotaError):
             provider.read(capacity=CAPACITY)
 
@@ -238,6 +306,124 @@ class CodexAccountQuotaTests(unittest.TestCase):
         module = load_provider()
         with self.assertRaises(module.CodexQuotaError):
             module.CodexQuotaProvider(state_path=Path("C:/codex-quota-cache.json"))
+
+    def test_memory_only_provider_never_derives_or_writes_a_cache(self) -> None:
+        module = load_provider()
+        provider = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code()],
+            state_path=None,
+            memory_only=True,
+            now=lambda: 1786100000.0,
+        )
+
+        evidence = provider.read(capacity=CAPACITY)
+
+        self.assertEqual("pro", evidence.plan_type)
+        self.assertIsNone(provider._state_path)
+        self.assertEqual([], list(self.temp.iterdir()))
+
+    def test_memory_only_provider_ignores_an_explicit_cache_path(self) -> None:
+        module = load_provider()
+        cache_path = self.temp / "must-not-exist.json"
+        provider = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code()],
+            state_path=cache_path,
+            memory_only=True,
+            now=lambda: 1786100000.0,
+        )
+
+        provider.read(capacity=CAPACITY)
+
+        self.assertIsNone(provider._state_path)
+        self.assertFalse(cache_path.exists())
+
+    def test_memory_only_provider_never_touches_cache_filesystem_methods(self) -> None:
+        module = load_provider()
+        cache_path = self.temp / "must-not-be-touched.json"
+        with (
+            mock.patch.object(Path, "stat", side_effect=AssertionError("cache stat")),
+            mock.patch.object(
+                Path, "read_text", side_effect=AssertionError("cache read")
+            ),
+            mock.patch.object(Path, "mkdir", side_effect=AssertionError("cache mkdir")),
+            mock.patch.object(
+                Path, "write_text", side_effect=AssertionError("cache write")
+            ),
+        ):
+            provider = module.CodexQuotaProvider(
+                command=[sys.executable, "-c", fake_server_code()],
+                state_path=cache_path,
+                memory_only=True,
+                now=lambda: 1786100000.0,
+            )
+            evidence = provider.read(capacity=CAPACITY)
+
+        self.assertEqual(0, evidence.snapshot["main"]["delta_ppm_300s"])
+        self.assertIsNone(provider._state_path)
+
+    def test_memory_only_provider_does_not_treat_prior_slope_as_live_truth(
+        self,
+    ) -> None:
+        module = load_provider()
+        cache_path = self.temp / "memory-only-slope.json"
+        first = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code(main_used=50)],
+            state_path=cache_path,
+            memory_only=True,
+            now=lambda: 1786100000.0,
+        ).read(capacity=CAPACITY)
+        second = module.CodexQuotaProvider(
+            command=[sys.executable, "-c", fake_server_code(main_used=51)],
+            state_path=cache_path,
+            memory_only=True,
+            now=lambda: 1786100300.0,
+        ).read(capacity=CAPACITY)
+
+        self.assertEqual(0, first.snapshot["main"]["delta_ppm_300s"])
+        self.assertEqual(0, second.snapshot["main"]["delta_ppm_300s"])
+        self.assertFalse(cache_path.exists())
+
+    def test_provider_fails_closed_when_the_app_server_cannot_start(self) -> None:
+        module = load_provider()
+        provider = module.CodexQuotaProvider(
+            command=["definitely-not-a-codex-app-server"],
+            state_path=self.temp / "start-failure-cache.json",
+            now=lambda: 1786100000.0,
+        )
+
+        with self.assertRaises(module.CodexQuotaError):
+            provider.read(capacity=CAPACITY)
+
+    def test_provider_fails_closed_on_a_timed_out_app_server(self) -> None:
+        module = load_provider()
+        provider = module.CodexQuotaProvider(
+            command=[
+                sys.executable,
+                "-c",
+                "import sys, time\nfor _ in sys.stdin:\n    time.sleep(1)",
+            ],
+            timeout_seconds=0.1,
+            state_path=self.temp / "timeout-cache.json",
+            now=lambda: 1786100000.0,
+        )
+
+        with self.assertRaises(module.CodexQuotaError):
+            provider.read(capacity=CAPACITY)
+
+    def test_provider_fails_closed_on_invalid_jsonl(self) -> None:
+        module = load_provider()
+        provider = module.CodexQuotaProvider(
+            command=[
+                sys.executable,
+                "-c",
+                "import sys\nfor _ in sys.stdin:\n    print('not-json', flush=True)",
+            ],
+            state_path=self.temp / "bad-jsonl-cache.json",
+            now=lambda: 1786100000.0,
+        )
+
+        with self.assertRaises(module.CodexQuotaError):
+            provider.read(capacity=CAPACITY)
 
 
 if __name__ == "__main__":

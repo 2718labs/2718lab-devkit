@@ -32,8 +32,8 @@ def test_import_does_not_load_astrbot_runtime() -> None:
 
 
 def test_package_uses_pep440_release_candidate_version() -> None:
-    assert getattr(devkit_astrbot, "__version__", None) == "1.0.0rc2"
-    assert distribution_version("2718lab-devkit-astrbot") == "1.0.0rc2"
+    assert getattr(devkit_astrbot, "__version__", None) == "1.0.0rc4"
+    assert distribution_version("2718lab-devkit-astrbot") == "1.0.0rc4"
 
 
 def test_cli_reports_semver_release_candidate(
@@ -43,7 +43,7 @@ def test_cli_reports_semver_release_candidate(
         main(["--version"])
 
     assert exit_info.value.code == 0
-    assert capsys.readouterr().out == "devkit-astrbot 1.0.0-rc2\n"
+    assert capsys.readouterr().out == "devkit-astrbot 1.0.0-rc4\n"
 
 
 def test_isolated_import_has_no_astrbot_primary_or_environment_side_effects(
