@@ -71,6 +71,26 @@ def test_checkout_is_pinned_to_the_node24_v5_release_everywhere() -> None:
         )
 
 
+def test_other_node24_actions_are_pinned_everywhere() -> None:
+    node24_actions = {
+        "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405": (
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+        ),
+        "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f": (
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+        ),
+        "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294": (
+            ".github/workflows/dependency-review.yml",
+        ),
+    }
+    for action_ref, paths in node24_actions.items():
+        for relative_path in paths:
+            workflow = (ROOT / relative_path).read_text(encoding="utf-8")
+            assert action_ref in workflow, relative_path
+
+
 def test_dependency_review_checks_pull_request_dependency_changes() -> None:
     workflow = (ROOT / ".github" / "workflows" / "dependency-review.yml").read_text(
         encoding="utf-8"
@@ -84,4 +104,4 @@ def test_dependency_review_checks_pull_request_dependency_changes() -> None:
     action_refs = re.findall(
         r"actions/dependency-review-action@([0-9a-f]{40})", workflow
     )
-    assert action_refs == ["2031cfc080254a8a887f58cffee85186f0e49e48"]
+    assert action_refs == ["a1d282b36b6f3519aa1f3fc636f609c47dddb294"]
