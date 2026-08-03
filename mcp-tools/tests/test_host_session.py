@@ -1337,22 +1337,23 @@ def _fresh_quota_session_for_compiler_evidence(
     *,
     provider: object,
     clock: Callable[[], float] | None = None,
+    snapshot: dict[str, object] | None = None,
 ) -> tuple[object, InheritedHandleHostBridge, InheritedHandleHostBridge]:
     """Return a live session with one independently attested quota snapshot."""
 
     child, host = _pipe_pair()
     key = b"q" * 32
-    snapshot = _snapshot(key=key)
+    quota_snapshot = _snapshot(key=key) if snapshot is None else snapshot
     session = module.HostSession(
         bridge=child,
         quota_evidence_resolver=lambda request_id, received: _attestation(
             module, request_id, received, key
         ),
-        quota_expectation=_quota_expectation(module, snapshot),
+        quota_expectation=_quota_expectation(module, quota_snapshot),
         compiler_evidence_provider=provider,
         clock=(lambda: _NOW) if clock is None else clock,
     )
-    reply = _reply_once(host, snapshot)
+    reply = _reply_once(host, quota_snapshot)
     try:
         assert isinstance(session.read_quota(), module.HostQuotaFacts)
     finally:
@@ -1520,31 +1521,28 @@ def test_host_session_compiler_evidence_rejects_material_bound_by_foreign_prepar
     None
 ):
     module = _host_session_module()
-    captured: list[object] = []
+    issued_by_first: list[object] = []
 
     def first_provider(preparation: object) -> object:
-        captured.append(preparation)
-        return preparation.bind(
+        material = preparation.bind(
             request_hash=_HASH_PREFIX + "1" * 64,
             reasoning_effort="high",
             verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
             verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
         )
+        issued_by_first.append(material)
+        return material
 
     first, first_child, first_host = _fresh_quota_session_for_compiler_evidence(
         module, provider=first_provider
     )
     try:
         first_handle = first.prepare_compiler_evidence(preparation_id="prep-owner")
-        assert first.consume_compiler_evidence(first_handle) != "NO_SAFE_WORK"
+        assert first_handle != "NO_SAFE_WORK"
+        assert len(issued_by_first) == 1
 
         def foreign_provider(_preparation: object) -> object:
-            return captured[0].bind(
-                request_hash=_HASH_PREFIX + "1" * 64,
-                reasoning_effort="high",
-                verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
-                verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
-            )
+            return issued_by_first[0]
 
         second, second_child, second_host = _fresh_quota_session_for_compiler_evidence(
             module, provider=foreign_provider
@@ -1553,6 +1551,9 @@ def test_host_session_compiler_evidence_rejects_material_bound_by_foreign_prepar
             assert (
                 second.prepare_compiler_evidence(preparation_id="prep-foreign")
                 == "NO_SAFE_WORK"
+            )
+            assert (
+                second.consume_compiler_evidence(issued_by_first[0]) == "NO_SAFE_WORK"
             )
         finally:
             second_child.close()
@@ -1690,3 +1691,232 @@ def test_host_session_compiler_evidence_rejects_index_or_terminal_provider_kwarg
     finally:
         child.close()
         host.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema", "2718lab-devkit/compiler-invocation-v2"),
+        ("reasoning_effort", "ultra"),
+        ("verified_route_result_hashes", ()),
+    ],
+)
+def test_host_session_compiler_evidence_rejects_manually_constructed_invocation(
+    field: str, value: object
+) -> None:
+    """A provider cannot forge accepted material using the private class."""
+
+    module = _host_session_module()
+    forged: list[object] = []
+    session: object
+
+    def provider(_preparation: object) -> object:
+        fields = {
+            "schema": "2718lab-devkit/compiler-invocation-v1",
+            "preparation_id": "prep-forged",
+            "request_hash": _HASH_PREFIX + "1" * 64,
+            "reasoning_effort": "high",
+            "verified_route_result_hashes": (_HASH_PREFIX + "2" * 64,),
+            "verified_lease_scope_bindings": (_HASH_PREFIX + "3" * 64,),
+            "issued_at": _NOW,
+            "expires_at": _NOW + 120,
+            "snapshot_hash": _HASH_PREFIX + "4" * 64,
+            "snapshot_seq": 1,
+            "quota_binding_hash": _HASH_PREFIX + "5" * 64,
+            "binding_hash": _HASH_PREFIX + "6" * 64,
+            "_owner": session._compiler_owner,
+        }
+        fields[field] = value
+        material = module._CompilerInvocation(**fields)
+        forged.append(material)
+        return material
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-forged")
+            == "NO_SAFE_WORK"
+        )
+        assert len(forged) == 1
+        assert session.consume_compiler_evidence(forged[0]) == "NO_SAFE_WORK"
+    finally:
+        child.close()
+        host.close()
+
+
+def test_host_session_compiler_preparation_never_exposes_raw_quota_facts() -> None:
+    """Provider material contains only a redacted quota binding, never quota facts."""
+
+    module = _host_session_module()
+    exposed: dict[str, object] = {}
+
+    def provider(preparation: object) -> object:
+        for name in ("_quota", "snapshot", "usage", "capacity", "signature"):
+            try:
+                exposed[name] = getattr(preparation, name)
+            except AttributeError:
+                pass
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-redacted")
+            != "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
+
+    assert exposed == {}
+
+
+def test_host_session_compiler_evidence_handle_expires_at_now_plus_121() -> None:
+    """A valid session-issued handle cannot be consumed after its 120-second TTL."""
+
+    module = _host_session_module()
+    now = [_NOW]
+
+    def provider(preparation: object) -> object:
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider, clock=lambda: now[0]
+    )
+    try:
+        handle = session.prepare_compiler_evidence(preparation_id="prep-handle-expiry")
+        assert handle != "NO_SAFE_WORK"
+        now[0] = _NOW + 121
+        assert session.consume_compiler_evidence(handle) == "NO_SAFE_WORK"
+    finally:
+        child.close()
+        host.close()
+
+
+@pytest.mark.parametrize("consume_at", (_NOW - 1, _NOW + 120))
+def test_host_session_compiler_evidence_rejects_clock_rollback_and_equal_expiry(
+    consume_at: int,
+) -> None:
+    """Consumption is strict: a regressed clock and equality at expiry both deny."""
+
+    module = _host_session_module()
+    now = [_NOW]
+
+    def provider(preparation: object) -> object:
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider, clock=lambda: now[0]
+    )
+    try:
+        handle = session.prepare_compiler_evidence(preparation_id="prep-strict-expiry")
+        assert handle != "NO_SAFE_WORK"
+        now[0] = consume_at
+        assert session.consume_compiler_evidence(handle) == "NO_SAFE_WORK"
+    finally:
+        child.close()
+        host.close()
+
+
+def test_host_session_compiler_evidence_expiry_cannot_outlive_signed_quota() -> None:
+    """A signed quota's valid-until time caps compiler-material lifetime."""
+
+    module = _host_session_module()
+    now = [_NOW]
+    short_lived_snapshot = _snapshot(
+        key=b"q" * 32,
+        valid_until="2023-11-14T22:13:21Z",
+    )
+
+    def provider(preparation: object) -> object:
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module,
+        provider=provider,
+        clock=lambda: now[0],
+        snapshot=short_lived_snapshot,
+    )
+    try:
+        handle = session.prepare_compiler_evidence(preparation_id="prep-quota-expiry")
+        assert handle != "NO_SAFE_WORK"
+        now[0] = _NOW + 2
+        assert session.consume_compiler_evidence(handle) == "NO_SAFE_WORK"
+    finally:
+        child.close()
+        host.close()
+
+
+@pytest.mark.parametrize("shutdown", ("close", "freeze"))
+def test_host_session_does_not_publish_quota_after_concurrent_shutdown(
+    shutdown: str,
+) -> None:
+    """Close/freeze racing a quota read cannot leave fresh facts available."""
+
+    module = _host_session_module()
+    child, host = _pipe_pair()
+    key = b"q" * 32
+    snapshot = _snapshot(key=key)
+    resolver_entered = threading.Event()
+    release_resolver = threading.Event()
+    results: list[object] = []
+
+    def resolver(request_id: str, received: object) -> object:
+        resolver_entered.set()
+        assert release_resolver.wait(timeout=2)
+        return _attestation(module, request_id, received, key)
+
+    session = module.HostSession(
+        bridge=child,
+        quota_evidence_resolver=resolver,
+        quota_expectation=_quota_expectation(module, snapshot),
+        clock=lambda: _NOW,
+    )
+    reply = _reply_once(host, snapshot)
+    reader = threading.Thread(target=lambda: results.append(session.read_quota()))
+    reader.start()
+    try:
+        assert resolver_entered.wait(timeout=2)
+        if shutdown == "close":
+            session.close()
+        else:
+            session._freeze()
+        release_resolver.set()
+        reader.join(timeout=2)
+        assert not reader.is_alive()
+    finally:
+        release_resolver.set()
+        reader.join(timeout=2)
+        reply.join(timeout=2)
+        child.close()
+        host.close()
+
+    assert results == ["NO_SAFE_WORK"]
+    assert (
+        session.prepare_compiler_evidence(preparation_id="prep-after-shutdown")
+        == "NO_SAFE_WORK"
+    )
