@@ -173,6 +173,8 @@ class HostSession:
         )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, object] = {}
+        self._burned_preparation_ids: set[str] = set()
+        self._has_fresh_quota = False
         self._clock = clock
         try:
             self._quota_expectation = _normalize_quota_expectation(quota_expectation)
@@ -246,6 +248,7 @@ class HostSession:
                 return
             self._closed = True
             self._frozen = True
+            self._has_fresh_quota = False
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -259,10 +262,16 @@ class HostSession:
             provider = self._compiler_evidence_provider
             if (
                 self._closed
+                or self._frozen
                 or provider is None
                 or not isinstance(preparation_id, str)
                 or _IDENTIFIER.fullmatch(preparation_id) is None
             ):
+                return _NO_SAFE_WORK
+            if preparation_id in self._burned_preparation_ids:
+                return _NO_SAFE_WORK
+            self._burned_preparation_ids.add(preparation_id)
+            if not self.is_available or not self._has_fresh_quota:
                 return _NO_SAFE_WORK
             try:
                 facts = provider(preparation_id)
@@ -312,6 +321,7 @@ class HostSession:
             self._record_unavailable((), _REASON_QUOTA_UNAVAILABLE)
             self._freeze()
             return _NO_SAFE_WORK
+        self._has_fresh_quota = True
         return facts
 
     def declare_routes(
@@ -592,7 +602,10 @@ class HostSession:
         )
 
     def _freeze(self) -> None:
-        self._frozen = True
+        with self._compiler_evidence_lock:
+            self._frozen = True
+            self._has_fresh_quota = False
+            self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
 
