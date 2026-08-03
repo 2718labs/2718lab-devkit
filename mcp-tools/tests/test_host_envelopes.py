@@ -45,8 +45,8 @@ def _binding(module: object, *, expires_at: int = _NOW + 60) -> object:
 def _assignment_payload() -> dict[str, object]:
     return {
         "correlation_id": "operation-1",
-        "assignment": "Run the bounded verification command",
-        "context": ["Use the supplied artifact references"],
+        "assignment": "assignment.verify",
+        "context": ["context.artifact-refs"],
         "artifact_refs": ["sha256:" + "1" * 64],
         "digest_refs": ["sha256:" + "2" * 64],
     }
@@ -61,8 +61,8 @@ def _terminal_payload(
         "correlation_id": correlation_id,
         "predecessor_hash": predecessor_hash,
         "terminal": "succeeded",
-        "result": ["Focused verification passed"],
-        "risk": [{"code": "none", "detail": "No residual runtime risk observed"}],
+        "result": ["result.verified"],
+        "risk": [{"code": "none", "detail": "risk.none"}],
         "artifact_refs": ["sha256:" + "3" * 64],
         "digest_refs": ["sha256:" + "4" * 64],
     }
@@ -72,8 +72,8 @@ def _peer_payload(*, peer_capability: str = _PEER_CAPABILITY) -> dict[str, objec
     return {
         "correlation_id": "handoff-1",
         "peer_capability": peer_capability,
-        "dependency": ["Consume the signed artifact reference"],
-        "evidence": ["Digest was verified before handoff"],
+        "dependency": ["dependency.artifact-refs"],
+        "evidence": ["evidence.digest-verified"],
         "artifact_refs": ["sha256:" + "5" * 64],
         "digest_refs": ["sha256:" + "6" * 64],
     }
@@ -298,6 +298,7 @@ def test_envelope_rejects_sensitive_text_in_each_permitted_text_field(
         "environment HOME private-value",
         "sk-proj-synthetic-private-value",
         "x" * 512,
+        "metadata:private-value",
     ],
 )
 def test_envelope_rejects_unverifiable_or_environment_sensitive_text_in_each_field(
@@ -325,6 +326,50 @@ def test_envelope_rejects_unverifiable_or_environment_sensitive_text_in_each_fie
 
 
 @pytest.mark.parametrize(
+    ("kind", "field"),
+    [
+        ("coordinator_assignment", "assignment"),
+        ("coordinator_assignment", "context"),
+        ("worker_terminal_result", "result"),
+        ("worker_terminal_result", "risk.detail"),
+        ("peer_evidence_handoff", "dependency"),
+        ("peer_evidence_handoff", "evidence"),
+    ],
+)
+@pytest.mark.parametrize(
+    "opaque_text",
+    [
+        "a" * 64,
+        "b" * 511,
+        "sk-live-synthetic-private-value",
+        "summary:encoded-value",
+    ],
+)
+def test_envelope_rejects_short_and_renamed_opaque_text_in_each_field(
+    kind: str, field: str, opaque_text: str
+) -> None:
+    module = _envelopes()
+    if kind == "coordinator_assignment":
+        payload = _assignment_payload()
+    elif kind == "worker_terminal_result":
+        payload = _terminal_payload()
+    else:
+        payload = _peer_payload()
+
+    if field == "assignment":
+        payload["assignment"] = opaque_text
+    elif field == "risk.detail":
+        payload["risk"] = [{"code": "none", "detail": opaque_text}]
+    else:
+        payload[field] = [opaque_text]
+
+    with pytest.raises(module.HostEnvelopeError) as caught:
+        _render(module, kind, payload)
+
+    assert caught.value.code == "HOST_ENVELOPE_INVALID"
+
+
+@pytest.mark.parametrize(
     ("kind", "payload"),
     [
         ("coordinator_assignment", _assignment_payload()),
@@ -339,6 +384,75 @@ def test_envelope_accepts_opaque_sha256_reference_fields(
     envelope = _render(module, kind, payload)
 
     assert module.validate_envelope(envelope, now=_NOW) == envelope
+
+
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    [
+        ("coordinator_assignment", "assignment"),
+        ("coordinator_assignment", "context"),
+        ("worker_terminal_result", "result"),
+        ("worker_terminal_result", "risk.detail"),
+        ("peer_evidence_handoff", "dependency"),
+        ("peer_evidence_handoff", "evidence"),
+    ],
+)
+def test_envelope_accepts_content_addressed_reference_in_each_text_field(
+    kind: str, field: str
+) -> None:
+    module = _envelopes()
+    if kind == "coordinator_assignment":
+        payload = _assignment_payload()
+    elif kind == "worker_terminal_result":
+        payload = _terminal_payload()
+    else:
+        payload = _peer_payload()
+
+    if field == "assignment":
+        payload["assignment"] = _TOKEN
+    elif field == "risk.detail":
+        payload["risk"] = [{"code": "none", "detail": _TOKEN}]
+    else:
+        payload[field] = [_TOKEN]
+
+    envelope = _render(module, kind, payload)
+
+    assert module.validate_envelope(envelope, now=_NOW) == envelope
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "wrong_metadata"),
+    [
+        ("coordinator_assignment", "assignment", "context.artifact-refs"),
+        ("coordinator_assignment", "context", "assignment.verify"),
+        ("worker_terminal_result", "result", "risk.none"),
+        ("worker_terminal_result", "risk.detail", "result.verified"),
+        ("peer_evidence_handoff", "dependency", "evidence.digest-verified"),
+        ("peer_evidence_handoff", "evidence", "dependency.artifact-refs"),
+    ],
+)
+def test_envelope_rejects_cross_purpose_metadata_in_each_text_field(
+    kind: str, field: str, wrong_metadata: str
+) -> None:
+    module = _envelopes()
+    if kind == "coordinator_assignment":
+        payload = _assignment_payload()
+    elif kind == "worker_terminal_result":
+        payload = _terminal_payload()
+    else:
+        payload = _peer_payload()
+
+    if field == "assignment":
+        payload["assignment"] = wrong_metadata
+    elif field == "risk.detail":
+        payload["risk"] = [{"code": "none", "detail": wrong_metadata}]
+    else:
+        payload[field] = [wrong_metadata]
+
+    with pytest.raises(module.HostEnvelopeError) as caught:
+        _render(module, kind, payload)
+
+    assert caught.value.code == "HOST_ENVELOPE_INVALID"
 
 
 def test_envelope_rejects_collection_limit_overruns() -> None:

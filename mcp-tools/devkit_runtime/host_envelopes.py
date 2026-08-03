@@ -1,6 +1,6 @@
 """Pure, closed validation for role-scoped private host envelopes.
 
-These records intentionally carry bounded summaries and content-addressed
+These records intentionally carry closed metadata values and content-addressed
 references only.  They are not a transport, capability bearer, filesystem
 message, or conversation container.
 """
@@ -43,24 +43,26 @@ _MAX_BYTES_BY_KIND: Final = {
     "worker_terminal_result": 24 * 1024,
     "peer_evidence_handoff": 16 * 1024,
 }
-_MAX_TEXT_BYTES: Final = 512
 _MAX_TEXT_ITEMS: Final = 16
 _MAX_ARTIFACT_REFS: Final = 16
 _MAX_DIGEST_REFS: Final = 32
 _MAX_RISKS: Final = 8
-_FORBIDDEN_TEXT_CHARACTERS: Final = frozenset(
-    {"$", "%", "=", "{", "}", "[", "]", "\\", "/", "`", "<", ">", "(", ")"}
-)
-_FORBIDDEN_TEXT = re.compile(
-    r"(?i)(?:\b(?:bearer|authorization|api[_-]?key|secret|capability|proof|"
-    r"token|credential|environment|env|home|transcript|conversation|chat)\b|"
-    r"\bsk-proj-[a-z0-9_-]+|"
-    r"\b(?:os\.environ|process\.env)\b|"
-    r"\b(?:user|assistant|system)\s*:|"
-    r"\b(?:export|set)\s+[A-Za-z_][A-Za-z0-9_]*=|"
-    r"\b[A-Z][A-Z0-9_]{2,}=|(?:[A-Za-z]:[\\/]|\\\\|^/)|"
-    r"```|<script\b|\b(?:def|class|import|function)\s+)"
-)
+_ALLOWED_TEXT_VALUES: Final = {
+    "assignment": frozenset(
+        {"assignment.verify", "assignment.inspect", "assignment.integrate", "assignment.retry"}
+    ),
+    "context": frozenset(
+        {"context.artifact-refs", "context.digest-refs", "context.binding-verified"}
+    ),
+    "result": frozenset({"result.verified", "result.failed", "result.blocked"}),
+    "risk.detail": frozenset({"risk.none", "risk.bounded", "risk.unverified"}),
+    "dependency": frozenset(
+        {"dependency.artifact-refs", "dependency.digest-refs", "dependency.predecessor-verified"}
+    ),
+    "evidence": frozenset(
+        {"evidence.artifact-digest", "evidence.digest-verified", "evidence.binding-verified"}
+    ),
+}
 
 
 class HostEnvelopeError(ValueError):
@@ -352,7 +354,7 @@ def _required_risks(payload: Mapping[str, object]) -> list[dict[str, str]]:
         code = risk.get("code")
         detail = risk.get("detail")
         _validate_identifier(code)
-        _validate_text(detail)
+        _validate_text(detail, purpose="risk.detail")
         assert type(code) is str
         assert type(detail) is str
         if code in codes:
@@ -384,7 +386,7 @@ def _required_text_items(payload: Mapping[str, object], field: str) -> list[str]
         _invalid()
     normalized: list[str] = []
     for value in values:
-        _validate_text(value)
+        _validate_text(value, purpose=field)
         assert type(value) is str
         normalized.append(value)
     return normalized
@@ -392,7 +394,7 @@ def _required_text_items(payload: Mapping[str, object], field: str) -> list[str]
 
 def _required_text(payload: Mapping[str, object], field: str) -> str:
     value = payload.get(field)
-    _validate_text(value)
+    _validate_text(value, purpose=field)
     assert type(value) is str
     return value
 
@@ -435,18 +437,14 @@ def _validate_digest(value: object) -> None:
         _invalid()
 
 
-def _validate_text(value: object) -> None:
-    if type(value) is not str or not value or value != value.strip():
-        _invalid()
-    try:
-        byte_length = len(value.encode("utf-8"))
-    except UnicodeError:
-        _invalid()
+def _validate_text(value: object, *, purpose: str) -> None:
+    """Accept only a purpose-bound metadata enum or an opaque digest reference."""
+
+    allowed = _ALLOWED_TEXT_VALUES.get(purpose)
     if (
-        byte_length >= _MAX_TEXT_BYTES
-        or any(character in value for character in ("\r", "\n", "\t"))
-        or any(character in value for character in _FORBIDDEN_TEXT_CHARACTERS)
-        or _FORBIDDEN_TEXT.search(value) is not None
+        type(value) is not str
+        or allowed is None
+        or (_DIGEST.fullmatch(value) is None and value not in allowed)
     ):
         _invalid()
 
