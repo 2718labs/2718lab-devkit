@@ -3910,7 +3910,10 @@ class TeamEfficiencyTests(unittest.TestCase):
             write_scope=list(second_unit["write_scope"]),
             temp_target=first_context["bootstrap_plan"]["temp_target"],
         )
-        context_cases.append(("duplicate_temp", duplicate_temp))
+        self.assertNotEqual(
+            first_context["bootstrap_plan"]["temp_target"],
+            duplicate_temp["execution_contexts"][1]["bootstrap_plan"]["temp_target"],
+        )
 
         missing_execution_binding = copy.deepcopy(baseline)
         del missing_execution_binding["execution_contexts"][0]
@@ -5545,9 +5548,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        replacement_root = self.temp / "configured-fastlane-root"
-        configured_root = replacement_root / "custom-root-project"
-        configured_root.mkdir(parents=True)
+        replacement_root = self.fast_lane_task_root / "replacement-root"
+        replacement_root.mkdir()
+        configured_root = self.fast_lane_task_root
         project = "custom-root-project"
         project_root = configured_root / project
         target = self.bootstrap_kwargs()
@@ -5575,9 +5578,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertEqual("team-efficiency/bootstrap-v2", plan["schema"])
             self.assertIsInstance(plan["task_root_hash"], str)
             self.assertNotIn("task_root", plan)
-            self.assertEqual(
-                str(project_root.resolve()), plan["temp_target"].rsplit("\\", 2)[0]
-            )
+            self.assertEqual(configured_root / "t", Path(plan["temp_target"]).parent)
             applied = helper.apply_bootstrap_plan(
                 plan,
                 runner=runner,
@@ -5589,11 +5590,11 @@ class TeamEfficiencyTests(unittest.TestCase):
         for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
             self.assertEqual(str(plan["temp_target"]), environment["CODEX_TASK_TEMP"])
             self.assertEqual(
-                str(Path(plan["temp_target"]) / "pycache"),
+                str(Path(plan["temp_target"]) / "p"),
                 environment["PYTHONPYCACHEPREFIX"],
             )
             self.assertEqual(
-                str(Path(plan["temp_target"]) / "uv-cache"),
+                str(Path(plan["temp_target"]) / "u"),
                 environment["UV_CACHE_DIR"],
             )
 
@@ -5609,6 +5610,134 @@ class TeamEfficiencyTests(unittest.TestCase):
                 )
 
         self.assertEqual(1, len(calls))
+
+    def test_bootstrap_uses_a_short_hash_bound_cache_leaf_for_deep_worktrees(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        configured_root = self.fast_lane_task_root
+        project = "/".join(["deepsegment"] * 3)
+        project_root = configured_root.joinpath(*project.split("/"))
+        target = self.bootstrap_kwargs()
+        target.update(
+            {
+                "project": project,
+                "worktree": project_root / "worktrees" / "deep-worktree",
+                "temp_target": project_root / "tasks" / "deep-task-temp",
+            }
+        )
+        calls: list[tuple[list[str], bool, dict[str, str]]] = []
+        probes: list[tuple[list[str], bool, dict[str, str]]] = []
+
+        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
+            calls.append((argv, check, env))
+
+        def probe_runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
+            probes.append((argv, check, env))
+
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
+        ):
+            plan = helper.build_bootstrap_plan(**target)
+            repeated = helper.build_bootstrap_plan(**target)
+            different_task = {**target, "task_id": "ATLAS-12C"}
+            different_plan = helper.build_bootstrap_plan(**different_task)
+            cache_leaf = Path(plan["temp_target"])
+
+            self.assertEqual("team-efficiency/bootstrap-v2", plan["schema"])
+            self.assertIsInstance(plan["task_root_hash"], str)
+            self.assertEqual(plan["temp_target"], repeated["temp_target"])
+            self.assertNotEqual(plan["temp_target"], different_plan["temp_target"])
+            self.assertEqual(configured_root / "t", cache_leaf.parent)
+            self.assertRegex(cache_leaf.name, r"^[0-9a-f]{16}$")
+            self.assertLessEqual(
+                helper._projected_python_cache_path_length(
+                    cache_leaf / "p", Path(plan["worktree"])
+                ),
+                helper.MAX_PYTHON_CACHE_PATH_LENGTH,
+            )
+            helper.apply_bootstrap_plan(
+                plan,
+                runner=runner,
+                probe_runner=probe_runner,
+            )
+
+        self.assertEqual(1, len(calls))
+        for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
+            for name in (
+                "CODEX_TASK_TEMP",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "PYTHONPYCACHEPREFIX",
+                "UV_CACHE_DIR",
+            ):
+                with self.subTest(name=name):
+                    self.assertTrue(
+                        Path(environment[name])
+                        .resolve(strict=False)
+                        .is_relative_to(configured_root.resolve())
+                    )
+            self.assertEqual(str(cache_leaf), environment["CODEX_TASK_TEMP"])
+            self.assertEqual(str(cache_leaf / "p"), environment["PYTHONPYCACHEPREFIX"])
+            self.assertEqual(str(cache_leaf / "u"), environment["UV_CACHE_DIR"])
+
+    def test_bootstrap_rejects_a_preexisting_short_cache_leaf(self) -> None:
+        helper = load_efficiency()
+        configured_root = self.fast_lane_task_root
+        target = self.bootstrap_kwargs()
+        project = "short-cache-project"
+        project_root = configured_root / project
+        target.update(
+            {
+                "project": project,
+                "worktree": project_root / "worktrees" / "atlas12b",
+                "temp_target": project_root / "tasks" / "caller-temp",
+            }
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
+        ):
+            plan = helper.build_bootstrap_plan(**target)
+            Path(plan["temp_target"]).mkdir(parents=True)
+            with self.assertRaisesRegex(
+                ValueError, "temp_target target already exists"
+            ):
+                helper.apply_bootstrap_plan(
+                    plan,
+                    runner=lambda *_args, **_kwargs: None,
+                    probe_runner=lambda *_args, **_kwargs: None,
+                )
+
+    def test_bootstrap_rejects_a_custom_root_that_exceeds_python_cache_budget(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        configured_root = self.temp / ("r" * 100)
+        configured_root.mkdir()
+        target = self.bootstrap_kwargs()
+        project = "over-budget-project"
+        project_root = configured_root / project
+        target.update(
+            {
+                "project": project,
+                "worktree": project_root / "worktrees" / "atlas12b",
+                "temp_target": project_root / "tasks" / "caller-temp",
+            }
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "configured fast-lane task root is not approved",
+            ):
+                helper.build_bootstrap_plan(**target)
 
     def test_bootstrap_rejects_an_invalid_configured_fastlane_task_root(self) -> None:
         helper = load_efficiency()
@@ -5639,8 +5768,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        configured_root = self.temp / "configured-fastlane-root"
-        configured_root.mkdir()
+        configured_root = self.fast_lane_task_root
         project = "win32-alias-project"
         project_root = configured_root / project
         target = self.bootstrap_kwargs()
@@ -5665,7 +5793,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        configured_root = self.temp / "configured-fastlane-root"
+        configured_root = self.fast_lane_task_root
         project_root = configured_root / "lexical-reparse-project"
         lexical = project_root / "alias" / "worktree"
         canonical = project_root / "real" / "worktree"
@@ -5701,8 +5829,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def test_bootstrap_rejects_a_reparse_project_before_build_and_apply(self) -> None:
         helper = load_efficiency()
-        configured_root = self.temp / "configured-fastlane-root"
-        configured_root.mkdir()
+        configured_root = self.fast_lane_task_root
         project = "reparse-project"
         project_root = configured_root / project
         target = self.bootstrap_kwargs()
@@ -5747,8 +5874,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        configured_root = self.temp / "configured-fastlane-root"
-        configured_root.mkdir()
+        configured_root = self.fast_lane_task_root
         project = "race-checked-project"
         project_root = configured_root / project
         target = self.bootstrap_kwargs()
@@ -5792,8 +5918,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def test_bootstrap_apply_pins_root_bound_directories_through_runner(self) -> None:
         helper = load_efficiency()
-        configured_root = self.temp / "configured-fastlane-root"
-        configured_root.mkdir()
+        configured_root = self.fast_lane_task_root
         project = "pinned-project"
         project_root = configured_root / project
         target = self.bootstrap_kwargs()
@@ -5815,7 +5940,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             pinned_paths = {path for path, _field in pinned}
             self.assertIn(configured_root, pinned_paths)
             self.assertIn(project_root, pinned_paths)
-            self.assertIn(project_root / "tasks" / "atlas12b", pinned_paths)
+            self.assertIn(Path(plan["temp_target"]).parent, pinned_paths)
+            self.assertIn(Path(plan["temp_target"]), pinned_paths)
             self.assertIn(project_root / "worktrees", pinned_paths)
             self.assertIn(
                 project_root / "worktrees" / "atlas12b-team-efficiency",
@@ -5871,7 +5997,10 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         self.assertEqual(project, plan["project"])
         self.assertEqual(str(worktree.resolve(strict=False)), plan["worktree"])
-        self.assertEqual(str(temp_target.resolve(strict=False)), plan["temp_target"])
+        self.assertEqual(
+            Path(r"D:\bun\tmp\codex") / "t",
+            Path(plan["temp_target"]).parent,
+        )
 
     def test_bootstrap_apply_uses_the_validated_argument_vector_only(self) -> None:
         helper = load_efficiency()

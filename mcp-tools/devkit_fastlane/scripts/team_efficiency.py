@@ -51,6 +51,13 @@ _FAST_LANE_DEFERRED_ROUTE_REASONS = frozenset(
 )
 _DEFAULT_FASTLANE_TASK_ROOT = Path(r"D:\bun\tmp\codex")
 _FASTLANE_TASK_ROOT_ENV = "CODEX_FASTLANE_TASK_ROOT"
+MAX_PYTHON_CACHE_PATH_LENGTH = 240
+_SHORT_TASK_CACHE_DIRECTORY = "t"
+_SHORT_TASK_CACHE_HASH_LENGTH = 16
+_PYTHON_CACHE_REPRESENTATIVE_SOURCES = (
+    Path("mcp-tools/devkit_fastlane/scripts/team_efficiency.py"),
+    Path("mcp-tools/devkit_fastlane/tests/test_team_efficiency.py"),
+)
 
 _TASK_ID = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|FLR1-[0-9a-f]{24})$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -1047,6 +1054,20 @@ def _root_bound_path(
     return resolved
 
 
+def _task_root_bound_path(value: object, field: str, *, task_root: Path) -> Path:
+    lexical_path = _absolute_path(
+        value,
+        field,
+        root_bound=True,
+        resolve_path=False,
+    )
+    _strictly_below(lexical_path, task_root, field)
+    _reject_reparse_points_below(lexical_path, task_root, field)
+    resolved = lexical_path.resolve(strict=False)
+    _strictly_below(resolved, task_root, field)
+    return resolved
+
+
 def _pin_windows_directory(path: Path, field: str) -> int | None:
     if os.name != "nt":
         return None
@@ -1243,6 +1264,54 @@ def _fastlane_task_root_hash(root: Path) -> str:
     )
 
 
+def _short_task_temp_target(
+    task_root: Path,
+    *,
+    task_id: str,
+    base_commit: str,
+    branch: str,
+    project: str,
+    write_scope: Sequence[str],
+) -> Path:
+    identity_hash = _sha256_json(
+        {
+            "schema": "team-efficiency/fast-lane-task-cache-identity-v1",
+            "task_id": task_id,
+            "base_commit": base_commit,
+            "branch": branch,
+            "project": project,
+            "write_scope_hash": _sha256_json(list(write_scope)),
+        }
+    )
+    return (
+        task_root
+        / _SHORT_TASK_CACHE_DIRECTORY
+        / identity_hash.removeprefix("sha256:")[:_SHORT_TASK_CACHE_HASH_LENGTH]
+    )
+
+
+def _projected_python_cache_path_length(cache_prefix: Path, worktree: Path) -> int:
+    projected_paths: list[Path] = []
+    for source_relative in _PYTHON_CACHE_REPRESENTATIVE_SOURCES:
+        source = worktree / source_relative
+        drive = source.drive.rstrip(":") or "drive"
+        projected_paths.append(
+            cache_prefix
+            / drive
+            / Path(*source.parts[1:-1])
+            / "__pycache__"
+            / f"{source.stem}.cpython-999.pyc"
+        )
+    return max(len(str(path)) for path in projected_paths)
+
+
+def _enforce_python_cache_path_budget(cache_prefix: Path, worktree: Path) -> None:
+    if _projected_python_cache_path_length(cache_prefix, worktree) > (
+        MAX_PYTHON_CACHE_PATH_LENGTH
+    ):
+        raise ValueError("configured fast-lane task root is not approved")
+
+
 def _bootstrap_task_root(plan: Mapping[str, Any]) -> Path:
     root = _configured_fastlane_task_root()
     if plan["schema"] == "team-efficiency/bootstrap-v1":
@@ -1266,6 +1335,7 @@ def build_bootstrap_plan(
     project: str,
     worktree: str | Path,
     temp_target: str | Path,
+    _validate_requested_temp_target: bool = True,
 ) -> dict[str, Any]:
     """Build a dry-run-only worktree plan without changing repository state."""
 
@@ -1284,12 +1354,29 @@ def build_bootstrap_plan(
         task_root=task_root,
         project_root=root,
     )
-    temp_path = _root_bound_path(
-        temp_target,
-        "temp_target",
-        task_root=task_root,
-        project_root=root,
+    if _validate_requested_temp_target:
+        requested_temp_target = _task_root_bound_path(
+            temp_target,
+            "temp_target",
+            task_root=task_root,
+        )
+        short_cache_parent = task_root / _SHORT_TASK_CACHE_DIRECTORY
+        if requested_temp_target.parent != short_cache_parent:
+            _root_bound_path(
+                temp_target,
+                "temp_target",
+                task_root=task_root,
+                project_root=root,
+            )
+    temp_path = _short_task_temp_target(
+        task_root,
+        task_id=normalized_task,
+        base_commit=normalized_base,
+        branch=normalized_branch,
+        project=normalized_project,
+        write_scope=normalized_scope,
     )
+    _enforce_python_cache_path_budget(temp_path / "p", worktree_path)
 
     command_argv = [
         "git",
@@ -1347,6 +1434,7 @@ def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         project=candidate["project"],
         worktree=candidate["worktree"],
         temp_target=candidate["temp_target"],
+        _validate_requested_temp_target=False,
     )
     if _canonical_json(candidate) != _canonical_json(rebuilt):
         raise ValueError("bootstrap plan was altered")
@@ -1358,31 +1446,37 @@ def _temporary_environment(
 ) -> tuple[dict[str, str], Path, Path, Path]:
     task_root = _bootstrap_task_root(plan)
     _, root = _project_root(plan["project"], task_root=task_root)
-    temp_target = _root_bound_path(
+    temp_target = _task_root_bound_path(
         plan["temp_target"],
         "temp_target",
         task_root=task_root,
-        project_root=root,
     )
     environment = os.environ.copy()
     target_text = str(temp_target)
     for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
         environment[name] = target_text
-    environment["PYTHONPYCACHEPREFIX"] = str(temp_target / "pycache")
-    environment["UV_CACHE_DIR"] = str(temp_target / "uv-cache")
+    environment["PYTHONPYCACHEPREFIX"] = str(temp_target / "p")
+    environment["UV_CACHE_DIR"] = str(temp_target / "u")
     return environment, temp_target, root, task_root
 
 
 def _create_verified_temp_target(
     temp_target: Path,
-    root: Path,
     task_root: Path,
     pins: _PinnedDirectoryTree,
 ) -> Path:
-    return _create_verified_directory(
+    _create_verified_directory(
+        temp_target.parent,
+        task_root=task_root,
+        project_root=task_root,
+        field="temp_target parent",
+        allow_project_root=True,
+        pins=pins,
+    )
+    return _create_fresh_verified_directory(
         temp_target,
         task_root=task_root,
-        project_root=root,
+        project_root=task_root,
         field="temp_target",
         pins=pins,
     )
@@ -1425,14 +1519,13 @@ def apply_bootstrap_plan(
     with _PinnedDirectoryTree() as pins:
         verified_temp_target = _create_verified_temp_target(
             temp_target,
-            root,
             task_root,
             pins,
         )
         for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
             environment[name] = str(verified_temp_target)
-        environment["PYTHONPYCACHEPREFIX"] = str(verified_temp_target / "pycache")
-        environment["UV_CACHE_DIR"] = str(verified_temp_target / "uv-cache")
+        environment["PYTHONPYCACHEPREFIX"] = str(verified_temp_target / "p")
+        environment["UV_CACHE_DIR"] = str(verified_temp_target / "u")
         selected_probe = probe_runner if probe_runner is not None else _run_git_probe
         selected_probe(
             ["git", "-C", validated["repo"], "rev-parse", "--git-dir"],
