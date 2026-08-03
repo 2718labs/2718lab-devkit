@@ -10,8 +10,11 @@ import json
 import os
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -1333,6 +1336,7 @@ def _fresh_quota_session_for_compiler_evidence(
     module: object,
     *,
     provider: object,
+    clock: Callable[[], float] | None = None,
 ) -> tuple[object, InheritedHandleHostBridge, InheritedHandleHostBridge]:
     """Return a live session with one independently attested quota snapshot."""
 
@@ -1346,7 +1350,7 @@ def _fresh_quota_session_for_compiler_evidence(
         ),
         quota_expectation=_quota_expectation(module, snapshot),
         compiler_evidence_provider=provider,
-        clock=lambda: _NOW,
+        clock=(lambda: _NOW) if clock is None else clock,
     )
     reply = _reply_once(host, snapshot)
     try:
@@ -1457,3 +1461,232 @@ def test_host_session_compiler_evidence_freeze_clears_and_denies_preparation() -
         host.close()
 
     assert provider_calls == []
+
+
+def test_host_session_compiler_evidence_binds_private_material_to_one_immutable_invocation() -> (
+    None
+):
+    module = _host_session_module()
+    request_hash = _HASH_PREFIX + "1" * 64
+    route_hashes = (_HASH_PREFIX + "2" * 64, _HASH_PREFIX + "3" * 64)
+    lease_hashes = (_HASH_PREFIX + "4" * 64, _HASH_PREFIX + "5" * 64)
+    preparations: list[object] = []
+
+    def provider(preparation: object) -> object:
+        preparations.append(preparation)
+        return preparation.bind(
+            request_hash=request_hash,
+            reasoning_effort="high",
+            verified_route_result_hashes=route_hashes,
+            verified_lease_scope_bindings=lease_hashes,
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        handle = session.prepare_compiler_evidence(preparation_id="prep-bound")
+        invocation = session.consume_compiler_evidence(handle)
+        original_request_hash = invocation.request_hash
+        with pytest.raises((AttributeError, TypeError)):
+            invocation.request_hash = _HASH_PREFIX + "0" * 64
+    finally:
+        child.close()
+        host.close()
+
+    assert len(preparations) == 1
+    assert type(preparations[0]) is not str
+    assert invocation.schema == "2718lab-devkit/compiler-invocation-v1"
+    assert invocation.preparation_id == "prep-bound"
+    assert invocation.request_hash == original_request_hash == request_hash
+    assert invocation.reasoning_effort == "high"
+    assert invocation.verified_route_result_hashes == route_hashes
+    assert invocation.verified_lease_scope_bindings == lease_hashes
+    assert invocation.issued_at == _NOW
+    assert invocation.expires_at == _NOW + 120
+    assert invocation.snapshot_hash == _snapshot(key=b"q" * 32)["snapshot_hash"]
+    assert invocation.snapshot_seq == 1
+    assert invocation.quota_binding_hash.startswith(_HASH_PREFIX)
+    assert len(invocation.quota_binding_hash) == len(_HASH_PREFIX) + 64
+    assert invocation.binding_hash.startswith(_HASH_PREFIX)
+    assert len(invocation.binding_hash) == len(_HASH_PREFIX) + 64
+    assert not hasattr(invocation, "snapshot")
+    assert not hasattr(invocation, "resolver")
+    assert not hasattr(invocation, "bridge")
+    assert session.consume_compiler_evidence(handle) == "NO_SAFE_WORK"
+
+
+def test_host_session_compiler_evidence_rejects_material_bound_by_foreign_preparation() -> (
+    None
+):
+    module = _host_session_module()
+    captured: list[object] = []
+
+    def first_provider(preparation: object) -> object:
+        captured.append(preparation)
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+
+    first, first_child, first_host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=first_provider
+    )
+    try:
+        first_handle = first.prepare_compiler_evidence(preparation_id="prep-owner")
+        assert first.consume_compiler_evidence(first_handle) != "NO_SAFE_WORK"
+
+        def foreign_provider(_preparation: object) -> object:
+            return captured[0].bind(
+                request_hash=_HASH_PREFIX + "1" * 64,
+                reasoning_effort="high",
+                verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+                verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+            )
+
+        second, second_child, second_host = _fresh_quota_session_for_compiler_evidence(
+            module, provider=foreign_provider
+        )
+        try:
+            assert (
+                second.prepare_compiler_evidence(preparation_id="prep-foreign")
+                == "NO_SAFE_WORK"
+            )
+        finally:
+            second_child.close()
+            second_host.close()
+    finally:
+        first_child.close()
+        first_host.close()
+
+
+def test_host_session_compiler_evidence_consumes_fresh_quota_once_and_expires() -> None:
+    module = _host_session_module()
+    provider_calls: list[str] = []
+    now = [_NOW]
+
+    def provider(preparation: object) -> object:
+        provider_calls.append("called")
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider, clock=lambda: now[0]
+    )
+    try:
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-once")
+            != "NO_SAFE_WORK"
+        )
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-without-quota")
+            == "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
+
+    expired_provider_calls: list[str] = []
+
+    def expired_provider(preparation: object) -> object:
+        expired_provider_calls.append("called")
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+        )
+
+    expired_now = [_NOW]
+    expired, expired_child, expired_host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=expired_provider, clock=lambda: expired_now[0]
+    )
+    try:
+        expired_now[0] = _NOW + 121
+        assert (
+            expired.prepare_compiler_evidence(preparation_id="prep-expired")
+            == "NO_SAFE_WORK"
+        )
+    finally:
+        expired_child.close()
+        expired_host.close()
+
+    assert provider_calls == ["called"]
+    assert expired_provider_calls == []
+
+
+@pytest.mark.parametrize(
+    ("reasoning_effort", "route_hashes", "lease_hashes"),
+    [
+        ("ultra", (_HASH_PREFIX + "2" * 64,), (_HASH_PREFIX + "3" * 64,)),
+        ("high", [_HASH_PREFIX + "2" * 64], (_HASH_PREFIX + "3" * 64,)),
+        (
+            "high",
+            (_HASH_PREFIX + "3" * 64, _HASH_PREFIX + "2" * 64),
+            (_HASH_PREFIX + "4" * 64,),
+        ),
+        (
+            "high",
+            (_HASH_PREFIX + "2" * 64, _HASH_PREFIX + "2" * 64),
+            (_HASH_PREFIX + "3" * 64,),
+        ),
+    ],
+)
+def test_host_session_compiler_evidence_rejects_invalid_effort_or_hash_tuples(
+    reasoning_effort: object,
+    route_hashes: object,
+    lease_hashes: object,
+) -> None:
+    module = _host_session_module()
+
+    def provider(preparation: object) -> object:
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort=reasoning_effort,
+            verified_route_result_hashes=route_hashes,
+            verified_lease_scope_bindings=lease_hashes,
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-invalid-binding")
+            == "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
+
+
+def test_host_session_compiler_evidence_rejects_index_or_terminal_provider_kwargs() -> None:
+    module = _host_session_module()
+
+    def provider(preparation: object) -> object:
+        return preparation.bind(
+            request_hash=_HASH_PREFIX + "1" * 64,
+            reasoning_effort="high",
+            verified_route_result_hashes=(_HASH_PREFIX + "2" * 64,),
+            verified_lease_scope_bindings=(_HASH_PREFIX + "3" * 64,),
+            index_hash=_HASH_PREFIX + "4" * 64,
+            terminal_hash=_HASH_PREFIX + "5" * 64,
+        )
+
+    session, child, host = _fresh_quota_session_for_compiler_evidence(
+        module, provider=provider
+    )
+    try:
+        assert (
+            session.prepare_compiler_evidence(preparation_id="prep-forbidden-kwargs")
+            == "NO_SAFE_WORK"
+        )
+    finally:
+        child.close()
+        host.close()
