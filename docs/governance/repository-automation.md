@@ -10,16 +10,20 @@ enabled.
 | --- | --- | --- |
 | CI | `.github/workflows/ci.yml` | validates MCP runtime, Fast Lane contracts, and the allowlisted package on `main` and pull requests |
 | CodeQL | `.github/workflows/codeql.yml` | scans Python on pull requests, `main`, and a weekly schedule |
-| Dependency review | `.github/workflows/dependency-review.yml` | rejects pull-request dependency changes with high-severity advisories |
+| Dependency review | `.github/workflows/dependency-review.yml` | rejects pull-request dependency changes with high-severity advisories after GitHub Dependency Graph is enabled |
 | Ownership | `.github/CODEOWNERS` | maps every active path to the accountable maintainer |
 | Gemini review policy | `.gemini/config.yaml`, `.gemini/styleguide.md` | configures severity, automatic review, and DevKit-specific review criteria without credentials |
 | Manual release | `.github/workflows/release.yml` | only creates a tag and GitHub Release after a maintainer dispatches it from current `main` and all release gates pass |
 
 The release workflow never publishes merely because a tag was pushed. It
 validates the selected commit against remote `main` before and after its gates,
-then creates an annotated tag only after validation succeeds. It rejects an
-unrelated or published existing tag, while an exact annotated tag with no
-release or a draft release can be resumed safely after a transient failure.
+then creates an annotated tag only after validation succeeds. It re-fetches and
+revalidates the tag's annotated object and target commit immediately before
+creating or resuming the draft release. It rejects an unrelated or published
+existing tag, while an exact annotated tag with no release or a draft release
+can be resumed safely after a transient failure. Checkout credentials are not
+persisted through artifact construction; write credentials are supplied only to
+the tag and GitHub Release steps.
 
 ## Required repository settings
 
@@ -27,7 +31,10 @@ GitHub rulesets cannot be enforced from a committed workflow. A repository
 administrator must protect `main` with pull-request review, required status
 checks (`CI` and `CodeQL`), CODEOWNERS review where appropriate, and blocked
 force pushes. Protect the `prerelease` and `production` environments used by
-the Release workflow before dispatching releases.
+the Release workflow before dispatching releases. In **Settings → Advanced
+Security**, enable **Dependency Graph** before requiring the `Dependency review`
+check; GitHub otherwise reports that the action is unsupported for the
+repository.
 
 ## Dosu size labels
 

@@ -19,7 +19,7 @@ def test_release_workflow_requires_a_main_dispatch_before_it_creates_a_tag() -> 
         'git check-ref-format "refs/tags/${RELEASE_TAG}"',
         "git merge-base --is-ancestor",
         "git tag -a",
-        "git push origin",
+        'git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"',
         "gh release create",
         "gh release upload",
         "--draft=false",
@@ -49,6 +49,44 @@ def test_release_workflow_requires_a_main_dispatch_before_it_creates_a_tag() -> 
     assert workflow.count("git fetch --no-tags origin +refs/heads/main") >= 2
     assert 'git cat-file -t "refs/tags/${RELEASE_TAG}"' in workflow
     assert "release recovery requires a draft release" in workflow
+
+
+def test_release_publish_keeps_write_credentials_out_of_the_build_and_rechecks_tag() -> (
+    None
+):
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    publish = workflow.split("\n  publish:\n", maxsplit=1)[1]
+    tag_step = publish.split(
+        "\n      - name: Create immutable annotated tag", maxsplit=1
+    )[1]
+    tag_step = tag_step.split(
+        "\n      - name: Create or resume draft GitHub Release", maxsplit=1
+    )[0]
+    release_step = publish.split(
+        "\n      - name: Create or resume draft GitHub Release", maxsplit=1
+    )[1]
+
+    assert "persist-credentials: false" in publish
+    assert 'test "${RELEASE_TAG_STATE}" = "resume"' in tag_step
+    assert (
+        tag_step.count(
+            'git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"'
+        )
+        == 1
+    )
+    assert tag_step.index(
+        'git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"'
+    ) > tag_step.index(
+        'git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"'
+    )
+    assert "RELEASE_COMMIT: ${{ needs.metadata.outputs.commit }}" in release_step
+    assert 'git cat-file -t "refs/tags/${RELEASE_TAG}"' in release_step
+    assert (
+        'test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{}")" = "${RELEASE_COMMIT}"'
+        in release_step
+    )
 
 
 def test_release_workflow_runs_mcp_runtime_on_its_windows_contract() -> None:

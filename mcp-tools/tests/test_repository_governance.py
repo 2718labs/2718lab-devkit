@@ -64,7 +64,10 @@ def test_dependency_review_checks_pull_request_dependency_changes() -> None:
 
     for required in (
         "pull_request:",
-        "actions/dependency-review-action@v4",
         "fail-on-severity: high",
     ):
         assert required in workflow
+    action_refs = re.findall(
+        r"actions/dependency-review-action@([0-9a-f]{40})", workflow
+    )
+    assert action_refs == ["2031cfc080254a8a887f58cffee85186f0e49e48"]
