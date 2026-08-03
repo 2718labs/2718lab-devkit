@@ -17,7 +17,13 @@ from typing import Final, NoReturn
 HOST_ENVELOPE_SCHEMA: Final = "2718lab-devkit/host-envelope-v1"
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_TASK_ID = re.compile(r"task-[1-9][0-9]{0,11}\Z")
+_CORRELATION_ID_BY_KIND: Final = {
+    "coordinator_assignment": re.compile(r"operation-[1-9][0-9]{0,11}\Z"),
+    "worker_terminal_result": re.compile(r"operation-[1-9][0-9]{0,11}\Z"),
+    "peer_evidence_handoff": re.compile(r"handoff-[1-9][0-9]{0,11}\Z"),
+}
+_RISK_CODES: Final = frozenset({"none", "bounded", "unverified"})
 _ROLE_BY_KIND: Final = {
     "coordinator_assignment": ("coordinator", "worker"),
     "worker_terminal_result": ("worker", "coordinator"),
@@ -228,8 +234,7 @@ def _validate_binding(binding: EnvelopeBinding, *, now: int) -> dict[str, object
     _validate_now(now)
     if type(binding) is not EnvelopeBinding:
         _invalid()
-    if _IDENTIFIER.fullmatch(binding.task_id) is None:
-        _invalid()
+    _validate_task_id(binding.task_id)
     if (
         type(binding.lease_epoch) is not int
         or binding.lease_epoch < 1
@@ -270,7 +275,9 @@ def _validate_expectation(
     payload = envelope["payload"]
     assert type(payload) is dict
     if expectation.correlation_id is not None:
-        _validate_identifier(expectation.correlation_id)
+        _validate_correlation_id(
+            expectation.correlation_id, kind=expectation.kind
+        )
         if payload.get("correlation_id") != expectation.correlation_id:
             raise HostEnvelopeError("HOST_ENVELOPE_BINDING_INVALID")
     if expectation.peer_capability is not None:
@@ -292,7 +299,9 @@ def _validate_payload(kind: str, payload: object) -> dict[str, object]:
         }:
             _invalid()
         return {
-            "correlation_id": _required_identifier(payload, "correlation_id"),
+            "correlation_id": _required_correlation_id(
+                payload, "correlation_id", kind="coordinator_assignment"
+            ),
             "assignment": _required_text(payload, "assignment"),
             "context": _required_text_items(payload, "context"),
             "artifact_refs": _required_refs(payload, "artifact_refs", _MAX_ARTIFACT_REFS),
@@ -313,7 +322,9 @@ def _validate_payload(kind: str, payload: object) -> dict[str, object]:
         if type(terminal) is not str or terminal not in {"succeeded", "failed", "blocked"}:
             _invalid()
         return {
-            "correlation_id": _required_identifier(payload, "correlation_id"),
+            "correlation_id": _required_correlation_id(
+                payload, "correlation_id", kind="worker_terminal_result"
+            ),
             "predecessor_hash": _required_digest(payload, "predecessor_hash"),
             "terminal": terminal,
             "result": _required_text_items(payload, "result"),
@@ -332,7 +343,9 @@ def _validate_payload(kind: str, payload: object) -> dict[str, object]:
         }:
             _invalid()
         return {
-            "correlation_id": _required_identifier(payload, "correlation_id"),
+            "correlation_id": _required_correlation_id(
+                payload, "correlation_id", kind="peer_evidence_handoff"
+            ),
             "peer_capability": _required_digest(payload, "peer_capability"),
             "dependency": _required_text_items(payload, "dependency"),
             "evidence": _required_text_items(payload, "evidence"),
@@ -353,7 +366,7 @@ def _required_risks(payload: Mapping[str, object]) -> list[dict[str, str]]:
             _invalid()
         code = risk.get("code")
         detail = risk.get("detail")
-        _validate_identifier(code)
+        _validate_risk_code(code)
         _validate_text(detail, purpose="risk.detail")
         assert type(code) is str
         assert type(detail) is str
@@ -399,9 +412,11 @@ def _required_text(payload: Mapping[str, object], field: str) -> str:
     return value
 
 
-def _required_identifier(payload: Mapping[str, object], field: str) -> str:
+def _required_correlation_id(
+    payload: Mapping[str, object], field: str, *, kind: str
+) -> str:
     value = payload.get(field)
-    _validate_identifier(value)
+    _validate_correlation_id(value, kind=kind)
     assert type(value) is str
     return value
 
@@ -427,8 +442,19 @@ def _required_int(payload: Mapping[str, object], field: str) -> int:
     return value
 
 
-def _validate_identifier(value: object) -> None:
-    if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
+def _validate_task_id(value: object) -> None:
+    if type(value) is not str or _TASK_ID.fullmatch(value) is None:
+        _invalid()
+
+
+def _validate_correlation_id(value: object, *, kind: str) -> None:
+    pattern = _CORRELATION_ID_BY_KIND.get(kind)
+    if type(value) is not str or pattern is None or pattern.fullmatch(value) is None:
+        _invalid()
+
+
+def _validate_risk_code(value: object) -> None:
+    if type(value) is not str or value not in _RISK_CODES:
         _invalid()
 
 

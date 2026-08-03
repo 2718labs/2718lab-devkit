@@ -625,7 +625,7 @@ def test_inherited_handle_bridge_rejects_replayed_capability_probe_sequence() ->
     try:
         child.send_capability_probe(
             binding={
-                "task_id": "host-bridge-task",
+                "task_id": "task-1",
                 "lease_epoch": 7,
                 "assignment_token": "sha256:" + "a" * 64,
                 "dispatch_context_hash": "sha256:" + "b" * 64,
@@ -647,11 +647,11 @@ def test_inherited_handle_bridge_rejects_replayed_capability_probe_sequence() ->
             replay._write_complete(
                 replay._frame_bytes(
                     kind="capability_probe",
-                    action_id="host-bridge-task",
+                    action_id="task-1",
                     sequence=replay._next_out,
                     payload={
                         "schema": "2718lab-devkit/host-capability-probe-v1",
-                        "task_id": "host-bridge-task",
+                        "task_id": "task-1",
                         "lease_epoch": 7,
                         "assignment_token": "sha256:" + "a" * 64,
                         "dispatch_context_hash": "sha256:" + "b" * 64,

@@ -19,7 +19,7 @@ from devkit_runtime.host_bridge import (
 )
 
 _NOW = 1_700_000_000
-_TASK_ID = "host-bridge-task"
+_TASK_ID = "task-1"
 _TOKEN = "sha256:" + "a" * 64
 _CONTEXT_HASH = "sha256:" + "b" * 64
 _ROUTE_HASH = "sha256:" + "c" * 64
@@ -152,7 +152,7 @@ def test_role_scoped_envelopes_render_validate_and_hash_canonically(
             "HOST_ENVELOPE_INVALID",
         ),
         (
-            lambda envelope: envelope.__setitem__("task_id", "other-task"),
+            lambda envelope: envelope.__setitem__("task_id", "task-2"),
             "HOST_ENVELOPE_BINDING_INVALID",
         ),
         (
@@ -206,6 +206,45 @@ def test_envelope_rejects_stale_or_equal_expiry(expires_at: int) -> None:
         )
 
     assert caught.value.code == "HOST_ENVELOPE_EXPIRED"
+
+
+@pytest.mark.parametrize(
+    "unsafe_identifier",
+    ["sk-live-synthetic-private-value", "opaque-1"],
+)
+@pytest.mark.parametrize("field", ["task_id", "correlation_id", "risk.code"])
+def test_envelope_rejects_unsafe_machine_identifiers(
+    field: str, unsafe_identifier: str
+) -> None:
+    module = _envelopes()
+    if field == "task_id":
+        binding = module.EnvelopeBinding(
+            task_id=unsafe_identifier,
+            lease_epoch=7,
+            assignment_token=_TOKEN,
+            dispatch_context_hash=_CONTEXT_HASH,
+            route_hash=_ROUTE_HASH,
+            expires_at=_NOW + 60,
+        )
+        with pytest.raises(module.HostEnvelopeError) as caught:
+            module.render_envelope(
+                kind="coordinator_assignment",
+                binding=binding,
+                payload=_assignment_payload(),
+                now=_NOW,
+            )
+    elif field == "correlation_id":
+        payload = _assignment_payload()
+        payload["correlation_id"] = unsafe_identifier
+        with pytest.raises(module.HostEnvelopeError) as caught:
+            _render(module, "coordinator_assignment", payload)
+    else:
+        payload = _terminal_payload()
+        payload["risk"] = [{"code": unsafe_identifier, "detail": "risk.none"}]
+        with pytest.raises(module.HostEnvelopeError) as caught:
+            _render(module, "worker_terminal_result", payload)
+
+    assert caught.value.code == "HOST_ENVELOPE_INVALID"
 
 
 @pytest.mark.parametrize(
@@ -844,7 +883,6 @@ def test_private_bridge_rejects_terminal_result_for_peer_handoff() -> None:
             module,
             "worker_terminal_result",
             _terminal_payload(
-                correlation_id=received.correlation_id,
                 predecessor_hash=received.envelope_hash,
             ),
         )
