@@ -42,6 +42,14 @@ class AtlasOutboxState(str, Enum):
     QUARANTINED = "quarantined"
 
 
+class RoleEnvelopeDirection(Enum):
+    """The three bounded directions supported by durable role messaging."""
+
+    COORDINATOR_TO_WORKER = "coordinator_to_worker"
+    WORKER_TO_COORDINATOR = "worker_to_coordinator"
+    PEER_TO_PEER = "peer_to_peer"
+
+
 @dataclass(frozen=True)
 class Workflow:
     id: str
@@ -124,3 +132,69 @@ class AtlasOutboxItem:
     def reasons(self) -> tuple[str, ...]:
         """Return stable reason codes using the projection-facing naming."""
         return self.reason_codes
+
+
+@dataclass(frozen=True)
+class RoleRiskItem:
+    """One bounded, reference-only risk carried by a worker terminal packet."""
+
+    code: str
+    severity: str
+    evidence_hash: str
+
+
+@dataclass(frozen=True)
+class RoleEnvelope:
+    """Durable, role-scoped mailbox entry with no transcript-bearing fields."""
+
+    delivery_id: str
+    sequence: int
+    direction: RoleEnvelopeDirection
+    workflow_id: str
+    sender_task_id: str
+    sender_role: str
+    sender_epoch: int
+    recipient_task_id: str
+    recipient_role: str
+    recipient_epoch: int
+    correlation_id: str
+    assignment_token_hash: str
+    dispatch_context_hash: str
+    route_provenance_hash: str
+    coordinator_task_id: str
+    coordinator_epoch: int
+    correlation_fence_hash: str
+    task_card_hash: str
+    contract_hashes: tuple[str, ...]
+    index_evidence_hashes: tuple[str, ...]
+    terminal_result_hash: str
+    evidence_hashes: tuple[str, ...]
+    dependency_hashes: tuple[str, ...]
+    recipient_capability_hash: str
+    risk_items: tuple[RoleRiskItem, ...]
+    issued_at: str
+    expires_at: str
+    delivery_state: str
+    acknowledged_at: str | None
+    envelope_hash: str
+
+
+@dataclass(frozen=True)
+class HostOperationReceipt:
+    """A reference-only host-operation report; it is never a task transition."""
+
+    operation_id: str
+    workflow_id: str
+    task_id: str
+    operation: str
+    lease_epoch: int
+    assignment_token_hash: str
+    dispatch_context_hash: str
+    route_provenance_hash: str
+    coordinator_task_id: str
+    coordinator_epoch: int
+    errno: int
+    status_code: str
+    outcome: str
+    receipt_hash: str
+    reported_at: str

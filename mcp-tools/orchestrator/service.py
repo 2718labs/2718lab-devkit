@@ -19,7 +19,14 @@ from typing import Any
 
 from devkit_atlas.receipts import RawExecutionReceipt, ReceiptRepository
 
-from .models import Task, TaskKind, TaskState, Workflow
+from .models import (
+    RoleEnvelopeDirection,
+    RoleRiskItem,
+    Task,
+    TaskKind,
+    TaskState,
+    Workflow,
+)
 from .store import AcceptedCodeTaskEvidence, Artifact, Lease, SQLiteStore, StoreError
 
 
@@ -786,6 +793,169 @@ class OrchestratorService:
         )
         return self._message_projection(message)
 
+    def send_role_envelope(
+        self,
+        workflow_id: str,
+        sender_task_id: str,
+        recipient_task_id: str,
+        *,
+        owner: str,
+        epoch: int,
+        recipient_epoch: int,
+        direction: RoleEnvelopeDirection | str,
+        sender_role: str,
+        recipient_role: str,
+        assignment_token: str,
+        dispatch_context_hash: str,
+        route_provenance_hash: str,
+        correlation_id: str,
+        ttl_seconds: int,
+        task_card_hash: str = "",
+        contract_hashes: tuple[str, ...] = (),
+        index_evidence_hashes: tuple[str, ...] = (),
+        terminal_result_hash: str = "",
+        evidence_hashes: tuple[str, ...] = (),
+        dependency_hashes: tuple[str, ...] = (),
+        risk_items: tuple[RoleRiskItem | Mapping[str, str], ...] = (),
+        coordinator_task_id: str | None = None,
+        coordinator_epoch: int | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably hand off one bounded role packet without a host-side send."""
+
+        try:
+            direction_value = RoleEnvelopeDirection(direction)
+        except (TypeError, ValueError) as error:
+            raise ServiceError(
+                "ROLE_ENVELOPE_INVALID", "role envelope direction is not supported"
+            ) from error
+        capability = None
+        if direction_value is RoleEnvelopeDirection.PEER_TO_PEER:
+            capability = next(
+                (
+                    peer["capability"]
+                    for peer in self.peers(workflow_id, sender_task_id)
+                    if peer["task_id"] == recipient_task_id
+                ),
+                None,
+            )
+            if capability is None:
+                raise ServiceError("PEER_FORBIDDEN", "recipient is not an authorized peer")
+        envelope = self._call(
+            self._store.enqueue_role_envelope,
+            workflow_id,
+            sender_task_id,
+            recipient_task_id,
+            owner,
+            epoch,
+            recipient_epoch=recipient_epoch,
+            direction=direction_value,
+            sender_role=sender_role,
+            recipient_role=recipient_role,
+            assignment_token=assignment_token,
+            dispatch_context_hash=dispatch_context_hash,
+            route_provenance_hash=route_provenance_hash,
+            correlation_id=correlation_id,
+            ttl_seconds=ttl_seconds,
+            task_card_hash=task_card_hash,
+            contract_hashes=contract_hashes,
+            index_evidence_hashes=index_evidence_hashes,
+            terminal_result_hash=terminal_result_hash,
+            evidence_hashes=evidence_hashes,
+            dependency_hashes=dependency_hashes,
+            risk_items=risk_items,
+            coordinator_task_id=coordinator_task_id,
+            coordinator_epoch=coordinator_epoch,
+            capability=capability,
+            now=now,
+            max_count=self._mailbox_count_limit,
+            max_bytes=self._mailbox_byte_limit,
+        )
+        return self._role_envelope_projection(envelope)
+
+    def role_inbox(
+        self,
+        workflow_id: str,
+        recipient_task_id: str,
+        *,
+        owner: str,
+        epoch: int,
+        recipient_role: str,
+        cursor: str | None = None,
+        limit: int = 50,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        envelopes = self._call(
+            self._store.read_role_inbox,
+            workflow_id,
+            recipient_task_id,
+            owner,
+            epoch,
+            recipient_role=recipient_role,
+            cursor=cursor,
+            limit=limit,
+            now=now,
+        )
+        return {"entries": tuple(self._role_envelope_projection(item) for item in envelopes)}
+
+    def ack_role_envelope(
+        self,
+        workflow_id: str,
+        recipient_task_id: str,
+        delivery_id: str,
+        *,
+        owner: str,
+        epoch: int,
+        recipient_role: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        envelope = self._call(
+            self._store.ack_role_envelope,
+            workflow_id,
+            recipient_task_id,
+            owner,
+            epoch,
+            delivery_id,
+            recipient_role=recipient_role,
+            now=now,
+        )
+        return self._role_envelope_projection(envelope)
+
+    def record_host_archive_result(
+        self,
+        workflow_id: str,
+        task_id: str,
+        *,
+        owner: str,
+        epoch: int,
+        operation_id: str,
+        assignment_token: str,
+        dispatch_context_hash: str,
+        route_provenance_hash: str,
+        coordinator_task_id: str,
+        coordinator_epoch: int,
+        errno: int,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a supplied archive report; no archive API is called here."""
+
+        receipt = self._call(
+            self._store.record_host_archive_result,
+            workflow_id,
+            task_id,
+            owner,
+            epoch,
+            operation_id=operation_id,
+            assignment_token=assignment_token,
+            dispatch_context_hash=dispatch_context_hash,
+            route_provenance_hash=route_provenance_hash,
+            coordinator_task_id=coordinator_task_id,
+            coordinator_epoch=coordinator_epoch,
+            errno=errno,
+            now=now,
+        )
+        return self._host_operation_projection(receipt)
+
     def completed_input(self, workflow_id: str, input_hash: str) -> Task | None:
         workflow = self._call(self._store.get_workflow, workflow_id)
         return self._call(
@@ -902,6 +1072,64 @@ class OrchestratorService:
             "created_at": message.created_at,
             "expires_at": message.expires_at,
             "delivery_state": message.delivery_state,
+        }
+
+    @staticmethod
+    def _role_envelope_projection(envelope: Any) -> dict[str, Any]:
+        """Project only typed references, never a token, capability, path, or body."""
+
+        return {
+            "delivery_id": envelope.delivery_id,
+            "direction": envelope.direction.value,
+            "workflow_id": envelope.workflow_id,
+            "sender_task_id": envelope.sender_task_id,
+            "sender_role": envelope.sender_role,
+            "sender_epoch": envelope.sender_epoch,
+            "recipient_task_id": envelope.recipient_task_id,
+            "recipient_role": envelope.recipient_role,
+            "recipient_epoch": envelope.recipient_epoch,
+            "coordinator_task_id": envelope.coordinator_task_id,
+            "coordinator_epoch": envelope.coordinator_epoch,
+            "correlation_id": envelope.correlation_id,
+            "dispatch_context_hash": envelope.dispatch_context_hash,
+            "route_provenance_hash": envelope.route_provenance_hash,
+            "correlation_fence_hash": envelope.correlation_fence_hash,
+            "task_card_hash": envelope.task_card_hash,
+            "contract_hashes": envelope.contract_hashes,
+            "index_evidence_hashes": envelope.index_evidence_hashes,
+            "terminal_result_hash": envelope.terminal_result_hash,
+            "evidence_hashes": envelope.evidence_hashes,
+            "dependency_hashes": envelope.dependency_hashes,
+            "recipient_capability_hash": envelope.recipient_capability_hash,
+            "risk_items": tuple(
+                {
+                    "code": risk.code,
+                    "severity": risk.severity,
+                    "evidence_hash": risk.evidence_hash,
+                }
+                for risk in envelope.risk_items
+            ),
+            "issued_at": envelope.issued_at,
+            "expires_at": envelope.expires_at,
+            "delivery_state": envelope.delivery_state,
+            "envelope_hash": envelope.envelope_hash,
+        }
+
+    @staticmethod
+    def _host_operation_projection(receipt: Any) -> dict[str, Any]:
+        return {
+            "operation_id": receipt.operation_id,
+            "workflow_id": receipt.workflow_id,
+            "task_id": receipt.task_id,
+            "operation": receipt.operation,
+            "lease_epoch": receipt.lease_epoch,
+            "coordinator_task_id": receipt.coordinator_task_id,
+            "coordinator_epoch": receipt.coordinator_epoch,
+            "errno": receipt.errno,
+            "status_code": receipt.status_code,
+            "outcome": receipt.outcome,
+            "receipt_hash": receipt.receipt_hash,
+            "reported_at": receipt.reported_at,
         }
 
     def _finish_task(

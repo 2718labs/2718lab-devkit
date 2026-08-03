@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import unittest
+from hashlib import sha256
 from pathlib import Path
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -233,6 +234,257 @@ class SQLiteStoreMessagingTests(unittest.TestCase):
                 max_bytes=100,
                 now=self._NOW,
             )
+
+
+class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
+    """Store-level role-envelope fences cannot be bypassed through the service."""
+
+    _NOW = "2026-08-03T00:00:00+00:00"
+
+    @staticmethod
+    def _hash(value: str) -> str:
+        return f"sha256:{sha256(value.encode('utf-8')).hexdigest()}"
+
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self._database = Path(self._temporary_directory.name) / "orchestrator.sqlite"
+        self.store = SQLiteStore(self._database)
+        self.workflow = self.store.create_workflow(
+            Workflow(
+                "workflow-role-mail",
+                WorkflowKind.DAG,
+                "role mailbox workflow",
+                "summary",
+                WorkflowState.RUNNING,
+                policy_version="policy-1",
+                created_at=self._NOW,
+                updated_at=self._NOW,
+            )
+        )
+        self.coordinator = self.store.register_task(
+            Task(
+                "coordinator",
+                self.workflow.id,
+                "coordinator",
+                "coordinator",
+                TaskState.RUNNING,
+                card_hash=self._hash("COORDINATOR SOURCE BODY MUST NOT PROJECT"),
+            ),
+            card_body="COORDINATOR SOURCE BODY MUST NOT PROJECT",
+            contract_subscriptions=(self._hash("contract"),),
+        )
+        self.worker_one = self.store.register_task(
+            Task(
+                "worker-one",
+                self.workflow.id,
+                "worker one",
+                "worker",
+                TaskState.RUNNING,
+                card_hash=self._hash("WORKER SOURCE BODY MUST NOT PROJECT"),
+            ),
+            card_body="WORKER SOURCE BODY MUST NOT PROJECT",
+            contract_subscriptions=(self._hash("contract"),),
+        )
+        self.worker_two = self.store.register_task(
+            Task(
+                "worker-two",
+                self.workflow.id,
+                "worker two",
+                "worker",
+                TaskState.RUNNING,
+                card_hash=self._hash("SECOND WORKER SOURCE BODY MUST NOT PROJECT"),
+            ),
+            card_body="SECOND WORKER SOURCE BODY MUST NOT PROJECT",
+            contract_subscriptions=(self._hash("contract"),),
+        )
+        self.coordinator_lease = self.store.acquire_lease(
+            "coordinator", "coordinator-owner", "2026-08-03T01:00:00+00:00", now=self._NOW
+        )
+        self.worker_one_lease = self.store.acquire_lease(
+            "worker-one", "worker-one-owner", "2026-08-03T01:00:00+00:00", now=self._NOW
+        )
+        self.worker_two_lease = self.store.acquire_lease(
+            "worker-two", "worker-two-owner", "2026-08-03T01:00:00+00:00", now=self._NOW
+        )
+        self.index_hash = self._hash("index")
+        self.store.register_task_artifact(
+            "coordinator",
+            "coordinator-owner",
+            self.coordinator_lease.epoch,
+            kind="evidence",
+            content_hash=self.index_hash,
+            safe_path="evidence/index.json",
+            size=16,
+            redaction_version="r1",
+            now=self._NOW,
+        )
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._temporary_directory.cleanup()
+
+    def _assignment_kwargs(self) -> dict[str, object]:
+        return {
+            "recipient_epoch": self.worker_one_lease.epoch,
+            "direction": "coordinator_to_worker",
+            "sender_role": "coordinator",
+            "recipient_role": "worker",
+            "assignment_token": self._hash("assignment token"),
+            "dispatch_context_hash": self._hash("dispatch context"),
+            "route_provenance_hash": self._hash("route provenance"),
+            "correlation_id": "assignment-one",
+            "ttl_seconds": 30,
+            "task_card_hash": self.worker_one.card_hash,
+            "contract_hashes": (self._hash("contract"),),
+            "index_evidence_hashes": (self.index_hash,),
+            "max_count": 4,
+            "max_bytes": 64,
+            "now": self._NOW,
+        }
+
+    def _role_row_count(self) -> int:
+        return int(
+            self.store._connection.execute("SELECT COUNT(*) FROM role_envelopes").fetchone()[0]
+        )
+
+    def test_sensitive_fields_each_reject_without_any_role_row_or_event(self) -> None:
+        self.assertTrue(hasattr(self.store, "enqueue_role_envelope"))
+        cases = (
+            ("assignment_token", "Bearer SHOULD NEVER PERSIST"),
+            ("dispatch_context_hash", "ENV=TOP_SECRET"),
+            ("task_card_hash", "RAW TRANSCRIPT MUST NEVER PERSIST"),
+            ("index_evidence_hashes", ("C:\\absolute\\source-body.txt",)),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                arguments = self._assignment_kwargs()
+                arguments[field] = value
+                with self.assertRaises(Exception) as captured:
+                    self.store.enqueue_role_envelope(
+                        self.workflow.id,
+                        "coordinator",
+                        "worker-one",
+                        "coordinator-owner",
+                        self.coordinator_lease.epoch,
+                        **arguments,
+                    )
+                self.assertEqual("ROLE_ENVELOPE_INVALID", captured.exception.code)
+                self.assertEqual(0, self._role_row_count())
+                self.assertEqual((), self.store.list_events(self.workflow.id))
+
+    def test_wrong_peer_capability_fails_without_a_new_role_envelope(self) -> None:
+        assignment = self.store.enqueue_role_envelope(
+            self.workflow.id,
+            "coordinator",
+            "worker-one",
+            "coordinator-owner",
+            self.coordinator_lease.epoch,
+            **self._assignment_kwargs(),
+        )
+        worker_evidence = self._hash("worker evidence")
+        self.store.register_task_artifact(
+            "worker-one",
+            "worker-one-owner",
+            self.worker_one_lease.epoch,
+            kind="evidence",
+            content_hash=worker_evidence,
+            safe_path="evidence/worker-evidence.json",
+            size=16,
+            redaction_version="r1",
+            now=self._NOW,
+        )
+        self.store.list_authorized_peers(self.workflow.id, "worker-one")
+        event_count = len(self.store.list_events(self.workflow.id))
+        with self.assertRaises(CapabilityInvalidError) as captured:
+            self.store.enqueue_role_envelope(
+                self.workflow.id,
+                "worker-one",
+                "worker-two",
+                "worker-one-owner",
+                self.worker_one_lease.epoch,
+                recipient_epoch=self.worker_two_lease.epoch,
+                direction="peer_to_peer",
+                sender_role="worker",
+                recipient_role="worker",
+                assignment_token=self._hash("assignment token"),
+                dispatch_context_hash=self._hash("dispatch context"),
+                route_provenance_hash=self._hash("route provenance"),
+                correlation_id="peer-one",
+                ttl_seconds=30,
+                evidence_hashes=(worker_evidence,),
+                dependency_hashes=(worker_evidence,),
+                coordinator_task_id="coordinator",
+                coordinator_epoch=self.coordinator_lease.epoch,
+                capability="wrong-peer-capability",
+                max_count=4,
+                max_bytes=64,
+                now=self._NOW,
+            )
+        self.assertEqual("CAPABILITY_INVALID", captured.exception.code)
+        self.assertEqual(assignment.delivery_id, self.store._role_envelope_from_row(
+            self.store._connection.execute(
+                "SELECT * FROM role_envelopes WHERE delivery_id = ?", (assignment.delivery_id,)
+            ).fetchone()
+        ).delivery_id)
+        self.assertEqual(1, self._role_row_count())
+        self.assertEqual(event_count, len(self.store.list_events(self.workflow.id)))
+
+
+class SQLiteStoreRoleEnvelopeSchemaTests(unittest.TestCase):
+    """The v6 upgrade creates the same unique envelope hash surface as a fresh v7 DB."""
+
+    def test_v6_upgrade_and_fresh_v7_have_the_partial_unique_envelope_hash_index(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        legacy_database = Path(temporary.name) / "legacy.sqlite"
+        fresh_database = Path(temporary.name) / "fresh.sqlite"
+        connection = sqlite3.connect(legacy_database)
+        try:
+            connection.execute(
+                "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO schema_metadata (key, value) VALUES ('schema_version', '6')"
+            )
+            connection.execute(
+                """
+                CREATE TABLE messages (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    delivery_id TEXT NOT NULL UNIQUE,
+                    workflow_id TEXT NOT NULL,
+                    sender_task_id TEXT NOT NULL,
+                    recipient_task_id TEXT NOT NULL,
+                    correlation_id TEXT NOT NULL,
+                    artifact_hash TEXT NOT NULL,
+                    redacted_metadata TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    UNIQUE (workflow_id, sender_task_id, recipient_task_id, correlation_id)
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        legacy = SQLiteStore(legacy_database)
+        fresh = SQLiteStore(fresh_database)
+        self.addCleanup(legacy.close)
+        self.addCleanup(fresh.close)
+        self.assertEqual(7, legacy.schema_version())
+        expected_index = "idx_role_envelopes_envelope_hash"
+        for store in (legacy, fresh):
+            indexes = {
+                str(row["name"]): int(row["unique"])
+                for row in store._connection.execute("PRAGMA index_list(role_envelopes)").fetchall()
+            }
+            self.assertEqual(1, indexes[expected_index])
+            sql = store._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (expected_index,),
+            ).fetchone()[0]
+            self.assertIn("WHERE envelope_hash IS NOT NULL", str(sql))
 
 
 if __name__ == "__main__":
