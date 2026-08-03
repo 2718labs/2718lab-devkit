@@ -108,7 +108,6 @@ jobs:
         run: |
           $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-release\mcp-runtime'
           New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'uv-cache') | Out-Null
-          New-Item -ItemType Directory -Force -Path 'D:\bun\tmp\codex\2718-devkit\worktrees\atlas12b-team-efficiency' | Out-Null
           @(
             "CODEX_TASK_TEMP=$root"
             "TEMP=$(Join-Path $root 'tmp')"

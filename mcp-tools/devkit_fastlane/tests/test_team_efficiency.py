@@ -221,9 +221,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.project = self.fast_lane_task_root.relative_to(
             r"D:\bun\tmp\codex"
         ).as_posix()
-        self.repo = (
-            Path(r"D:\bun\tmp\codex\2718-devkit\worktrees") / "atlas12b-team-efficiency"
-        )
+        self.repo = self.fast_lane_task_root / "fixture-repository"
+        self.repo.mkdir()
         self._stores: list[SQLiteStore] = []
         self._index_services: list[ProjectIndexService] = []
         self._project_runtimes: list[ProjectCheckpointRuntime] = []
@@ -238,6 +237,10 @@ class TeamEfficiencyTests(unittest.TestCase):
         self._temporary_directory.cleanup()
         if self._fastlane_task_root is not None:
             os.environ["CODEX_FASTLANE_TASK_ROOT"] = self._fastlane_task_root
+
+    def test_fast_lane_fixture_repository_is_task_local_and_existing(self) -> None:
+        self.assertEqual(self.fast_lane_task_root / "fixture-repository", self.repo)
+        self.assertTrue(self.repo.is_dir())
 
     def orchestrator(
         self,

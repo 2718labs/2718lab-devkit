@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -125,9 +126,9 @@ for raw in sys.stdin:
 
 class CodexAccountQuotaTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = Path(
-            tempfile.mkdtemp(prefix="quota-provider-", dir="D:/bun/tmp/codex")
-        )
+        task_root = Path(os.environ["CODEX_TASK_TEMP"]).resolve(strict=False)
+        task_root.mkdir(parents=True, exist_ok=True)
+        self.temp = Path(tempfile.mkdtemp(prefix="quota-provider-", dir=task_root))
 
     def tearDown(self) -> None:
         for path in sorted(self.temp.rglob("*"), reverse=True):
@@ -136,6 +137,9 @@ class CodexAccountQuotaTests(unittest.TestCase):
             elif path.is_dir():
                 path.rmdir()
         self.temp.rmdir()
+
+    def test_temporary_state_is_scoped_to_the_configured_task_root(self) -> None:
+        self.assertTrue(self.temp.is_relative_to(Path(os.environ["CODEX_TASK_TEMP"])))
 
     def provider(self, *, spark_label: str = "GPT-5.3-Codex-Spark"):
         module = load_provider()

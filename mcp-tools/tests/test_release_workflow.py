@@ -67,5 +67,5 @@ def test_release_workflow_runs_mcp_runtime_on_its_windows_contract() -> None:
     fixture_repo = (
         "D:\\bun\\tmp\\codex\\2718-devkit\\worktrees\\atlas12b-team-efficiency"
     )
-    assert fixture_repo in mcp_runtime
-    assert fixture_repo in ci_mcp_runtime
+    assert fixture_repo not in mcp_runtime
+    assert fixture_repo not in ci_mcp_runtime
