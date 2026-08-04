@@ -2,9 +2,23 @@
 
 All notable changes to 2718lab DevKit are documented here.
 
-The project follows Keep a Changelog conventions. GitHub Releases for tagged
-versions are published by the repository release workflow after the CI and
-artifact checks pass.
+The project follows Keep a Changelog conventions. A maintainer dispatches the
+repository release workflow from current `main`; it creates a new annotated tag
+only after the CI and artifact checks pass.
+
+## [Unreleased]
+
+### Changed
+
+- Removed the retired AstrBot extension, its dedicated manual, and its
+  packaging/release/CI paths. DevKit is now one Codex-first product with an
+  MCP runtime and a documentation-only Skill manual bundle.
+- Replaced tag-push publication with a maintainer-dispatched release gate that
+  validates current `main`, creates an annotated tag only after its gates, and
+  can safely resume an exact tag that has no release or only a draft release.
+- Added repository governance files, CODEOWNERS, CodeQL, and checked-in Gemini
+  Code Assist review policy. Dosu size labeling is documented as its external
+  GitHub App integration so it remains a single label writer.
 
 ## [1.0.0-rc4] - 2026-08-03
 

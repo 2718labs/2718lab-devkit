@@ -187,7 +187,6 @@ plan 可自报的根字段。
 
 | 领域 | Skill |
 |---|---|
-| AstrBot | `astrbot-plugin-dev` |
 | MCP / FastMCP | `mcp-server-dev` |
 | Python 工程 | `python-engineering` |
 | 发布、CI、市场 | `oss-repo-ops` |

@@ -1,4 +1,4 @@
-"""Metadata checks for the MCP-only primary plugin package."""
+"""Metadata checks for the MCP runtime primary plugin package."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 MANUAL_SKILLS = {
-    "astrbot-plugin-dev",
     "bugkiller",
     "code-atlas",
     "devkit-overview",
@@ -31,7 +30,9 @@ def load_json(relative_path: str) -> dict[str, Any]:
 
 
 class BugkillerMetadataTests(unittest.TestCase):
-    def test_primary_plugin_manifest_is_rc4_and_mcp_only(self) -> None:
+    def test_primary_plugin_manifest_is_rc4_and_has_no_prompt_runtime_surface(
+        self,
+    ) -> None:
         codex = load_json(".codex-plugin/plugin.json")
         self.assertEqual("1.0.0-rc4", codex["version"])
         self.assertEqual("./.mcp.json", codex["mcpServers"])
@@ -86,8 +87,25 @@ class BugkillerMetadataTests(unittest.TestCase):
                 surface.is_dir() and any(surface.iterdir()),
                 removed_surface,
             )
-        for relative_path in ("skills", "extensions"):
-            self.assertTrue((ROOT / relative_path).is_dir(), relative_path)
+        self.assertTrue((ROOT / "skills").is_dir(), "skills")
+        self.assertFalse((ROOT / "extensions").exists(), "extensions")
+
+    def test_astrbot_is_not_an_active_source_or_automation_surface(self) -> None:
+        for relative_path in (
+            "extensions/astrbot",
+            "skills/astrbot-plugin-dev",
+            "skills/oss-repo-ops/references/astrbot-market.md",
+        ):
+            self.assertFalse((ROOT / relative_path).exists(), relative_path)
+        for relative_path in (
+            ".github/dependabot.yml",
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+            "README.md",
+            "README.zh-CN.md",
+        ):
+            content = (ROOT / relative_path).read_text(encoding="utf-8").casefold()
+            self.assertNotIn("astrbot", content, relative_path)
 
     def test_local_skill_bundle_contains_only_reference_manuals(self) -> None:
         skill_root = ROOT / "skills"
