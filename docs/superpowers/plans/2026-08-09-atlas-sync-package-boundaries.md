@@ -66,16 +66,13 @@ watchers; changes to Project Index package files.
 - Modify: `mcp-tools/project_index/models.py`
 - Modify: `mcp-tools/project_index/store.py`
 - Modify: `mcp-tools/project_index/service.py`
-- Modify: `mcp-tools/devkit_runtime/project_checkpoint.py`
-- Modify: `mcp-tools/devkit_runtime/tool_result.py`
-- Modify: `mcp-tools/server.py`
 - Test: `mcp-tools/tests/test_project_index_core.py`
-- Test: `mcp-tools/tests/test_mcp_contract.py`
-- Test: `mcp-tools/tests/test_tool_result_contract.py`
 
 **Prohibited:** a new MCP tool; package-root registration as a Git worktree;
 path/glob selectors; semantic dependency or package-manager workspace
-resolution; edits to Atlas runtime files.
+resolution; edits to runtime adapters, server, result projectors, or Atlas
+runtime files.  The coordinator owns those shared public-adapter files after
+both disjoint worker commits are reviewed.
 
 - [ ] Write RED tests for the existing coverage hole: a snapshot restricted to
   `packages/foo` must be `INDEX_PARTIAL` for required `packages`, including
@@ -84,13 +81,12 @@ resolution; edits to Atlas runtime files.
   descriptors; root/nested packages; unsupported/invalid manifest gaps;
   descriptor persistence across reopen; manifest-hash/snapshot-id sensitivity;
   and schema-v4-to-v5 migration.
-- [ ] Write RED tests for public package selection: sync publishes bounded
-  descriptor ids; no selector preserves legacy status/query payload behavior;
-  ordered valid selectors limit nodes/edges/windows/receipt and ignore an
-  unselected package change; unordered, duplicate, unknown, and out-of-coverage
-  selector requests fail closed.
+- [ ] Write RED domain tests for ordered valid package ids limiting
+  nodes/edges/windows/receipt and ignoring an unselected package change;
+  unordered, duplicate, unknown, and out-of-coverage selector requests fail
+  closed.  Public adapter/schema assertions are coordinator-owned in Task 3.
 - [ ] Run focused RED and retain exact failure evidence:
-  `python -m pytest -q tests/test_project_index_core.py tests/test_mcp_contract.py tests/test_tool_result_contract.py -k "coverage or package"`.
+  `python -m pytest -q tests/test_project_index_core.py -k "coverage or package"`.
 - [ ] Implement pure manifest discovery and a `PackageDescriptor`; fold its
   canonical payload into the snapshot manifest hash.
 - [ ] Bump Project Index schema from 4 to 5 and add only the append-only
@@ -101,19 +97,22 @@ resolution; edits to Atlas runtime files.
   Implement package-scoped status/query as a union of descriptor roots and
   verify only those source bytes.  Keep default `IndexStatus` keys unchanged;
   publish descriptors as the intentional additive sync result field.
-- [ ] Append only optional selector parameters to the existing MCP signatures,
-  update exact contract/schema tests, and retain the exact seventeen-tool set.
 - [ ] Run GREEN:
-  `python -m pytest -q tests/test_project_index_core.py tests/test_project_index_checkpoints.py tests/test_project_index_workflow.py tests/test_mcp_contract.py tests/test_tool_result_contract.py`.
-- [ ] Run `python -m ruff check project_index devkit_runtime/project_checkpoint.py devkit_runtime/tool_result.py server.py tests/test_project_index_core.py tests/test_mcp_contract.py tests/test_tool_result_contract.py`.
+  `python -m pytest -q tests/test_project_index_core.py tests/test_project_index_checkpoints.py tests/test_project_index_workflow.py`.
+- [ ] Run `python -m ruff check project_index tests/test_project_index_core.py`.
 - [ ] Inspect `git diff --check`, stage only the listed files, and commit with
   a scoped message such as `add snapshot-bound project index package scopes`.
 
-### Task 3: Integration, Independent Review, and Release-Contract Verification
+### Task 3: Integration, Public Adapter, Independent Review, and Release-Contract Verification
 
 **Files:**
-- Modify only through cherry-picking the two reviewed task commits into the
-  coordinator branch.
+- Begin by cherry-picking the two reviewed task commits into the coordinator
+  branch; resolve no unrelated work.
+- Modify after both cherry-picks, owned only by the coordinator:
+  `mcp-tools/devkit_runtime/project_checkpoint.py`,
+  `mcp-tools/devkit_runtime/tool_result.py`, `mcp-tools/server.py`,
+  `mcp-tools/tests/test_mcp_contract.py`, and
+  `mcp-tools/tests/test_tool_result_contract.py`.
 - Optional documentation follow-up only after verification: the design/spec
   and this plan already committed by the coordinator.
 
@@ -124,6 +123,13 @@ resolution; edits to Atlas runtime files.
   adequacy.  Return only defects, or `QUALITY OK`.
 - [ ] Cherry-pick only review-approved commits in dependency order; do not
   overwrite unrelated work or resolve scope drift by reset/checkout.
+- [ ] Write one adapter-level RED test for the additive sync descriptor result
+  and appended `package_ids` status/query parameters, while no-selector status
+  retains its exact data keys and the tool inventory remains seventeen.
+- [ ] Wire the reviewed domain package API through the shared runtime adapter,
+  result projector, and server.  Do not change Atlas's four-field accept
+  contract while touching `server.py`.
+- [ ] Run the new adapter test GREEN, then targeted public-contract checks.
 - [ ] Run integrated focused verification:
   `python -m pytest -q tests/test_runtime_composition.py tests/test_atlas_acceptance_runtime.py tests/test_atlas_acceptance.py tests/test_project_index_core.py tests/test_project_index_checkpoints.py tests/test_project_index_workflow.py tests/test_mcp_contract.py tests/test_tool_result_contract.py`.
 - [ ] Run source/lint checks, `git diff --check`, `git status --short`, and
