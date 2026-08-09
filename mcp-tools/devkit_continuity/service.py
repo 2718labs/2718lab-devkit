@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .canonical import canonical_hash, canonical_json
+from .canonical import canonical_hash
 from .cas import ContinuityCas
 from .models import (
     BoundExecutionReceipt,
@@ -24,33 +24,18 @@ class ContinuityService:
         self.store, self.cas = store, cas
 
     def claim_or_reuse(self, key: ContinuityKey) -> ContinuityAttempt:
-        current = self.store.current_attempt(key)
-        if current is not None and current.state in {"frozen", "published"}:
-            return current
-        epoch = 1 if current is None else current.fence_epoch + 1
-        return self.store.append_attempt_event(key, epoch, "claimed", None, None)
+        return self.store.claim_or_reuse_atomic(key)
 
     def freeze(self, attempt: ContinuityAttempt, request: Any, evidence: Any) -> FrozenView:
         view = self._typed_view(attempt.key, request, evidence)
         if view.key.key_hash != attempt.key.key_hash:
             raise ContinuityStoreError("CONTINUITY_VIEW_CONFLICT")
-        saved = self.store.insert_or_get_view(view, view.manifest_json)
-        receipt = ContinuityReceipt.create(key=attempt.key, view_id=saved.view_id, kind="frozen")
-        self.store.insert_or_get_receipt(receipt, canonical_json({"key": attempt.key.to_dict(), "view_id": saved.view_id, "kind": "frozen"}))
-        current = self.store.current_attempt(attempt.key)
-        if current is None or current.state == "claimed":
-            self.store.append_attempt_event(attempt.key, attempt.fence_epoch, "frozen", saved.view_id, receipt.receipt_hash)
-        return saved
+        receipt = ContinuityReceipt.create(key=attempt.key, view_id=view.view_id, kind="frozen")
+        self.store.freeze_attempt_atomic(attempt, view, receipt)
+        return view
 
     def publish(self, attempt: ContinuityAttempt, frozen_view: FrozenView):
-        current = self.store.pointer_for(attempt.key)
-        expected = 0 if current is None else current.pointer_version
-        expected_fence = 0 if current is None else current.fence_epoch
-        pointer = self.store.compare_and_swap_pointer(attempt.key, frozen_view, expected, expected_fence, attempt.fence_epoch)
-        receipt = ContinuityReceipt.create(key=attempt.key, view_id=frozen_view.view_id, kind="published")
-        self.store.insert_or_get_receipt(receipt, canonical_json({"key": attempt.key.to_dict(), "view_id": frozen_view.view_id, "kind": "published"}))
-        self.store.append_attempt_event(attempt.key, attempt.fence_epoch, "published", frozen_view.view_id, receipt.receipt_hash)
-        return pointer
+        return self.store.publish_attempt_atomic(attempt, frozen_view)
 
     def _typed_view(self, key: ContinuityKey, request: Any, evidence: Any) -> FrozenView:
         from devkit_atlas.extractors import ExtractionRequest

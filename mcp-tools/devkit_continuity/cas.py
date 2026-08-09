@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import stat
 from pathlib import Path
 
@@ -35,16 +36,19 @@ class ContinuityCas:
         if target.exists():
             self._read_target(target, content_hash, byte_length)
             return content_hash
+        stage: Path | None = None
+        stage_owned = False
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             self._verify_target_parent(target)
             stage_directory = self.root / ".staging"
             stage_directory.mkdir(exist_ok=True)
             _safe_root(stage_directory, create=False)
-            stage = stage_directory / (content_hash[7:] + ".stage")
-            if stage.exists():
-                raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
+            stage = stage_directory / (
+                content_hash[7:] + "." + secrets.token_hex(16) + ".stage"
+            )
             descriptor = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            stage_owned = True
             try:
                 os.write(descriptor, body)
                 os.fsync(descriptor)
@@ -58,17 +62,21 @@ class ContinuityCas:
                 self._read_target(target, content_hash, byte_length)
             except OSError as error:
                 raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
-            finally:
-                try:
-                    stage.unlink()
-                except FileNotFoundError:
-                    pass
             self._read_target(target, content_hash, byte_length)
             return content_hash
         except ContinuityCasError:
             raise
         except (OSError, ValueError) as error:
             raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
+        finally:
+            if stage is not None and stage_owned:
+                try:
+                    _safe_root(stage.parent, create=False)
+                    stage.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
 
     def read_verified(self, content_hash: str, byte_length: int) -> bytes:
         if not is_hash_id(content_hash) or type(byte_length) is not int or byte_length < 0:
