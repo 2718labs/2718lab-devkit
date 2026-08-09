@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .canonical import canonical_json
+from .canonical import canonical_hash, canonical_json, is_hash_id
 from .cas import ContinuityCas, _bootstrap_cas
 from .models import (
     BoundExecutionReceipt,
@@ -24,7 +24,7 @@ from .models import (
     FrozenView,
 )
 
-_SCHEMA_VERSION = "2"
+_SCHEMA_VERSION = "3"
 _IMMUTABLE_TABLES = ("continuity_keys", "views", "entries", "receipts", "attempts")
 _V1_TABLE_SQL = {
     "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
@@ -44,6 +44,23 @@ _V2_TABLE_SQL = {
     "pointers": "CREATE TABLE pointers (key_hash TEXT PRIMARY KEY NOT NULL, workflow_id TEXT NOT NULL, code_task_id TEXT NOT NULL, code_task_version INTEGER NOT NULL CHECK(code_task_version>=0), view_id TEXT NOT NULL, pointer_version INTEGER NOT NULL CHECK(pointer_version>0), fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), UNIQUE(workflow_id,code_task_id,code_task_version), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash), FOREIGN KEY(view_id,key_hash) REFERENCES views(view_id,key_hash))",
 }
 _V1_AUDIT_TABLES = tuple(f"{table}_v1" for table in _V1_TABLE_SQL)
+_V3_TABLE_SQL = {
+    **_V2_TABLE_SQL,
+    "v1_audit_seals": "CREATE TABLE v1_audit_seals (audit_id TEXT PRIMARY KEY NOT NULL CHECK(audit_id='v1'), source_version INTEGER NOT NULL CHECK(source_version=1), content_hash TEXT NOT NULL, schema_hash TEXT NOT NULL)",
+}
+
+
+def _v1_audit_table_sql(table: str) -> str:
+    statement = _V1_TABLE_SQL[table]
+    statement = statement.replace(
+        f"CREATE TABLE {table} ", f'CREATE TABLE "{table}_v1" ', 1
+    )
+    return statement.replace("REFERENCES views(", 'REFERENCES "views_v1"(')
+
+
+_V1_AUDIT_TABLE_SQL = {
+    f"{table}_v1": _v1_audit_table_sql(table) for table in _V1_TABLE_SQL
+}
 
 
 def _column_contract(
@@ -171,6 +188,54 @@ _V2_INDEX_CONTRACTS = {
     "attempts": _V1_INDEX_CONTRACTS["attempts"],
     "pointers": (("pk", ("key_hash",)), ("u", ("workflow_id", "code_task_id", "code_task_version"))),
 }
+_V3_COLUMN_CONTRACTS = {
+    **_V2_COLUMN_CONTRACTS,
+    "v1_audit_seals": _column_contract(
+        ("audit_id", "TEXT", 1, 1),
+        ("source_version", "INTEGER", 1, 0),
+        ("content_hash", "TEXT", 1, 0),
+        ("schema_hash", "TEXT", 1, 0),
+    ),
+}
+_V3_FOREIGN_KEY_CONTRACTS = {
+    **_V2_FOREIGN_KEY_CONTRACTS,
+    "v1_audit_seals": (),
+}
+_V3_INDEX_CONTRACTS = {
+    **_V2_INDEX_CONTRACTS,
+    "v1_audit_seals": (("pk", ("audit_id",)),),
+}
+_V1_AUDIT_COLUMN_CONTRACTS = {
+    f"{table}_v1": contract for table, contract in _V1_COLUMN_CONTRACTS.items()
+}
+_V1_AUDIT_FOREIGN_KEY_CONTRACTS = {
+    f"{table}_v1": tuple(
+        (
+            foreign_key_id,
+            sequence,
+            f"{target}_v1" if target in _V1_TABLE_SQL else target,
+            source,
+            destination,
+            on_update,
+            on_delete,
+            match,
+        )
+        for (
+            foreign_key_id,
+            sequence,
+            target,
+            source,
+            destination,
+            on_update,
+            on_delete,
+            match,
+        ) in contract
+    )
+    for table, contract in _V1_FOREIGN_KEY_CONTRACTS.items()
+}
+_V1_AUDIT_INDEX_CONTRACTS = {
+    f"{table}_v1": contract for table, contract in _V1_INDEX_CONTRACTS.items()
+}
 
 
 class ContinuityStoreError(ContinuityError):
@@ -206,8 +271,9 @@ class ContinuityStore:
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(f"file:{database.as_posix()}?mode={mode}", uri=True)
+            connection.row_factory = sqlite3.Row
             _configure_connection(connection)
-            _verify_v2_schema(connection)
+            _verify_v3_schema(connection)
             return cls(connection, read_only=read_only)
         except (sqlite3.Error, OSError, ContinuityError) as error:
             if connection is not None:
@@ -427,24 +493,28 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
     """Runtime-private creation/migration seam; ordinary openers never create."""
     connection: sqlite3.Connection | None = None
     try:
-        _bootstrap_cas(cas_root, scratch_root)
         database.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(database)
         connection.row_factory = sqlite3.Row
         _configure_connection(connection)
+        _verify_bootstrap_preflight(connection)
+        _bootstrap_cas(cas_root, scratch_root)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("BEGIN IMMEDIATE")
         version = _schema_version(connection)
         if version is None:
-            _create_v2_schema(connection)
+            _create_v3_schema(connection)
         elif version == "1":
             _verify_v1_schema(connection)
-            _migrate_v1_to_v2(connection)
-        elif version == _SCHEMA_VERSION:
+            _migrate_v1_to_v3(connection)
+        elif version == "2":
             _verify_v2_schema(connection)
+            _migrate_v2_to_v3(connection)
+        elif version == _SCHEMA_VERSION:
+            _verify_v3_schema(connection)
         else:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-        _verify_v2_schema(connection)
+        _verify_v3_schema(connection)
         connection.commit()
         return ContinuityStore(connection, read_only=False)
     except (sqlite3.Error, OSError) as error:
@@ -453,6 +523,24 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
     except Exception:
         _rollback_and_close(connection)
         raise
+
+
+def _verify_bootstrap_preflight(connection: sqlite3.Connection) -> None:
+    """Reject malformed legacy state before a journal-mode change can touch it."""
+    version = _schema_version(connection)
+    if version is None:
+        return
+    if version == "1":
+        _verify_v1_schema(connection)
+        _validate_v1_state(connection)
+        return
+    if version == "2":
+        _verify_v2_schema(connection)
+        return
+    if version == "3":
+        _verify_v3_schema(connection)
+        return
+    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
 
 
 def _rollback_and_close(connection: sqlite3.Connection | None) -> None:
@@ -486,17 +574,33 @@ def _schema_version(connection: sqlite3.Connection) -> str | None:
     return rows[0][1]
 
 
-def _create_v2_schema(connection: sqlite3.Connection) -> None:
-    for statement in _V2_TABLE_SQL.values():
+def _create_v3_schema(connection: sqlite3.Connection, *, seal_triggers: bool = True) -> None:
+    for statement in _V3_TABLE_SQL.values():
         connection.execute(statement)
-    connection.execute("INSERT INTO schema_metadata(key,value) VALUES('schema_version','2')")
+    connection.execute("INSERT INTO schema_metadata(key,value) VALUES('schema_version','3')")
     for table in _IMMUTABLE_TABLES:
-        connection.execute(f"CREATE TRIGGER {table}_immutable_update BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END")
-        connection.execute(f"CREATE TRIGGER {table}_immutable_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END")
+        _create_immutable_triggers(connection, table, ("UPDATE", "DELETE"))
+    if seal_triggers:
+        _create_immutable_triggers(connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE"))
 
 
-def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
-    """Transactionally preserve a verified v1 snapshot under *_v1 audit names."""
+def _create_immutable_triggers(
+    connection: sqlite3.Connection, table: str, actions: tuple[str, ...]
+) -> None:
+    for action in actions:
+        connection.execute(
+            f"CREATE TRIGGER {table}_immutable_{action.lower()} BEFORE {action} ON {table} "
+            "BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END"
+        )
+
+
+def _create_v1_audit_immutable_triggers(connection: sqlite3.Connection) -> None:
+    for table in _V1_AUDIT_TABLES:
+        _create_immutable_triggers(connection, table, ("INSERT", "UPDATE", "DELETE"))
+
+
+def _migrate_v1_to_v3(connection: sqlite3.Connection) -> None:
+    """Transactionally preserve and seal a verified v1 snapshot."""
     keys = _validate_v1_state(connection)
     legacy = ("schema_metadata", "views", "entries", "receipts", "attempts", "pointers")
     for table in _IMMUTABLE_TABLES[1:]:
@@ -504,7 +608,26 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
             connection.execute(f"DROP TRIGGER {table}_immutable_{action}")
     for table in legacy:
         connection.execute(f"ALTER TABLE {table} RENAME TO {table}_v1")
-    _create_v2_schema(connection)
+    _create_v3_schema(connection, seal_triggers=False)
+    _create_v1_audit_immutable_triggers(connection)
+    connection.execute(
+        "INSERT INTO v1_audit_seals(audit_id,source_version,content_hash,schema_hash) VALUES(?,?,?,?)",
+        ("v1", 1, _audit_content_hash(connection), _audit_schema_hash(connection)),
+    )
+    _create_immutable_triggers(connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE"))
+    _copy_verified_v1_state_to_v3(connection, keys)
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Upgrade only a strictly verified v2 database with no unauditable snapshot."""
+    connection.execute(_V3_TABLE_SQL["v1_audit_seals"])
+    connection.execute("UPDATE schema_metadata SET value='3' WHERE key='schema_version'")
+    _create_immutable_triggers(connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE"))
+
+
+def _copy_verified_v1_state_to_v3(
+    connection: sqlite3.Connection, keys: dict[str, ContinuityKey]
+) -> None:
     for key in keys.values():
         connection.execute(
             "INSERT INTO continuity_keys(key_hash,key_json,workflow_id,code_task_id,code_task_version,acceptance_id,ingestion_key,payload_hash,evidence_binding_hash) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -524,14 +647,18 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
         )
 
 
-def _validate_v1_state(connection: sqlite3.Connection) -> dict[str, ContinuityKey]:
-    """Rebuild every v1 record before any legacy table is renamed."""
+def _validate_v1_state(
+    connection: sqlite3.Connection, *, suffix: str = ""
+) -> dict[str, ContinuityKey]:
+    """Rebuild every v1 record before migration or audit-seal acceptance."""
+    if suffix not in {"", "_v1"}:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     try:
-        keys = _v1_keys(connection)
-        views = _v1_views(connection, keys)
-        receipts = _v1_receipts(connection, keys, views)
-        attempts = _v1_attempts(connection, keys, views, receipts)
-        _validate_v1_pointers(connection, keys, views, attempts)
+        keys = _v1_keys(connection, suffix)
+        views = _v1_views(connection, keys, suffix)
+        receipts = _v1_receipts(connection, keys, views, suffix)
+        attempts = _v1_attempts(connection, keys, views, receipts, suffix)
+        _validate_v1_pointers(connection, keys, views, attempts, suffix)
         return keys
     except ContinuityStoreError:
         raise
@@ -539,9 +666,11 @@ def _validate_v1_state(connection: sqlite3.Connection) -> dict[str, ContinuityKe
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
 
 
-def _v1_keys(connection: sqlite3.Connection) -> dict[str, ContinuityKey]:
+def _v1_keys(connection: sqlite3.Connection, suffix: str) -> dict[str, ContinuityKey]:
     keys: dict[str, ContinuityKey] = {}
-    for row in connection.execute("SELECT key_hash,key_json FROM attempts ORDER BY key_hash,sequence"):
+    for row in connection.execute(
+        f"SELECT key_hash,key_json FROM attempts{suffix} ORDER BY key_hash,sequence"
+    ):
         value = json.loads(row["key_json"])
         key = ContinuityKey(**value)
         if key.key_hash != row["key_hash"] or canonical_json(key.to_dict()) != row["key_json"]:
@@ -554,18 +683,20 @@ def _v1_keys(connection: sqlite3.Connection) -> dict[str, ContinuityKey]:
 
 
 def _v1_views(
-    connection: sqlite3.Connection, keys: dict[str, ContinuityKey]
+    connection: sqlite3.Connection, keys: dict[str, ContinuityKey], suffix: str
 ) -> dict[str, FrozenView]:
     entries: dict[str, list[FrozenEntry]] = {}
     for row in connection.execute(
-        "SELECT view_id,role,path,content_hash,byte_length FROM entries ORDER BY view_id,role,path,content_hash"
+        f"SELECT view_id,role,path,content_hash,byte_length FROM entries{suffix} "
+        "ORDER BY view_id,role,path,content_hash"
     ):
         entries.setdefault(row["view_id"], []).append(
             FrozenEntry(row["role"], row["path"], row["content_hash"], row["byte_length"])
         )
     views: dict[str, FrozenView] = {}
     for row in connection.execute(
-        "SELECT view_id,key_hash,manifest_hash,cas_root_hash,manifest_json FROM views ORDER BY view_id"
+        f"SELECT view_id,key_hash,manifest_hash,cas_root_hash,manifest_json FROM views{suffix} "
+        "ORDER BY view_id"
     ):
         key = keys.get(row["key_hash"])
         if key is None:
@@ -682,10 +813,12 @@ def _v1_receipts(
     connection: sqlite3.Connection,
     keys: dict[str, ContinuityKey],
     views: dict[str, FrozenView],
+    suffix: str,
 ) -> dict[str, ContinuityReceipt]:
     receipts: dict[str, ContinuityReceipt] = {}
     for row in connection.execute(
-        "SELECT receipt_hash,key_hash,view_id,kind,receipt_json FROM receipts ORDER BY receipt_hash"
+        f"SELECT receipt_hash,key_hash,view_id,kind,receipt_json FROM receipts{suffix} "
+        "ORDER BY receipt_hash"
     ):
         key = keys.get(row["key_hash"])
         view = views.get(row["view_id"])
@@ -703,10 +836,12 @@ def _v1_attempts(
     keys: dict[str, ContinuityKey],
     views: dict[str, FrozenView],
     receipts: dict[str, ContinuityReceipt],
+    suffix: str,
 ) -> dict[str, tuple[ContinuityAttempt, ...]]:
     attempts: dict[str, list[ContinuityAttempt]] = {}
     for row in connection.execute(
-        "SELECT key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash FROM attempts ORDER BY key_hash,sequence"
+        f"SELECT key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash FROM attempts{suffix} "
+        "ORDER BY key_hash,sequence"
     ):
         key = keys.get(row["key_hash"])
         if key is None or row["key_json"] != canonical_json(key.to_dict()):
@@ -752,10 +887,12 @@ def _validate_v1_pointers(
     keys: dict[str, ContinuityKey],
     views: dict[str, FrozenView],
     attempts: dict[str, tuple[ContinuityAttempt, ...]],
+    suffix: str,
 ) -> None:
     """Require each legacy pointer to bind a verified same-fence view record."""
     for row in connection.execute(
-        "SELECT workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch FROM pointers"
+        f"SELECT workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch "
+        f"FROM pointers{suffix}"
     ):
         candidates = [
             key
@@ -802,7 +939,7 @@ def _verify_v1_schema(connection: sqlite3.Connection) -> None:
 
 
 def _verify_v2_schema(connection: sqlite3.Connection) -> None:
-    if _schema_version(connection) != _SCHEMA_VERSION or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+    if _schema_version(connection) != "2" or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     _verify_schema_contract(
         connection,
@@ -811,8 +948,36 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
         foreign_key_contracts=_V2_FOREIGN_KEY_CONTRACTS,
         index_contracts=_V2_INDEX_CONTRACTS,
         immutable_tables=_IMMUTABLE_TABLES,
-        allow_v1_audit=True,
+        allow_v1_audit=False,
     )
+
+
+def _verify_v3_schema(connection: sqlite3.Connection) -> None:
+    if _schema_version(connection) != "3" or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    audit_present = _verify_schema_contract(
+        connection,
+        table_sql=_V3_TABLE_SQL,
+        column_contracts=_V3_COLUMN_CONTRACTS,
+        foreign_key_contracts=_V3_FOREIGN_KEY_CONTRACTS,
+        index_contracts=_V3_INDEX_CONTRACTS,
+        immutable_tables=_IMMUTABLE_TABLES,
+        allow_v1_audit=True,
+        fully_immutable_tables=("v1_audit_seals",),
+    )
+    if audit_present:
+        _verify_table_contracts(
+            connection,
+            table_sql=_V1_AUDIT_TABLE_SQL,
+            column_contracts=_V1_AUDIT_COLUMN_CONTRACTS,
+            foreign_key_contracts=_V1_AUDIT_FOREIGN_KEY_CONTRACTS,
+            index_contracts=_V1_AUDIT_INDEX_CONTRACTS,
+            check_foreign_keys=False,
+        )
+        _validate_v1_state(connection, suffix="_v1")
+        _verify_v1_audit_seal(connection, expected_rows=1)
+    else:
+        _verify_v1_audit_seal(connection, expected_rows=0)
 
 
 def _verify_schema_contract(
@@ -824,14 +989,36 @@ def _verify_schema_contract(
     index_contracts: dict[str, tuple[tuple[str, tuple[str, ...]], ...]],
     immutable_tables: tuple[str, ...],
     allow_v1_audit: bool,
-) -> None:
-    _verify_schema_objects(
+    fully_immutable_tables: tuple[str, ...] = (),
+) -> bool:
+    audit_present = _verify_schema_objects(
         connection,
         table_names=set(table_sql),
         immutable_tables=immutable_tables,
         allow_v1_audit=allow_v1_audit,
+        fully_immutable_tables=fully_immutable_tables,
     )
-    if connection.execute("PRAGMA foreign_key_check").fetchall():
+    _verify_table_contracts(
+        connection,
+        table_sql=table_sql,
+        column_contracts=column_contracts,
+        foreign_key_contracts=foreign_key_contracts,
+        index_contracts=index_contracts,
+        check_foreign_keys=True,
+    )
+    return audit_present
+
+
+def _verify_table_contracts(
+    connection: sqlite3.Connection,
+    *,
+    table_sql: dict[str, str],
+    column_contracts: dict[str, tuple[tuple[int, str, str, int, None, int, int], ...]],
+    foreign_key_contracts: dict[str, tuple[tuple[int, int, str, str, str, str, str, str], ...]],
+    index_contracts: dict[str, tuple[tuple[str, tuple[str, ...]], ...]],
+    check_foreign_keys: bool,
+) -> None:
+    if check_foreign_keys and connection.execute("PRAGMA foreign_key_check").fetchall():
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     for table, expected_sql in table_sql.items():
         if _normalized_schema_sql(connection, "table", table) != _normalize_sql(expected_sql):
@@ -858,7 +1045,8 @@ def _verify_schema_objects(
     table_names: set[str],
     immutable_tables: tuple[str, ...],
     allow_v1_audit: bool,
-) -> None:
+    fully_immutable_tables: tuple[str, ...],
+) -> bool:
     objects = tuple(
         tuple(row)
         for row in connection.execute(
@@ -872,18 +1060,29 @@ def _verify_schema_objects(
         allowed_table_sets.add(frozenset(table_names | set(_V1_AUDIT_TABLES)))
     if frozenset(actual_tables) not in allowed_table_sets:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    audit_present = bool(set(_V1_AUDIT_TABLES) & actual_tables)
+    expected_actions = {
+        table: ("UPDATE", "DELETE") for table in immutable_tables
+    }
+    expected_actions.update(
+        {table: ("INSERT", "UPDATE", "DELETE") for table in fully_immutable_tables}
+    )
+    if audit_present:
+        expected_actions.update(
+            {table: ("INSERT", "UPDATE", "DELETE") for table in _V1_AUDIT_TABLES}
+        )
     expected_trigger_names = {
         f"{table}_immutable_{action.lower()}"
-        for table in immutable_tables
-        for action in ("UPDATE", "DELETE")
+        for table, actions in expected_actions.items()
+        for action in actions
     }
     actual_triggers = {
         name: sql for kind, name, _table, sql in objects if kind == "trigger"
     }
     if set(actual_triggers) != expected_trigger_names:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    for table in immutable_tables:
-        for action in ("UPDATE", "DELETE"):
+    for table, actions in expected_actions.items():
+        for action in actions:
             name = f"{table}_immutable_{action.lower()}"
             trigger_sql = actual_triggers[name]
             if (
@@ -893,6 +1092,7 @@ def _verify_schema_objects(
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     if any(kind not in {"table", "trigger"} for kind, _name, _table, _sql in objects):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    return audit_present
 
 
 def _immutable_trigger_sql(table: str, action: str) -> str:
@@ -900,6 +1100,68 @@ def _immutable_trigger_sql(table: str, action: str) -> str:
         f"CREATE TRIGGER {table}_immutable_{action.lower()} BEFORE {action} ON {table} "
         "BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END"
     )
+
+
+def _verify_v1_audit_seal(connection: sqlite3.Connection, *, expected_rows: int) -> None:
+    rows = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "SELECT audit_id,source_version,content_hash,schema_hash FROM v1_audit_seals "
+            "ORDER BY audit_id"
+        )
+    )
+    if len(rows) != expected_rows:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    if expected_rows == 0:
+        return
+    audit_id, source_version, content_hash, schema_hash = rows[0]
+    if (
+        audit_id != "v1"
+        or source_version != 1
+        or not is_hash_id(content_hash)
+        or not is_hash_id(schema_hash)
+        or content_hash != _audit_content_hash(connection)
+        or schema_hash != _audit_schema_hash(connection)
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+
+
+def _audit_content_hash(connection: sqlite3.Connection) -> str:
+    tables: list[dict[str, Any]] = []
+    for table, columns in _V1_COLUMN_CONTRACTS.items():
+        names = tuple(column[1] for column in columns)
+        primary_key = tuple(column[1] for column in sorted(columns, key=lambda column: column[5]) if column[5])
+        query = (
+            f"SELECT {','.join(names)} FROM {table}_v1 "
+            f"ORDER BY {','.join(primary_key)}"
+        )
+        tables.append(
+            {
+                "table": table,
+                "columns": list(names),
+                "rows": [list(row) for row in connection.execute(query)],
+            }
+        )
+    return canonical_hash({"schema": "continuity-v1-audit-content/v1", "tables": tables})
+
+
+def _audit_schema_hash(connection: sqlite3.Connection) -> str:
+    names = set(_V1_AUDIT_TABLES)
+    names.update(
+        f"{table}_immutable_{action.lower()}"
+        for table in _V1_AUDIT_TABLES
+        for action in ("INSERT", "UPDATE", "DELETE")
+    )
+    records = [
+        {"type": kind, "name": name, "table": table, "sql": sql}
+        for kind, name, table, sql in connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            "WHERE lower(substr(name,1,7)) != 'sqlite_' AND type IN ('table','trigger') "
+            "ORDER BY type,name"
+        )
+        if name in names
+    ]
+    return canonical_hash({"schema": "continuity-v1-audit-schema/v1", "objects": records})
 
 
 def _normalized_schema_sql(connection: sqlite3.Connection, kind: str, name: str) -> str:

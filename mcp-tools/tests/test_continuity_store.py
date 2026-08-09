@@ -22,6 +22,7 @@ from devkit_atlas.service import (  # noqa: E402
     AcceptedAtlasProjectionEvidence,
     AcceptedAtlasProjectionRequest,
 )
+from devkit_continuity import store as continuity_store  # noqa: E402
 from devkit_continuity.canonical import canonical_json  # noqa: E402
 from devkit_continuity.cas import ContinuityCas, ContinuityCasError  # noqa: E402
 from devkit_continuity.models import (  # noqa: E402
@@ -197,6 +198,187 @@ def _tamper_table_sql(database: Path, table: str, source: str, replacement: str)
             connection.execute("PRAGMA writable_schema=OFF")
 
 
+_V1_TABLE_NAMES = ("schema_metadata", "views", "entries", "receipts", "attempts", "pointers")
+_V2_LIVE_IMMUTABLE_TABLES = ("continuity_keys", "views", "entries", "receipts", "attempts")
+
+
+def _create_legacy_v2_triggers(connection: sqlite3.Connection) -> None:
+    for table in _V2_LIVE_IMMUTABLE_TABLES:
+        for action in ("update", "delete"):
+            connection.execute(
+                f"CREATE TRIGGER {table}_immutable_{action} BEFORE {action.upper()} ON {table} "
+                "BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END"
+            )
+
+
+def _create_legacy_empty_v2(config: RuntimeConfig) -> None:
+    config.data_root.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(config.continuity_database) as connection:
+        for statement in continuity_store._V2_TABLE_SQL.values():
+            connection.execute(statement)
+        connection.execute("INSERT INTO schema_metadata(key,value) VALUES('schema_version','2')")
+        _create_legacy_v2_triggers(connection)
+
+
+def _create_legacy_populated_v2(
+    config: RuntimeConfig,
+) -> tuple[ContinuityKey, FrozenView]:
+    config.data_root.mkdir(parents=True, exist_ok=True)
+    key = _key()
+    view = _view(key)
+    frozen = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen")
+    published = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published")
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        for statement in continuity_store._V2_TABLE_SQL.values():
+            connection.execute(statement)
+        connection.execute("INSERT INTO schema_metadata(key,value) VALUES('schema_version','2')")
+        _create_legacy_v2_triggers(connection)
+        connection.execute(
+            "INSERT INTO continuity_keys(key_hash,key_json,workflow_id,code_task_id,"
+            "code_task_version,acceptance_id,ingestion_key,payload_hash,evidence_binding_hash) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                key.key_hash,
+                canonical_json(key.to_dict()),
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                key.acceptance_id,
+                key.ingestion_key,
+                key.payload_hash,
+                key.evidence_binding_hash,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO views(view_id,key_hash,manifest_hash,cas_root_hash,manifest_json) "
+            "VALUES(?,?,?,?,?)",
+            (view.view_id, key.key_hash, view.manifest_hash, view.cas_root_hash, view.manifest_json),
+        )
+        connection.executemany(
+            "INSERT INTO entries(view_id,role,path,content_hash,byte_length) VALUES(?,?,?,?,?)",
+            [
+                (view.view_id, item.role, item.path, item.content_hash, item.byte_length)
+                for item in view.entries
+            ],
+        )
+        for receipt in (frozen, published):
+            connection.execute(
+                "INSERT INTO receipts(receipt_hash,key_hash,view_id,kind,receipt_json) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    receipt.receipt_hash,
+                    key.key_hash,
+                    view.view_id,
+                    receipt.kind,
+                    canonical_json(
+                        {
+                            "key": key.to_dict(),
+                            "view_id": view.view_id,
+                            "kind": receipt.kind,
+                        }
+                    ),
+                ),
+            )
+        connection.executemany(
+            "INSERT INTO attempts(key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                (key.key_hash, canonical_json(key.to_dict()), 1, 1, "claimed", None, None),
+                (key.key_hash, canonical_json(key.to_dict()), 1, 2, "frozen", view.view_id, frozen.receipt_hash),
+                (key.key_hash, canonical_json(key.to_dict()), 1, 3, "published", view.view_id, published.receipt_hash),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO pointers(key_hash,workflow_id,code_task_id,code_task_version,view_id,"
+            "pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
+            (
+                key.key_hash,
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                view.view_id,
+                1,
+                1,
+            ),
+        )
+    return key, view
+
+
+def _create_legacy_v2_with_unsealed_audit(config: RuntimeConfig) -> None:
+    key, _view_value, _receipt = _create_verified_v1(config)
+    with sqlite3.connect(config.continuity_database) as connection:
+        for table in ("views", "entries", "receipts", "attempts"):
+            for action in ("update", "delete"):
+                connection.execute(f"DROP TRIGGER {table}_immutable_{action}")
+        for table in _V1_TABLE_NAMES:
+            connection.execute(f"ALTER TABLE {table} RENAME TO {table}_v1")
+        for statement in continuity_store._V2_TABLE_SQL.values():
+            connection.execute(statement)
+        connection.execute("INSERT INTO schema_metadata(key,value) VALUES('schema_version','2')")
+        _create_legacy_v2_triggers(connection)
+        connection.execute(
+            "INSERT INTO continuity_keys(key_hash,key_json,workflow_id,code_task_id,"
+            "code_task_version,acceptance_id,ingestion_key,payload_hash,evidence_binding_hash) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                key.key_hash,
+                canonical_json(key.to_dict()),
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                key.acceptance_id,
+                key.ingestion_key,
+                key.payload_hash,
+                key.evidence_binding_hash,
+            ),
+        )
+        for table in ("views", "entries", "receipts", "attempts"):
+            columns = ",".join(
+                row[1] for row in connection.execute(f"PRAGMA table_xinfo({table}_v1)")
+            )
+            connection.execute(
+                f"INSERT INTO {table}({columns}) SELECT {columns} FROM {table}_v1"
+            )
+        pointer = connection.execute(
+            "SELECT workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch "
+            "FROM pointers_v1"
+        ).fetchone()
+        assert pointer is not None
+        connection.execute(
+            "INSERT INTO pointers(key_hash,workflow_id,code_task_id,code_task_version,view_id,"
+            "pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
+            (key.key_hash, *pointer),
+        )
+
+
+def _continuity_database_snapshot(config: RuntimeConfig) -> tuple[object, ...]:
+    with sqlite3.connect(config.continuity_database) as connection:
+        objects = tuple(
+            connection.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master "
+                "WHERE lower(substr(name,1,7)) != 'sqlite_' ORDER BY type,name"
+            )
+        )
+        tables = tuple(row[1] for row in objects if row[0] == "table")
+        return (
+            connection.execute("PRAGMA journal_mode").fetchone()[0],
+            objects,
+            tuple(
+                (table, tuple(connection.execute(f"SELECT * FROM {table} ORDER BY rowid")))
+                for table in tables
+            ),
+        )
+
+
+def _audit_trigger_names() -> set[str]:
+    return {
+        f"{table}_v1_immutable_{action}"
+        for table in _V1_TABLE_NAMES
+        for action in ("insert", "update", "delete")
+    }
+
+
 def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) -> None:
     assert not hasattr(ContinuityStore, "bootstrap")
     assert not hasattr(ContinuityCas, "bootstrap")
@@ -212,7 +394,7 @@ def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) 
     assert config.continuity_database.exists() and config.continuity_cas_root.is_dir()
     with sqlite3.connect(config.continuity_database) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "3"
     _config(tmp_path)
 
 
@@ -295,7 +477,7 @@ def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: 
     key, view, receipt = _create_verified_v1(config)
     RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
     with sqlite3.connect(config.continuity_database) as connection:
-        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "3"
         assert {"views_v1", "entries_v1", "receipts_v1", "attempts_v1", "pointers_v1"} <= {
             row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
@@ -307,7 +489,237 @@ def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: 
     migrated.close()
 
 
-def test_prepared_v2_open_rejects_partial_v1_audit_tables(tmp_path: Path) -> None:
+def test_fresh_v3_has_an_empty_immutable_audit_seal_relation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with sqlite3.connect(config.continuity_database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "3"
+        assert connection.execute("SELECT COUNT(*) FROM v1_audit_seals").fetchone()[0] == 0
+        trigger_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+    assert {
+        "v1_audit_seals_immutable_insert",
+        "v1_audit_seals_immutable_update",
+        "v1_audit_seals_immutable_delete",
+    } <= trigger_names
+
+
+def test_v1_migration_creates_a_v3_audit_seal_and_all_audit_triggers(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_verified_v1(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "3"
+        seals = tuple(
+            connection.execute(
+                "SELECT audit_id,source_version,content_hash,schema_hash FROM v1_audit_seals"
+            )
+        )
+        trigger_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+    assert len(seals) == 1
+    assert seals[0][1] == 1
+    assert all(isinstance(value, str) and value.startswith("sha256:") for value in seals[0][2:])
+    assert _audit_trigger_names() <= trigger_names
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "INSERT INTO schema_metadata_v1(key,value) VALUES('other','value')",
+        "UPDATE views_v1 SET manifest_hash='tampered'",
+        "DELETE FROM pointers_v1",
+    ),
+    ids=("insert", "update", "delete"),
+)
+def test_v1_audit_triggers_reject_ordinary_mutations(tmp_path: Path, statement: str) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_verified_v1(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        with pytest.raises(sqlite3.DatabaseError):
+            connection.execute(statement)
+
+
+@pytest.mark.parametrize("read_only", (True, False), ids=("readonly", "readwrite"))
+def test_audit_seal_rejects_bypassed_historical_pointer_mutation(
+    tmp_path: Path, read_only: bool
+) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_verified_v1(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    trigger_name = "pointers_v1_immutable_update"
+    with sqlite3.connect(config.continuity_database) as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (trigger_name,)
+        ).fetchone()
+        if trigger is not None:
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+        assert connection.execute(
+            "UPDATE pointers_v1 SET pointer_version=pointer_version+1"
+        ).rowcount == 1
+        if trigger is not None:
+            connection.execute(trigger[0])
+    with pytest.raises(ContinuityStoreError) as error:
+        (ContinuityStore.open_readonly if read_only else ContinuityStore.open_readwrite)(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+    assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+
+
+def test_legacy_v2_with_unsealed_audit_is_rejected_without_writes(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_legacy_v2_with_unsealed_audit(config)
+    assert not config.continuity_cas_root.exists()
+    before = _continuity_database_snapshot(config)
+    with pytest.raises(RuntimeConfigError) as error:
+        RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    assert error.value.code == "DATA_ROOT_UNAVAILABLE"
+    assert _continuity_database_snapshot(config) == before
+    assert not config.continuity_cas_root.exists()
+
+
+def test_legacy_v2_without_audit_migrates_to_v3(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_legacy_empty_v2(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "3"
+        assert connection.execute("SELECT COUNT(*) FROM v1_audit_seals").fetchone()[0] == 0
+
+
+def test_legacy_populated_v2_without_audit_migrates_losslessly_to_v3(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    key, view = _create_legacy_populated_v2(config)
+    tables = ("continuity_keys", "views", "entries", "receipts", "attempts", "pointers")
+    with sqlite3.connect(config.continuity_database) as connection:
+        before = {
+            table: tuple(connection.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+            for table in tables
+        }
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "3"
+        after = {
+            table: tuple(connection.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+            for table in tables
+        }
+        assert connection.execute("SELECT COUNT(*) FROM v1_audit_seals").fetchone()[0] == 0
+    assert after == before
+    store = ContinuityStore.open_readonly(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+    expected = ContinuityAttempt(
+        key,
+        1,
+        "published",
+        view.view_id,
+        ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published").receipt_hash,
+    )
+    assert store.current_attempt(key) == expected
+    assert store.pointer_for(key) is not None
+    store.close()
+
+
+def test_live_pointer_progression_does_not_break_the_audit_seal(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    key, view, _receipt = _create_verified_v1(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        seal_before = connection.execute(
+            "SELECT audit_id,source_version,content_hash,schema_hash FROM v1_audit_seals"
+        ).fetchone()
+    store = ContinuityStore.open_readwrite(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+    frozen = store.current_attempt(key)
+    assert frozen is not None and frozen.state == "frozen"
+    store.publish_attempt_atomic(frozen, view)
+    published_receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published")
+    store._connection.execute(
+        "INSERT INTO attempts(key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (
+            key.key_hash,
+            canonical_json(key.to_dict()),
+            1,
+            4,
+            "abandoned",
+            view.view_id,
+            published_receipt.receipt_hash,
+        ),
+    )
+    store._connection.commit()
+    claimed = store.claim_or_reuse_atomic(key)
+    frozen_next = store.freeze_attempt_atomic(
+        claimed,
+        view,
+        ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen"),
+    )
+    pointer = store.publish_attempt_atomic(frozen_next, view)
+    assert pointer.fence_epoch == 2 and pointer.pointer_version == 2
+    store.close()
+    with sqlite3.connect(config.continuity_database) as connection:
+        seal_after = connection.execute(
+            "SELECT audit_id,source_version,content_hash,schema_hash FROM v1_audit_seals"
+        ).fetchone()
+    assert seal_after == seal_before
+    reopened = ContinuityStore.open_readonly(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+    reopened.close()
+
+
+def test_prepared_open_rejects_tampered_v1_audit_table_shape(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_verified_v1(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.execute("ALTER TABLE views_v1 ADD COLUMN evil TEXT")
+    with pytest.raises(ContinuityStoreError) as error:
+        ContinuityStore.open_readwrite(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+    assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+
+
+def test_prepared_readonly_open_rejects_mutated_v1_audit_rows(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_verified_v1(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='views_v1_immutable_update'"
+        ).fetchone()
+        assert trigger is not None
+        connection.execute("DROP TRIGGER views_v1_immutable_update")
+        assert connection.execute(
+            "UPDATE views_v1 SET manifest_hash='tampered'"
+        ).rowcount == 1
+        connection.execute(trigger[0])
+    with pytest.raises(ContinuityStoreError) as error:
+        ContinuityStore.open_readonly(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+    assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+
+
+def test_prepared_v3_open_rejects_partial_v1_audit_tables(tmp_path: Path) -> None:
     config = _unprepared_config(tmp_path)
     _create_verified_v1(config)
     RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
