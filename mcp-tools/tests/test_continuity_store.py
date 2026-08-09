@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from devkit_atlas.service import (  # noqa: E402
 )
 from devkit_continuity.cas import ContinuityCas, ContinuityCasError  # noqa: E402
 from devkit_continuity.models import (  # noqa: E402
+    ContinuityAttempt,
     ContinuityKey,
     ContinuityReceipt,
     FrozenEntry,
@@ -30,6 +32,8 @@ from devkit_continuity.models import (  # noqa: E402
 )
 from devkit_continuity.service import ContinuityService  # noqa: E402
 from devkit_continuity.store import ContinuityStore, ContinuityStoreError  # noqa: E402
+from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
+from devkit_runtime.config import RuntimeConfig  # noqa: E402
 from project_index.checkpoints import CheckpointFile  # noqa: E402
 from project_index.models import CoverageGap, IndexNode, SnapshotFile  # noqa: E402
 
@@ -45,6 +49,26 @@ def _key() -> ContinuityKey:
 def _view(key: ContinuityKey) -> FrozenView:
     body = b"after"
     return FrozenView.create(key=key, entries=(FrozenEntry("after_file", "src/a.py", _hash(body), len(body)),))
+
+
+def _config(tmp_path: Path) -> RuntimeConfig:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    config = RuntimeConfig.load(
+        environ={"PLUGIN_DATA": str(tmp_path / "data"), "CODEX_TASK_TEMP": str(scratch)}
+    )
+    RuntimeBootstrap.run(
+        config,
+        proof_registry_bootstrap=lambda database: sqlite3.connect(database).close(),
+    )
+    return config
+
+
+def _prepared_store(tmp_path: Path) -> tuple[RuntimeConfig, ContinuityStore]:
+    config = _config(tmp_path)
+    return config, ContinuityStore.open_readwrite(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
 
 
 def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, AcceptedAtlasProjectionRequest, AcceptedAtlasProjectionEvidence]:
@@ -69,15 +93,18 @@ def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, Accep
     return key, request, evidence
 
 
-def test_bootstrap_creates_isolated_v1_wal_and_is_idempotent(tmp_path: Path) -> None:
-    database, cas_root, scratch = tmp_path / "continuity.sqlite3", tmp_path / "cas", tmp_path / "scratch"
-    store = ContinuityStore.bootstrap(database, cas_root, scratch)
+def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) -> None:
+    assert not hasattr(ContinuityStore, "bootstrap")
+    config = _config(tmp_path)
+    store = ContinuityStore.open_readwrite(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
     store.close()
-    assert database.exists() and cas_root.is_dir()
-    with sqlite3.connect(database) as connection:
+    assert config.continuity_database.exists() and config.continuity_cas_root.is_dir()
+    with sqlite3.connect(config.continuity_database) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "1"
-    ContinuityStore.bootstrap(database, cas_root, scratch).close()
+    _config(tmp_path)
 
 
 def test_readonly_open_never_creates_database_or_cas(tmp_path: Path) -> None:
@@ -88,8 +115,8 @@ def test_readonly_open_never_creates_database_or_cas(tmp_path: Path) -> None:
 
 
 def test_cas_verifies_bytes_and_preserves_existing_content(tmp_path: Path) -> None:
-    root, scratch = tmp_path / "cas", tmp_path / "scratch"
-    cas = ContinuityCas.bootstrap(root, scratch)
+    config = _config(tmp_path)
+    cas = ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
     body, digest = b"body", _hash(b"body")
     assert cas.put_verified(digest, len(body), body) == digest
     assert cas.read_verified(digest, len(body)) == body
@@ -99,8 +126,7 @@ def test_cas_verifies_bytes_and_preserves_existing_content(tmp_path: Path) -> No
 
 
 def test_store_has_immutable_relations_append_only_attempts_and_fenced_pointer_cas(tmp_path: Path) -> None:
-    database, cas_root, scratch = tmp_path / "continuity.sqlite3", tmp_path / "cas", tmp_path / "scratch"
-    store = ContinuityStore.bootstrap(database, cas_root, scratch)
+    _, store = _prepared_store(tmp_path)
     key, view = _key(), _view(_key())
     receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen")
     assert store.insert_or_get_view(view, view.manifest_json) == view
@@ -110,17 +136,20 @@ def test_store_has_immutable_relations_append_only_attempts_and_fenced_pointer_c
     assert (first.state, second.state, store.current_attempt(key).state) == ("claimed", "frozen", "frozen")
     with pytest.raises(sqlite3.DatabaseError):
         store._connection.execute("DELETE FROM views")
-    assert store.compare_and_swap_pointer(key, view, 0, 1).pointer_version == 1
+    assert store.compare_and_swap_pointer(key, view, 0, 0, 1).pointer_version == 1
     with pytest.raises(ContinuityStoreError):
-        store.compare_and_swap_pointer(key, view, 0, 1)
+        store.compare_and_swap_pointer(key, view, 0, 1, 1)
     with pytest.raises(ContinuityStoreError):
-        store.compare_and_swap_pointer(key, view, 1, 0)
+        store.compare_and_swap_pointer(key, view, 1, 99, 99)
+    assert store.compare_and_swap_pointer(key, view, 1, 1, 2).pointer_version == 2
+    with pytest.raises(ContinuityStoreError):
+        store.compare_and_swap_pointer(key, view, 2, 0, 2)
     store.close()
 
 
 def test_service_equal_freeze_reuses_and_changed_view_conflicts(tmp_path: Path) -> None:
-    database, cas_root, scratch = tmp_path / "continuity.sqlite3", tmp_path / "cas", tmp_path / "scratch"
-    service = ContinuityService(ContinuityStore.bootstrap(database, cas_root, scratch), ContinuityCas.open_prepared(cas_root, scratch, read_only=False))
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False))
     key, request, evidence = _typed_inputs()
     attempt = service.claim_or_reuse(key)
     view = service.freeze(attempt, request, evidence)
@@ -128,3 +157,53 @@ def test_service_equal_freeze_reuses_and_changed_view_conflicts(tmp_path: Path) 
     _, _, altered = _typed_inputs(after_body=b"altered")
     with pytest.raises(ContinuityStoreError):
         service.freeze(attempt, request, altered)
+
+
+def test_prepared_open_rejects_same_name_noop_trigger_and_pointer_shape(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    store.close()
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.execute("DROP TRIGGER views_immutable_delete")
+        connection.execute("CREATE TRIGGER views_immutable_delete BEFORE DELETE ON views BEGIN SELECT 1; END")
+        connection.commit()
+    with pytest.raises(ContinuityStoreError):
+        ContinuityStore.open_readwrite(config.continuity_database, config.continuity_cas_root, config.scratch_root)
+
+    config, store = _prepared_store(tmp_path / "shape")
+    store.close()
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.execute("DROP TABLE pointers")
+        connection.execute("CREATE TABLE pointers (workflow_id TEXT NOT NULL, code_task_id TEXT NOT NULL, code_task_version INTEGER NOT NULL, view_id TEXT NOT NULL, pointer_version INTEGER NOT NULL, fence_epoch INTEGER NOT NULL)")
+        connection.commit()
+    with pytest.raises(ContinuityStoreError):
+        ContinuityStore.open_readwrite(config.continuity_database, config.continuity_cas_root, config.scratch_root)
+
+
+def test_cas_revalidates_shard_before_post_open_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    cas = ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
+    body, digest = b"body", _hash(b"body")
+    cas.put_verified(digest, len(body), body)
+    from devkit_continuity import cas as cas_module
+
+    original = cas_module._safe_root
+
+    def reject_shard(path: Path, *, create: bool) -> None:
+        if path.name == digest[7:9]:
+            raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
+        original(path, create=create)
+
+    monkeypatch.setattr(cas_module, "_safe_root", reject_shard)
+    with pytest.raises(ContinuityCasError):
+        cas.read_verified(digest, len(body))
+
+
+def test_unrelated_typed_evidence_fails_before_cas_or_database_write(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False))
+    key, request, evidence = _typed_inputs()
+    with pytest.raises(ContinuityStoreError):
+        service.freeze(ContinuityAttempt(key, 1, "claimed", None, None), request, replace(evidence, language="other"))
+    assert not (config.continuity_cas_root / "sha256").exists()
+    assert store._connection.execute("SELECT COUNT(*) FROM views").fetchone()[0] == 0
+    assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0

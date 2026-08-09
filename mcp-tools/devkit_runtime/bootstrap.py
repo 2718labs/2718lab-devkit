@@ -58,7 +58,7 @@ def _bootstrap_stores(
 ) -> None:
     from devkit_atlas.receipts import ReceiptRepository
     from devkit_atlas.store import AtlasStore
-    from devkit_continuity.store import ContinuityStore
+    from devkit_continuity.store import _bootstrap_store
     from devkit_relay.store import RelayStore
     from orchestrator.store import SQLiteStore
     from project_index.checkpoints import CheckpointService
@@ -69,7 +69,7 @@ def _bootstrap_stores(
     checkpoints: CheckpointService | None = None
     atlas: AtlasStore | None = None
     relay: RelayStore | None = None
-    continuity: ContinuityStore | None = None
+    continuity = None
     try:
         orchestrator = SQLiteStore(config.orchestrator_database)
         project_index = ProjectIndexService(config.project_index_database)
@@ -81,7 +81,7 @@ def _bootstrap_stores(
         )
         atlas = AtlasStore(config.atlas_database)
         relay = RelayStore(config.relay_database)
-        continuity = ContinuityStore.bootstrap(
+        continuity = _bootstrap_store(
             config.continuity_database, config.continuity_cas_root, config.scratch_root
         )
         proof_registry_bootstrap(config.relay_proof_registry_database)

@@ -45,7 +45,8 @@ class ContinuityService:
     def publish(self, attempt: ContinuityAttempt, frozen_view: FrozenView):
         current = self.store.pointer_for(attempt.key)
         expected = 0 if current is None else current.pointer_version
-        pointer = self.store.compare_and_swap_pointer(attempt.key, frozen_view, expected, attempt.fence_epoch)
+        expected_fence = 0 if current is None else current.fence_epoch
+        pointer = self.store.compare_and_swap_pointer(attempt.key, frozen_view, expected, expected_fence, attempt.fence_epoch)
         receipt = ContinuityReceipt.create(key=attempt.key, view_id=frozen_view.view_id, kind="published")
         self.store.insert_or_get_receipt(receipt, canonical_json({"key": attempt.key.to_dict(), "view_id": frozen_view.view_id, "kind": "published"}))
         self.store.append_attempt_event(attempt.key, attempt.fence_epoch, "published", frozen_view.view_id, receipt.receipt_hash)
@@ -70,6 +71,34 @@ class ContinuityService:
         ):
             raise ContinuityStoreError("CONTINUITY_INPUT_INVALID")
         extraction = evidence.extraction_request
+        if (
+            evidence.code_task_version != request.code_task_version
+            or evidence.language != request.language
+            or evidence.framework != request.framework
+            or evidence.checkpoint_hash != request.checkpoint_hash
+            or evidence.indexed_diff_hash != request.indexed_diff_hash
+            or evidence.output_query_trace_id != request.output_query_trace_id
+            or evidence.verification_artifact_hashes != request.verification_artifact_hashes
+            or extraction.workflow_id != request.workflow_id
+            or extraction.task_id != request.code_task_id
+            or extraction.acceptance_id != request.acceptance_id
+            or not isinstance(extraction.task_kind, str)
+            or not extraction.task_kind
+            or extraction.intent_id != request.intent_id
+            or extraction.checkpoint_id != request.checkpoint_id
+            or extraction.input_snapshot_id != request.input_snapshot_id
+            or extraction.output_snapshot_id != request.output_snapshot_id
+            or tuple(item.receipt_id for item in extraction.execution_receipts)
+            != request.execution_receipt_ids
+            or any(
+                item.workflow_id != request.workflow_id
+                or item.task_id != request.code_task_id
+                or item.acceptance_id != request.acceptance_id
+                or item.output_snapshot_id != request.output_snapshot_id
+                for item in extraction.execution_receipts
+            )
+        ):
+            raise ContinuityStoreError("CONTINUITY_INPUT_INVALID")
         entries: list[FrozenEntry] = []
         for role, files in (("before_file", extraction.before_files), ("after_file", extraction.after_files)):
             for item in files:
