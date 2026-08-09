@@ -29,9 +29,15 @@ from devkit_atlas.service import (  # noqa: E402
     AcceptedAtlasProjectionRequest,
 )
 from devkit_continuity import store as continuity_store  # noqa: E402
-from devkit_continuity.canonical import canonical_hash, canonical_json  # noqa: E402
+from devkit_continuity.canonical import (  # noqa: E402
+    canonical_hash,
+    canonical_json,
+    manifest_identity,
+    view_identity,
+)
 from devkit_continuity.cas import ContinuityCas, ContinuityCasError  # noqa: E402
 from devkit_continuity.models import (  # noqa: E402
+    BoundExecutionReceipt,
     ContinuityAttempt,
     ContinuityError,
     ContinuityKey,
@@ -907,6 +913,42 @@ def test_v1_audit_parser_keeps_legacy_manifest_nonreplayable(tmp_path: Path) -> 
 
     assert parsed == view
     assert parsed.replay_metadata is None
+
+
+def test_v1_manifest_parser_rejects_empty_command_receipt() -> None:
+    key = _key()
+    entries = _view(key).entries
+    receipt = BoundExecutionReceipt(
+        receipt_id="receipt-1",
+        kind="command",
+        workflow_id=key.workflow_id,
+        task_id=key.code_task_id,
+        acceptance_id=key.acceptance_id,
+        workspace_hash=_hash(b"workspace"),
+        output_snapshot_id="output-1",
+        command_spec=("python",),
+        command_spec_hash=canonical_hash(("python",)),
+        input_hash=_hash(b"input"),
+        output_hash=_hash(b"output"),
+        exit_code=0,
+        success=True,
+    )
+    valid_view = FrozenView.create(key=key, entries=entries, execution_receipts=(receipt,))
+    historic_manifest = json.loads(valid_view.manifest_json)
+    historic_receipt = historic_manifest["execution_receipts"][0]
+    historic_receipt["command_spec"] = []
+    historic_receipt["command_spec_hash"] = canonical_hash(())
+    manifest_json = canonical_json(historic_manifest)
+    manifest_hash = manifest_identity(historic_manifest)
+    historic_row = {
+        "view_id": view_identity(manifest_hash, valid_view.cas_root_hash),
+        "manifest_hash": manifest_hash,
+        "cas_root_hash": valid_view.cas_root_hash,
+        "manifest_json": manifest_json,
+    }
+
+    with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+        continuity_store._frozen_view_from_manifest(key, historic_row, entries)
 
 
 @pytest.mark.parametrize("tamper", ("unknown", "missing"))

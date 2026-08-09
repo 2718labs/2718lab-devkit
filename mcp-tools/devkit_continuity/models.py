@@ -230,6 +230,8 @@ class BoundExecutionReceipt:
             self.output_snapshot_id,
         ):
             _require_identifier(value)
+        if self.kind not in {"command", "write"}:
+            raise ContinuityError("RECEIPT_KIND_INVALID")
         for value in (
             self.workspace_hash,
             self.command_spec_hash,
@@ -238,6 +240,8 @@ class BoundExecutionReceipt:
         ):
             _require_hash(value)
         command_spec = _command_spec_tuple(self.command_spec)
+        if self.kind == "command" and not command_spec:
+            raise ContinuityError("COMMAND_SPEC_INVALID")
         for item in command_spec:
             _require_command_atom(item)
         if self.command_spec_hash != canonical_hash(command_spec):

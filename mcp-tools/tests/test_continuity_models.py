@@ -112,6 +112,16 @@ def test_bound_receipt_accepts_empty_patch_like_command_spec_with_canonical_hash
     assert receipt.command_spec_hash == canonical_hash(())
 
 
+def test_bound_receipt_rejects_empty_command_spec() -> None:
+    with pytest.raises(ContinuityError, match="^COMMAND_SPEC_INVALID$"):
+        _bound_receipt(kind="command", command_spec=())
+
+
+def test_bound_receipt_rejects_unknown_kind() -> None:
+    with pytest.raises(ContinuityError, match="^RECEIPT_KIND_INVALID$"):
+        _bound_receipt(kind="patch", command_spec=())
+
+
 @pytest.mark.parametrize(
     ("kind", "command_spec"),
     (("write", ()), ("command", ("python", "-m", "pytest"))),
@@ -123,9 +133,11 @@ def test_bound_receipt_rejects_noncanonical_command_spec_hash(
         _bound_receipt(kind=kind, command_spec=command_spec, command_spec_hash=HASH_A)
 
 
-def test_bound_receipt_accepts_nonempty_canonical_command_spec_hash() -> None:
-    receipt = _bound_receipt(command_spec=("python", "-m", "pytest"))
+@pytest.mark.parametrize("kind", ("command", "write"))
+def test_bound_receipt_accepts_nonempty_canonical_command_spec_hash(kind: str) -> None:
+    receipt = _bound_receipt(kind=kind, command_spec=("python", "-m", "pytest"))
 
+    assert receipt.kind == kind
     assert receipt.command_spec_hash == canonical_hash(("python", "-m", "pytest"))
 
 
@@ -870,7 +882,7 @@ def test_each_coverage_gap_field_binds_manifest_and_view_identity(changed: objec
     "changed",
     (
         lambda value: replace(value, receipt_id="receipt-2"),
-        lambda value: replace(value, kind="test"),
+        lambda value: replace(value, kind="write"),
         lambda value: replace(value, workflow_id="workflow-8"),
         lambda value: replace(value, task_id="task-9"),
         lambda value: replace(value, acceptance_id="acceptance-10"),
