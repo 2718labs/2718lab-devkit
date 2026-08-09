@@ -371,6 +371,16 @@ class FrozenView:
         ordered_receipts = _typed_tuple(
             execution_receipts, BoundExecutionReceipt, "EXECUTION_RECEIPT_INVALID"
         )
+        if not isinstance(key, ContinuityKey):
+            raise ContinuityError("KEY_INVALID")
+        if tuple(sorted(ordered_entries, key=_entry_sort_key)) != ordered_entries:
+            raise ContinuityError("ENTRIES_NOT_CANONICAL")
+        if len({(item.role, item.path) for item in ordered_entries}) != len(
+            ordered_entries
+        ):
+            raise ContinuityError("ENTRIES_DUPLICATE")
+        _require_optional_hash(request_hash)
+        _require_optional_hash(evidence_hash)
         manifest = canonical_frozen_view_manifest(
             key,
             ordered_entries,

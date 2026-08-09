@@ -536,3 +536,106 @@ def test_each_continuity_receipt_input_binds_receipt_identity(changed: object) -
     )
 
     assert base.receipt_hash != altered.receipt_hash
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: FrozenView.create(key=None, entries=_entries()),
+        lambda: FrozenView.create(key=_key(), entries=_entries(), request_hash="not-a-hash"),
+        lambda: FrozenView.create(key=_key(), entries=tuple(reversed(_entries()))),
+        lambda: FrozenView.create(
+            key=_key(),
+            entries=(
+                FrozenEntry("before_file", "src/a.py", HASH_A, 1),
+                FrozenEntry("before_file", "src/a.py", HASH_B, 2),
+            ),
+        ),
+    ),
+)
+def test_frozen_view_factory_normalizes_invalid_inputs(factory: object) -> None:
+    with pytest.raises(ContinuityError):
+        factory()  # type: ignore[operator]
+
+
+def _view_for_metadata(**overrides: object) -> FrozenView:
+    common: dict[str, object] = {
+        "key": _key(),
+        "entries": _entries(),
+        "changed_nodes": (ChangedNode.from_index_node(_index_node()),),
+        "coverage_gaps": (CoverageGap("src/a.py", "PARSER_GAP", "unsupported"),),
+        "execution_receipts": (_bound_receipt(),),
+    }
+    return FrozenView.create(**(common | overrides))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda value: replace(value, node_id="node-2"),
+        lambda value: replace(value, kind="class"),
+        lambda value: replace(value, path="src/b.py"),
+        lambda value: replace(value, content_hash=HASH_B),
+        lambda value: replace(value, name="other"),
+        lambda value: replace(value, qualified_name="pkg.other"),
+        lambda value: replace(value, start_line=3),
+        lambda value: replace(value, end_line=7),
+        lambda value: replace(value, attributes=(("decorator", "other"),)),
+        lambda value: replace(value, extractor_id="other-parser"),
+        lambda value: replace(value, extractor_version="2.0"),
+        lambda value: replace(value, provenance="declared"),
+        lambda value: replace(value, start_byte=13),
+        lambda value: replace(value, end_byte=97),
+    ),
+)
+def test_each_changed_node_field_binds_manifest_and_view_identity(changed: object) -> None:
+    node = ChangedNode.from_index_node(_index_node())
+    first = _view_for_metadata(changed_nodes=(node,))
+    second = _view_for_metadata(changed_nodes=(changed(node),))  # type: ignore[operator]
+
+    assert first.manifest_hash != second.manifest_hash
+    assert first.view_id != second.view_id
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda value: replace(value, path="src/b.py"),
+        lambda value: replace(value, code="OTHER_GAP"),
+        lambda value: replace(value, message="different"),
+    ),
+)
+def test_each_coverage_gap_field_binds_manifest_and_view_identity(changed: object) -> None:
+    gap = CoverageGap("src/a.py", "PARSER_GAP", "unsupported")
+    first = _view_for_metadata(coverage_gaps=(gap,))
+    second = _view_for_metadata(coverage_gaps=(changed(gap),))  # type: ignore[operator]
+
+    assert first.manifest_hash != second.manifest_hash
+    assert first.view_id != second.view_id
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda value: replace(value, receipt_id="receipt-2"),
+        lambda value: replace(value, kind="test"),
+        lambda value: replace(value, workflow_id="workflow-8"),
+        lambda value: replace(value, task_id="task-9"),
+        lambda value: replace(value, acceptance_id="acceptance-10"),
+        lambda value: replace(value, workspace_hash=HASH_B),
+        lambda value: replace(value, output_snapshot_id="output-2"),
+        lambda value: replace(value, command_spec=("python", "-m", "compileall")),
+        lambda value: replace(value, command_spec_hash=HASH_C),
+        lambda value: replace(value, input_hash=HASH_A),
+        lambda value: replace(value, output_hash=HASH_B),
+        lambda value: replace(value, exit_code=1),
+        lambda value: replace(value, success=False),
+    ),
+)
+def test_each_bound_receipt_field_binds_manifest_and_view_identity(changed: object) -> None:
+    receipt = _bound_receipt()
+    first = _view_for_metadata(execution_receipts=(receipt,))
+    second = _view_for_metadata(execution_receipts=(changed(receipt),))  # type: ignore[operator]
+
+    assert first.manifest_hash != second.manifest_hash
+    assert first.view_id != second.view_id
