@@ -10,7 +10,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 _HASH_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_MANIFEST_SCHEMA = "continuity-frozen-view/v1"
+_MANIFEST_SCHEMA_V1 = "continuity-frozen-view/v1"
+_MANIFEST_SCHEMA_V2 = "continuity-frozen-view/v2"
 _KEY_DOMAIN = "continuity-key/v1"
 _MANIFEST_DOMAIN = "continuity-manifest/v1"
 _CAS_ROOT_DOMAIN = "continuity-cas-root/v1"
@@ -96,8 +97,13 @@ def canonical_frozen_view_manifest(
     changed_nodes: Sequence[Any] = (),
     coverage_gaps: Sequence[Any] = (),
     execution_receipts: Sequence[Any] = (),
+    replay_metadata: Any | None = None,
 ) -> dict[str, Any]:
-    """Build the complete, ordered v1 frozen-view manifest payload."""
+    """Build the complete ordered frozen-view manifest payload.
+
+    Metadata-free views remain byte-for-byte compatible with the historical v1
+    format. A typed replay context creates the explicit v2 format instead.
+    """
     entry_values = tuple(_entry_value(entry) for entry in entries)
     if tuple(sorted(entry_values, key=_entry_sort_key)) != entry_values:
         raise ValueError("ENTRIES_NOT_CANONICAL")
@@ -110,8 +116,8 @@ def canonical_frozen_view_manifest(
         raise ValueError("HASH_ID_INVALID")
     _require_optional_hash(request_hash)
     _require_optional_hash(evidence_hash)
-    return {
-        "schema": _MANIFEST_SCHEMA,
+    manifest = {
+        "schema": _MANIFEST_SCHEMA_V1 if replay_metadata is None else _MANIFEST_SCHEMA_V2,
         "key": _key_value(key),
         "entries": list(entry_values),
         "input_snapshot_ids": _identifier_list(input_snapshot_ids),
@@ -128,6 +134,11 @@ def canonical_frozen_view_manifest(
             execution_receipts, "EXECUTION_RECEIPT_INVALID"
         ),
     }
+    if replay_metadata is not None:
+        manifest["replay_metadata"] = _metadata_value(
+            replay_metadata, "REPLAY_METADATA_INVALID"
+        )
+    return manifest
 
 
 def _domain_identity(domain: str, payload: Any) -> str:
@@ -189,6 +200,16 @@ def _metadata_values(values: Sequence[Any], code: str) -> list[dict[str, Any]]:
             raise ValueError(code)
         result.append(item)
     return result
+
+
+def _metadata_value(value: Any, code: str) -> dict[str, Any]:
+    to_dict = getattr(value, "to_dict", None)
+    if not callable(to_dict):
+        raise ValueError(code)
+    item = to_dict()
+    if not isinstance(item, dict):
+        raise ValueError(code)
+    return item
 
 
 def _entry_sort_key(entry: Mapping[str, Any]) -> tuple[str, str, str]:

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_continuity.canonical import (  # noqa: E402
     canonical_frozen_view_manifest,
+    canonical_hash,
     canonical_json,
     cas_root_identity,
     manifest_identity,
@@ -29,6 +30,7 @@ from devkit_continuity.models import (  # noqa: E402
     CoverageGap,
     FrozenEntry,
     FrozenView,
+    ReplayMetadata,
 )
 from devkit_runtime.config import RuntimeConfig  # noqa: E402
 from project_index.models import IndexNode  # noqa: E402
@@ -98,6 +100,70 @@ def _bound_receipt(
     )
 
 
+def _replay_metadata() -> ReplayMetadata:
+    return ReplayMetadata(
+        task_kind="code",
+        intent_id="intent-1",
+        workspace_hash=HASH_A,
+        write_scope=("src/a.py",),
+        indexed_diff_hash=HASH_B,
+        language="python",
+        framework="pytest",
+        checkpoint_hash=HASH_C,
+    )
+
+
+def _v2_view_inputs(metadata: ReplayMetadata | None = None) -> dict[str, object]:
+    key = _key()
+    metadata = _replay_metadata() if metadata is None else metadata
+    input_snapshot_id, output_snapshot_id = "input-1", "output-1"
+    checkpoint_id, query_id = "checkpoint-1", "query-1"
+    artifact_hashes = (HASH_A,)
+    receipt_ids = (HASH_B,)
+    request_payload = {
+        "ingestion_key": key.ingestion_key,
+        "payload_hash": key.payload_hash,
+        "acceptance_id": key.acceptance_id,
+        "workflow_id": key.workflow_id,
+        "code_task_id": key.code_task_id,
+        "code_task_version": key.code_task_version,
+        "input_snapshot_id": input_snapshot_id,
+        "output_snapshot_id": output_snapshot_id,
+        "indexed_diff_hash": metadata.indexed_diff_hash,
+        "intent_id": metadata.intent_id,
+        "language": metadata.language,
+        "framework": metadata.framework,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_hash": metadata.checkpoint_hash,
+        "output_query_trace_id": query_id,
+        "verification_artifact_hashes": artifact_hashes,
+        "execution_receipt_ids": receipt_ids,
+        "evidence_binding_hash": key.evidence_binding_hash,
+    }
+    evidence_payload = {
+        "code_task_version": key.code_task_version,
+        "language": metadata.language,
+        "framework": metadata.framework,
+        "checkpoint_hash": metadata.checkpoint_hash,
+        "indexed_diff_hash": metadata.indexed_diff_hash,
+        "output_query_trace_id": query_id,
+        "verification_artifact_hashes": artifact_hashes,
+    }
+    return {
+        "key": key,
+        "entries": _entries(),
+        "input_snapshot_ids": (input_snapshot_id,),
+        "output_snapshot_ids": (output_snapshot_id,),
+        "checkpoint_ids": (checkpoint_id,),
+        "query_ids": (query_id,),
+        "verification_artifact_hashes": artifact_hashes,
+        "execution_receipt_ids": receipt_ids,
+        "request_hash": canonical_hash(request_payload),
+        "evidence_hash": canonical_hash(evidence_payload),
+        "replay_metadata": metadata,
+    }
+
+
 def test_canonical_json_is_utf8_sorted_and_compact() -> None:
     assert canonical_json({"z": "雪", "a": [True, None]}) == '{"a":[true,null],"z":"雪"}'
 
@@ -142,6 +208,88 @@ def test_frozen_view_factory_binds_complete_canonical_manifest() -> None:
     assert view.cas_root_hash == cas_root_identity(entries)
     assert view.view_id == view_identity(view.manifest_hash, view.cas_root_hash)
     assert view.manifest_json == canonical_json(manifest)
+
+
+def test_replay_metadata_upgrades_manifest_to_typed_v2_identity() -> None:
+    metadata = _replay_metadata()
+    common = _v2_view_inputs(metadata)
+
+    view = FrozenView.create(**common)
+    manifest = canonical_frozen_view_manifest(**common)
+
+    assert manifest["schema"] == "continuity-frozen-view/v2"
+    assert manifest["replay_metadata"] == metadata.to_dict()
+    assert view.replay_metadata == metadata
+    assert view.manifest_json == canonical_json(manifest)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda value: replace(value, intent_id="intent-2"),
+        lambda value: replace(value, workspace_hash=HASH_B),
+        lambda value: replace(value, write_scope=("src/b.py",)),
+        lambda value: replace(value, indexed_diff_hash=HASH_C),
+        lambda value: replace(value, language="rust"),
+        lambda value: replace(value, framework=""),
+        lambda value: replace(value, checkpoint_hash=HASH_A),
+    ),
+)
+def test_each_replay_metadata_field_binds_identity_and_direct_constructor(
+    changed: object,
+) -> None:
+    metadata = _replay_metadata()
+    first = FrozenView.create(**_v2_view_inputs(metadata))
+    altered_metadata = changed(metadata)  # type: ignore[operator]
+    altered = FrozenView.create(**_v2_view_inputs(altered_metadata))
+
+    assert first.view_id != altered.view_id
+    with pytest.raises(ContinuityError):
+        replace(first, replay_metadata=altered_metadata)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        lambda: ReplayMetadata("other", "intent", HASH_A, ("src/a.py",), HASH_B, "python", "", HASH_C),
+        lambda: ReplayMetadata("code", "intent", HASH_A, ("/absolute",), HASH_B, "python", "", HASH_C),
+        lambda: ReplayMetadata("code", "intent", HASH_A, ("node_modules/a.py",), HASH_B, "python", "", HASH_C),
+        lambda: ReplayMetadata("code", "intent", HASH_A, ("src/a.py", "src/a.py"), HASH_B, "python", "", HASH_C),
+        lambda: ReplayMetadata("code", "intent", HASH_A, ("src/b.py", "src/a.py"), HASH_B, "python", "", HASH_C),
+        lambda: ReplayMetadata("code", "intent", HASH_A, ("src/a.py",), HASH_B, "python", "\n", HASH_C),
+    ),
+)
+def test_replay_metadata_rejects_unsafe_or_nondeterministic_values(metadata: object) -> None:
+    with pytest.raises(ContinuityError):
+        metadata()  # type: ignore[operator]
+
+
+def test_replay_metadata_normalizes_atlas_compatible_scope_separator() -> None:
+    metadata = ReplayMetadata(
+        "code", "intent", HASH_A, ("src\\a.py",), HASH_B, "python", "", HASH_C
+    )
+
+    assert metadata.write_scope == ("src/a.py",)
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"input_snapshot_ids": ("input-1", "input-2")},
+        {"output_snapshot_ids": ("output-1", "output-2")},
+        {"checkpoint_ids": ("checkpoint-1", "checkpoint-2")},
+        {"query_ids": ("query-1", "query-2")},
+        {"verification_artifact_hashes": ()},
+        {"verification_artifact_hashes": (HASH_B, HASH_A)},
+        {"execution_receipt_ids": ()},
+        {"execution_receipt_ids": (HASH_C, HASH_B)},
+    ),
+)
+def test_v2_replay_metadata_requires_exact_atlas_cardinality_and_order(
+    override: dict[str, object],
+) -> None:
+    with pytest.raises(ContinuityError):
+        FrozenView.create(**(_v2_view_inputs() | override))  # type: ignore[arg-type]
 
 
 def test_identity_domains_are_explicit_and_distinct() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -37,6 +38,7 @@ from devkit_continuity.models import (  # noqa: E402
     ContinuityReceipt,
     FrozenEntry,
     FrozenView,
+    ReplayMetadata,
 )
 from devkit_continuity.service import ContinuityService  # noqa: E402
 from devkit_continuity.store import ContinuityStore, ContinuityStoreError  # noqa: E402
@@ -93,7 +95,7 @@ def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, Accep
     )
     before_body = b"before"
     extraction = ExtractionRequest(
-        "workflow", "task", request.acceptance_id, "kind", "intent", _hash(b"workspace"), "checkpoint", "input", "output", ("src",),
+        "workflow", "task", request.acceptance_id, "code", "intent", _hash(b"workspace"), "checkpoint", "input", "output", ("src",),
         (CheckpointFile("src/a.py", _hash(before_body), before_body),),
         (SnapshotFile("src/a.py", _hash(after_body), after_body),),
         (IndexNode("node", "function", "src/a.py", "run", "pkg.run", 1, 1, _hash(after_body)),),
@@ -864,6 +866,126 @@ def test_state_machine_is_only_lifecycle_write_surface_and_relations_are_immutab
         store._connection.execute("DELETE FROM views")
     store._connection.rollback()
     store.close()
+
+
+def test_service_freeze_persists_complete_typed_replay_metadata(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store,
+        ContinuityCas.open_prepared(
+            config.continuity_cas_root, config.scratch_root, read_only=False
+        ),
+    )
+    key, request, evidence = _typed_inputs()
+
+    view = service.freeze(service.claim_or_reuse(key), request, evidence)
+
+    assert view.replay_metadata == ReplayMetadata(
+        task_kind="code",
+        intent_id=request.intent_id,
+        workspace_hash=evidence.extraction_request.workspace_hash,
+        write_scope=evidence.extraction_request.write_scope,
+        indexed_diff_hash=request.indexed_diff_hash,
+        language=request.language,
+        framework=request.framework,
+        checkpoint_hash=request.checkpoint_hash,
+    )
+    assert '"schema":"continuity-frozen-view/v2"' in view.manifest_json
+
+
+def test_v1_audit_parser_keeps_legacy_manifest_nonreplayable(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    key, view, _receipt = _create_verified_v1(config)
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT view_id,key_hash,manifest_hash,cas_root_hash,manifest_json FROM views"
+        ).fetchone()
+    assert row is not None
+
+    parsed = continuity_store._v1_frozen_view(key, row, view.entries)
+
+    assert parsed == view
+    assert parsed.replay_metadata is None
+
+
+@pytest.mark.parametrize("tamper", ("unknown", "missing"))
+def test_manifest_parser_rejects_unknown_or_incomplete_v2_payload(
+    tmp_path: Path, tamper: str
+) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store,
+        ContinuityCas.open_prepared(
+            config.continuity_cas_root, config.scratch_root, read_only=False
+        ),
+    )
+    key, request, evidence = _typed_inputs()
+    view = service.freeze(service.claim_or_reuse(key), request, evidence)
+    row = store._connection.execute(
+        "SELECT view_id,key_hash,manifest_hash,cas_root_hash,manifest_json FROM views"
+    ).fetchone()
+    assert row is not None
+    manifest = json.loads(row["manifest_json"])
+    if tamper == "unknown":
+        manifest["unexpected"] = True
+    else:
+        del manifest["replay_metadata"]
+    tampered = dict(row)
+    tampered["manifest_json"] = canonical_json(manifest)
+
+    with pytest.raises(ContinuityStoreError):
+        continuity_store._frozen_view_from_manifest(key, tampered, view.entries)
+
+
+def test_prepared_open_revalidates_persisted_v2_manifest_schema(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store,
+        ContinuityCas.open_prepared(
+            config.continuity_cas_root, config.scratch_root, read_only=False
+        ),
+    )
+    key, request, evidence = _typed_inputs()
+    service.freeze(service.claim_or_reuse(key), request, evidence)
+    store.close()
+    with sqlite3.connect(config.continuity_database) as connection:
+        manifest_json = connection.execute("SELECT manifest_json FROM views").fetchone()[0]
+        manifest = json.loads(manifest_json)
+        manifest["unexpected"] = True
+        connection.execute("DROP TRIGGER views_immutable_update")
+        connection.execute(
+            "UPDATE views SET manifest_json=?", (canonical_json(manifest),)
+        )
+        _restore_v1_update_trigger(connection, "views")
+    with pytest.raises(ContinuityStoreError):
+        ContinuityStore.open_readwrite(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+
+
+def test_prepared_reopen_rebuilds_bound_v2_manifest(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store,
+        ContinuityCas.open_prepared(
+            config.continuity_cas_root, config.scratch_root, read_only=False
+        ),
+    )
+    key, request, evidence = _typed_inputs()
+    view = service.freeze(service.claim_or_reuse(key), request, evidence)
+    store.close()
+
+    reopened = ContinuityStore.open_readonly(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+
+    assert reopened.current_attempt(key) == ContinuityAttempt(
+        key, 1, "frozen", view.view_id, ContinuityReceipt.create(
+            key=key, view_id=view.view_id, kind="frozen"
+        ).receipt_hash
+    )
+    reopened.close()
 
 
 def test_service_equal_freeze_reuses_and_changed_view_conflicts(tmp_path: Path) -> None:

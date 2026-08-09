@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
 from .canonical import (
     canonical_frozen_view_manifest,
+    canonical_hash,
     canonical_json,
     cas_root_identity,
     is_hash_id,
@@ -21,6 +23,10 @@ _ENTRY_ROLES = frozenset({"before_file", "after_file"})
 _PROVENANCE_VALUES = frozenset({"observed", "resolved", "declared"})
 _COMMAND_ABSOLUTE_PATH_VALUE = re.compile(
     r"(?:^|=)(?:[A-Za-z]:[\\/]|[\\/]{2}|/|file:/)", re.IGNORECASE
+)
+_REPLAY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_GENERATED_SCOPE_COMPONENTS = frozenset(
+    {".git", ".venv", "venv", "node_modules", "vendor", "dist", "build", "__pycache__"}
 )
 
 
@@ -259,6 +265,111 @@ class BoundExecutionReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplayMetadata:
+    """The missing non-body facts required for an offline Atlas replay."""
+
+    task_kind: str
+    intent_id: str
+    workspace_hash: str
+    write_scope: tuple[str, ...]
+    indexed_diff_hash: str
+    language: str
+    framework: str
+    checkpoint_hash: str
+
+    def __post_init__(self) -> None:
+        if self.task_kind != "code":
+            raise ContinuityError("REPLAY_METADATA_INVALID")
+        _require_replay_identifier(self.intent_id)
+        _require_hash(self.workspace_hash)
+        write_scope = _canonical_write_scope(self.write_scope)
+        _require_hash(self.indexed_diff_hash)
+        _require_replay_identifier(self.language)
+        _require_replay_identifier(self.framework, allow_empty=True)
+        _require_hash(self.checkpoint_hash)
+        object.__setattr__(self, "write_scope", write_scope)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_kind": self.task_kind,
+            "intent_id": self.intent_id,
+            "workspace_hash": self.workspace_hash,
+            "write_scope": list(self.write_scope),
+            "indexed_diff_hash": self.indexed_diff_hash,
+            "language": self.language,
+            "framework": self.framework,
+            "checkpoint_hash": self.checkpoint_hash,
+        }
+
+
+def _validate_replay_binding(
+    key: ContinuityKey,
+    *,
+    input_snapshot_ids: tuple[str, ...],
+    output_snapshot_ids: tuple[str, ...],
+    checkpoint_ids: tuple[str, ...],
+    query_ids: tuple[str, ...],
+    verification_artifact_hashes: tuple[str, ...],
+    execution_receipt_ids: tuple[str, ...],
+    request_hash: str | None,
+    evidence_hash: str | None,
+    replay_metadata: ReplayMetadata,
+) -> None:
+    """Bind v2 context to the exact typed Atlas request and evidence shapes."""
+    if (
+        len(input_snapshot_ids) != 1
+        or len(output_snapshot_ids) != 1
+        or len(checkpoint_ids) != 1
+        or len(query_ids) != 1
+        or request_hash is None
+        or evidence_hash is None
+        or not verification_artifact_hashes
+        or tuple(sorted(verification_artifact_hashes)) != verification_artifact_hashes
+        or len(set(verification_artifact_hashes)) != len(verification_artifact_hashes)
+        or not execution_receipt_ids
+        or any(not is_hash_id(value) for value in execution_receipt_ids)
+        or tuple(sorted(execution_receipt_ids)) != execution_receipt_ids
+        or len(set(execution_receipt_ids)) != len(execution_receipt_ids)
+    ):
+        raise ContinuityError("REPLAY_BINDING_INVALID")
+    input_snapshot_id = input_snapshot_ids[0]
+    output_snapshot_id = output_snapshot_ids[0]
+    checkpoint_id = checkpoint_ids[0]
+    query_id = query_ids[0]
+    request = {
+        "ingestion_key": key.ingestion_key,
+        "payload_hash": key.payload_hash,
+        "acceptance_id": key.acceptance_id,
+        "workflow_id": key.workflow_id,
+        "code_task_id": key.code_task_id,
+        "code_task_version": key.code_task_version,
+        "input_snapshot_id": input_snapshot_id,
+        "output_snapshot_id": output_snapshot_id,
+        "indexed_diff_hash": replay_metadata.indexed_diff_hash,
+        "intent_id": replay_metadata.intent_id,
+        "language": replay_metadata.language,
+        "framework": replay_metadata.framework,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_hash": replay_metadata.checkpoint_hash,
+        "output_query_trace_id": query_id,
+        "verification_artifact_hashes": verification_artifact_hashes,
+        "execution_receipt_ids": execution_receipt_ids,
+        "evidence_binding_hash": key.evidence_binding_hash,
+    }
+    evidence = {
+        "code_task_version": key.code_task_version,
+        "language": replay_metadata.language,
+        "framework": replay_metadata.framework,
+        "checkpoint_hash": replay_metadata.checkpoint_hash,
+        "indexed_diff_hash": replay_metadata.indexed_diff_hash,
+        "output_query_trace_id": query_id,
+        "verification_artifact_hashes": verification_artifact_hashes,
+    }
+    if canonical_hash(request) != request_hash or canonical_hash(evidence) != evidence_hash:
+        raise ContinuityError("REPLAY_BINDING_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
 class FrozenView:
     view_id: str
     manifest_hash: str
@@ -273,6 +384,7 @@ class FrozenView:
     execution_receipt_ids: tuple[str, ...] = ()
     request_hash: str | None = None
     evidence_hash: str | None = None
+    replay_metadata: ReplayMetadata | None = None
     changed_nodes: tuple[ChangedNode, ...] = ()
     coverage_gaps: tuple[CoverageGap, ...] = ()
     execution_receipts: tuple[BoundExecutionReceipt, ...] = ()
@@ -296,6 +408,22 @@ class FrozenView:
         execution_receipt_ids = _identifier_tuple(self.execution_receipt_ids)
         _require_optional_hash(self.request_hash)
         _require_optional_hash(self.evidence_hash)
+        replay_metadata = self.replay_metadata
+        if replay_metadata is not None and not isinstance(replay_metadata, ReplayMetadata):
+            raise ContinuityError("REPLAY_METADATA_INVALID")
+        if replay_metadata is not None:
+            _validate_replay_binding(
+                self.key,
+                input_snapshot_ids=input_snapshot_ids,
+                output_snapshot_ids=output_snapshot_ids,
+                checkpoint_ids=checkpoint_ids,
+                query_ids=query_ids,
+                verification_artifact_hashes=verification_artifact_hashes,
+                execution_receipt_ids=execution_receipt_ids,
+                request_hash=self.request_hash,
+                evidence_hash=self.evidence_hash,
+                replay_metadata=replay_metadata,
+            )
         changed_nodes = _typed_tuple(self.changed_nodes, ChangedNode, "CHANGED_NODE_INVALID")
         coverage_gaps = _typed_tuple(self.coverage_gaps, CoverageGap, "COVERAGE_GAP_INVALID")
         receipts = _typed_tuple(
@@ -312,6 +440,7 @@ class FrozenView:
             execution_receipt_ids=execution_receipt_ids,
             request_hash=self.request_hash,
             evidence_hash=self.evidence_hash,
+            replay_metadata=replay_metadata,
             changed_nodes=changed_nodes,
             coverage_gaps=coverage_gaps,
             execution_receipts=receipts,
@@ -334,6 +463,7 @@ class FrozenView:
             self, "verification_artifact_hashes", verification_artifact_hashes
         )
         object.__setattr__(self, "execution_receipt_ids", execution_receipt_ids)
+        object.__setattr__(self, "replay_metadata", replay_metadata)
         object.__setattr__(self, "changed_nodes", changed_nodes)
         object.__setattr__(self, "coverage_gaps", coverage_gaps)
         object.__setattr__(self, "execution_receipts", receipts)
@@ -352,6 +482,7 @@ class FrozenView:
         execution_receipt_ids: tuple[str, ...] | list[str] = (),
         request_hash: str | None = None,
         evidence_hash: str | None = None,
+        replay_metadata: ReplayMetadata | None = None,
         changed_nodes: tuple[ChangedNode, ...] | list[ChangedNode] = (),
         coverage_gaps: tuple[CoverageGap, ...] | list[CoverageGap] = (),
         execution_receipts: tuple[BoundExecutionReceipt, ...]
@@ -381,6 +512,21 @@ class FrozenView:
             raise ContinuityError("ENTRIES_DUPLICATE")
         _require_optional_hash(request_hash)
         _require_optional_hash(evidence_hash)
+        if replay_metadata is not None and not isinstance(replay_metadata, ReplayMetadata):
+            raise ContinuityError("REPLAY_METADATA_INVALID")
+        if replay_metadata is not None:
+            _validate_replay_binding(
+                key,
+                input_snapshot_ids=ordered_inputs,
+                output_snapshot_ids=ordered_outputs,
+                checkpoint_ids=ordered_checkpoints,
+                query_ids=ordered_queries,
+                verification_artifact_hashes=ordered_artifacts,
+                execution_receipt_ids=ordered_receipt_ids,
+                request_hash=request_hash,
+                evidence_hash=evidence_hash,
+                replay_metadata=replay_metadata,
+            )
         manifest = canonical_frozen_view_manifest(
             key,
             ordered_entries,
@@ -392,6 +538,7 @@ class FrozenView:
             execution_receipt_ids=ordered_receipt_ids,
             request_hash=request_hash,
             evidence_hash=evidence_hash,
+            replay_metadata=replay_metadata,
             changed_nodes=ordered_nodes,
             coverage_gaps=ordered_gaps,
             execution_receipts=ordered_receipts,
@@ -412,6 +559,7 @@ class FrozenView:
             execution_receipt_ids=ordered_receipt_ids,
             request_hash=request_hash,
             evidence_hash=evidence_hash,
+            replay_metadata=replay_metadata,
             changed_nodes=ordered_nodes,
             coverage_gaps=ordered_gaps,
             execution_receipts=ordered_receipts,
@@ -432,6 +580,7 @@ class FrozenView:
                 execution_receipt_ids=self.execution_receipt_ids,
                 request_hash=self.request_hash,
                 evidence_hash=self.evidence_hash,
+                replay_metadata=self.replay_metadata,
                 changed_nodes=self.changed_nodes,
                 coverage_gaps=self.coverage_gaps,
                 execution_receipts=self.execution_receipts,
@@ -533,6 +682,53 @@ def _require_relative_path(value: object) -> None:
     parts = value.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ContinuityError("PATH_INVALID")
+
+
+def _canonical_write_scope(value: object) -> tuple[str, ...]:
+    try:
+        scope = tuple(value)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ContinuityError("WRITE_SCOPE_INVALID") from error
+    if not scope:
+        raise ContinuityError("WRITE_SCOPE_INVALID")
+    normalized = tuple(_normalize_replay_scope_path(path) for path in scope)
+    if (
+        tuple(sorted(normalized)) != normalized
+        or len(set(normalized)) != len(normalized)
+        or len({unicodedata.normalize("NFC", path).casefold() for path in normalized})
+        != len(normalized)
+    ):
+        raise ContinuityError("WRITE_SCOPE_INVALID")
+    return normalized
+
+
+def _normalize_replay_scope_path(value: object) -> str:
+    if not isinstance(value, str):
+        raise ContinuityError("WRITE_SCOPE_INVALID")
+    if (
+        not value
+        or value.strip() != value
+        or value.startswith(("/", "\\"))
+        or re.match(r"^[A-Za-z]:", value) is not None
+    ):
+        raise ContinuityError("WRITE_SCOPE_INVALID")
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if (
+        any(part in {"", ".", ".."} or ":" in part for part in parts)
+        or any(part.casefold() in _GENERATED_SCOPE_COMPONENTS for part in parts)
+        or ".generated." in parts[-1].casefold()
+        or parts[-1].casefold().endswith("_pb2.py")
+    ):
+        raise ContinuityError("WRITE_SCOPE_INVALID")
+    return "/".join(parts)
+
+
+def _require_replay_identifier(value: object, *, allow_empty: bool = False) -> None:
+    if isinstance(value, str) and not value and allow_empty:
+        return
+    if not isinstance(value, str) or _REPLAY_IDENTIFIER.fullmatch(value) is None:
+        raise ContinuityError("REPLAY_METADATA_INVALID")
 
 
 def _require_optional_hash(value: object) -> None:
