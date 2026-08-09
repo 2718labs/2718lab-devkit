@@ -36,7 +36,7 @@ class SQLiteStoreTests(unittest.TestCase):
         return Task(task_id, self.workflow.id, task_id, "terra")
 
     def test_schema_uses_wal_foreign_keys_and_current_schema_version(self) -> None:
-        self.assertEqual(self.store.schema_version(), 11)
+        self.assertEqual(self.store.schema_version(), 12)
         self.assertEqual(self.store.journal_mode(), "wal")
         self.assertTrue(self.store.foreign_keys_enabled())
 

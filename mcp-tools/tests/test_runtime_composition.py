@@ -1041,12 +1041,21 @@ def _legacy_v10_atlas_outbox_database(
         acceptance_id, timestamp = _insert_legacy_atlas_acceptance(
             connection, suffix="a"
         )
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            ("schema_version", "10"),
+        )
         connection.execute("DROP TABLE atlas_ingestion_outbox")
         connection.executescript(_atlas_outbox_schema())
-        connection.execute(
-            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
-            ("10",),
-        )
         connection.execute(
             """
             INSERT INTO atlas_ingestion_outbox (
@@ -1083,7 +1092,7 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
 
     store = SQLiteStore(database)
     try:
-        assert store.schema_version() == 11
+        assert store.schema_version() == 12
         columns = {
             str(row["name"]): int(row["notnull"])
             for row in store._connection.execute(
@@ -1213,6 +1222,15 @@ def test_sqlite_store_rolls_back_incomplete_v10_outbox_upgrade(
         }
         assert "payload_json" not in columns
         assert columns["ingestion_key"] == 0
+        metadata_columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert metadata_columns["key"] == 0
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_metadata_v12'"
+        ).fetchone() is None
         assert connection.execute(
             "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
         ).fetchone()[0] == "10"
@@ -1397,5 +1415,290 @@ def test_sqlite_store_rejects_noncanonical_schema_metadata(
         with pytest.raises(StoreError, match="orchestrator store is not prepared"):
             store = SQLiteStore.from_prepared_connection(connection)
             store.close()
+    finally:
+        connection.close()
+
+
+def _runtime_with_null_schema_metadata_key(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            (("schema_version", "11"), (None, "invalid-null-key")),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_null_schema_metadata_key(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_null_schema_metadata_key(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+    else:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+                store = SQLiteStore.from_prepared_connection(connection)
+                store.close()
+        finally:
+            connection.close()
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        columns = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 0
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key IS NULL"
+        ).fetchone()[0] == "invalid-null-key"
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "11"
+    finally:
+        connection.close()
+
+
+def _legacy_metadata_database(
+    tmp_path: Path,
+    *,
+    version: str,
+    rows: tuple[tuple[str, str], ...] | None = None,
+) -> Path:
+    database = tmp_path / f"legacy-schema-metadata-{version}.sqlite3"
+    bootstrap = SQLiteStore(database)
+    bootstrap.close()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        metadata_rows = (("schema_version", version),) if rows is None else rows
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            metadata_rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database
+
+
+@pytest.mark.parametrize("legacy_version", ("10", "11"))
+def test_sqlite_store_migrates_trustworthy_legacy_schema_metadata(
+    tmp_path: Path, legacy_version: str
+) -> None:
+    database = _legacy_metadata_database(tmp_path, version=legacy_version)
+
+    store = SQLiteStore(database)
+    try:
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in store._connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 1
+        assert store.schema_version() == 12
+        assert tuple(
+            tuple(row)
+            for row in store._connection.execute(
+                "SELECT key, value FROM schema_metadata"
+            )
+        ) == (("schema_version", "12"),)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected_rows"),
+    (
+        ((), ()),
+        (
+            (("schema_version", "11"), ("legacy_marker", "preserved")),
+            (("legacy_marker", "preserved"), ("schema_version", "11")),
+        ),
+    ),
+    ids=("empty", "extra-row"),
+)
+def test_sqlite_store_rejects_untrusted_legacy_schema_metadata(
+    tmp_path: Path,
+    rows: tuple[tuple[str, str], ...],
+    expected_rows: tuple[tuple[str, str], ...],
+) -> None:
+    database = _legacy_metadata_database(tmp_path, version="11", rows=rows)
+
+    with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        columns = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 0
+        assert tuple(
+            connection.execute(
+                "SELECT key, value FROM schema_metadata ORDER BY key, value"
+            )
+        ) == expected_rows
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_metadata_v12'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def _runtime_with_strict_schema_metadata_rows(
+    tmp_path: Path,
+    rows: tuple[tuple[str, str], ...],
+) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DELETE FROM schema_metadata")
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+@pytest.mark.parametrize(
+    ("rows", "expected_rows"),
+    (
+        (
+            (("schema_version", "11"),),
+            (("schema_version", "11"),),
+        ),
+        (
+            (("schema_version", "13"),),
+            (("schema_version", "13"),),
+        ),
+        ((), ()),
+        (
+            (("schema_version", "12"), ("legacy_marker", "preserved")),
+            (("legacy_marker", "preserved"), ("schema_version", "12")),
+        ),
+    ),
+    ids=("legacy-version", "future-version", "empty", "extra-row"),
+)
+def test_sqlite_store_rejects_noncanonical_strict_schema_metadata(
+    tmp_path: Path,
+    entry_point: str,
+    rows: tuple[tuple[str, str], ...],
+    expected_rows: tuple[tuple[str, str], ...],
+) -> None:
+    config = _runtime_with_strict_schema_metadata_rows(tmp_path, rows)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+    else:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+                store = SQLiteStore.from_prepared_connection(connection)
+                store.close()
+        finally:
+            connection.close()
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        columns = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 1
+        assert tuple(
+            connection.execute(
+                "SELECT key, value FROM schema_metadata ORDER BY key, value"
+            )
+        ) == expected_rows
+    finally:
+        connection.close()
+
+
+def _runtime_with_generated_schema_metadata_column(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL,
+                generated_marker TEXT GENERATED ALWAYS AS (key || value) VIRTUAL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            ("schema_version", "12"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_generated_schema_metadata_column(
+    tmp_path: Path,
+    entry_point: str,
+) -> None:
+    config = _runtime_with_generated_schema_metadata_column(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+    else:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+                store = SQLiteStore.from_prepared_connection(connection)
+                store.close()
+        finally:
+            connection.close()
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    connection.row_factory = sqlite3.Row
+    try:
+        assert {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_xinfo(schema_metadata)")
+        } == {"key", "value", "generated_marker"}
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()["value"] == "12"
     finally:
         connection.close()

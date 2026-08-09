@@ -434,7 +434,7 @@ class AcceptedCodeTaskEvidence:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 11
+    _SCHEMA_VERSION = 12
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
@@ -497,14 +497,14 @@ class SQLiteStore:
         connection.row_factory = sqlite3.Row
         return store
 
-    @staticmethod
-    def _validate_schema_metadata_layout(
-        executor: sqlite3.Connection | sqlite3.Cursor,
-    ) -> None:
+    @classmethod
+    def _schema_metadata_layout(
+        cls, executor: sqlite3.Connection | sqlite3.Cursor
+    ) -> tuple[dict[str, sqlite3.Row], tuple[str, ...]]:
         try:
             columns = {
                 str(row["name"]): row
-                for row in executor.execute("PRAGMA table_info(schema_metadata)")
+                for row in executor.execute("PRAGMA table_xinfo(schema_metadata)")
             }
             primary_key = tuple(
                 str(row["name"])
@@ -513,6 +513,33 @@ class SQLiteStore:
             )
         except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
+        return columns, primary_key
+
+    @classmethod
+    def _validate_schema_metadata_layout(
+        cls, executor: sqlite3.Connection | sqlite3.Cursor
+    ) -> None:
+        columns, primary_key = cls._schema_metadata_layout(executor)
+        if (
+            set(columns) != {"key", "value"}
+            or str(columns["key"]["type"]).casefold() != "text"
+            or str(columns["value"]["type"]).casefold() != "text"
+            or primary_key != ("key",)
+            or not int(columns["key"]["notnull"])
+            or not int(columns["value"]["notnull"])
+        ):
+            raise StoreError("orchestrator store is not prepared")
+
+    @classmethod
+    def _migrate_schema_metadata_key_not_null(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        fresh_database: bool,
+    ) -> None:
+        """Rebuild only a complete legacy metadata table with non-nullable contents."""
+
+        columns, primary_key = cls._schema_metadata_layout(cursor)
         if (
             set(columns) != {"key", "value"}
             or str(columns["key"]["type"]).casefold() != "text"
@@ -521,6 +548,66 @@ class SQLiteStore:
             or not int(columns["value"]["notnull"])
         ):
             raise StoreError("orchestrator store is not prepared")
+        try:
+            metadata_rows = cursor.execute(
+                "SELECT key, value FROM schema_metadata"
+            ).fetchall()
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator store is not prepared") from error
+        if int(columns["key"]["notnull"]):
+            if fresh_database and not metadata_rows:
+                return
+            if (
+                len(metadata_rows) != 1
+                or type(metadata_rows[0]["key"]) is not str
+                or metadata_rows[0]["key"] != "schema_version"
+                or type(metadata_rows[0]["value"]) is not str
+                or metadata_rows[0]["value"] != str(cls._SCHEMA_VERSION)
+            ):
+                raise StoreError("orchestrator store is not prepared")
+            return
+        try:
+            source_version = (
+                None
+                if (
+                    len(metadata_rows) != 1
+                    or type(metadata_rows[0]["key"]) is not str
+                    or metadata_rows[0]["key"] != "schema_version"
+                    or type(metadata_rows[0]["value"]) is not str
+                )
+                else int(metadata_rows[0]["value"])
+            )
+        except (TypeError, ValueError) as error:
+            raise StoreError("orchestrator store is not prepared") from error
+        if (
+            source_version is None
+            or not 1 <= source_version < cls._SCHEMA_VERSION
+            or str(source_version) != metadata_rows[0]["value"]
+        ):
+            raise StoreError("orchestrator store is not prepared")
+        try:
+            cursor.execute(
+                """
+                CREATE TABLE schema_metadata_v12 (
+                    key TEXT NOT NULL PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO schema_metadata_v12 (key, value)
+                SELECT key, value FROM schema_metadata
+                """
+            )
+            cursor.execute("DROP TABLE schema_metadata")
+            cursor.execute(
+                "ALTER TABLE schema_metadata_v12 RENAME TO schema_metadata"
+            )
+        except sqlite3.IntegrityError as error:
+            raise StoreError("orchestrator store is not prepared") from error
+        except sqlite3.DatabaseError as error:
+            raise StoreError("orchestrator schema is corrupt") from error
 
     @classmethod
     def validate_prepared_connection(cls, connection: sqlite3.Connection) -> None:
@@ -582,13 +669,15 @@ class SQLiteStore:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            version_rows = connection.execute(
-                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            metadata_rows = connection.execute(
+                "SELECT key, value FROM schema_metadata"
             ).fetchall()
-            version = (
-                None
-                if len(version_rows) != 1 or type(version_rows[0]["value"]) is not str
-                else version_rows[0]["value"]
+            has_current_schema_metadata = (
+                len(metadata_rows) == 1
+                and type(metadata_rows[0]["key"]) is str
+                and metadata_rows[0]["key"] == "schema_version"
+                and type(metadata_rows[0]["value"]) is str
+                and metadata_rows[0]["value"] == str(cls._SCHEMA_VERSION)
             )
             journal_mode = str(
                 connection.execute("PRAGMA journal_mode").fetchone()[0]
@@ -678,7 +767,7 @@ class SQLiteStore:
         )
         if (
             not required_tables.issubset(tables)
-            or version != str(cls._SCHEMA_VERSION)
+            or not has_current_schema_metadata
             or journal_mode != "wal"
             or not required_outbox_columns.issubset(outbox_columns)
             or not required_outbox_not_null_columns.issubset(
@@ -6096,11 +6185,21 @@ class SQLiteStore:
 
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
+            try:
+                fresh_database = cursor.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                    LIMIT 1
+                    """
+                ).fetchone() is None
+            except sqlite3.DatabaseError as error:
+                raise StoreError("orchestrator schema is corrupt") from error
             _execute_schema_statements(
                 cursor,
                 """
                 CREATE TABLE IF NOT EXISTS schema_metadata (
-                    key TEXT PRIMARY KEY,
+                    key TEXT NOT NULL PRIMARY KEY,
                     value TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS workflows (
@@ -6484,6 +6583,10 @@ class SQLiteStore:
                         batch_hash, assignment_hash, descriptor_hash, grant_id
                     );
                 """,
+            )
+            self._migrate_schema_metadata_key_not_null(
+                cursor,
+                fresh_database=fresh_database,
             )
             self._validate_schema_metadata_layout(cursor)
             self._migrate_atlas_outbox_ingestion_key_not_null(cursor)
