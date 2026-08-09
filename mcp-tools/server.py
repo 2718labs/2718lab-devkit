@@ -673,7 +673,7 @@ def atlas_accept(
     return _invoke(
         "atlas_accept",
         read_only=False,
-        operation=lambda uow: uow.atlas.accept(
+        operation=lambda uow: uow.accept_atlas(
             workflow_id, code_task_id, acceptance_id, ingestion_key
         ),
         invalid_code="ATLAS_REQUEST_INVALID",

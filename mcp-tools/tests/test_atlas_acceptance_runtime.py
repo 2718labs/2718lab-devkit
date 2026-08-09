@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
+import sqlite3
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -15,6 +18,7 @@ if str(MCP_TOOLS) not in sys.path:
 
 from test_atlas_acceptance import CodeTaskAcceptanceFixture  # noqa: E402
 
+import server as server_module  # noqa: E402
 from devkit_atlas import ASSET_ROOT  # noqa: E402
 from devkit_atlas.canonical import canonical_json  # noqa: E402
 from devkit_atlas.models import AtlasError  # noqa: E402
@@ -24,6 +28,8 @@ from devkit_atlas.store import AtlasStore  # noqa: E402
 from devkit_runtime.atlas_acceptance import (  # noqa: E402
     ProductionAcceptanceEvidenceReader,
 )
+from devkit_runtime.composition import RuntimeRoot  # noqa: E402
+from devkit_runtime.config import RuntimeConfig  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
 
 
@@ -424,3 +430,211 @@ class ProductionAcceptanceEvidenceReaderTests(CodeTaskAcceptanceFixture):
             )
 
         assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+
+
+class DefaultRuntimeAcceptanceEvidenceTests(CodeTaskAcceptanceFixture):
+    """The production UoW must rebuild, rather than receive, acceptance evidence."""
+
+    _COMPLETE_IN_SETUP = True
+
+    def _runtime_config(self) -> RuntimeConfig:
+        scratch_root = self.root / "runtime-scratch"
+        return RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(self.root / "runtime-data"),
+                "CODEX_TASK_TEMP": str(scratch_root),
+            }
+        )
+
+    def _publish_accepted_evidence_to_runtime(self, config: RuntimeConfig) -> None:
+        """Seed the already-bootstrapped runtime with real immutable evidence."""
+
+        target = sqlite3.connect(config.orchestrator_database)
+        try:
+            self.store._connection.backup(target)  # noqa: SLF001 - fixture source
+        finally:
+            target.close()
+        shutil.copy2(self.receipts.evidence_key_path, config.data_root)
+        shutil.copytree(
+            self.receipts.receipt_root,
+            config.data_root / "atlas-receipts" / "sha256",
+            dirs_exist_ok=True,
+        )
+
+    @staticmethod
+    def _outbox_state(config: RuntimeConfig, ingestion_key: str) -> tuple[str, int, str]:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            row = connection.execute(
+                """
+                SELECT state, attempt_count, last_error_code
+                FROM atlas_ingestion_outbox
+                WHERE ingestion_key = ?
+                """,
+                (ingestion_key,),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert row is not None
+        return (str(row[0]), int(row[1]), str(row[2]))
+
+    @staticmethod
+    def _delete_runtime_evidence_binding(config: RuntimeConfig) -> None:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            connection.execute(
+                "DELETE FROM events WHERE workflow_id = ? AND task_id = ? AND event_type = ?",
+                ("workflow", "code-task", SQLiteStore._EVIDENCE_BINDING_EVENT_TYPE),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _default_accept(
+        config: RuntimeConfig,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> object:
+        root = RuntimeRoot(config)
+        try:
+            with root.open_uow(read_only=False) as uow:
+                return uow.accept_atlas(
+                    "workflow", "code-task", acceptance_id, ingestion_key
+                )
+        finally:
+            root.shutdown()
+
+    def test_default_write_uow_projects_accepted_evidence(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+
+        projection = self._default_accept(
+            config, acceptance.acceptance_id, outbox.ingestion_key
+        )
+
+        assert projection.acceptance_id == acceptance.acceptance_id
+        assert self._outbox_state(config, outbox.ingestion_key) == ("projected", 0, "")
+
+    def test_default_write_uow_retries_unavailable_evidence(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        self._delete_runtime_evidence_binding(config)
+
+        with pytest.raises(AtlasError) as raised:
+            self._default_accept(config, acceptance.acceptance_id, outbox.ingestion_key)
+
+        assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+        assert self._outbox_state(config, outbox.ingestion_key) == (
+            "pending",
+            1,
+            "ATLAS_EVIDENCE_UNAVAILABLE",
+        )
+
+    def test_default_write_uow_quarantines_conflicting_evidence(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        self.source.write_text("def value() -> int:\n    return 3\n", encoding="utf-8")
+
+        with pytest.raises(AtlasError) as raised:
+            self._default_accept(config, acceptance.acceptance_id, outbox.ingestion_key)
+
+        assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+        assert self._outbox_state(config, outbox.ingestion_key) == (
+            "quarantined",
+            0,
+            "ATLAS_EVIDENCE_CONFLICT",
+        )
+
+    def test_default_write_uow_does_not_construct_orchestrator_schema(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+
+        with mock.patch.object(
+            SQLiteStore,
+            "__init__",
+            side_effect=AssertionError("ordinary UoW must not create schema"),
+        ):
+            projection = self._default_accept(
+                config, acceptance.acceptance_id, outbox.ingestion_key
+            )
+
+        assert projection.acceptance_id == acceptance.acceptance_id
+
+    def test_default_write_uow_does_not_transition_an_unknown_ingestion_key(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        unknown_key = "sha256:" + "0" * 64
+
+        with pytest.raises(AtlasError) as raised:
+            self._default_accept(config, acceptance.acceptance_id, unknown_key)
+
+        assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+        assert self._outbox_state(config, outbox.ingestion_key) == ("pending", 0, "")
+
+    def test_default_read_uow_keeps_accepted_outbox_unchanged(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+
+        root = RuntimeRoot(config)
+        try:
+            with root.open_uow(read_only=True) as uow:
+                with pytest.raises(AtlasError) as raised:
+                    uow.atlas.accept(
+                        "workflow",
+                        "code-task",
+                        acceptance.acceptance_id,
+                        outbox.ingestion_key,
+                    )
+        finally:
+            root.shutdown()
+
+        assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+        assert self._outbox_state(config, outbox.ingestion_key) == ("pending", 0, "")
+
+    def test_default_uow_closes_its_orchestrator_store(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        root = RuntimeRoot(config)
+        uow = root.open_uow(read_only=False)
+        try:
+            projection = uow.accept_atlas(
+                "workflow", "code-task", acceptance.acceptance_id, outbox.ingestion_key
+            )
+            store = uow._orchestrator_store  # noqa: SLF001 - ownership regression
+            reader = uow._acceptance_evidence_reader  # noqa: SLF001 - ownership regression
+            assert reader._orchestrator._store is store  # noqa: SLF001
+            assert store._connection is not None  # noqa: SLF001
+        finally:
+            uow.close()
+            root.shutdown()
+
+        assert projection.acceptance_id == acceptance.acceptance_id
+        assert store._connection is None  # noqa: SLF001
+
+    def test_public_atlas_accept_drains_the_matching_outbox(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        root = RuntimeRoot(config)
+        try:
+            with mock.patch.object(server_module, "_runtime_root", return_value=root):
+                result = server_module.atlas_accept(
+                    "workflow",
+                    "code-task",
+                    acceptance.acceptance_id,
+                    outbox.ingestion_key,
+                )
+        finally:
+            root.shutdown()
+
+        assert result["ok"] is True
+        assert result["data"]["acceptance_id"] == acceptance.acceptance_id
+        assert self._outbox_state(config, outbox.ingestion_key) == ("projected", 0, "")

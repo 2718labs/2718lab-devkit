@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, cast
 from .config import RuntimeConfig, RuntimeConfigError
 
 if TYPE_CHECKING:
+    from devkit_atlas.models import AtlasError
     from devkit_atlas.service import AtlasService
     from devkit_atlas.store import AtlasStore
     from devkit_relay.proofs import IntegrationProofResolver
@@ -92,6 +93,8 @@ class RuntimeUnitOfWork:
         self._project_checkpoint: object = _UNSET
         self._atlas_store: object = _UNSET
         self._atlas: object = _UNSET
+        self._orchestrator_store: object = _UNSET
+        self._acceptance_evidence_reader: object = _UNSET
         self._registry: object = _UNSET
         self._relay: object = _UNSET
         self._closed = False
@@ -132,9 +135,36 @@ class RuntimeUnitOfWork:
                 self._factories.build_atlas(
                     atlas_store=self.atlas_store,
                     project_checkpoint=self.project_checkpoint,
+                    acceptance_evidence_reader=self._atlas_acceptance_evidence_reader(),
                 )
             )
         return cast("AtlasService", self._atlas)
+
+    def accept_atlas(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> object:
+        """Project one accepted task and durably drain only its matching outbox row."""
+
+        from devkit_atlas.models import AtlasError
+
+        self._assert_open()
+        if self._read_only:
+            raise RuntimeConfigError("RUNTIME_READ_ONLY")
+        try:
+            projection = self.atlas.accept(
+                workflow_id, code_task_id, acceptance_id, ingestion_key
+            )
+        except AtlasError as error:
+            self._record_atlas_acceptance_failure(
+                acceptance_id, ingestion_key, error
+            )
+            raise
+        self._mark_atlas_acceptance_projected(acceptance_id, ingestion_key)
+        return projection
 
     @property
     def registry(self) -> object:
@@ -207,6 +237,117 @@ class RuntimeUnitOfWork:
     def _assert_open(self) -> None:
         if self._closed:
             raise RuntimeConfigError("RUNTIME_CLOSED")
+
+    def _atlas_acceptance_evidence_reader(self) -> object | None:
+        """Build immutable evidence reconstruction only for one RW Atlas call."""
+
+        if self._read_only:
+            return None
+        if self._acceptance_evidence_reader is _UNSET:
+            from devkit_atlas.receipts import ReceiptRepository
+            from devkit_runtime.atlas_acceptance import (
+                ProductionAcceptanceEvidenceReader,
+            )
+            from orchestrator.service import OrchestratorService
+
+            project_checkpoint = self.project_checkpoint
+            self._orchestrator_store = self._remember(
+                _open_orchestrator_store_rw(self._config)
+            )
+            receipts = ReceiptRepository(self._config.data_root)
+            orchestrator = OrchestratorService(
+                self._orchestrator_store,
+                index_service=project_checkpoint.project_index,
+                checkpoint_service=project_checkpoint.checkpoint_service,
+                receipt_repository=receipts,
+            )
+            self._acceptance_evidence_reader = ProductionAcceptanceEvidenceReader(
+                orchestrator,
+                project_checkpoint.project_index,
+                project_checkpoint.checkpoint_service,
+                receipts,
+            )
+        return self._acceptance_evidence_reader
+
+    def _matching_atlas_outbox(
+        self, acceptance_id: str, ingestion_key: str
+    ) -> object:
+        from devkit_atlas.models import AtlasError
+
+        store = self._orchestrator_store
+        if store is _UNSET:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        outbox = store.atlas_outbox_for_acceptance(acceptance_id)
+        if (
+            outbox is None
+            or outbox.acceptance_id != acceptance_id
+            or outbox.ingestion_key != ingestion_key
+            or outbox.payload_hash != ingestion_key
+            or outbox.payload_hash != acceptance_id
+        ):
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        return outbox
+
+    def _mark_atlas_acceptance_projected(
+        self, acceptance_id: str, ingestion_key: str
+    ) -> None:
+        from devkit_atlas.models import AtlasError
+        from orchestrator.models import AtlasOutboxState
+        from orchestrator.store import AtlasOutboxTransitionError
+
+        outbox = self._matching_atlas_outbox(acceptance_id, ingestion_key)
+        if outbox.state is AtlasOutboxState.PROJECTED:
+            return
+        if outbox.state is not AtlasOutboxState.PENDING:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        try:
+            updated = self._orchestrator_store.mark_atlas_outbox_projected(
+                ingestion_key
+            )
+        except AtlasOutboxTransitionError as error:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
+        if (
+            updated.state is not AtlasOutboxState.PROJECTED
+            or updated.acceptance_id != acceptance_id
+            or updated.ingestion_key != ingestion_key
+        ):
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+
+    def _record_atlas_acceptance_failure(
+        self, acceptance_id: str, ingestion_key: str, error: AtlasError
+    ) -> None:
+        """Persist only retryable/untrusted evidence outcomes for the exact key."""
+
+        from orchestrator.models import AtlasOutboxState
+        from orchestrator.store import (
+            AtlasOutboxAttemptLimitError,
+            AtlasOutboxTransitionError,
+        )
+
+        outbox = self._matching_atlas_outbox(acceptance_id, ingestion_key)
+        if error.code == "ATLAS_EVIDENCE_UNAVAILABLE":
+            if outbox.state is not AtlasOutboxState.PENDING:
+                return
+            try:
+                self._orchestrator_store.mark_atlas_outbox_retry(
+                    ingestion_key,
+                    error_code=error.code,
+                    reason_codes=(error.code,),
+                )
+            except (AtlasOutboxAttemptLimitError, AtlasOutboxTransitionError):
+                return
+            return
+        if error.code == "ATLAS_EVIDENCE_CONFLICT":
+            if outbox.state is not AtlasOutboxState.PENDING:
+                return
+            try:
+                self._orchestrator_store.mark_atlas_outbox_quarantined(
+                    ingestion_key,
+                    error_code=error.code,
+                    reason_codes=(error.code,),
+                )
+            except AtlasOutboxTransitionError:
+                return
 
 
 def open_runtime_uow(
@@ -305,7 +446,37 @@ def _open_atlas_store_rw(config: RuntimeConfig) -> object:
         raise
 
 
-def _build_atlas(*, atlas_store: object, project_checkpoint: object) -> object:
+def _open_orchestrator_store_rw(config: RuntimeConfig) -> object:
+    """Open one validated existing orchestrator store without schema creation."""
+
+    from orchestrator.store import SQLiteStore
+
+    connection: sqlite3.Connection | None = None
+    try:
+        database = Path(config.orchestrator_database).absolute()
+        connection = sqlite3.connect(
+            database.as_uri() + "?mode=rw",
+            uri=True,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        SQLiteStore.validate_prepared_connection(connection)
+        store = SQLiteStore.from_prepared_connection(connection)
+        connection = None
+        return store
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _build_atlas(
+    *,
+    atlas_store: object,
+    project_checkpoint: object,
+    acceptance_evidence_reader: object | None = None,
+) -> object:
     from devkit_atlas import ASSET_ROOT
     from devkit_atlas.recipes import BundledRecipeLoader
     from devkit_atlas.service import AtlasService
@@ -317,6 +488,7 @@ def _build_atlas(*, atlas_store: object, project_checkpoint: object) -> object:
         cast("AtlasStore", atlas_store),
         BundledRecipeLoader(ASSET_ROOT),
         project_index,
+        acceptance_evidence_reader=acceptance_evidence_reader,
     )
 
 

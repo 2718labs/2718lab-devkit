@@ -358,6 +358,78 @@ class SQLiteStore:
             self._connection = None  # type: ignore[assignment]
             raise
 
+    @classmethod
+    def from_prepared_connection(cls, connection: sqlite3.Connection) -> SQLiteStore:
+        """Bind a validated, invocation-owned connection without creating schema."""
+
+        store = cls.__new__(cls)
+        store._connection = connection
+        connection.row_factory = sqlite3.Row
+        return store
+
+    @classmethod
+    def validate_prepared_connection(cls, connection: sqlite3.Connection) -> None:
+        """Reject an absent, stale, or incomplete store before runtime use."""
+
+        required_tables = {
+            "schema_metadata",
+            "workflows",
+            "tasks",
+            "code_task_acceptances",
+            "code_task_receipt_attestations",
+            "code_task_receipt_owners",
+            "atlas_ingestion_outbox",
+            "task_dependencies",
+            "lease_epochs",
+            "leases",
+            "events",
+            "artifacts",
+            "task_inputs",
+            "artifact_owners",
+            "task_cards",
+            "task_contract_subscriptions",
+            "task_required_evidence",
+            "task_index_bindings",
+            "task_index_query_receipts",
+            "task_index_verification_artifacts",
+            "task_index_binding_events",
+            "peer_capabilities",
+            "messages",
+            "role_envelopes",
+            "host_operation_receipts",
+            "external_bootstrap_descriptors",
+            "external_bootstrap_batches",
+            "external_bootstrap_batch_items",
+            "external_bootstrap_outbox",
+            "external_dispatch_grants",
+            "external_dispatch_grant_bindings",
+            "external_bootstrap_batch_commitments",
+            "external_dispatch_grant_commitments",
+        }
+        connection.row_factory = sqlite3.Row
+        try:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            version_row = connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            version = None if version_row is None else int(version_row["value"])
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).casefold()
+        except (TypeError, ValueError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator schema is corrupt") from error
+        if (
+            not required_tables.issubset(tables)
+            or version != cls._SCHEMA_VERSION
+            or journal_mode != "wal"
+        ):
+            raise StoreError("orchestrator store is not prepared")
+
     def close(self) -> None:
         """Close the underlying database connection."""
         if self._connection is not None:

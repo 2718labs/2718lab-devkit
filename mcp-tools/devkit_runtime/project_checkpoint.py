@@ -46,6 +46,14 @@ class ProjectCheckpointRuntime:
 
         return self._checkpoints.status_for_workspace(workspace_id, checkpoint_id)
 
+    @property
+    def checkpoint_service(self) -> CheckpointService:
+        """Expose the call-owned checkpoint service to verified runtime adapters."""
+
+        if self._closed:
+            raise IndexError("INDEX_UNAVAILABLE", "project checkpoint runtime is closed")
+        return self._checkpoints
+
     def create(
         self,
         workspace_id: str,

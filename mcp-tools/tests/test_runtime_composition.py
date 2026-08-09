@@ -516,7 +516,13 @@ def test_runtime_root_wires_fresh_call_scoped_typed_adapters(tmp_path: Path) -> 
         assert read_only is True
         return resource("atlas-store")
 
-    def build_atlas(*, atlas_store: Resource, project_checkpoint: Resource) -> object:
+    def build_atlas(
+        *,
+        atlas_store: Resource,
+        project_checkpoint: Resource,
+        acceptance_evidence_reader: object | None = None,
+    ) -> object:
+        assert acceptance_evidence_reader is None
         return ("atlas", atlas_store.name, project_checkpoint.name)
 
     def build_registry(
