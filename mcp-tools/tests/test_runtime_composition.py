@@ -13,6 +13,7 @@ from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.relay_runtime import RelayRuntime
 from devkit_runtime.uow import RuntimeAdapterFactories, RuntimeUnitOfWork
+from orchestrator.store import StoreError
 
 
 def test_runtime_config_load_prefers_plugin_data_without_writing(
@@ -678,3 +679,72 @@ def test_default_write_uow_preserves_relay_zero_write_broker_gate(
     with sqlite3.connect(config.relay_database.as_uri() + "?mode=ro", uri=True) as conn:
         after = conn.execute("SELECT COUNT(*) FROM relay_v3_runs").fetchone()
     assert after == before
+
+
+@pytest.mark.parametrize(
+    "outbox_schema",
+    (
+        """
+        CREATE TABLE atlas_ingestion_outbox (
+            ingestion_key TEXT PRIMARY KEY,
+            payload_hash TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            last_error_code TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE atlas_ingestion_outbox (
+            ingestion_key TEXT NOT NULL,
+            acceptance_id TEXT NOT NULL UNIQUE
+                REFERENCES code_task_acceptances(acceptance_id),
+            payload_hash TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            last_error_code TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+    ),
+    ids=("missing-acceptance-binding", "missing-key-payload-identity"),
+)
+def test_default_write_uow_rejects_malformed_atlas_outbox_schema(
+    tmp_path: Path, outbox_schema: str
+) -> None:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.execute(outbox_schema)
+        connection.commit()
+    finally:
+        connection.close()
+
+    root = RuntimeRoot(config)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            with root.open_uow(read_only=False) as uow:
+                _ = uow.atlas
+    finally:
+        root.shutdown()

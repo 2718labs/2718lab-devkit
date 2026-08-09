@@ -407,6 +407,18 @@ class SQLiteStore:
             "external_dispatch_grant_commitments",
         }
         connection.row_factory = sqlite3.Row
+
+        def index_columns(index_name: object) -> tuple[str, ...]:
+            if type(index_name) is not str:
+                raise ValueError("index name is invalid")
+            identifier = index_name.replace('"', '""')
+            return tuple(
+                str(column["name"])
+                for column in connection.execute(
+                    f'PRAGMA index_info("{identifier}")'
+                )
+            )
+
         try:
             tables = {
                 str(row["name"])
@@ -421,12 +433,76 @@ class SQLiteStore:
             journal_mode = str(
                 connection.execute("PRAGMA journal_mode").fetchone()[0]
             ).casefold()
+            outbox_columns = {
+                str(row["name"]): row
+                for row in connection.execute(
+                    "PRAGMA table_info(atlas_ingestion_outbox)"
+                )
+            }
+            outbox_primary_key = tuple(
+                str(row["name"])
+                for row in sorted(
+                    outbox_columns.values(), key=lambda row: int(row["pk"])
+                )
+                if int(row["pk"])
+            )
+            outbox_unique_columns = {
+                index_columns(row["name"])
+                for row in connection.execute(
+                    "PRAGMA index_list(atlas_ingestion_outbox)"
+                )
+                if int(row["unique"])
+            }
+            outbox_foreign_keys = {
+                (str(row["from"]), str(row["table"]), str(row["to"]))
+                for row in connection.execute(
+                    "PRAGMA foreign_key_list(atlas_ingestion_outbox)"
+                )
+            }
+            outbox_row = connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'atlas_ingestion_outbox'
+                """
+            ).fetchone()
+            outbox_sql = (
+                ""
+                if outbox_row is None
+                else re.sub(r"\s+", "", str(outbox_row["sql"])).casefold()
+            )
         except (TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
+        required_outbox_columns = {
+            "ingestion_key",
+            "acceptance_id",
+            "payload_hash",
+            "state",
+            "attempt_count",
+            "last_error_code",
+            "reason_codes_json",
+            "created_at",
+            "updated_at",
+        }
+        has_outbox_identity = (
+            outbox_primary_key == ("ingestion_key",)
+            and ("acceptance_id",) in outbox_unique_columns
+            and ("payload_hash",) in outbox_unique_columns
+            and (
+                "acceptance_id",
+                "code_task_acceptances",
+                "acceptance_id",
+            )
+            in outbox_foreign_keys
+            and "check(ingestion_key=payload_hash)" in outbox_sql
+            and "check(statein('pending','projected','quarantined'))" in outbox_sql
+            and "check(attempt_countbetween0and16)" in outbox_sql
+        )
         if (
             not required_tables.issubset(tables)
             or version != cls._SCHEMA_VERSION
             or journal_mode != "wal"
+            or not required_outbox_columns.issubset(outbox_columns)
+            or not has_outbox_identity
         ):
             raise StoreError("orchestrator store is not prepared")
 
