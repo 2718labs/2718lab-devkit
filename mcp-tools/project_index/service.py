@@ -37,7 +37,7 @@ from .models import (
     SnapshotFile,
     SourceWindow,
 )
-from .packages import discover_packages
+from .packages import discover_packages, package_descriptor_sort_key
 from .registry import WorkspaceRegistry
 from .store import ProjectIndexStore, StoreError
 from .workspace import is_workspace_id, workspace_identity
@@ -322,7 +322,7 @@ class ProjectIndexService:
         workspace_id: str,
         snapshot_id: str | None = None,
         required_paths: Sequence[str | Path] | None = None,
-        package_ids: Sequence[str] = (),
+        package_ids: Sequence[str] | None = None,
     ) -> IndexStatus:
         workspace_id, root = self._workspace_for_reference(workspace_id)
         snapshot = (
@@ -350,7 +350,11 @@ class ProjectIndexService:
 
         expected = self._store.file_hashes(snapshot.snapshot_id)
         includes = self._store.include_paths(snapshot.snapshot_id)
-        selected_packages = _select_packages(snapshot.packages, selected_ids)
+        selected_packages = (
+            ()
+            if selected_ids is None
+            else _select_packages(snapshot.packages, selected_ids)
+        )
         scope_entries = [(scope, scope) for scope in required]
         scope_entries.extend(
             (package.root_path, package.root_path or package.manifest_path)
@@ -451,7 +455,7 @@ class ProjectIndexService:
         source_lines: int = 12,
         byte_budget: int = 32768,
         allow_miss_escape: bool = False,
-        package_ids: Sequence[str] = (),
+        package_ids: Sequence[str] | None = None,
     ) -> QueryResult:
         workspace_id, root = self._workspace_for_reference(workspace_id)
         snapshot = self._require_snapshot(workspace_id, snapshot_id)
@@ -472,7 +476,14 @@ class ProjectIndexService:
             )
 
         selected_package_ids = _normalize_package_ids(package_ids)
-        selected_packages = _select_packages(snapshot.packages, selected_package_ids)
+        selector_ids = (
+            () if selected_package_ids is None else selected_package_ids
+        )
+        selected_packages = (
+            ()
+            if selected_package_ids is None
+            else _select_packages(snapshot.packages, selected_package_ids)
+        )
         kinds = tuple(sorted({str(value) for value in node_kinds if str(value)}))
         relation_filter = tuple(
             sorted({str(value) for value in relations if str(value)})
@@ -585,7 +596,7 @@ class ProjectIndexService:
             source_lines,
             byte_budget,
             allow_miss_escape,
-            selected_package_ids,
+            selector_ids,
         )
         result = QueryResult(
             trace_id=trace_id,
@@ -618,7 +629,7 @@ class ProjectIndexService:
             ),
             gaps=result.gaps,
             truncated=result.truncated,
-            package_ids=selected_package_ids,
+            package_ids=selector_ids,
         )
         try:
             self._store.put_query_receipt(receipt)
@@ -1005,7 +1016,7 @@ def _manifest_hash(
                     package.manifest_path,
                     package.manifest_hash,
                 )
-                for package in packages
+                for package in sorted(packages, key=package_descriptor_sort_key)
             ),
         }
     )
@@ -1362,7 +1373,11 @@ def _scopes_to_includes(scopes: Sequence[str]) -> tuple[str, ...]:
     return () if any(not scope for scope in scopes) else tuple(sorted(set(scopes)))
 
 
-def _normalize_package_ids(package_ids: Sequence[str]) -> tuple[str, ...]:
+def _normalize_package_ids(
+    package_ids: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    if package_ids is None:
+        return None
     if isinstance(package_ids, (str, bytes)):
         raise IndexError("INVALID_QUERY", "package ids must be an ordered sequence")
     try:
@@ -1371,6 +1386,8 @@ def _normalize_package_ids(package_ids: Sequence[str]) -> tuple[str, ...]:
         raise IndexError(
             "INVALID_QUERY", "package ids must be an ordered sequence"
         ) from exc
+    if not supplied:
+        raise IndexError("INVALID_QUERY", "package ids must not be empty")
     if any(
         not isinstance(package_id, str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", package_id) is None

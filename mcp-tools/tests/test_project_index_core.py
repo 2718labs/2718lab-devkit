@@ -491,14 +491,17 @@ def test_sync_discovers_persists_and_rebuilds_snapshot_bound_packages(
     first = service.sync(workspace_id)
 
     descriptors = first.packages
-    assert [item.ecosystem for item in descriptors] == ["cargo", "node", "python"]
-    assert [item.name for item in descriptors] == ["core-lib", "web-client", "root-python"]
-    assert [item.root_path for item in descriptors] == ["crates/core", "packages/web", ""]
+    assert [item.ecosystem for item in descriptors] == ["python", "cargo", "node"]
+    assert [item.name for item in descriptors] == ["root-python", "core-lib", "web-client"]
+    assert [item.root_path for item in descriptors] == ["", "crates/core", "packages/web"]
     assert [item.manifest_path for item in descriptors] == [
+        "pyproject.toml",
         "crates/core/Cargo.toml",
         "packages/web/package.json",
-        "pyproject.toml",
     ]
+    assert service_module._manifest_hash((), (), descriptors) == service_module._manifest_hash(
+        (), (), tuple(reversed(descriptors))
+    )
     assert len({item.package_id for item in descriptors}) == len(descriptors)
     assert all(item.manifest_hash.startswith("sha256:") for item in descriptors)
     assert any(
@@ -523,6 +526,49 @@ def test_sync_discovers_persists_and_rebuilds_snapshot_bound_packages(
     assert changed.snapshot_id != first.snapshot_id
     assert changed.manifest_hash != first.manifest_hash
     assert changed.packages != descriptors
+    reopened.close()
+
+
+def test_package_descriptors_are_root_first_after_persistence(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        '{"name":"root-node"}\n', encoding="utf-8"
+    )
+    (workspace / "pyproject.toml").write_text(
+        '[project]\nname = "root-python"\n', encoding="utf-8"
+    )
+    first_nested = workspace / "a" / "deep"
+    first_nested.mkdir(parents=True)
+    (first_nested / "Cargo.toml").write_text(
+        '[package]\nname = "first-cargo"\n', encoding="utf-8"
+    )
+    last_nested = workspace / "z" / "nested"
+    last_nested.mkdir(parents=True)
+    (last_nested / "package.json").write_text(
+        '{"name":"last-node"}\n', encoding="utf-8"
+    )
+
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+    descriptors = snapshot.packages
+    assert [
+        (item.root_path, item.manifest_path, item.ecosystem, item.name)
+        for item in descriptors
+    ] == [
+        ("", "package.json", "node", "root-node"),
+        ("", "pyproject.toml", "python", "root-python"),
+        ("a/deep", "a/deep/Cargo.toml", "cargo", "first-cargo"),
+        ("z/nested", "z/nested/package.json", "node", "last-node"),
+    ]
+    assert service_module._manifest_hash((), (), descriptors) == service_module._manifest_hash(
+        (), (), tuple(reversed(descriptors))
+    )
+
+    service.close()
+    reopened = _service(tmp_path)
+    assert reopened.snapshot_facts(workspace_id, snapshot.snapshot_id).packages == descriptors
     reopened.close()
 
 
@@ -653,6 +699,46 @@ def test_package_query_is_ordered_scoped_and_receipt_bound(tmp_path: Path) -> No
             package_ids=("sha256:" + "0" * 64,),
         )
     assert unknown_error.value.code == "NOT_FOUND"
+    service.close()
+
+
+def test_package_ids_require_none_for_legacy_full_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "module.py").write_text(
+        "def marker():\n    return 1\n", encoding="utf-8"
+    )
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    with pytest.raises(IndexError) as empty_status:
+        service.status(workspace_id, snapshot.snapshot_id, package_ids=())
+    assert empty_status.value.code == "INVALID_QUERY"
+    with pytest.raises(IndexError) as empty_query:
+        service.query(
+            workspace_id,
+            snapshot.snapshot_id,
+            "marker",
+            package_ids=[],
+        )
+    assert empty_query.value.code == "INVALID_QUERY"
+
+    default_status = service.status(workspace_id, snapshot.snapshot_id)
+    none_status = service.status(workspace_id, snapshot.snapshot_id, package_ids=None)
+    assert none_status == default_status
+    default_query = service.query(
+        workspace_id, snapshot.snapshot_id, "marker", source_lines=0
+    )
+    none_query = service.query(
+        workspace_id,
+        snapshot.snapshot_id,
+        "marker",
+        source_lines=0,
+        package_ids=None,
+    )
+    assert none_query == default_query
+    assert service.get_query_receipt(none_query.trace_id).package_ids == ()
     service.close()
 
 

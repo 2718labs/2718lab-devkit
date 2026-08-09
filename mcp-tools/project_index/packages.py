@@ -72,17 +72,22 @@ def discover_packages(
         )
     return (
         tuple(
-            sorted(
-                descriptors,
-                key=lambda item: (
-                    item.manifest_path,
-                    item.ecosystem,
-                    item.name,
-                    item.package_id,
-                ),
-            )
+            sorted(descriptors, key=package_descriptor_sort_key)
         ),
         tuple(sorted(set(gaps), key=lambda item: (item.path, item.code, item.message))),
+    )
+
+
+def package_descriptor_sort_key(
+    descriptor: PackageDescriptor,
+) -> tuple[str, str, str, str]:
+    """Return the canonical snapshot ordering for package descriptors."""
+
+    return (
+        descriptor.root_path,
+        descriptor.manifest_path,
+        descriptor.ecosystem,
+        descriptor.package_id,
     )
 
 

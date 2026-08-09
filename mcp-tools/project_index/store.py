@@ -625,7 +625,7 @@ class ProjectIndexStore:
             SELECT package_id, ecosystem, name, root_path, manifest_path, manifest_hash
             FROM project_index_snapshot_packages
             WHERE snapshot_id = ?
-            ORDER BY manifest_path, ecosystem, name, package_id
+            ORDER BY root_path, manifest_path, ecosystem, package_id
             """,
             (snapshot_id,),
         ).fetchall()
