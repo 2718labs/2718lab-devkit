@@ -1105,6 +1105,48 @@ def test_unrelated_typed_evidence_fails_before_cas_or_database_write(tmp_path: P
     assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
 
 
+def test_typed_receipt_workspace_mismatch_fails_before_cas_or_database_write(
+    tmp_path: Path,
+) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False))
+    key, request, evidence = _typed_inputs()
+    altered_receipt = replace(
+        evidence.extraction_request.execution_receipts[0], workspace_hash=_hash(b"other-workspace")
+    )
+    altered_extraction = replace(
+        evidence.extraction_request, execution_receipts=(altered_receipt,)
+    )
+    altered_evidence = replace(evidence, extraction_request=altered_extraction)
+
+    with pytest.raises(ContinuityStoreError):
+        service.freeze(
+            ContinuityAttempt(key, 1, "claimed", None, None), request, altered_evidence
+        )
+
+    assert not (config.continuity_cas_root / "sha256").exists()
+    assert store._connection.execute("SELECT COUNT(*) FROM views").fetchone()[0] == 0
+    assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
+def test_invalid_typed_file_fails_before_cas_or_database_write(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False))
+    key, request, evidence = _typed_inputs()
+    invalid_file = replace(evidence.extraction_request.after_files[0], path="/unsafe.py")
+    altered_extraction = replace(evidence.extraction_request, after_files=(invalid_file,))
+    altered_evidence = replace(evidence, extraction_request=altered_extraction)
+
+    with pytest.raises(ContinuityError):
+        service.freeze(
+            ContinuityAttempt(key, 1, "claimed", None, None), request, altered_evidence
+        )
+
+    assert not (config.continuity_cas_root / "sha256").exists()
+    assert store._connection.execute("SELECT COUNT(*) FROM views").fetchone()[0] == 0
+    assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
 def test_atomic_current_fence_rejects_stale_freeze_and_publish(tmp_path: Path) -> None:
     _, store = _prepared_store(tmp_path)
     key, view = _key(), _view(_key())

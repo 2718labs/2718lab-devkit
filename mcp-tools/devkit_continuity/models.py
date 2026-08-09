@@ -25,6 +25,8 @@ _COMMAND_ABSOLUTE_PATH_VALUE = re.compile(
     r"(?:^|=)(?:[A-Za-z]:[\\/]|[\\/]{2}|/|file:/)", re.IGNORECASE
 )
 _REPLAY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_MAX_REPLAY_WRITE_SCOPE = 8
+_MAX_REPLAY_EVIDENCE_IDS = 32
 _GENERATED_SCOPE_COMPONENTS = frozenset(
     {".git", ".venv", "venv", "node_modules", "vendor", "dist", "build", "__pycache__"}
 )
@@ -311,6 +313,7 @@ def _validate_replay_binding(
     query_ids: tuple[str, ...],
     verification_artifact_hashes: tuple[str, ...],
     execution_receipt_ids: tuple[str, ...],
+    execution_receipts: tuple[BoundExecutionReceipt, ...],
     request_hash: str | None,
     evidence_hash: str | None,
     replay_metadata: ReplayMetadata,
@@ -324,12 +327,24 @@ def _validate_replay_binding(
         or request_hash is None
         or evidence_hash is None
         or not verification_artifact_hashes
+        or len(verification_artifact_hashes) > _MAX_REPLAY_EVIDENCE_IDS
         or tuple(sorted(verification_artifact_hashes)) != verification_artifact_hashes
         or len(set(verification_artifact_hashes)) != len(verification_artifact_hashes)
         or not execution_receipt_ids
+        or len(execution_receipt_ids) > _MAX_REPLAY_EVIDENCE_IDS
         or any(not is_hash_id(value) for value in execution_receipt_ids)
         or tuple(sorted(execution_receipt_ids)) != execution_receipt_ids
         or len(set(execution_receipt_ids)) != len(execution_receipt_ids)
+        or tuple(item.receipt_id for item in execution_receipts)
+        != execution_receipt_ids
+        or any(
+            item.workflow_id != key.workflow_id
+            or item.task_id != key.code_task_id
+            or item.acceptance_id != key.acceptance_id
+            or item.workspace_hash != replay_metadata.workspace_hash
+            or item.output_snapshot_id != output_snapshot_ids[0]
+            for item in execution_receipts
+        )
     ):
         raise ContinuityError("REPLAY_BINDING_INVALID")
     input_snapshot_id = input_snapshot_ids[0]
@@ -408,6 +423,11 @@ class FrozenView:
         execution_receipt_ids = _identifier_tuple(self.execution_receipt_ids)
         _require_optional_hash(self.request_hash)
         _require_optional_hash(self.evidence_hash)
+        changed_nodes = _typed_tuple(self.changed_nodes, ChangedNode, "CHANGED_NODE_INVALID")
+        coverage_gaps = _typed_tuple(self.coverage_gaps, CoverageGap, "COVERAGE_GAP_INVALID")
+        receipts = _typed_tuple(
+            self.execution_receipts, BoundExecutionReceipt, "EXECUTION_RECEIPT_INVALID"
+        )
         replay_metadata = self.replay_metadata
         if replay_metadata is not None and not isinstance(replay_metadata, ReplayMetadata):
             raise ContinuityError("REPLAY_METADATA_INVALID")
@@ -420,15 +440,11 @@ class FrozenView:
                 query_ids=query_ids,
                 verification_artifact_hashes=verification_artifact_hashes,
                 execution_receipt_ids=execution_receipt_ids,
+                execution_receipts=receipts,
                 request_hash=self.request_hash,
                 evidence_hash=self.evidence_hash,
                 replay_metadata=replay_metadata,
             )
-        changed_nodes = _typed_tuple(self.changed_nodes, ChangedNode, "CHANGED_NODE_INVALID")
-        coverage_gaps = _typed_tuple(self.coverage_gaps, CoverageGap, "COVERAGE_GAP_INVALID")
-        receipts = _typed_tuple(
-            self.execution_receipts, BoundExecutionReceipt, "EXECUTION_RECEIPT_INVALID"
-        )
         manifest = canonical_frozen_view_manifest(
             self.key,
             entries,
@@ -523,6 +539,7 @@ class FrozenView:
                 query_ids=ordered_queries,
                 verification_artifact_hashes=ordered_artifacts,
                 execution_receipt_ids=ordered_receipt_ids,
+                execution_receipts=ordered_receipts,
                 request_hash=request_hash,
                 evidence_hash=evidence_hash,
                 replay_metadata=replay_metadata,
@@ -689,7 +706,7 @@ def _canonical_write_scope(value: object) -> tuple[str, ...]:
         scope = tuple(value)  # type: ignore[arg-type]
     except TypeError as error:
         raise ContinuityError("WRITE_SCOPE_INVALID") from error
-    if not scope:
+    if not scope or len(scope) > _MAX_REPLAY_WRITE_SCOPE:
         raise ContinuityError("WRITE_SCOPE_INVALID")
     normalized = tuple(_normalize_replay_scope_path(path) for path in scope)
     if (

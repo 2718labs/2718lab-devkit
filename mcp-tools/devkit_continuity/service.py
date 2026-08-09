@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from .canonical import canonical_hash
@@ -92,6 +93,7 @@ class ContinuityService:
                 item.workflow_id != request.workflow_id
                 or item.task_id != request.code_task_id
                 or item.acceptance_id != request.acceptance_id
+                or item.workspace_hash != extraction.workspace_hash
                 or item.output_snapshot_id != request.output_snapshot_id
                 for item in extraction.execution_receipts
             )
@@ -110,17 +112,69 @@ class ContinuityService:
             )
         except ContinuityError as error:
             raise ContinuityStoreError("CONTINUITY_INPUT_INVALID") from error
-        entries: list[FrozenEntry] = []
-        for role, files in (("before_file", extraction.before_files), ("after_file", extraction.after_files)):
-            for item in files:
-                body = getattr(item, "body", None)
-                content_hash = getattr(item, "content_hash", None)
-                path = getattr(item, "path", None)
-                self.cas.put_verified(content_hash, len(body) if type(body) is bytes else -1, body)
-                entries.append(FrozenEntry(role, path, content_hash, len(body)))
-        entries.sort(key=lambda item: (item.role, item.path, item.content_hash))
-        receipts = tuple(BoundExecutionReceipt(item.receipt_id, item.kind, item.workflow_id, item.task_id, item.acceptance_id, item.workspace_hash, item.output_snapshot_id, item.command_spec, item.command_spec_hash, item.input_hash, item.output_hash, item.exit_code, item.success) for item in extraction.execution_receipts)
-        return FrozenView.create(key=key, entries=tuple(entries), input_snapshot_ids=(request.input_snapshot_id,), output_snapshot_ids=(request.output_snapshot_id,), checkpoint_ids=(request.checkpoint_id,), query_ids=(request.output_query_trace_id,), verification_artifact_hashes=request.verification_artifact_hashes, execution_receipt_ids=request.execution_receipt_ids, request_hash=canonical_hash(_public_request(request)), evidence_hash=canonical_hash(_evidence(evidence)), replay_metadata=replay_metadata, changed_nodes=tuple(ChangedNode.from_index_node(node) for node in extraction.changed_nodes), coverage_gaps=tuple(CoverageGap(gap.path, gap.code, gap.message) for gap in extraction.coverage_gaps), execution_receipts=receipts)
+        try:
+            entries: list[FrozenEntry] = []
+            cas_inputs: list[tuple[str, int, bytes]] = []
+            for role, files in (
+                ("before_file", extraction.before_files),
+                ("after_file", extraction.after_files),
+            ):
+                for item in files:
+                    body = getattr(item, "body", None)
+                    content_hash = getattr(item, "content_hash", None)
+                    path = getattr(item, "path", None)
+                    if type(body) is not bytes:
+                        raise ContinuityError("CONTINUITY_INPUT_INVALID")
+                    entry = FrozenEntry(role, path, content_hash, len(body))
+                    if "sha256:" + hashlib.sha256(body).hexdigest() != content_hash:
+                        raise ContinuityError("CONTINUITY_INPUT_INVALID")
+                    entries.append(entry)
+                    cas_inputs.append((entry.content_hash, entry.byte_length, body))
+            entries.sort(key=lambda item: (item.role, item.path, item.content_hash))
+            receipts = tuple(
+                BoundExecutionReceipt(
+                    item.receipt_id,
+                    item.kind,
+                    item.workflow_id,
+                    item.task_id,
+                    item.acceptance_id,
+                    item.workspace_hash,
+                    item.output_snapshot_id,
+                    item.command_spec,
+                    item.command_spec_hash,
+                    item.input_hash,
+                    item.output_hash,
+                    item.exit_code,
+                    item.success,
+                )
+                for item in extraction.execution_receipts
+            )
+            view = FrozenView.create(
+                key=key,
+                entries=tuple(entries),
+                input_snapshot_ids=(request.input_snapshot_id,),
+                output_snapshot_ids=(request.output_snapshot_id,),
+                checkpoint_ids=(request.checkpoint_id,),
+                query_ids=(request.output_query_trace_id,),
+                verification_artifact_hashes=request.verification_artifact_hashes,
+                execution_receipt_ids=request.execution_receipt_ids,
+                request_hash=canonical_hash(_public_request(request)),
+                evidence_hash=canonical_hash(_evidence(evidence)),
+                replay_metadata=replay_metadata,
+                changed_nodes=tuple(
+                    ChangedNode.from_index_node(node) for node in extraction.changed_nodes
+                ),
+                coverage_gaps=tuple(
+                    CoverageGap(gap.path, gap.code, gap.message)
+                    for gap in extraction.coverage_gaps
+                ),
+                execution_receipts=receipts,
+            )
+        except (AttributeError, ContinuityError, TypeError, ValueError) as error:
+            raise ContinuityStoreError("CONTINUITY_INPUT_INVALID") from error
+        for content_hash, byte_length, body in cas_inputs:
+            self.cas.put_verified(content_hash, byte_length, body)
+        return view
 
 
 def _public_request(request: Any) -> dict[str, Any]:

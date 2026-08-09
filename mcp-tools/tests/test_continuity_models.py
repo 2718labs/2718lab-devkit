@@ -113,13 +113,39 @@ def _replay_metadata() -> ReplayMetadata:
     )
 
 
-def _v2_view_inputs(metadata: ReplayMetadata | None = None) -> dict[str, object]:
+def _v2_bound_receipt(
+    metadata: ReplayMetadata | None = None,
+) -> BoundExecutionReceipt:
+    metadata = _replay_metadata() if metadata is None else metadata
+    return BoundExecutionReceipt(
+        receipt_id=HASH_B,
+        kind="command",
+        workflow_id="workflow-7",
+        task_id="task-8",
+        acceptance_id="acceptance-9",
+        workspace_hash=metadata.workspace_hash,
+        output_snapshot_id="output-1",
+        command_spec=("python",),
+        command_spec_hash=HASH_A,
+        input_hash=HASH_B,
+        output_hash=HASH_C,
+        exit_code=0,
+        success=True,
+    )
+
+
+def _v2_view_inputs(
+    metadata: ReplayMetadata | None = None,
+    *,
+    verification_artifact_hashes: tuple[str, ...] = (HASH_A,),
+    execution_receipt_ids: tuple[str, ...] = (HASH_B,),
+) -> dict[str, object]:
     key = _key()
     metadata = _replay_metadata() if metadata is None else metadata
     input_snapshot_id, output_snapshot_id = "input-1", "output-1"
     checkpoint_id, query_id = "checkpoint-1", "query-1"
-    artifact_hashes = (HASH_A,)
-    receipt_ids = (HASH_B,)
+    artifact_hashes = verification_artifact_hashes
+    receipt_ids = execution_receipt_ids
     request_payload = {
         "ingestion_key": key.ingestion_key,
         "payload_hash": key.payload_hash,
@@ -161,6 +187,7 @@ def _v2_view_inputs(metadata: ReplayMetadata | None = None) -> dict[str, object]
         "request_hash": canonical_hash(request_payload),
         "evidence_hash": canonical_hash(evidence_payload),
         "replay_metadata": metadata,
+        "execution_receipts": (_v2_bound_receipt(metadata),),
     }
 
 
@@ -270,6 +297,41 @@ def test_replay_metadata_normalizes_atlas_compatible_scope_separator() -> None:
     )
 
     assert metadata.write_scope == ("src/a.py",)
+
+
+def test_replay_metadata_rejects_write_scope_larger_than_atlas_limit() -> None:
+    scope = tuple(f"src/{index}.py" for index in range(9))
+
+    with pytest.raises(ContinuityError):
+        ReplayMetadata("code", "intent", HASH_A, scope, HASH_B, "python", "", HASH_C)
+
+
+@pytest.mark.parametrize("field", ("verification_artifact_hashes", "execution_receipt_ids"))
+def test_v2_replay_metadata_rejects_evidence_over_atlas_limit(field: str) -> None:
+    values = tuple(f"sha256:{index:064x}" for index in range(33))
+
+    with pytest.raises(ContinuityError):
+        FrozenView.create(**_v2_view_inputs(**{field: values}))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda value: replace(value, receipt_id=HASH_C),
+        lambda value: replace(value, workflow_id="workflow-8"),
+        lambda value: replace(value, task_id="task-9"),
+        lambda value: replace(value, acceptance_id="acceptance-10"),
+        lambda value: replace(value, workspace_hash=HASH_C),
+        lambda value: replace(value, output_snapshot_id="output-2"),
+    ),
+)
+def test_v2_execution_receipts_bind_to_frozen_view_replay_context(changed: object) -> None:
+    receipt = _v2_bound_receipt()
+
+    with pytest.raises(ContinuityError):
+        FrozenView.create(
+            **(_v2_view_inputs() | {"execution_receipts": (changed(receipt),)})  # type: ignore[operator,arg-type]
+        )
 
 
 @pytest.mark.parametrize(
