@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from .canonical import canonical_json
-from .cas import ContinuityCas
+from .cas import ContinuityCas, _bootstrap_cas
 from .models import (
     ContinuityAttempt,
     ContinuityKey,
@@ -143,7 +143,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
 def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
     """Runtime-private creation/migration seam; ordinary openers never create."""
-    ContinuityCas.bootstrap(cas_root, scratch_root)
+    _bootstrap_cas(cas_root, scratch_root)
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
     try:

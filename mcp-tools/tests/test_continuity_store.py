@@ -95,6 +95,11 @@ def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, Accep
 
 def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) -> None:
     assert not hasattr(ContinuityStore, "bootstrap")
+    assert not hasattr(ContinuityCas, "bootstrap")
+    missing_root, missing_scratch = tmp_path / "missing-cas", tmp_path / "missing-scratch"
+    with pytest.raises(ContinuityCasError):
+        ContinuityCas.open_prepared(missing_root, missing_scratch, read_only=False)
+    assert not missing_root.exists() and not missing_scratch.exists()
     config = _config(tmp_path)
     store = ContinuityStore.open_readwrite(
         config.continuity_database, config.continuity_cas_root, config.scratch_root

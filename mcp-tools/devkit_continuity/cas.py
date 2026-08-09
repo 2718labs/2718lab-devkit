@@ -19,15 +19,11 @@ class ContinuityCas:
         self.root, self.scratch_root, self.read_only = root, scratch_root, read_only
 
     @classmethod
-    def bootstrap(cls, root: Path, scratch_root: Path) -> ContinuityCas:
-        _safe_root(root, create=True)
-        _safe_root(scratch_root, create=True)
-        return cls(root, scratch_root, read_only=False)
-
-    @classmethod
     def open_prepared(cls, root: Path, scratch_root: Path, read_only: bool) -> ContinuityCas:
         _safe_root(root, create=False)
         _safe_root(scratch_root, create=False)
+        if not root.is_dir() or not scratch_root.is_dir():
+            raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
         return cls(root, scratch_root, read_only=read_only)
 
     def put_verified(self, content_hash: str, byte_length: int, body: bytes) -> str:
@@ -137,6 +133,13 @@ def _validate(content_hash: object, byte_length: object, body: object) -> None:
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     if digest != content_hash or len(body) != byte_length:
         raise ContinuityCasError("CONTINUITY_CAS_CONFLICT")
+
+
+def _bootstrap_cas(root: Path, scratch_root: Path) -> ContinuityCas:
+    """Runtime-private CAS creation seam; ordinary openers never create."""
+    _safe_root(root, create=True)
+    _safe_root(scratch_root, create=True)
+    return ContinuityCas(root, scratch_root, read_only=False)
 
 
 def _safe_root(path: Path, *, create: bool) -> None:
