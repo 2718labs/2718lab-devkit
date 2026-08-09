@@ -758,9 +758,9 @@ def _require_optional_hash(value: object) -> None:
 
 
 def _require_command_atom(value: object) -> None:
-    _require_identifier(value)
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise ContinuityError("COMMAND_SPEC_INVALID")
+    _require_identifier(value)
     if _COMMAND_ABSOLUTE_PATH_VALUE.search(value) is not None:
         raise ContinuityError("COMMAND_SPEC_INVALID")
 
@@ -776,7 +776,7 @@ def _typed_tuple(value: object, expected_type: type[Any], code: str) -> tuple[An
 
 
 def _command_spec_tuple(value: object) -> tuple[str, ...]:
-    if not isinstance(value, tuple):
+    if type(value) is not tuple:
         raise ContinuityError("COMMAND_SPEC_INVALID")
     try:
         result = tuple(value)  # type: ignore[arg-type]

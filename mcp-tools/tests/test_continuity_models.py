@@ -147,6 +147,43 @@ def test_bound_receipt_rejects_non_tuple_command_spec() -> None:
         )
 
 
+class _TupleProxy:
+    def __init__(self) -> None:
+        self.iterated = False
+
+    @property
+    def __class__(self) -> type[tuple[object, ...]]:
+        return tuple
+
+    def __iter__(self):
+        self.iterated = True
+        return iter(("python",))
+
+
+def test_bound_receipt_rejects_tuple_proxy_without_iteration() -> None:
+    proxy = _TupleProxy()
+
+    with pytest.raises(ContinuityError, match="^COMMAND_SPEC_INVALID$"):
+        _bound_receipt(
+            command_spec=proxy,
+            command_spec_hash=canonical_hash(("python",)),
+        )
+
+    assert proxy.iterated is False
+
+
+def test_bound_receipt_rejects_string_subclass_command_atom() -> None:
+    class _StringSubclass(str):
+        pass
+
+    command_spec = (_StringSubclass("python"),)
+    with pytest.raises(ContinuityError, match="^COMMAND_SPEC_INVALID$"):
+        _bound_receipt(
+            command_spec=command_spec,
+            command_spec_hash=canonical_hash(command_spec),
+        )
+
+
 @pytest.mark.parametrize(
     ("kind", "command_spec"),
     (("write", ()), ("command", ("python", "-m", "pytest"))),
