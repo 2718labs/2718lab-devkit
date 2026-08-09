@@ -250,7 +250,7 @@ class ContinuityStore:
     @classmethod
     def open_readonly(cls, database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
         try:
-            ContinuityCas.open_prepared(cas_root, scratch_root, read_only=True)
+            _verify_prepared_cas(cas_root, scratch_root, read_only=True)
         except Exception as error:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
         return cls._open(database, read_only=True)
@@ -258,7 +258,7 @@ class ContinuityStore:
     @classmethod
     def open_readwrite(cls, database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
         try:
-            ContinuityCas.open_prepared(cas_root, scratch_root, read_only=False)
+            _verify_prepared_cas(cas_root, scratch_root, read_only=False)
         except Exception as error:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
         return cls._open(database, read_only=False)
@@ -489,6 +489,24 @@ def _receipt_json(receipt: ContinuityReceipt) -> str:
     return canonical_json({"key": receipt.key.to_dict(), "view_id": receipt.view_id, "kind": receipt.kind})
 
 
+def _verify_prepared_cas(cas_root: Path, scratch_root: Path, *, read_only: bool) -> None:
+    """Close verification-only native CAS roots before opening SQLite."""
+    cas = ContinuityCas.open_prepared(cas_root, scratch_root, read_only=read_only)
+    try:
+        return None
+    finally:
+        cas.close()
+
+
+def _bootstrap_prepared_cas(cas_root: Path, scratch_root: Path) -> None:
+    """Runtime-only CAS creation verification never retains an unused root handle."""
+    cas = _bootstrap_cas(cas_root, scratch_root)
+    try:
+        return None
+    finally:
+        cas.close()
+
+
 def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
     """Runtime-private creation/migration seam; ordinary openers never create."""
     connection: sqlite3.Connection | None = None
@@ -498,7 +516,7 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
         connection.row_factory = sqlite3.Row
         _configure_connection(connection)
         _verify_bootstrap_preflight(connection)
-        _bootstrap_cas(cas_root, scratch_root)
+        _bootstrap_prepared_cas(cas_root, scratch_root)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("BEGIN IMMEDIATE")
         version = _schema_version(connection)
@@ -517,7 +535,7 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
         _verify_v3_schema(connection)
         connection.commit()
         return ContinuityStore(connection, read_only=False)
-    except (sqlite3.Error, OSError) as error:
+    except (sqlite3.Error, OSError, ContinuityError) as error:
         _rollback_and_close(connection)
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
     except Exception:

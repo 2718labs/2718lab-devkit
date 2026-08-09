@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import os
 import sqlite3
 import sys
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -826,6 +831,21 @@ def test_cas_verifies_bytes_and_preserves_existing_content(tmp_path: Path) -> No
     assert cas.read_verified(digest, len(body)) == body
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_real_publish_cleans_stage_without_removing_target(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    body, digest = b"native-stage", _hash(b"native-stage")
+    cas = ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
+    assert cas._native_backend is not None
+    assert cas.put_verified(digest, len(body), body) == digest
+    assert not tuple((config.continuity_cas_root / ".staging").glob("*.stage"))
+    cas.close()
+
+    reopened = ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=True)
+    assert reopened.read_verified(digest, len(body)) == body
+    reopened.close()
+
+
 def test_state_machine_is_only_lifecycle_write_surface_and_relations_are_immutable(tmp_path: Path) -> None:
     config, store = _prepared_store(tmp_path)
     for name in ("append_attempt_event", "insert_or_get_view", "insert_or_get_receipt", "compare_and_swap_pointer"):
@@ -932,6 +952,7 @@ def test_prepared_open_rejects_same_name_noop_trigger_and_pointer_shape(tmp_path
         ContinuityStore.open_readwrite(config.continuity_database, config.continuity_cas_root, config.scratch_root)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="portable path CAS revalidation hook")
 def test_cas_revalidates_shard_before_post_open_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(tmp_path)
     cas = ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
@@ -1112,6 +1133,7 @@ def test_v2_foreign_keys_are_enabled_and_reject_orphans(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="portable path CAS stage hook")
 def test_cas_stage_failure_cleans_owner_stage_and_allows_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1137,6 +1159,7 @@ def test_cas_stage_failure_cleans_owner_stage_and_allows_retry(
     assert cas.put_verified(digest, len(body), body) == digest
 
 
+@pytest.mark.skipif(os.name == "nt", reason="portable path CAS write hook")
 def test_cas_stage_write_failure_cleans_owner_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(tmp_path)
     cas = ContinuityCas.open_prepared(
@@ -1182,3 +1205,678 @@ def test_cas_stage_collision_keeps_other_owner_and_does_not_block_later_writer(
         cas.put_verified(digest, len(body), body)
     assert owner_stage.exists()
     assert cas.put_verified(digest, len(body), body) == digest
+
+
+class _MemoryNativeHandle:
+    def __init__(
+        self, path: tuple[str, ...], *, directory: bool, identity: int, delete_on_close: bool = False
+    ) -> None:
+        self.path = path
+        self.directory = directory
+        self.identity = identity
+        self.delete_on_close = delete_on_close
+        self.closed = False
+
+
+class _MemoryNativeApi:
+    """Handle-only test facade; no method accepts a child filesystem path."""
+
+    def __init__(self) -> None:
+        self.directories: set[tuple[str, ...]] = {()}
+        self.files: dict[tuple[str, ...], bytes] = {}
+        self.identities: dict[tuple[str, ...], int] = {(): 1}
+        self._next_identity = 2
+        self.events: list[tuple[object, ...]] = []
+        self.reject_paths: set[tuple[str, ...]] = set()
+        self.link_error: OSError | None = None
+        self.on_flush: Callable[[], None] | None = None
+        self.on_link: Callable[[_MemoryNativeHandle, tuple[str, ...]], None] | None = None
+        self.close_fail_paths: set[tuple[str, ...]] = set()
+        self.live_handles: list[_MemoryNativeHandle] = []
+        self._lock = threading.Lock()
+
+    def open_root(self, _root: Path, *, writable: bool) -> _MemoryNativeHandle:
+        self.events.append(("open_root", writable))
+        return self._new_handle((), directory=True)
+
+    def open_child(
+        self,
+        parent: _MemoryNativeHandle,
+        name: str,
+        *,
+        directory: bool,
+        create: bool,
+        exclusive: bool = False,
+        delete_on_close: bool = False,
+    ) -> _MemoryNativeHandle:
+        assert isinstance(parent, _MemoryNativeHandle)
+        assert not parent.closed and "/" not in name and "\\" not in name and name not in {"", ".", ".."}
+        path = parent.path + (name,)
+        self.events.append(
+            ("open_child", parent.path, name, directory, create, exclusive, delete_on_close)
+        )
+        with self._lock:
+            if directory:
+                if path not in self.directories:
+                    if not create:
+                        raise FileNotFoundError(name)
+                    self.directories.add(path)
+                    self._assign_identity(path)
+                return self._new_handle(path, directory=True)
+            if path not in self.files:
+                if not create:
+                    raise FileNotFoundError(name)
+                self.files[path] = b""
+                self._assign_identity(path)
+            elif exclusive:
+                raise FileExistsError(name)
+        return self._new_handle(path, directory=False, delete_on_close=delete_on_close)
+
+    def revalidate(self, handle: _MemoryNativeHandle, *, directory: bool) -> None:
+        assert isinstance(handle, _MemoryNativeHandle)
+        self.events.append(("revalidate", handle.path, directory))
+        if (
+            handle.closed
+            or handle.directory is not directory
+            or handle.path in self.reject_paths
+            or self.identities.get(handle.path) != handle.identity
+        ):
+            raise OSError("reparse or identity changed")
+
+    def write_all(self, handle: _MemoryNativeHandle, body: bytes) -> None:
+        self.events.append(("write", handle.path))
+        assert not handle.directory
+        with self._lock:
+            self.files[handle.path] = body
+
+    def flush(self, handle: _MemoryNativeHandle) -> None:
+        self.events.append(("flush", handle.path))
+        if self.on_flush is not None:
+            self.on_flush()
+
+    def rewind(self, handle: _MemoryNativeHandle) -> None:
+        self.events.append(("rewind", handle.path))
+
+    def read_all(self, handle: _MemoryNativeHandle) -> bytes:
+        self.events.append(("read", handle.path))
+        with self._lock:
+            return self.files[handle.path]
+
+    def link(
+        self, source: _MemoryNativeHandle, target_parent: _MemoryNativeHandle, target_name: str
+    ) -> bool:
+        self.events.append(("link", source.path, target_parent.path, target_name))
+        if self.link_error is not None:
+            raise self.link_error
+        target = target_parent.path + (target_name,)
+        with self._lock:
+            if target in self.files:
+                return False
+            self.files[target] = self.files[source.path]
+            self.identities[target] = source.identity
+        if self.on_link is not None:
+            self.on_link(source, target)
+        return True
+
+    def delete_owned(self, handle: _MemoryNativeHandle) -> None:
+        self.events.append(("delete_owned", handle.path))
+        assert handle.path[:1] == (".staging",)
+        with self._lock:
+            self.files.pop(handle.path, None)
+
+    def close(self, handle: _MemoryNativeHandle) -> None:
+        self.events.append(("close", handle.path))
+        if handle.delete_on_close:
+            with self._lock:
+                self.files.pop(handle.path, None)
+                self.identities.pop(handle.path, None)
+        handle.closed = True
+        self.live_handles.remove(handle)
+        if handle.path in self.close_fail_paths:
+            raise OSError("injected close failure")
+
+    def _new_handle(
+        self, path: tuple[str, ...], *, directory: bool, delete_on_close: bool = False
+    ) -> _MemoryNativeHandle:
+        handle = _MemoryNativeHandle(
+            path,
+            directory=directory,
+            identity=self.identities[path],
+            delete_on_close=delete_on_close,
+        )
+        self.live_handles.append(handle)
+        return handle
+
+    def _assign_identity(self, path: tuple[str, ...]) -> None:
+        self.identities[path] = self._next_identity
+        self._next_identity += 1
+
+
+def _windows_backend_for_test(api: _MemoryNativeApi, root: Path) -> object:
+    from devkit_continuity import cas as cas_module
+
+    backend_type = getattr(cas_module, "_WindowsHandleCasBackend", None)
+    assert backend_type is not None, "native handle backend is unavailable"
+    backend = backend_type(root, api, read_only=False)
+    backend.verify_prepared()
+    return backend
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_cas_loader_absence_fails_closed_without_path_primitives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    root, scratch = tmp_path / "continuity-cas", tmp_path / "scratch"
+    root.mkdir()
+    scratch.mkdir()
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        calls.append("path-primitive")
+        raise AssertionError("path primitive must not run")
+
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: None)
+    monkeypatch.setattr(cas_module, "_safe_root", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(cas_module.os, "open", forbidden)
+    monkeypatch.setattr(cas_module.os, "link", forbidden)
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        ContinuityCas.open_prepared(root, scratch, read_only=False)
+    assert calls == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_cas_direct_constructor_cannot_enable_path_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    root, scratch = tmp_path / "continuity-cas", tmp_path / "scratch"
+    root.mkdir()
+    scratch.mkdir()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Windows CAS must not use portable path operations")
+
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(cas_module.os, "open", forbidden)
+    monkeypatch.setattr(cas_module.os, "link", forbidden)
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        ContinuityCas(root, scratch, read_only=False)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_cas_delegates_without_path_primitives_and_closes_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    root, scratch = tmp_path / "continuity-cas", tmp_path / "scratch"
+    root.mkdir()
+    scratch.mkdir()
+    calls: list[tuple[object, ...]] = []
+
+    class Backend:
+        def put_verified(self, content_hash: str, byte_length: int, body: bytes) -> str:
+            calls.append(("put", content_hash, byte_length, body))
+            return content_hash
+
+        def read_verified(self, content_hash: str, byte_length: int) -> bytes:
+            calls.append(("read", content_hash, byte_length))
+            return b"native"
+
+        def close(self) -> None:
+            calls.append(("close",))
+
+    backend = Backend()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("portable path primitive must not run")
+
+    monkeypatch.setattr(cas_module, "_open_native_backend", lambda *_args, **_kwargs: backend, raising=False)
+    monkeypatch.setattr(cas_module, "_safe_root", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(cas_module.os, "open", forbidden)
+    monkeypatch.setattr(cas_module.os, "link", forbidden)
+    digest = _hash(b"native")
+    cas = ContinuityCas.open_prepared(root, scratch, read_only=False)
+    assert cas.put_verified(digest, 6, b"native") == digest
+    assert cas.read_verified(digest, 6) == b"native"
+    cas.close()
+    assert calls == [("put", digest, 6, b"native"), ("read", digest, 6), ("close",)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_cas_native_exceptions_are_always_stable_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    root, scratch = tmp_path / "continuity-cas", tmp_path / "scratch"
+    root.mkdir()
+    scratch.mkdir()
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: (_ for _ in ()).throw(RuntimeError("bad loader")))
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        ContinuityCas.open_prepared(root, scratch, read_only=False)
+
+    class Backend:
+        def put_verified(self, _content_hash: str, _byte_length: int, _body: bytes) -> str:
+            raise RuntimeError("bad native write")
+
+        def read_verified(self, _content_hash: str, _byte_length: int) -> bytes:
+            raise RuntimeError("bad native read")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cas_module, "_open_native_backend", lambda *_args, **_kwargs: Backend())
+    cas = ContinuityCas.open_prepared(root, scratch, read_only=False)
+    digest = _hash(b"body")
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        cas.put_verified(digest, 4, b"body")
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        cas.read_verified(digest, 4)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_loader_fails_closed_on_non_x64_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    original_sizeof = cas_module.ctypes.sizeof
+
+    def sizeof(value: object) -> int:
+        if value is cas_module.ctypes.c_void_p:
+            return 4
+        return original_sizeof(value)
+
+    monkeypatch.setattr(cas_module.ctypes, "sizeof", sizeof)
+    monkeypatch.setattr(
+        cas_module,
+        "_WindowsNativeApi",
+        lambda: pytest.fail("x64-only native ABI must not initialize"),
+    )
+    assert cas_module._load_windows_native_api() is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_concurrent_publish_has_one_target_and_no_owned_stages(tmp_path: Path) -> None:
+    api = _MemoryNativeApi()
+    first = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    second = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    body, digest = b"same-body", _hash(b"same-body")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(
+                lambda backend: backend.put_verified(digest, len(body), body),
+                (first, second),
+            )
+        )
+    target = ("sha256", digest[7:9], digest[9:11], digest[7:])
+    assert results == (digest, digest)
+    assert api.files[target] == body
+    assert [path for path in api.files if path[:1] == (".staging",)] == []
+    stage_opens = [event for event in api.events if event[0] == "open_child" and str(event[2]).endswith(".stage")]
+    assert stage_opens and all(event[-1] is True for event in stage_opens)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_link_failure_cleans_only_owned_stage(tmp_path: Path) -> None:
+    api = _MemoryNativeApi()
+    api.link_error = OSError("injected link failure")
+    backend = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    sentinel = ("external", "sentinel")
+    api.files[sentinel] = b"untouched"
+    body, digest = b"failure", _hash(b"failure")
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        backend.put_verified(digest, len(body), body)
+    assert api.files[sentinel] == b"untouched"
+    assert [path for path in api.files if path[:1] == (".staging",)] == []
+    assert any(event[0] == "delete_owned" for event in api.events)
+    api.link_error = None
+    assert backend.put_verified(digest, len(body), body) == digest
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_revalidates_relative_tree_and_leaf_before_each_read(
+    tmp_path: Path,
+) -> None:
+    api = _MemoryNativeApi()
+    backend = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    body, digest = b"revalidate", _hash(b"revalidate")
+    assert backend.put_verified(digest, len(body), body) == digest
+    target = ("sha256", digest[7:9], digest[9:11], digest[7:])
+    api.events.clear()
+    assert backend.read_verified(digest, len(body)) == body
+    tree_paths = (
+        (),
+        ("sha256",),
+        ("sha256", digest[7:9]),
+        ("sha256", digest[7:9], digest[9:11]),
+    )
+    for path in tree_paths:
+        assert ("revalidate", path, True) in api.events
+    leaf_verify = ("revalidate", target, False)
+    leaf_read = ("read", target)
+    assert leaf_verify in api.events and leaf_read in api.events
+    assert api.events.index(leaf_verify) < api.events.index(leaf_read)
+
+    api.reject_paths.add(target)
+    api.events.clear()
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        backend.read_verified(digest, len(body))
+    assert leaf_read not in api.events
+
+    api.reject_paths.clear()
+    api.reject_paths.add(())
+    api.events.clear()
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        backend.read_verified(digest, len(body))
+    assert not [event for event in api.events if event[0] == "open_child"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_fails_before_link_when_held_child_identity_changes(tmp_path: Path) -> None:
+    api = _MemoryNativeApi()
+    backend = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    body, digest = b"swapped-child", _hash(b"swapped-child")
+    target_parent = ("sha256", digest[7:9], digest[9:11])
+    sentinel = ("external", "sentinel")
+    api.files[sentinel] = b"untouched"
+
+    def swap_child_identity() -> None:
+        api.reject_paths.add(target_parent)
+
+    api.on_flush = swap_child_identity
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        backend.put_verified(digest, len(body), body)
+    assert not [event for event in api.events if event[0] == "link"]
+    assert api.files[sentinel] == b"untouched"
+    assert [path for path in api.files if path[:1] == (".staging",)] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_rejects_post_publish_leaf_not_linked_to_owned_stage(tmp_path: Path) -> None:
+    api = _MemoryNativeApi()
+    backend = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    body, digest = b"identity-link", _hash(b"identity-link")
+
+    def replace_published_leaf(source: _MemoryNativeHandle, target: tuple[str, ...]) -> None:
+        api.identities[target] = source.identity + 1000
+
+    api.on_link = replace_published_leaf
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        backend.put_verified(digest, len(body), body)
+    assert [path for path in api.files if path[:1] == (".staging",)] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_readonly_retains_only_read_handles(tmp_path: Path) -> None:
+    api = _MemoryNativeApi()
+    writer = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    body, digest = b"readonly", _hash(b"readonly")
+    assert writer.put_verified(digest, len(body), body) == digest
+    backend_type = type(writer)
+    reader = backend_type(tmp_path / "continuity-cas", api, read_only=True)
+    reader.verify_prepared()
+    assert ("open_root", False) in api.events
+    api.events.clear()
+    assert reader.read_verified(digest, len(body)) == body
+    assert not [event for event in api.events if event[0] == "open_root"]
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_READ_ONLY"):
+        reader.put_verified(digest, len(body), body)
+    assert not [event for event in api.events if event[0] in {"write", "link"}]
+    reader.close()
+    writer.close()
+    assert api.live_handles == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_closes_every_child_after_close_failure(tmp_path: Path) -> None:
+    api = _MemoryNativeApi()
+    backend = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    body, digest = b"close-all", _hash(b"close-all")
+    target_parent = ("sha256", digest[7:9], digest[9:11])
+    api.close_fail_paths.add(target_parent)
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        backend.put_verified(digest, len(body), body)
+    assert [handle.path for handle in api.live_handles] == [()]
+    api.close_fail_paths.clear()
+    backend.close()
+    assert api.live_handles == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_api_uses_relative_nonreparse_nt_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    native_type = getattr(cas_module, "_WindowsNativeApi", None)
+    handle_type = getattr(cas_module, "_WindowsNativeHandle", None)
+    assert native_type is not None and handle_type is not None
+    api = object.__new__(native_type)
+    api._root_volume = 7
+    directories = {101}
+    query_classes: list[int] = []
+    create_calls: list[tuple[int, str, int, int, int, int, int]] = []
+    link_calls: list[tuple[int, int, bool, str]] = []
+
+    def raw_value(value: object) -> int:
+        return int(ctypes.cast(value, ctypes.c_void_p).value or 0)
+
+    def get_info(handle: object, info_class: int, buffer: object, _size: int) -> bool:
+        query_classes.append(info_class)
+        value = raw_value(handle)
+        if info_class == cas_module._FILE_ID_INFO:
+            info = ctypes.cast(buffer, ctypes.POINTER(cas_module._FILE_ID_INFO_VALUE)).contents
+            info.VolumeSerialNumber = 7
+            for index in range(16):
+                info.FileId.Identifier[index] = (value + index + 1) % 255 or 1
+        elif info_class == cas_module._FILE_ATTRIBUTE_TAG_INFO:
+            info = ctypes.cast(buffer, ctypes.POINTER(cas_module._FILE_ATTRIBUTE_TAG_INFO_VALUE)).contents
+            info.FileAttributes = cas_module._FILE_ATTRIBUTE_DIRECTORY if value in directories else 0
+            info.ReparseTag = 0
+        elif info_class == cas_module._FILE_STANDARD_INFO:
+            info = ctypes.cast(buffer, ctypes.POINTER(cas_module._FILE_STANDARD_INFO_VALUE)).contents
+            info.DeletePending = 0
+        else:
+            raise AssertionError(f"unexpected information class {info_class}")
+        return True
+
+    def get_volume_info(
+        _handle: object,
+        _name: object,
+        _name_size: int,
+        _serial: object,
+        _maximum: object,
+        _flags: object,
+        filesystem: object,
+        _filesystem_size: int,
+    ) -> bool:
+        ctypes.cast(_flags, ctypes.POINTER(cas_module.wintypes.DWORD)).contents.value = 0x00400000
+        filesystem.value = "NTFS"
+        return True
+
+    def nt_create(
+        out_handle: object,
+        desired: int,
+        object_attributes: object,
+        _status: object,
+        _allocation: object,
+        _attributes: int,
+        share: int,
+        disposition: int,
+        options: int,
+        _ea: object,
+        _ea_length: int,
+    ) -> int:
+        attributes = ctypes.cast(
+            object_attributes, ctypes.POINTER(cas_module._OBJECT_ATTRIBUTES)
+        ).contents
+        name = ctypes.wstring_at(
+            attributes.ObjectName.contents.Buffer, attributes.ObjectName.contents.Length // 2
+        )
+        create_calls.append(
+            (
+                raw_value(attributes.RootDirectory),
+                name,
+                attributes.Attributes,
+                desired,
+                share,
+                disposition,
+                options,
+            )
+        )
+        ctypes.cast(out_handle, ctypes.POINTER(ctypes.c_void_p)).contents.value = 202
+        return 0
+
+    def nt_set_information(
+        source: object,
+        _status: object,
+        information: object,
+        length: int,
+        information_class: int,
+    ) -> int:
+        assert information_class == cas_module._FILE_LINK_INFORMATION
+        raw = ctypes.string_at(information, length)
+        header = cas_module._FILE_LINK_INFORMATION_HEADER.from_buffer_copy(raw)
+        name = raw[20 : 20 + header.FileNameLength].decode("utf-16-le")
+        link_calls.append(
+            (raw_value(source), raw_value(header.RootDirectory), bool(header.ReplaceIfExists), name)
+        )
+        return 0
+
+    api._get_info_ex = get_info
+    api._get_volume_info = get_volume_info
+    api._nt_create = nt_create
+    api._nt_set_information = nt_set_information
+    api._close_handle = lambda _handle: True
+    parent = handle_type(101, directory=True)
+    api.revalidate(parent, directory=True)
+    api._check_filesystem(parent)
+    monkeypatch.setattr(cas_module.os, "link", lambda *_args, **_kwargs: pytest.fail("path link"))
+
+    stage = api.open_child(
+        parent,
+        "stage",
+        directory=False,
+        create=True,
+        exclusive=True,
+        delete_on_close=True,
+    )
+    assert create_calls == [
+        (
+            101,
+            "stage",
+            cas_module._OBJ_CASE_INSENSITIVE | cas_module._OBJ_DONT_REPARSE,
+            cas_module._FILE_READ_DATA
+            | cas_module._FILE_READ_ATTRIBUTES
+            | cas_module._SYNCHRONIZE
+            | cas_module._FILE_WRITE_DATA
+            | cas_module._FILE_WRITE_ATTRIBUTES
+            | cas_module._DELETE,
+            cas_module._FILE_SHARE_READ,
+            cas_module._FILE_CREATE,
+            cas_module._FILE_NON_DIRECTORY_FILE
+            | cas_module._FILE_SYNCHRONOUS_IO_NONALERT
+            | cas_module._FILE_OPEN_REPARSE_POINT
+            | cas_module._FILE_DELETE_ON_CLOSE,
+        )
+    ]
+    assert set(query_classes) >= {
+        cas_module._FILE_ID_INFO,
+        cas_module._FILE_ATTRIBUTE_TAG_INFO,
+        cas_module._FILE_STANDARD_INFO,
+    }
+    api.link(stage, parent, "digest")
+    assert link_calls == [(202, 101, False, "digest")]
+    with pytest.raises(OSError):
+        api.open_child(parent, "unsafe/name", directory=True, create=False)
+    assert len(create_calls) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_api_rejects_volume_without_hardlink_capability() -> None:
+    from devkit_continuity import cas as cas_module
+
+    native_type = getattr(cas_module, "_WindowsNativeApi", None)
+    handle_type = getattr(cas_module, "_WindowsNativeHandle", None)
+    assert native_type is not None and handle_type is not None
+    api = object.__new__(native_type)
+
+    def get_volume_info(
+        _handle: object,
+        _name: object,
+        _name_size: int,
+        _serial: object,
+        _maximum: object,
+        _flags: object,
+        filesystem: object,
+        _filesystem_size: int,
+    ) -> bool:
+        filesystem.value = "NTFS"
+        return True
+
+    api._get_volume_info = get_volume_info
+    with pytest.raises(OSError):
+        api._check_filesystem(handle_type(101, directory=True))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_cas_retains_verified_root_handle_until_close(tmp_path: Path) -> None:
+    api = _MemoryNativeApi()
+    backend = _windows_backend_for_test(api, tmp_path / "continuity-cas")
+    body, digest = b"retained-root", _hash(b"retained-root")
+    backend.verify_prepared()
+    api.events.clear()
+
+    assert backend.put_verified(digest, len(body), body) == digest
+    assert backend.read_verified(digest, len(body)) == body
+    assert not [event for event in api.events if event[0] == "open_root"]
+
+    backend.close()
+    with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+        backend.read_verified(digest, len(body))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_runtime_bootstrap_and_prepared_open_close_native_validation_handles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    closes: list[str] = []
+
+    class Backend:
+        def put_verified(self, content_hash: str, byte_length: int, body: bytes) -> str:
+            return content_hash
+
+        def read_verified(self, content_hash: str, byte_length: int) -> bytes:
+            raise FileNotFoundError(content_hash)
+
+        def close(self) -> None:
+            closes.append("close")
+
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: object())
+    monkeypatch.setattr(
+        cas_module,
+        "_open_native_backend",
+        lambda *_args, **_kwargs: Backend(),
+        raising=False,
+    )
+    config = _unprepared_config(tmp_path)
+    RuntimeBootstrap.run(
+        config,
+        proof_registry_bootstrap=lambda database: sqlite3.connect(database).close(),
+    )
+    assert closes == ["close"]
+
+    prepared = ContinuityStore.open_readonly(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+    prepared.close()
+    assert closes == ["close", "close"]
