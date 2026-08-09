@@ -1331,6 +1331,12 @@ def _bootstrapped_runtime_config(tmp_path: Path) -> RuntimeConfig:
     return config
 
 
+def test_runtime_bootstrap_prepares_private_continuity_storage(tmp_path: Path) -> None:
+    config = _bootstrapped_runtime_config(tmp_path)
+    assert config.continuity_database.exists()
+    assert config.continuity_cas_root.is_dir()
+
+
 def _runtime_with_orphaned_atlas_outbox(tmp_path: Path) -> RuntimeConfig:
     config = _bootstrapped_runtime_config(tmp_path)
     ingestion_key = f"sha256:{'a' * 64}"
