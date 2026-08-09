@@ -776,9 +776,11 @@ def _typed_tuple(value: object, expected_type: type[Any], code: str) -> tuple[An
 
 
 def _command_spec_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise ContinuityError("COMMAND_SPEC_INVALID")
     try:
         result = tuple(value)  # type: ignore[arg-type]
-    except TypeError as error:
+    except (TypeError, ValueError) as error:
         raise ContinuityError("COMMAND_SPEC_INVALID") from error
     return result
 

@@ -122,6 +122,31 @@ def test_bound_receipt_rejects_unknown_kind() -> None:
         _bound_receipt(kind="patch", command_spec=())
 
 
+class _ExplodingCommandSpec(tuple[str, ...]):
+    def __new__(cls) -> _ExplodingCommandSpec:
+        return super().__new__(cls, ("python",))
+
+    def __iter__(self):
+        raise ValueError("sentinel")
+
+
+def test_bound_receipt_normalizes_command_spec_iteration_errors() -> None:
+    with pytest.raises(ContinuityError, match="^COMMAND_SPEC_INVALID$"):
+        _bound_receipt(
+            kind="write",
+            command_spec=_ExplodingCommandSpec(),
+            command_spec_hash=canonical_hash(()),
+        )
+
+
+def test_bound_receipt_rejects_non_tuple_command_spec() -> None:
+    with pytest.raises(ContinuityError, match="^COMMAND_SPEC_INVALID$"):
+        _bound_receipt(
+            command_spec=["python"],
+            command_spec_hash=canonical_hash(["python"]),
+        )
+
+
 @pytest.mark.parametrize(
     ("kind", "command_spec"),
     (("write", ()), ("command", ("python", "-m", "pytest"))),

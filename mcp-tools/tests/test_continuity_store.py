@@ -91,7 +91,12 @@ def _prepared_store(tmp_path: Path) -> tuple[RuntimeConfig, ContinuityStore]:
     )
 
 
-def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, AcceptedAtlasProjectionRequest, AcceptedAtlasProjectionEvidence]:
+def _typed_inputs(
+    *,
+    after_body: bytes = b"after",
+    receipt_kind: str = "command",
+    receipt_command_spec: tuple[str, ...] = ("python",),
+) -> tuple[ContinuityKey, AcceptedAtlasProjectionRequest, AcceptedAtlasProjectionEvidence]:
     request = AcceptedAtlasProjectionRequest.create(
         workflow_id="workflow", code_task_id="task", code_task_version=1,
         input_snapshot_id="input", output_snapshot_id="output", indexed_diff_hash=_hash(b"diff"),
@@ -106,7 +111,7 @@ def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, Accep
         (SnapshotFile("src/a.py", _hash(after_body), after_body),),
         (IndexNode("node", "function", "src/a.py", "run", "pkg.run", 1, 1, _hash(after_body)),),
         (CoverageGap("src/a.py", "PARSER_GAP", "gap"),),
-        (AtlasReceipt(_hash(b"receipt"), "command", "workflow", "task", request.acceptance_id, _hash(b"workspace"), "output", ("python",), canonical_hash(("python",)), _hash(b"input"), _hash(b"output"), 0, True),),
+        (AtlasReceipt(_hash(b"receipt"), receipt_kind, "workflow", "task", request.acceptance_id, _hash(b"workspace"), "output", receipt_command_spec, canonical_hash(receipt_command_spec), _hash(b"input"), _hash(b"output"), 0, True),),
     )
     evidence = AcceptedAtlasProjectionEvidence(1, "python", "pytest", request.checkpoint_hash, request.indexed_diff_hash, "query", request.verification_artifact_hashes, extraction)
     key = ContinuityKey(request.workflow_id, request.code_task_id, request.code_task_version, request.acceptance_id, request.ingestion_key, request.payload_hash, request.evidence_binding_hash)
@@ -897,6 +902,26 @@ def test_service_freeze_persists_complete_typed_replay_metadata(tmp_path: Path) 
         checkpoint_hash=request.checkpoint_hash,
     )
     assert '"schema":"continuity-frozen-view/v2"' in view.manifest_json
+
+
+def test_service_freeze_accepts_atlas_write_receipt_with_empty_command_spec(
+    tmp_path: Path,
+) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store,
+        ContinuityCas.open_prepared(
+            config.continuity_cas_root, config.scratch_root, read_only=False
+        ),
+    )
+    key, request, evidence = _typed_inputs(
+        receipt_kind="write", receipt_command_spec=()
+    )
+
+    view = service.freeze(service.claim_or_reuse(key), request, evidence)
+
+    assert view.execution_receipts[0].kind == "write"
+    assert view.execution_receipts[0].command_spec == ()
 
 
 def test_v1_audit_parser_keeps_legacy_manifest_nonreplayable(tmp_path: Path) -> None:
