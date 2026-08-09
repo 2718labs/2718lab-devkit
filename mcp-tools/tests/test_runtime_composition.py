@@ -517,6 +517,9 @@ def test_runtime_root_wires_fresh_call_scoped_typed_adapters(tmp_path: Path) -> 
         assert read_only is True
         return resource("atlas-store")
 
+    def open_continuity(*, config: RuntimeConfig, read_only: bool) -> Resource:
+        raise AssertionError("read-only UoW must not open the continuity writer")
+
     def build_atlas(
         *,
         atlas_store: Resource,
@@ -547,6 +550,7 @@ def test_runtime_root_wires_fresh_call_scoped_typed_adapters(tmp_path: Path) -> 
         adapter_factories=RuntimeAdapterFactories(
             open_project_checkpoint=open_project_checkpoint,
             open_atlas_store=open_atlas_store,
+            open_continuity=open_continuity,
             build_atlas=build_atlas,
             build_registry=build_registry,
             open_relay=open_relay,
@@ -573,6 +577,58 @@ def test_runtime_root_wires_fresh_call_scoped_typed_adapters(tmp_path: Path) -> 
     with pytest.raises(RuntimeConfigError) as caught:
         first.relay
     assert caught.value.code == "RUNTIME_CLOSED"
+
+
+def test_write_uow_lazily_owns_continuity_adapter_and_closes_it_once(
+    tmp_path: Path,
+) -> None:
+    class Resource:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "data"),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+    continuity = Resource()
+    calls: list[bool] = []
+
+    def open_continuity(*, config: RuntimeConfig, read_only: bool) -> Resource:
+        assert config.data_root == tmp_path / "data"
+        calls.append(read_only)
+        return continuity
+
+    factories = RuntimeAdapterFactories(
+        open_project_checkpoint=lambda **_kwargs: Resource(),
+        open_atlas_store=lambda **_kwargs: Resource(),
+        open_continuity=open_continuity,
+        build_atlas=lambda **_kwargs: object(),
+        build_registry=lambda **_kwargs: object(),
+        open_relay=lambda **_kwargs: Resource(),
+    )
+    uow = RuntimeUnitOfWork(
+        config=config,
+        read_only=False,
+        factories=factories,
+        capability_broker=None,
+        integration_attestor=None,
+        tool_results=object(),
+    )
+
+    assert uow._continuity_service() is continuity  # noqa: SLF001 - ownership seam
+    assert uow._continuity_service() is continuity  # noqa: SLF001 - ownership seam
+    uow.close()
+    uow.close()
+
+    assert calls == [False]
+    assert continuity.closed == 1
 
 
 def test_runtime_root_default_uow_is_lazy_and_pid_guarded(

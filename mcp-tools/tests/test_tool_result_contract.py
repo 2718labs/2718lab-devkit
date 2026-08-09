@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_atlas.models import (  # noqa: E402
     AcceptanceProjection,
+    AtlasError,
     AtlasNode,
     AtlasStatus,
     GraphQueryResult,
@@ -94,6 +95,24 @@ def test_success_and_failure_envelopes_have_exact_top_level_keys() -> None:
     }
     assert set(success) == {"schema", "ok", "data"}
     assert set(failure) == {"schema", "ok", "error"}
+
+
+@pytest.mark.parametrize(
+    "code",
+    ("ATLAS_EVIDENCE_UNAVAILABLE", "ATLAS_EVIDENCE_CONFLICT"),
+)
+def test_continuity_evidence_failures_keep_the_generic_secret_free_envelope(
+    code: str,
+) -> None:
+    result = result_from_exception(AtlasError(code, "C:/private/cas/sha256/secret"))
+
+    assert result == {
+        "schema": RESULT_SCHEMA,
+        "ok": False,
+        "error": {"code": code, "message": "request rejected"},
+    }
+    assert "private" not in str(result)
+    assert "secret" not in str(result)
 
 
 @pytest.mark.parametrize("value", [None, [], "text", 1, True])

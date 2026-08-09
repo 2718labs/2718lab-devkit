@@ -254,6 +254,7 @@ class _Reader:
         self.request = request
         self.evidence = evidence
         self.calls = 0
+        self.rebuild_calls = 0
 
     def rebuild(
         self,
@@ -262,6 +263,7 @@ class _Reader:
         acceptance_id: str,
         ingestion_key: str,
     ) -> AcceptedAtlasProjectionRequest:
+        self.rebuild_calls += 1
         if (workflow_id, code_task_id, acceptance_id, ingestion_key) != (
             self.request.workflow_id,
             self.request.code_task_id,
@@ -317,6 +319,34 @@ def _counts(store: AtlasStore) -> tuple[int, int, int, int, int]:
         count("atlas_blobs"),
         count("atlas_ingestion_receipts"),
     )
+
+
+def test_private_prepared_projection_reads_authoritative_evidence_once(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    reader = _Reader(request, _evidence(request))
+    service, store, runtime = _service_at(tmp_path, reader)
+
+    prepared = service._prepare_accepted_projection(
+        request.workflow_id,
+        request.code_task_id,
+        request.acceptance_id,
+        request.ingestion_key,
+    )
+
+    assert reader.rebuild_calls == 1
+    assert reader.calls == 1
+    projection = service._project_prepared_acceptance(prepared)
+    assert projection.acceptance_id == request.acceptance_id
+    assert reader.rebuild_calls == 1
+    assert reader.calls == 1
+
+    assert service.project_acceptance(request) == projection
+    assert reader.rebuild_calls == 1
+    assert reader.calls == 2
+    store.close()
+    runtime.close()
 
 
 def test_project_acceptance_persists_a_recipe_once_and_redacts_output(

@@ -25,6 +25,8 @@ from devkit_atlas.models import AtlasError  # noqa: E402
 from devkit_atlas.recipes import BundledRecipeLoader  # noqa: E402
 from devkit_atlas.service import AtlasService  # noqa: E402
 from devkit_atlas.store import AtlasStore  # noqa: E402
+from devkit_continuity.models import ContinuityKey  # noqa: E402
+from devkit_continuity.store import ContinuityStore  # noqa: E402
 from devkit_runtime.atlas_acceptance import (  # noqa: E402
     ProductionAcceptanceEvidenceReader,
 )
@@ -515,6 +517,41 @@ class DefaultRuntimeAcceptanceEvidenceTests(CodeTaskAcceptanceFixture):
         )
 
         assert projection.acceptance_id == acceptance.acceptance_id
+        assert self._outbox_state(config, outbox.ingestion_key) == ("projected", 0, "")
+
+    def test_default_write_uow_publishes_a_fenced_continuity_view_first(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        binding = self.store.evidence_binding_for_acceptance(acceptance.acceptance_id)
+        assert binding is not None
+
+        self._default_accept(config, acceptance.acceptance_id, outbox.ingestion_key)
+
+        key = ContinuityKey(
+            "workflow",
+            "code-task",
+            acceptance.code_task_version,
+            acceptance.acceptance_id,
+            outbox.ingestion_key,
+            acceptance.payload_hash,
+            binding.evidence_binding_hash,
+        )
+        continuity = ContinuityStore.open_readonly(
+            config.continuity_database,
+            config.continuity_cas_root,
+            config.scratch_root,
+        )
+        try:
+            attempt = continuity.current_attempt(key)
+            pointer = continuity.pointer_for(key)
+        finally:
+            continuity.close()
+
+        assert attempt is not None and attempt.state == "published"
+        assert pointer is not None
+        assert pointer.view_id == attempt.view_id
+        assert pointer.fence_epoch == attempt.fence_epoch
         assert self._outbox_state(config, outbox.ingestion_key) == ("projected", 0, "")
 
     def test_default_write_uow_retries_unavailable_evidence(self) -> None:

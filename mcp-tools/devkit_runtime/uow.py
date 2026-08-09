@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from devkit_atlas.models import AtlasError
     from devkit_atlas.service import AtlasService
     from devkit_atlas.store import AtlasStore
+    from devkit_continuity.service import ContinuityService
     from devkit_relay.proofs import IntegrationProofResolver
     from devkit_relay.store import RelayStore
     from devkit_runtime.project_checkpoint import ProjectCheckpointRuntime
@@ -54,6 +55,7 @@ class RuntimeAdapterFactories:
 
     open_project_checkpoint: Callable[..., object]
     open_atlas_store: Callable[..., object]
+    open_continuity: Callable[..., object]
     build_atlas: Callable[..., object]
     build_registry: Callable[..., object]
     open_relay: Callable[..., object]
@@ -65,6 +67,31 @@ class _OwnedAdapter:
 
     value: object
     closer: object
+
+
+@dataclass(frozen=True)
+class _OwnedClosers:
+    """Close a composed adapter's private resources exactly once each."""
+
+    resources: tuple[object, ...]
+
+    def close(self) -> None:
+        closed: set[int] = set()
+        first_error: Exception | None = None
+        for resource in reversed(self.resources):
+            if id(resource) in closed:
+                continue
+            closed.add(id(resource))
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 _UNSET = object()
@@ -93,6 +120,7 @@ class RuntimeUnitOfWork:
         self._project_checkpoint: object = _UNSET
         self._atlas_store: object = _UNSET
         self._atlas: object = _UNSET
+        self._continuity: object = _UNSET
         self._orchestrator_store: object = _UNSET
         self._acceptance_evidence_reader: object = _UNSET
         self._registry: object = _UNSET
@@ -154,17 +182,45 @@ class RuntimeUnitOfWork:
         self._assert_open()
         if self._read_only:
             raise RuntimeConfigError("RUNTIME_READ_ONLY")
+        marking_outbox = False
         try:
-            projection = self.atlas.accept(
+            prepared = self.atlas._prepare_accepted_projection(  # noqa: SLF001
                 workflow_id, code_task_id, acceptance_id, ingestion_key
             )
-        except AtlasError as error:
-            self._record_atlas_acceptance_failure(
-                acceptance_id, ingestion_key, error
+            key = self._continuity_key(
+                prepared, workflow_id, code_task_id, acceptance_id, ingestion_key
             )
-            raise
-        self._mark_atlas_acceptance_projected(acceptance_id, ingestion_key)
-        return projection
+            self._matching_atlas_outbox(acceptance_id, ingestion_key)
+            continuity = self._continuity_service()
+            attempt = continuity.claim_or_reuse(key)
+            if attempt.state == "published":
+                self._published_pointer(continuity, attempt, attempt.view_id)
+                projection = self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
+            else:
+                frozen_view = continuity.freeze(
+                    attempt, prepared.request, prepared.evidence
+                )
+                projection = self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
+                self._publish_or_recover(continuity, attempt, frozen_view)
+            marking_outbox = True
+            self._mark_atlas_acceptance_projected(acceptance_id, ingestion_key)
+            return projection
+        except AtlasError as error:
+            atlas_error = self._atlas_acceptance_error(error)
+            if not marking_outbox:
+                self._record_atlas_acceptance_failure_safely(
+                    acceptance_id, ingestion_key, atlas_error
+                )
+            if atlas_error is error:
+                raise
+            raise atlas_error from error
+        except Exception as error:
+            atlas_error = self._continuity_error(error)
+            if not marking_outbox:
+                self._record_atlas_acceptance_failure_safely(
+                    acceptance_id, ingestion_key, atlas_error
+                )
+            raise atlas_error from error
 
     @property
     def registry(self) -> object:
@@ -269,12 +325,171 @@ class RuntimeUnitOfWork:
             )
         return self._acceptance_evidence_reader
 
+    def _continuity_service(self) -> ContinuityService:
+        """Open the private writer only when a write Atlas acceptance needs it."""
+
+        self._assert_open()
+        if self._read_only:
+            raise RuntimeConfigError("RUNTIME_READ_ONLY")
+        if self._continuity is _UNSET:
+            self._continuity = self._remember(
+                self._factories.open_continuity(
+                    config=self._config,
+                    read_only=False,
+                )
+            )
+        return cast("ContinuityService", self._continuity)
+
+    @staticmethod
+    def _continuity_key(
+        prepared: object,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> object:
+        """Bind continuity only to the exact reader-produced seven-field key."""
+
+        from devkit_atlas.models import AtlasError
+        from devkit_continuity.models import ContinuityError, ContinuityKey
+
+        request = getattr(prepared, "request", None)
+        try:
+            if (
+                request is None
+                or request.workflow_id != workflow_id
+                or request.code_task_id != code_task_id
+                or request.acceptance_id != acceptance_id
+                or request.ingestion_key != ingestion_key
+            ):
+                raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+            return ContinuityKey(
+                request.workflow_id,
+                request.code_task_id,
+                request.code_task_version,
+                request.acceptance_id,
+                request.ingestion_key,
+                request.payload_hash,
+                request.evidence_binding_hash,
+            )
+        except AtlasError:
+            raise
+        except (AttributeError, ContinuityError, TypeError, ValueError) as error:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
+
+    @staticmethod
+    def _published_pointer(
+        continuity: ContinuityService,
+        attempt: object,
+        view_id: object,
+    ) -> object:
+        """Require one exact current published attempt and matching pointer."""
+
+        from devkit_atlas.models import AtlasError
+
+        try:
+            key = attempt.key
+            current = continuity.store.current_attempt(key)
+            pointer = continuity.store.pointer_for(key)
+            if (
+                current != attempt
+                or attempt.state != "published"
+                or not isinstance(view_id, str)
+                or attempt.view_id != view_id
+                or pointer is None
+                or (
+                    pointer.workflow_id,
+                    pointer.code_task_id,
+                    pointer.code_task_version,
+                    pointer.view_id,
+                    pointer.fence_epoch,
+                )
+                != (
+                    key.workflow_id,
+                    key.code_task_id,
+                    key.code_task_version,
+                    view_id,
+                    attempt.fence_epoch,
+                )
+            ):
+                raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+            return pointer
+        except AtlasError:
+            raise
+        except Exception as error:
+            raise AtlasError("ATLAS_EVIDENCE_UNAVAILABLE") from error
+
+    def _publish_or_recover(
+        self, continuity: ContinuityService, attempt: object, frozen_view: object
+    ) -> object:
+        """Recover only a proven same-view publication race before failure handling."""
+
+        from devkit_atlas.models import AtlasError
+
+        try:
+            continuity.publish(attempt, frozen_view)
+        except Exception as error:
+            try:
+                current = continuity.store.current_attempt(attempt.key)
+                if current is None:
+                    raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+                return self._published_pointer(
+                    continuity, current, frozen_view.view_id
+                )
+            except AtlasError:
+                raise error
+        current = continuity.store.current_attempt(attempt.key)
+        if current is None:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        return self._published_pointer(continuity, current, frozen_view.view_id)
+
+    @staticmethod
+    def _continuity_error(error: Exception) -> AtlasError:
+        """Map private state failures without carrying private details public."""
+
+        from devkit_atlas.models import AtlasError
+        from devkit_continuity.cas import ContinuityCasError
+        from devkit_continuity.models import ContinuityError
+        from devkit_continuity.store import ContinuityStoreError
+
+        if isinstance(error, AtlasError):
+            return error
+        if isinstance(error, (ContinuityError, ContinuityStoreError, ContinuityCasError)):
+            if str(error) in {
+                "CONTINUITY_CAS_UNAVAILABLE",
+                "CONTINUITY_STORE_UNPREPARED",
+                "CONTINUITY_STORE_READ_ONLY",
+            }:
+                return AtlasError("ATLAS_EVIDENCE_UNAVAILABLE")
+            return AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        if isinstance(error, (OSError, sqlite3.Error)):
+            return AtlasError("ATLAS_EVIDENCE_UNAVAILABLE")
+        return AtlasError("ATLAS_EVIDENCE_UNAVAILABLE")
+
+    @staticmethod
+    def _atlas_acceptance_error(error: AtlasError) -> AtlasError:
+        """Translate private Atlas seam failures before public UoW handling."""
+
+        from devkit_atlas.models import AtlasError
+
+        if error.code in {
+            "ATLAS_EVIDENCE_UNAVAILABLE",
+            "ATLAS_EVIDENCE_CONFLICT",
+        }:
+            return error
+        if error.code == "acceptance_evidence_unavailable":
+            return AtlasError("ATLAS_EVIDENCE_UNAVAILABLE")
+        return AtlasError("ATLAS_EVIDENCE_CONFLICT")
+
     def _matching_atlas_outbox(
         self, acceptance_id: str, ingestion_key: str
     ) -> object:
         from devkit_atlas.models import AtlasError
 
         store = self._orchestrator_store
+        if store is _UNSET:
+            self._atlas_acceptance_evidence_reader()
+            store = self._orchestrator_store
         if store is _UNSET:
             raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
         outbox = store.atlas_outbox_for_acceptance(acceptance_id)
@@ -348,6 +563,18 @@ class RuntimeUnitOfWork:
                 )
             except AtlasOutboxTransitionError:
                 return
+
+    def _record_atlas_acceptance_failure_safely(
+        self, acceptance_id: str, ingestion_key: str, error: AtlasError
+    ) -> None:
+        """Keep the original evidence failure when its outbox is untrusted."""
+
+        from devkit_atlas.models import AtlasError
+
+        try:
+            self._record_atlas_acceptance_failure(acceptance_id, ingestion_key, error)
+        except AtlasError:
+            return
 
 
 def open_runtime_uow(
@@ -443,6 +670,44 @@ def _open_atlas_store_rw(config: RuntimeConfig) -> object:
     except Exception:
         if connection is not None:
             connection.close()
+        raise
+
+
+def _open_continuity(*, config: RuntimeConfig, read_only: bool) -> object:
+    """Open only an already-prepared private Continuity store and CAS."""
+
+    from devkit_continuity.cas import ContinuityCas
+    from devkit_continuity.service import ContinuityService
+    from devkit_continuity.store import ContinuityStore
+
+    store = (
+        ContinuityStore.open_readonly(
+            config.continuity_database,
+            config.continuity_cas_root,
+            config.scratch_root,
+        )
+        if read_only
+        else ContinuityStore.open_readwrite(
+            config.continuity_database,
+            config.continuity_cas_root,
+            config.scratch_root,
+        )
+    )
+    cas: ContinuityCas | None = None
+    try:
+        cas = ContinuityCas.open_prepared(
+            config.continuity_cas_root,
+            config.scratch_root,
+            read_only=read_only,
+        )
+        return _OwnedAdapter(
+            value=ContinuityService(store, cas),
+            closer=_OwnedClosers((store, cas)),
+        )
+    except Exception:
+        if cas is not None:
+            cas.close()
+        store.close()
         raise
 
 
@@ -574,6 +839,7 @@ def _open_relay_store_rw(config: RuntimeConfig) -> RelayStore:
 DEFAULT_RUNTIME_ADAPTER_FACTORIES = RuntimeAdapterFactories(
     open_project_checkpoint=_open_project_checkpoint,
     open_atlas_store=_open_atlas_store,
+    open_continuity=_open_continuity,
     build_atlas=_build_atlas,
     build_registry=_build_registry,
     open_relay=_open_relay,
