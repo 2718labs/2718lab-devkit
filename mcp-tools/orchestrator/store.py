@@ -482,6 +482,15 @@ class SQLiteStore:
     def from_prepared_connection(cls, connection: sqlite3.Connection) -> SQLiteStore:
         """Bind a validated, invocation-owned connection without creating schema."""
 
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            foreign_keys_enabled = bool(
+                connection.execute("PRAGMA foreign_keys").fetchone()[0]
+            )
+        except (IndexError, TypeError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator store is not prepared") from error
+        if not foreign_keys_enabled:
+            raise StoreError("orchestrator store is not prepared")
         cls.validate_prepared_connection(connection)
         store = cls.__new__(cls)
         store._connection = connection
@@ -560,6 +569,11 @@ class SQLiteStore:
                     "PRAGMA table_info(atlas_ingestion_outbox)"
                 )
             }
+            outbox_not_null_columns = {
+                str(row["name"])
+                for row in outbox_columns.values()
+                if int(row["notnull"])
+            }
             outbox_primary_key = tuple(
                 str(row["name"])
                 for row in sorted(
@@ -605,6 +619,17 @@ class SQLiteStore:
             "created_at",
             "updated_at",
         }
+        required_outbox_not_null_columns = {
+            "acceptance_id",
+            "payload_json",
+            "payload_hash",
+            "state",
+            "attempt_count",
+            "last_error_code",
+            "reason_codes_json",
+            "created_at",
+            "updated_at",
+        }
         has_outbox_identity = (
             outbox_primary_key == ("ingestion_key",)
             and ("acceptance_id",) in outbox_unique_columns
@@ -622,6 +647,9 @@ class SQLiteStore:
             or version != cls._SCHEMA_VERSION
             or journal_mode != "wal"
             or not required_outbox_columns.issubset(outbox_columns)
+            or not required_outbox_not_null_columns.issubset(
+                outbox_not_null_columns
+            )
             or not has_outbox_identity
         ):
             raise StoreError("orchestrator store is not prepared")

@@ -754,17 +754,25 @@ def _atlas_outbox_schema(
     *,
     include_payload_json: bool = True,
     partial_unique_indexes: bool = False,
+    nullable_column: str | None = None,
     equality_check: str = "CHECK (ingestion_key = payload_hash)",
     state_check: str = "CHECK (state IN ('pending', 'projected', 'quarantined'))",
     attempt_check: str = "CHECK (attempt_count BETWEEN 0 AND 16)",
 ) -> str:
-    payload_json = "payload_json TEXT NOT NULL," if include_payload_json else ""
+    def not_null(column: str) -> str:
+        return "" if nullable_column == column else " NOT NULL"
+
+    payload_json = (
+        f"payload_json TEXT{not_null('payload_json')},"
+        if include_payload_json
+        else ""
+    )
     if partial_unique_indexes:
         acceptance_id = (
-            "acceptance_id TEXT NOT NULL "
+            f"acceptance_id TEXT{not_null('acceptance_id')} "
             "REFERENCES code_task_acceptances(acceptance_id),"
         )
-        payload_hash = "payload_hash TEXT NOT NULL,"
+        payload_hash = f"payload_hash TEXT{not_null('payload_hash')},"
         unique_indexes = """
             CREATE UNIQUE INDEX atlas_outbox_acceptance_partial
                 ON atlas_ingestion_outbox(acceptance_id)
@@ -775,10 +783,10 @@ def _atlas_outbox_schema(
         """
     else:
         acceptance_id = (
-            "acceptance_id TEXT NOT NULL UNIQUE "
+            f"acceptance_id TEXT{not_null('acceptance_id')} UNIQUE "
             "REFERENCES code_task_acceptances(acceptance_id),"
         )
-        payload_hash = "payload_hash TEXT NOT NULL UNIQUE,"
+        payload_hash = f"payload_hash TEXT{not_null('payload_hash')} UNIQUE,"
         unique_indexes = ""
     return f"""
         CREATE TABLE atlas_ingestion_outbox (
@@ -786,12 +794,12 @@ def _atlas_outbox_schema(
             {acceptance_id}
             {payload_json}
             {payload_hash}
-            state TEXT NOT NULL {state_check},
-            attempt_count INTEGER NOT NULL {attempt_check},
-            last_error_code TEXT NOT NULL,
-            reason_codes_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
+            state TEXT{not_null('state')} {state_check},
+            attempt_count INTEGER{not_null('attempt_count')} {attempt_check},
+            last_error_code TEXT{not_null('last_error_code')},
+            reason_codes_json TEXT{not_null('reason_codes_json')},
+            created_at TEXT{not_null('created_at')},
+            updated_at TEXT{not_null('updated_at')},
             {equality_check}
         );
         {unique_indexes}
@@ -888,3 +896,60 @@ def test_sqlite_store_entry_points_reject_malformed_current_outbox_schema(
             SQLiteStore.from_prepared_connection(connection)
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize(
+    "nullable_column",
+    (
+        "acceptance_id",
+        "payload_json",
+        "payload_hash",
+        "state",
+        "attempt_count",
+        "last_error_code",
+        "reason_codes_json",
+        "created_at",
+        "updated_at",
+    ),
+)
+def test_default_write_uow_rejects_nullable_atlas_outbox_columns(
+    tmp_path: Path, nullable_column: str
+) -> None:
+    config = _runtime_with_malformed_atlas_outbox(
+        tmp_path, _atlas_outbox_schema(nullable_column=nullable_column)
+    )
+    root = RuntimeRoot(config)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            with root.open_uow(read_only=False) as uow:
+                _ = uow.atlas
+    finally:
+        root.shutdown()
+
+
+def test_prepared_sqlite_store_enables_foreign_keys_on_raw_connection(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    connection = sqlite3.connect(config.orchestrator_database)
+    store = SQLiteStore.from_prepared_connection(connection)
+    try:
+        assert store.foreign_keys_enabled()
+    finally:
+        store.close()
