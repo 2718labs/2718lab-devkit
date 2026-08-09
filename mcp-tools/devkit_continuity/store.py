@@ -285,10 +285,7 @@ class ContinuityStore:
             raise ContinuityStoreError("CONTINUITY_POINTER_CONFLICT")
         current = self.pointer_for(key)
         if current is None:
-            self._connection.execute(
-                "INSERT INTO pointers(key_hash,workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
-                (key.key_hash, key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, 1, new_fence_epoch),
-            )
+            self._insert_pointer_row(key, view, new_fence_epoch)
             return ContinuityPointer(key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, 1, new_fence_epoch)
         if new_fence_epoch < current.fence_epoch:
             raise ContinuityStoreError("CONTINUITY_POINTER_CONFLICT")
@@ -303,6 +300,12 @@ class ContinuityStore:
         if changed != 1:
             raise ContinuityStoreError("CONTINUITY_POINTER_CONFLICT")
         return ContinuityPointer(key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, current.pointer_version + 1, new_fence_epoch)
+
+    def _insert_pointer_row(self, key: ContinuityKey, view: FrozenView, fence_epoch: int) -> None:
+        self._connection.execute(
+            "INSERT INTO pointers(key_hash,workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
+            (key.key_hash, key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, 1, fence_epoch),
+        )
 
 
 def _receipt_json(receipt: ContinuityReceipt) -> str:

@@ -349,6 +349,27 @@ def test_atomic_sqlite_races_normalize_to_continuity_error(
         store.claim_or_reuse_atomic(key)
 
 
+def test_atomic_initial_pointer_integrity_race_normalizes_and_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, store = _prepared_store(tmp_path)
+    key, view = _key(), _view(_key())
+    frozen = store.freeze_attempt_atomic(
+        store.claim_or_reuse_atomic(key),
+        view,
+        ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen"),
+    )
+
+    def duplicate(*_args: object) -> None:
+        raise sqlite3.IntegrityError("duplicate pointer")
+
+    monkeypatch.setattr(store, "_insert_pointer_row", duplicate, raising=False)
+    with pytest.raises(ContinuityError):
+        store.publish_attempt_atomic(frozen, view)
+    assert store.pointer_for(key) is None
+    assert store.current_attempt(key) == frozen
+
+
 def test_v2_foreign_keys_are_enabled_and_reject_orphans(tmp_path: Path) -> None:
     _, store = _prepared_store(tmp_path)
     assert store._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
