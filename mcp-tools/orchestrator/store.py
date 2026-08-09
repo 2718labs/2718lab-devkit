@@ -5920,9 +5920,6 @@ class SQLiteStore:
                     "PRAGMA table_info(atlas_ingestion_outbox)"
                 ).fetchall()
             }
-            ingestion_key = columns.get("ingestion_key")
-            if ingestion_key is None or int(ingestion_key["notnull"]):
-                return
             required_columns = {
                 "ingestion_key",
                 "acceptance_id",
@@ -5935,8 +5932,79 @@ class SQLiteStore:
                 "created_at",
                 "updated_at",
             }
-            if not required_columns.issubset(columns):
+            if set(columns) != required_columns:
+                raise StoreError("orchestrator store is not prepared")
+            ingestion_key = columns["ingestion_key"]
+            if int(ingestion_key["notnull"]):
                 return
+            source_version_row = cursor.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            source_version = (
+                None if source_version_row is None else int(source_version_row["value"])
+            )
+
+            def index_columns(index_name: object) -> tuple[str, ...]:
+                if type(index_name) is not str:
+                    raise ValueError("index name is invalid")
+                identifier = index_name.replace('"', '""')
+                return tuple(
+                    str(row["name"])
+                    for row in cursor.execute(f'PRAGMA index_info("{identifier}")')
+                )
+
+            outbox_not_null_columns = {
+                str(row["name"])
+                for row in columns.values()
+                if int(row["notnull"])
+            }
+            outbox_primary_key = tuple(
+                str(row["name"])
+                for row in sorted(
+                    columns.values(), key=lambda row: int(row["pk"])
+                )
+                if int(row["pk"])
+            )
+            outbox_unique_columns = {
+                index_columns(row["name"])
+                for row in cursor.execute(
+                    "PRAGMA index_list(atlas_ingestion_outbox)"
+                ).fetchall()
+                if int(row["unique"]) and not int(row["partial"])
+            }
+            outbox_foreign_keys = {
+                (str(row["from"]), str(row["table"]), str(row["to"]))
+                for row in cursor.execute(
+                    "PRAGMA foreign_key_list(atlas_ingestion_outbox)"
+                )
+            }
+            outbox_row = cursor.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'atlas_ingestion_outbox'
+                """
+            ).fetchone()
+            outbox_checks = (
+                frozenset()
+                if outbox_row is None
+                else _sqlite_check_expressions(outbox_row["sql"])
+            )
+            required_not_null_columns = required_columns - {"ingestion_key"}
+            has_complete_v10_layout = (
+                required_not_null_columns.issubset(outbox_not_null_columns)
+                and outbox_primary_key == ("ingestion_key",)
+                and ("acceptance_id",) in outbox_unique_columns
+                and ("payload_hash",) in outbox_unique_columns
+                and (
+                    "acceptance_id",
+                    "code_task_acceptances",
+                    "acceptance_id",
+                )
+                in outbox_foreign_keys
+                and _ATLAS_OUTBOX_REQUIRED_CHECKS.issubset(outbox_checks)
+            )
+            if source_version != 10 or not has_complete_v10_layout:
+                raise StoreError("orchestrator store is not prepared")
             if cursor.execute(
                 """
                 SELECT 1 FROM atlas_ingestion_outbox
@@ -6445,6 +6513,7 @@ class SQLiteStore:
                 """,
                 ("schema_version", str(self._SCHEMA_VERSION)),
             )
+            self.validate_prepared_connection(self._connection)
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:

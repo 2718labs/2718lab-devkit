@@ -1156,3 +1156,137 @@ def test_sqlite_store_fails_closed_for_legacy_null_outbox_key(tmp_path: Path) ->
         ).fetchone()[0] == "10"
     finally:
         connection.close()
+
+
+def _legacy_v10_incomplete_atlas_outbox_database(
+    tmp_path: Path,
+) -> tuple[Path, str, str]:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, acceptance_id, timestamp = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=ingestion_key
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.executescript(_atlas_outbox_schema(include_payload_json=False))
+        connection.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_hash, state, attempt_count,
+                last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ingestion_key,
+                acceptance_id,
+                acceptance_id,
+                "pending",
+                0,
+                "",
+                "[]",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, ingestion_key, acceptance_id
+
+
+def test_sqlite_store_rolls_back_incomplete_v10_outbox_upgrade(
+    tmp_path: Path,
+) -> None:
+    database, ingestion_key, acceptance_id = _legacy_v10_incomplete_atlas_outbox_database(
+        tmp_path
+    )
+
+    with pytest.raises(StoreError):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        assert "payload_json" not in columns
+        assert columns["ingestion_key"] == 0
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "10"
+        assert tuple(
+            connection.execute(
+                """
+                SELECT ingestion_key, acceptance_id, payload_hash, state, attempt_count
+                FROM atlas_ingestion_outbox
+                """
+            ).fetchone()
+        ) == (
+            ingestion_key,
+            acceptance_id,
+            acceptance_id,
+            "pending",
+            0,
+        )
+    finally:
+        connection.close()
+
+
+def _malformed_v11_nullable_atlas_outbox_database(
+    tmp_path: Path,
+) -> tuple[Path, str, str]:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, acceptance_id, _ = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=ingestion_key
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+            ("11",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, ingestion_key, acceptance_id
+
+
+def test_sqlite_store_preserves_malformed_v11_nullable_outbox(
+    tmp_path: Path,
+) -> None:
+    database, ingestion_key, acceptance_id = _malformed_v11_nullable_atlas_outbox_database(
+        tmp_path
+    )
+
+    with pytest.raises(StoreError):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        assert columns["ingestion_key"] == 0
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "11"
+        assert tuple(
+            connection.execute(
+                """
+                SELECT ingestion_key, acceptance_id, payload_hash, state, attempt_count
+                FROM atlas_ingestion_outbox
+                """
+            ).fetchone()
+        ) == (
+            ingestion_key,
+            acceptance_id,
+            acceptance_id,
+            "pending",
+            0,
+        )
+    finally:
+        connection.close()
