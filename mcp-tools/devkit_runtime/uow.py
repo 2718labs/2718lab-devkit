@@ -640,11 +640,9 @@ class RuntimeUnitOfWork:
     ) -> None:
         """Keep the original evidence failure when its outbox is untrusted."""
 
-        from devkit_atlas.models import AtlasError
-
         try:
             self._record_atlas_acceptance_failure(acceptance_id, ingestion_key, error)
-        except AtlasError:
+        except Exception:
             return
 
 

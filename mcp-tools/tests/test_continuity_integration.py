@@ -44,8 +44,11 @@ class _Orchestrator:
         self.outbox = outbox
         self.unrelated = _Outbox("other-acceptance", "other-ingestion", _HASH)
         self.fail_mark_once = False
+        self.lookup_error: Exception | None = None
 
     def atlas_outbox_for_acceptance(self, acceptance_id: str) -> _Outbox | None:
+        if self.lookup_error is not None:
+            raise self.lookup_error
         return self.outbox if acceptance_id == self.outbox.acceptance_id else None
 
     def mark_atlas_outbox_projected(self, ingestion_key: str) -> _Outbox:
@@ -360,6 +363,26 @@ def test_private_atlas_evidence_failure_is_mapped_before_outbox_retry(
     assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
     assert orchestrator.outbox.state is AtlasOutboxState.PENDING
     assert orchestrator.outbox.retry_count == 1
+
+
+def test_outbox_lookup_error_cannot_replace_a_mapped_atlas_failure(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, _continuity, orchestrator = _uow(tmp_path)
+    atlas.prepare_error = AtlasError("acceptance_evidence_unavailable")
+    orchestrator.lookup_error = RuntimeError("outbox lookup probe")
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+    assert "probe" not in str(raised.value)
 
 
 def test_same_fence_freeze_race_reuses_the_deterministic_frozen_view(
