@@ -449,17 +449,46 @@ class RuntimeUnitOfWork:
             ):
                 raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
             if current.state == "frozen":
-                return (
-                    continuity.freeze(current, prepared.request, prepared.evidence),
-                    False,
-                )
-            if current.state != "published":
-                raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
-            frozen_view = continuity._typed_view(  # noqa: SLF001
-                attempt.key, prepared.request, prepared.evidence
+                try:
+                    return (
+                        continuity.freeze(current, prepared.request, prepared.evidence),
+                        False,
+                    )
+                except ContinuityStoreError as retry_error:
+                    if str(retry_error) != "CONTINUITY_STATE_CONFLICT":
+                        raise
+                    current = continuity.store.current_attempt(attempt.key)
+                    return self._recover_published_freeze_race(
+                        continuity, attempt, current, prepared, retry_error
+                    )
+            return self._recover_published_freeze_race(
+                continuity, attempt, current, prepared, error
             )
-            self._published_pointer(continuity, current, frozen_view.view_id)
-            return frozen_view, True
+
+    def _recover_published_freeze_race(
+        self,
+        continuity: ContinuityService,
+        attempt: object,
+        current: object,
+        prepared: object,
+        error: Exception,
+    ) -> tuple[object, bool]:
+        """Resume a race only after proving its exact published deterministic view."""
+
+        from devkit_atlas.models import AtlasError
+
+        if (
+            current is None
+            or current.key != attempt.key
+            or current.fence_epoch != attempt.fence_epoch
+            or current.state != "published"
+        ):
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
+        frozen_view = continuity._typed_view(  # noqa: SLF001
+            attempt.key, prepared.request, prepared.evidence
+        )
+        self._published_pointer(continuity, current, frozen_view.view_id)
+        return frozen_view, True
 
     def _publish_or_recover(
         self, continuity: ContinuityService, attempt: object, frozen_view: object

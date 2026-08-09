@@ -95,6 +95,16 @@ class _Continuity:
                 attempt.key, attempt.fence_epoch, "frozen", _VIEW, _RECEIPT
             )
             raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+        if self.freeze_race == "frozen_then_published":
+            if self.freeze_calls == 1:
+                self.current = ContinuityAttempt(
+                    attempt.key, attempt.fence_epoch, "frozen", _VIEW, _RECEIPT
+                )
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+            if self.freeze_calls == 2:
+                self.freeze_race = None
+                self._publish(_VIEW)
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
         if self.freeze_race == "published":
             self.freeze_race = None
             self._publish(_VIEW)
@@ -388,6 +398,29 @@ def test_same_fence_published_freeze_race_requires_matching_view_and_pointer(
     )
 
     assert projection == {"projection": 1}
+    assert continuity.typed_view_calls == 1
+    assert continuity.publish_calls == 0
+    assert continuity.current.state == "published"
+    assert orchestrator.outbox.state is AtlasOutboxState.PROJECTED
+    assert orchestrator.outbox.quarantine_count == 0
+
+
+def test_same_fence_second_freeze_race_recovers_one_published_view(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.freeze_race = "frozen_then_published"
+    request = atlas.prepared.request
+
+    projection = uow.accept_atlas(
+        request.workflow_id,
+        request.code_task_id,
+        request.acceptance_id,
+        request.ingestion_key,
+    )
+
+    assert projection == {"projection": 1}
+    assert continuity.freeze_calls == 2
     assert continuity.typed_view_calls == 1
     assert continuity.publish_calls == 0
     assert continuity.current.state == "published"
