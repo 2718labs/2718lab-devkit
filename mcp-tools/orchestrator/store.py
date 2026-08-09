@@ -497,6 +497,31 @@ class SQLiteStore:
         connection.row_factory = sqlite3.Row
         return store
 
+    @staticmethod
+    def _validate_schema_metadata_layout(
+        executor: sqlite3.Connection | sqlite3.Cursor,
+    ) -> None:
+        try:
+            columns = {
+                str(row["name"]): row
+                for row in executor.execute("PRAGMA table_info(schema_metadata)")
+            }
+            primary_key = tuple(
+                str(row["name"])
+                for row in sorted(columns.values(), key=lambda row: int(row["pk"]))
+                if int(row["pk"])
+            )
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator schema is corrupt") from error
+        if (
+            set(columns) != {"key", "value"}
+            or str(columns["key"]["type"]).casefold() != "text"
+            or str(columns["value"]["type"]).casefold() != "text"
+            or primary_key != ("key",)
+            or not int(columns["value"]["notnull"])
+        ):
+            raise StoreError("orchestrator store is not prepared")
+
     @classmethod
     def validate_prepared_connection(cls, connection: sqlite3.Connection) -> None:
         """Reject an absent, stale, or incomplete store before runtime use."""
@@ -550,16 +575,21 @@ class SQLiteStore:
             )
 
         try:
+            cls._validate_schema_metadata_layout(connection)
             tables = {
                 str(row["name"])
                 for row in connection.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            version_row = connection.execute(
+            version_rows = connection.execute(
                 "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-            ).fetchone()
-            version = None if version_row is None else int(version_row["value"])
+            ).fetchall()
+            version = (
+                None
+                if len(version_rows) != 1 or type(version_rows[0]["value"]) is not str
+                else version_rows[0]["value"]
+            )
             journal_mode = str(
                 connection.execute("PRAGMA journal_mode").fetchone()[0]
             ).casefold()
@@ -605,6 +635,9 @@ class SQLiteStore:
                 if outbox_row is None
                 else _sqlite_check_expressions(outbox_row["sql"])
             )
+            foreign_key_violation = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchone()
         except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
         required_outbox_columns = {
@@ -645,13 +678,14 @@ class SQLiteStore:
         )
         if (
             not required_tables.issubset(tables)
-            or version != cls._SCHEMA_VERSION
+            or version != str(cls._SCHEMA_VERSION)
             or journal_mode != "wal"
             or not required_outbox_columns.issubset(outbox_columns)
             or not required_outbox_not_null_columns.issubset(
                 outbox_not_null_columns
             )
             or not has_outbox_identity
+            or foreign_key_violation is not None
         ):
             raise StoreError("orchestrator store is not prepared")
 
@@ -6451,6 +6485,7 @@ class SQLiteStore:
                     );
                 """,
             )
+            self._validate_schema_metadata_layout(cursor)
             self._migrate_atlas_outbox_ingestion_key_not_null(cursor)
             self._preflight_external_bootstrap_rows(cursor)
             self._canonicalize_external_bootstrap_expiries(cursor)

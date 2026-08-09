@@ -1290,3 +1290,112 @@ def test_sqlite_store_preserves_malformed_v11_nullable_outbox(
         )
     finally:
         connection.close()
+
+
+def _bootstrapped_runtime_config(tmp_path: Path) -> RuntimeConfig:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    return config
+
+
+def _runtime_with_orphaned_atlas_outbox(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    ingestion_key = f"sha256:{'a' * 64}"
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        assert not connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ingestion_key,
+                f"sha256:{'b' * 64}",
+                "{}",
+                ingestion_key,
+                "pending",
+                0,
+                "",
+                "[]",
+                "2026-08-09T00:00:00Z",
+                "2026-08-09T00:00:00Z",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_orphaned_atlas_outbox_foreign_key(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_orphaned_atlas_outbox(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+        return
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore.from_prepared_connection(connection)
+            store.close()
+    finally:
+        connection.close()
+
+
+def _runtime_with_noncanonical_schema_metadata(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute("CREATE TABLE schema_metadata (key TEXT, value TEXT)")
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            (("schema_version", "11"), ("schema_version", "10")),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_noncanonical_schema_metadata(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_noncanonical_schema_metadata(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+        return
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore.from_prepared_connection(connection)
+            store.close()
+    finally:
+        connection.close()
