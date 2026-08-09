@@ -30,6 +30,7 @@ from devkit_continuity.models import (  # noqa: E402
     FrozenView,
 )
 from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from project_index.models import IndexNode  # noqa: E402
 
 HASH_A = "sha256:" + "a" * 64
 HASH_B = "sha256:" + "b" * 64
@@ -52,6 +53,25 @@ def _entries() -> tuple[FrozenEntry, ...]:
     return (
         FrozenEntry("after_file", "src/a.py", HASH_A, 4),
         FrozenEntry("before_file", "src/a.py", HASH_B, 3),
+    )
+
+
+def _index_node(*, start_byte: int = 12) -> IndexNode:
+    return IndexNode(
+        node_id="node-1",
+        kind="function",
+        path="src/a.py",
+        name="run",
+        qualified_name="pkg.run",
+        start_line=2,
+        end_line=6,
+        content_hash=HASH_A,
+        attributes=(("decorator", "route"), ("visibility", "public")),
+        extractor_id="python-ast",
+        extractor_version="1.2",
+        provenance="resolved",
+        start_byte=start_byte,
+        end_byte=96,
     )
 
 
@@ -133,6 +153,11 @@ def test_models_reject_invalid_values(factory: object) -> None:
         factory()  # type: ignore[operator]
 
 
+def test_changed_node_rejects_control_characters_in_identifiers() -> None:
+    with pytest.raises(ContinuityError):
+        ChangedNode("node\n1", "function", "src/a.py", HASH_A)
+
+
 def test_view_rejects_unordered_or_duplicate_role_path_entries() -> None:
     duplicate = (
         FrozenEntry("before_file", "a", HASH_A, 1),
@@ -143,6 +168,35 @@ def test_view_rejects_unordered_or_duplicate_role_path_entries() -> None:
         FrozenView(HASH_A, HASH_B, HASH_C, _key(), duplicate)
     with pytest.raises(ContinuityError):
         FrozenView(HASH_A, HASH_B, HASH_C, _key(), unordered)
+
+
+@pytest.mark.parametrize("forged_field", ("view_id", "manifest_hash", "cas_root_hash"))
+def test_direct_frozen_view_rejects_forged_canonical_identities(
+    forged_field: str,
+) -> None:
+    view = FrozenView.create(key=_key(), entries=_entries())
+    values = {
+        "view_id": view.view_id,
+        "manifest_hash": view.manifest_hash,
+        "cas_root_hash": view.cas_root_hash,
+    }
+    values[forged_field] = HASH_A
+
+    with pytest.raises(ContinuityError):
+        FrozenView(
+            values["view_id"],
+            values["manifest_hash"],
+            values["cas_root_hash"],
+            view.key,
+            view.entries,
+        )
+
+
+def test_direct_continuity_receipt_rejects_forged_receipt_hash() -> None:
+    view = FrozenView.create(key=_key(), entries=_entries())
+
+    with pytest.raises(ContinuityError):
+        ContinuityReceipt(_key(), view.view_id, HASH_A, "verified")
 
 
 def test_runtime_config_exposes_continuity_locations_without_io(tmp_path: Path) -> None:
@@ -232,6 +286,43 @@ def test_view_manifest_retains_typed_replay_metadata_and_order() -> None:
         "pytest",
         "tests/test_a.py",
     ]
+
+
+def test_changed_node_converts_full_index_node_metadata_losslessly() -> None:
+    source = _index_node()
+
+    changed = ChangedNode.from_index_node(source)
+
+    assert changed.to_dict() == {
+        "node_id": "node-1",
+        "kind": "function",
+        "path": "src/a.py",
+        "name": "run",
+        "qualified_name": "pkg.run",
+        "start_line": 2,
+        "end_line": 6,
+        "content_hash": HASH_A,
+        "attributes": [["decorator", "route"], ["visibility", "public"]],
+        "extractor_id": "python-ast",
+        "extractor_version": "1.2",
+        "provenance": "resolved",
+        "start_byte": 12,
+        "end_byte": 96,
+    }
+
+
+def test_retained_changed_node_metadata_binds_manifest_and_view_identity() -> None:
+    first = FrozenView.create(
+        key=_key(), entries=_entries(), changed_nodes=(ChangedNode.from_index_node(_index_node()),)
+    )
+    second = FrozenView.create(
+        key=_key(),
+        entries=_entries(),
+        changed_nodes=(ChangedNode.from_index_node(_index_node(start_byte=13)),),
+    )
+
+    assert first.manifest_hash != second.manifest_hash
+    assert first.view_id != second.view_id
 
 
 @pytest.mark.parametrize(

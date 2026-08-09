@@ -18,6 +18,7 @@ from .canonical import (
 )
 
 _ENTRY_ROLES = frozenset({"before_file", "after_file"})
+_PROVENANCE_VALUES = frozenset({"observed", "resolved", "declared"})
 _COMMAND_ABSOLUTE_PATH_VALUE = re.compile(r"(?:^|=)(?:/|[A-Za-z]:[\\/])")
 
 
@@ -99,19 +100,78 @@ class ChangedNode:
     kind: str
     path: str
     content_hash: str
+    name: str = ""
+    qualified_name: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    attributes: tuple[tuple[str, str], ...] = ()
+    extractor_id: str = ""
+    extractor_version: str = ""
+    provenance: str = "observed"
+    start_byte: int = 0
+    end_byte: int = 0
 
     def __post_init__(self) -> None:
         _require_identifier(self.node_id)
         _require_identifier(self.kind)
         _require_relative_path(self.path)
         _require_hash(self.content_hash)
+        _require_text(self.name)
+        _require_text(self.qualified_name)
+        _require_nonnegative_integer(self.start_line, "NODE_LINE_SPAN_INVALID")
+        _require_nonnegative_integer(self.end_line, "NODE_LINE_SPAN_INVALID")
+        if self.end_line < self.start_line:
+            raise ContinuityError("NODE_LINE_SPAN_INVALID")
+        attributes = _attribute_tuple(self.attributes)
+        _require_text(self.extractor_id)
+        _require_text(self.extractor_version)
+        if self.provenance not in _PROVENANCE_VALUES:
+            raise ContinuityError("NODE_PROVENANCE_INVALID")
+        _require_nonnegative_integer(self.start_byte, "NODE_BYTE_SPAN_INVALID")
+        _require_nonnegative_integer(self.end_byte, "NODE_BYTE_SPAN_INVALID")
+        if self.end_byte < self.start_byte:
+            raise ContinuityError("NODE_BYTE_SPAN_INVALID")
+        object.__setattr__(self, "attributes", attributes)
 
-    def to_dict(self) -> dict[str, str]:
+    @classmethod
+    def from_index_node(cls, node: Any) -> ChangedNode:
+        """Copy lossless, non-body data from one project-index node."""
+        try:
+            return cls(
+                node_id=node.node_id,
+                kind=node.kind,
+                path=node.path,
+                content_hash=node.content_hash,
+                name=node.name,
+                qualified_name=node.qualified_name,
+                start_line=node.start_line,
+                end_line=node.end_line,
+                attributes=node.attributes,
+                extractor_id=node.extractor_id,
+                extractor_version=node.extractor_version,
+                provenance=node.provenance,
+                start_byte=node.start_byte,
+                end_byte=node.end_byte,
+            )
+        except AttributeError as error:
+            raise ContinuityError("INDEX_NODE_INVALID") from error
+
+    def to_dict(self) -> dict[str, Any]:
         return {
             "node_id": self.node_id,
             "kind": self.kind,
             "path": self.path,
+            "name": self.name,
+            "qualified_name": self.qualified_name,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
             "content_hash": self.content_hash,
+            "attributes": [list(item) for item in self.attributes],
+            "extractor_id": self.extractor_id,
+            "extractor_version": self.extractor_version,
+            "provenance": self.provenance,
+            "start_byte": self.start_byte,
+            "end_byte": self.end_byte,
         }
 
 
@@ -241,6 +301,30 @@ class FrozenView:
         receipts = _typed_tuple(
             self.execution_receipts, BoundExecutionReceipt, "EXECUTION_RECEIPT_INVALID"
         )
+        manifest = canonical_frozen_view_manifest(
+            self.key,
+            entries,
+            input_snapshot_ids=input_snapshot_ids,
+            output_snapshot_ids=output_snapshot_ids,
+            checkpoint_ids=checkpoint_ids,
+            query_ids=query_ids,
+            verification_artifact_hashes=verification_artifact_hashes,
+            execution_receipt_ids=execution_receipt_ids,
+            request_hash=self.request_hash,
+            evidence_hash=self.evidence_hash,
+            changed_nodes=changed_nodes,
+            coverage_gaps=coverage_gaps,
+            execution_receipts=receipts,
+        )
+        expected_manifest_hash = manifest_identity(manifest)
+        expected_cas_root_hash = cas_root_identity(entries)
+        expected_view_id = view_identity(expected_manifest_hash, expected_cas_root_hash)
+        if self.manifest_hash != expected_manifest_hash:
+            raise ContinuityError("MANIFEST_HASH_MISMATCH")
+        if self.cas_root_hash != expected_cas_root_hash:
+            raise ContinuityError("CAS_ROOT_HASH_MISMATCH")
+        if self.view_id != expected_view_id:
+            raise ContinuityError("VIEW_ID_MISMATCH")
         object.__setattr__(self, "entries", entries)
         object.__setattr__(self, "input_snapshot_ids", input_snapshot_ids)
         object.__setattr__(self, "output_snapshot_ids", output_snapshot_ids)
@@ -397,6 +481,8 @@ class ContinuityReceipt:
         _require_hash(self.view_id)
         _require_hash(self.receipt_hash)
         _require_identifier(self.kind)
+        if self.receipt_hash != receipt_identity(self.key, self.view_id, self.kind):
+            raise ContinuityError("RECEIPT_HASH_MISMATCH")
 
     @classmethod
     def create(
@@ -417,8 +503,15 @@ def _require_hash(value: object) -> None:
 def _require_identifier(value: object) -> None:
     if not isinstance(value, str) or not value:
         raise ContinuityError("IDENTIFIER_INVALID")
-    if any(ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF for character in value):
+    if any(0xD800 <= ord(character) <= 0xDFFF or ord(character) < 0x20 for character in value):
         raise ContinuityError("IDENTIFIER_INVALID")
+
+
+def _require_text(value: object) -> None:
+    if not isinstance(value, str):
+        raise ContinuityError("TEXT_INVALID")
+    if any(ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ContinuityError("TEXT_INVALID")
 
 
 def _require_relative_path(value: object) -> None:
@@ -452,6 +545,19 @@ def _typed_tuple(value: object, expected_type: type[Any], code: str) -> tuple[An
         raise ContinuityError(code) from error
     if not all(isinstance(item, expected_type) for item in result):
         raise ContinuityError(code)
+    return result
+
+
+def _attribute_tuple(value: object) -> tuple[tuple[str, str], ...]:
+    try:
+        result = tuple(value)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ContinuityError("NODE_ATTRIBUTES_INVALID") from error
+    for item in result:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ContinuityError("NODE_ATTRIBUTES_INVALID")
+        _require_text(item[0])
+        _require_text(item[1])
     return result
 
 
