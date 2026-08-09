@@ -22,6 +22,7 @@ from .models import (
     IndexNode,
     IndexSnapshot,
     IndexState,
+    PackageDescriptor,
     QueryReceipt,
 )
 from .workspace import (
@@ -47,7 +48,7 @@ class WorkspaceRegistration:
 class ProjectIndexStore:
     """Store immutable snapshots and path-neutral parser artifacts."""
 
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
 
     def __init__(self, database_path: str | Path) -> None:
         """Open an existing prepared store without changing durable state."""
@@ -119,6 +120,7 @@ class ProjectIndexStore:
             "project_index_blobs",
             "project_index_snapshots",
             "project_index_snapshot_files",
+            "project_index_snapshot_packages",
             "project_index_parse_cache",
             "project_index_nodes",
             "project_index_edges",
@@ -236,7 +238,7 @@ class ProjectIndexStore:
         ).fetchone()
         if row is None:
             return None
-        return self._bound_snapshot_from_row(row, workspace_id)
+        return self._with_packages(self._bound_snapshot_from_row(row, workspace_id))
 
     def snapshot_has_historical_binding(self, snapshot_id: str) -> bool:
         row = self._connection.execute(
@@ -323,10 +325,12 @@ class ProjectIndexStore:
         nodes: Sequence[IndexNode],
         edges: Sequence[IndexEdge],
         gaps: Sequence[CoverageGap],
+        packages: Sequence[PackageDescriptor] | None = None,
         parsed_cache_entries: Sequence[tuple[SourceFile, ParsedExtraction]] = (),
     ) -> IndexSnapshot:
         """Insert a complete graph once and append a workspace sync pointer."""
         workspace_id = snapshot.workspace_id or snapshot.workspace
+        package_descriptors = snapshot.packages if packages is None else tuple(packages)
         if not is_workspace_id(workspace_id):
             raise StoreError("snapshot has no registered workspace binding")
         with self._transaction() as cursor:
@@ -395,6 +399,26 @@ class ProjectIndexStore:
                             len(source.data),
                         )
                         for source in files
+                    ),
+                )
+                cursor.executemany(
+                    """
+                    INSERT INTO project_index_snapshot_packages
+                        (snapshot_id, package_id, ecosystem, name, root_path,
+                         manifest_path, manifest_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            snapshot.snapshot_id,
+                            package.package_id,
+                            package.ecosystem,
+                            package.name,
+                            package.root_path,
+                            package.manifest_path,
+                            package.manifest_hash,
+                        )
+                        for package in package_descriptors
                     ),
                 )
                 cursor.executemany(
@@ -476,6 +500,7 @@ class ProjectIndexStore:
                     or stored.manifest_hash != snapshot.manifest_hash
                     or stored.parser_set_hash != snapshot.parser_set_hash
                     or stored.head != snapshot.head
+                    or package_descriptors != self.packages(snapshot.snapshot_id)
                 ):
                     raise StoreError("snapshot identifier collision")
             cursor.execute(
@@ -501,10 +526,10 @@ class ProjectIndexStore:
                 """
                 INSERT OR IGNORE INTO project_index_query_receipts
                     (trace_id, snapshot_id, query_text, mode, node_kinds, relations,
-                     max_nodes, max_depth, source_lines, byte_budget, allow_miss_escape,
-                     miss_escape_used, returned_node_ids, returned_edge_ids,
-                     returned_source_windows, gaps, truncated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      max_nodes, max_depth, source_lines, byte_budget, allow_miss_escape,
+                      miss_escape_used, returned_node_ids, returned_edge_ids,
+                      returned_source_windows, gaps, truncated, package_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     receipt.trace_id,
@@ -526,6 +551,7 @@ class ProjectIndexStore:
                         tuple((gap.path, gap.code, gap.message) for gap in receipt.gaps)
                     ),
                     int(receipt.truncated),
+                    _json(receipt.package_ids),
                 ),
             )
         stored = self.get_query_receipt(receipt.trace_id)
@@ -549,7 +575,7 @@ class ProjectIndexStore:
             "SELECT * FROM project_index_snapshots WHERE snapshot_id = ?",
             (snapshot_id,),
         ).fetchone()
-        return None if row is None else self._snapshot_from_row(row)
+        return None if row is None else self._with_packages(self._snapshot_from_row(row))
 
     def latest_snapshot(self, workspace_id: str) -> IndexSnapshot | None:
         row = self._connection.execute(
@@ -566,7 +592,11 @@ class ProjectIndexStore:
             """,
             (workspace_id,),
         ).fetchone()
-        return None if row is None else self._bound_snapshot_from_row(row, workspace_id)
+        return (
+            None
+            if row is None
+            else self._with_packages(self._bound_snapshot_from_row(row, workspace_id))
+        )
 
     def include_paths(self, snapshot_id: str) -> tuple[str, ...]:
         row = self._connection.execute(
@@ -588,6 +618,28 @@ class ProjectIndexStore:
             (snapshot_id,),
         ).fetchall()
         return {str(row["path"]): str(row["content_hash"]) for row in rows}
+
+    def packages(self, snapshot_id: str) -> tuple[PackageDescriptor, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT package_id, ecosystem, name, root_path, manifest_path, manifest_hash
+            FROM project_index_snapshot_packages
+            WHERE snapshot_id = ?
+            ORDER BY manifest_path, ecosystem, name, package_id
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        return tuple(
+            PackageDescriptor(
+                package_id=str(row["package_id"]),
+                ecosystem=str(row["ecosystem"]),
+                name=str(row["name"]),
+                root_path=str(row["root_path"]),
+                manifest_path=str(row["manifest_path"]),
+                manifest_hash=str(row["manifest_hash"]),
+            )
+            for row in rows
+        )
 
     def nodes(self, snapshot_id: str) -> tuple[IndexNode, ...]:
         rows = self._connection.execute(
@@ -661,6 +713,19 @@ class ProjectIndexStore:
                 );
                 CREATE INDEX IF NOT EXISTS project_index_files_hash
                     ON project_index_snapshot_files(content_hash);
+                CREATE TABLE IF NOT EXISTS project_index_snapshot_packages (
+                    snapshot_id TEXT NOT NULL REFERENCES project_index_snapshots(snapshot_id),
+                    package_id TEXT NOT NULL,
+                    ecosystem TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    root_path TEXT NOT NULL,
+                    manifest_path TEXT NOT NULL,
+                    manifest_hash TEXT NOT NULL REFERENCES project_index_blobs(content_hash),
+                    PRIMARY KEY (snapshot_id, package_id),
+                    UNIQUE (snapshot_id, manifest_path)
+                );
+                CREATE INDEX IF NOT EXISTS project_index_packages_manifest
+                    ON project_index_snapshot_packages(snapshot_id, manifest_path);
                 CREATE TABLE IF NOT EXISTS project_index_parse_cache (
                     content_hash TEXT NOT NULL REFERENCES project_index_blobs(content_hash),
                     extractor_id TEXT NOT NULL,
@@ -758,7 +823,8 @@ class ProjectIndexStore:
                     returned_edge_ids TEXT NOT NULL,
                     returned_source_windows TEXT NOT NULL,
                     gaps TEXT NOT NULL,
-                    truncated INTEGER NOT NULL
+                    truncated INTEGER NOT NULL,
+                    package_ids TEXT NOT NULL DEFAULT '[]'
                 );
                 """
             )
@@ -778,7 +844,8 @@ class ProjectIndexStore:
             self._migrate_v1_columns()
             self._migrate_workspace_binding_columns()
             self._migrate_workspace_registry(
-                quarantine_legacy=previous_schema_version < self._SCHEMA_VERSION
+                # Schema 5 only adds package descriptors; v4 bindings remain valid.
+                quarantine_legacy=previous_schema_version < 4
             )
             self._connection.execute(
                 """
@@ -814,6 +881,9 @@ class ProjectIndexStore:
                 ("extractor_id", "TEXT NOT NULL DEFAULT ''"),
                 ("extractor_version", "TEXT NOT NULL DEFAULT ''"),
                 ("provenance", "TEXT NOT NULL DEFAULT 'observed'"),
+            ),
+            "project_index_query_receipts": (
+                ("package_ids", "TEXT NOT NULL DEFAULT '[]'"),
             ),
         }
         for table, columns in additions.items():
@@ -963,6 +1033,9 @@ class ProjectIndexStore:
         else:
             self._connection.commit()
 
+    def _with_packages(self, snapshot: IndexSnapshot) -> IndexSnapshot:
+        return replace(snapshot, packages=self.packages(snapshot.snapshot_id))
+
     @staticmethod
     def _snapshot_from_row(row: sqlite3.Row) -> IndexSnapshot:
         return IndexSnapshot(
@@ -1062,6 +1135,7 @@ class ProjectIndexStore:
                 for path, code, message in json.loads(row["gaps"])
             ),
             truncated=bool(row["truncated"]),
+            package_ids=tuple(str(value) for value in json.loads(row["package_ids"])),
         )
 
 

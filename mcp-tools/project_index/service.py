@@ -29,6 +29,7 @@ from .models import (
     IndexSnapshot,
     IndexState,
     IndexStatus,
+    PackageDescriptor,
     QueryReceipt,
     QueryResult,
     SnapshotDiff,
@@ -36,11 +37,12 @@ from .models import (
     SnapshotFile,
     SourceWindow,
 )
+from .packages import discover_packages
 from .registry import WorkspaceRegistry
 from .store import ProjectIndexStore, StoreError
 from .workspace import is_workspace_id, workspace_identity
 
-_SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v4"
+_SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v5"
 _READ_CHUNK_SIZE = 64 * 1024
 _REPARSE_POINT = 0x400
 _IGNORED_DIRECTORIES = frozenset(
@@ -265,7 +267,14 @@ class ProjectIndexService:
                 "INDEX_CORRUPT", "project index parser cache is corrupt"
             ) from exc
 
-        manifest_hash = _manifest_hash(normalized_includes, files)
+        packages, package_gaps = discover_packages(workspace_id, files)
+        gaps = tuple(
+            sorted(
+                (*extraction.gaps, *package_gaps),
+                key=lambda gap: (gap.path, gap.code, gap.message),
+            )
+        )
+        manifest_hash = _manifest_hash(normalized_includes, files, packages)
         parser_set_hash = _parser_set_hash(parsed_files)
         head = _git_head(root)
         snapshot_id = _snapshot_identifier(
@@ -278,18 +287,19 @@ class ProjectIndexService:
             snapshot_id=snapshot_id,
             workspace=workspace_id,
             state=IndexState.INDEX_PARTIAL
-            if extraction.gaps
+            if gaps
             else IndexState.INDEX_READY,
             file_count=len(files),
             blob_count=len({source.content_hash for source in files}),
             reused_blob_count=len(reused_hashes),
             node_count=len(extraction.nodes),
             edge_count=len(extraction.edges),
-            gap_count=len(extraction.gaps),
+            gap_count=len(gaps),
             manifest_hash=manifest_hash,
             parser_set_hash=parser_set_hash,
             head=head,
             workspace_id=workspace_id,
+            packages=packages,
         )
         try:
             return self._store.put_snapshot(
@@ -298,7 +308,8 @@ class ProjectIndexService:
                 files=files,
                 nodes=extraction.nodes,
                 edges=extraction.edges,
-                gaps=extraction.gaps,
+                gaps=gaps,
+                packages=packages,
                 parsed_cache_entries=parsed_cache_entries,
             )
         except (sqlite3.DatabaseError, StoreError) as exc:
@@ -311,6 +322,7 @@ class ProjectIndexService:
         workspace_id: str,
         snapshot_id: str | None = None,
         required_paths: Sequence[str | Path] | None = None,
+        package_ids: Sequence[str] = (),
     ) -> IndexStatus:
         workspace_id, root = self._workspace_for_reference(workspace_id)
         snapshot = (
@@ -319,6 +331,7 @@ class ProjectIndexService:
             else self._store.latest_snapshot(workspace_id)
         )
         required = self._normalize_paths(required_paths)
+        selected_ids = _normalize_package_ids(package_ids)
         if snapshot is None or snapshot.workspace_id != workspace_id:
             return IndexStatus(
                 workspace_id,
@@ -337,27 +350,64 @@ class ProjectIndexService:
 
         expected = self._store.file_hashes(snapshot.snapshot_id)
         includes = self._store.include_paths(snapshot.snapshot_id)
-        current_files = self._collect_files(root, includes)
-        current = {source.path: source.content_hash for source in current_files}
-        if required:
-            missing_values: list[str] = []
+        selected_packages = _select_packages(snapshot.packages, selected_ids)
+        scope_entries = [(scope, scope) for scope in required]
+        scope_entries.extend(
+            (package.root_path, package.root_path or package.manifest_path)
+            for package in selected_packages
+        )
+        uncovered = tuple(
+            (scope, missing_label)
+            for scope, missing_label in scope_entries
+            if not _scope_is_fully_included(scope, includes)
+        )
+        covered = tuple(
+            (scope, missing_label)
+            for scope, missing_label in scope_entries
+            if _scope_is_fully_included(scope, includes)
+        )
+        if scope_entries and not covered:
+            current: Mapping[str, str] = {}
+        else:
+            verification_includes = (
+                _scopes_to_includes(tuple(scope for scope, _ in covered))
+                if selected_packages
+                else includes
+            )
+            current = {
+                source.path: source.content_hash
+                for source in self._collect_files(root, verification_includes)
+            }
+        snapshot_gaps = self._store.gaps(snapshot.snapshot_id)
+        package_roots = tuple(package.root_path for package in selected_packages)
+        status_gaps = (
+            tuple(
+                gap
+                for gap in snapshot_gaps
+                if _path_in_any_scope(gap.path, package_roots)
+            )
+            if selected_packages
+            else snapshot_gaps
+        )
+        if scope_entries:
+            missing_values = [missing_label for _, missing_label in uncovered]
             changed_values: set[str] = set()
-            for scope in required:
+            for scope, missing_label in covered:
                 expected_scope = {
-                    path for path in expected if _path_in_scope(path, scope)
+                    path for path in expected if _path_in_scope_or_root(path, scope)
                 }
                 current_scope = {
-                    path for path in current if _path_in_scope(path, scope)
+                    path for path in current if _path_in_scope_or_root(path, scope)
                 }
                 if not expected_scope:
-                    missing_values.append(scope)
+                    missing_values.append(missing_label)
                     continue
                 changed_values.update(
                     path
                     for path in expected_scope.union(current_scope)
                     if expected.get(path) != current.get(path)
                 )
-            missing = tuple(sorted(missing_values))
+            missing = tuple(sorted(set(missing_values)))
             changed = tuple(sorted(changed_values))
         else:
             missing = ()
@@ -373,6 +423,8 @@ class ProjectIndexService:
             state = IndexState.INDEX_STALE
         elif missing:
             state = IndexState.INDEX_PARTIAL
+        elif selected_packages:
+            state = IndexState.INDEX_PARTIAL if status_gaps else IndexState.INDEX_READY
         else:
             state = snapshot.state
         return IndexStatus(
@@ -382,7 +434,7 @@ class ProjectIndexService:
             required_paths=required,
             missing_paths=missing,
             changed_paths=changed,
-            gaps=self._store.gaps(snapshot.snapshot_id),
+            gaps=status_gaps,
             binding_state=snapshot.binding_state,
         )
 
@@ -399,6 +451,7 @@ class ProjectIndexService:
         source_lines: int = 12,
         byte_budget: int = 32768,
         allow_miss_escape: bool = False,
+        package_ids: Sequence[str] = (),
     ) -> QueryResult:
         workspace_id, root = self._workspace_for_reference(workspace_id)
         snapshot = self._require_snapshot(workspace_id, snapshot_id)
@@ -418,6 +471,8 @@ class ProjectIndexService:
                 "INVALID_QUERY", "byte_budget must be between 1 and 4194304"
             )
 
+        selected_package_ids = _normalize_package_ids(package_ids)
+        selected_packages = _select_packages(snapshot.packages, selected_package_ids)
         kinds = tuple(sorted({str(value) for value in node_kinds if str(value)}))
         relation_filter = tuple(
             sorted({str(value) for value in relations if str(value)})
@@ -425,8 +480,45 @@ class ProjectIndexService:
         nodes = self._store.nodes(snapshot_id)
         edges = self._store.edges(snapshot_id)
         expected_hashes = self._store.file_hashes(snapshot_id)
-        source_text = self._verified_source_text(root, expected_hashes)
+        package_roots = tuple(package.root_path for package in selected_packages)
+        if selected_packages:
+            if any(
+                not _scope_is_fully_included(package.root_path, self._store.include_paths(snapshot_id))
+                for package in selected_packages
+            ):
+                raise IndexError(
+                    "INDEX_PARTIAL",
+                    "project index snapshot does not fully cover selected packages",
+                )
+            expected_hashes = {
+                path: content_hash
+                for path, content_hash in expected_hashes.items()
+                if _path_in_any_scope(path, package_roots)
+            }
+            current_files = self._collect_files(
+                root,
+                _scopes_to_includes(package_roots),
+                error_code="INDEX_STALE",
+            )
+            current_hashes = {
+                source.path: source.content_hash for source in current_files
+            }
+            if current_hashes != expected_hashes:
+                raise IndexError(
+                    "INDEX_STALE", "project index snapshot does not match the workspace"
+                )
+            source_text = {
+                source.path: source.text or "" for source in current_files
+            }
+        else:
+            source_text = self._verified_source_text(root, expected_hashes)
         eligible = tuple(node for node in nodes if not kinds or node.kind in kinds)
+        if selected_packages:
+            eligible = tuple(
+                node
+                for node in eligible
+                if _path_in_any_scope(node.path, package_roots)
+            )
         ranked = _lexical_matches(eligible, query, source_text)
         miss_escape_used = False
         if not ranked and allow_miss_escape and query.strip():
@@ -445,12 +537,12 @@ class ProjectIndexService:
         selected = selected[:max_nodes]
         selected, used_bytes, node_truncated = _bounded_items(selected, byte_budget, 0)
         truncated = truncated or node_truncated
-        selected_ids = {node.node_id for node in selected}
+        selected_node_ids = {node.node_id for node in selected}
         candidate_edges = tuple(
             edge
             for edge in edges
-            if edge.source_id in selected_ids
-            and edge.target_id in selected_ids
+            if edge.source_id in selected_node_ids
+            and edge.target_id in selected_node_ids
             and (not relation_filter or edge.relation in relation_filter)
         )
         selected_edges, used_bytes, edge_truncated = _bounded_items(
@@ -464,9 +556,14 @@ class ProjectIndexService:
             byte_budget,
             used_bytes,
         )
-        gaps, _, gap_truncated = _bounded_items(
-            self._store.gaps(snapshot_id), byte_budget, used_bytes
-        )
+        query_gaps = self._store.gaps(snapshot_id)
+        if selected_packages:
+            query_gaps = tuple(
+                gap
+                for gap in query_gaps
+                if _path_in_any_scope(gap.path, package_roots)
+            )
+        gaps, _, gap_truncated = _bounded_items(query_gaps, byte_budget, used_bytes)
         truncated = (
             truncated
             or node_truncated
@@ -474,6 +571,9 @@ class ProjectIndexService:
             or window_truncated
             or gap_truncated
         )
+        result_state = (
+            IndexState.INDEX_PARTIAL if query_gaps else IndexState.INDEX_READY
+        ) if selected_packages else snapshot.state
         trace_id = _trace_identifier(
             snapshot_id,
             query,
@@ -485,11 +585,12 @@ class ProjectIndexService:
             source_lines,
             byte_budget,
             allow_miss_escape,
+            selected_package_ids,
         )
         result = QueryResult(
             trace_id=trace_id,
             snapshot_id=snapshot_id,
-            state=snapshot.state,
+            state=result_state,
             nodes=tuple(selected),
             edges=selected_edges,
             source_windows=windows,
@@ -517,6 +618,7 @@ class ProjectIndexService:
             ),
             gaps=result.gaps,
             truncated=result.truncated,
+            package_ids=selected_package_ids,
         )
         try:
             self._store.put_query_receipt(receipt)
@@ -641,6 +743,7 @@ class ProjectIndexService:
                     key=lambda gap: (gap.path, gap.code, gap.message),
                 )
             ),
+            packages=snapshot.packages,
         )
 
     def read_snapshot_files(
@@ -882,13 +985,28 @@ class ProjectIndexService:
         return verified
 
 
-def _manifest_hash(include_paths: Sequence[str], files: Sequence[SourceFile]) -> str:
+def _manifest_hash(
+    include_paths: Sequence[str],
+    files: Sequence[SourceFile],
+    packages: Sequence[PackageDescriptor],
+) -> str:
     return _hash_json(
         {
             "files": tuple(
                 (source.path, source.content_hash, len(source.data)) for source in files
             ),
             "include_paths": tuple(include_paths),
+            "packages": tuple(
+                (
+                    package.package_id,
+                    package.ecosystem,
+                    package.name,
+                    package.root_path,
+                    package.manifest_path,
+                    package.manifest_hash,
+                )
+                for package in packages
+            ),
         }
     )
 
@@ -946,6 +1064,7 @@ def _trace_identifier(
     source_lines: int,
     byte_budget: int,
     allow_miss_escape: bool,
+    package_ids: Sequence[str],
 ) -> str:
     return _hash_json(
         {
@@ -959,6 +1078,7 @@ def _trace_identifier(
             "source_lines": source_lines,
             "byte_budget": byte_budget,
             "allow_miss_escape": allow_miss_escape,
+            "package_ids": tuple(package_ids),
         }
     )
 
@@ -1213,6 +1333,63 @@ def _path_matches(path: str, include_paths: Sequence[str]) -> bool:
 
 def _path_in_scope(path: str, scope: str) -> bool:
     return path == scope or path.startswith(f"{scope}/")
+
+
+def _scope_is_fully_included(scope: str, include_paths: Sequence[str]) -> bool:
+    """Whether a captured include root contains every possible path in scope."""
+
+    if not include_paths:
+        return True
+    if not scope:
+        return False
+    return any(
+        scope == include or scope.startswith(f"{include}/")
+        for include in include_paths
+    )
+
+
+def _path_in_scope_or_root(path: str, scope: str) -> bool:
+    return not scope or _path_in_scope(path, scope)
+
+
+def _path_in_any_scope(path: str, scopes: Sequence[str]) -> bool:
+    return any(_path_in_scope_or_root(path, scope) for scope in scopes)
+
+
+def _scopes_to_includes(scopes: Sequence[str]) -> tuple[str, ...]:
+    """Canonicalize a union of package roots for bounded workspace scanning."""
+
+    return () if any(not scope for scope in scopes) else tuple(sorted(set(scopes)))
+
+
+def _normalize_package_ids(package_ids: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(package_ids, (str, bytes)):
+        raise IndexError("INVALID_QUERY", "package ids must be an ordered sequence")
+    try:
+        supplied = tuple(package_ids)
+    except TypeError as exc:
+        raise IndexError(
+            "INVALID_QUERY", "package ids must be an ordered sequence"
+        ) from exc
+    if any(
+        not isinstance(package_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", package_id) is None
+        for package_id in supplied
+    ):
+        raise IndexError("INVALID_QUERY", "package ids must be descriptor identifiers")
+    if supplied != tuple(sorted(set(supplied))):
+        raise IndexError("INVALID_QUERY", "package ids must be unique and ordered")
+    return supplied
+
+
+def _select_packages(
+    packages: Sequence[PackageDescriptor], package_ids: Sequence[str]
+) -> tuple[PackageDescriptor, ...]:
+    descriptors = {package.package_id: package for package in packages}
+    missing = tuple(package_id for package_id in package_ids if package_id not in descriptors)
+    if missing:
+        raise IndexError("NOT_FOUND", "project index package was not found")
+    return tuple(descriptors[package_id] for package_id in package_ids)
 
 
 def _path_may_match(path: str, include_paths: Sequence[str]) -> bool:
