@@ -89,18 +89,35 @@ and are therefore unavailable across workspaces or snapshots.  Schema version
 increments from 4 to 5.  Existing snapshots remain readable but have zero
 descriptors; a fresh sync creates the first package-aware snapshot.
 
-`project_index_sync` publishes the bounded descriptor list with its snapshot
-result so a caller can obtain opaque package ids.  This is an intentional,
-tested additive result-schema change.  Default `project_index_status` output
-stays unchanged.
+`project_index_sync` publishes the first bounded, snapshot-bound package page
+with its snapshot result so a caller can obtain opaque package ids without an
+unbounded result.  The default page size is 128 descriptors and a page records
+`offset`, `limit`, `total_count`, `returned_count`, `packages`, and an optional
+`next_offset`.  `project_index_status` can retrieve a continuation page only
+when given that same explicit `snapshot_id` plus both page parameters.  Thus a
+later sync cannot make a continuation drift to a new catalog.  Default
+`project_index_status` output stays unchanged when no page is requested.
+
+Descriptor identity fields remain public, but display fields are bounded.  A
+safe name, relative root, or manifest path is emitted directly; an overlong or
+unsafe value is replaced by a SHA-256/UTF-8-byte digest in `field_digests` and
+the descriptor is marked `representation="digested"`.  An intentionally empty
+declared name remains `""`; no host path or raw manifest text crosses the
+boundary.
 
 ## Package-Scoped Public Behavior
 
 No new MCP tool is added.  The following optional arguments are appended to
 the existing signatures:
 
-- `project_index_status(..., package_ids: list[str] | None = None)`
+- `project_index_sync(..., package_page_limit: int = 128)`
+- `project_index_status(..., package_ids: list[str] | None = None,
+  package_page_offset: int | None = None, package_page_limit: int | None = None)`
 - `project_index_query(..., task_lease=None, package_ids: list[str] | None = None)`
+
+Page requests require an explicit nonempty snapshot id and both an offset and
+limit; the limit is in `1..128`.  Invalid page input is rejected before a UoW
+opens.  `package_ids` never act as a cursor.
 
 `None` preserves every existing workspace-wide behavior.  A supplied selector
 list must be nonempty, strictly sorted, unique, syntactically valid, and made
@@ -145,6 +162,8 @@ to include one child file while missing the rest of a requested directory.
 - The server keeps exactly seventeen public MCP tools.
 - `atlas_accept` keeps its exact four input fields and failure surface.
 - Legacy no-selector index status/query responses retain their exact data keys.
+- A first package page is prepared before a leased sync binds its output
+  snapshot, so a public-projection failure cannot advance private lease state.
 - Project Index schema migration is forward-only and fresh snapshots are
   deterministic across reopen.
 - Atlas remains fail-closed when bootstrap evidence, output snapshot, receipt,

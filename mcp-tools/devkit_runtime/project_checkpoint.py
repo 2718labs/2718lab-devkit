@@ -119,7 +119,7 @@ class ProjectCheckpointRuntime:
             source_lines,
             byte_budget,
             allow_miss_escape,
-            package_ids,
+            package_ids=package_ids,
         )
 
     def close(self) -> None:

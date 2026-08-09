@@ -7,6 +7,7 @@ reach the public result boundary.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -40,7 +41,10 @@ from project_index.models import (
     IndexSnapshot,
     IndexState,
     IndexStatus,
+    IndexStatusResult,
+    IndexSyncResult,
     PackageDescriptor,
+    PackagePage,
     QueryResult,
     SourceWindow,
 )
@@ -49,8 +53,10 @@ RESULT_SCHEMA: Final = "2718lab-devkit/tool-result-v1"
 MAX_RESULT_BYTES: Final = 524_288
 MAX_STRING_BYTES: Final = 65_536
 MAX_LIST_ITEMS: Final = 512
-MAX_PACKAGE_CATALOG_ITEMS: Final = 2_048
 MAX_PUBLIC_DEPTH: Final = 32
+MAX_PACKAGE_PAGE_ITEMS: Final = 128
+MAX_PACKAGE_DISPLAY_BYTES: Final = 256
+PACKAGE_PAGE_BYTE_BUDGET: Final = 320_000
 
 SUCCESS_KEYS: Final = frozenset({"schema", "ok", "data"})
 FAILURE_KEYS: Final = frozenset({"schema", "ok", "error"})
@@ -310,10 +316,7 @@ def _json_value(
         if depth >= MAX_PUBLIC_DEPTH:
             raise _fail("public value nesting exceeds bound")
         items = cast(list[object], value)
-        item_limit = (
-            MAX_PACKAGE_CATALOG_ITEMS if key == "packages" else MAX_LIST_ITEMS
-        )
-        if len(items) > item_limit:
+        if len(items) > MAX_LIST_ITEMS:
             raise _fail("public container exceeds item bound")
         container_id = id(value)
         active_ids = set() if active is None else active
@@ -416,8 +419,13 @@ def _string_list(value: object, *, maximum: int = MAX_LIST_ITEMS) -> list[str]:
     ]
 
 
-def _relative_path(value: object, *, allow_empty: bool = False) -> str:
-    path = _safe_string(value, allow_empty=allow_empty)
+def _relative_path(
+    value: object,
+    *,
+    allow_empty: bool = False,
+    maximum: int = MAX_STRING_BYTES,
+) -> str:
+    path = _safe_string(value, allow_empty=allow_empty, maximum=maximum)
     normalized = path.replace("\\", "/")
     if not normalized and allow_empty:
         return ""
@@ -485,14 +493,114 @@ def _package_descriptor(value: object) -> dict[str, object]:
     ecosystem = _identifier(value.ecosystem)
     if ecosystem not in {"python", "node", "cargo"}:
         raise _fail("unsupported project-index package ecosystem")
-    return {
+    result: dict[str, object] = {
         "package_id": _hash(value.package_id),
         "ecosystem": ecosystem,
-        "name": _safe_string(value.name),
-        "relative_root": _relative_path(value.root_path, allow_empty=True),
-        "manifest_path": _relative_path(value.manifest_path),
         "manifest_hash": _hash(value.manifest_hash),
     }
+    fields = (
+        ("name", value.name, False, True),
+        ("relative_root", value.root_path, True, True),
+        ("manifest_path", value.manifest_path, True, False),
+    )
+    digests: dict[str, dict[str, object]] = {}
+    for key, raw_value, path_like, allow_empty in fields:
+        public_value = _package_display_value(
+            raw_value,
+            path_like=path_like,
+            allow_empty=allow_empty,
+        )
+        if public_value is None:
+            digests[key] = _package_field_digest(raw_value)
+        else:
+            result[key] = public_value
+    if digests:
+        result["representation"] = "digested"
+        result["field_digests"] = digests
+    else:
+        result["representation"] = "full"
+    return result
+
+
+def _package_display_value(
+    value: object,
+    *,
+    path_like: bool,
+    allow_empty: bool,
+) -> str | None:
+    try:
+        if path_like:
+            return _relative_path(
+                value,
+                allow_empty=allow_empty,
+                maximum=MAX_PACKAGE_DISPLAY_BYTES,
+            )
+        return _safe_string(
+            value,
+            allow_empty=allow_empty,
+            maximum=MAX_PACKAGE_DISPLAY_BYTES,
+        )
+    except (ResultContractError, UnicodeError):
+        return None
+
+
+def _package_field_digest(value: object) -> dict[str, object]:
+    if type(value) is not str:
+        raise _fail("invalid package descriptor field")
+    encoded = value.encode("utf-8", errors="surrogatepass")
+    return {
+        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+        "utf8_bytes": len(encoded),
+    }
+
+
+def _package_page_data(
+    value: object,
+    *,
+    snapshot_id: str,
+) -> dict[str, object]:
+    if type(value) is not PackagePage:
+        raise _fail("invalid package page")
+    if _identifier(value.snapshot_id) != snapshot_id:
+        raise _fail("package page snapshot mismatch")
+    offset = _nonnegative_int(value.offset)
+    limit = _nonnegative_int(value.limit)
+    total_count = _nonnegative_int(value.total_count)
+    if not 1 <= limit <= MAX_PACKAGE_PAGE_ITEMS:
+        raise _fail("invalid package page limit")
+    if offset > total_count:
+        raise _fail("invalid package page offset")
+    packages = _bounded_list(value.packages, maximum=MAX_PACKAGE_PAGE_ITEMS)
+    expected_count = min(limit, total_count - offset)
+    if len(packages) != expected_count:
+        raise _fail("invalid package page count")
+    expected_next = offset + len(packages)
+    if expected_next < total_count:
+        if value.next_offset != expected_next:
+            raise _fail("invalid package page continuation")
+    elif value.next_offset is not None:
+        raise _fail("invalid terminal package page")
+
+    public_packages: list[dict[str, object]] = []
+    for package in packages:
+        candidate = _package_descriptor(package)
+        if _encoded_size({"packages": [*public_packages, candidate]}) > PACKAGE_PAGE_BYTE_BUDGET:
+            break
+        public_packages.append(candidate)
+    if packages and not public_packages:
+        raise _fail("package descriptor cannot fit public page")
+    returned_count = len(public_packages)
+    data: dict[str, object] = {
+        "offset": offset,
+        "limit": limit,
+        "total_count": total_count,
+        "returned_count": returned_count,
+        "packages": public_packages,
+    }
+    next_offset = offset + returned_count
+    if next_offset < total_count:
+        data["next_offset"] = next_offset
+    return data
 
 
 def _index_node(value: object) -> dict[str, object]:
@@ -569,7 +677,15 @@ def _snapshot_workspace(snapshot: IndexSnapshot) -> str:
     return _workspace_id(workspace)
 
 
-def _index_snapshot_data(snapshot: IndexSnapshot) -> dict[str, object]:
+def _index_snapshot_data(value: object) -> dict[str, object]:
+    if type(value) is IndexSyncResult:
+        snapshot = value.snapshot
+        package_page = value.package_page
+    elif type(value) is IndexSnapshot:
+        snapshot = value
+        package_page = _first_package_page(snapshot)
+    else:
+        raise _fail("invalid project-index sync result")
     if type(snapshot) is not IndexSnapshot:
         raise _fail("invalid project-index snapshot")
     data: dict[str, object] = {
@@ -585,14 +701,10 @@ def _index_snapshot_data(snapshot: IndexSnapshot) -> dict[str, object]:
         "manifest_hash": _hash(snapshot.manifest_hash, allow_empty=True),
         "parser_set_hash": _hash(snapshot.parser_set_hash, allow_empty=True),
         "binding_state": _identifier(snapshot.binding_state),
-        # Package selectors must remain available beyond one generic result page;
-        # the response byte budget remains the outer public-output bound.
-        "packages": [
-            _package_descriptor(item)
-            for item in _bounded_list(
-                snapshot.packages, maximum=MAX_PACKAGE_CATALOG_ITEMS
-            )
-        ],
+        "package_page": _package_page_data(
+            package_page,
+            snapshot_id=_identifier(snapshot.snapshot_id),
+        ),
     }
     head = _optional_string(snapshot.head)
     if head is not None:
@@ -600,7 +712,29 @@ def _index_snapshot_data(snapshot: IndexSnapshot) -> dict[str, object]:
     return data
 
 
-def _index_status_data(status: IndexStatus) -> dict[str, object]:
+def _first_package_page(snapshot: IndexSnapshot) -> PackagePage:
+    if not isinstance(snapshot.packages, (tuple, list)):
+        raise _fail("invalid snapshot package catalog")
+    packages = tuple(snapshot.packages)
+    total_count = len(packages)
+    end = min(total_count, MAX_PACKAGE_PAGE_ITEMS)
+    return PackagePage(
+        snapshot_id=snapshot.snapshot_id,
+        offset=0,
+        limit=MAX_PACKAGE_PAGE_ITEMS,
+        total_count=total_count,
+        packages=packages[:end],
+        next_offset=end if end < total_count else None,
+    )
+
+
+def _index_status_data(value: object) -> dict[str, object]:
+    package_page: PackagePage | None = None
+    if type(value) is IndexStatusResult:
+        status = value.status
+        package_page = value.package_page
+    else:
+        status = value
     if type(status) is not IndexStatus:
         raise _fail("invalid project-index status")
     data: dict[str, object] = {
@@ -620,6 +754,13 @@ def _index_status_data(status: IndexStatus) -> dict[str, object]:
     }
     if status.snapshot_id is not None:
         data["snapshot_id"] = _identifier(status.snapshot_id)
+    if package_page is not None:
+        if status.snapshot_id is None:
+            raise _fail("package page requires snapshot status")
+        data["package_page"] = _package_page_data(
+            package_page,
+            snapshot_id=_identifier(status.snapshot_id),
+        )
     return data
 
 
@@ -644,12 +785,12 @@ def project_index_register(workspace_id: object) -> dict[str, object]:
     return envelope_success({"workspace_id": _workspace_id(workspace_id)})
 
 
-def project_index_sync(snapshot: IndexSnapshot) -> dict[str, object]:
-    return envelope_success(_index_snapshot_data(snapshot))
+def project_index_sync(result: object) -> dict[str, object]:
+    return envelope_success(_index_snapshot_data(result))
 
 
-def project_index_status(status: IndexStatus) -> dict[str, object]:
-    return envelope_success(_index_status_data(status))
+def project_index_status(result: object) -> dict[str, object]:
+    return envelope_success(_index_status_data(result))
 
 
 def project_index_query(result: QueryResult) -> dict[str, object]:

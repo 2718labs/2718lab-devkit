@@ -58,7 +58,10 @@ from project_index.models import (  # noqa: E402
     IndexSnapshot,
     IndexState,
     IndexStatus,
+    IndexStatusResult,
+    IndexSyncResult,
     PackageDescriptor,
+    PackagePage,
     QueryResult,
     SourceWindow,
 )
@@ -265,7 +268,7 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
         "manifest_hash",
         "parser_set_hash",
         "binding_state",
-        "packages",
+        "package_page",
     }
     assert set(status_data) == {
         "workspace_id",
@@ -287,16 +290,23 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
         "gaps",
         "truncated",
     }
-    assert sync_data["packages"] == [
-        {
-            "package_id": "sha256:" + "e" * 64,
-            "ecosystem": "python",
-            "name": "demo",
-            "relative_root": "packages/demo",
-            "manifest_path": "packages/demo/pyproject.toml",
-            "manifest_hash": "sha256:" + "f" * 64,
-        }
-    ]
+    assert sync_data["package_page"] == {
+        "offset": 0,
+        "limit": 128,
+        "total_count": 1,
+        "returned_count": 1,
+        "packages": [
+            {
+                "package_id": "sha256:" + "e" * 64,
+                "ecosystem": "python",
+                "name": "demo",
+                "relative_root": "packages/demo",
+                "manifest_path": "packages/demo/pyproject.toml",
+                "manifest_hash": "sha256:" + "f" * 64,
+                "representation": "full",
+            }
+        ],
+    }
     assert query_data["source_windows"] == [
         {
             "path": "src/a.py",
@@ -343,7 +353,7 @@ def test_index_sync_projector_allows_an_unnamed_package_descriptor() -> None:
 
     data = _data(project_index_sync(snapshot))
 
-    assert data["packages"][0]["name"] == ""
+    assert data["package_page"]["packages"][0]["name"] == ""
 
 
 def test_index_sync_projector_lists_package_catalog_beyond_generic_list_bound() -> None:
@@ -374,8 +384,93 @@ def test_index_sync_projector_lists_package_catalog_beyond_generic_list_bound() 
 
     data = _data(project_index_sync(snapshot))
 
-    assert len(data["packages"]) == 513
-    assert data["packages"][512]["package_id"] == "sha256:" + f"{512:064x}"
+    assert "packages" not in data
+    assert data["package_page"]["total_count"] == 513
+    assert data["package_page"]["returned_count"] == 128
+    assert data["package_page"]["next_offset"] == 128
+    assert data["package_page"]["packages"][127]["package_id"] == (
+        "sha256:" + f"{127:064x}"
+    )
+
+
+def test_package_catalog_pages_are_safe_and_make_forward_progress() -> None:
+    unsafe_name = "line\nbreak"
+    unsafe_root = "C:/host/private"
+    unsafe_manifest = "../private/package.json"
+    packages = tuple(
+        PackageDescriptor(
+            package_id=f"sha256:{position:064x}",
+            ecosystem="node",
+            name=unsafe_name if position == 0 else "n" * 4096,
+            root_path=unsafe_root if position == 0 else f"packages/pkg-{position}",
+            manifest_path=(
+                unsafe_manifest
+                if position == 0
+                else f"packages/pkg-{position}/package.json"
+            ),
+            manifest_hash=f"sha256:{position + 10_000:064x}",
+        )
+        for position in range(513)
+    )
+    snapshot = IndexSnapshot(
+        snapshot_id="snapshot-1",
+        workspace="workspace-1",
+        workspace_id="workspace-1",
+        state=IndexState.INDEX_READY,
+        file_count=513,
+        blob_count=513,
+        reused_blob_count=0,
+        node_count=0,
+        edge_count=0,
+        gap_count=0,
+        packages=packages,
+    )
+    first_page = PackagePage(
+        snapshot_id="snapshot-1",
+        offset=0,
+        limit=128,
+        total_count=513,
+        packages=packages[:128],
+        next_offset=128,
+    )
+    continuation = PackagePage(
+        snapshot_id="snapshot-1",
+        offset=128,
+        limit=128,
+        total_count=513,
+        packages=packages[128:256],
+        next_offset=256,
+    )
+    status = IndexStatus(
+        workspace="workspace-1",
+        snapshot_id="snapshot-1",
+        state=IndexState.INDEX_READY,
+    )
+
+    sync_data = _data(project_index_sync(IndexSyncResult(snapshot, first_page)))
+    status_data = _data(
+        project_index_status(IndexStatusResult(status, continuation))
+    )
+
+    first = sync_data["package_page"]
+    descriptor = first["packages"][0]
+    assert "packages" not in sync_data
+    assert first["offset"] == 0
+    assert first["returned_count"] == 128
+    assert first["next_offset"] == 128
+    assert descriptor["representation"] == "digested"
+    assert set(descriptor["field_digests"]) == {
+        "name",
+        "relative_root",
+        "manifest_path",
+    }
+    assert unsafe_name not in str(sync_data)
+    assert unsafe_root not in str(sync_data)
+    assert unsafe_manifest not in str(sync_data)
+    assert "root_path" not in str(sync_data)
+    assert status_data["package_page"]["offset"] == 128
+    assert status_data["package_page"]["returned_count"] == 128
+    assert status_data["package_page"]["next_offset"] == 256
 
 
 def test_checkpoint_projectors_reject_legacy_workspace_root() -> None:

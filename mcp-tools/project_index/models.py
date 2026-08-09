@@ -142,6 +142,14 @@ class IndexSnapshot:
 
 
 @dataclass(frozen=True)
+class IndexSyncResult:
+    """A newly synchronized snapshot and its first bounded package page."""
+
+    snapshot: IndexSnapshot
+    package_page: PackagePage
+
+
+@dataclass(frozen=True)
 class SnapshotFacts:
     snapshot: IndexSnapshot
     file_hashes: tuple[tuple[str, str], ...]
@@ -168,6 +176,14 @@ class IndexStatus:
     changed_paths: tuple[str, ...] = ()
     gaps: tuple[CoverageGap, ...] = ()
     binding_state: str = "active"
+
+
+@dataclass(frozen=True)
+class IndexStatusResult:
+    """An optional, explicit package catalog page paired with index status."""
+
+    status: IndexStatus
+    package_page: PackagePage | None = None
 
 
 @dataclass(frozen=True)

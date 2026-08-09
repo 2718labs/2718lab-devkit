@@ -110,7 +110,8 @@ both disjoint worker commits are reviewed.
   branch; resolve no unrelated work.
 - Modify after both cherry-picks, owned only by the coordinator:
   `mcp-tools/devkit_runtime/project_checkpoint.py`,
-  `mcp-tools/devkit_runtime/tool_result.py`, `mcp-tools/server.py`,
+  `mcp-tools/devkit_runtime/tool_result.py`, `mcp-tools/project_index/__init__.py`,
+  `mcp-tools/project_index/models.py`, `mcp-tools/server.py`,
   `mcp-tools/tests/test_mcp_contract.py`, and
   `mcp-tools/tests/test_tool_result_contract.py`.
 - Optional documentation follow-up only after verification: the design/spec
@@ -123,12 +124,14 @@ both disjoint worker commits are reviewed.
   adequacy.  Return only defects, or `QUALITY OK`.
 - [ ] Cherry-pick only review-approved commits in dependency order; do not
   overwrite unrelated work or resolve scope drift by reset/checkout.
-- [ ] Write one adapter-level RED test for the additive sync descriptor result
-  and appended `package_ids` status/query parameters, while no-selector status
-  retains its exact data keys and the tool inventory remains seventeen.
-- [ ] Wire the reviewed domain package API through the shared runtime adapter,
-  result projector, and server.  Do not change Atlas's four-field accept
-  contract while touching `server.py`.
+- [ ] Write adapter-level RED tests for the additive snapshot-bound first
+  package page, status continuation page, and appended `package_ids`
+  status/query parameters, while no-selector status retains its exact data
+  keys and the tool inventory remains seventeen.
+- [ ] Wire the reviewed domain package-page API through the shared runtime
+  adapter, result projector, and server.  Do not change Atlas's four-field
+  accept contract while touching `server.py`; prepare the first public page
+  before binding an output snapshot.
 - [ ] Run the new adapter test GREEN, then targeted public-contract checks.
 - [ ] Run integrated focused verification:
   `python -m pytest -q tests/test_runtime_composition.py tests/test_atlas_acceptance_runtime.py tests/test_atlas_acceptance.py tests/test_project_index_core.py tests/test_project_index_checkpoints.py tests/test_project_index_workflow.py tests/test_mcp_contract.py tests/test_tool_result_contract.py`.
