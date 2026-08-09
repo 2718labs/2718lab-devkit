@@ -180,6 +180,23 @@ def _v1_state_snapshot(config: RuntimeConfig) -> tuple[tuple[str, tuple[tuple[ob
         )
 
 
+def _tamper_table_sql(database: Path, table: str, source: str, replacement: str) -> None:
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        assert row is not None and isinstance(row[0], str) and source in row[0]
+        connection.execute("PRAGMA writable_schema=ON")
+        try:
+            changed = connection.execute(
+                "UPDATE sqlite_master SET sql=? WHERE type='table' AND name=?",
+                (row[0].replace(source, replacement, 1), table),
+            ).rowcount
+            assert changed == 1
+        finally:
+            connection.execute("PRAGMA writable_schema=OFF")
+
+
 def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) -> None:
     assert not hasattr(ContinuityStore, "bootstrap")
     assert not hasattr(ContinuityCas, "bootstrap")
@@ -199,6 +216,80 @@ def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) 
     _config(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("table", "source", "replacement"),
+    (
+        ("continuity_keys", "acceptance_id TEXT NOT NULL", "acceptance_id TEXT"),
+        ("continuity_keys", "acceptance_id TEXT NOT NULL", "acceptance_id BLOB NOT NULL"),
+        ("continuity_keys", "key_json TEXT UNIQUE NOT NULL", "key_json TEXT NOT NULL"),
+        ("entries", "byte_length INTEGER NOT NULL CHECK(byte_length>=0)", "byte_length INTEGER NOT NULL"),
+        (
+            "views",
+            "FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash)",
+            "FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash) ON DELETE CASCADE",
+        ),
+    ),
+    ids=("not-null", "declared-type", "unique", "check", "foreign-key-action"),
+)
+def test_prepared_v2_open_rejects_declared_schema_contract_tampering(
+    tmp_path: Path, table: str, source: str, replacement: str
+) -> None:
+    config, store = _prepared_store(tmp_path)
+    store.close()
+    _tamper_table_sql(config.continuity_database, table, source, replacement)
+    with pytest.raises(ContinuityStoreError) as error:
+        ContinuityStore.open_readwrite(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+    assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "CREATE TABLE sqliteevil (value TEXT)",
+        "CREATE UNIQUE INDEX continuity_keys_extra_unique ON continuity_keys(workflow_id)",
+        "CREATE TRIGGER pointers_extra_update BEFORE UPDATE ON pointers BEGIN SELECT 1; END",
+    ),
+    ids=("extra-table", "extra-unique-index", "extra-trigger"),
+)
+def test_prepared_v2_open_rejects_extra_schema_objects(tmp_path: Path, statement: str) -> None:
+    config, store = _prepared_store(tmp_path)
+    store.close()
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.execute(statement)
+    with pytest.raises(ContinuityStoreError) as error:
+        ContinuityStore.open_readwrite(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+    assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+
+
+def test_runtime_bootstrap_rejects_v1_declared_schema_contract_tampering(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_verified_v1(config)
+    _tamper_table_sql(
+        config.continuity_database,
+        "views",
+        "manifest_hash TEXT NOT NULL",
+        "manifest_hash BLOB",
+    )
+    with pytest.raises(RuntimeConfigError) as error:
+        RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    assert error.value.code == "DATA_ROOT_UNAVAILABLE"
+    _assert_v1_not_switched(config)
+
+
+def test_runtime_bootstrap_normalizes_continuity_sqlite_setup_errors(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    config.data_root.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.execute("CREATE VIEW schema_metadata AS SELECT 1 AS key, 1 AS value")
+    with pytest.raises(RuntimeConfigError) as error:
+        RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    assert error.value.code == "DATA_ROOT_UNAVAILABLE"
+
+
 def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: Path) -> None:
     config = _unprepared_config(tmp_path)
     key, view, receipt = _create_verified_v1(config)
@@ -214,6 +305,19 @@ def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: 
     assert migrated.current_attempt(key) == ContinuityAttempt(key, 1, "frozen", view.view_id, receipt.receipt_hash)
     assert migrated.pointer_for(key) is not None
     migrated.close()
+
+
+def test_prepared_v2_open_rejects_partial_v1_audit_tables(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    _create_verified_v1(config)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    with sqlite3.connect(config.continuity_database) as connection:
+        connection.execute("DROP TABLE entries_v1")
+    with pytest.raises(ContinuityStoreError) as error:
+        ContinuityStore.open_readwrite(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+    assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
 
 
 def test_runtime_bootstrap_migrates_verified_legacy_direct_frozen_v1_state(tmp_path: Path) -> None:

@@ -26,6 +26,151 @@ from .models import (
 
 _SCHEMA_VERSION = "2"
 _IMMUTABLE_TABLES = ("continuity_keys", "views", "entries", "receipts", "attempts")
+_V1_TABLE_SQL = {
+    "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
+    "views": "CREATE TABLE views (view_id TEXT PRIMARY KEY NOT NULL, key_hash TEXT UNIQUE NOT NULL, manifest_hash TEXT NOT NULL, cas_root_hash TEXT NOT NULL, manifest_json TEXT NOT NULL)",
+    "entries": "CREATE TABLE entries (view_id TEXT NOT NULL, role TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, PRIMARY KEY(view_id,role,path), FOREIGN KEY(view_id) REFERENCES views(view_id))",
+    "receipts": "CREATE TABLE receipts (receipt_hash TEXT PRIMARY KEY NOT NULL, key_hash TEXT NOT NULL, view_id TEXT NOT NULL, kind TEXT NOT NULL, receipt_json TEXT NOT NULL)",
+    "attempts": "CREATE TABLE attempts (key_hash TEXT NOT NULL, key_json TEXT NOT NULL, fence_epoch INTEGER NOT NULL, sequence INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('claimed','frozen','published','expired','abandoned')), view_id TEXT, receipt_hash TEXT, PRIMARY KEY(key_hash,sequence), CHECK((state='claimed' AND view_id IS NULL AND receipt_hash IS NULL) OR (state!='claimed' AND view_id IS NOT NULL AND receipt_hash IS NOT NULL)))",
+    "pointers": "CREATE TABLE pointers (workflow_id TEXT NOT NULL, code_task_id TEXT NOT NULL, code_task_version INTEGER NOT NULL, view_id TEXT NOT NULL, pointer_version INTEGER NOT NULL, fence_epoch INTEGER NOT NULL, PRIMARY KEY(workflow_id,code_task_id,code_task_version))",
+}
+_V2_TABLE_SQL = {
+    "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
+    "continuity_keys": "CREATE TABLE continuity_keys (key_hash TEXT PRIMARY KEY NOT NULL, key_json TEXT UNIQUE NOT NULL, workflow_id TEXT NOT NULL, code_task_id TEXT NOT NULL, code_task_version INTEGER NOT NULL CHECK(code_task_version>=0), acceptance_id TEXT NOT NULL, ingestion_key TEXT NOT NULL, payload_hash TEXT NOT NULL, evidence_binding_hash TEXT NOT NULL)",
+    "views": "CREATE TABLE views (view_id TEXT PRIMARY KEY NOT NULL, key_hash TEXT UNIQUE NOT NULL, manifest_hash TEXT NOT NULL, cas_root_hash TEXT NOT NULL, manifest_json TEXT NOT NULL, UNIQUE(view_id,key_hash), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash))",
+    "entries": "CREATE TABLE entries (view_id TEXT NOT NULL, role TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL CHECK(byte_length>=0), PRIMARY KEY(view_id,role,path), FOREIGN KEY(view_id) REFERENCES views(view_id))",
+    "receipts": "CREATE TABLE receipts (receipt_hash TEXT PRIMARY KEY NOT NULL, key_hash TEXT NOT NULL, view_id TEXT NOT NULL, kind TEXT NOT NULL, receipt_json TEXT NOT NULL, UNIQUE(receipt_hash,key_hash), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash), FOREIGN KEY(view_id,key_hash) REFERENCES views(view_id,key_hash))",
+    "attempts": "CREATE TABLE attempts (key_hash TEXT NOT NULL, key_json TEXT NOT NULL, fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), sequence INTEGER NOT NULL CHECK(sequence>0), state TEXT NOT NULL CHECK(state IN ('claimed','frozen','published','expired','abandoned')), view_id TEXT, receipt_hash TEXT, PRIMARY KEY(key_hash,sequence), CHECK((state='claimed' AND view_id IS NULL AND receipt_hash IS NULL) OR (state!='claimed' AND view_id IS NOT NULL AND receipt_hash IS NOT NULL)), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash), FOREIGN KEY(view_id,key_hash) REFERENCES views(view_id,key_hash), FOREIGN KEY(receipt_hash,key_hash) REFERENCES receipts(receipt_hash,key_hash))",
+    "pointers": "CREATE TABLE pointers (key_hash TEXT PRIMARY KEY NOT NULL, workflow_id TEXT NOT NULL, code_task_id TEXT NOT NULL, code_task_version INTEGER NOT NULL CHECK(code_task_version>=0), view_id TEXT NOT NULL, pointer_version INTEGER NOT NULL CHECK(pointer_version>0), fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), UNIQUE(workflow_id,code_task_id,code_task_version), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash), FOREIGN KEY(view_id,key_hash) REFERENCES views(view_id,key_hash))",
+}
+_V1_AUDIT_TABLES = tuple(f"{table}_v1" for table in _V1_TABLE_SQL)
+
+
+def _column_contract(
+    *columns: tuple[str, str, int, int],
+) -> tuple[tuple[int, str, str, int, None, int, int], ...]:
+    return tuple(
+        (position, name, declared_type, not_null, None, primary_key, 0)
+        for position, (name, declared_type, not_null, primary_key) in enumerate(columns)
+    )
+
+
+_V1_COLUMN_CONTRACTS = {
+    "schema_metadata": _column_contract(("key", "TEXT", 1, 1), ("value", "TEXT", 1, 0)),
+    "views": _column_contract(
+        ("view_id", "TEXT", 1, 1),
+        ("key_hash", "TEXT", 1, 0),
+        ("manifest_hash", "TEXT", 1, 0),
+        ("cas_root_hash", "TEXT", 1, 0),
+        ("manifest_json", "TEXT", 1, 0),
+    ),
+    "entries": _column_contract(
+        ("view_id", "TEXT", 1, 1),
+        ("role", "TEXT", 1, 2),
+        ("path", "TEXT", 1, 3),
+        ("content_hash", "TEXT", 1, 0),
+        ("byte_length", "INTEGER", 1, 0),
+    ),
+    "receipts": _column_contract(
+        ("receipt_hash", "TEXT", 1, 1),
+        ("key_hash", "TEXT", 1, 0),
+        ("view_id", "TEXT", 1, 0),
+        ("kind", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+    ),
+    "attempts": _column_contract(
+        ("key_hash", "TEXT", 1, 1),
+        ("key_json", "TEXT", 1, 0),
+        ("fence_epoch", "INTEGER", 1, 0),
+        ("sequence", "INTEGER", 1, 2),
+        ("state", "TEXT", 1, 0),
+        ("view_id", "TEXT", 0, 0),
+        ("receipt_hash", "TEXT", 0, 0),
+    ),
+    "pointers": _column_contract(
+        ("workflow_id", "TEXT", 1, 1),
+        ("code_task_id", "TEXT", 1, 2),
+        ("code_task_version", "INTEGER", 1, 3),
+        ("view_id", "TEXT", 1, 0),
+        ("pointer_version", "INTEGER", 1, 0),
+        ("fence_epoch", "INTEGER", 1, 0),
+    ),
+}
+_V2_COLUMN_CONTRACTS = {
+    **_V1_COLUMN_CONTRACTS,
+    "continuity_keys": _column_contract(
+        ("key_hash", "TEXT", 1, 1),
+        ("key_json", "TEXT", 1, 0),
+        ("workflow_id", "TEXT", 1, 0),
+        ("code_task_id", "TEXT", 1, 0),
+        ("code_task_version", "INTEGER", 1, 0),
+        ("acceptance_id", "TEXT", 1, 0),
+        ("ingestion_key", "TEXT", 1, 0),
+        ("payload_hash", "TEXT", 1, 0),
+        ("evidence_binding_hash", "TEXT", 1, 0),
+    ),
+    "views": _V1_COLUMN_CONTRACTS["views"],
+    "entries": _V1_COLUMN_CONTRACTS["entries"],
+    "receipts": _V1_COLUMN_CONTRACTS["receipts"],
+    "attempts": _V1_COLUMN_CONTRACTS["attempts"],
+    "pointers": _column_contract(
+        ("key_hash", "TEXT", 1, 1),
+        ("workflow_id", "TEXT", 1, 0),
+        ("code_task_id", "TEXT", 1, 0),
+        ("code_task_version", "INTEGER", 1, 0),
+        ("view_id", "TEXT", 1, 0),
+        ("pointer_version", "INTEGER", 1, 0),
+        ("fence_epoch", "INTEGER", 1, 0),
+    ),
+}
+_V1_FOREIGN_KEY_CONTRACTS = {
+    "schema_metadata": (),
+    "views": (),
+    "entries": ((0, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),),
+    "receipts": (),
+    "attempts": (),
+    "pointers": (),
+}
+_V2_FOREIGN_KEY_CONTRACTS = {
+    "schema_metadata": (),
+    "continuity_keys": (),
+    "views": ((0, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),),
+    "entries": _V1_FOREIGN_KEY_CONTRACTS["entries"],
+    "receipts": (
+        (0, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),
+        (0, 1, "views", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (1, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+    ),
+    "attempts": (
+        (0, 0, "receipts", "receipt_hash", "receipt_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (0, 1, "receipts", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (1, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),
+        (1, 1, "views", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (2, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+    ),
+    "pointers": (
+        (0, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),
+        (0, 1, "views", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (1, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+    ),
+}
+_V1_INDEX_CONTRACTS = {
+    "schema_metadata": (("pk", ("key",)),),
+    "views": (("pk", ("view_id",)), ("u", ("key_hash",))),
+    "entries": (("pk", ("view_id", "role", "path")),),
+    "receipts": (("pk", ("receipt_hash",)),),
+    "attempts": (("pk", ("key_hash", "sequence")),),
+    "pointers": (("pk", ("workflow_id", "code_task_id", "code_task_version")),),
+}
+_V2_INDEX_CONTRACTS = {
+    "schema_metadata": _V1_INDEX_CONTRACTS["schema_metadata"],
+    "continuity_keys": (("pk", ("key_hash",)), ("u", ("key_json",))),
+    "views": (("pk", ("view_id",)), ("u", ("key_hash",)), ("u", ("view_id", "key_hash"))),
+    "entries": _V1_INDEX_CONTRACTS["entries"],
+    "receipts": (("pk", ("receipt_hash",)), ("u", ("receipt_hash", "key_hash"))),
+    "attempts": _V1_INDEX_CONTRACTS["attempts"],
+    "pointers": (("pk", ("key_hash",)), ("u", ("workflow_id", "code_task_id", "code_task_version"))),
+}
 
 
 class ContinuityStoreError(ContinuityError):
@@ -280,10 +425,11 @@ def _receipt_json(receipt: ContinuityReceipt) -> str:
 
 def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
     """Runtime-private creation/migration seam; ordinary openers never create."""
-    _bootstrap_cas(cas_root, scratch_root)
-    database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database)
+    connection: sqlite3.Connection | None = None
     try:
+        _bootstrap_cas(cas_root, scratch_root)
+        database.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database)
         connection.row_factory = sqlite3.Row
         _configure_connection(connection)
         connection.execute("PRAGMA journal_mode=WAL")
@@ -301,10 +447,25 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
         _verify_v2_schema(connection)
         connection.commit()
         return ContinuityStore(connection, read_only=False)
+    except (sqlite3.Error, OSError) as error:
+        _rollback_and_close(connection)
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
     except Exception:
-        connection.rollback()
-        connection.close()
+        _rollback_and_close(connection)
         raise
+
+
+def _rollback_and_close(connection: sqlite3.Connection | None) -> None:
+    if connection is None:
+        return
+    try:
+        connection.rollback()
+    except sqlite3.Error:
+        pass
+    try:
+        connection.close()
+    except sqlite3.Error:
+        pass
 
 
 def _configure_connection(connection: sqlite3.Connection) -> None:
@@ -314,9 +475,11 @@ def _configure_connection(connection: sqlite3.Connection) -> None:
 
 
 def _schema_version(connection: sqlite3.Connection) -> str | None:
-    table = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_metadata'").fetchone()
-    if table is None:
+    rows = connection.execute("SELECT type FROM sqlite_master WHERE name='schema_metadata'").fetchall()
+    if not rows:
         return None
+    if len(rows) != 1 or rows[0][0] != "table":
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     rows = connection.execute("SELECT key,value FROM schema_metadata").fetchall()
     if len(rows) != 1 or rows[0][0] != "schema_version":
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
@@ -324,18 +487,9 @@ def _schema_version(connection: sqlite3.Connection) -> str | None:
 
 
 def _create_v2_schema(connection: sqlite3.Connection) -> None:
-    statements = (
-        "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
-        "CREATE TABLE continuity_keys (key_hash TEXT PRIMARY KEY NOT NULL, key_json TEXT UNIQUE NOT NULL, workflow_id TEXT NOT NULL, code_task_id TEXT NOT NULL, code_task_version INTEGER NOT NULL CHECK(code_task_version>=0), acceptance_id TEXT NOT NULL, ingestion_key TEXT NOT NULL, payload_hash TEXT NOT NULL, evidence_binding_hash TEXT NOT NULL)",
-        "CREATE TABLE views (view_id TEXT PRIMARY KEY NOT NULL, key_hash TEXT UNIQUE NOT NULL, manifest_hash TEXT NOT NULL, cas_root_hash TEXT NOT NULL, manifest_json TEXT NOT NULL, UNIQUE(view_id,key_hash), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash))",
-        "CREATE TABLE entries (view_id TEXT NOT NULL, role TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL CHECK(byte_length>=0), PRIMARY KEY(view_id,role,path), FOREIGN KEY(view_id) REFERENCES views(view_id))",
-        "CREATE TABLE receipts (receipt_hash TEXT PRIMARY KEY NOT NULL, key_hash TEXT NOT NULL, view_id TEXT NOT NULL, kind TEXT NOT NULL, receipt_json TEXT NOT NULL, UNIQUE(receipt_hash,key_hash), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash), FOREIGN KEY(view_id,key_hash) REFERENCES views(view_id,key_hash))",
-        "CREATE TABLE attempts (key_hash TEXT NOT NULL, key_json TEXT NOT NULL, fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), sequence INTEGER NOT NULL CHECK(sequence>0), state TEXT NOT NULL CHECK(state IN ('claimed','frozen','published','expired','abandoned')), view_id TEXT, receipt_hash TEXT, PRIMARY KEY(key_hash,sequence), CHECK((state='claimed' AND view_id IS NULL AND receipt_hash IS NULL) OR (state!='claimed' AND view_id IS NOT NULL AND receipt_hash IS NOT NULL)), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash), FOREIGN KEY(view_id,key_hash) REFERENCES views(view_id,key_hash), FOREIGN KEY(receipt_hash,key_hash) REFERENCES receipts(receipt_hash,key_hash))",
-        "CREATE TABLE pointers (key_hash TEXT PRIMARY KEY NOT NULL, workflow_id TEXT NOT NULL, code_task_id TEXT NOT NULL, code_task_version INTEGER NOT NULL CHECK(code_task_version>=0), view_id TEXT NOT NULL, pointer_version INTEGER NOT NULL CHECK(pointer_version>0), fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), UNIQUE(workflow_id,code_task_id,code_task_version), FOREIGN KEY(key_hash) REFERENCES continuity_keys(key_hash), FOREIGN KEY(view_id,key_hash) REFERENCES views(view_id,key_hash))",
-        "INSERT INTO schema_metadata(key,value) VALUES('schema_version','2')",
-    )
-    for statement in statements:
+    for statement in _V2_TABLE_SQL.values():
         connection.execute(statement)
+    connection.execute("INSERT INTO schema_metadata(key,value) VALUES('schema_version','2')")
     for table in _IMMUTABLE_TABLES:
         connection.execute(f"CREATE TRIGGER {table}_immutable_update BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END")
         connection.execute(f"CREATE TRIGGER {table}_immutable_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END")
@@ -634,115 +788,157 @@ def _column_names(connection: sqlite3.Connection, table: str) -> tuple[str, ...]
 
 
 def _verify_v1_schema(connection: sqlite3.Connection) -> None:
-    required = {"schema_metadata", "views", "entries", "receipts", "attempts", "pointers"}
-    actual = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if not required <= actual:
+    if _schema_version(connection) != "1" or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    if tuple(connection.execute("PRAGMA foreign_key_check")):
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    expected = {
-        "schema_metadata": ("key", "value"), "views": ("view_id", "key_hash", "manifest_hash", "cas_root_hash", "manifest_json"),
-        "entries": ("view_id", "role", "path", "content_hash", "byte_length"), "receipts": ("receipt_hash", "key_hash", "view_id", "kind", "receipt_json"),
-        "attempts": ("key_hash", "key_json", "fence_epoch", "sequence", "state", "view_id", "receipt_hash"),
-        "pointers": ("workflow_id", "code_task_id", "code_task_version", "view_id", "pointer_version", "fence_epoch"),
-    }
-    if any(_column_names(connection, table) != columns for table, columns in expected.items()):
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    expected_primary_keys = {
-        "schema_metadata": (("key", 1),),
-        "views": (("view_id", 1),),
-        "entries": (("view_id", 1), ("role", 2), ("path", 3)),
-        "receipts": (("receipt_hash", 1),),
-        "attempts": (("key_hash", 1), ("sequence", 2)),
-        "pointers": (("workflow_id", 1), ("code_task_id", 2), ("code_task_version", 3)),
-    }
-    for table, primary_key in expected_primary_keys.items():
-        actual_primary_key = tuple((row[1], row[5]) for row in connection.execute(f"PRAGMA table_xinfo({table})") if row[5])
-        if actual_primary_key != primary_key:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    entries_foreign_keys = {(row[2], row[3], row[4]) for row in connection.execute("PRAGMA foreign_key_list(entries)")}
-    if entries_foreign_keys != {("views", "view_id", "view_id")} or not _has_unique_index(connection, "views", ("key_hash",)):
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    attempts_sql = _normalized_schema_sql(connection, "table", "attempts")
-    if "CHECK(STATEIN('CLAIMED','FROZEN','PUBLISHED','EXPIRED','ABANDONED'))" not in attempts_sql or "CHECK((STATE='CLAIMED'ANDVIEW_IDISNULLANDRECEIPT_HASHISNULL)OR(STATE!='CLAIMED'ANDVIEW_IDISNOTNULLANDRECEIPT_HASHISNOTNULL))" not in attempts_sql:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    for table in ("views", "entries", "receipts", "attempts"):
-        for action in ("UPDATE", "DELETE"):
-            expected_trigger = f"CREATETRIGGER{table}_IMMUTABLE_{action.lower()}BEFORE{action}ON{table}BEGINSELECTRAISE(ABORT,'CONTINUITY_IMMUTABLE');END".upper()
-            if _normalized_schema_sql(connection, "trigger", f"{table}_immutable_{action.lower()}") != expected_trigger:
-                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    _verify_schema_contract(
+        connection,
+        table_sql=_V1_TABLE_SQL,
+        column_contracts=_V1_COLUMN_CONTRACTS,
+        foreign_key_contracts=_V1_FOREIGN_KEY_CONTRACTS,
+        index_contracts=_V1_INDEX_CONTRACTS,
+        immutable_tables=("views", "entries", "receipts", "attempts"),
+        allow_v1_audit=False,
+    )
 
 
 def _verify_v2_schema(connection: sqlite3.Connection) -> None:
     if _schema_version(connection) != _SCHEMA_VERSION or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    required = {"schema_metadata", "continuity_keys", "views", "entries", "receipts", "attempts", "pointers"}
-    names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if not required <= names:
+    _verify_schema_contract(
+        connection,
+        table_sql=_V2_TABLE_SQL,
+        column_contracts=_V2_COLUMN_CONTRACTS,
+        foreign_key_contracts=_V2_FOREIGN_KEY_CONTRACTS,
+        index_contracts=_V2_INDEX_CONTRACTS,
+        immutable_tables=_IMMUTABLE_TABLES,
+        allow_v1_audit=True,
+    )
+
+
+def _verify_schema_contract(
+    connection: sqlite3.Connection,
+    *,
+    table_sql: dict[str, str],
+    column_contracts: dict[str, tuple[tuple[int, str, str, int, None, int, int], ...]],
+    foreign_key_contracts: dict[str, tuple[tuple[int, int, str, str, str, str, str, str], ...]],
+    index_contracts: dict[str, tuple[tuple[str, tuple[str, ...]], ...]],
+    immutable_tables: tuple[str, ...],
+    allow_v1_audit: bool,
+) -> None:
+    _verify_schema_objects(
+        connection,
+        table_names=set(table_sql),
+        immutable_tables=immutable_tables,
+        allow_v1_audit=allow_v1_audit,
+    )
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    if tuple(connection.execute("PRAGMA foreign_key_check")):
+    for table, expected_sql in table_sql.items():
+        if _normalized_schema_sql(connection, "table", table) != _normalize_sql(expected_sql):
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        actual_columns = tuple(tuple(row) for row in connection.execute(f"PRAGMA table_xinfo({table})"))
+        if actual_columns != column_contracts[table]:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        actual_foreign_keys = tuple(
+            tuple(row) for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        )
+        if actual_foreign_keys != foreign_key_contracts[table]:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        _verify_index_contract(
+            connection,
+            table,
+            column_contracts[table],
+            index_contracts[table],
+        )
+
+
+def _verify_schema_objects(
+    connection: sqlite3.Connection,
+    *,
+    table_names: set[str],
+    immutable_tables: tuple[str, ...],
+    allow_v1_audit: bool,
+) -> None:
+    objects = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            "WHERE lower(substr(name,1,7)) != 'sqlite_' ORDER BY type,name"
+        )
+    )
+    actual_tables = {name for kind, name, _table, _sql in objects if kind == "table"}
+    allowed_table_sets = {frozenset(table_names)}
+    if allow_v1_audit:
+        allowed_table_sets.add(frozenset(table_names | set(_V1_AUDIT_TABLES)))
+    if frozenset(actual_tables) not in allowed_table_sets:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    expected = {
-        "schema_metadata": ("key", "value"),
-        "continuity_keys": ("key_hash", "key_json", "workflow_id", "code_task_id", "code_task_version", "acceptance_id", "ingestion_key", "payload_hash", "evidence_binding_hash"),
-        "views": ("view_id", "key_hash", "manifest_hash", "cas_root_hash", "manifest_json"),
-        "entries": ("view_id", "role", "path", "content_hash", "byte_length"),
-        "receipts": ("receipt_hash", "key_hash", "view_id", "kind", "receipt_json"),
-        "attempts": ("key_hash", "key_json", "fence_epoch", "sequence", "state", "view_id", "receipt_hash"),
-        "pointers": ("key_hash", "workflow_id", "code_task_id", "code_task_version", "view_id", "pointer_version", "fence_epoch"),
+    expected_trigger_names = {
+        f"{table}_immutable_{action.lower()}"
+        for table in immutable_tables
+        for action in ("UPDATE", "DELETE")
     }
-    if any(_column_names(connection, table) != columns for table, columns in expected.items()):
+    actual_triggers = {
+        name: sql for kind, name, _table, sql in objects if kind == "trigger"
+    }
+    if set(actual_triggers) != expected_trigger_names:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    expected_primary_keys = {
-        "schema_metadata": (("key", 1),),
-        "continuity_keys": (("key_hash", 1),),
-        "views": (("view_id", 1),),
-        "entries": (("view_id", 1), ("role", 2), ("path", 3)),
-        "receipts": (("receipt_hash", 1),),
-        "attempts": (("key_hash", 1), ("sequence", 2)),
-        "pointers": (("key_hash", 1),),
-    }
-    for table, primary_key in expected_primary_keys.items():
-        actual = tuple((row[1], row[5]) for row in connection.execute(f"PRAGMA table_xinfo({table})") if row[5])
-        if actual != primary_key:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    expected_foreign_keys = {
-        "views": {("continuity_keys", "key_hash", "key_hash")},
-        "entries": {("views", "view_id", "view_id")},
-        "receipts": {("continuity_keys", "key_hash", "key_hash"), ("views", "view_id", "view_id"), ("views", "key_hash", "key_hash")},
-        "attempts": {("continuity_keys", "key_hash", "key_hash"), ("views", "view_id", "view_id"), ("views", "key_hash", "key_hash"), ("receipts", "receipt_hash", "receipt_hash"), ("receipts", "key_hash", "key_hash")},
-        "pointers": {("continuity_keys", "key_hash", "key_hash"), ("views", "view_id", "view_id"), ("views", "key_hash", "key_hash")},
-    }
-    for table, foreign_keys in expected_foreign_keys.items():
-        actual = {(row[2], row[3], row[4]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
-        if foreign_keys != actual:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    for table, columns in (
-        ("continuity_keys", ("key_json",)),
-        ("views", ("key_hash",)),
-        ("views", ("view_id", "key_hash")),
-        ("receipts", ("receipt_hash", "key_hash")),
-        ("pointers", ("workflow_id", "code_task_id", "code_task_version")),
-    ):
-        if not _has_unique_index(connection, table, columns):
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    for table in _IMMUTABLE_TABLES:
+    for table in immutable_tables:
         for action in ("UPDATE", "DELETE"):
-            expected_trigger = f"CREATETRIGGER{table}_IMMUTABLE_{action.lower()}BEFORE{action}ON{table}BEGINSELECTRAISE(ABORT,'CONTINUITY_IMMUTABLE');END".upper()
-            if _normalized_schema_sql(connection, "trigger", f"{table}_immutable_{action.lower()}") != expected_trigger:
+            name = f"{table}_immutable_{action.lower()}"
+            trigger_sql = actual_triggers[name]
+            if (
+                not isinstance(trigger_sql, str)
+                or _normalize_sql(trigger_sql) != _immutable_trigger_sql(table, action)
+            ):
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    if any(kind not in {"table", "trigger"} for kind, _name, _table, _sql in objects):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+
+
+def _immutable_trigger_sql(table: str, action: str) -> str:
+    return _normalize_sql(
+        f"CREATE TRIGGER {table}_immutable_{action.lower()} BEFORE {action} ON {table} "
+        "BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END"
+    )
 
 
 def _normalized_schema_sql(connection: sqlite3.Connection, kind: str, name: str) -> str:
     row = connection.execute("SELECT sql FROM sqlite_master WHERE type=? AND name=?", (kind, name)).fetchone()
-    return "" if row is None or not isinstance(row[0], str) else "".join(row[0].upper().split())
+    return "" if row is None or not isinstance(row[0], str) else _normalize_sql(row[0])
 
 
-def _has_unique_index(connection: sqlite3.Connection, table: str, columns: tuple[str, ...]) -> bool:
+def _normalize_sql(sql: str) -> str:
+    return "".join(sql.upper().split())
+
+
+def _verify_index_contract(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: tuple[tuple[int, str, str, int, None, int, int], ...],
+    expected: tuple[tuple[str, tuple[str, ...]], ...],
+) -> None:
+    actual: list[tuple[str, tuple[str, ...]]] = []
+    column_ids = {name: position for position, name, *_rest in columns}
     for row in connection.execute(f"PRAGMA index_list({table})"):
-        if not row[2]:
-            continue
-        indexed = tuple(item[2] for item in connection.execute(f"PRAGMA index_info({row[1]})"))
-        if indexed == columns:
-            return True
-    return False
+        if row[2] != 1 or row[3] not in {"pk", "u"} or row[4] != 0:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        xinfo = tuple(tuple(item) for item in connection.execute(f"PRAGMA index_xinfo({row[1]})"))
+        key_columns = tuple(item[2] for item in xinfo if item[5] == 1)
+        if (
+            any(not isinstance(name, str) or name not in column_ids for name in key_columns)
+            or xinfo != _expected_index_xinfo(column_ids, key_columns)
+        ):
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        actual.append((row[3], key_columns))
+    if tuple(sorted(actual, key=repr)) != tuple(sorted(expected, key=repr)):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+
+
+def _expected_index_xinfo(
+    column_ids: dict[str, int], key_columns: tuple[str | None, ...]
+) -> tuple[tuple[int, int, str | None, int, str, int], ...]:
+    return tuple(
+        (position, column_ids[column], column, 0, "BINARY", 1)
+        for position, column in enumerate(key_columns)
+        if column is not None
+    ) + ((len(key_columns), -1, None, 0, "BINARY", 0),)
