@@ -21,7 +21,7 @@ from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
 from devkit_runtime.config import RuntimeConfig  # noqa: E402
 from devkit_runtime.project_checkpoint import open_project_checkpoint_rw  # noqa: E402
 from project_index import IndexError, IndexState, ProjectIndexService  # noqa: E402
-from project_index.store import ProjectIndexStore  # noqa: E402
+from project_index.store import ProjectIndexStore, StoreError  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -843,6 +843,96 @@ def test_schema_v4_migrates_to_package_descriptor_relation(tmp_path: Path) -> No
         assert "package_ids" in columns
     finally:
         migrated.close()
+
+
+@pytest.mark.parametrize(
+    ("table_name", "replacement_schema"),
+    (
+        (
+            "project_index_snapshot_packages",
+            """
+            CREATE TABLE project_index_snapshot_packages (
+                snapshot_id TEXT NOT NULL
+                    REFERENCES project_index_snapshots(snapshot_id),
+                package_id TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                name TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                manifest_path TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL
+                    REFERENCES project_index_blobs(content_hash),
+                PRIMARY KEY (snapshot_id, manifest_path),
+                UNIQUE (snapshot_id, package_id)
+            )
+            """,
+        ),
+        (
+            "project_index_snapshot_packages",
+            """
+            CREATE TABLE project_index_snapshot_packages (
+                snapshot_id TEXT NOT NULL,
+                package_id TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                name TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                manifest_path TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, package_id),
+                UNIQUE (snapshot_id, manifest_path)
+            )
+            """,
+        ),
+        (
+            "project_index_query_receipts",
+            """
+            CREATE TABLE project_index_query_receipts (
+                trace_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL
+                    REFERENCES project_index_snapshots(snapshot_id),
+                query_text TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                node_kinds TEXT NOT NULL,
+                relations TEXT NOT NULL,
+                max_nodes INTEGER NOT NULL,
+                max_depth INTEGER NOT NULL,
+                source_lines INTEGER NOT NULL,
+                byte_budget INTEGER NOT NULL,
+                allow_miss_escape INTEGER NOT NULL,
+                miss_escape_used INTEGER NOT NULL,
+                returned_node_ids TEXT NOT NULL,
+                returned_edge_ids TEXT NOT NULL,
+                returned_source_windows TEXT NOT NULL,
+                gaps TEXT NOT NULL,
+                truncated INTEGER NOT NULL
+            )
+            """,
+        ),
+    ),
+    ids=("package-key-shape", "package-foreign-keys", "receipt-package-ids"),
+)
+def test_prepared_handoff_rejects_malformed_package_schema(
+    tmp_path: Path,
+    table_name: str,
+    replacement_schema: str,
+) -> None:
+    config = _runtime_config(tmp_path)
+    RuntimeBootstrap.run(config)
+    connection = sqlite3.connect(config.project_index_database)
+    try:
+        connection.execute(f"DROP TABLE {table_name}")
+        connection.execute(replacement_schema)
+        connection.commit()
+    finally:
+        connection.close()
+
+    prepared = sqlite3.connect(config.project_index_database)
+    try:
+        with pytest.raises(StoreError, match="project index store is not prepared"):
+            ProjectIndexStore.from_prepared_connection(
+                config.project_index_database, prepared
+            )
+    finally:
+        prepared.close()
 
 
 def test_nodes_and_edges_expose_auditable_utf8_spans(tmp_path: Path) -> None:

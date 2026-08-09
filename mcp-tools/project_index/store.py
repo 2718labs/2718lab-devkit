@@ -89,6 +89,7 @@ class ProjectIndexStore:
         store._connection.execute("PRAGMA busy_timeout = 5000")
         store._connection.execute("PRAGMA journal_mode = WAL")
         store._create_schema()
+        cls.validate_prepared_connection(store._connection)
         return store
 
     @classmethod
@@ -108,6 +109,7 @@ class ProjectIndexStore:
         store._connection = connection
         store._owns_connection = False
         connection.row_factory = sqlite3.Row
+        cls.validate_prepared_connection(connection)
         return store
 
     @classmethod
@@ -130,6 +132,44 @@ class ProjectIndexStore:
             "project_index_snapshot_bindings",
             "project_index_query_receipts",
         }
+
+        def table_columns(table_name: str) -> dict[str, sqlite3.Row]:
+            return {
+                str(row["name"]): row
+                for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+            }
+
+        def primary_key(columns: dict[str, sqlite3.Row]) -> tuple[str, ...]:
+            return tuple(
+                str(row["name"])
+                for row in sorted(columns.values(), key=lambda row: int(row["pk"]))
+                if int(row["pk"])
+            )
+
+        def index_columns(index_name: object) -> tuple[str, ...]:
+            if type(index_name) is not str:
+                raise ValueError("index name is invalid")
+            identifier = index_name.replace('"', '""')
+            return tuple(
+                str(row["name"])
+                for row in connection.execute(f'PRAGMA index_info("{identifier}")')
+            )
+
+        def unique_columns(table_name: str) -> set[tuple[str, ...]]:
+            return {
+                index_columns(row["name"])
+                for row in connection.execute(f'PRAGMA index_list("{table_name}")')
+                if int(row["unique"]) and not int(row["partial"])
+            }
+
+        def foreign_keys(table_name: str) -> set[tuple[str, str, str]]:
+            return {
+                (str(row["from"]), str(row["table"]), str(row["to"]))
+                for row in connection.execute(
+                    f'PRAGMA foreign_key_list("{table_name}")'
+                )
+            }
+
         try:
             tables = {
                 str(row["name"])
@@ -141,9 +181,94 @@ class ProjectIndexStore:
                 "SELECT value FROM project_index_metadata WHERE key = 'schema_version'"
             ).fetchone()
             version = None if version_row is None else int(version_row["value"])
+            package_columns = table_columns("project_index_snapshot_packages")
+            receipt_columns = table_columns("project_index_query_receipts")
+            package_primary_key = primary_key(package_columns)
+            receipt_primary_key = primary_key(receipt_columns)
+            package_unique_columns = unique_columns("project_index_snapshot_packages")
+            package_foreign_keys = foreign_keys("project_index_snapshot_packages")
+            receipt_foreign_keys = foreign_keys("project_index_query_receipts")
         except (TypeError, ValueError, sqlite3.DatabaseError) as exc:
             raise StoreError("project index schema is corrupt") from exc
-        if not required_tables.issubset(tables) or version != cls._SCHEMA_VERSION:
+
+        required_package_columns = {
+            "snapshot_id",
+            "package_id",
+            "ecosystem",
+            "name",
+            "root_path",
+            "manifest_path",
+            "manifest_hash",
+        }
+        required_receipt_columns = {
+            "trace_id",
+            "snapshot_id",
+            "query_text",
+            "mode",
+            "node_kinds",
+            "relations",
+            "max_nodes",
+            "max_depth",
+            "source_lines",
+            "byte_budget",
+            "allow_miss_escape",
+            "miss_escape_used",
+            "returned_node_ids",
+            "returned_edge_ids",
+            "returned_source_windows",
+            "gaps",
+            "truncated",
+            "package_ids",
+        }
+        package_columns_are_not_null = all(
+            int(package_columns[column]["notnull"]) == 1
+            for column in required_package_columns
+            if column in package_columns
+        )
+        receipt_columns_are_not_null = all(
+            int(receipt_columns[column]["notnull"]) == 1
+            for column in required_receipt_columns - {"trace_id"}
+            if column in receipt_columns
+        )
+        package_ids_column = receipt_columns.get("package_ids")
+        has_package_shape = (
+            required_package_columns.issubset(package_columns)
+            and package_columns_are_not_null
+            and package_primary_key == ("snapshot_id", "package_id")
+            and ("snapshot_id", "manifest_path") in package_unique_columns
+            and (
+                "snapshot_id",
+                "project_index_snapshots",
+                "snapshot_id",
+            )
+            in package_foreign_keys
+            and (
+                "manifest_hash",
+                "project_index_blobs",
+                "content_hash",
+            )
+            in package_foreign_keys
+        )
+        has_receipt_shape = (
+            required_receipt_columns.issubset(receipt_columns)
+            and receipt_columns_are_not_null
+            and receipt_primary_key == ("trace_id",)
+            and (
+                "snapshot_id",
+                "project_index_snapshots",
+                "snapshot_id",
+            )
+            in receipt_foreign_keys
+            and package_ids_column is not None
+            and int(package_ids_column["notnull"]) == 1
+            and str(package_ids_column["dflt_value"]) == "'[]'"
+        )
+        if (
+            not required_tables.issubset(tables)
+            or version != cls._SCHEMA_VERSION
+            or not has_package_shape
+            or not has_receipt_shape
+        ):
             raise StoreError("project index store is not prepared")
 
     def close(self) -> None:
