@@ -434,7 +434,7 @@ class AcceptedCodeTaskEvidence:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 10
+    _SCHEMA_VERSION = 11
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
@@ -620,6 +620,7 @@ class SQLiteStore:
             "updated_at",
         }
         required_outbox_not_null_columns = {
+            "ingestion_key",
             "acceptance_id",
             "payload_json",
             "payload_hash",
@@ -5908,6 +5909,89 @@ class SQLiteStore:
                     ),
                 )
 
+    @staticmethod
+    def _migrate_atlas_outbox_ingestion_key_not_null(cursor: sqlite3.Cursor) -> None:
+        """Rebuild the legacy outbox because SQLite cannot alter a primary key nullability."""
+
+        try:
+            columns = {
+                str(row["name"]): row
+                for row in cursor.execute(
+                    "PRAGMA table_info(atlas_ingestion_outbox)"
+                ).fetchall()
+            }
+            ingestion_key = columns.get("ingestion_key")
+            if ingestion_key is None or int(ingestion_key["notnull"]):
+                return
+            required_columns = {
+                "ingestion_key",
+                "acceptance_id",
+                "payload_json",
+                "payload_hash",
+                "state",
+                "attempt_count",
+                "last_error_code",
+                "reason_codes_json",
+                "created_at",
+                "updated_at",
+            }
+            if not required_columns.issubset(columns):
+                return
+            if cursor.execute(
+                """
+                SELECT 1 FROM atlas_ingestion_outbox
+                WHERE ingestion_key IS NULL
+                LIMIT 1
+                """
+            ).fetchone() is not None:
+                raise StoreError("legacy atlas outbox row is invalid")
+            cursor.execute(
+                """
+                CREATE TABLE atlas_ingestion_outbox_v11 (
+                    ingestion_key TEXT NOT NULL PRIMARY KEY,
+                    acceptance_id TEXT NOT NULL UNIQUE
+                        REFERENCES code_task_acceptances(acceptance_id),
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('pending', 'projected', 'quarantined')),
+                    attempt_count INTEGER NOT NULL
+                        CHECK (attempt_count BETWEEN 0 AND 16),
+                    last_error_code TEXT NOT NULL,
+                    reason_codes_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (ingestion_key = payload_hash)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO atlas_ingestion_outbox_v11 (
+                    ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                    attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+                )
+                SELECT
+                    ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                    attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+                FROM atlas_ingestion_outbox
+                """
+            )
+            cursor.execute("DROP TABLE atlas_ingestion_outbox")
+            cursor.execute(
+                "ALTER TABLE atlas_ingestion_outbox_v11 RENAME TO atlas_ingestion_outbox"
+            )
+            cursor.execute(
+                """
+                CREATE INDEX idx_atlas_outbox_pending
+                    ON atlas_ingestion_outbox(state, created_at, ingestion_key)
+                """
+            )
+        except sqlite3.IntegrityError as error:
+            raise StoreError("legacy atlas outbox row is invalid") from error
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator schema is corrupt") from error
+
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
             _execute_schema_statements(
@@ -5993,7 +6077,7 @@ class SQLiteStore:
                         task_id, code_task_version, attestation_hash, receipt_id
                     );
                 CREATE TABLE IF NOT EXISTS atlas_ingestion_outbox (
-                    ingestion_key TEXT PRIMARY KEY,
+                    ingestion_key TEXT NOT NULL PRIMARY KEY,
                     acceptance_id TEXT NOT NULL UNIQUE
                         REFERENCES code_task_acceptances(acceptance_id),
                     payload_json TEXT NOT NULL,
@@ -6299,6 +6383,7 @@ class SQLiteStore:
                     );
                 """,
             )
+            self._migrate_atlas_outbox_ingestion_key_not_null(cursor)
             self._preflight_external_bootstrap_rows(cursor)
             self._canonicalize_external_bootstrap_expiries(cursor)
             cursor.execute(

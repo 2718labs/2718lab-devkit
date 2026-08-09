@@ -124,7 +124,7 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
         self.assertNotIn("bearer", persisted.lower())
 
     def test_schema_upgrade_exposes_external_bootstrap_tables(self) -> None:
-        self.assertEqual(self.store.schema_version(), 10)
+        self.assertEqual(self.store.schema_version(), 11)
         table_names = {
             str(row[0])
             for row in self.store._connection.execute(
@@ -828,7 +828,7 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
 
         reopened = SQLiteStore(self.database)
         try:
-            self.assertEqual(10, reopened.schema_version())
+            self.assertEqual(11, reopened.schema_version())
             self.assertEqual(
                 "2026-08-03T00:00:00+00:00",
                 reopened._connection.execute(
@@ -945,7 +945,7 @@ class ExternalBootstrapStoreTests(unittest.TestCase):
 
         reopened = SQLiteStore(self.database)
         try:
-            self.assertEqual(10, reopened.schema_version())
+            self.assertEqual(11, reopened.schema_version())
             persisted_item_json = reopened._connection.execute(
                 """
                 SELECT payload_json FROM external_bootstrap_batch_items

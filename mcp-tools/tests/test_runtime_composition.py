@@ -901,6 +901,7 @@ def test_sqlite_store_entry_points_reject_malformed_current_outbox_schema(
 @pytest.mark.parametrize(
     "nullable_column",
     (
+        "ingestion_key",
         "acceptance_id",
         "payload_json",
         "payload_hash",
@@ -953,3 +954,205 @@ def test_prepared_sqlite_store_enables_foreign_keys_on_raw_connection(
         assert store.foreign_keys_enabled()
     finally:
         store.close()
+
+
+def _insert_legacy_atlas_acceptance(
+    connection: sqlite3.Connection, *, suffix: str
+) -> tuple[str, str]:
+    timestamp = "2026-08-09T00:00:00Z"
+    workflow_id = "legacy-workflow"
+    task_id = f"legacy-task-{suffix}"
+    acceptance_id = f"sha256:{suffix * 64}"
+    connection.execute(
+        """
+        INSERT INTO workflows (
+            id, kind, title, product_summary, state, version, policy_version,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        (
+            workflow_id,
+            "general",
+            "legacy workflow",
+            "legacy outbox migration fixture",
+            "active",
+            1,
+            "legacy",
+            timestamp,
+            timestamp,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks (
+            id, workflow_id, title, owner_role, state, write_scope, card_hash,
+            result_hash, version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workflow_id,
+            "legacy task",
+            "writer",
+            "pending",
+            "mcp-tools/orchestrator/store.py",
+            f"sha256:{'c' * 64}",
+            f"sha256:{'d' * 64}",
+            1,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO code_task_acceptances (
+            acceptance_id, workflow_id, code_task_id, code_task_version,
+            input_snapshot_id, output_snapshot_id, indexed_diff_hash, intent_id,
+            language, framework, payload_json, payload_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            acceptance_id,
+            workflow_id,
+            task_id,
+            1,
+            f"sha256:{'e' * 64}",
+            f"sha256:{'f' * 64}",
+            f"sha256:{'0' * 64}",
+            "legacy",
+            "python",
+            "pytest",
+            "{}",
+            acceptance_id,
+            timestamp,
+        ),
+    )
+    return acceptance_id, timestamp
+
+
+def _legacy_v10_atlas_outbox_database(
+    tmp_path: Path, *, ingestion_key: str | None
+) -> tuple[Path, str, str]:
+    database = tmp_path / "legacy-atlas-outbox.sqlite3"
+    bootstrap = SQLiteStore(database)
+    bootstrap.close()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        acceptance_id, timestamp = _insert_legacy_atlas_acceptance(
+            connection, suffix="a"
+        )
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.executescript(_atlas_outbox_schema())
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+            ("10",),
+        )
+        connection.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ingestion_key,
+                acceptance_id,
+                "{}",
+                acceptance_id,
+                "pending",
+                0,
+                "",
+                "[]",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, acceptance_id, timestamp
+
+
+def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
+    tmp_path: Path,
+) -> None:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, acceptance_id, timestamp = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=ingestion_key
+    )
+
+    store = SQLiteStore(database)
+    try:
+        assert store.schema_version() == 11
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in store._connection.execute(
+                "PRAGMA table_info(atlas_ingestion_outbox)"
+            )
+        }
+        assert columns["ingestion_key"] == 1
+        assert tuple(
+            store._connection.execute(
+                """
+                SELECT ingestion_key, acceptance_id, payload_hash, state, attempt_count
+                FROM atlas_ingestion_outbox
+                """
+            ).fetchone()
+        ) == (
+            ingestion_key,
+            acceptance_id,
+            acceptance_id,
+            "pending",
+            0,
+        )
+
+        next_acceptance_id, _ = _insert_legacy_atlas_acceptance(
+            store._connection, suffix="b"
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="NOT NULL constraint failed: atlas_ingestion_outbox.ingestion_key",
+        ):
+            store._connection.execute(
+                """
+                INSERT INTO atlas_ingestion_outbox (
+                    ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                    attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    next_acceptance_id,
+                    "{}",
+                    next_acceptance_id,
+                    "pending",
+                    0,
+                    "",
+                    "[]",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+        ).fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_sqlite_store_fails_closed_for_legacy_null_outbox_key(tmp_path: Path) -> None:
+    database, _, _ = _legacy_v10_atlas_outbox_database(tmp_path, ingestion_key=None)
+
+    with pytest.raises(StoreError, match="legacy atlas outbox row is invalid"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT ingestion_key FROM atlas_ingestion_outbox"
+        ).fetchone()[0] is None
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "10"
+    finally:
+        connection.close()
