@@ -40,7 +40,7 @@ class ContinuityCas:
     def open_prepared(cls, root: Path, scratch_root: Path, read_only: bool) -> ContinuityCas:
         if os.name == "nt":
             try:
-                backend = _open_native_backend(root, scratch_root, read_only=read_only)
+                backend = _open_native_backend(root, read_only=read_only)
             except ContinuityCasError:
                 raise
             except Exception as error:
@@ -186,21 +186,68 @@ class ContinuityCas:
 class _WindowsHandleCasBackend:
     """Windows-only CAS operations rooted in verified directory handles."""
 
-    def __init__(self, root: Path, api: Any, *, read_only: bool) -> None:
-        self._root, self._api, self._read_only = root, api, read_only
+    def __init__(
+        self, root: Path, api: Any, *, read_only: bool, create_root: bool = False
+    ) -> None:
+        self._root, self._api, self._read_only, self._create_root = (
+            root,
+            api,
+            read_only,
+            create_root,
+        )
         self._root_handle: Any | None = None
 
     def verify_prepared(self) -> None:
         if self._root_handle is not None:
             self._api.revalidate(self._root_handle, directory=True)
             return
-        root = self._api.open_root(self._root, writable=not self._read_only)
+        if not self._root.is_absolute():
+            raise OSError("native CAS root must be absolute")
+        root = (
+            self._open_root_relative_to_trusted_parent()
+            if self._create_root
+            else self._api.open_root(self._root, writable=not self._read_only)
+        )
         try:
             self._api.revalidate(root, directory=True)
             self._root_handle = root
         finally:
             if self._root_handle is not root:
                 self._api.close(root)
+
+    def _open_root_relative_to_trusted_parent(self) -> Any:
+        """Create the CAS root only below the host-trusted private data-root handle."""
+        if not self._root.is_absolute():
+            raise OSError("native CAS root must be absolute")
+        root_name = self._root.name
+        _require_component(root_name)
+        parent = self._api.open_root(self._root.parent, writable=True)
+        root: Any | None = None
+        transferred = False
+        try:
+            self._api.revalidate(parent, directory=True)
+            root = self._api.open_child(
+                parent,
+                root_name,
+                directory=True,
+                create=True,
+                exclusive=False,
+            )
+            self._api.revalidate(root, directory=True)
+            self._api.close(parent)
+            transferred = True
+            return root
+        finally:
+            if not transferred:
+                if root is not None:
+                    try:
+                        self._api.close(root)
+                    except Exception:
+                        pass
+                try:
+                    self._api.close(parent)
+                except Exception:
+                    pass
 
     def close(self) -> None:
         """Close the verified root; operations own their child handles."""
@@ -477,11 +524,13 @@ if os.name == "nt":
             self.closed = False
 
     class _WindowsNativeApi:
-        """Minimal ctypes facade: only the initial trusted root opening receives a path.
+        """Minimal ctypes facade: only the initial trusted data-root opening receives a path.
 
-        The host must establish the private data root before this first CAS-root
-        open.  Protection starts below the verified CAS root HANDLE; it does not
-        protect adversarial ancestors while that initial absolute path is parsed.
+        The host must establish and protect the private data root (the CAS root's
+        parent) before this first absolute open.  Bootstrap creates or verifies
+        the CAS root relative to that trusted parent HANDLE.  Protection starts
+        below the verified CAS root HANDLE; it does not protect adversarial
+        ancestors while the initial trusted-parent path is parsed.
         """
 
         def __init__(self) -> None:
@@ -886,16 +935,15 @@ def _load_windows_native_api() -> Any | None:
         return None
 
 
-def _open_native_backend(root: Path, scratch_root: Path, *, read_only: bool) -> Any | None:
+def _open_native_backend(
+    root: Path, *, read_only: bool, create_root: bool = False
+) -> Any | None:
     api = _load_windows_native_api()
     if api is None:
         return None
-    backend = _WindowsHandleCasBackend(root, api, read_only=read_only)
+    backend = _WindowsHandleCasBackend(root, api, read_only=read_only, create_root=create_root)
     try:
         backend.verify_prepared()
-        _safe_root(scratch_root, create=False)
-        if not scratch_root.is_dir():
-            raise OSError("continuity scratch root unavailable")
         return backend
     except Exception:
         backend.close()
@@ -912,15 +960,18 @@ def _validate(content_hash: object, byte_length: object, body: object) -> None:
 
 def _bootstrap_cas(root: Path, scratch_root: Path) -> ContinuityCas:
     """Runtime-private CAS creation seam; ordinary openers never create."""
-    if os.name == "nt" and _load_windows_native_api() is None:
-        raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
-    _safe_root(root, create=True)
-    _safe_root(scratch_root, create=True)
     if os.name == "nt":
-        backend = _open_native_backend(root, scratch_root, read_only=False)
+        try:
+            backend = _open_native_backend(root, read_only=False, create_root=True)
+        except ContinuityCasError:
+            raise
+        except Exception as error:
+            raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
         if backend is None:
             raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
         return ContinuityCas(root, scratch_root, read_only=False, native_backend=backend)
+    _safe_root(root, create=True)
+    _safe_root(scratch_root, create=True)
     return ContinuityCas(root, scratch_root, read_only=False)
 
 

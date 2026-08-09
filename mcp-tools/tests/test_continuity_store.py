@@ -1233,9 +1233,14 @@ class _MemoryNativeApi:
         self.on_link: Callable[[_MemoryNativeHandle, tuple[str, ...]], None] | None = None
         self.close_fail_paths: set[tuple[str, ...]] = set()
         self.live_handles: list[_MemoryNativeHandle] = []
+        self.opened_root_paths: list[Path] = []
+        self.fail_root_paths: set[Path] = set()
         self._lock = threading.Lock()
 
     def open_root(self, _root: Path, *, writable: bool) -> _MemoryNativeHandle:
+        self.opened_root_paths.append(_root)
+        if _root in self.fail_root_paths:
+            raise OSError("trusted parent unavailable")
         self.events.append(("open_root", writable))
         return self._new_handle((), directory=True)
 
@@ -1320,7 +1325,7 @@ class _MemoryNativeApi:
 
     def delete_owned(self, handle: _MemoryNativeHandle) -> None:
         self.events.append(("delete_owned", handle.path))
-        assert handle.path[:1] == (".staging",)
+        assert len(handle.path) >= 2 and handle.path[-2] == ".staging"
         with self._lock:
             self.files.pop(handle.path, None)
 
@@ -1360,6 +1365,163 @@ def _windows_backend_for_test(api: _MemoryNativeApi, root: Path) -> object:
     backend = backend_type(root, api, read_only=False)
     backend.verify_prepared()
     return backend
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_prepared_open_never_touches_scratch_or_path_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    root, scratch = tmp_path / "data" / "continuity-cas", tmp_path / "unused-scratch"
+    root.mkdir(parents=True)
+    api = _MemoryNativeApi()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Windows native CAS must not use Path/os fallback")
+
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: api)
+    monkeypatch.setattr(cas_module, "_safe_root", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(Path, "is_dir", forbidden)
+    monkeypatch.setattr(cas_module.os, "open", forbidden)
+    monkeypatch.setattr(cas_module.os, "link", forbidden)
+    cas = ContinuityCas.open_prepared(root, scratch, read_only=False)
+    assert cas._native_backend is not None
+    assert api.opened_root_paths == [root]
+    assert scratch not in api.opened_root_paths
+    cas.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_prepared_open_leaves_missing_scratch_unused(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    scratch = tmp_path / "missing-scratch"
+    cas = ContinuityCas.open_prepared(config.continuity_cas_root, scratch, read_only=False)
+    body, digest = b"no-scratch", _hash(b"no-scratch")
+    assert cas.put_verified(digest, len(body), body) == digest
+    assert not scratch.exists()
+    cas.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_bootstrap_creates_root_relative_to_trusted_parent_without_path_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    data_root = tmp_path / "trusted-data"
+    data_root.mkdir()
+    root, scratch = data_root / "continuity-cas", tmp_path / "unused-scratch"
+    api = _MemoryNativeApi()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Windows native CAS bootstrap must not use Path/os fallback")
+
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: api)
+    monkeypatch.setattr(cas_module, "_safe_root", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(Path, "is_dir", forbidden)
+    monkeypatch.setattr(cas_module.os, "open", forbidden)
+    monkeypatch.setattr(cas_module.os, "link", forbidden)
+    cas = cas_module._bootstrap_cas(root, scratch)
+    assert cas._native_backend is not None
+    assert api.opened_root_paths == [data_root]
+    assert scratch not in api.opened_root_paths
+    assert (
+        "open_child",
+        (),
+        "continuity-cas",
+        True,
+        True,
+        False,
+        False,
+    ) in api.events
+    body, digest = b"bootstrap-root", _hash(b"bootstrap-root")
+    api.events.clear()
+    assert cas.put_verified(digest, len(body), body) == digest
+    assert not [event for event in api.events if event[0] == "open_root"]
+    assert [handle.path for handle in api.live_handles] == [("continuity-cas",)]
+    cas.close()
+    assert api.live_handles == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_bootstrap_closes_root_child_when_parent_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    data_root = tmp_path / "trusted-data"
+    data_root.mkdir()
+    api = _MemoryNativeApi()
+    api.close_fail_paths.add(())
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: api)
+
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        cas_module._bootstrap_cas(data_root / "continuity-cas", tmp_path / "unused-scratch")
+
+    assert api.live_handles == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_bootstrap_fails_closed_when_trusted_parent_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    root, scratch = tmp_path / "missing-data" / "continuity-cas", tmp_path / "unused-scratch"
+    api = _MemoryNativeApi()
+    api.fail_root_paths.add(root.parent)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Windows native CAS bootstrap must not use Path/os fallback")
+
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: api)
+    monkeypatch.setattr(cas_module, "_safe_root", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(Path, "is_dir", forbidden)
+    monkeypatch.setattr(cas_module.os, "open", forbidden)
+    monkeypatch.setattr(cas_module.os, "link", forbidden)
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        cas_module._bootstrap_cas(root, scratch)
+    assert api.opened_root_paths == [root.parent]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_bootstrap_rejects_nonabsolute_root_before_any_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    api = _MemoryNativeApi()
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Windows native CAS bootstrap must not use Path/os fallback")
+
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: api)
+    monkeypatch.setattr(cas_module, "_safe_root", forbidden)
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(Path, "is_dir", forbidden)
+    monkeypatch.setattr(cas_module.os, "open", forbidden)
+    monkeypatch.setattr(cas_module.os, "link", forbidden)
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        cas_module._bootstrap_cas(Path("relative") / "continuity-cas", Path("scratch"))
+    assert api.opened_root_paths == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
+def test_windows_native_prepared_open_rejects_nonabsolute_root_before_any_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from devkit_continuity import cas as cas_module
+
+    api = _MemoryNativeApi()
+
+    monkeypatch.setattr(cas_module, "_load_windows_native_api", lambda: api)
+    with pytest.raises(ContinuityCasError, match="^CONTINUITY_CAS_UNAVAILABLE$"):
+        ContinuityCas.open_prepared(Path("relative") / "continuity-cas", Path("scratch"), read_only=True)
+    assert api.opened_root_paths == []
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native CAS backend")
