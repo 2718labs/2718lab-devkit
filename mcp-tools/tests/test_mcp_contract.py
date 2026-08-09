@@ -43,7 +43,12 @@ EXPECTED_TOOL_NAMES = frozenset(
 EXPECTED_PARAMETERS = {
     "project_index_register": ("workspace_root",),
     "project_index_sync": ("workspace_id", "include_paths", "task_lease", "bind_as"),
-    "project_index_status": ("workspace_id", "snapshot_id", "required_paths"),
+    "project_index_status": (
+        "workspace_id",
+        "snapshot_id",
+        "required_paths",
+        "package_ids",
+    ),
     "project_index_query": (
         "workspace_id",
         "snapshot_id",
@@ -57,6 +62,7 @@ EXPECTED_PARAMETERS = {
         "byte_budget",
         "allow_miss_escape",
         "task_lease",
+        "package_ids",
     ),
     "worktree_checkpoint_create": ("workspace_id", "task_lease", "snapshot_id"),
     "worktree_checkpoint_status": ("workspace_id", "checkpoint_id"),
@@ -171,6 +177,70 @@ def test_tool_signatures_and_top_level_input_schemas_are_exact() -> None:
             set(getattr(tools[name], "inputSchema").get("required", ()))
             == expected_required
         )
+
+
+def test_package_scope_is_an_additive_public_index_contract(
+    tmp_path, monkeypatch
+) -> None:
+    task_root = Path(os.environ["CODEX_TASK_TEMP"]).resolve()
+    assert tmp_path.resolve().is_relative_to(task_root)
+    workspace = tmp_path / "workspace"
+    package = workspace / "packages" / "demo"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text('{"name":"demo"}', encoding="utf-8")
+    (package / "module.py").write_text(
+        "def selected_package_function() -> str:\n    return 'demo'\n",
+        encoding="utf-8",
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "data"),
+            "CODEX_TASK_TEMP": str(scratch),
+        }
+    )
+    RuntimeBootstrap.run(config)
+    root = RuntimeRoot(config)
+    monkeypatch.setattr(server, "_RUNTIME_ROOT", root)
+
+    try:
+        registered = server.project_index_register(str(workspace))
+        assert registered["ok"] is True
+        workspace_id = registered["data"]["workspace_id"]
+        assert isinstance(workspace_id, str)
+
+        synced = server.project_index_sync(workspace_id)
+        assert synced["ok"] is True
+        sync_data = synced["data"]
+        assert isinstance(sync_data, dict)
+        packages = sync_data["packages"]
+        assert isinstance(packages, list)
+        assert len(packages) == 1
+        descriptor = packages[0]
+        assert descriptor["ecosystem"] == "node"
+        assert descriptor["name"] == "demo"
+        assert descriptor["relative_root"] == "packages/demo"
+        assert descriptor["manifest_path"] == "packages/demo/package.json"
+        package_id = descriptor["package_id"]
+        assert isinstance(package_id, str)
+
+        status = server.project_index_status(
+            workspace_id,
+            sync_data["snapshot_id"],
+            package_ids=[package_id],
+        )
+        query = server.project_index_query(
+            workspace_id,
+            sync_data["snapshot_id"],
+            "selected_package_function",
+            package_ids=[package_id],
+        )
+    finally:
+        root.shutdown()
+
+    assert status["ok"] is True
+    assert query["ok"] is True
 
 
 def test_lease_and_relay_integrate_boundaries_reject_unknown_or_retired_fields() -> (

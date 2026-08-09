@@ -461,6 +461,7 @@ def project_index_status(
     workspace_id: str,
     snapshot_id: str | None = None,
     required_paths: list[str] | None = None,
+    package_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Read verified index status through the opaque workspace boundary."""
 
@@ -468,7 +469,10 @@ def project_index_status(
         "project_index_status",
         read_only=True,
         operation=lambda uow: uow.project_checkpoint.project_index.status(
-            workspace_id, snapshot_id, required_paths
+            workspace_id,
+            snapshot_id,
+            required_paths,
+            package_ids,
         ),
     )
 
@@ -487,6 +491,7 @@ def project_index_query(
     byte_budget: int = 32768,
     allow_miss_escape: bool = False,
     task_lease: TaskLeaseRef | None = None,
+    package_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Run a receipt-persisting bounded query against one workspace id."""
 
@@ -509,6 +514,7 @@ def project_index_query(
             source_lines=source_lines,
             byte_budget=byte_budget,
             allow_miss_escape=allow_miss_escape,
+            package_ids=package_ids,
         )
         if authority is not None:
             if lease is None:

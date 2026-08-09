@@ -40,6 +40,7 @@ from project_index.models import (
     IndexSnapshot,
     IndexState,
     IndexStatus,
+    PackageDescriptor,
     QueryResult,
     SourceWindow,
 )
@@ -48,6 +49,7 @@ RESULT_SCHEMA: Final = "2718lab-devkit/tool-result-v1"
 MAX_RESULT_BYTES: Final = 524_288
 MAX_STRING_BYTES: Final = 65_536
 MAX_LIST_ITEMS: Final = 512
+MAX_PACKAGE_CATALOG_ITEMS: Final = 2_048
 MAX_PUBLIC_DEPTH: Final = 32
 
 SUCCESS_KEYS: Final = frozenset({"schema", "ok", "data"})
@@ -170,6 +172,7 @@ _INDEX_ERROR_CODES = frozenset(
         "UNSAFE_WORKSPACE",
         "HISTORICAL_UNVERIFIED",
         "INDEX_UNAVAILABLE",
+        "INDEX_PARTIAL",
         "INDEX_STALE",
         "INDEX_CORRUPT",
         "INVALID_QUERY",
@@ -307,7 +310,10 @@ def _json_value(
         if depth >= MAX_PUBLIC_DEPTH:
             raise _fail("public value nesting exceeds bound")
         items = cast(list[object], value)
-        if len(items) > MAX_LIST_ITEMS:
+        item_limit = (
+            MAX_PACKAGE_CATALOG_ITEMS if key == "packages" else MAX_LIST_ITEMS
+        )
+        if len(items) > item_limit:
             raise _fail("public container exceeds item bound")
         container_id = id(value)
         active_ids = set() if active is None else active
@@ -473,6 +479,22 @@ def _gap(value: object) -> dict[str, object]:
     }
 
 
+def _package_descriptor(value: object) -> dict[str, object]:
+    if type(value) is not PackageDescriptor:
+        raise _fail("invalid project-index package descriptor")
+    ecosystem = _identifier(value.ecosystem)
+    if ecosystem not in {"python", "node", "cargo"}:
+        raise _fail("unsupported project-index package ecosystem")
+    return {
+        "package_id": _hash(value.package_id),
+        "ecosystem": ecosystem,
+        "name": _safe_string(value.name),
+        "relative_root": _relative_path(value.root_path, allow_empty=True),
+        "manifest_path": _relative_path(value.manifest_path),
+        "manifest_hash": _hash(value.manifest_hash),
+    }
+
+
 def _index_node(value: object) -> dict[str, object]:
     if type(value) is not IndexNode:
         raise _fail("invalid project-index node")
@@ -563,6 +585,14 @@ def _index_snapshot_data(snapshot: IndexSnapshot) -> dict[str, object]:
         "manifest_hash": _hash(snapshot.manifest_hash, allow_empty=True),
         "parser_set_hash": _hash(snapshot.parser_set_hash, allow_empty=True),
         "binding_state": _identifier(snapshot.binding_state),
+        # Package selectors must remain available beyond one generic result page;
+        # the response byte budget remains the outer public-output bound.
+        "packages": [
+            _package_descriptor(item)
+            for item in _bounded_list(
+                snapshot.packages, maximum=MAX_PACKAGE_CATALOG_ITEMS
+            )
+        ],
     }
     head = _optional_string(snapshot.head)
     if head is not None:

@@ -99,6 +99,7 @@ class ProjectCheckpointRuntime:
         source_lines: int = 12,
         byte_budget: int = 32768,
         allow_miss_escape: bool = False,
+        package_ids: Sequence[str] | None = None,
     ) -> QueryResult:
         """Persist a deterministic receipt through this runtime's RW service."""
 
@@ -118,6 +119,7 @@ class ProjectCheckpointRuntime:
             source_lines,
             byte_budget,
             allow_miss_escape,
+            package_ids,
         )
 
     def close(self) -> None:
