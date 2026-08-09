@@ -30,6 +30,7 @@ from .models import (
     IndexState,
     IndexStatus,
     PackageDescriptor,
+    PackagePage,
     QueryReceipt,
     QueryResult,
     SnapshotDiff,
@@ -43,6 +44,7 @@ from .store import ProjectIndexStore, StoreError
 from .workspace import is_workspace_id, workspace_identity
 
 _SNAPSHOT_FORMAT_VERSION = "project-index-snapshot-v5"
+_MAX_PACKAGE_PAGE_LIMIT = 128
 _READ_CHUNK_SIZE = 64 * 1024
 _REPARSE_POINT = 0x400
 _IGNORED_DIRECTORIES = frozenset(
@@ -757,6 +759,45 @@ class ProjectIndexService:
             packages=snapshot.packages,
         )
 
+    def package_page(
+        self,
+        workspace_id: str,
+        snapshot_id: str,
+        *,
+        offset: int,
+        limit: int,
+    ) -> PackagePage:
+        """Read one canonical descriptor page from an explicit persisted snapshot.
+
+        Pages are bounded to 128 descriptors so a caller can retrieve an
+        arbitrarily large package catalog without an unbounded result.
+        """
+
+        normalized_offset, normalized_limit = _normalize_package_page_parameters(
+            offset, limit
+        )
+        workspace_id, _ = self._workspace_for_reference(workspace_id)
+        snapshot = self._require_snapshot(
+            workspace_id, snapshot_id, allow_historical=True
+        )
+        packages = tuple(
+            sorted(snapshot.packages, key=package_descriptor_sort_key)
+        )
+        total_count = len(packages)
+        if normalized_offset > total_count:
+            raise IndexError(
+                "INVALID_QUERY", "package page offset exceeds snapshot package count"
+            )
+        end = min(total_count, normalized_offset + normalized_limit)
+        return PackagePage(
+            snapshot_id=snapshot.snapshot_id,
+            offset=normalized_offset,
+            limit=normalized_limit,
+            total_count=total_count,
+            packages=packages[normalized_offset:end],
+            next_offset=end if end < total_count else None,
+        )
+
     def read_snapshot_files(
         self,
         workspace_id: str,
@@ -1397,6 +1438,18 @@ def _normalize_package_ids(
     if supplied != tuple(sorted(set(supplied))):
         raise IndexError("INVALID_QUERY", "package ids must be unique and ordered")
     return supplied
+
+
+def _normalize_package_page_parameters(offset: int, limit: int) -> tuple[int, int]:
+    if type(offset) is not int or offset < 0:
+        raise IndexError(
+            "INVALID_QUERY", "package page offset must be a non-negative integer"
+        )
+    if type(limit) is not int or limit <= 0 or limit > _MAX_PACKAGE_PAGE_LIMIT:
+        raise IndexError(
+            "INVALID_QUERY", "package page limit must be between 1 and 128"
+        )
+    return offset, limit
 
 
 def _select_packages(

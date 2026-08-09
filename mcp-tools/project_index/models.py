@@ -89,6 +89,18 @@ class PackageDescriptor:
 
 
 @dataclass(frozen=True)
+class PackagePage:
+    """One immutable, snapshot-bound page of package descriptors."""
+
+    snapshot_id: str
+    offset: int
+    limit: int
+    total_count: int
+    packages: tuple[PackageDescriptor, ...]
+    next_offset: int | None
+
+
+@dataclass(frozen=True)
 class SourceWindow:
     path: str
     start_line: int

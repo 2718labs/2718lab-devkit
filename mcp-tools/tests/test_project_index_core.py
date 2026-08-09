@@ -742,6 +742,103 @@ def test_package_ids_require_none_for_legacy_full_scope(tmp_path: Path) -> None:
     service.close()
 
 
+def test_package_page_retrieves_a_snapshot_bound_catalog_beyond_512(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    for index in range(513):
+        package = workspace / "packages" / f"package-{index:03d}"
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            f'{{"name":"package-{index:03d}"}}\n', encoding="utf-8"
+        )
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    first = service.package_page(
+        workspace_id, snapshot.snapshot_id, offset=0, limit=128
+    )
+    assert first.snapshot_id == snapshot.snapshot_id
+    assert first.total_count == 513
+    assert first.offset == 0
+    assert first.limit == 128
+    assert first.next_offset == 128
+    assert first.packages == snapshot.packages[:128]
+
+    pages = [first]
+    while pages[-1].next_offset is not None:
+        pages.append(
+            service.package_page(
+                workspace_id,
+                snapshot.snapshot_id,
+                offset=pages[-1].next_offset,
+                limit=128,
+            )
+        )
+    assert tuple(page.offset for page in pages) == (0, 128, 256, 384, 512)
+    assert all(page.limit == 128 for page in pages)
+    assert pages[-1].next_offset is None
+    assert pages[-1].packages == snapshot.packages[512:]
+    assert tuple(
+        package for page in pages for package in page.packages
+    ) == snapshot.packages
+
+    (workspace / "packages" / "package-000" / "package.json").write_text(
+        '{"name":"changed-after-snapshot"}\n', encoding="utf-8"
+    )
+    assert (
+        service.package_page(workspace_id, snapshot.snapshot_id, offset=0, limit=1)
+        .packages
+        == snapshot.packages[:1]
+    )
+    service.close()
+
+
+@pytest.mark.parametrize(
+    ("offset", "limit"),
+    ((-1, 1), (0, 0), (0, 129), (True, 1), (0, True)),
+)
+def test_package_page_rejects_invalid_pagination_parameters(
+    tmp_path: Path, offset: int, limit: int
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "package.json").write_text('{"name":"root"}\n', encoding="utf-8")
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    with pytest.raises(IndexError) as captured:
+        service.package_page(
+            workspace_id, snapshot.snapshot_id, offset=offset, limit=limit
+        )
+    assert captured.value.code == "INVALID_QUERY"
+    service.close()
+
+
+def test_package_page_permits_the_end_offset_and_rejects_past_the_catalog(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "package.json").write_text('{"name":"root"}\n', encoding="utf-8")
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    end = service.package_page(
+        workspace_id, snapshot.snapshot_id, offset=1, limit=1
+    )
+    assert end.packages == ()
+    assert end.next_offset is None
+
+    with pytest.raises(IndexError) as captured:
+        service.package_page(workspace_id, snapshot.snapshot_id, offset=2, limit=1)
+    assert captured.value.code == "INVALID_QUERY"
+    service.close()
+
+
 def test_package_selector_rejects_a_boundary_not_fully_covered_by_snapshot(
     tmp_path: Path,
 ) -> None:
