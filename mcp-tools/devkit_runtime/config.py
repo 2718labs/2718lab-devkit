@@ -48,6 +48,14 @@ class RuntimeConfig:
         return self.data_root / "checkpoint-cas"
 
     @property
+    def continuity_database(self) -> Path:
+        return self.data_root / "continuity.sqlite3"
+
+    @property
+    def continuity_cas_root(self) -> Path:
+        return self.data_root / "continuity-cas"
+
+    @property
     def atlas_database(self) -> Path:
         return self.data_root / "atlas.sqlite3"
 
