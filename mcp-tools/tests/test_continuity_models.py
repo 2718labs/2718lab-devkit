@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,28 @@ def _index_node(*, start_byte: int = 12) -> IndexNode:
         provenance="resolved",
         start_byte=start_byte,
         end_byte=96,
+    )
+
+
+def _bound_receipt(
+    *,
+    exit_code: int = 0,
+    command_spec: object = ("python", "-m", "pytest", "tests/test_a.py"),
+) -> BoundExecutionReceipt:
+    return BoundExecutionReceipt(
+        receipt_id="receipt-1",
+        kind="command",
+        workflow_id="workflow-7",
+        task_id="task-8",
+        acceptance_id="acceptance-9",
+        workspace_hash=HASH_A,
+        output_snapshot_id="output-1",
+        command_spec=command_spec,  # type: ignore[arg-type]
+        command_spec_hash=HASH_B,
+        input_hash=HASH_C,
+        output_hash=HASH_A,
+        exit_code=exit_code,
+        success=True,
     )
 
 
@@ -355,3 +378,161 @@ def test_bound_receipt_rejects_host_absolute_paths_in_command_arguments() -> Non
             0,
             True,
         )
+
+
+@pytest.mark.parametrize(
+    "atom",
+    (
+        "/host-private",
+        "C:\\host-private",
+        "\\\\server\\share",
+        "//server/share",
+        "file:///host-private",
+        "FILE:///host-private",
+        "--rootdir=/host-private",
+        "--rootdir=C:\\host-private",
+        "--rootdir=\\\\server\\share",
+        "--rootdir=//server/share",
+        "--rootdir=file:///host-private",
+        "--rootdir=FILE:///host-private",
+    ),
+)
+def test_bound_receipt_rejects_absolute_paths_in_all_command_atom_forms(atom: str) -> None:
+    with pytest.raises(ContinuityError):
+        _bound_receipt(command_spec=("python", atom))
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: FrozenEntry([], "src/a.py", HASH_A, 1),
+        lambda: ChangedNode("node-1", "function", "src/a.py", HASH_A, provenance=[]),
+        lambda: _bound_receipt(command_spec=None),
+        lambda: FrozenView(HASH_A, HASH_B, HASH_C, _key(), None),
+    ),
+)
+def test_model_constructors_normalize_hostile_inputs(factory: object) -> None:
+    with pytest.raises(ContinuityError):
+        factory()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda key: replace(key, workflow_id="workflow-8"),
+        lambda key: replace(key, code_task_id="task-9"),
+        lambda key: replace(key, code_task_version=1),
+        lambda key: replace(key, acceptance_id="acceptance-10"),
+        lambda key: replace(key, ingestion_key="ingest-11"),
+        lambda key: replace(key, payload_hash=HASH_C),
+        lambda key: replace(key, evidence_binding_hash=HASH_C),
+    ),
+)
+def test_each_continuity_key_field_binds_key_identity(changed: object) -> None:
+    key = _key()
+    altered = changed(key)  # type: ignore[operator]
+
+    assert key.key_hash != altered.key_hash
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda entry: replace(entry, role="before_file"),
+        lambda entry: replace(entry, path="src/b.py"),
+        lambda entry: replace(entry, content_hash=HASH_C),
+        lambda entry: replace(entry, byte_length=5),
+    ),
+)
+def test_each_frozen_entry_field_binds_cas_identity(changed: object) -> None:
+    entry = FrozenEntry("after_file", "src/a.py", HASH_A, 4)
+    altered = changed(entry)  # type: ignore[operator]
+
+    assert cas_root_identity((entry,)) != cas_root_identity((altered,))
+
+
+def test_equal_frozen_view_inputs_are_byte_identical() -> None:
+    common = {
+        "key": _key(),
+        "entries": _entries(),
+        "input_snapshot_ids": ("input-1",),
+        "output_snapshot_ids": ("output-1",),
+        "checkpoint_ids": ("checkpoint-1",),
+        "query_ids": ("query-1",),
+        "verification_artifact_hashes": (HASH_C,),
+        "execution_receipt_ids": ("execution-1",),
+        "request_hash": HASH_A,
+        "evidence_hash": HASH_B,
+        "changed_nodes": (ChangedNode.from_index_node(_index_node()),),
+        "coverage_gaps": (CoverageGap("src/a.py", "PARSER_GAP", "unsupported"),),
+        "execution_receipts": (_bound_receipt(),),
+    }
+
+    first = FrozenView.create(**common)
+    second = FrozenView.create(**common)
+
+    assert first.manifest_json.encode("utf-8") == second.manifest_json.encode("utf-8")
+    assert first.view_id == second.view_id
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"input_snapshot_ids": ("input-2",)},
+        {"output_snapshot_ids": ("output-2",)},
+        {"checkpoint_ids": ("checkpoint-2",)},
+        {"query_ids": ("query-2",)},
+        {"verification_artifact_hashes": (HASH_A,)},
+        {"execution_receipt_ids": ("execution-2",)},
+        {"request_hash": HASH_C},
+        {"evidence_hash": HASH_C},
+        {"changed_nodes": (ChangedNode.from_index_node(_index_node(start_byte=13)),)},
+        {"coverage_gaps": (CoverageGap("src/a.py", "PARSER_GAP", "different"),)},
+        {"execution_receipts": (_bound_receipt(exit_code=1),)},
+    ),
+)
+def test_each_manifest_payload_component_binds_view_identity(
+    override: dict[str, object],
+) -> None:
+    common: dict[str, object] = {
+        "key": _key(),
+        "entries": _entries(),
+        "input_snapshot_ids": ("input-1",),
+        "output_snapshot_ids": ("output-1",),
+        "checkpoint_ids": ("checkpoint-1",),
+        "query_ids": ("query-1",),
+        "verification_artifact_hashes": (HASH_C,),
+        "execution_receipt_ids": ("execution-1",),
+        "request_hash": HASH_A,
+        "evidence_hash": HASH_B,
+        "changed_nodes": (ChangedNode.from_index_node(_index_node()),),
+        "coverage_gaps": (CoverageGap("src/a.py", "PARSER_GAP", "unsupported"),),
+        "execution_receipts": (_bound_receipt(),),
+    }
+    first = FrozenView.create(**common)  # type: ignore[arg-type]
+    second = FrozenView.create(**(common | override))  # type: ignore[arg-type]
+
+    assert first.manifest_hash != second.manifest_hash
+    assert first.view_id != second.view_id
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        lambda key, view: (replace(key, workflow_id="workflow-8"), view, "verified"),
+        lambda key, view: (key, FrozenView.create(key=key, entries=(FrozenEntry("after_file", "src/b.py", HASH_A, 4),)), "verified"),
+        lambda key, view: (key, view, "frozen"),
+    ),
+)
+def test_each_continuity_receipt_input_binds_receipt_identity(changed: object) -> None:
+    key = _key()
+    view = FrozenView.create(key=key, entries=_entries())
+    base = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="verified")
+    altered_key, altered_view, altered_kind = changed(key, view)  # type: ignore[operator]
+    altered = ContinuityReceipt.create(
+        key=altered_key,
+        view_id=altered_view.view_id,
+        kind=altered_kind,
+    )
+
+    assert base.receipt_hash != altered.receipt_hash

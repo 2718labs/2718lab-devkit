@@ -19,7 +19,9 @@ from .canonical import (
 
 _ENTRY_ROLES = frozenset({"before_file", "after_file"})
 _PROVENANCE_VALUES = frozenset({"observed", "resolved", "declared"})
-_COMMAND_ABSOLUTE_PATH_VALUE = re.compile(r"(?:^|=)(?:/|[A-Za-z]:[\\/])")
+_COMMAND_ABSOLUTE_PATH_VALUE = re.compile(
+    r"(?:^|=)(?:[A-Za-z]:[\\/]|[\\/]{2}|/|file:/)", re.IGNORECASE
+)
 
 
 class ContinuityError(ValueError):
@@ -77,7 +79,7 @@ class FrozenEntry:
     byte_length: int
 
     def __post_init__(self) -> None:
-        if self.role not in _ENTRY_ROLES:
+        if not isinstance(self.role, str) or self.role not in _ENTRY_ROLES:
             raise ContinuityError("ENTRY_ROLE_INVALID")
         _require_relative_path(self.path)
         _require_hash(self.content_hash)
@@ -125,7 +127,7 @@ class ChangedNode:
         attributes = _attribute_tuple(self.attributes)
         _require_text(self.extractor_id)
         _require_text(self.extractor_version)
-        if self.provenance not in _PROVENANCE_VALUES:
+        if not isinstance(self.provenance, str) or self.provenance not in _PROVENANCE_VALUES:
             raise ContinuityError("NODE_PROVENANCE_INVALID")
         _require_nonnegative_integer(self.start_byte, "NODE_BYTE_SPAN_INVALID")
         _require_nonnegative_integer(self.end_byte, "NODE_BYTE_SPAN_INVALID")
@@ -227,7 +229,7 @@ class BoundExecutionReceipt:
             self.output_hash,
         ):
             _require_hash(value)
-        command_spec = tuple(self.command_spec)
+        command_spec = _command_spec_tuple(self.command_spec)
         if not command_spec:
             raise ContinuityError("COMMAND_SPEC_INVALID")
         for item in command_spec:
@@ -281,9 +283,7 @@ class FrozenView:
         _require_hash(self.cas_root_hash)
         if not isinstance(self.key, ContinuityKey):
             raise ContinuityError("KEY_INVALID")
-        entries = tuple(self.entries)
-        if not all(isinstance(item, FrozenEntry) for item in entries):
-            raise ContinuityError("ENTRY_INVALID")
+        entries = _typed_tuple(self.entries, FrozenEntry, "ENTRY_INVALID")
         if tuple(sorted(entries, key=_entry_sort_key)) != entries:
             raise ContinuityError("ENTRIES_NOT_CANONICAL")
         if len({(item.role, item.path) for item in entries}) != len(entries):
@@ -357,13 +357,13 @@ class FrozenView:
         execution_receipts: tuple[BoundExecutionReceipt, ...]
         | list[BoundExecutionReceipt] = (),
     ) -> FrozenView:
-        ordered_entries = tuple(entries)
-        ordered_inputs = tuple(input_snapshot_ids)
-        ordered_outputs = tuple(output_snapshot_ids)
-        ordered_checkpoints = tuple(checkpoint_ids)
-        ordered_queries = tuple(query_ids)
-        ordered_artifacts = tuple(verification_artifact_hashes)
-        ordered_receipt_ids = tuple(execution_receipt_ids)
+        ordered_entries = _typed_tuple(entries, FrozenEntry, "ENTRY_INVALID")
+        ordered_inputs = _identifier_tuple(input_snapshot_ids)
+        ordered_outputs = _identifier_tuple(output_snapshot_ids)
+        ordered_checkpoints = _identifier_tuple(checkpoint_ids)
+        ordered_queries = _identifier_tuple(query_ids)
+        ordered_artifacts = _hash_tuple(verification_artifact_hashes)
+        ordered_receipt_ids = _identifier_tuple(execution_receipt_ids)
         ordered_nodes = _typed_tuple(
             changed_nodes, ChangedNode, "CHANGED_NODE_INVALID"
         )
@@ -545,6 +545,14 @@ def _typed_tuple(value: object, expected_type: type[Any], code: str) -> tuple[An
         raise ContinuityError(code) from error
     if not all(isinstance(item, expected_type) for item in result):
         raise ContinuityError(code)
+    return result
+
+
+def _command_spec_tuple(value: object) -> tuple[str, ...]:
+    try:
+        result = tuple(value)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ContinuityError("COMMAND_SPEC_INVALID") from error
     return result
 
 
