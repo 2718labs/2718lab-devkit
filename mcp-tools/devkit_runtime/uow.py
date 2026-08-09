@@ -178,6 +178,7 @@ class RuntimeUnitOfWork:
         """Project one accepted task and durably drain only its matching outbox row."""
 
         from devkit_atlas.models import AtlasError
+        from devkit_atlas.store import StoreConflictError
 
         self._assert_open()
         if self._read_only:
@@ -197,14 +198,22 @@ class RuntimeUnitOfWork:
                 self._published_pointer(continuity, attempt, attempt.view_id)
                 projection = self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
             else:
-                frozen_view = continuity.freeze(
-                    attempt, prepared.request, prepared.evidence
+                frozen_view, already_published = self._freeze_or_recover(
+                    continuity, attempt, prepared
                 )
                 projection = self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
-                self._publish_or_recover(continuity, attempt, frozen_view)
+                if not already_published:
+                    self._publish_or_recover(continuity, attempt, frozen_view)
             marking_outbox = True
             self._mark_atlas_acceptance_projected(acceptance_id, ingestion_key)
             return projection
+        except StoreConflictError as error:
+            atlas_error = AtlasError("ATLAS_EVIDENCE_CONFLICT")
+            if not marking_outbox:
+                self._record_atlas_acceptance_failure_safely(
+                    acceptance_id, ingestion_key, atlas_error
+                )
+            raise atlas_error from error
         except AtlasError as error:
             atlas_error = self._atlas_acceptance_error(error)
             if not marking_outbox:
@@ -418,6 +427,39 @@ class RuntimeUnitOfWork:
             raise
         except Exception as error:
             raise AtlasError("ATLAS_EVIDENCE_UNAVAILABLE") from error
+
+    def _freeze_or_recover(
+        self, continuity: ContinuityService, attempt: object, prepared: object
+    ) -> tuple[object, bool]:
+        """Freeze once, retaining only a proven same-fence concurrent result."""
+
+        from devkit_atlas.models import AtlasError
+        from devkit_continuity.store import ContinuityStoreError
+
+        try:
+            return continuity.freeze(attempt, prepared.request, prepared.evidence), False
+        except ContinuityStoreError as error:
+            if str(error) != "CONTINUITY_STATE_CONFLICT":
+                raise
+            current = continuity.store.current_attempt(attempt.key)
+            if (
+                current is None
+                or current.key != attempt.key
+                or current.fence_epoch != attempt.fence_epoch
+            ):
+                raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
+            if current.state == "frozen":
+                return (
+                    continuity.freeze(current, prepared.request, prepared.evidence),
+                    False,
+                )
+            if current.state != "published":
+                raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
+            frozen_view = continuity._typed_view(  # noqa: SLF001
+                attempt.key, prepared.request, prepared.evidence
+            )
+            self._published_pointer(continuity, current, frozen_view.view_id)
+            return frozen_view, True
 
     def _publish_or_recover(
         self, continuity: ContinuityService, attempt: object, frozen_view: object

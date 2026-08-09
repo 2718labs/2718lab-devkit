@@ -10,6 +10,7 @@ import pytest
 
 from devkit_atlas.models import AtlasError
 from devkit_atlas.service import AcceptedAtlasProjectionRequest
+from devkit_atlas.store import StoreConflictError
 from devkit_continuity.cas import ContinuityCasError
 from devkit_continuity.models import ContinuityAttempt, ContinuityKey, ContinuityPointer
 from devkit_continuity.store import ContinuityStoreError
@@ -77,6 +78,8 @@ class _Continuity:
         self.freeze_calls = 0
         self.publish_calls = 0
         self.freeze_error: Exception | None = None
+        self.freeze_race: str | None = None
+        self.typed_view_calls = 0
         self.race_mode: str | None = None
         self.publish_error: Exception | None = None
 
@@ -85,14 +88,33 @@ class _Continuity:
         return self.current
 
     def freeze(self, attempt: ContinuityAttempt, _request: object, _evidence: object) -> object:
-        assert attempt == self.current
         self.freeze_calls += 1
+        if self.freeze_race == "frozen":
+            self.freeze_race = None
+            self.current = ContinuityAttempt(
+                attempt.key, attempt.fence_epoch, "frozen", _VIEW, _RECEIPT
+            )
+            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+        if self.freeze_race == "published":
+            self.freeze_race = None
+            self._publish(_VIEW)
+            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+        if self.freeze_race == "published_different":
+            self.freeze_race = None
+            self._publish(_OTHER_VIEW)
+            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+        assert attempt == self.current
         if self.freeze_error is not None:
             raise self.freeze_error
         if self.current.state == "claimed":
             self.current = ContinuityAttempt(
                 attempt.key, attempt.fence_epoch, "frozen", _VIEW, _RECEIPT
             )
+        return SimpleNamespace(view_id=_VIEW)
+
+    def _typed_view(self, key: ContinuityKey, _request: object, _evidence: object) -> object:
+        assert key == self.current.key
+        self.typed_view_calls += 1
         return SimpleNamespace(view_id=_VIEW)
 
     def publish(self, attempt: ContinuityAttempt, view: object) -> ContinuityPointer:
@@ -143,7 +165,7 @@ class _Atlas:
         self.prepare_calls = 0
         self.project_calls = 0
         self.prepare_error: AtlasError | None = None
-        self.project_error: AtlasError | None = None
+        self.project_error: Exception | None = None
 
     def accept(self, *_args: object) -> object:
         raise AssertionError("UoW must not re-enter public Atlas.accept after freeze")
@@ -328,6 +350,91 @@ def test_private_atlas_evidence_failure_is_mapped_before_outbox_retry(
     assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
     assert orchestrator.outbox.state is AtlasOutboxState.PENDING
     assert orchestrator.outbox.retry_count == 1
+
+
+def test_same_fence_freeze_race_reuses_the_deterministic_frozen_view(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.freeze_race = "frozen"
+    request = atlas.prepared.request
+
+    projection = uow.accept_atlas(
+        request.workflow_id,
+        request.code_task_id,
+        request.acceptance_id,
+        request.ingestion_key,
+    )
+
+    assert projection == {"projection": 1}
+    assert continuity.freeze_calls == 2
+    assert continuity.current.state == "published"
+    assert orchestrator.outbox.state is AtlasOutboxState.PROJECTED
+    assert orchestrator.outbox.quarantine_count == 0
+
+
+def test_same_fence_published_freeze_race_requires_matching_view_and_pointer(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.freeze_race = "published"
+    request = atlas.prepared.request
+
+    projection = uow.accept_atlas(
+        request.workflow_id,
+        request.code_task_id,
+        request.acceptance_id,
+        request.ingestion_key,
+    )
+
+    assert projection == {"projection": 1}
+    assert continuity.typed_view_calls == 1
+    assert continuity.publish_calls == 0
+    assert continuity.current.state == "published"
+    assert orchestrator.outbox.state is AtlasOutboxState.PROJECTED
+    assert orchestrator.outbox.quarantine_count == 0
+
+
+def test_different_view_published_freeze_race_quarantines_the_exact_outbox(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.freeze_race = "published_different"
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+    assert atlas.project_calls == 0
+    assert orchestrator.outbox.state is AtlasOutboxState.QUARANTINED
+    assert orchestrator.outbox.quarantine_count == 1
+
+
+def test_prepared_atlas_store_conflict_is_quarantined_as_a_public_conflict(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, _continuity, orchestrator = _uow(tmp_path)
+    atlas.project_error = StoreConflictError("private store mismatch")
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+    assert "private" not in str(raised.value)
+    assert orchestrator.outbox.state is AtlasOutboxState.QUARANTINED
+    assert orchestrator.outbox.quarantine_count == 1
 
 
 def test_publish_availability_failure_keeps_the_frozen_view_for_retry(
