@@ -525,6 +525,8 @@ class SQLiteStore:
             or str(columns["key"]["type"]).casefold() != "text"
             or str(columns["value"]["type"]).casefold() != "text"
             or primary_key != ("key",)
+            or int(columns["key"]["hidden"]) != 0
+            or int(columns["value"]["hidden"]) != 0
             or not int(columns["key"]["notnull"])
             or not int(columns["value"]["notnull"])
         ):
@@ -545,6 +547,8 @@ class SQLiteStore:
             or str(columns["key"]["type"]).casefold() != "text"
             or str(columns["value"]["type"]).casefold() != "text"
             or primary_key != ("key",)
+            or int(columns["key"]["hidden"]) != 0
+            or int(columns["value"]["hidden"]) != 0
             or not int(columns["value"]["notnull"])
         ):
             raise StoreError("orchestrator store is not prepared")
