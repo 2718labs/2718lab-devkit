@@ -35,6 +35,17 @@ class ContinuityService:
         return view
 
     def publish(self, attempt: ContinuityAttempt, frozen_view: FrozenView):
+        current = self.store.current_attempt(attempt.key)
+        if (
+            attempt.state == "claimed"
+            and attempt.view_id is None
+            and attempt.receipt_hash is None
+            and current is not None
+            and current.fence_epoch == attempt.fence_epoch
+            and current.state == "frozen"
+            and current.view_id == frozen_view.view_id
+        ):
+            attempt = current
         return self.store.publish_attempt_atomic(attempt, frozen_view)
 
     def _typed_view(self, key: ContinuityKey, request: Any, evidence: Any) -> FrozenView:

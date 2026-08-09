@@ -35,7 +35,7 @@ from devkit_continuity.models import (  # noqa: E402
 from devkit_continuity.service import ContinuityService  # noqa: E402
 from devkit_continuity.store import ContinuityStore, ContinuityStoreError  # noqa: E402
 from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
-from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from devkit_runtime.config import RuntimeConfig, RuntimeConfigError  # noqa: E402
 from project_index.checkpoints import CheckpointFile  # noqa: E402
 from project_index.models import CoverageGap, IndexNode, SnapshotFile  # noqa: E402
 
@@ -54,16 +54,20 @@ def _view(key: ContinuityKey) -> FrozenView:
 
 
 def _config(tmp_path: Path) -> RuntimeConfig:
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(parents=True, exist_ok=True)
-    config = RuntimeConfig.load(
-        environ={"PLUGIN_DATA": str(tmp_path / "data"), "CODEX_TASK_TEMP": str(scratch)}
-    )
+    config = _unprepared_config(tmp_path)
     RuntimeBootstrap.run(
         config,
         proof_registry_bootstrap=lambda database: sqlite3.connect(database).close(),
     )
     return config
+
+
+def _unprepared_config(tmp_path: Path) -> RuntimeConfig:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    return RuntimeConfig.load(
+        environ={"PLUGIN_DATA": str(tmp_path / "data"), "CODEX_TASK_TEMP": str(scratch)}
+    )
 
 
 def _prepared_store(tmp_path: Path) -> tuple[RuntimeConfig, ContinuityStore]:
@@ -95,34 +99,13 @@ def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, Accep
     return key, request, evidence
 
 
-def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) -> None:
-    assert not hasattr(ContinuityStore, "bootstrap")
-    assert not hasattr(ContinuityCas, "bootstrap")
-    missing_root, missing_scratch = tmp_path / "missing-cas", tmp_path / "missing-scratch"
-    with pytest.raises(ContinuityCasError):
-        ContinuityCas.open_prepared(missing_root, missing_scratch, read_only=False)
-    assert not missing_root.exists() and not missing_scratch.exists()
-    config = _config(tmp_path)
-    store = ContinuityStore.open_readwrite(
-        config.continuity_database, config.continuity_cas_root, config.scratch_root
-    )
-    store.close()
-    assert config.continuity_database.exists() and config.continuity_cas_root.is_dir()
-    with sqlite3.connect(config.continuity_database) as connection:
-        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
-    _config(tmp_path)
-
-
-def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: Path) -> None:
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-    config = RuntimeConfig.load(
-        environ={"PLUGIN_DATA": str(tmp_path / "data"), "CODEX_TASK_TEMP": str(scratch)}
-    )
-    config.data_root.mkdir()
+def _create_verified_v1(
+    config: RuntimeConfig, *, direct_frozen: bool = False
+) -> tuple[ContinuityKey, FrozenView, ContinuityReceipt]:
+    config.data_root.mkdir(parents=True, exist_ok=True)
     key, view = _key(), _view(_key())
-    receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen")
+    frozen = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen")
+    published = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published")
     with sqlite3.connect(config.continuity_database) as connection:
         connection.executescript(
             """
@@ -146,18 +129,79 @@ def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: 
             "INSERT INTO entries(view_id,role,path,content_hash,byte_length) VALUES(?,?,?,?,?)",
             [(view.view_id, item.role, item.path, item.content_hash, item.byte_length) for item in view.entries],
         )
-        connection.execute(
-            "INSERT INTO receipts(receipt_hash,key_hash,view_id,kind,receipt_json) VALUES(?,?,?,?,?)",
-            (receipt.receipt_hash, key.key_hash, view.view_id, "frozen", canonical_json({"key": key.to_dict(), "view_id": view.view_id, "kind": "frozen"})),
+        for receipt in (frozen, published):
+            connection.execute(
+                "INSERT INTO receipts(receipt_hash,key_hash,view_id,kind,receipt_json) VALUES(?,?,?,?,?)",
+                (receipt.receipt_hash, key.key_hash, view.view_id, receipt.kind, canonical_json({"key": key.to_dict(), "view_id": view.view_id, "kind": receipt.kind})),
+            )
+        attempts = (
+            ((key.key_hash, canonical_json(key.to_dict()), 1, 1, "frozen", view.view_id, frozen.receipt_hash),)
+            if direct_frozen
+            else (
+                (key.key_hash, canonical_json(key.to_dict()), 1, 1, "claimed", None, None),
+                (key.key_hash, canonical_json(key.to_dict()), 1, 2, "frozen", view.view_id, frozen.receipt_hash),
+            )
         )
-        connection.execute(
+        connection.executemany(
             "INSERT INTO attempts(key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash) VALUES(?,?,?,?,?,?,?)",
-            (key.key_hash, canonical_json(key.to_dict()), 1, 1, "frozen", view.view_id, receipt.receipt_hash),
+            attempts,
         )
         connection.execute(
             "INSERT INTO pointers(workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch) VALUES(?,?,?,?,?,?)",
             (key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, 1, 1),
         )
+    return key, view, frozen
+
+
+def _restore_v1_update_trigger(connection: sqlite3.Connection, table: str) -> None:
+    connection.execute(
+        f"CREATE TRIGGER {table}_immutable_update BEFORE UPDATE ON {table} "
+        "BEGIN SELECT RAISE(ABORT, 'CONTINUITY_IMMUTABLE'); END"
+    )
+
+
+def _assert_v1_not_switched(config: RuntimeConfig) -> None:
+    with sqlite3.connect(config.continuity_database) as connection:
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"schema_metadata", "views", "entries", "receipts", "attempts", "pointers"} <= names
+        assert not {"continuity_keys", "views_v1", "entries_v1", "receipts_v1", "attempts_v1", "pointers_v1"} & names
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "1"
+        assert connection.execute("SELECT COUNT(*) FROM views").fetchone()[0] == 1
+
+
+def _v1_state_snapshot(config: RuntimeConfig) -> tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]:
+    with sqlite3.connect(config.continuity_database) as connection:
+        return tuple(
+            (
+                table,
+                tuple(connection.execute(f"SELECT * FROM {table} ORDER BY rowid")),
+            )
+            for table in ("schema_metadata", "views", "entries", "receipts", "attempts", "pointers")
+        )
+
+
+def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) -> None:
+    assert not hasattr(ContinuityStore, "bootstrap")
+    assert not hasattr(ContinuityCas, "bootstrap")
+    missing_root, missing_scratch = tmp_path / "missing-cas", tmp_path / "missing-scratch"
+    with pytest.raises(ContinuityCasError):
+        ContinuityCas.open_prepared(missing_root, missing_scratch, read_only=False)
+    assert not missing_root.exists() and not missing_scratch.exists()
+    config = _config(tmp_path)
+    store = ContinuityStore.open_readwrite(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+    store.close()
+    assert config.continuity_database.exists() and config.continuity_cas_root.is_dir()
+    with sqlite3.connect(config.continuity_database) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
+    _config(tmp_path)
+
+
+def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    key, view, receipt = _create_verified_v1(config)
     RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
     with sqlite3.connect(config.continuity_database) as connection:
         assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "2"
@@ -170,6 +214,82 @@ def test_runtime_bootstrap_transactionally_migrates_verified_v1_state(tmp_path: 
     assert migrated.current_attempt(key) == ContinuityAttempt(key, 1, "frozen", view.view_id, receipt.receipt_hash)
     assert migrated.pointer_for(key) is not None
     migrated.close()
+
+
+def test_runtime_bootstrap_migrates_verified_legacy_direct_frozen_v1_state(tmp_path: Path) -> None:
+    config = _unprepared_config(tmp_path)
+    key, view, receipt = _create_verified_v1(config, direct_frozen=True)
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    migrated = ContinuityStore.open_readwrite(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+    assert migrated.current_attempt(key) == ContinuityAttempt(key, 1, "frozen", view.view_id, receipt.receipt_hash)
+    assert migrated.pointer_for(key) is not None
+    migrated.close()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "manifest_hash",
+        "cas_root_hash",
+        "view_id",
+        "receipt_payload",
+        "receipt_hash",
+        "attempt_receipt",
+        "pointer_fence",
+    ),
+)
+def test_runtime_bootstrap_rejects_tampered_v1_without_switching_legacy_tables(
+    tmp_path: Path, tamper: str
+) -> None:
+    config = _unprepared_config(tmp_path)
+    key, view, receipt = _create_verified_v1(config)
+    with sqlite3.connect(config.continuity_database) as connection:
+        if tamper == "manifest_hash":
+            connection.execute("DROP TRIGGER views_immutable_update")
+            connection.execute("UPDATE views SET manifest_hash=?", (_hash(b"tampered manifest"),))
+            _restore_v1_update_trigger(connection, "views")
+        elif tamper == "cas_root_hash":
+            connection.execute("DROP TRIGGER views_immutable_update")
+            connection.execute("UPDATE views SET cas_root_hash=?", (_hash(b"tampered cas root"),))
+            _restore_v1_update_trigger(connection, "views")
+        elif tamper == "view_id":
+            changed_view_id = _hash(b"tampered view")
+            for table in ("views", "entries", "receipts", "attempts"):
+                connection.execute(f"DROP TRIGGER {table}_immutable_update")
+            for table in ("views", "entries", "receipts", "pointers"):
+                connection.execute(f"UPDATE {table} SET view_id=?", (changed_view_id,))
+            connection.execute("UPDATE attempts SET view_id=? WHERE state!='claimed'", (changed_view_id,))
+            for table in ("views", "entries", "receipts", "attempts"):
+                _restore_v1_update_trigger(connection, table)
+        elif tamper == "receipt_payload":
+            connection.execute("DROP TRIGGER receipts_immutable_update")
+            connection.execute("UPDATE receipts SET receipt_json='{}' WHERE receipt_hash=?", (receipt.receipt_hash,))
+            _restore_v1_update_trigger(connection, "receipts")
+        elif tamper == "receipt_hash":
+            changed_receipt_hash = _hash(b"tampered receipt")
+            for table in ("receipts", "attempts"):
+                connection.execute(f"DROP TRIGGER {table}_immutable_update")
+            connection.execute("UPDATE receipts SET receipt_hash=? WHERE receipt_hash=?", (changed_receipt_hash, receipt.receipt_hash))
+            connection.execute("UPDATE attempts SET receipt_hash=? WHERE state='published'", (changed_receipt_hash,))
+            for table in ("receipts", "attempts"):
+                _restore_v1_update_trigger(connection, table)
+        elif tamper == "attempt_receipt":
+            published = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published")
+            connection.execute("DROP TRIGGER attempts_immutable_update")
+            connection.execute("UPDATE attempts SET receipt_hash=? WHERE state='frozen'", (published.receipt_hash,))
+            _restore_v1_update_trigger(connection, "attempts")
+        elif tamper == "pointer_fence":
+            connection.execute("UPDATE pointers SET fence_epoch=2")
+        else:
+            raise AssertionError(f"unknown tamper: {tamper}")
+    before = _v1_state_snapshot(config)
+    with pytest.raises(RuntimeConfigError) as error:
+        RuntimeBootstrap.run(config, proof_registry_bootstrap=lambda database: sqlite3.connect(database).close())
+    assert error.value.code == "DATA_ROOT_UNAVAILABLE"
+    _assert_v1_not_switched(config)
+    assert _v1_state_snapshot(config) == before
 
 
 def test_readonly_open_never_creates_database_or_cas(tmp_path: Path) -> None:
@@ -190,26 +310,23 @@ def test_cas_verifies_bytes_and_preserves_existing_content(tmp_path: Path) -> No
     assert cas.read_verified(digest, len(body)) == body
 
 
-def test_store_has_immutable_relations_append_only_attempts_and_fenced_pointer_cas(tmp_path: Path) -> None:
-    _, store = _prepared_store(tmp_path)
-    key, view = _key(), _view(_key())
-    receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen")
-    assert store.insert_or_get_view(view, view.manifest_json) == view
-    assert store.insert_or_get_receipt(receipt, "{}") == receipt
-    first = store.append_attempt_event(key, 1, "claimed", None, None)
-    second = store.append_attempt_event(key, 1, "frozen", view.view_id, receipt.receipt_hash)
-    assert (first.state, second.state, store.current_attempt(key).state) == ("claimed", "frozen", "frozen")
+def test_state_machine_is_only_lifecycle_write_surface_and_relations_are_immutable(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    for name in ("append_attempt_event", "insert_or_get_view", "insert_or_get_receipt", "compare_and_swap_pointer"):
+        assert not hasattr(store, name)
+    service = ContinuityService(
+        store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
+    )
+    key, request, evidence = _typed_inputs()
+    claimed = service.claim_or_reuse(key)
+    view = service.freeze(claimed, request, evidence)
+    pointer = service.publish(claimed, view)
+    assert pointer.view_id == view.view_id
+    assert store.current_attempt(key) is not None
+    assert store.current_attempt(key).state == "published"
     with pytest.raises(sqlite3.DatabaseError):
         store._connection.execute("DELETE FROM views")
     store._connection.rollback()
-    assert store.compare_and_swap_pointer(key, view, 0, 0, 1).pointer_version == 1
-    with pytest.raises(ContinuityStoreError):
-        store.compare_and_swap_pointer(key, view, 0, 1, 1)
-    with pytest.raises(ContinuityStoreError):
-        store.compare_and_swap_pointer(key, view, 1, 99, 99)
-    assert store.compare_and_swap_pointer(key, view, 1, 1, 2).pointer_version == 2
-    with pytest.raises(ContinuityStoreError):
-        store.compare_and_swap_pointer(key, view, 2, 0, 2)
     store.close()
 
 
@@ -223,6 +340,60 @@ def test_service_equal_freeze_reuses_and_changed_view_conflicts(tmp_path: Path) 
     _, _, altered = _typed_inputs(after_body=b"altered")
     with pytest.raises(ContinuityStoreError):
         service.freeze(attempt, request, altered)
+
+
+def test_service_publishes_from_original_claim_and_rejects_noncurrent_attempt(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
+    )
+    key, request, evidence = _typed_inputs()
+    claimed = service.claim_or_reuse(key)
+    view = service.freeze(claimed, request, evidence)
+    pointer = service.publish(claimed, view)
+    assert pointer.view_id == view.view_id
+    assert store.current_attempt(key).state == "published"
+    published_receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published")
+    store._connection.execute(
+        "INSERT INTO attempts(key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash) VALUES(?,?,?,?,?,?,?)",
+        (key.key_hash, canonical_json(key.to_dict()), 1, 4, "abandoned", view.view_id, published_receipt.receipt_hash),
+    )
+    store._connection.commit()
+    assert service.claim_or_reuse(key) == ContinuityAttempt(key, 2, "claimed", None, None)
+    with pytest.raises(ContinuityStoreError):
+        service.publish(claimed, view)
+
+
+def test_service_only_upgrades_the_original_claim_to_current_frozen_attempt(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
+    )
+    key, request, evidence = _typed_inputs()
+    claimed = service.claim_or_reuse(key)
+    view = service.freeze(claimed, request, evidence)
+    forged = ContinuityAttempt(key, claimed.fence_epoch, "published", view.view_id, _hash(b"forged"))
+    with pytest.raises(ContinuityStoreError):
+        service.publish(forged, view)
+    assert service.publish(claimed, view).view_id == view.view_id
+
+
+def test_claim_or_reuse_reuses_active_attempt_at_each_lifecycle_state(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(
+        store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False)
+    )
+    key, request, evidence = _typed_inputs()
+    claimed = service.claim_or_reuse(key)
+    assert service.claim_or_reuse(key) == claimed
+    view = service.freeze(claimed, request, evidence)
+    frozen = store.current_attempt(key)
+    assert frozen is not None and frozen.state == "frozen"
+    assert service.claim_or_reuse(key) == frozen
+    service.publish(claimed, view)
+    published = store.current_attempt(key)
+    assert published is not None and published.state == "published"
+    assert service.claim_or_reuse(key) == published
 
 
 def test_prepared_open_rejects_same_name_noop_trigger_and_pointer_shape(tmp_path: Path) -> None:
@@ -275,15 +446,26 @@ def test_unrelated_typed_evidence_fails_before_cas_or_database_write(tmp_path: P
     assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
 
 
-def test_atomic_claim_fence_rejects_stale_freeze_and_publish(tmp_path: Path) -> None:
+def test_atomic_current_fence_rejects_stale_freeze_and_publish(tmp_path: Path) -> None:
     _, store = _prepared_store(tmp_path)
     key, view = _key(), _view(_key())
     first = store.claim_or_reuse_atomic(key)
+    frozen_receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen")
+    frozen = store.freeze_attempt_atomic(first, view, frozen_receipt)
+    store.publish_attempt_atomic(frozen, view)
+    published = store.current_attempt(key)
+    assert published is not None and published.state == "published"
+    published_receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published")
+    store._connection.executemany(
+        "INSERT INTO attempts(key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash) VALUES(?,?,?,?,?,?,?)",
+        (
+            (key.key_hash, canonical_json(key.to_dict()), 1, 4, "abandoned", view.view_id, published_receipt.receipt_hash),
+        ),
+    )
+    store._connection.commit()
     second = store.claim_or_reuse_atomic(key)
-    assert (first.fence_epoch, second.fence_epoch) == (1, 2)
+    assert second == ContinuityAttempt(key, 2, "claimed", None, None)
     receipt = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen")
-    with pytest.raises(ContinuityError):
-        store.append_attempt_event(key, 1, "claimed", None, None)
     with pytest.raises(ContinuityError):
         store.freeze_attempt_atomic(first, view, receipt)
     with pytest.raises(ContinuityError):
@@ -347,6 +529,25 @@ def test_atomic_sqlite_races_normalize_to_continuity_error(
     monkeypatch.setattr(store, "_append_attempt_row", duplicate, raising=False)
     with pytest.raises(ContinuityError):
         store.claim_or_reuse_atomic(key)
+
+
+@pytest.mark.parametrize("error_type", (RuntimeError, TypeError))
+def test_atomic_rolls_back_unexpected_exception_and_connection_remains_usable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    _, store = _prepared_store(tmp_path)
+    key = _key()
+    original = store._append_attempt_row
+
+    def explode(*_args: object) -> None:
+        raise error_type("injected")
+
+    monkeypatch.setattr(store, "_append_attempt_row", explode)
+    with pytest.raises(error_type, match="injected"):
+        store.claim_or_reuse_atomic(key)
+    assert store._connection.execute("SELECT COUNT(*) FROM continuity_keys").fetchone()[0] == 0
+    monkeypatch.setattr(store, "_append_attempt_row", original)
+    assert store.claim_or_reuse_atomic(key) == ContinuityAttempt(key, 1, "claimed", None, None)
 
 
 def test_atomic_initial_pointer_integrity_race_normalizes_and_rolls_back(
