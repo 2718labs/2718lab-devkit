@@ -371,6 +371,153 @@ class ContinuityStore:
             row["fence_epoch"],
         )
 
+    def replay_view_for(self, key: ContinuityKey) -> FrozenView:
+        """Rebuild only the exact current, published v2 view for offline replay."""
+        if type(key) is not ContinuityKey:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        try:
+            with self._replay_snapshot():
+                key_row = self._connection.execute(
+                    "SELECT key_json,workflow_id,code_task_id,code_task_version,"
+                    "acceptance_id,ingestion_key,payload_hash,evidence_binding_hash "
+                    "FROM continuity_keys WHERE key_hash=?",
+                    (key.key_hash,),
+                ).fetchone()
+                if key_row is None or (
+                    key_row["key_json"] != canonical_json(key.to_dict())
+                    or (
+                        key_row["workflow_id"],
+                        key_row["code_task_id"],
+                        key_row["code_task_version"],
+                        key_row["acceptance_id"],
+                        key_row["ingestion_key"],
+                        key_row["payload_hash"],
+                        key_row["evidence_binding_hash"],
+                    )
+                    != (
+                        key.workflow_id,
+                        key.code_task_id,
+                        key.code_task_version,
+                        key.acceptance_id,
+                        key.ingestion_key,
+                        key.payload_hash,
+                        key.evidence_binding_hash,
+                    )
+                ):
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                attempt_row = self._connection.execute(
+                    "SELECT key_json,fence_epoch,state,view_id,receipt_hash FROM attempts "
+                    "WHERE key_hash=? ORDER BY sequence DESC LIMIT 1",
+                    (key.key_hash,),
+                ).fetchone()
+                if (
+                    attempt_row is None
+                    or attempt_row["key_json"] != canonical_json(key.to_dict())
+                ):
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                attempt = ContinuityAttempt(
+                    key,
+                    attempt_row["fence_epoch"],
+                    attempt_row["state"],
+                    attempt_row["view_id"],
+                    attempt_row["receipt_hash"],
+                )
+                if (
+                    attempt.state != "published"
+                    or attempt.view_id is None
+                    or attempt.receipt_hash is None
+                ):
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                pointer_row = self._connection.execute(
+                    "SELECT key_hash,workflow_id,code_task_id,code_task_version,"
+                    "view_id,pointer_version,fence_epoch FROM pointers WHERE key_hash=?",
+                    (key.key_hash,),
+                ).fetchone()
+                if pointer_row is None:
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                pointer = ContinuityPointer(
+                    pointer_row["workflow_id"],
+                    pointer_row["code_task_id"],
+                    pointer_row["code_task_version"],
+                    pointer_row["view_id"],
+                    pointer_row["pointer_version"],
+                    pointer_row["fence_epoch"],
+                )
+                if (
+                    pointer_row["key_hash"] != key.key_hash
+                    or (
+                        pointer.workflow_id,
+                        pointer.code_task_id,
+                        pointer.code_task_version,
+                    )
+                    != (key.workflow_id, key.code_task_id, key.code_task_version)
+                    or pointer.view_id != attempt.view_id
+                    or pointer.fence_epoch != attempt.fence_epoch
+                ):
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                receipt_row = self._connection.execute(
+                    "SELECT key_hash,view_id,kind,receipt_json FROM receipts "
+                    "WHERE receipt_hash=?",
+                    (attempt.receipt_hash,),
+                ).fetchone()
+                expected_receipt = ContinuityReceipt.create(
+                    key=key, view_id=attempt.view_id, kind="published"
+                )
+                if (
+                    attempt.receipt_hash != expected_receipt.receipt_hash
+                    or receipt_row is None
+                    or receipt_row["key_hash"] != key.key_hash
+                    or receipt_row["view_id"] != attempt.view_id
+                    or receipt_row["kind"] != "published"
+                    or receipt_row["receipt_json"] != _receipt_json(expected_receipt)
+                ):
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                view_row = self._connection.execute(
+                    "SELECT view_id,key_hash,manifest_hash,cas_root_hash,manifest_json "
+                    "FROM views WHERE view_id=? AND key_hash=?",
+                    (attempt.view_id, key.key_hash),
+                ).fetchone()
+                if view_row is None:
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                entries = tuple(
+                    FrozenEntry(
+                        row["role"],
+                        row["path"],
+                        row["content_hash"],
+                        row["byte_length"],
+                    )
+                    for row in self._connection.execute(
+                        "SELECT role,path,content_hash,byte_length FROM entries "
+                        "WHERE view_id=? ORDER BY role,path,content_hash",
+                        (attempt.view_id,),
+                    )
+                )
+                view = _frozen_view_from_manifest(key, view_row, entries)
+                if (
+                    view.key != key
+                    or view.view_id != attempt.view_id
+                    or view.view_id != pointer.view_id
+                    or view.replay_metadata is None
+                ):
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                return view
+        except ContinuityStoreError:
+            raise
+        except (sqlite3.Error, OSError, ContinuityError, KeyError, TypeError, ValueError) as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+
+    @contextmanager
+    def _replay_snapshot(self) -> Iterator[None]:
+        self._connection.execute("SAVEPOINT continuity_replay_snapshot")
+        try:
+            yield
+        except Exception:
+            self._connection.execute("ROLLBACK TO SAVEPOINT continuity_replay_snapshot")
+            self._connection.execute("RELEASE SAVEPOINT continuity_replay_snapshot")
+            raise
+        else:
+            self._connection.execute("RELEASE SAVEPOINT continuity_replay_snapshot")
+
     @contextmanager
     def _atomic(self) -> Iterator[None]:
         self._writable()

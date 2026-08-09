@@ -924,6 +924,207 @@ def test_service_freeze_accepts_atlas_write_receipt_with_empty_command_spec(
     assert view.execution_receipts[0].command_spec == ()
 
 
+class _ReplayCas:
+    def __init__(
+        self,
+        bodies: dict[tuple[str, int], bytes],
+        *,
+        fail_at_read: int | None = None,
+    ) -> None:
+        self._bodies = bodies
+        self._fail_at_read = fail_at_read
+        self.calls: list[tuple[str, int]] = []
+
+    def read_verified(self, content_hash: str, byte_length: int) -> bytes:
+        self.calls.append((content_hash, byte_length))
+        if self._fail_at_read == len(self.calls):
+            raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
+        try:
+            return self._bodies[(content_hash, byte_length)]
+        except KeyError as error:
+            raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
+
+
+def _published_v2_replay(
+    tmp_path: Path,
+) -> tuple[RuntimeConfig, ContinuityStore, ContinuityCas, ContinuityKey, FrozenView]:
+    config, store = _prepared_store(tmp_path)
+    cas = ContinuityCas.open_prepared(
+        config.continuity_cas_root, config.scratch_root, read_only=False
+    )
+    service = ContinuityService(store, cas)
+    key, request, evidence = _typed_inputs()
+    attempt = service.claim_or_reuse(key)
+    view = service.freeze(attempt, request, evidence)
+    service.publish(attempt, view)
+    return config, store, cas, key, view
+
+
+def test_service_verify_and_materialize_published_v2_replay_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, writer_store, writer_cas, key, view = _published_v2_replay(tmp_path)
+    bodies = {
+        (_hash(b"before"), len(b"before")): b"before",
+        (_hash(b"after"), len(b"after")): b"after",
+    }
+    replay_cas = _ReplayCas(bodies)
+    reader_store: ContinuityStore | None = None
+    try:
+        writer_cas.close()
+        writer_store.close()
+        reader_store = ContinuityStore.open_readonly(
+            config.continuity_database, config.continuity_cas_root, config.scratch_root
+        )
+        replay = ContinuityService(reader_store, replay_cas)
+        monkeypatch.setattr(
+            replay,
+            "_typed_view",
+            lambda *_args: pytest.fail("offline replay must not build an Atlas view"),
+        )
+
+        assert reader_store.replay_view_for(key) == view
+        assert replay.verify_replay(key) == view
+        assert replay_cas.calls == []
+        assert replay.materialize_replay(key) == tuple(
+            (entry, bodies[(entry.content_hash, entry.byte_length)])
+            for entry in view.entries
+        )
+        assert replay_cas.calls == [
+            (entry.content_hash, entry.byte_length) for entry in view.entries
+        ]
+    finally:
+        if reader_store is not None:
+            reader_store.close()
+
+
+def test_materialize_replay_rejects_v1_before_cas_read(tmp_path: Path) -> None:
+    _config, store = _prepared_store(tmp_path)
+    key = _key()
+    view = _view(key)
+    attempt = store.claim_or_reuse_atomic(key)
+    frozen = store.freeze_attempt_atomic(
+        attempt,
+        view,
+        ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen"),
+    )
+    store.publish_attempt_atomic(frozen, view)
+    replay_cas = _ReplayCas({})
+
+    try:
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+            ContinuityService(store, replay_cas).materialize_replay(key)
+        assert replay_cas.calls == []
+    finally:
+        store.close()
+
+
+def test_materialize_replay_rejects_frozen_unpublished_view_before_cas_read(
+    tmp_path: Path,
+) -> None:
+    config, store = _prepared_store(tmp_path)
+    writer_cas = ContinuityCas.open_prepared(
+        config.continuity_cas_root, config.scratch_root, read_only=False
+    )
+    writer = ContinuityService(store, writer_cas)
+    key, request, evidence = _typed_inputs()
+    writer.freeze(writer.claim_or_reuse(key), request, evidence)
+    replay_cas = _ReplayCas({})
+
+    try:
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+            ContinuityService(store, replay_cas).materialize_replay(key)
+        assert replay_cas.calls == []
+    finally:
+        writer_cas.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("missing_pointer", "key_mismatch", "view_mismatch", "fence_mismatch"),
+)
+def test_materialize_replay_rejects_pointer_mismatch_before_cas_read(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    _config, store, writer_cas, key, _view = _published_v2_replay(tmp_path)
+    if tamper == "missing_pointer":
+        store._connection.execute(
+            "DELETE FROM pointers WHERE workflow_id=? AND code_task_id=? AND code_task_version=?",
+            (key.workflow_id, key.code_task_id, key.code_task_version),
+        )
+    elif tamper == "key_mismatch":
+        store._connection.execute(
+            "UPDATE pointers SET workflow_id=? WHERE key_hash=?",
+            ("other-workflow", key.key_hash),
+        )
+    elif tamper == "view_mismatch":
+        store._connection.execute("PRAGMA foreign_keys=OFF")
+        store._connection.execute(
+            "UPDATE pointers SET view_id=? WHERE workflow_id=? AND code_task_id=? AND code_task_version=?",
+            (_hash(b"other-view"), key.workflow_id, key.code_task_id, key.code_task_version),
+        )
+        store._connection.execute("PRAGMA foreign_keys=ON")
+    else:
+        assert tamper == "fence_mismatch"
+        store._connection.execute(
+            "UPDATE pointers SET fence_epoch=fence_epoch+1 WHERE workflow_id=? AND code_task_id=? AND code_task_version=?",
+            (key.workflow_id, key.code_task_id, key.code_task_version),
+        )
+    store._connection.commit()
+    replay_cas = _ReplayCas({})
+
+    try:
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+            ContinuityService(store, replay_cas).materialize_replay(key)
+        assert replay_cas.calls == []
+    finally:
+        writer_cas.close()
+        store.close()
+
+
+def test_materialize_replay_returns_no_partial_result_after_cas_failure(
+    tmp_path: Path,
+) -> None:
+    _config, store, writer_cas, key, view = _published_v2_replay(tmp_path)
+    bodies = {
+        (_hash(b"before"), len(b"before")): b"before",
+        (_hash(b"after"), len(b"after")): b"after",
+    }
+    replay_cas = _ReplayCas(bodies, fail_at_read=2)
+    result: tuple[tuple[FrozenEntry, bytes], ...] | None = None
+
+    try:
+        with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+            result = ContinuityService(store, replay_cas).materialize_replay(key)
+        assert result is None
+        assert replay_cas.calls == [
+            (entry.content_hash, entry.byte_length) for entry in view.entries
+        ]
+    finally:
+        writer_cas.close()
+        store.close()
+
+
+def test_materialize_replay_rejects_missing_cas_content_without_result(
+    tmp_path: Path,
+) -> None:
+    _config, store, writer_cas, key, _view = _published_v2_replay(tmp_path)
+    replay_cas = _ReplayCas({})
+    result: tuple[tuple[FrozenEntry, bytes], ...] | None = None
+
+    try:
+        with pytest.raises(ContinuityCasError, match="CONTINUITY_CAS_UNAVAILABLE"):
+            result = ContinuityService(store, replay_cas).materialize_replay(key)
+        assert result is None
+        assert len(replay_cas.calls) == 1
+    finally:
+        writer_cas.close()
+        store.close()
+
+
 def test_v1_audit_parser_keeps_legacy_manifest_nonreplayable(tmp_path: Path) -> None:
     config = _unprepared_config(tmp_path)
     key, view, _receipt = _create_verified_v1(config)

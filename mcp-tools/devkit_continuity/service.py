@@ -51,6 +51,25 @@ class ContinuityService:
             attempt = current
         return self.store.publish_attempt_atomic(attempt, frozen_view)
 
+    def verify_replay(self, key: ContinuityKey) -> FrozenView:
+        """Return a revalidated v2 view without consulting Atlas or the CAS."""
+        return self.store.replay_view_for(key)
+
+    def materialize_replay(
+        self, key: ContinuityKey
+    ) -> tuple[tuple[FrozenEntry, bytes], ...]:
+        """Read every canonical replay entry only after offline verification succeeds."""
+        view = self.verify_replay(key)
+        materialized: list[tuple[FrozenEntry, bytes]] = []
+        for entry in view.entries:
+            materialized.append(
+                (
+                    entry,
+                    self.cas.read_verified(entry.content_hash, entry.byte_length),
+                )
+            )
+        return tuple(materialized)
+
     def _typed_view(self, key: ContinuityKey, request: Any, evidence: Any) -> FrozenView:
         from devkit_atlas.extractors import ExtractionRequest
         from devkit_atlas.models import AtlasError
