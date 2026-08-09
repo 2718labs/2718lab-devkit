@@ -40,6 +40,125 @@ from .models import (
     WorkflowState,
 )
 
+_ATLAS_OUTBOX_REQUIRED_CHECKS = frozenset(
+    {
+        ("ingestion_key", "=", "payload_hash"),
+        (
+            "state",
+            "in",
+            "(",
+            "'pending'",
+            ",",
+            "'projected'",
+            ",",
+            "'quarantined'",
+            ")",
+        ),
+        ("attempt_count", "between", "0", "and", "16"),
+    }
+)
+
+
+def _sqlite_check_expressions(table_sql: object) -> frozenset[tuple[str, ...]]:
+    """Return complete CHECK expressions from one SQLite table declaration."""
+
+    if type(table_sql) is not str:
+        raise ValueError("table declaration is not text")
+    tokens = _sqlite_schema_tokens(table_sql)
+    checks: set[tuple[str, ...]] = set()
+    index = 0
+    while index < len(tokens):
+        if tokens[index] != "check" or index + 1 == len(tokens) or tokens[index + 1] != "(":
+            index += 1
+            continue
+        expression, index = _sqlite_parenthesized_tokens(tokens, index + 1)
+        checks.add(_strip_sql_outer_parentheses(expression))
+    return frozenset(checks)
+
+
+def _sqlite_schema_tokens(table_sql: str) -> tuple[str, ...]:
+    """Tokenize enough SQLite DDL to distinguish real CHECK clauses from comments."""
+
+    tokens: list[str] = []
+    index = 0
+    while index < len(table_sql):
+        character = table_sql[index]
+        if character.isspace():
+            index += 1
+        elif table_sql.startswith("--", index):
+            newline = table_sql.find("\n", index + 2)
+            index = len(table_sql) if newline < 0 else newline + 1
+        elif table_sql.startswith("/*", index):
+            ending = table_sql.find("*/", index + 2)
+            if ending < 0:
+                raise ValueError("unterminated SQLite comment")
+            index = ending + 2
+        elif character in "'\"`[":
+            token, index = _sqlite_quoted_token(table_sql, index)
+            tokens.append(token)
+        elif character.isalnum() or character in "_$":
+            ending = index + 1
+            while ending < len(table_sql) and (
+                table_sql[ending].isalnum() or table_sql[ending] in "_$"
+            ):
+                ending += 1
+            tokens.append(table_sql[index:ending].casefold())
+            index = ending
+        else:
+            tokens.append(character)
+            index += 1
+    return tuple(tokens)
+
+
+def _sqlite_quoted_token(table_sql: str, index: int) -> tuple[str, int]:
+    opening = table_sql[index]
+    closing = "]" if opening == "[" else opening
+    parts: list[str] = []
+    index += 1
+    while index < len(table_sql):
+        character = table_sql[index]
+        if character != closing:
+            parts.append(character)
+            index += 1
+            continue
+        if index + 1 < len(table_sql) and table_sql[index + 1] == closing:
+            parts.append(closing)
+            index += 2
+            continue
+        value = "".join(parts)
+        return (
+            f"'{value}'" if opening == "'" else value.casefold(),
+            index + 1,
+        )
+    raise ValueError("unterminated SQLite quoted token")
+
+
+def _sqlite_parenthesized_tokens(
+    tokens: tuple[str, ...], opening_index: int
+) -> tuple[tuple[str, ...], int]:
+    if opening_index >= len(tokens) or tokens[opening_index] != "(":
+        raise ValueError("SQLite CHECK expression is malformed")
+    depth = 0
+    for index in range(opening_index, len(tokens)):
+        if tokens[index] == "(":
+            depth += 1
+        elif tokens[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return tokens[opening_index + 1 : index], index + 1
+            if depth < 0:
+                break
+    raise ValueError("SQLite CHECK expression is unbalanced")
+
+
+def _strip_sql_outer_parentheses(tokens: tuple[str, ...]) -> tuple[str, ...]:
+    while len(tokens) >= 2 and tokens[0] == "(":
+        inner, ending = _sqlite_parenthesized_tokens(tokens, 0)
+        if ending != len(tokens):
+            break
+        tokens = inner
+    return tokens
+
 
 class StoreError(RuntimeError):
     """Base error raised by the persistence layer."""
@@ -353,6 +472,7 @@ class SQLiteStore:
         self._connection.execute("PRAGMA journal_mode = WAL")
         try:
             self._create_schema()
+            self.validate_prepared_connection(self._connection)
         except BaseException:
             self._connection.close()
             self._connection = None  # type: ignore[assignment]
@@ -362,6 +482,7 @@ class SQLiteStore:
     def from_prepared_connection(cls, connection: sqlite3.Connection) -> SQLiteStore:
         """Bind a validated, invocation-owned connection without creating schema."""
 
+        cls.validate_prepared_connection(connection)
         store = cls.__new__(cls)
         store._connection = connection
         connection.row_factory = sqlite3.Row
@@ -451,7 +572,7 @@ class SQLiteStore:
                 for row in connection.execute(
                     "PRAGMA index_list(atlas_ingestion_outbox)"
                 )
-                if int(row["unique"])
+                if int(row["unique"]) and not int(row["partial"])
             }
             outbox_foreign_keys = {
                 (str(row["from"]), str(row["table"]), str(row["to"]))
@@ -465,16 +586,17 @@ class SQLiteStore:
                 WHERE type = 'table' AND name = 'atlas_ingestion_outbox'
                 """
             ).fetchone()
-            outbox_sql = (
-                ""
+            outbox_checks = (
+                frozenset()
                 if outbox_row is None
-                else re.sub(r"\s+", "", str(outbox_row["sql"])).casefold()
+                else _sqlite_check_expressions(outbox_row["sql"])
             )
-        except (TypeError, ValueError, sqlite3.DatabaseError) as error:
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
         required_outbox_columns = {
             "ingestion_key",
             "acceptance_id",
+            "payload_json",
             "payload_hash",
             "state",
             "attempt_count",
@@ -493,9 +615,7 @@ class SQLiteStore:
                 "acceptance_id",
             )
             in outbox_foreign_keys
-            and "check(ingestion_key=payload_hash)" in outbox_sql
-            and "check(statein('pending','projected','quarantined'))" in outbox_sql
-            and "check(attempt_countbetween0and16)" in outbox_sql
+            and _ATLAS_OUTBOX_REQUIRED_CHECKS.issubset(outbox_checks)
         )
         if (
             not required_tables.issubset(tables)

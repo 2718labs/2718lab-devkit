@@ -13,7 +13,7 @@ from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.relay_runtime import RelayRuntime
 from devkit_runtime.uow import RuntimeAdapterFactories, RuntimeUnitOfWork
-from orchestrator.store import StoreError
+from orchestrator.store import SQLiteStore, StoreError
 
 
 def test_runtime_config_load_prefers_plugin_data_without_writing(
@@ -748,3 +748,143 @@ def test_default_write_uow_rejects_malformed_atlas_outbox_schema(
                 _ = uow.atlas
     finally:
         root.shutdown()
+
+
+def _atlas_outbox_schema(
+    *,
+    include_payload_json: bool = True,
+    partial_unique_indexes: bool = False,
+    equality_check: str = "CHECK (ingestion_key = payload_hash)",
+    state_check: str = "CHECK (state IN ('pending', 'projected', 'quarantined'))",
+    attempt_check: str = "CHECK (attempt_count BETWEEN 0 AND 16)",
+) -> str:
+    payload_json = "payload_json TEXT NOT NULL," if include_payload_json else ""
+    if partial_unique_indexes:
+        acceptance_id = (
+            "acceptance_id TEXT NOT NULL "
+            "REFERENCES code_task_acceptances(acceptance_id),"
+        )
+        payload_hash = "payload_hash TEXT NOT NULL,"
+        unique_indexes = """
+            CREATE UNIQUE INDEX atlas_outbox_acceptance_partial
+                ON atlas_ingestion_outbox(acceptance_id)
+                WHERE state = 'pending';
+            CREATE UNIQUE INDEX atlas_outbox_payload_partial
+                ON atlas_ingestion_outbox(payload_hash)
+                WHERE state = 'pending';
+        """
+    else:
+        acceptance_id = (
+            "acceptance_id TEXT NOT NULL UNIQUE "
+            "REFERENCES code_task_acceptances(acceptance_id),"
+        )
+        payload_hash = "payload_hash TEXT NOT NULL UNIQUE,"
+        unique_indexes = ""
+    return f"""
+        CREATE TABLE atlas_ingestion_outbox (
+            ingestion_key TEXT PRIMARY KEY,
+            {acceptance_id}
+            {payload_json}
+            {payload_hash}
+            state TEXT NOT NULL {state_check},
+            attempt_count INTEGER NOT NULL {attempt_check},
+            last_error_code TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            {equality_check}
+        );
+        {unique_indexes}
+    """
+
+
+def _runtime_with_malformed_atlas_outbox(
+    tmp_path: Path, outbox_schema: str
+) -> RuntimeConfig:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.executescript(outbox_schema)
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize(
+    "outbox_schema",
+    (
+        _atlas_outbox_schema(include_payload_json=False),
+        _atlas_outbox_schema(partial_unique_indexes=True),
+        _atlas_outbox_schema(
+            equality_check="CHECK (1) /* CHECK (ingestion_key = payload_hash) */"
+        ),
+        _atlas_outbox_schema(
+            state_check=(
+                "CHECK (1) "
+                "/* CHECK (state IN ('pending', 'projected', 'quarantined')) */"
+            )
+        ),
+        _atlas_outbox_schema(
+            attempt_check=(
+                "CHECK (1) /* CHECK (attempt_count BETWEEN 0 AND 16) */"
+            )
+        ),
+    ),
+    ids=(
+        "missing-payload-json",
+        "partial-unique-indexes",
+        "comment-forged-key-payload-check",
+        "comment-forged-state-check",
+        "comment-forged-attempt-check",
+    ),
+)
+def test_default_write_uow_rejects_atlas_outbox_validation_bypasses(
+    tmp_path: Path, outbox_schema: str
+) -> None:
+    config = _runtime_with_malformed_atlas_outbox(tmp_path, outbox_schema)
+    root = RuntimeRoot(config)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            with root.open_uow(read_only=False) as uow:
+                _ = uow.atlas
+    finally:
+        root.shutdown()
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_entry_points_reject_malformed_current_outbox_schema(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_malformed_atlas_outbox(
+        tmp_path, _atlas_outbox_schema(include_payload_json=False)
+    )
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+        return
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            SQLiteStore.from_prepared_connection(connection)
+    finally:
+        connection.close()
