@@ -53,12 +53,24 @@ class ContinuityService:
 
     def _typed_view(self, key: ContinuityKey, request: Any, evidence: Any) -> FrozenView:
         from devkit_atlas.extractors import ExtractionRequest
+        from devkit_atlas.models import AtlasError
         from devkit_atlas.service import (
             AcceptedAtlasProjectionEvidence,
             AcceptedAtlasProjectionRequest,
+            AtlasService,
         )
-        if not isinstance(request, AcceptedAtlasProjectionRequest) or not isinstance(evidence, AcceptedAtlasProjectionEvidence) or not isinstance(evidence.extraction_request, ExtractionRequest):
+        if (
+            type(request) is not AcceptedAtlasProjectionRequest
+            or type(evidence) is not AcceptedAtlasProjectionEvidence
+            or type(evidence.extraction_request) is not ExtractionRequest
+        ):
             raise ContinuityStoreError("CONTINUITY_INPUT_INVALID")
+        try:
+            request = AtlasService._validate_accepted_projection_request(request)
+            AtlasService._require_canonical_core_key(request)
+            extraction = AtlasService._validate_reader_evidence(request, evidence)
+        except AtlasError as error:
+            raise ContinuityStoreError("CONTINUITY_INPUT_INVALID") from error
         if (
             key.workflow_id != request.workflow_id
             or key.code_task_id != request.code_task_id
@@ -69,7 +81,6 @@ class ContinuityService:
             or key.evidence_binding_hash != request.evidence_binding_hash
         ):
             raise ContinuityStoreError("CONTINUITY_INPUT_INVALID")
-        extraction = evidence.extraction_request
         if (
             evidence.code_task_version != request.code_task_version
             or evidence.language != request.language

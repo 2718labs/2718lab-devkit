@@ -1147,6 +1147,32 @@ def test_invalid_typed_file_fails_before_cas_or_database_write(tmp_path: Path) -
     assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    "field",
+    ("payload_hash", "evidence_binding_hash", "ingestion_key", "acceptance_id"),
+)
+def test_forged_request_canonical_linkage_fails_before_cas_or_database_write(
+    tmp_path: Path, field: str
+) -> None:
+    config, store = _prepared_store(tmp_path)
+    service = ContinuityService(store, ContinuityCas.open_prepared(config.continuity_cas_root, config.scratch_root, read_only=False))
+    key, request, evidence = _typed_inputs()
+    forged_request = replace(request, **{field: _hash(f"forged-{field}".encode())})
+    forged_key = replace(key, **{field: getattr(forged_request, field)})
+
+    with pytest.raises(ContinuityStoreError) as error:
+        service.freeze(
+            ContinuityAttempt(forged_key, 1, "claimed", None, None),
+            forged_request,
+            evidence,
+        )
+
+    assert error.value.code == "CONTINUITY_INPUT_INVALID"
+    assert not (config.continuity_cas_root / "sha256").exists()
+    assert store._connection.execute("SELECT COUNT(*) FROM views").fetchone()[0] == 0
+    assert store._connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
 def test_atomic_current_fence_rejects_stale_freeze_and_publish(tmp_path: Path) -> None:
     _, store = _prepared_store(tmp_path)
     key, view = _key(), _view(_key())
