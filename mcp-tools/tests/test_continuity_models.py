@@ -81,23 +81,52 @@ def _index_node(*, start_byte: int = 12) -> IndexNode:
 def _bound_receipt(
     *,
     exit_code: int = 0,
+    kind: str = "command",
     command_spec: object = ("python", "-m", "pytest", "tests/test_a.py"),
+    command_spec_hash: str | None = None,
 ) -> BoundExecutionReceipt:
+    if command_spec_hash is None:
+        command_spec_hash = canonical_hash(command_spec)
     return BoundExecutionReceipt(
         receipt_id="receipt-1",
-        kind="command",
+        kind=kind,
         workflow_id="workflow-7",
         task_id="task-8",
         acceptance_id="acceptance-9",
         workspace_hash=HASH_A,
         output_snapshot_id="output-1",
         command_spec=command_spec,  # type: ignore[arg-type]
-        command_spec_hash=HASH_B,
+        command_spec_hash=command_spec_hash,
         input_hash=HASH_C,
         output_hash=HASH_A,
         exit_code=exit_code,
         success=True,
     )
+
+
+def test_bound_receipt_accepts_empty_patch_like_command_spec_with_canonical_hash() -> None:
+    receipt = _bound_receipt(kind="write", command_spec=())
+
+    assert receipt.kind == "write"
+    assert receipt.command_spec == ()
+    assert receipt.command_spec_hash == canonical_hash(())
+
+
+@pytest.mark.parametrize(
+    ("kind", "command_spec"),
+    (("write", ()), ("command", ("python", "-m", "pytest"))),
+)
+def test_bound_receipt_rejects_noncanonical_command_spec_hash(
+    kind: str, command_spec: tuple[str, ...]
+) -> None:
+    with pytest.raises(ContinuityError, match="^COMMAND_SPEC_HASH_MISMATCH$"):
+        _bound_receipt(kind=kind, command_spec=command_spec, command_spec_hash=HASH_A)
+
+
+def test_bound_receipt_accepts_nonempty_canonical_command_spec_hash() -> None:
+    receipt = _bound_receipt(command_spec=("python", "-m", "pytest"))
+
+    assert receipt.command_spec_hash == canonical_hash(("python", "-m", "pytest"))
 
 
 def _replay_metadata() -> ReplayMetadata:
@@ -126,7 +155,7 @@ def _v2_bound_receipt(
         workspace_hash=metadata.workspace_hash,
         output_snapshot_id="output-1",
         command_spec=("python",),
-        command_spec_hash=HASH_A,
+        command_spec_hash=canonical_hash(("python",)),
         input_hash=HASH_B,
         output_hash=HASH_C,
         exit_code=0,
@@ -248,6 +277,19 @@ def test_replay_metadata_upgrades_manifest_to_typed_v2_identity() -> None:
     assert manifest["replay_metadata"] == metadata.to_dict()
     assert view.replay_metadata == metadata
     assert view.manifest_json == canonical_json(manifest)
+
+
+def test_empty_write_receipt_can_enter_v2_frozen_view() -> None:
+    receipt = replace(
+        _v2_bound_receipt(),
+        kind="write",
+        command_spec=(),
+        command_spec_hash=canonical_hash(()),
+    )
+
+    view = FrozenView.create(**(_v2_view_inputs() | {"execution_receipts": (receipt,)}))
+
+    assert view.execution_receipts == (receipt,)
 
 
 @pytest.mark.parametrize(
@@ -460,7 +502,7 @@ def test_view_manifest_retains_typed_replay_metadata_and_order() -> None:
         workspace_hash=HASH_A,
         output_snapshot_id="output-1",
         command_spec=("python", "-m", "pytest", "tests/test_a.py"),
-        command_spec_hash=HASH_B,
+        command_spec_hash=canonical_hash(("python", "-m", "pytest", "tests/test_a.py")),
         input_hash=HASH_C,
         output_hash=HASH_A,
         exit_code=0,
@@ -582,7 +624,7 @@ def test_bound_receipt_rejects_host_absolute_paths_in_command_arguments() -> Non
             HASH_A,
             "output-1",
             ("python", "--rootdir=/host-private"),
-            HASH_B,
+            canonical_hash(("python", "--rootdir=/host-private")),
             HASH_C,
             HASH_A,
             0,
@@ -834,8 +876,11 @@ def test_each_coverage_gap_field_binds_manifest_and_view_identity(changed: objec
         lambda value: replace(value, acceptance_id="acceptance-10"),
         lambda value: replace(value, workspace_hash=HASH_B),
         lambda value: replace(value, output_snapshot_id="output-2"),
-        lambda value: replace(value, command_spec=("python", "-m", "compileall")),
-        lambda value: replace(value, command_spec_hash=HASH_C),
+        lambda value: replace(
+            value,
+            command_spec=("python", "-m", "compileall"),
+            command_spec_hash=canonical_hash(("python", "-m", "compileall")),
+        ),
         lambda value: replace(value, input_hash=HASH_A),
         lambda value: replace(value, output_hash=HASH_B),
         lambda value: replace(value, exit_code=1),

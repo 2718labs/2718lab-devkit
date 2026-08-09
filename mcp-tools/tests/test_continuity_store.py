@@ -29,7 +29,7 @@ from devkit_atlas.service import (  # noqa: E402
     AcceptedAtlasProjectionRequest,
 )
 from devkit_continuity import store as continuity_store  # noqa: E402
-from devkit_continuity.canonical import canonical_json  # noqa: E402
+from devkit_continuity.canonical import canonical_hash, canonical_json  # noqa: E402
 from devkit_continuity.cas import ContinuityCas, ContinuityCasError  # noqa: E402
 from devkit_continuity.models import (  # noqa: E402
     ContinuityAttempt,
@@ -100,7 +100,7 @@ def _typed_inputs(*, after_body: bytes = b"after") -> tuple[ContinuityKey, Accep
         (SnapshotFile("src/a.py", _hash(after_body), after_body),),
         (IndexNode("node", "function", "src/a.py", "run", "pkg.run", 1, 1, _hash(after_body)),),
         (CoverageGap("src/a.py", "PARSER_GAP", "gap"),),
-        (AtlasReceipt(_hash(b"receipt"), "command", "workflow", "task", request.acceptance_id, _hash(b"workspace"), "output", ("python",), _hash(b"command"), _hash(b"input"), _hash(b"output"), 0, True),),
+        (AtlasReceipt(_hash(b"receipt"), "command", "workflow", "task", request.acceptance_id, _hash(b"workspace"), "output", ("python",), canonical_hash(("python",)), _hash(b"input"), _hash(b"output"), 0, True),),
     )
     evidence = AcceptedAtlasProjectionEvidence(1, "python", "pytest", request.checkpoint_hash, request.indexed_diff_hash, "query", request.verification_artifact_hashes, extraction)
     key = ContinuityKey(request.workflow_id, request.code_task_id, request.code_task_version, request.acceptance_id, request.ingestion_key, request.payload_hash, request.evidence_binding_hash)

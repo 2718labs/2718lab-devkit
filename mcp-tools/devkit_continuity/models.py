@@ -238,10 +238,10 @@ class BoundExecutionReceipt:
         ):
             _require_hash(value)
         command_spec = _command_spec_tuple(self.command_spec)
-        if not command_spec:
-            raise ContinuityError("COMMAND_SPEC_INVALID")
         for item in command_spec:
             _require_command_atom(item)
+        if self.command_spec_hash != canonical_hash(command_spec):
+            raise ContinuityError("COMMAND_SPEC_HASH_MISMATCH")
         if isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int):
             raise ContinuityError("EXIT_CODE_INVALID")
         if not isinstance(self.success, bool):
