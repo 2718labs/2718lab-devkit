@@ -28,7 +28,7 @@ from devkit_atlas.service import AtlasService  # noqa: E402
 from devkit_atlas.store import AtlasStore  # noqa: E402
 from devkit_continuity.models import ContinuityKey  # noqa: E402
 from devkit_continuity.service import ContinuityService  # noqa: E402
-from devkit_continuity.store import ContinuityStore  # noqa: E402
+from devkit_continuity.store import ContinuityStore, ContinuityStoreError  # noqa: E402
 from devkit_runtime.atlas_acceptance import (  # noqa: E402
     ProductionAcceptanceEvidenceReader,
 )
@@ -793,6 +793,68 @@ class DefaultRuntimeAcceptanceEvidenceTests(CodeTaskAcceptanceFixture):
             "ATLAS_EVIDENCE_UNAVAILABLE",
         )
 
+    def test_forced_candidate_miss_live_published_path_rechecks_after_projection_wal(
+        self,
+    ) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        self._default_accept(config, acceptance.acceptance_id, outbox.ingestion_key)
+        self._reset_runtime_outbox_pending(config, outbox.ingestion_key)
+        original_project = AtlasService._project_prepared_acceptance
+        project_calls = 0
+
+        def switch_to_wal_during_projection(
+            atlas: AtlasService, prepared: object
+        ) -> object:
+            nonlocal project_calls
+            projection = original_project(atlas, prepared)
+            project_calls += 1
+            connection = sqlite3.connect(config.continuity_database)
+            try:
+                assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == (
+                    "wal",
+                )
+            finally:
+                connection.close()
+            return projection
+
+        root = RuntimeRoot(config)
+        try:
+            with (
+                mock.patch.object(
+                    ContinuityService, "find_replay_candidate", return_value=None
+                ),
+                mock.patch.object(
+                    ContinuityService,
+                    "publish",
+                    side_effect=AssertionError("published path must not republish"),
+                ),
+                mock.patch.object(
+                    AtlasService,
+                    "_project_prepared_acceptance",
+                    new=switch_to_wal_during_projection,
+                ),
+            ):
+                with root.open_uow(read_only=False) as uow:
+                    with pytest.raises(AtlasError) as raised:
+                        uow.accept_atlas(
+                            "workflow",
+                            "code-task",
+                            acceptance.acceptance_id,
+                            outbox.ingestion_key,
+                        )
+        finally:
+            root.shutdown()
+
+        assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+        assert project_calls == 1
+        assert self._outbox_state(config, outbox.ingestion_key) == (
+            "pending",
+            1,
+            "ATLAS_EVIDENCE_UNAVAILABLE",
+        )
+
     def test_frozen_replay_stops_before_projection_when_wal_appears_after_materialize(
         self,
     ) -> None:
@@ -960,6 +1022,111 @@ class DefaultRuntimeAcceptanceEvidenceTests(CodeTaskAcceptanceFixture):
         assert live_calls == []
         assert attempt == ("frozen",)
         assert pointer is None
+        assert self._outbox_state(config, outbox.ingestion_key) == (
+            "pending",
+            1,
+            "ATLAS_EVIDENCE_UNAVAILABLE",
+        )
+
+    def test_frozen_replay_same_view_race_fails_closed_when_wal_precedes_recovery_proof(
+        self,
+    ) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        key = self._freeze_runtime_evidence(
+            config, acceptance.acceptance_id, outbox.ingestion_key
+        )
+        live_calls: list[str] = []
+
+        def deny_live(*_args: object, **_kwargs: object) -> object:
+            live_calls.append("live dependency")
+            raise AssertionError("frozen replay must not consult live evidence")
+
+        original_publish = ContinuityService.publish
+        original_project = AtlasService._project_prepared_acceptance
+        project_calls = 0
+        publish_calls = 0
+
+        def publish_same_view_then_switch_to_wal(
+            continuity: ContinuityService, attempt: object, view: object
+        ) -> object:
+            nonlocal publish_calls
+            original_publish(continuity, attempt, view)
+            publish_calls += 1
+            connection = sqlite3.connect(config.continuity_database)
+            try:
+                assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == (
+                    "wal",
+                )
+            finally:
+                connection.close()
+            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+
+        def count_projection(atlas: AtlasService, prepared: object) -> object:
+            nonlocal project_calls
+            projection = original_project(atlas, prepared)
+            project_calls += 1
+            return projection
+
+        factories = replace(
+            DEFAULT_RUNTIME_ADAPTER_FACTORIES,
+            open_project_checkpoint=deny_live,
+            build_atlas=deny_live,
+        )
+        root = RuntimeRoot(config, adapter_factories=factories)
+        try:
+            with (
+                mock.patch.object(
+                    ProductionAcceptanceEvidenceReader, "rebuild", side_effect=deny_live
+                ),
+                mock.patch.object(
+                    ProductionAcceptanceEvidenceReader, "read", side_effect=deny_live
+                ),
+                mock.patch.object(
+                    ProjectIndexService, "read_snapshot_files", side_effect=deny_live
+                ),
+                mock.patch.object(
+                    ContinuityService,
+                    "publish",
+                    new=publish_same_view_then_switch_to_wal,
+                ),
+                mock.patch.object(
+                    AtlasService,
+                    "_project_prepared_acceptance",
+                    new=count_projection,
+                ),
+            ):
+                with root.open_uow(read_only=False) as uow:
+                    with pytest.raises(AtlasError) as raised:
+                        uow.accept_atlas(
+                            "workflow",
+                            "code-task",
+                            acceptance.acceptance_id,
+                            outbox.ingestion_key,
+                        )
+        finally:
+            root.shutdown()
+
+        connection = sqlite3.connect(config.continuity_database)
+        try:
+            attempt = connection.execute(
+                "SELECT state FROM attempts WHERE key_hash=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (key.key_hash,),
+            ).fetchone()
+            pointer = connection.execute(
+                "SELECT view_id FROM pointers WHERE key_hash=?", (key.key_hash,)
+            ).fetchone()
+        finally:
+            connection.close()
+
+        assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+        assert project_calls == 1
+        assert publish_calls == 1
+        assert live_calls == []
+        assert attempt == ("published",)
+        assert pointer is not None
         assert self._outbox_state(config, outbox.ingestion_key) == (
             "pending",
             1,

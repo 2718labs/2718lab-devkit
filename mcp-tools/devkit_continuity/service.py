@@ -118,6 +118,55 @@ class ContinuityService:
             raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
         return state
 
+    def _prove_published_replay(
+        self,
+        key: ContinuityKey,
+        view_id: str,
+        fence_epoch: int,
+        *,
+        expected_attempt: ContinuityAttempt | None = None,
+    ) -> _ReplayState:
+        """Prove a canonical published receipt and exact pointer without live state."""
+
+        if (
+            type(key) is not ContinuityKey
+            or type(view_id) is not str
+            or type(fence_epoch) is not int
+            or (
+                expected_attempt is not None
+                and type(expected_attempt) is not ContinuityAttempt
+            )
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        state = self.store.replay_state_for(key)
+        pointer = state.pointer
+        if (
+            state.attempt.state != "published"
+            or state.attempt.view_id != view_id
+            or state.attempt.fence_epoch != fence_epoch
+            or (
+                expected_attempt is not None
+                and state.attempt != expected_attempt
+            )
+            or pointer is None
+            or (
+                pointer.workflow_id,
+                pointer.code_task_id,
+                pointer.code_task_version,
+                pointer.view_id,
+                pointer.fence_epoch,
+            )
+            != (
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                view_id,
+                fence_epoch,
+            )
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return state
+
     def _verify_replay_state(self, key: ContinuityKey, expected: _ReplayState) -> None:
         """Reject a physical or durable state change after a replay observation."""
 
