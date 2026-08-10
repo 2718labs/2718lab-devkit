@@ -665,6 +665,39 @@ def test_published_replay_precedes_live_evidence_and_never_republishes(
     assert orchestrator.outbox.state is AtlasOutboxState.PROJECTED
 
 
+def test_published_replay_rejects_pointer_mismatch_before_projection(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.replay_enabled = True
+    continuity._publish(_VIEW)  # noqa: SLF001 - model completed durable replay state
+    assert continuity.pointer is not None
+    continuity.pointer = ContinuityPointer(
+        continuity.pointer.workflow_id,
+        continuity.pointer.code_task_id,
+        continuity.pointer.code_task_version,
+        _OTHER_VIEW,
+        continuity.pointer.pointer_version,
+        continuity.pointer.fence_epoch,
+    )
+    atlas.forbid_live_prepare = True
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+    assert atlas.prepare_calls == 0
+    assert atlas.project_calls == 0
+    assert continuity.publish_calls == 0
+    assert orchestrator.outbox.state is AtlasOutboxState.QUARANTINED
+
+
 def test_frozen_replay_projects_then_publishes_the_same_fence(
     tmp_path: Path,
 ) -> None:

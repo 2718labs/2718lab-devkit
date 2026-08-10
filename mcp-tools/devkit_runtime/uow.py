@@ -292,11 +292,11 @@ class RuntimeUnitOfWork:
         )
         if getattr(prepared, "extraction", None) != replay.extraction:
             raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        if replay.attempt.state == "published":
+            self._published_pointer(continuity, replay.attempt, replay.view.view_id)
         projection = atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
         if replay.attempt.state == "frozen":
             self._publish_or_recover(continuity, replay.attempt, replay.view)
-        else:
-            self._published_pointer(continuity, replay.attempt, replay.view.view_id)
         return projection
 
     @property
