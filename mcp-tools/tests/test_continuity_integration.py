@@ -783,3 +783,29 @@ def test_invalid_replay_candidate_cannot_fall_back_to_live_evidence(
     assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
     assert atlas.prepare_calls == 0
     assert orchestrator.outbox.state is AtlasOutboxState.QUARANTINED
+
+
+def test_unprepared_replay_candidate_is_unavailable_without_live_evidence(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.replay_candidate_error = ContinuityStoreError(
+        "CONTINUITY_STORE_UNPREPARED"
+    )
+    atlas.forbid_live_prepare = True
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+    assert atlas.prepare_calls == 0
+    assert atlas.project_calls == 0
+    assert continuity.publish_calls == 0
+    assert orchestrator.outbox.state is AtlasOutboxState.PENDING
+    assert orchestrator.outbox.retry_count == 1

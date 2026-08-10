@@ -253,9 +253,88 @@ class ContinuityStoreError(ContinuityError):
     """Stable persistence failure that deliberately exposes only a code."""
 
 
+_SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+_SQLITE_ROLLBACK_JOURNAL_FORMAT = (1, 1)
+
+
+def _wal_sidecars(database: Path) -> tuple[Path, Path]:
+    return (
+        database.with_name(f"{database.name}-wal"),
+        database.with_name(f"{database.name}-shm"),
+    )
+
+
+def _require_absent(path: Path) -> None:
+    """Reject any visible SQLite sidecar without attempting to clean it."""
+
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+
+
+def _require_delete_journal_invariant(database: Path) -> None:
+    """Prove a primary database can be read without SQLite journal recovery."""
+
+    try:
+        with database.open("rb") as source:
+            header = source.read(20)
+    except OSError as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    if (
+        len(header) != 20
+        or header[:16] != _SQLITE_HEADER_MAGIC
+        or (header[18], header[19]) != _SQLITE_ROLLBACK_JOURNAL_FORMAT
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    for sidecar in _wal_sidecars(database):
+        _require_absent(sidecar)
+
+
+def _journal_mode(connection: sqlite3.Connection) -> str:
+    row = connection.execute("PRAGMA journal_mode").fetchone()
+    if row is None or len(row) != 1 or not isinstance(row[0], str):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    return row[0].lower()
+
+
+def _transition_to_delete_journal(
+    connection: sqlite3.Connection, database: Path
+) -> None:
+    """Fenced bootstrap-only WAL recovery followed by a durable DELETE switch."""
+
+    mode = _journal_mode(connection)
+    if mode == "wal":
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or tuple(checkpoint) != (0, 0, 0):
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    elif mode not in {"delete", "truncate", "persist", "memory", "off"}:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    result = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+    if (
+        result is None
+        or len(result) != 1
+        or not isinstance(result[0], str)
+        or result[0].lower() != "delete"
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    for sidecar in _wal_sidecars(database):
+        _require_absent(sidecar)
+
+
 class ContinuityStore:
-    def __init__(self, connection: sqlite3.Connection, *, read_only: bool) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        read_only: bool,
+        readonly_database: Path | None = None,
+    ) -> None:
         self._connection, self.read_only = connection, read_only
+        self._readonly_database = readonly_database
         self._connection.row_factory = sqlite3.Row
 
     @classmethod
@@ -278,14 +357,23 @@ class ContinuityStore:
     def _open(cls, database: Path, *, read_only: bool) -> ContinuityStore:
         if not database.is_file():
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        _require_delete_journal_invariant(database)
         mode = "ro" if read_only else "rw"
         connection: sqlite3.Connection | None = None
         try:
-            connection = sqlite3.connect(f"file:{database.as_posix()}?mode={mode}", uri=True)
+            uri = f"file:{database.as_posix()}?mode={mode}"
+            if read_only:
+                uri += "&cache=private"
+            connection = sqlite3.connect(uri, uri=True)
             connection.row_factory = sqlite3.Row
             _configure_connection(connection)
             _verify_v3_schema(connection)
-            return cls(connection, read_only=read_only)
+            _require_delete_journal_invariant(database)
+            return cls(
+                connection,
+                read_only=read_only,
+                readonly_database=database if read_only else None,
+            )
         except (sqlite3.Error, OSError, ContinuityError) as error:
             if connection is not None:
                 connection.close()
@@ -597,15 +685,22 @@ class ContinuityStore:
 
     @contextmanager
     def _replay_snapshot(self) -> Iterator[None]:
+        self._assert_readonly_snapshot_invariant()
         self._connection.execute("SAVEPOINT continuity_replay_snapshot")
         try:
             yield
         except Exception:
             self._connection.execute("ROLLBACK TO SAVEPOINT continuity_replay_snapshot")
             self._connection.execute("RELEASE SAVEPOINT continuity_replay_snapshot")
+            self._assert_readonly_snapshot_invariant()
             raise
         else:
             self._connection.execute("RELEASE SAVEPOINT continuity_replay_snapshot")
+            self._assert_readonly_snapshot_invariant()
+
+    def _assert_readonly_snapshot_invariant(self) -> None:
+        if self._readonly_database is not None:
+            _require_delete_journal_invariant(self._readonly_database)
 
     @contextmanager
     def _atomic(self) -> Iterator[None]:
@@ -753,8 +848,8 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
         connection.row_factory = sqlite3.Row
         _configure_connection(connection)
         _verify_bootstrap_preflight(connection)
+        _transition_to_delete_journal(connection, database)
         _bootstrap_prepared_cas(cas_root, scratch_root)
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("BEGIN IMMEDIATE")
         version = _schema_version(connection)
         if version is None:
@@ -771,6 +866,7 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         _verify_v3_schema(connection)
         connection.commit()
+        _require_delete_journal_invariant(database)
         return ContinuityStore(connection, read_only=False)
     except (sqlite3.Error, OSError, ContinuityError) as error:
         _rollback_and_close(connection)

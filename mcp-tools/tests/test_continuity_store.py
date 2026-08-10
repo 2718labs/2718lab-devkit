@@ -389,6 +389,20 @@ def _continuity_database_snapshot(config: RuntimeConfig) -> tuple[object, ...]:
         )
 
 
+def _sqlite_journal_header(database: Path) -> tuple[int, int]:
+    with database.open("rb") as source:
+        header = source.read(20)
+    assert header[:16] == b"SQLite format 3\x00"
+    return header[18], header[19]
+
+
+def _continuity_wal_sidecars(database: Path) -> tuple[Path, Path]:
+    return (
+        database.with_name(f"{database.name}-wal"),
+        database.with_name(f"{database.name}-shm"),
+    )
+
+
 def _audit_trigger_names() -> set[str]:
     return {
         f"{table}_v1_immutable_{action}"
@@ -411,9 +425,72 @@ def test_runtime_bootstrap_is_the_only_continuity_creation_seam(tmp_path: Path) 
     store.close()
     assert config.continuity_database.exists() and config.continuity_cas_root.is_dir()
     with sqlite3.connect(config.continuity_database) as connection:
-        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
         assert connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()[0] == "3"
+    assert _sqlite_journal_header(config.continuity_database) == (1, 1)
+    assert not any(path.exists() for path in _continuity_wal_sidecars(config.continuity_database))
     _config(tmp_path)
+
+
+def test_runtime_bootstrap_migrates_quiescent_wal_state_to_delete(tmp_path: Path) -> None:
+    config, store = _prepared_store(tmp_path)
+    key = _key()
+    view = _view(key)
+    attempt = store.claim_or_reuse_atomic(key)
+    frozen = store.freeze_attempt_atomic(
+        attempt,
+        view,
+        ContinuityReceipt.create(key=key, view_id=view.view_id, kind="frozen"),
+    )
+    store.close()
+    with sqlite3.connect(config.continuity_database) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+    assert _sqlite_journal_header(config.continuity_database) == (2, 2)
+
+    RuntimeBootstrap.run(
+        config,
+        proof_registry_bootstrap=lambda database: sqlite3.connect(database).close(),
+    )
+
+    assert _sqlite_journal_header(config.continuity_database) == (1, 1)
+    assert not any(path.exists() for path in _continuity_wal_sidecars(config.continuity_database))
+    reopened = ContinuityStore.open_readwrite(
+        config.continuity_database, config.continuity_cas_root, config.scratch_root
+    )
+    try:
+        assert reopened.current_attempt(key) == frozen
+    finally:
+        reopened.close()
+
+
+def test_wal_transition_requires_a_complete_checkpoint(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    writer = sqlite3.connect(config.continuity_database, timeout=0.0)
+    reader: sqlite3.Connection | None = None
+    candidate: sqlite3.Connection | None = None
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        reader = sqlite3.connect(config.continuity_database, timeout=0.0)
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT COUNT(*) FROM continuity_keys").fetchone() == (0,)
+        writer.execute("PRAGMA user_version=1")
+        candidate = sqlite3.connect(config.continuity_database, timeout=0.0)
+        candidate.execute("PRAGMA busy_timeout=0")
+
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+            continuity_store._transition_to_delete_journal(  # noqa: SLF001
+                candidate,
+                config.continuity_database,
+            )
+
+        assert candidate.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    finally:
+        if candidate is not None:
+            candidate.close()
+        if reader is not None:
+            reader.close()
+        writer.close()
 
 
 @pytest.mark.parametrize(
