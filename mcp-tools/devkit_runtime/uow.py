@@ -292,10 +292,15 @@ class RuntimeUnitOfWork:
         )
         if getattr(prepared, "extraction", None) != replay.extraction:
             raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
-        if replay.attempt.state == "published":
-            self._published_pointer(continuity, replay.attempt, replay.view.view_id)
+        replay_state = continuity._prove_materialized_replay(  # noqa: SLF001
+            replay.attempt.key,
+            replay.attempt,
+            replay.view,
+        )
         projection = atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
-        if replay.attempt.state == "frozen":
+        if replay.attempt.state == "published":
+            continuity._verify_replay_state(replay.attempt.key, replay_state)  # noqa: SLF001
+        elif replay.attempt.state == "frozen":
             self._publish_or_recover(continuity, replay.attempt, replay.view)
         return projection
 
@@ -612,19 +617,17 @@ class RuntimeUnitOfWork:
         """Recover only a proven same-view publication race before failure handling."""
 
         from devkit_atlas.models import AtlasError
+        from devkit_continuity.store import ContinuityStoreError
 
         try:
             continuity.publish(attempt, frozen_view)
-        except Exception as error:
-            try:
-                current = continuity.store.current_attempt(attempt.key)
-                if current is None:
-                    raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
-                return self._published_pointer(
-                    continuity, current, frozen_view.view_id
-                )
-            except AtlasError:
-                raise error
+        except ContinuityStoreError as error:
+            if str(error) != "CONTINUITY_STATE_CONFLICT":
+                raise
+            current = continuity.store.current_attempt(attempt.key)
+            if current is None:
+                raise AtlasError("ATLAS_EVIDENCE_CONFLICT") from error
+            return self._published_pointer(continuity, current, frozen_view.view_id)
         current = continuity.store.current_attempt(attempt.key)
         if current is None:
             raise AtlasError("ATLAS_EVIDENCE_CONFLICT")

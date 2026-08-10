@@ -249,6 +249,114 @@ def test_verify_replay_fails_closed_when_a_cas_body_mismatches(
         service.verify_replay(key)
 
 
+def test_materialize_replay_rechecks_after_cas_before_typed_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, writer, key, view = _frozen_service(tmp_path, publish=True)
+    writer.store.close()
+    writer.cas.close()
+    reader_store = ContinuityStore.open_readonly(
+        config.continuity_database,
+        config.continuity_cas_root,
+        config.scratch_root,
+    )
+    reader_cas = ContinuityCas.open_prepared(
+        config.continuity_cas_root,
+        config.scratch_root,
+        read_only=True,
+    )
+    reader = ContinuityService(reader_store, reader_cas)
+    calls: list[tuple[str, int]] = []
+    typed_calls: list[object] = []
+    original_read = reader_cas.read_verified
+    original_typed = reader._typed_replay_materialization  # noqa: SLF001
+
+    def switch_to_wal_after_first_cas_read(
+        content_hash: str, byte_length: int
+    ) -> bytes:
+        body = original_read(content_hash, byte_length)
+        calls.append((content_hash, byte_length))
+        if len(calls) == 1:
+            with sqlite3.connect(config.continuity_database) as connection:
+                assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == (
+                    "wal",
+                )
+        return body
+
+    def record_typed_rebuild(*args: object) -> object:
+        typed_calls.append(args)
+        return original_typed(*args)
+
+    monkeypatch.setattr(reader_cas, "read_verified", switch_to_wal_after_first_cas_read)
+    monkeypatch.setattr(reader, "_typed_replay_materialization", record_typed_rebuild)
+    try:
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+            reader.materialize_replay(key)
+        assert calls == [
+            (entry.content_hash, entry.byte_length) for entry in view.entries
+        ]
+        assert typed_calls == []
+    finally:
+        reader_store.close()
+        reader_cas.close()
+
+
+def test_materialize_replay_rechecks_after_typed_rebuild_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, writer, key, _view = _frozen_service(tmp_path, publish=True)
+    writer.store.close()
+    writer.cas.close()
+    reader_store = ContinuityStore.open_readonly(
+        config.continuity_database,
+        config.continuity_cas_root,
+        config.scratch_root,
+    )
+    reader_cas = ContinuityCas.open_prepared(
+        config.continuity_cas_root,
+        config.scratch_root,
+        read_only=True,
+    )
+    reader = ContinuityService(reader_store, reader_cas)
+    typed_calls: list[object] = []
+    original_typed = reader._typed_replay_materialization  # noqa: SLF001
+
+    def switch_to_wal_after_typed_rebuild(*args: object) -> object:
+        result = original_typed(*args)
+        typed_calls.append(args)
+        with sqlite3.connect(config.continuity_database) as connection:
+            assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == (
+                "wal",
+            )
+        return result
+
+    monkeypatch.setattr(reader, "_typed_replay_materialization", switch_to_wal_after_typed_rebuild)
+    try:
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+            reader.materialize_replay(key)
+        assert len(typed_calls) == 1
+    finally:
+        reader_store.close()
+        reader_cas.close()
+
+
+def test_publish_fails_closed_when_the_writer_sees_wal_after_freeze(
+    tmp_path: Path,
+) -> None:
+    _config, service, key, view = _frozen_service(tmp_path, publish=False)
+    assert (  # noqa: SLF001
+        service.store._connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        == "wal"
+    )
+
+    with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+        service.publish(service.store.current_attempt(key), view)  # type: ignore[arg-type]
+
+    assert service.store.current_attempt(key) is not None
+    assert service.store.current_attempt(key).state == "frozen"  # type: ignore[union-attr]
+    assert service.store.pointer_for(key) is None
+
+
 def test_frozen_v2_candidate_replays_without_a_pointer(tmp_path: Path) -> None:
     _config, service, key, view = _frozen_service(tmp_path, publish=False)
 
@@ -322,11 +430,16 @@ def test_readonly_replay_fails_closed_when_uncheckpointed_wal_is_visible(
         config.continuity_cas_root, config.scratch_root, read_only=False
     )
     writer = ContinuityService(store, cas)
-    assert store._connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"  # noqa: SLF001
-    store._connection.execute("PRAGMA wal_autocheckpoint=0")  # noqa: SLF001
     key, request, evidence = _typed_inputs()
     attempt = writer.claim_or_reuse(key)
     writer.publish(attempt, writer.freeze(attempt, request, evidence))
+    store.close()
+    cas.close()
+    wal_writer = sqlite3.connect(config.continuity_database)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute("UPDATE pointers SET pointer_version=pointer_version+1")
+    wal_writer.commit()
     wal = config.continuity_database.with_name(
         f"{config.continuity_database.name}-wal"
     )
@@ -361,8 +474,7 @@ def test_readonly_replay_fails_closed_when_uncheckpointed_wal_is_visible(
         assert connect_calls == []
         assert _data_root_snapshot(config.data_root) == before
     finally:
-        store.close()
-        cas.close()
+        wal_writer.close()
 
 
 def test_readonly_replay_rechecks_for_wal_created_during_connection(

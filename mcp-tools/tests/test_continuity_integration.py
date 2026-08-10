@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,6 +93,10 @@ class _Continuity:
         self.replay_request: object | None = None
         self.replay_evidence: object | None = None
         self.replay_extraction: object | None = None
+        self.replay_after_materialize: Callable[[], None] | None = None
+        self.replay_proof_error: Exception | None = None
+        self.replay_proof_calls = 0
+        self.replay_post_proof_calls = 0
 
     def find_replay_candidate(
         self,
@@ -123,13 +128,55 @@ class _Continuity:
         assert self.replay_request is not None
         assert self.replay_evidence is not None
         assert self.replay_extraction is not None
-        return SimpleNamespace(
+        replay = SimpleNamespace(
             attempt=self.current,
             view=SimpleNamespace(view_id=_VIEW),
             request=self.replay_request,
             evidence=self.replay_evidence,
             extraction=self.replay_extraction,
         )
+        if self.replay_after_materialize is not None:
+            callback = self.replay_after_materialize
+            self.replay_after_materialize = None
+            callback()
+        return replay
+
+    def _prove_materialized_replay(
+        self,
+        key: ContinuityKey,
+        attempt: ContinuityAttempt,
+        view: object,
+    ) -> object:
+        self.replay_proof_calls += 1
+        if self.replay_proof_error is not None:
+            raise self.replay_proof_error
+        if (
+            key != self.current.key
+            or attempt != self.current
+            or getattr(view, "view_id", None) != self.current.view_id
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        if self.current.state == "published" and (
+            self.pointer is None
+            or self.pointer.view_id != self.current.view_id
+            or self.pointer.fence_epoch != self.current.fence_epoch
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return SimpleNamespace(
+            attempt=self.current,
+            view_id=self.current.view_id,
+            pointer=self.pointer,
+        )
+
+    def _verify_replay_state(self, key: ContinuityKey, state: object) -> None:
+        self.replay_post_proof_calls += 1
+        if (
+            key != self.current.key
+            or getattr(state, "attempt", None) != self.current
+            or getattr(state, "view_id", None) != self.current.view_id
+            or getattr(state, "pointer", None) != self.pointer
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
 
     def claim_or_reuse(self, key: ContinuityKey) -> ContinuityAttempt:
         assert key == self.current.key
@@ -224,6 +271,7 @@ class _Atlas:
         self.project_calls = 0
         self.prepare_error: AtlasError | None = None
         self.project_error: Exception | None = None
+        self.project_hook: Callable[[], None] | None = None
         self.forbid_live_prepare = False
         self.replay_prepare_calls = 0
 
@@ -253,6 +301,8 @@ class _Atlas:
     def _project_prepared_acceptance(self, prepared: object) -> object:
         assert prepared is self.prepared
         self.project_calls += 1
+        if self.project_hook is not None:
+            self.project_hook()
         if self.project_error is not None:
             raise self.project_error
         return {"projection": self.project_calls}
@@ -698,6 +748,85 @@ def test_published_replay_rejects_pointer_mismatch_before_projection(
     assert orchestrator.outbox.state is AtlasOutboxState.QUARANTINED
 
 
+def test_published_replay_rechecks_pointer_after_projection_before_outbox_mark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.replay_enabled = True
+    continuity._publish(_VIEW)  # noqa: SLF001 - model completed durable replay state
+    original_project = atlas._project_prepared_acceptance
+
+    def mutate_pointer_during_projection(prepared: object) -> object:
+        projection = original_project(prepared)
+        assert continuity.pointer is not None
+        continuity.pointer = ContinuityPointer(
+            continuity.pointer.workflow_id,
+            continuity.pointer.code_task_id,
+            continuity.pointer.code_task_version,
+            continuity.pointer.view_id,
+            continuity.pointer.pointer_version + 1,
+            continuity.pointer.fence_epoch + 1,
+        )
+        return projection
+
+    monkeypatch.setattr(
+        atlas,
+        "_project_prepared_acceptance",
+        mutate_pointer_during_projection,
+    )
+    atlas.forbid_live_prepare = True
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_CONFLICT"
+    assert atlas.prepare_calls == 0
+    assert atlas.project_calls == 1
+    assert continuity.publish_calls == 0
+    assert orchestrator.outbox.state is AtlasOutboxState.QUARANTINED
+    assert orchestrator.outbox.quarantine_count == 1
+    assert orchestrator.unrelated.state is AtlasOutboxState.PENDING
+
+
+def test_published_replay_rejects_unavailable_proof_after_materialize_before_projection(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.replay_enabled = True
+    continuity._publish(_VIEW)  # noqa: SLF001 - model completed durable replay state
+
+    def switch_to_wal_after_materialize() -> None:
+        continuity.replay_proof_error = ContinuityStoreError(
+            "CONTINUITY_STORE_UNPREPARED"
+        )
+
+    continuity.replay_after_materialize = switch_to_wal_after_materialize
+    atlas.forbid_live_prepare = True
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+    assert atlas.prepare_calls == 0
+    assert atlas.project_calls == 0
+    assert continuity.publish_calls == 0
+    assert orchestrator.outbox.state is AtlasOutboxState.PENDING
+    assert orchestrator.outbox.retry_count == 1
+    assert orchestrator.unrelated.state is AtlasOutboxState.PENDING
+
+
 def test_frozen_replay_projects_then_publishes_the_same_fence(
     tmp_path: Path,
 ) -> None:
@@ -723,6 +852,111 @@ def test_frozen_replay_projects_then_publishes_the_same_fence(
     assert continuity.publish_calls == 1
     assert continuity.current.state == "published"
     assert orchestrator.outbox.state is AtlasOutboxState.PROJECTED
+
+
+def test_frozen_replay_rejects_unavailable_proof_after_materialize_before_projection(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.replay_enabled = True
+    continuity.current = ContinuityAttempt(
+        continuity.current.key, 1, "frozen", _VIEW, _RECEIPT
+    )
+
+    def switch_to_wal_after_materialize() -> None:
+        continuity.replay_proof_error = ContinuityStoreError(
+            "CONTINUITY_STORE_UNPREPARED"
+        )
+
+    continuity.replay_after_materialize = switch_to_wal_after_materialize
+    atlas.forbid_live_prepare = True
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+    assert atlas.prepare_calls == 0
+    assert atlas.project_calls == 0
+    assert continuity.publish_calls == 0
+    assert continuity.pointer is None
+    assert orchestrator.outbox.state is AtlasOutboxState.PENDING
+    assert orchestrator.outbox.retry_count == 1
+    assert orchestrator.unrelated.state is AtlasOutboxState.PENDING
+
+
+def test_frozen_replay_does_not_publish_after_projection_makes_state_unavailable(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.replay_enabled = True
+    continuity.current = ContinuityAttempt(
+        continuity.current.key, 1, "frozen", _VIEW, _RECEIPT
+    )
+    atlas.forbid_live_prepare = True
+    atlas.project_hook = lambda: setattr(
+        continuity,
+        "publish_error",
+        ContinuityStoreError("CONTINUITY_STORE_UNPREPARED"),
+    )
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+    assert atlas.prepare_calls == 0
+    assert atlas.project_calls == 1
+    assert continuity.publish_calls == 1
+    assert continuity.current.state == "frozen"
+    assert continuity.pointer is None
+    assert orchestrator.outbox.state is AtlasOutboxState.PENDING
+    assert orchestrator.outbox.retry_count == 1
+    assert orchestrator.unrelated.state is AtlasOutboxState.PENDING
+
+
+def test_frozen_replay_does_not_recover_an_unavailable_publish_as_projected(
+    tmp_path: Path,
+) -> None:
+    uow, atlas, continuity, orchestrator = _uow(tmp_path)
+    continuity.replay_enabled = True
+    continuity.current = ContinuityAttempt(
+        continuity.current.key, 1, "frozen", _VIEW, _RECEIPT
+    )
+    atlas.forbid_live_prepare = True
+
+    def become_published_but_unavailable() -> None:
+        continuity._publish(_VIEW)  # noqa: SLF001 - race fixture owns durable state
+        continuity.publish_error = ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+
+    atlas.project_hook = become_published_but_unavailable
+    request = atlas.prepared.request
+
+    with pytest.raises(AtlasError) as raised:
+        uow.accept_atlas(
+            request.workflow_id,
+            request.code_task_id,
+            request.acceptance_id,
+            request.ingestion_key,
+        )
+
+    assert raised.value.code == "ATLAS_EVIDENCE_UNAVAILABLE"
+    assert atlas.prepare_calls == 0
+    assert atlas.project_calls == 1
+    assert continuity.publish_calls == 1
+    assert orchestrator.outbox.state is AtlasOutboxState.PENDING
+    assert orchestrator.outbox.retry_count == 1
+    assert orchestrator.unrelated.state is AtlasOutboxState.PENDING
 
 
 def test_post_pointer_pending_replay_repairs_only_the_matching_outbox(

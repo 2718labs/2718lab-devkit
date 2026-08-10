@@ -331,10 +331,10 @@ class ContinuityStore:
         connection: sqlite3.Connection,
         *,
         read_only: bool,
-        readonly_database: Path | None = None,
+        database: Path | None = None,
     ) -> None:
         self._connection, self.read_only = connection, read_only
-        self._readonly_database = readonly_database
+        self._database = database
         self._connection.row_factory = sqlite3.Row
 
     @classmethod
@@ -372,7 +372,7 @@ class ContinuityStore:
             return cls(
                 connection,
                 read_only=read_only,
-                readonly_database=database if read_only else None,
+                database=database,
             )
         except (sqlite3.Error, OSError, ContinuityError) as error:
             if connection is not None:
@@ -685,28 +685,30 @@ class ContinuityStore:
 
     @contextmanager
     def _replay_snapshot(self) -> Iterator[None]:
-        self._assert_readonly_snapshot_invariant()
+        self._assert_physical_invariant()
         self._connection.execute("SAVEPOINT continuity_replay_snapshot")
         try:
             yield
         except Exception:
             self._connection.execute("ROLLBACK TO SAVEPOINT continuity_replay_snapshot")
             self._connection.execute("RELEASE SAVEPOINT continuity_replay_snapshot")
-            self._assert_readonly_snapshot_invariant()
+            self._assert_physical_invariant()
             raise
         else:
             self._connection.execute("RELEASE SAVEPOINT continuity_replay_snapshot")
-            self._assert_readonly_snapshot_invariant()
+            self._assert_physical_invariant()
 
-    def _assert_readonly_snapshot_invariant(self) -> None:
-        if self._readonly_database is not None:
-            _require_delete_journal_invariant(self._readonly_database)
+    def _assert_physical_invariant(self) -> None:
+        if self._database is not None:
+            _require_delete_journal_invariant(self._database)
 
     @contextmanager
     def _atomic(self) -> Iterator[None]:
         self._writable()
+        self._assert_physical_invariant()
         try:
             self._connection.execute("BEGIN IMMEDIATE")
+            self._assert_physical_invariant()
             yield
             self._connection.commit()
         except Exception as error:
@@ -867,7 +869,7 @@ def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> Cont
         _verify_v3_schema(connection)
         connection.commit()
         _require_delete_journal_invariant(database)
-        return ContinuityStore(connection, read_only=False)
+        return ContinuityStore(connection, read_only=False, database=database)
     except (sqlite3.Error, OSError, ContinuityError) as error:
         _rollback_and_close(connection)
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error

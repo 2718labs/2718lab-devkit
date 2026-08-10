@@ -20,7 +20,7 @@ from .models import (
     FrozenView,
     ReplayMetadata,
 )
-from .store import ContinuityStore, ContinuityStoreError
+from .store import ContinuityStore, ContinuityStoreError, _ReplayState
 
 if TYPE_CHECKING:
     from devkit_atlas.extractors import ExtractionRequest
@@ -86,18 +86,47 @@ class ContinuityService:
     def verify_replay(self, key: ContinuityKey) -> FrozenView:
         """Structurally verify one v2 frozen view and every referenced CAS body."""
 
-        _attempt, view, _bodies = self._verified_replay(key)
-        return view
+        state, _bodies = self._verified_replay(key)
+        self._verify_replay_state(key, state)
+        return state.view
 
     def materialize_replay(self, key: ContinuityKey) -> _ReplayMaterialization:
         """Rebuild an Atlas-ready typed projection input without live evidence."""
 
-        attempt, view, bodies = self._verified_replay(key)
-        return self._typed_replay_materialization(attempt, view, bodies)
+        state, bodies = self._verified_replay(key)
+        self._verify_replay_state(key, state)
+        materialization = self._typed_replay_materialization(
+            state.attempt, state.view, bodies
+        )
+        self._verify_replay_state(key, state)
+        return materialization
+
+    def _prove_materialized_replay(
+        self,
+        key: ContinuityKey,
+        attempt: ContinuityAttempt,
+        view: FrozenView,
+    ) -> _ReplayState:
+        """Recheck physical storage and bind a typed replay to its exact state."""
+
+        if type(key) is not ContinuityKey or type(attempt) is not ContinuityAttempt:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        if type(view) is not FrozenView:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        state = self.store.replay_state_for(key)
+        if state.attempt != attempt or state.view != view:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return state
+
+    def _verify_replay_state(self, key: ContinuityKey, expected: _ReplayState) -> None:
+        """Reject a physical or durable state change after a replay observation."""
+
+        if self.store.replay_state_for(key) != expected:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
 
     def _verified_replay(
         self, key: ContinuityKey
-    ) -> tuple[ContinuityAttempt, FrozenView, tuple[tuple[FrozenEntry, bytes], ...]]:
+    ) -> tuple[_ReplayState, tuple[tuple[FrozenEntry, bytes], ...]]:
         state = self.store.replay_state_for(key)
         bodies = tuple(
             (
@@ -106,7 +135,7 @@ class ContinuityService:
             )
             for entry in state.view.entries
         )
-        return state.attempt, state.view, bodies
+        return state, bodies
 
     @staticmethod
     def _typed_replay_materialization(
