@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from .canonical import canonical_hash
 from .cas import ContinuityCas
@@ -20,6 +21,24 @@ from .models import (
     ReplayMetadata,
 )
 from .store import ContinuityStore, ContinuityStoreError
+
+if TYPE_CHECKING:
+    from devkit_atlas.extractors import ExtractionRequest
+    from devkit_atlas.service import (
+        AcceptedAtlasProjectionEvidence,
+        AcceptedAtlasProjectionRequest,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayMaterialization:
+    """Private, fully typed input for a reader-free Atlas projection."""
+
+    attempt: ContinuityAttempt
+    view: FrozenView
+    request: AcceptedAtlasProjectionRequest
+    evidence: AcceptedAtlasProjectionEvidence
+    extraction: ExtractionRequest
 
 
 class ContinuityService:
@@ -51,24 +70,181 @@ class ContinuityService:
             attempt = current
         return self.store.publish_attempt_atomic(attempt, frozen_view)
 
-    def verify_replay(self, key: ContinuityKey) -> FrozenView:
-        """Return a revalidated v2 view without consulting Atlas or the CAS."""
-        return self.store.replay_view_for(key)
+    def find_replay_candidate(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> ContinuityKey | None:
+        """Locate exactly one frozen view using only public acceptance IDs."""
 
-    def materialize_replay(
+        return self.store.find_replay_candidate(
+            workflow_id, code_task_id, acceptance_id, ingestion_key
+        )
+
+    def verify_replay(self, key: ContinuityKey) -> FrozenView:
+        """Structurally verify one v2 frozen view and every referenced CAS body."""
+
+        _attempt, view, _bodies = self._verified_replay(key)
+        return view
+
+    def materialize_replay(self, key: ContinuityKey) -> _ReplayMaterialization:
+        """Rebuild an Atlas-ready typed projection input without live evidence."""
+
+        attempt, view, bodies = self._verified_replay(key)
+        return self._typed_replay_materialization(attempt, view, bodies)
+
+    def _verified_replay(
         self, key: ContinuityKey
-    ) -> tuple[tuple[FrozenEntry, bytes], ...]:
-        """Read every canonical replay entry only after offline verification succeeds."""
-        view = self.verify_replay(key)
-        materialized: list[tuple[FrozenEntry, bytes]] = []
-        for entry in view.entries:
-            materialized.append(
-                (
-                    entry,
-                    self.cas.read_verified(entry.content_hash, entry.byte_length),
-                )
+    ) -> tuple[ContinuityAttempt, FrozenView, tuple[tuple[FrozenEntry, bytes], ...]]:
+        state = self.store.replay_state_for(key)
+        bodies = tuple(
+            (
+                entry,
+                self.cas.read_verified(entry.content_hash, entry.byte_length),
             )
-        return tuple(materialized)
+            for entry in state.view.entries
+        )
+        return state.attempt, state.view, bodies
+
+    @staticmethod
+    def _typed_replay_materialization(
+        attempt: ContinuityAttempt,
+        view: FrozenView,
+        bodies: tuple[tuple[FrozenEntry, bytes], ...],
+    ) -> _ReplayMaterialization:
+        """Convert verified Continuity data to exact Atlas value objects only."""
+
+        from devkit_atlas.extractors import (
+            BoundExecutionReceipt as AtlasExecutionReceipt,
+        )
+        from devkit_atlas.extractors import ExtractionRequest
+        from devkit_atlas.models import AtlasError
+        from devkit_atlas.service import (
+            AcceptedAtlasProjectionEvidence,
+            AcceptedAtlasProjectionRequest,
+            AtlasService,
+        )
+        from project_index.checkpoints import CheckpointFile
+        from project_index.models import CoverageGap as IndexCoverageGap
+        from project_index.models import IndexNode, SnapshotFile
+
+        metadata = view.replay_metadata
+        if not isinstance(metadata, ReplayMetadata):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        try:
+            request = AcceptedAtlasProjectionRequest.create(
+                workflow_id=view.key.workflow_id,
+                code_task_id=view.key.code_task_id,
+                code_task_version=view.key.code_task_version,
+                input_snapshot_id=view.input_snapshot_ids[0],
+                output_snapshot_id=view.output_snapshot_ids[0],
+                indexed_diff_hash=metadata.indexed_diff_hash,
+                intent_id=metadata.intent_id,
+                language=metadata.language,
+                framework=metadata.framework,
+                checkpoint_id=view.checkpoint_ids[0],
+                checkpoint_hash=metadata.checkpoint_hash,
+                output_query_trace_id=view.query_ids[0],
+                verification_artifact_hashes=view.verification_artifact_hashes,
+                execution_receipt_ids=view.execution_receipt_ids,
+            )
+            if (
+                request.ingestion_key != view.key.ingestion_key
+                or request.payload_hash != view.key.payload_hash
+                or request.acceptance_id != view.key.acceptance_id
+                or request.evidence_binding_hash != view.key.evidence_binding_hash
+                or view.request_hash != canonical_hash(_public_request(request))
+            ):
+                raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+            before_files: list[CheckpointFile] = []
+            after_files: list[SnapshotFile] = []
+            for entry, body in bodies:
+                if entry.role == "before_file":
+                    before_files.append(
+                        CheckpointFile(entry.path, entry.content_hash, body)
+                    )
+                elif entry.role == "after_file":
+                    after_files.append(SnapshotFile(entry.path, entry.content_hash, body))
+                else:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+            extraction = ExtractionRequest(
+                workflow_id=view.key.workflow_id,
+                task_id=view.key.code_task_id,
+                acceptance_id=view.key.acceptance_id,
+                task_kind=metadata.task_kind,
+                intent_id=metadata.intent_id,
+                workspace_hash=metadata.workspace_hash,
+                checkpoint_id=view.checkpoint_ids[0],
+                input_snapshot_id=view.input_snapshot_ids[0],
+                output_snapshot_id=view.output_snapshot_ids[0],
+                write_scope=metadata.write_scope,
+                before_files=tuple(before_files),
+                after_files=tuple(after_files),
+                changed_nodes=tuple(
+                    IndexNode(
+                        node_id=node.node_id,
+                        kind=node.kind,
+                        path=node.path,
+                        name=node.name,
+                        qualified_name=node.qualified_name,
+                        start_line=node.start_line,
+                        end_line=node.end_line,
+                        content_hash=node.content_hash,
+                        attributes=node.attributes,
+                        extractor_id=node.extractor_id,
+                        extractor_version=node.extractor_version,
+                        provenance=node.provenance,
+                        start_byte=node.start_byte,
+                        end_byte=node.end_byte,
+                    )
+                    for node in view.changed_nodes
+                ),
+                coverage_gaps=tuple(
+                    IndexCoverageGap(gap.path, gap.code, gap.message)
+                    for gap in view.coverage_gaps
+                ),
+                execution_receipts=tuple(
+                    AtlasExecutionReceipt(
+                        receipt.receipt_id,
+                        receipt.kind,
+                        receipt.workflow_id,
+                        receipt.task_id,
+                        receipt.acceptance_id,
+                        receipt.workspace_hash,
+                        receipt.output_snapshot_id,
+                        receipt.command_spec,
+                        receipt.command_spec_hash,
+                        receipt.input_hash,
+                        receipt.output_hash,
+                        receipt.exit_code,
+                        receipt.success,
+                    )
+                    for receipt in view.execution_receipts
+                ),
+            )
+            evidence = AcceptedAtlasProjectionEvidence(
+                code_task_version=view.key.code_task_version,
+                language=metadata.language,
+                framework=metadata.framework,
+                checkpoint_hash=metadata.checkpoint_hash,
+                indexed_diff_hash=metadata.indexed_diff_hash,
+                output_query_trace_id=view.query_ids[0],
+                verification_artifact_hashes=view.verification_artifact_hashes,
+                extraction_request=extraction,
+            )
+            if view.evidence_hash != canonical_hash(_evidence(evidence)):
+                raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+            request = AtlasService._validate_accepted_projection_request(request)
+            AtlasService._require_canonical_core_key(request)
+            if AtlasService._validate_reader_evidence(request, evidence) != extraction:
+                raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        except ContinuityStoreError:
+            raise
+        except (AtlasError, AttributeError, IndexError, TypeError, ValueError) as error:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT") from error
+        return _ReplayMaterialization(attempt, view, request, evidence, extraction)
 
     def _typed_view(self, key: ContinuityKey, request: Any, evidence: Any) -> FrozenView:
         from devkit_atlas.extractors import ExtractionRequest

@@ -97,6 +97,13 @@ class _OwnedClosers:
 _UNSET = object()
 
 
+class _ReplayProjectIndex:
+    """A poison dependency proving replay never reaches the live project index."""
+
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"offline replay touched project index attribute: {name}")
+
+
 class RuntimeUnitOfWork:
     """One closeable bundle of lazily opened, invocation-scoped adapters."""
 
@@ -121,6 +128,8 @@ class RuntimeUnitOfWork:
         self._atlas_store: object = _UNSET
         self._atlas: object = _UNSET
         self._continuity: object = _UNSET
+        self._replay_continuity: object = _UNSET
+        self._replay_atlas: object = _UNSET
         self._orchestrator_store: object = _UNSET
         self._acceptance_evidence_reader: object = _UNSET
         self._registry: object = _UNSET
@@ -185,25 +194,17 @@ class RuntimeUnitOfWork:
             raise RuntimeConfigError("RUNTIME_READ_ONLY")
         marking_outbox = False
         try:
-            prepared = self.atlas._prepare_accepted_projection(  # noqa: SLF001
+            replay_key = self._continuity_replay_service().find_replay_candidate(
                 workflow_id, code_task_id, acceptance_id, ingestion_key
             )
-            key = self._continuity_key(
-                prepared, workflow_id, code_task_id, acceptance_id, ingestion_key
-            )
-            self._matching_atlas_outbox(acceptance_id, ingestion_key)
-            continuity = self._continuity_service()
-            attempt = continuity.claim_or_reuse(key)
-            if attempt.state == "published":
-                self._published_pointer(continuity, attempt, attempt.view_id)
-                projection = self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
-            else:
-                frozen_view, already_published = self._freeze_or_recover(
-                    continuity, attempt, prepared
+            if replay_key is None:
+                projection = self._accept_atlas_live(
+                    workflow_id, code_task_id, acceptance_id, ingestion_key
                 )
-                projection = self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
-                if not already_published:
-                    self._publish_or_recover(continuity, attempt, frozen_view)
+            else:
+                projection = self._accept_atlas_replay(
+                    replay_key, acceptance_id, ingestion_key
+                )
             marking_outbox = True
             self._mark_atlas_acceptance_projected(acceptance_id, ingestion_key)
             return projection
@@ -230,6 +231,73 @@ class RuntimeUnitOfWork:
                     acceptance_id, ingestion_key, atlas_error
                 )
             raise atlas_error from error
+
+    def _accept_atlas_live(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> object:
+        """Retain CP-C's reader-backed first-freeze path only for no candidate."""
+
+        prepared = self.atlas._prepare_accepted_projection(  # noqa: SLF001
+            workflow_id, code_task_id, acceptance_id, ingestion_key
+        )
+        key = self._continuity_key(
+            prepared, workflow_id, code_task_id, acceptance_id, ingestion_key
+        )
+        self._matching_atlas_outbox(acceptance_id, ingestion_key)
+        continuity = self._continuity_service()
+        attempt = continuity.claim_or_reuse(key)
+        if attempt.state == "published":
+            self._published_pointer(continuity, attempt, attempt.view_id)
+            return self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
+        frozen_view, already_published = self._freeze_or_recover(
+            continuity, attempt, prepared
+        )
+        projection = self.atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
+        if not already_published:
+            self._publish_or_recover(continuity, attempt, frozen_view)
+        return projection
+
+    def _accept_atlas_replay(
+        self, key: object, acceptance_id: str, ingestion_key: str
+    ) -> object:
+        """Project one structurally verified frozen view without a live reader."""
+
+        from devkit_atlas.models import AtlasError
+
+        replay_continuity = self._continuity_replay_service()
+        replay = replay_continuity.materialize_replay(key)
+        continuity = replay_continuity
+        if replay.attempt.state == "frozen":
+            # Recheck through the writer immediately before projecting/publishing;
+            # a concurrent pointer winner may only advance to the same view.
+            continuity = self._continuity_service()
+            replay = continuity.materialize_replay(key)
+        if replay.attempt.state not in {"frozen", "published"}:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        if (
+            replay.request.acceptance_id != acceptance_id
+            or replay.request.ingestion_key != ingestion_key
+        ):
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        # The outbox is intentionally opened only after immutable replay is
+        # complete, but before Atlas side effects, and never through the reader.
+        self._matching_atlas_outbox(acceptance_id, ingestion_key)
+        atlas = self._replay_atlas_service()
+        prepared = atlas._prepare_projection_from_request(  # noqa: SLF001
+            replay.request, replay.evidence
+        )
+        if getattr(prepared, "extraction", None) != replay.extraction:
+            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        projection = atlas._project_prepared_acceptance(prepared)  # noqa: SLF001
+        if replay.attempt.state == "frozen":
+            self._publish_or_recover(continuity, replay.attempt, replay.view)
+        else:
+            self._published_pointer(continuity, replay.attempt, replay.view.view_id)
+        return projection
 
     @property
     def registry(self) -> object:
@@ -316,9 +384,10 @@ class RuntimeUnitOfWork:
             from orchestrator.service import OrchestratorService
 
             project_checkpoint = self.project_checkpoint
-            self._orchestrator_store = self._remember(
-                _open_orchestrator_store_rw(self._config)
-            )
+            if self._orchestrator_store is _UNSET:
+                self._orchestrator_store = self._remember(
+                    _open_orchestrator_store_rw(self._config)
+                )
             receipts = ReceiptRepository(self._config.data_root)
             orchestrator = OrchestratorService(
                 self._orchestrator_store,
@@ -348,6 +417,53 @@ class RuntimeUnitOfWork:
                 )
             )
         return cast("ContinuityService", self._continuity)
+
+    def _continuity_replay_service(self) -> ContinuityService:
+        """Open an independently read-only Continuity view before any live reader."""
+
+        self._assert_open()
+        if self._read_only:
+            raise RuntimeConfigError("RUNTIME_READ_ONLY")
+        if self._replay_continuity is _UNSET:
+            self._replay_continuity = self._remember(
+                self._factories.open_continuity(
+                    config=self._config,
+                    read_only=True,
+                )
+            )
+        return cast("ContinuityService", self._replay_continuity)
+
+    def _replay_atlas_service(self) -> object:
+        """Construct Atlas's prepared/project seam with a poison live index."""
+
+        self._assert_open()
+        if self._replay_atlas is _UNSET:
+            # Test seams may provide a preconstructed private Atlas object.  In
+            # production this branch bypasses the live factory entirely.
+            if self._atlas is not _UNSET:
+                self._replay_atlas = self._atlas
+            else:
+                from devkit_atlas import ASSET_ROOT
+                from devkit_atlas.recipes import BundledRecipeLoader
+                from devkit_atlas.service import AtlasService
+
+                self._replay_atlas = AtlasService(
+                    cast("AtlasStore", self.atlas_store),
+                    BundledRecipeLoader(ASSET_ROOT),
+                    _ReplayProjectIndex(),
+                    acceptance_evidence_reader=None,
+                )
+        return self._replay_atlas
+
+    def _orchestrator_store_for_outbox(self) -> object:
+        """Open the exact outbox authority without constructing a live reader."""
+
+        self._assert_open()
+        if self._orchestrator_store is _UNSET:
+            self._orchestrator_store = self._remember(
+                _open_orchestrator_store_rw(self._config)
+            )
+        return self._orchestrator_store
 
     @staticmethod
     def _continuity_key(
@@ -557,12 +673,7 @@ class RuntimeUnitOfWork:
     ) -> object:
         from devkit_atlas.models import AtlasError
 
-        store = self._orchestrator_store
-        if store is _UNSET:
-            self._atlas_acceptance_evidence_reader()
-            store = self._orchestrator_store
-        if store is _UNSET:
-            raise AtlasError("ATLAS_EVIDENCE_CONFLICT")
+        store = self._orchestrator_store_for_outbox()
         outbox = store.atlas_outbox_for_acceptance(acceptance_id)
         if (
             outbox is None

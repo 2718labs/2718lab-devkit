@@ -6,6 +6,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,15 @@ from .models import (
 
 _SCHEMA_VERSION = "3"
 _IMMUTABLE_TABLES = ("continuity_keys", "views", "entries", "receipts", "attempts")
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayState:
+    """Verified private durable state required before a CAS replay read."""
+
+    attempt: ContinuityAttempt
+    view: FrozenView
+    pointer: ContinuityPointer | None
 _V1_TABLE_SQL = {
     "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
     "views": "CREATE TABLE views (view_id TEXT PRIMARY KEY NOT NULL, key_hash TEXT UNIQUE NOT NULL, manifest_hash TEXT NOT NULL, cas_root_hash TEXT NOT NULL, manifest_json TEXT NOT NULL)",
@@ -371,140 +381,219 @@ class ContinuityStore:
             row["fence_epoch"],
         )
 
-    def replay_view_for(self, key: ContinuityKey) -> FrozenView:
-        """Rebuild only the exact current, published v2 view for offline replay."""
+    def find_replay_candidate(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> ContinuityKey | None:
+        """Return one exact frozen/public candidate, never a best-effort match.
+
+        The four public identifiers intentionally omit the two internal hashes.
+        A collision across those hidden bindings is therefore an immutable
+        conflict, not a reason to consult mutable live evidence.
+        """
+
+        if not all(
+            isinstance(value, str) and value
+            for value in (workflow_id, code_task_id, acceptance_id, ingestion_key)
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        try:
+            with self._replay_snapshot():
+                rows = tuple(
+                    self._connection.execute(
+                        "SELECT key_hash,key_json,workflow_id,code_task_id,"
+                        "code_task_version,acceptance_id,ingestion_key,payload_hash,"
+                        "evidence_binding_hash FROM continuity_keys "
+                        "WHERE workflow_id=? AND code_task_id=? AND acceptance_id=? "
+                        "AND ingestion_key=? ORDER BY key_hash",
+                        (workflow_id, code_task_id, acceptance_id, ingestion_key),
+                    )
+                )
+                if not rows:
+                    return None
+                if len(rows) != 1:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_AMBIGUOUS")
+                key = self._replay_key_from_row(rows[0])
+                attempt = self._replay_current_attempt(key)
+                if attempt.state not in {"frozen", "published"}:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                # A four-ID hit is never permission to re-enter mutable live
+                # evidence.  Prove this exact v2 candidate is structurally
+                # replayable before returning its hidden bindings to the UoW.
+                self.replay_state_for(key)
+                return key
+        except ContinuityStoreError:
+            raise
+        except (sqlite3.Error, OSError) as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        except (ContinuityError, KeyError, TypeError, ValueError) as error:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT") from error
+
+    def replay_state_for(self, key: ContinuityKey) -> _ReplayState:
+        """Verify the exact frozen/published durable graph without CAS reads."""
+
         if type(key) is not ContinuityKey:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
         try:
             with self._replay_snapshot():
                 key_row = self._connection.execute(
-                    "SELECT key_json,workflow_id,code_task_id,code_task_version,"
-                    "acceptance_id,ingestion_key,payload_hash,evidence_binding_hash "
-                    "FROM continuity_keys WHERE key_hash=?",
+                    "SELECT key_hash,key_json,workflow_id,code_task_id,"
+                    "code_task_version,acceptance_id,ingestion_key,payload_hash,"
+                    "evidence_binding_hash FROM continuity_keys WHERE key_hash=?",
                     (key.key_hash,),
                 ).fetchone()
-                if key_row is None or (
-                    key_row["key_json"] != canonical_json(key.to_dict())
-                    or (
-                        key_row["workflow_id"],
-                        key_row["code_task_id"],
-                        key_row["code_task_version"],
-                        key_row["acceptance_id"],
-                        key_row["ingestion_key"],
-                        key_row["payload_hash"],
-                        key_row["evidence_binding_hash"],
-                    )
-                    != (
-                        key.workflow_id,
-                        key.code_task_id,
-                        key.code_task_version,
-                        key.acceptance_id,
-                        key.ingestion_key,
-                        key.payload_hash,
-                        key.evidence_binding_hash,
-                    )
-                ):
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                attempt_row = self._connection.execute(
-                    "SELECT key_json,fence_epoch,state,view_id,receipt_hash FROM attempts "
-                    "WHERE key_hash=? ORDER BY sequence DESC LIMIT 1",
-                    (key.key_hash,),
-                ).fetchone()
+                if key_row is None or self._replay_key_from_row(key_row) != key:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                attempt = self._replay_current_attempt(key)
+                if attempt.state not in {"frozen", "published"}:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                if attempt.view_id is None or attempt.receipt_hash is None:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                view = self._replay_view(key, attempt.view_id)
+                if view.replay_metadata is None:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                frozen = self._replay_receipt(key, view.view_id, "frozen")
+                if attempt.state == "frozen":
+                    if attempt.receipt_hash != frozen.receipt_hash:
+                        raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                    pointer = self._replay_pointer(key)
+                    if pointer is not None:
+                        raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                    return _ReplayState(attempt, view, None)
+                published = self._replay_receipt(key, view.view_id, "published")
+                if attempt.receipt_hash != published.receipt_hash:
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                pointer = self._replay_pointer(key)
                 if (
-                    attempt_row is None
-                    or attempt_row["key_json"] != canonical_json(key.to_dict())
-                ):
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                attempt = ContinuityAttempt(
-                    key,
-                    attempt_row["fence_epoch"],
-                    attempt_row["state"],
-                    attempt_row["view_id"],
-                    attempt_row["receipt_hash"],
-                )
-                if (
-                    attempt.state != "published"
-                    or attempt.view_id is None
-                    or attempt.receipt_hash is None
-                ):
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                pointer_row = self._connection.execute(
-                    "SELECT key_hash,workflow_id,code_task_id,code_task_version,"
-                    "view_id,pointer_version,fence_epoch FROM pointers WHERE key_hash=?",
-                    (key.key_hash,),
-                ).fetchone()
-                if pointer_row is None:
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                pointer = ContinuityPointer(
-                    pointer_row["workflow_id"],
-                    pointer_row["code_task_id"],
-                    pointer_row["code_task_version"],
-                    pointer_row["view_id"],
-                    pointer_row["pointer_version"],
-                    pointer_row["fence_epoch"],
-                )
-                if (
-                    pointer_row["key_hash"] != key.key_hash
-                    or (
-                        pointer.workflow_id,
-                        pointer.code_task_id,
-                        pointer.code_task_version,
-                    )
-                    != (key.workflow_id, key.code_task_id, key.code_task_version)
-                    or pointer.view_id != attempt.view_id
+                    pointer is None
+                    or pointer.view_id != view.view_id
                     or pointer.fence_epoch != attempt.fence_epoch
                 ):
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                receipt_row = self._connection.execute(
-                    "SELECT key_hash,view_id,kind,receipt_json FROM receipts "
-                    "WHERE receipt_hash=?",
-                    (attempt.receipt_hash,),
-                ).fetchone()
-                expected_receipt = ContinuityReceipt.create(
-                    key=key, view_id=attempt.view_id, kind="published"
-                )
-                if (
-                    attempt.receipt_hash != expected_receipt.receipt_hash
-                    or receipt_row is None
-                    or receipt_row["key_hash"] != key.key_hash
-                    or receipt_row["view_id"] != attempt.view_id
-                    or receipt_row["kind"] != "published"
-                    or receipt_row["receipt_json"] != _receipt_json(expected_receipt)
-                ):
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                view_row = self._connection.execute(
-                    "SELECT view_id,key_hash,manifest_hash,cas_root_hash,manifest_json "
-                    "FROM views WHERE view_id=? AND key_hash=?",
-                    (attempt.view_id, key.key_hash),
-                ).fetchone()
-                if view_row is None:
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                entries = tuple(
-                    FrozenEntry(
-                        row["role"],
-                        row["path"],
-                        row["content_hash"],
-                        row["byte_length"],
-                    )
-                    for row in self._connection.execute(
-                        "SELECT role,path,content_hash,byte_length FROM entries "
-                        "WHERE view_id=? ORDER BY role,path,content_hash",
-                        (attempt.view_id,),
-                    )
-                )
-                view = _frozen_view_from_manifest(key, view_row, entries)
-                if (
-                    view.key != key
-                    or view.view_id != attempt.view_id
-                    or view.view_id != pointer.view_id
-                    or view.replay_metadata is None
-                ):
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-                return view
+                    raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+                return _ReplayState(attempt, view, pointer)
         except ContinuityStoreError:
             raise
-        except (sqlite3.Error, OSError, ContinuityError, KeyError, TypeError, ValueError) as error:
+        except (sqlite3.Error, OSError) as error:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        except (ContinuityError, KeyError, TypeError, ValueError) as error:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT") from error
+
+    def replay_view_for(self, key: ContinuityKey) -> FrozenView:
+        """Compatibility read helper retaining the validated v2 frozen view."""
+
+        return self.replay_state_for(key).view
+
+    def _replay_key_from_row(self, row: sqlite3.Row) -> ContinuityKey:
+        key = ContinuityKey(
+            row["workflow_id"],
+            row["code_task_id"],
+            row["code_task_version"],
+            row["acceptance_id"],
+            row["ingestion_key"],
+            row["payload_hash"],
+            row["evidence_binding_hash"],
+        )
+        if (
+            row["key_hash"] != key.key_hash
+            or row["key_json"] != canonical_json(key.to_dict())
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return key
+
+    def _replay_current_attempt(self, key: ContinuityKey) -> ContinuityAttempt:
+        row = self._connection.execute(
+            "SELECT key_json,fence_epoch,state,view_id,receipt_hash FROM attempts "
+            "WHERE key_hash=? ORDER BY sequence DESC LIMIT 1",
+            (key.key_hash,),
+        ).fetchone()
+        if row is None or row["key_json"] != canonical_json(key.to_dict()):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return ContinuityAttempt(
+            key,
+            row["fence_epoch"],
+            row["state"],
+            row["view_id"],
+            row["receipt_hash"],
+        )
+
+    def _replay_view(self, key: ContinuityKey, view_id: str) -> FrozenView:
+        row = self._connection.execute(
+            "SELECT view_id,key_hash,manifest_hash,cas_root_hash,manifest_json "
+            "FROM views WHERE view_id=? AND key_hash=?",
+            (view_id, key.key_hash),
+        ).fetchone()
+        if row is None:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        entries = tuple(
+            FrozenEntry(
+                entry["role"],
+                entry["path"],
+                entry["content_hash"],
+                entry["byte_length"],
+            )
+            for entry in self._connection.execute(
+                "SELECT role,path,content_hash,byte_length FROM entries "
+                "WHERE view_id=? ORDER BY role,path,content_hash",
+                (view_id,),
+            )
+        )
+        try:
+            view = _frozen_view_from_manifest(key, row, entries)
+        except ContinuityStoreError as error:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT") from error
+        if view.key != key or view.view_id != view_id:
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return view
+
+    def _replay_receipt(
+        self, key: ContinuityKey, view_id: str, kind: str
+    ) -> ContinuityReceipt:
+        expected = ContinuityReceipt.create(key=key, view_id=view_id, kind=kind)
+        row = self._connection.execute(
+            "SELECT key_hash,view_id,kind,receipt_json FROM receipts "
+            "WHERE receipt_hash=?",
+            (expected.receipt_hash,),
+        ).fetchone()
+        if (
+            row is None
+            or row["key_hash"] != key.key_hash
+            or row["view_id"] != view_id
+            or row["kind"] != kind
+            or row["receipt_json"] != _receipt_json(expected)
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return expected
+
+    def _replay_pointer(self, key: ContinuityKey) -> ContinuityPointer | None:
+        row = self._connection.execute(
+            "SELECT key_hash,workflow_id,code_task_id,code_task_version,"
+            "view_id,pointer_version,fence_epoch FROM pointers WHERE key_hash=?",
+            (key.key_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        pointer = ContinuityPointer(
+            row["workflow_id"],
+            row["code_task_id"],
+            row["code_task_version"],
+            row["view_id"],
+            row["pointer_version"],
+            row["fence_epoch"],
+        )
+        if (
+            row["key_hash"] != key.key_hash
+            or (
+                pointer.workflow_id,
+                pointer.code_task_id,
+                pointer.code_task_version,
+            )
+            != (key.workflow_id, key.code_task_id, key.code_task_version)
+        ):
+            raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
+        return pointer
 
     @contextmanager
     def _replay_snapshot(self) -> Iterator[None]:

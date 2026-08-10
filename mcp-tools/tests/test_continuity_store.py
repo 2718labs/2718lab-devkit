@@ -986,14 +986,17 @@ def test_service_verify_and_materialize_published_v2_replay_offline(
 
         assert reader_store.replay_view_for(key) == view
         assert replay.verify_replay(key) == view
-        assert replay_cas.calls == []
-        assert replay.materialize_replay(key) == tuple(
-            (entry, bodies[(entry.content_hash, entry.byte_length)])
-            for entry in view.entries
-        )
         assert replay_cas.calls == [
             (entry.content_hash, entry.byte_length) for entry in view.entries
         ]
+        materialized = replay.materialize_replay(key)
+        assert materialized.view == view
+        assert materialized.attempt.state == "published"
+        assert materialized.extraction.before_files[0].body == b"before"
+        assert materialized.extraction.after_files[0].body == b"after"
+        assert replay_cas.calls == [
+            (entry.content_hash, entry.byte_length) for entry in view.entries
+        ] * 2
     finally:
         if reader_store is not None:
             reader_store.close()
@@ -1013,14 +1016,14 @@ def test_materialize_replay_rejects_v1_before_cas_read(tmp_path: Path) -> None:
     replay_cas = _ReplayCas({})
 
     try:
-        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_REPLAY_CONFLICT"):
             ContinuityService(store, replay_cas).materialize_replay(key)
         assert replay_cas.calls == []
     finally:
         store.close()
 
 
-def test_materialize_replay_rejects_frozen_unpublished_view_before_cas_read(
+def test_materialize_replay_supports_frozen_unpublished_view_before_publish(
     tmp_path: Path,
 ) -> None:
     config, store = _prepared_store(tmp_path)
@@ -1029,13 +1032,21 @@ def test_materialize_replay_rejects_frozen_unpublished_view_before_cas_read(
     )
     writer = ContinuityService(store, writer_cas)
     key, request, evidence = _typed_inputs()
-    writer.freeze(writer.claim_or_reuse(key), request, evidence)
-    replay_cas = _ReplayCas({})
+    view = writer.freeze(writer.claim_or_reuse(key), request, evidence)
+    replay_cas = _ReplayCas(
+        {
+            (_hash(b"before"), len(b"before")): b"before",
+            (_hash(b"after"), len(b"after")): b"after",
+        }
+    )
 
     try:
-        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
-            ContinuityService(store, replay_cas).materialize_replay(key)
-        assert replay_cas.calls == []
+        materialized = ContinuityService(store, replay_cas).materialize_replay(key)
+        assert materialized.attempt.state == "frozen"
+        assert materialized.view == view
+        assert replay_cas.calls == [
+            (entry.content_hash, entry.byte_length) for entry in view.entries
+        ]
     finally:
         writer_cas.close()
         store.close()
@@ -1077,7 +1088,7 @@ def test_materialize_replay_rejects_pointer_mismatch_before_cas_read(
     replay_cas = _ReplayCas({})
 
     try:
-        with pytest.raises(ContinuityStoreError, match="CONTINUITY_STORE_UNPREPARED"):
+        with pytest.raises(ContinuityStoreError, match="CONTINUITY_REPLAY_CONFLICT"):
             ContinuityService(store, replay_cas).materialize_replay(key)
         assert replay_cas.calls == []
     finally:

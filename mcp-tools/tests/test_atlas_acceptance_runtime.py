@@ -7,6 +7,7 @@ import json
 import shutil
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -26,13 +27,16 @@ from devkit_atlas.recipes import BundledRecipeLoader  # noqa: E402
 from devkit_atlas.service import AtlasService  # noqa: E402
 from devkit_atlas.store import AtlasStore  # noqa: E402
 from devkit_continuity.models import ContinuityKey  # noqa: E402
+from devkit_continuity.service import ContinuityService  # noqa: E402
 from devkit_continuity.store import ContinuityStore  # noqa: E402
 from devkit_runtime.atlas_acceptance import (  # noqa: E402
     ProductionAcceptanceEvidenceReader,
 )
 from devkit_runtime.composition import RuntimeRoot  # noqa: E402
 from devkit_runtime.config import RuntimeConfig  # noqa: E402
+from devkit_runtime.uow import DEFAULT_RUNTIME_ADAPTER_FACTORIES  # noqa: E402
 from orchestrator.store import SQLiteStore  # noqa: E402
+from project_index.service import ProjectIndexService  # noqa: E402
 
 
 def test_public_rebuild_has_exact_four_acceptance_fields() -> None:
@@ -493,6 +497,21 @@ class DefaultRuntimeAcceptanceEvidenceTests(CodeTaskAcceptanceFixture):
             connection.close()
 
     @staticmethod
+    def _reset_runtime_outbox_pending(config: RuntimeConfig, ingestion_key: str) -> None:
+        """Model the crash window after a durable pointer and before outbox drain."""
+
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            cursor = connection.execute(
+                "UPDATE atlas_ingestion_outbox SET state = ? WHERE ingestion_key = ?",
+                ("pending", ingestion_key),
+            )
+            assert cursor.rowcount == 1
+            connection.commit()
+        finally:
+            connection.close()
+
+    @staticmethod
     def _default_accept(
         config: RuntimeConfig,
         acceptance_id: str,
@@ -507,6 +526,39 @@ class DefaultRuntimeAcceptanceEvidenceTests(CodeTaskAcceptanceFixture):
         finally:
             root.shutdown()
 
+    @staticmethod
+    def _freeze_runtime_evidence(
+        config: RuntimeConfig,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> ContinuityKey:
+        """Create a real frozen v2 view without projecting or publishing it."""
+
+        root = RuntimeRoot(config)
+        try:
+            with root.open_uow(read_only=False) as uow:
+                prepared = uow.atlas._prepare_accepted_projection(  # noqa: SLF001
+                    "workflow", "code-task", acceptance_id, ingestion_key
+                )
+                key = uow._continuity_key(  # noqa: SLF001
+                    prepared,
+                    "workflow",
+                    "code-task",
+                    acceptance_id,
+                    ingestion_key,
+                )
+                attempt = uow._continuity_service().claim_or_reuse(key)  # noqa: SLF001
+                view, already_published = uow._freeze_or_recover(  # noqa: SLF001
+                    uow._continuity_service(), attempt, prepared  # noqa: SLF001
+                )
+        finally:
+            root.shutdown()
+
+        assert key == attempt.key
+        assert view.key == key
+        assert already_published is False
+        return key
+
     def test_default_write_uow_projects_accepted_evidence(self) -> None:
         acceptance, outbox = self._accept()
         config = self._runtime_config()
@@ -517,6 +569,147 @@ class DefaultRuntimeAcceptanceEvidenceTests(CodeTaskAcceptanceFixture):
         )
 
         assert projection.acceptance_id == acceptance.acceptance_id
+        assert self._outbox_state(config, outbox.ingestion_key) == ("projected", 0, "")
+
+    def test_default_write_uow_replays_frozen_v2_without_live_dependencies(self) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        key = self._freeze_runtime_evidence(
+            config, acceptance.acceptance_id, outbox.ingestion_key
+        )
+        live_calls: list[str] = []
+
+        def deny_live(*_args: object, **_kwargs: object) -> object:
+            live_calls.append("live dependency")
+            raise AssertionError("replay must not construct live evidence dependencies")
+
+        factories = replace(
+            DEFAULT_RUNTIME_ADAPTER_FACTORIES,
+            open_project_checkpoint=deny_live,
+            build_atlas=deny_live,
+        )
+        root = RuntimeRoot(config, adapter_factories=factories)
+        try:
+            with (
+                mock.patch.object(
+                    ProductionAcceptanceEvidenceReader, "rebuild", side_effect=deny_live
+                ),
+                mock.patch.object(
+                    ProductionAcceptanceEvidenceReader, "read", side_effect=deny_live
+                ),
+                mock.patch.object(
+                    ProjectIndexService, "read_snapshot_files", side_effect=deny_live
+                ),
+            ):
+                with root.open_uow(read_only=False) as uow:
+                    projection = uow.accept_atlas(
+                        "workflow",
+                        "code-task",
+                        acceptance.acceptance_id,
+                        outbox.ingestion_key,
+                    )
+        finally:
+            root.shutdown()
+
+        continuity = ContinuityStore.open_readonly(
+            config.continuity_database,
+            config.continuity_cas_root,
+            config.scratch_root,
+        )
+        try:
+            attempt = continuity.current_attempt(key)
+            pointer = continuity.pointer_for(key)
+        finally:
+            continuity.close()
+
+        assert projection.acceptance_id == acceptance.acceptance_id
+        assert live_calls == []
+        assert attempt is not None and attempt.state == "published"
+        assert pointer is not None and pointer.view_id == attempt.view_id
+        assert self._outbox_state(config, outbox.ingestion_key) == ("projected", 0, "")
+
+    def test_default_write_uow_replays_published_v2_to_one_pending_outbox(
+        self,
+    ) -> None:
+        acceptance, outbox = self._accept()
+        config = self._runtime_config()
+        self._publish_accepted_evidence_to_runtime(config)
+        self._default_accept(config, acceptance.acceptance_id, outbox.ingestion_key)
+        binding = self.store.evidence_binding_for_acceptance(acceptance.acceptance_id)
+        assert binding is not None
+        key = ContinuityKey(
+            "workflow",
+            "code-task",
+            acceptance.code_task_version,
+            acceptance.acceptance_id,
+            outbox.ingestion_key,
+            acceptance.payload_hash,
+            binding.evidence_binding_hash,
+        )
+        continuity = ContinuityStore.open_readonly(
+            config.continuity_database,
+            config.continuity_cas_root,
+            config.scratch_root,
+        )
+        try:
+            before_attempt = continuity.current_attempt(key)
+            before_pointer = continuity.pointer_for(key)
+        finally:
+            continuity.close()
+        assert before_attempt is not None and before_attempt.state == "published"
+        assert before_pointer is not None
+        self._reset_runtime_outbox_pending(config, outbox.ingestion_key)
+        live_calls: list[str] = []
+
+        def deny_live(*_args: object, **_kwargs: object) -> object:
+            live_calls.append("live dependency")
+            raise AssertionError("published replay must not consult live state or republish")
+
+        factories = replace(
+            DEFAULT_RUNTIME_ADAPTER_FACTORIES,
+            open_project_checkpoint=deny_live,
+            build_atlas=deny_live,
+        )
+        root = RuntimeRoot(config, adapter_factories=factories)
+        try:
+            with (
+                mock.patch.object(
+                    ProductionAcceptanceEvidenceReader, "rebuild", side_effect=deny_live
+                ),
+                mock.patch.object(
+                    ProductionAcceptanceEvidenceReader, "read", side_effect=deny_live
+                ),
+                mock.patch.object(
+                    ProjectIndexService, "read_snapshot_files", side_effect=deny_live
+                ),
+                mock.patch.object(ContinuityService, "publish", side_effect=deny_live),
+            ):
+                with root.open_uow(read_only=False) as uow:
+                    projection = uow.accept_atlas(
+                        "workflow",
+                        "code-task",
+                        acceptance.acceptance_id,
+                        outbox.ingestion_key,
+                    )
+        finally:
+            root.shutdown()
+
+        continuity = ContinuityStore.open_readonly(
+            config.continuity_database,
+            config.continuity_cas_root,
+            config.scratch_root,
+        )
+        try:
+            after_attempt = continuity.current_attempt(key)
+            after_pointer = continuity.pointer_for(key)
+        finally:
+            continuity.close()
+
+        assert projection.acceptance_id == acceptance.acceptance_id
+        assert live_calls == []
+        assert after_attempt == before_attempt
+        assert after_pointer == before_pointer
         assert self._outbox_state(config, outbox.ingestion_key) == ("projected", 0, "")
 
     def test_default_write_uow_publishes_a_fenced_continuity_view_first(self) -> None:
