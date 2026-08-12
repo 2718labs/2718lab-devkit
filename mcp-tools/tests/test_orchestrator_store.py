@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -13,6 +15,7 @@ from orchestrator.models import Task, TaskState, Workflow, WorkflowKind
 from orchestrator.store import (
     SQLiteStore,
     StaleLeaseError,
+    StoreError,
     StrictIndexError,
     VersionConflictError,
 )
@@ -35,10 +38,281 @@ class SQLiteStoreTests(unittest.TestCase):
     def _task(self, task_id: str) -> Task:
         return Task(task_id, self.workflow.id, task_id, "terra")
 
-    def test_schema_uses_wal_foreign_keys_and_current_schema_version(self) -> None:
-        self.assertEqual(self.store.schema_version(), 12)
-        self.assertEqual(self.store.journal_mode(), "wal")
-        self.assertTrue(self.store.foreign_keys_enabled())
+    def _legacy_v12_wal_database(self, name: str) -> Path:
+        """Build one complete v12-shaped WAL database without any v13 object."""
+        database = Path(self.directory.name) / name
+        seeded = SQLiteStore(database)
+        try:
+            seeded.create_workflow(
+                Workflow("legacy-workflow", WorkflowKind.DAG, "legacy", "summary")
+            )
+        finally:
+            seeded.close()
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("DROP TRIGGER IF EXISTS atlas_finalizations_no_update")
+            connection.execute("DROP TRIGGER IF EXISTS atlas_finalizations_no_delete")
+            connection.execute("DROP TABLE IF EXISTS atlas_finalizations")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute(
+                "UPDATE schema_metadata SET value = '12' WHERE key = 'schema_version'"
+            )
+            connection.execute(
+                "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-wal-workflow",
+                    "dag",
+                    "legacy WAL",
+                    "summary",
+                    "new",
+                    0,
+                    "",
+                    "2026-08-12T00:00:00+00:00",
+                    "2026-08-12T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return database
+
+    def _seed_finalization_identities(self) -> tuple[str, str, str]:
+        acceptance_id = "sha256:" + "a" * 64
+        task = self.store.register_task(
+            Task("finalization-task", self.workflow.id, "task", "terra")
+        )
+        with self.store._transaction() as cursor:  # noqa: SLF001 - contract fixture
+            cursor.execute(
+                """
+                INSERT INTO code_task_acceptances (
+                    acceptance_id, workflow_id, code_task_id, code_task_version,
+                    input_snapshot_id, output_snapshot_id, indexed_diff_hash,
+                    intent_id, language, framework, payload_json, payload_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    acceptance_id,
+                    self.workflow.id,
+                    task.id,
+                    0,
+                    "input",
+                    "output",
+                    "diff",
+                    "intent",
+                    "python",
+                    "pytest",
+                    "{}",
+                    acceptance_id,
+                    "2026-08-12T00:00:00+00:00",
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO atlas_ingestion_outbox (
+                    ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                    attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    acceptance_id,
+                    acceptance_id,
+                    "{}",
+                    acceptance_id,
+                    "projected",
+                    0,
+                    "",
+                    "[]",
+                    "2026-08-12T00:00:00+00:00",
+                    "2026-08-12T00:00:00+00:00",
+                ),
+            )
+        return (
+            acceptance_id,
+            "sha256:" + "b" * 64,
+            "sha256:" + "c" * 64,
+        )
+
+    def test_prepared_store_requires_delete_journal_and_finalization_relation(self) -> None:
+        """The v13 prepared-store contract has no WAL recovery dependency."""
+        table_names = {
+            str(row["name"])
+            for row in self.store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+        with self.subTest("schema version"):
+            self.assertEqual(self.store.schema_version(), 13)
+        with self.subTest("physical journal mode"):
+            self.assertEqual(self.store.journal_mode(), "delete")
+        with self.subTest("immutable finalization relation"):
+            self.assertIn("atlas_finalizations", table_names)
+        with self.subTest("foreign keys"):
+            self.assertTrue(self.store.foreign_keys_enabled())
+
+    def test_v12_wal_migration_preserves_rows_and_switches_to_delete(self) -> None:
+        database = self._legacy_v12_wal_database("legacy-v12-wal.sqlite")
+
+        migrated = SQLiteStore(database)
+        try:
+            self.assertEqual(13, migrated.schema_version())
+            self.assertEqual("delete", migrated.journal_mode())
+            self.assertEqual("legacy WAL", migrated.get_workflow("legacy-wal-workflow").title)
+        finally:
+            migrated.close()
+
+        self.assertEqual(b"\x01\x01", database.read_bytes()[18:20])
+        self.assertFalse(database.with_name(f"{database.name}-wal").exists())
+        self.assertFalse(database.with_name(f"{database.name}-shm").exists())
+
+    def test_v12_checkpoint_or_sidecar_failure_is_fail_closed_without_schema_mutation(
+        self,
+    ) -> None:
+        database = self._legacy_v12_wal_database("legacy-v12-busy.sqlite")
+        reader = sqlite3.connect(database)
+        writer = sqlite3.connect(database)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT * FROM workflows").fetchall()
+            writer.execute(
+                "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "checkpoint-blocker",
+                    "dag",
+                    "blocked",
+                    "summary",
+                    "new",
+                    0,
+                    "",
+                    "2026-08-12T00:00:00+00:00",
+                    "2026-08-12T00:00:00+00:00",
+                ),
+            )
+            writer.commit()
+            with self.assertRaises(StoreError):
+                SQLiteStore(database)
+        finally:
+            writer.close()
+            reader.close()
+
+        connection = sqlite3.connect(database)
+        try:
+            self.assertEqual(
+                "12",
+                connection.execute(
+                    "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'atlas_finalizations'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+        invalid = self._legacy_v12_wal_database("legacy-v12-invalid-sidecar.sqlite")
+        invalid.with_name(f"{invalid.name}-wal").write_bytes(b"not-a-wal")
+        with self.assertRaises(StoreError):
+            SQLiteStore(invalid)
+        connection = sqlite3.connect(invalid)
+        try:
+            self.assertEqual(
+                "12",
+                connection.execute(
+                    "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'atlas_finalizations'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    def test_finalization_certificate_is_canonical_validated_and_immutable(self) -> None:
+        acceptance_id, continuity_key_hash, published_receipt_hash = (
+            self._seed_finalization_identities()
+        )
+        finalization = self.store._build_atlas_finalization(  # noqa: SLF001
+            acceptance_id=acceptance_id,
+            ingestion_key=acceptance_id,
+            payload_hash=acceptance_id,
+            continuity_key_hash=continuity_key_hash,
+            view_id="view-1",
+            fence_epoch=1,
+            pointer_version=1,
+            published_receipt_hash=published_receipt_hash,
+            atlas_receipt_digest="sha256:" + "d" * 64,
+            created_at="2026-08-12T00:00:00+00:00",
+        )
+        with self.store._transaction() as cursor:  # noqa: SLF001 - internal seam
+            stored = self.store._insert_atlas_finalization(cursor, finalization)  # noqa: SLF001
+
+        self.assertEqual(finalization, stored)
+        self.assertEqual(
+            finalization,
+            self.store._atlas_finalization_for_acceptance(acceptance_id),  # noqa: SLF001
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._connection.execute(  # noqa: SLF001 - trigger contract
+                "UPDATE atlas_finalizations SET view_id = 'other' WHERE acceptance_id = ?",
+                (acceptance_id,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store._connection.execute(  # noqa: SLF001 - trigger contract
+                "DELETE FROM atlas_finalizations WHERE acceptance_id = ?",
+                (acceptance_id,),
+            )
+
+        with self.assertRaises(ValueError):
+            self.store._insert_atlas_finalization(  # noqa: SLF001
+                self.store._connection.cursor(),
+                replace(finalization, finalization_hash="sha256:" + "e" * 64),
+            )
+        mismatched = self.store._build_atlas_finalization(  # noqa: SLF001
+            acceptance_id=acceptance_id,
+            ingestion_key=acceptance_id,
+            payload_hash="sha256:" + "f" * 64,
+            continuity_key_hash=continuity_key_hash,
+            view_id="view-1",
+            fence_epoch=1,
+            pointer_version=1,
+            published_receipt_hash=published_receipt_hash,
+            atlas_receipt_digest="sha256:" + "d" * 64,
+            created_at="2026-08-12T00:00:00+00:00",
+        )
+        with self.assertRaises(StoreError):
+            with self.store._transaction() as cursor:  # noqa: SLF001
+                self.store._insert_atlas_finalization(cursor, mismatched)  # noqa: SLF001
+
+        self.store._connection.execute(  # noqa: SLF001 - corruption read contract
+            "DROP TRIGGER atlas_finalizations_no_update"
+        )
+        self.store._connection.execute(  # noqa: SLF001 - corruption read contract
+            """
+            UPDATE atlas_finalizations SET payload_hash = ?, finalization_hash = ?
+            WHERE acceptance_id = ?
+            """,
+            (mismatched.payload_hash, finalization.finalization_hash, acceptance_id),
+        )
+        with self.assertRaises(StoreError):
+            self.store._atlas_finalization_for_acceptance(acceptance_id)  # noqa: SLF001
+
+    def test_prepared_connection_rejects_finalization_shape_or_trigger_drift(self) -> None:
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute("DROP TRIGGER atlas_finalizations_no_update")
+            connection.commit()
+        finally:
+            connection.close()
+        prepared = sqlite3.connect(self.database)
+        try:
+            with self.assertRaises(StoreError):
+                SQLiteStore.from_prepared_connection(prepared)
+        finally:
+            prepared.close()
 
     def test_strict_binding_persists_only_an_opaque_workspace_authority(self) -> None:
         task = self.store.register_task(

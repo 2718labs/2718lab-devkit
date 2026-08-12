@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from enum import Enum, StrEnum
 
 
-class WorkflowKind(str, Enum):
+class WorkflowKind(StrEnum):
     LINEAR = "linear"
     DAG = "dag"
 
 
-class WorkflowState(str, Enum):
+class WorkflowState(StrEnum):
     NEW = "new"
     RUNNING = "running"
     DONE = "done"
@@ -20,7 +20,7 @@ class WorkflowState(str, Enum):
     CANCELLED = "cancelled"
 
 
-class TaskState(str, Enum):
+class TaskState(StrEnum):
     NEW = "new"
     READY = "ready"
     RUNNING = "running"
@@ -31,12 +31,12 @@ class TaskState(str, Enum):
     CANCELLED = "cancelled"
 
 
-class TaskKind(str, Enum):
+class TaskKind(StrEnum):
     GENERAL = "general"
     CODE = "code"
 
 
-class AtlasOutboxState(str, Enum):
+class AtlasOutboxState(StrEnum):
     PENDING = "pending"
     PROJECTED = "projected"
     QUARANTINED = "quarantined"
@@ -138,6 +138,24 @@ class AtlasOutboxItem:
     def reasons(self) -> tuple[str, ...]:
         """Return stable reason codes using the projection-facing naming."""
         return self.reason_codes
+
+
+@dataclass(frozen=True)
+class AtlasFinalization:
+    """Immutable evidence binding a projected Atlas outbox to Continuity."""
+
+    schema_version: str
+    acceptance_id: str
+    ingestion_key: str
+    payload_hash: str
+    continuity_key_hash: str
+    view_id: str
+    fence_epoch: int
+    pointer_version: int
+    published_receipt_hash: str
+    atlas_receipt_digest: str
+    finalization_hash: str
+    created_at: str
 
 
 @dataclass(frozen=True)

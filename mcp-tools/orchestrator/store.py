@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .models import (
+    AtlasFinalization,
     AtlasOutboxItem,
     AtlasOutboxState,
     CodeTaskAcceptance,
@@ -39,6 +40,171 @@ from .models import (
     WorkflowKind,
     WorkflowState,
 )
+
+_SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+_SQLITE_DELETE_JOURNAL_FORMAT = (1, 1)
+_SQLITE_WAL_JOURNAL_FORMAT = (2, 2)
+_ATLAS_FINALIZATION_SCHEMA_VERSION = "atlas-finalization/v1"
+_ATLAS_FINALIZATION_DOMAIN = "2718lab/orchestrator/atlas-finalization/v1"
+_ATLAS_FINALIZATION_COLUMNS = (
+    "schema_version",
+    "acceptance_id",
+    "ingestion_key",
+    "payload_hash",
+    "continuity_key_hash",
+    "view_id",
+    "fence_epoch",
+    "pointer_version",
+    "published_receipt_hash",
+    "atlas_receipt_digest",
+    "finalization_hash",
+    "created_at",
+)
+_ATLAS_FINALIZATION_REQUIRED_CHECKS = frozenset(
+    {
+        ("schema_version", "=", f"'{_ATLAS_FINALIZATION_SCHEMA_VERSION}'"),
+        ("fence_epoch", ">", "0"),
+        ("pointer_version", ">", "0"),
+    }
+)
+
+
+def _sqlite_wal_sidecars(database: Path) -> tuple[Path, Path]:
+    return (
+        database.with_name(f"{database.name}-wal"),
+        database.with_name(f"{database.name}-shm"),
+    )
+
+
+def _require_absent_sqlite_sidecar(path: Path) -> None:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise StoreError("orchestrator store is not prepared") from error
+    raise StoreError("orchestrator store is not prepared")
+
+
+def _require_delete_journal_invariant(database: Path) -> None:
+    """Prove the primary file has no WAL recovery dependency or sidecars."""
+    try:
+        with database.open("rb") as source:
+            header = source.read(20)
+    except OSError as error:
+        raise StoreError("orchestrator store is not prepared") from error
+    if (
+        len(header) != 20
+        or header[:16] != _SQLITE_HEADER_MAGIC
+        or (header[18], header[19]) != _SQLITE_DELETE_JOURNAL_FORMAT
+    ):
+        raise StoreError("orchestrator store is not prepared")
+    for sidecar in _sqlite_wal_sidecars(database):
+        _require_absent_sqlite_sidecar(sidecar)
+
+
+def _preflight_legacy_physical_state(database: Path) -> None:
+    """Read legacy physical state before SQLite can alter a malformed sidecar."""
+    if not database.exists():
+        return
+    try:
+        with database.open("rb") as source:
+            header = source.read(20)
+    except OSError as error:
+        raise StoreError("orchestrator store is not prepared") from error
+    if len(header) != 20 or header[:16] != _SQLITE_HEADER_MAGIC:
+        raise StoreError("orchestrator store is not prepared")
+    wal, shm = _sqlite_wal_sidecars(database)
+    wal_exists, shm_exists = wal.exists(), shm.exists()
+    format_bytes = (header[18], header[19])
+    if format_bytes == _SQLITE_DELETE_JOURNAL_FORMAT:
+        if wal_exists or shm_exists:
+            raise StoreError("orchestrator store is not prepared")
+        return
+    if format_bytes != _SQLITE_WAL_JOURNAL_FORMAT or wal_exists != shm_exists:
+        raise StoreError("orchestrator store is not prepared")
+    if not wal_exists:
+        return
+    try:
+        with wal.open("rb") as source:
+            wal_header = source.read(32)
+        shm_size = shm.stat().st_size
+    except OSError as error:
+        raise StoreError("orchestrator store is not prepared") from error
+    if (
+        len(wal_header) != 32
+        or wal_header[:4] not in {b"7\x7f\x06\x82", b"7\x7f\x06\x83"}
+        or shm_size < 32_768
+    ):
+        raise StoreError("orchestrator store is not prepared")
+
+
+def _schema_version_from_connection(connection: sqlite3.Connection) -> int | None:
+    row = connection.execute(
+        "SELECT type FROM sqlite_master WHERE name = 'schema_metadata'"
+    ).fetchone()
+    if row is None:
+        return None
+    if len(row) != 1 or row[0] != "table":
+        raise StoreError("orchestrator store is not prepared")
+    rows = connection.execute(
+        "SELECT key, value FROM schema_metadata"
+    ).fetchall()
+    if len(rows) != 1 or rows[0][0] != "schema_version":
+        raise StoreError("orchestrator store is not prepared")
+    try:
+        value = int(rows[0][1])
+    except (TypeError, ValueError) as error:
+        raise StoreError("orchestrator store is not prepared") from error
+    if str(value) != rows[0][1]:
+        raise StoreError("orchestrator store is not prepared")
+    return value
+
+
+def _main_database_path(connection: sqlite3.Connection) -> Path:
+    rows = connection.execute("PRAGMA database_list").fetchall()
+    for row in rows:
+        if len(row) == 3 and row[1] == "main" and isinstance(row[2], str) and row[2]:
+            return Path(row[2])
+    raise StoreError("orchestrator store is not prepared")
+
+
+def _transition_to_delete_journal(connection: sqlite3.Connection, database: Path) -> None:
+    """Checkpoint a valid legacy WAL exactly, then make DELETE durable."""
+    row = connection.execute("PRAGMA journal_mode").fetchone()
+    if row is None or len(row) != 1 or not isinstance(row[0], str):
+        raise StoreError("orchestrator store is not prepared")
+    mode = row[0].casefold()
+    if mode == "wal":
+        try:
+            with database.open("rb") as source:
+                header = source.read(20)
+        except OSError as error:
+            raise StoreError("orchestrator store is not prepared") from error
+        if (
+            len(header) != 20
+            or header[:16] != _SQLITE_HEADER_MAGIC
+            or (header[18], header[19]) != _SQLITE_WAL_JOURNAL_FORMAT
+        ):
+            raise StoreError("orchestrator store is not prepared")
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or tuple(checkpoint) != (0, 0, 0):
+            raise StoreError("orchestrator store is not prepared")
+    elif mode not in {"delete", "truncate", "persist", "memory", "off"}:
+        raise StoreError("orchestrator store is not prepared")
+    elif mode == "delete":
+        for sidecar in _sqlite_wal_sidecars(database):
+            _require_absent_sqlite_sidecar(sidecar)
+    result = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+    if (
+        result is None
+        or len(result) != 1
+        or not isinstance(result[0], str)
+        or result[0].casefold() != "delete"
+    ):
+        raise StoreError("orchestrator store is not prepared")
+    for sidecar in _sqlite_wal_sidecars(database):
+        _require_absent_sqlite_sidecar(sidecar)
 
 _ATLAS_OUTBOX_REQUIRED_CHECKS = frozenset(
     {
@@ -434,7 +600,7 @@ class AcceptedCodeTaskEvidence:
 class SQLiteStore:
     """A small transactional store backed by a single SQLite database file."""
 
-    _SCHEMA_VERSION = 12
+    _SCHEMA_VERSION = 13
     _MAX_MESSAGE_TTL_SECONDS = 86_400
     _MAX_INBOX_LIMIT = 100
     _MAX_HOST_TARGET_LENGTH = 256
@@ -465,14 +631,17 @@ class SQLiteStore:
     _MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS = 9
 
     def __init__(self, database: str | Path) -> None:
-        self._connection = sqlite3.connect(str(database), isolation_level=None)
+        self._database = Path(database)
+        _preflight_legacy_physical_state(self._database)
+        self._connection = sqlite3.connect(str(self._database), isolation_level=None)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
-        self._connection.execute("PRAGMA journal_mode = WAL")
         try:
+            self._prepare_legacy_journal()
             self._create_schema()
             self.validate_prepared_connection(self._connection)
+            _require_delete_journal_invariant(self._database)
         except BaseException:
             self._connection.close()
             self._connection = None  # type: ignore[assignment]
@@ -492,10 +661,43 @@ class SQLiteStore:
         if not foreign_keys_enabled:
             raise StoreError("orchestrator store is not prepared")
         cls.validate_prepared_connection(connection)
+        _require_delete_journal_invariant(_main_database_path(connection))
         store = cls.__new__(cls)
         store._connection = connection
+        store._database = None
         connection.row_factory = sqlite3.Row
         return store
+
+    def _prepare_legacy_journal(self) -> None:
+        """Fail closed before an on-disk v12 database is changed to DELETE."""
+        try:
+            version = _schema_version_from_connection(self._connection)
+            if version is None:
+                _transition_to_delete_journal(self._connection, self._database)
+                return
+            if version == self._SCHEMA_VERSION:
+                _require_delete_journal_invariant(self._database)
+                return
+            if not 1 <= version < self._SCHEMA_VERSION:
+                raise StoreError("orchestrator store is not prepared")
+            if version == 12:
+                self._validate_v12_schema_before_journal_transition()
+            _transition_to_delete_journal(self._connection, self._database)
+        except (sqlite3.DatabaseError, OSError, ValueError) as error:
+            raise StoreError("orchestrator store is not prepared") from error
+
+    def _validate_v12_schema_before_journal_transition(self) -> None:
+        """Prove a legacy v12 primary is complete before touching journal state."""
+        try:
+            self._validate_schema_metadata_layout(self._connection)
+            row = self._connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            if row is None or str(row["value"]) != "12":
+                raise StoreError("orchestrator store is not prepared")
+            self._validate_v12_required_shape(self._connection)
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator store is not prepared") from error
 
     @classmethod
     def _schema_metadata_layout(
@@ -511,7 +713,7 @@ class SQLiteStore:
                 for row in sorted(columns.values(), key=lambda row: int(row["pk"]))
                 if int(row["pk"])
             )
-        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+        except (IndexError, OSError, TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
         return columns, primary_key
 
@@ -566,7 +768,8 @@ class SQLiteStore:
                 or type(metadata_rows[0]["key"]) is not str
                 or metadata_rows[0]["key"] != "schema_version"
                 or type(metadata_rows[0]["value"]) is not str
-                or metadata_rows[0]["value"] != str(cls._SCHEMA_VERSION)
+                or metadata_rows[0]["value"]
+                not in {"12", str(cls._SCHEMA_VERSION)}
             ):
                 raise StoreError("orchestrator store is not prepared")
             return
@@ -625,6 +828,7 @@ class SQLiteStore:
             "code_task_receipt_attestations",
             "code_task_receipt_owners",
             "atlas_ingestion_outbox",
+            "atlas_finalizations",
             "task_dependencies",
             "lease_epochs",
             "leases",
@@ -728,10 +932,11 @@ class SQLiteStore:
                 if outbox_row is None
                 else _sqlite_check_expressions(outbox_row["sql"])
             )
+            cls._validate_atlas_finalization_shape(connection)
             foreign_key_violation = connection.execute(
                 "PRAGMA foreign_key_check"
             ).fetchone()
-        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+        except (IndexError, OSError, TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
         required_outbox_columns = {
             "ingestion_key",
@@ -772,13 +977,154 @@ class SQLiteStore:
         if (
             not required_tables.issubset(tables)
             or not has_current_schema_metadata
-            or journal_mode != "wal"
+            or journal_mode != "delete"
             or not required_outbox_columns.issubset(outbox_columns)
             or not required_outbox_not_null_columns.issubset(
                 outbox_not_null_columns
             )
             or not has_outbox_identity
             or foreign_key_violation is not None
+        ):
+            raise StoreError("orchestrator store is not prepared")
+
+    @classmethod
+    def _validate_v12_required_shape(
+        cls, connection: sqlite3.Connection | sqlite3.Cursor
+    ) -> None:
+        """Reject malformed v12 contents before its WAL checkpoint can mutate it."""
+        required_tables = {
+            "schema_metadata",
+            "workflows",
+            "tasks",
+            "code_task_acceptances",
+            "code_task_receipt_attestations",
+            "code_task_receipt_owners",
+            "atlas_ingestion_outbox",
+            "task_dependencies",
+            "lease_epochs",
+            "leases",
+            "events",
+            "artifacts",
+            "task_inputs",
+            "artifact_owners",
+            "task_cards",
+            "task_contract_subscriptions",
+            "task_required_evidence",
+            "task_index_bindings",
+            "task_index_query_receipts",
+            "task_index_verification_artifacts",
+            "task_index_binding_events",
+            "peer_capabilities",
+            "messages",
+            "role_envelopes",
+            "host_operation_receipts",
+            "external_bootstrap_descriptors",
+            "external_bootstrap_batches",
+            "external_bootstrap_batch_items",
+            "external_bootstrap_outbox",
+            "external_dispatch_grants",
+            "external_dispatch_grant_bindings",
+            "external_bootstrap_batch_commitments",
+            "external_dispatch_grant_commitments",
+        }
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not required_tables.issubset(tables):
+            raise StoreError("orchestrator store is not prepared")
+        outbox_columns = {
+            str(row["name"]): row
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        expected_columns = {
+            "ingestion_key",
+            "acceptance_id",
+            "payload_json",
+            "payload_hash",
+            "state",
+            "attempt_count",
+            "last_error_code",
+            "reason_codes_json",
+            "created_at",
+            "updated_at",
+        }
+        if set(outbox_columns) != expected_columns:
+            raise StoreError("orchestrator store is not prepared")
+        outbox_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'atlas_ingestion_outbox'"
+        ).fetchone()
+        if (
+            outbox_row is None
+            or not _ATLAS_OUTBOX_REQUIRED_CHECKS.issubset(
+                _sqlite_check_expressions(outbox_row["sql"])
+            )
+            or connection.execute("PRAGMA foreign_key_check").fetchone() is not None
+        ):
+            raise StoreError("orchestrator store is not prepared")
+
+    @classmethod
+    def _validate_atlas_finalization_shape(cls, connection: sqlite3.Connection) -> None:
+        """Verify the immutable certificate table and its exact anchors."""
+        columns = {
+            str(row["name"]): row
+            for row in connection.execute("PRAGMA table_info(atlas_finalizations)")
+        }
+        primary_key = tuple(
+            str(row["name"])
+            for row in sorted(columns.values(), key=lambda row: int(row["pk"]))
+            if int(row["pk"])
+        )
+        not_null = {
+            str(row["name"]) for row in columns.values() if int(row["notnull"])
+        }
+        foreign_keys = {
+            (str(row["from"]), str(row["table"]), str(row["to"]))
+            for row in connection.execute("PRAGMA foreign_key_list(atlas_finalizations)")
+        }
+        unique_columns = {
+            tuple(
+                str(column["name"])
+                for column in connection.execute(
+                    f'PRAGMA index_info("{str(row["name"]).replace(chr(34), chr(34) * 2)}")'
+                )
+            )
+            for row in connection.execute("PRAGMA index_list(atlas_finalizations)")
+            if int(row["unique"]) and not int(row["partial"])
+        }
+        declaration = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'atlas_finalizations'"
+        ).fetchone()
+        trigger_rows = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'atlas_finalizations'"
+        ).fetchall()
+        trigger_sql = {str(row["name"]): str(row["sql"]) for row in trigger_rows}
+        expected_abort = {
+            "atlas_finalizations_no_update": "before update on atlas_finalizations",
+            "atlas_finalizations_no_delete": "before delete on atlas_finalizations",
+        }
+        if (
+            tuple(columns) != _ATLAS_FINALIZATION_COLUMNS
+            or primary_key != ("finalization_hash",)
+            or not set(_ATLAS_FINALIZATION_COLUMNS).issubset(not_null)
+            or ("acceptance_id",) not in unique_columns
+            or ("ingestion_key",) not in unique_columns
+            or ("acceptance_id", "code_task_acceptances", "acceptance_id")
+            not in foreign_keys
+            or ("ingestion_key", "atlas_ingestion_outbox", "ingestion_key")
+            not in foreign_keys
+            or declaration is None
+            or not _ATLAS_FINALIZATION_REQUIRED_CHECKS.issubset(
+                _sqlite_check_expressions(declaration["sql"])
+            )
+            or set(trigger_sql) != set(expected_abort)
+            or any(
+                expected not in trigger_sql[name].casefold()
+                or "raise(abort" not in trigger_sql[name].casefold()
+                for name, expected in expected_abort.items()
+            )
         ):
             raise StoreError("orchestrator store is not prepared")
 
@@ -2966,6 +3312,198 @@ class SQLiteStore:
             reason_codes=reason_codes,
             now=now,
         )
+
+    @classmethod
+    def _build_atlas_finalization(
+        cls,
+        *,
+        acceptance_id: str,
+        ingestion_key: str,
+        payload_hash: str,
+        continuity_key_hash: str,
+        view_id: str,
+        fence_epoch: int,
+        pointer_version: int,
+        published_receipt_hash: str,
+        atlas_receipt_digest: str,
+        created_at: str,
+    ) -> AtlasFinalization:
+        """Build a private canonical certificate for a future attached finalizer."""
+        payload = cls._atlas_finalization_payload(
+            acceptance_id=acceptance_id,
+            ingestion_key=ingestion_key,
+            payload_hash=payload_hash,
+            continuity_key_hash=continuity_key_hash,
+            view_id=view_id,
+            fence_epoch=fence_epoch,
+            pointer_version=pointer_version,
+            published_receipt_hash=published_receipt_hash,
+            atlas_receipt_digest=atlas_receipt_digest,
+            created_at=created_at,
+        )
+        finalization_hash = _domain_separated_hash(
+            _ATLAS_FINALIZATION_DOMAIN, _canonical_payload_json(payload)
+        )
+        return AtlasFinalization(
+            str(payload["schema_version"]),
+            str(payload["acceptance_id"]),
+            str(payload["ingestion_key"]),
+            str(payload["payload_hash"]),
+            str(payload["continuity_key_hash"]),
+            str(payload["view_id"]),
+            int(payload["fence_epoch"]),
+            int(payload["pointer_version"]),
+            str(payload["published_receipt_hash"]),
+            str(payload["atlas_receipt_digest"]),
+            finalization_hash,
+            str(payload["created_at"]),
+        )
+
+    @classmethod
+    def _atlas_finalization_payload(
+        cls,
+        *,
+        acceptance_id: str,
+        ingestion_key: str,
+        payload_hash: str,
+        continuity_key_hash: str,
+        view_id: str,
+        fence_epoch: int,
+        pointer_version: int,
+        published_receipt_hash: str,
+        atlas_receipt_digest: str,
+        created_at: str,
+    ) -> dict[str, object]:
+        def identifier(name: str, value: str) -> str:
+            return cls._safe_acceptance_identifier(name, value)
+
+        def hash_identifier(name: str, value: str) -> str:
+            return cls._safe_sha256_identifier(name, value)
+
+        if (
+            isinstance(fence_epoch, bool)
+            or not isinstance(fence_epoch, int)
+            or not 0 < fence_epoch <= 2**63 - 1
+        ):
+            raise ValueError("fence_epoch must be a positive SQLite integer")
+        if (
+            isinstance(pointer_version, bool)
+            or not isinstance(pointer_version, int)
+            or not 0 < pointer_version <= 2**63 - 1
+        ):
+            raise ValueError("pointer_version must be a positive SQLite integer")
+        return {
+            "acceptance_id": hash_identifier("acceptance_id", acceptance_id),
+            "atlas_receipt_digest": hash_identifier(
+                "atlas_receipt_digest", atlas_receipt_digest
+            ),
+            "continuity_key_hash": hash_identifier(
+                "continuity_key_hash", continuity_key_hash
+            ),
+            "created_at": _utc_timestamp(created_at),
+            "fence_epoch": fence_epoch,
+            "ingestion_key": hash_identifier("ingestion_key", ingestion_key),
+            "payload_hash": hash_identifier("payload_hash", payload_hash),
+            "pointer_version": pointer_version,
+            "published_receipt_hash": hash_identifier(
+                "published_receipt_hash", published_receipt_hash
+            ),
+            "schema_version": _ATLAS_FINALIZATION_SCHEMA_VERSION,
+            "view_id": identifier("view_id", view_id),
+        }
+
+    @classmethod
+    def _validate_atlas_finalization(
+        cls, finalization: AtlasFinalization
+    ) -> AtlasFinalization:
+        if not isinstance(finalization, AtlasFinalization):
+            raise ValueError("finalization must be an AtlasFinalization")
+        expected = cls._build_atlas_finalization(
+            acceptance_id=finalization.acceptance_id,
+            ingestion_key=finalization.ingestion_key,
+            payload_hash=finalization.payload_hash,
+            continuity_key_hash=finalization.continuity_key_hash,
+            view_id=finalization.view_id,
+            fence_epoch=finalization.fence_epoch,
+            pointer_version=finalization.pointer_version,
+            published_receipt_hash=finalization.published_receipt_hash,
+            atlas_receipt_digest=finalization.atlas_receipt_digest,
+            created_at=finalization.created_at,
+        )
+        if finalization != expected:
+            raise ValueError("atlas finalization is not canonical")
+        return expected
+
+    @classmethod
+    def _insert_atlas_finalization(
+        cls, cursor: sqlite3.Cursor, finalization: AtlasFinalization
+    ) -> AtlasFinalization:
+        """Private insert seam for a future single-connection finalization UoW."""
+        candidate = cls._validate_atlas_finalization(finalization)
+        try:
+            outbox = cursor.execute(
+                "SELECT acceptance_id, payload_hash, state FROM atlas_ingestion_outbox "
+                "WHERE ingestion_key = ?",
+                (candidate.ingestion_key,),
+            ).fetchone()
+        except sqlite3.DatabaseError as error:
+            raise StoreError("orchestrator finalization is not prepared") from error
+        if (
+            outbox is None
+            or str(outbox["acceptance_id"]) != candidate.acceptance_id
+            or str(outbox["payload_hash"]) != candidate.payload_hash
+            or str(outbox["state"]) != AtlasOutboxState.PROJECTED.value
+        ):
+            raise StoreError("orchestrator finalization identity mismatch")
+        try:
+            cursor.execute(
+                """
+                INSERT INTO atlas_finalizations (
+                    schema_version, acceptance_id, ingestion_key, payload_hash,
+                    continuity_key_hash, view_id, fence_epoch, pointer_version,
+                    published_receipt_hash, atlas_receipt_digest, finalization_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.schema_version,
+                    candidate.acceptance_id,
+                    candidate.ingestion_key,
+                    candidate.payload_hash,
+                    candidate.continuity_key_hash,
+                    candidate.view_id,
+                    candidate.fence_epoch,
+                    candidate.pointer_version,
+                    candidate.published_receipt_hash,
+                    candidate.atlas_receipt_digest,
+                    candidate.finalization_hash,
+                    candidate.created_at,
+                ),
+            )
+            row = cursor.execute(
+                "SELECT * FROM atlas_finalizations WHERE finalization_hash = ?",
+                (candidate.finalization_hash,),
+            ).fetchone()
+        except sqlite3.IntegrityError as error:
+            raise StoreError("orchestrator finalization conflict") from error
+        if row is None:
+            raise StoreError("orchestrator finalization is not prepared")
+        return cls._atlas_finalization_from_row(row)
+
+    def _atlas_finalization_for_acceptance(
+        self, acceptance_id: str
+    ) -> AtlasFinalization | None:
+        """Private read seam for an attached finalizer's idempotency check."""
+        acceptance_id = self._safe_sha256_identifier("acceptance_id", acceptance_id)
+        row = self._connection.execute(
+            "SELECT * FROM atlas_finalizations WHERE acceptance_id = ?", (acceptance_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            finalization = self._atlas_finalization_from_row(row)
+            return self._validate_atlas_finalization(finalization)
+        except (KeyError, TypeError, ValueError) as error:
+            raise StoreError("orchestrator finalization is not prepared") from error
 
     def dependencies_for(self, task_id: str) -> tuple[str, ...]:
         rows = self._connection.execute(
@@ -6299,6 +6837,33 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_atlas_outbox_pending
                     ON atlas_ingestion_outbox(state, created_at, ingestion_key);
+                CREATE TABLE IF NOT EXISTS atlas_finalizations (
+                    schema_version TEXT NOT NULL
+                        CHECK (schema_version = 'atlas-finalization/v1'),
+                    acceptance_id TEXT NOT NULL UNIQUE
+                        REFERENCES code_task_acceptances(acceptance_id),
+                    ingestion_key TEXT NOT NULL UNIQUE
+                        REFERENCES atlas_ingestion_outbox(ingestion_key),
+                    payload_hash TEXT NOT NULL,
+                    continuity_key_hash TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    fence_epoch INTEGER NOT NULL CHECK (fence_epoch > 0),
+                    pointer_version INTEGER NOT NULL CHECK (pointer_version > 0),
+                    published_receipt_hash TEXT NOT NULL,
+                    atlas_receipt_digest TEXT NOT NULL,
+                    finalization_hash TEXT NOT NULL PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS atlas_finalizations_no_update
+                BEFORE UPDATE ON atlas_finalizations
+                BEGIN
+                    SELECT RAISE(ABORT, 'atlas finalization is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS atlas_finalizations_no_delete
+                BEFORE DELETE ON atlas_finalizations
+                BEGIN
+                    SELECT RAISE(ABORT, 'atlas finalization is immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS task_dependencies (
                     task_id TEXT NOT NULL REFERENCES tasks(id),
                     dependency_id TEXT NOT NULL REFERENCES tasks(id),
@@ -6734,6 +7299,23 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _atlas_finalization_from_row(row: sqlite3.Row) -> AtlasFinalization:
+        return AtlasFinalization(
+            str(row["schema_version"]),
+            str(row["acceptance_id"]),
+            str(row["ingestion_key"]),
+            str(row["payload_hash"]),
+            str(row["continuity_key_hash"]),
+            str(row["view_id"]),
+            int(row["fence_epoch"]),
+            int(row["pointer_version"]),
+            str(row["published_receipt_hash"]),
+            str(row["atlas_receipt_digest"]),
+            str(row["finalization_hash"]),
+            str(row["created_at"]),
+        )
+
+    @staticmethod
     def _lease_from_row(row: sqlite3.Row) -> Lease:
         return Lease(
             row["task_id"],
@@ -7065,6 +7647,14 @@ def _canonical_receipt_attestation_json(payload: Mapping[str, object]) -> str:
 
 def _payload_hash(payload_json: str) -> str:
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _domain_separated_hash(domain: str, payload_json: str) -> str:
+    """Hash canonical metadata in a fixed domain to prevent cross-record reuse."""
+    digest = hashlib.sha256(
+        domain.encode("ascii") + b"\x00" + payload_json.encode("utf-8")
+    ).hexdigest()
     return f"sha256:{digest}"
 
 
