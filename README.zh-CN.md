@@ -10,15 +10,17 @@
 本仓库承载版本化的 v1.0.0-rc4 包；已提交的 manifest 和 allowlist 定义
 公开产物范围，下面的安装、构建和验证章节给出支持的工作流。
 
-RC4 保留 fail-closed 的 Host 合同预览，但不会自行创建 Desktop 会话；缺少
-Host 私有验证器时，intent admission 一律返回 `NO_SAFE_WORK`。
+RC4 保留刻意 fail-closed 的 Fast Lane 预览。当前公共编译器和 CLI 固定返回
+`NO_SAFE_WORK` 与零 assignments：不会消费 host-status、quota 或实时账号输入，
+也没有 worktree 执行路径。Ultra、实时额度和宿主消费属于未来外部
+Desktop-host bridge 合同的要求；本仓库并未提供该 bridge。
 
 > [!IMPORTANT]
 > **工作流提醒：** 先用有界证据路由；一个写入范围只允许一个 writer；执行前必须
 > claim 并 bind；只有验证过的终态事件才能 refill；完成集成和验收后才能归档。
 > prewarm 只读，`action="retain"` 不是新 spawn。任务临时目录、缓存、工作树和证据
-> 应放在隔离的用户自有工作区；需要时显式配置 quota 样本缓存路径。不要把运行时
-> 状态或凭据提交到仓库。
+> 应放在隔离的用户自有工作区。解析兼容的 Fast Lane quota 输入目前不消费额度。
+> 不要把运行时状态或凭据提交到仓库。
 
 ## 已交付内容
 
@@ -29,9 +31,9 @@ Host 私有验证器时，intent admission 一律返回 `NO_SAFE_WORK`。
   动作；工作树准备和 agent 调度仍由 Codex 宿主负责。
 - 主包是 MCP-only：精确暴露 17 个工具，不暴露 MCP prompts、MCP
   resources、静态 prompt agent 或模型运行器。
-- Fast Lane 是 MCP runtime 中的纯本地编译器。它根据有界难度和宿主能力
-  证据选择显式模型/推理级别，不创建 agent、不改 Git、不执行命令；额度
-  和生命周期证明仍是宿主私有输入。
+- Fast Lane 是 MCP runtime 中的纯本地编译器。其公共面当前没有调度权限并且
+  fail-closed：不会产生 assignment，也不会 spawn agent、修改 Git、运行命令或
+  执行 worktree。宿主/私有 quota 消费预留给未来的外部 Desktop-host bridge 合同。
 
 ## 核心模块速览
 
@@ -43,17 +45,16 @@ Host 私有验证器时，intent admission 一律返回 `NO_SAFE_WORK`。
 | [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | 显式工作包编译和生命周期宿主动作 | [Relay 工具](#精确-mcp-面) |
 | [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | 运行时路径、checkpoint、持久边界和宿主私有 bridge | [运行时数据与恢复](#运行时数据与崩溃恢复) |
 | [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | 持久化 workflow、task、lease 和生命周期状态 | [workflow 生命周期](mcp-tools/devkit_fastlane/references/efficiency-automation.md#workflow-lifecycle-plan) |
-| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | 确定性路由/Fast Lane 编译器、额度快照采集、契约和测试 | [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
+| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | 确定性路由/Fast Lane 编译器、未来额度 bridge 参考、契约和测试 | [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
 | [`.codex-plugin/`](.codex-plugin/) | 插件 manifest、产物 allowlist 和可复现构建器 | [构建主产物](#构建主产物) |
 
 ## 整体工作流
 
-仓库级默认工作流是 Fast Lane。`workflow-design` 负责准备有界输入，宿主再调用
-`fastlane_compile` 或 `team_efficiency.py` 编译 inert 计划。
-`fast-lane-routing` 只是宿主消费指南：skill 和编译器本身都不会启动 agent，
-也不会创建跨会话工作树。最短路径是：配置宿主，选择 MCP 或 Fast Lane 入口，
-编译有界计划，只让有能力的宿主执行带围栏的描述符，
-再用终态证据完成集成、验收和归档。
+仓库级默认工作流是 Fast Lane。`workflow-design` 准备有界输入；
+`fastlane_compile` 或 `team_efficiency.py` 随后只返回无权限、fail-closed 的计划。
+`fast-lane-routing` 记录的是预期的未来宿主消费边界；skill 和当前编译器均不会
+启动 agent，也不会创建或执行跨会话工作树。当前路径只用于检查被阻断的计划，
+权限仍保留在本仓库之外。
 
 ```mermaid
 flowchart TD
@@ -62,20 +63,9 @@ flowchart TD
         C["mcp-tools/server.py<br/>stdio 入口"] --> D["Project Index / Checkpoint<br/>Atlas / Relay"] --> E["有界结果<br/>宿主动作"]
     end
     subgraph FAST["Fast Lane"]
-        F["fast-lane request<br/>+ host-status"] --> G["team_efficiency.py<br/>纯编译器"]
-        G --> H["fastlane_routing.py<br/>精确宿主能力证明"]
-        H --> I{"是否启用额度平衡？"}
-        I -->|是| J["codex_account_quota.py<br/>Codex app-server 快照"]
-        I -->|否| K["使用有界宿主证据"]
-        J --> L["额度 / 宿主证据<br/>绑定到规划"]
-        K --> L
-        L --> M["inert 计划<br/>start / retain / idle"]
-        M --> N["宿主 claim → bind → start"]
-        N --> O{"是否有已验证终态事件？"}
-        O -->|否| P["保留 / 带围栏恢复<br/>不投机 refill"]
-        O -->|是| Q["集成 + 验证"] --> R["lane 0 验收"] --> S["归档独立任务"]
-        G -. "无效或过期" .-> X["失败关闭<br/>NO_SAFE_WORK / usage_unknown"]
-        J -. "额度源失败" .-> X
+        F["fast-lane request"] --> G["team_efficiency.py<br/>公共编译器"]
+        G --> X["失败关闭<br/>NO_SAFE_WORK，零 assignments"]
+        H["未来外部 Desktop-host bridge<br/>仅合同"] -. "未交付或调用" .-> G
     end
     B -->|MCP 工具| C
     B -->|Fast Lane| F
@@ -108,8 +98,9 @@ agent profile、脚手架模板、校验器或调度代码，并且刻意不进�
 - [发布历史](CHANGELOG.md)
 
 实现入口见
-[Fast Lane 编译器](mcp-tools/devkit_fastlane/scripts/team_efficiency.py) 和
-[宿主专用 Codex 额度采集与快照模块](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)。
+[Fast Lane 编译器](mcp-tools/devkit_fastlane/scripts/team_efficiency.py)。
+额度采集模块仅保留为未来外部 Desktop-host bridge 合同的参考模块；公共编译器和
+CLI 不会调用它。
 
 ## 精确 MCP 面
 
@@ -166,30 +157,17 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
 额度采集模块。它明确不包含可选 skill bundle、命令辅助文件、hooks、CI 文件、
 宿主私有状态、prompts、静态 agent 或任意仓库文件。
 
-Fast Lane 应通过以下可执行入口运行：
+Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 
-    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
 
-需要实时额度时，补充 `--quota-input`、`--live-quota`，并可选择提供绝对路径的
-`--quota-state-path <user-owned-cache-file>`。这个由用户配置的缓存只保存有界的
-最近样本；未提供该选项时，会在已设置的 `CODEX_TASK_TEMP` 下使用缓存，否则不
-保存样本缓存。构建输出、额度缓存和临时证据都应放在源码树之外，并排除在版本
-控制之外。
+遗留的 `--host-status`、quota 和 live-quota 开关仅保持解析兼容。当前公共 CLI
+不会读取或消费它们，不会采集额度样本，也不能激活工作。实时额度和 quota cache
+属于未来外部 Desktop-host bridge 合同，不属于本发行版。
 
-Fast Lane 的 worktree 与 worker cache 位置由 `CODEX_FASTLANE_TASK_ROOT`
-独立配置，MCP manifest 会从宿主转发该变量。未设置时保持
-`D:\bun\tmp\codex`；设置时必须是现存、本地绝对、非 C 盘、不得为卷根且无
-reparse-point 的目录。编译器只会在其下派生受限的相对 `project`，根变化、越界
-目标、project reparse-point、Win32 路径别名或不在声明 project 下的 read worktree
-都会 fail-closed；每个 read context 也绑定规范根 hash。默认 bootstrap 输出仍是
-v1；非默认根只在 bootstrap-v2 中以同一规范 hash 绑定，绝不接受 request 自报根
-路径。这是可信宿主配置，绝不是 request JSON 字段。
-
-例如，先创建目标目录，再在启动 Codex 前设置 G 盘任务根：
-
-```powershell
-$env:CODEX_FASTLANE_TASK_ROOT = 'G:\CodexData\fastlane'
-```
+`CODEX_FASTLANE_TASK_ROOT` 以及 worktree/cache 位置同样预留给未来由宿主拥有的
+执行 bridge。当前公共编译器既不会创建也不会执行 worktree，不能把它的输出当作
+已接受 worktree 配置的证据。
 
 ## 运行时数据与崩溃恢复
 
@@ -222,44 +200,23 @@ receipt 恢复。继续前先重新绑定有效的当前上下文。不得从聊
 Fast Lane 编译器位于
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py 和
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
-`fastlane_compile`，只返回惰性描述符。
+`fastlane_compile`；当前每一次调用都会刻意以 `NO_SAFE_WORK` 和零 assignments
+被阻断。
 
-- 工作流默认不等于 CLI 隐式启动：宿主必须显式提供 effort。Ultra 会激活
-  编译器；低于 Ultra 的 effort 需要宿主显式传入 `--enable`。
-- 难度、风险、范围、验证成本、阻塞严重度和可用容量共同选择路由。
-  请求的模型与推理级别保持显式，并且必须有宿主证明。
-- 每个 assignment 都会渲染给 `collaboration.spawn_agent` 使用的
-  `host_dispatch`；宿主必须原样传入其中的 `model` 和 `reasoning_effort`，
-  不得继承当前会话模型。assignment 同时携带一个有界 `index_context`：
-  宿主只在边界各查询一次，worker 消费 packet，不轮询索引，也不手写索引编排。
-- 跨会话选择由 compiler 固定。只有当
-  `dispatch_policy.action=dispatch_all` projection 及其 worktree/fence 义务都
-  验证通过时，有能力的宿主集成才机械消费所有列出的 assignment；编译器和 skill
-  本身不创建会话或工作树。
-- 每个 Codex 会话有三个本地 child 槽位，划分为 start/retain 和诚实的 idle
-  记录。存在新鲜签名额度快照及经验证的全局 ledger 时，主池可在所有会话间目标化
-  6、8、10 或 12 个非 Spark agent 槽位。prewarm 始终是只读证据工作。
-- 只有验证过的终态事件才能释放并补位。commentary 更新不会触发轮询
-  或投机性 refill。
-- 协调器始终保有派发、集成、风险决策和验收责任。只有精确宿主证明的路由要求
-  架构、困难诊断或独立终审时才使用 Sol lane；Terra 和 Luna 各自处理被精确证明
-  的路线。路由不会静默替换模型。
-- Spark 是严重阻塞的窄道。它需要可复现的关键路径阻塞、有界解耦改动、
-  明确停止条件和显式 entitlement，不是日常默认路线。
+- `ultra` 和 `--enable` 只选择被阻断结果的形状，不会激活调度。
+- 公共编译器/CLI 不消费 host-status、quota request、实时额度、index evidence 或
+  worktree root。
+- 它不会派发会话、创建 worktree、补位或运行命令；仓库内不存在这些动作的执行路径。
+- 外部 Desktop-host bridge 未来可以提供经证明的项目权限、宿主/额度消费和执行能力。
+  这只是未来合同，不是已交付实现，也不是任何 Desktop host 源码已经存在的声明。
 
-### 实时账号额度提醒
+### 实时账号额度边界
 
-需要额度平衡时，宿主必须显式接入官方本地 Codex 额度源。`--live-quota` 通过
-`codex app-server --stdio` 读取主池和 Spark 池，把新鲜签名快照绑定到 quota request；
-来源、freshness 或签名异常时会失败关闭为 `usage_unknown`：
-
-    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
-
-详细的额度采集与快照契约见
-[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)。它不会读取
-`auth.json`、cookie 或私有 HTTP 接口；样本缓存路径由用户通过
-`--quota-state-path` 配置（例如其他已配置盘符上的项目缓存）。未提供时跟随
-`CODEX_TASK_TEMP`，不会静默回落到未批准的临时目录。
+实时账号额度不是当前公共 Fast Lane 能力。向本发行版传入 `--live-quota`、
+`--quota-input` 或 `--quota-state-path` 不会读取账号来源、消费额度证据，也不会改变
+零 assignment 的结果。现有
+[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)
+是未来外部 Desktop-host bridge 合同的参考材料；本仓库不提供也不会调用该 bridge。
 
 ## 安全与范围边界
 

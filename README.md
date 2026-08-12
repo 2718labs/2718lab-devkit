@@ -11,17 +11,20 @@ planning. This repository carries the versioned v1.0.0-rc4 package. The
 checked-in manifest and allowlist define the public package surface; the install,
 build, and verification sections below describe the supported workflow.
 
-RC4 retains a fail-closed Host-contract preview. It does not create Desktop
-sessions: without a Host-private verifier, intent admission returns
-`NO_SAFE_WORK`.
+RC4 retains a deliberately fail-closed Fast Lane preview. The public compiler
+and CLI return `NO_SAFE_WORK` with zero assignments: they do not consume host
+status, quota, or live-account inputs, and have no worktree execution path.
+Ultra, live quota, and host consumption are future requirements of an external
+Desktop-host bridge contract; no such bridge is provided by this repository.
 
 > [!IMPORTANT]
 > **Workflow reminder:** route from bounded evidence, keep one writer per
 > write scope, claim and bind before execution, refill only after a validated
 > terminal event, integrate and accept before archiving. Prewarm is read-only;
 > `action="retain"` is not a new spawn. Keep task scratch, caches, worktrees,
-> and evidence in an isolated user-owned workspace; configure quota sample
-> storage explicitly when needed. Do not commit runtime state or credentials.
+> and evidence in an isolated user-owned workspace. Parse-compatible Fast Lane
+> quota inputs do not currently consume quota. Do not commit runtime state or
+> credentials.
 
 ## What is shipped
 
@@ -35,10 +38,10 @@ sessions: without a Host-private verifier, intent admission returns
   worktree bootstrap and agent dispatch.
 - The primary package is MCP-only: it exposes exactly 17 tools, no MCP prompts,
   no MCP resources, no static prompt agents, and no model runner.
-- Fast Lane is a pure MCP runtime compiler. It selects explicit model/effort
-  routes from bounded difficulty and host capability evidence; it never spawns
-  agents, edits Git, or runs commands. Host-private quota and lifecycle
-  attestations stay outside the public request.
+- Fast Lane is a pure MCP runtime compiler. Its public surface is presently
+  authority-inert and fail-closed: it emits no assignments and never spawns
+  agents, edits Git, runs commands, or executes worktrees. Host/private quota
+  consumption is reserved for a future external Desktop-host bridge contract.
 
 ## Module overview
 
@@ -50,20 +53,17 @@ sessions: without a Host-private verifier, intent admission returns
 | [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | explicit work-package compilation and lifecycle host actions | [Relay tools](#exact-mcp-surface) |
 | [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | runtime paths, checkpoints, durable boundaries, and the private host bridge | [runtime and recovery](#runtime-data-and-recovery) |
 | [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | durable workflow, task, lease, and lifecycle state | [workflow lifecycle](mcp-tools/devkit_fastlane/references/efficiency-automation.md#workflow-lifecycle-plan) |
-| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | deterministic routing/Fast Lane compiler, quota snapshot collection, contracts, and tests | [Fast Lane contract](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
+| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | deterministic routing/Fast Lane compiler, future quota-bridge reference, contracts, and tests | [Fast Lane contract](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
 | [`.codex-plugin/`](.codex-plugin/) | plugin manifest, artifact allowlist, and reproducible package builder | [artifact build](#build-the-primary-artifact) |
 
 ## Overall workflow
 
-The repository workflow defaults to Fast Lane. `workflow-design` prepares the
-bounded input; the host then calls `fastlane_compile` or `team_efficiency.py`
-to compile an inert plan. `fast-lane-routing` is the host-consumption guide:
-neither a skill nor the compiler starts agents or creates cross-session
-worktrees. The short path is:
-
-configure the host, choose the MCP or Fast Lane entry, compile a bounded plan,
-let a capable host execute only fenced descriptors, and close the lifecycle
-with terminal evidence, integration, acceptance, and archive.
+The repository workflow defaults to Fast Lane. `workflow-design` prepares a
+bounded input; `fastlane_compile` or `team_efficiency.py` then returns an
+authority-inert, fail-closed plan. `fast-lane-routing` documents the intended
+future host-consumption boundary; neither a skill nor the current compiler
+starts agents or creates/executes cross-session worktrees. The current path is
+to inspect the blocked plan and retain authority outside this repository.
 
 ```mermaid
 flowchart TD
@@ -72,20 +72,9 @@ flowchart TD
         C["mcp-tools/server.py<br/>stdio entry"] --> D["Project Index / Checkpoint<br/>Atlas / Relay"] --> E["Bounded result<br/>host action"]
     end
     subgraph FAST["Fast Lane"]
-        F["fast-lane request<br/>+ host-status"] --> G["team_efficiency.py<br/>pure compiler"]
-        G --> H["fastlane_routing.py<br/>exact host attestation"]
-        H --> I{"Quota balancing enabled?"}
-        I -->|yes| J["codex_account_quota.py<br/>Codex app-server snapshot"]
-        I -->|no| K["Use bounded host evidence"]
-        J --> L["Quota / host evidence<br/>bound into planning"]
-        K --> L
-        L --> M["Inert plan<br/>start / retain / idle"]
-        M --> N["Host claim → bind → start"]
-        N --> O{"Validated terminal event?"}
-        O -->|no| P["Retain / fenced recovery<br/>no speculative refill"]
-        O -->|yes| Q["Integrate + verify"] --> R["Lane 0 acceptance"] --> S["Archive independent task"]
-        G -. "invalid or stale" .-> X["Fail closed<br/>NO_SAFE_WORK / usage_unknown"]
-        J -. "source failure" .-> X
+        F["fast-lane request"] --> G["team_efficiency.py<br/>public compiler"]
+        G --> X["Fail closed<br/>NO_SAFE_WORK, zero assignments"]
+        H["Future external Desktop-host bridge<br/>contract only"] -. "not shipped or invoked" .-> G
     end
     B -->|MCP tools| C
     B -->|Fast Lane| F
@@ -120,9 +109,10 @@ re-reading the whole repository:
   retired components and are not the current implementation contract.
 - [Release history](CHANGELOG.md)
 
-For implementation entry points, see
-[the Fast Lane compiler](mcp-tools/devkit_fastlane/scripts/team_efficiency.py) and
-[the host-only Codex quota producer](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py).
+For the current implementation entry point, see
+[the Fast Lane compiler](mcp-tools/devkit_fastlane/scripts/team_efficiency.py).
+The quota producer is retained as a reference module for the future external
+Desktop-host bridge contract; the public compiler and CLI do not invoke it.
 
 ## Exact MCP surface
 
@@ -185,34 +175,21 @@ It deliberately excludes the optional skill bundle, command helpers, hooks,
 CI files, host-private state, prompts, static agents, and arbitrary repository
 files.
 
-Run Fast Lane through its executable entry point:
+Run Fast Lane through its executable entry point to inspect its fail-closed
+result:
 
-    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
+    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
 
-For live quota, add `--quota-input`, `--live-quota`, and an optional absolute
-`--quota-state-path <user-owned-cache-file>`. That user-configurable cache
-stores only the bounded recent sample; without the option, it uses
-`CODEX_TASK_TEMP` when set and otherwise keeps no sample cache. Keep build
-output, quota caches, and temporary evidence outside the source tree and out
-of version control.
+The legacy `--host-status`, quota, and live-quota switches remain
+parse-compatible only. The current public CLI does not read or consume them,
+does not collect a quota sample, and cannot activate work. Live quota and
+quota-cache handling belong to the future external Desktop-host bridge
+contract, not this release.
 
-Fast Lane worktree and worker-cache placement is independently configured by
-`CODEX_FASTLANE_TASK_ROOT`, which the MCP manifest forwards from the host.
-When it is unset, Fast Lane preserves `D:\bun\tmp\codex`; when set, it must
-name an existing local absolute non-C, non-volume-root directory without
-reparse points. The compiler derives the bounded relative `project` below that
-root and rejects root changes, root escapes, project reparse points, Win32 path
-aliases, or read worktrees outside their declared project. Every read context
-also binds the canonical root hash. Default bootstrap output remains v1; a
-non-default root is bound by the same canonical hash in bootstrap-v2, never by
-a request-provided root value. This is trusted host configuration, never a
-request-JSON field.
-
-For example, configure an existing G-drive root before starting Codex:
-
-```powershell
-$env:CODEX_FASTLANE_TASK_ROOT = 'G:\CodexData\fastlane'
-```
+`CODEX_FASTLANE_TASK_ROOT` and worktree/cache placement are likewise reserved
+for a future host-owned execution bridge. The current public compiler neither
+creates nor executes a worktree and must not be used as evidence that a
+worktree configuration has been accepted.
 
 ## Runtime data and recovery
 
@@ -250,55 +227,28 @@ after evidence, commit, integration, and acceptance have all succeeded.
 The Fast Lane compiler is in
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py and
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The public MCP entry is
-`fastlane_compile`; it returns inert descriptors only.
+`fastlane_compile`; every current invocation is deliberately blocked with
+`NO_SAFE_WORK` and zero assignments.
 
-- The workflow default does not make the CLI implicit: the host supplies an
-  explicit effort. `ultra` activates the compiler; lower efforts require the
-  host's explicit `--enable`.
-- Difficulty, risk, scope, verification cost, blocker severity, and available
-  capacity select the route. The requested model and reasoning effort remain
-  explicit and host-attested.
-- Each assignment renders a `host_dispatch` tuple for `collaboration.spawn_agent`;
-  the host must pass its exact `model` and `reasoning_effort` and must not inherit
-  the current conversation model. The same assignment carries one bounded
-  `index_context`: the host performs boundary queries once and the worker only
-  consumes the packet, without index polling or hand-written query choreography.
-- Cross-session selection is compiler-owned. A capable host integration
-  mechanically consumes every listed assignment only when a
-  `dispatch_policy.action=dispatch_all` projection and its worktree/fence
-  obligations validate; the compiler and skills never create a session or
-  worktree themselves.
-- Each Codex session has three local child slots, partitioned into start/retain
-  and honest idle records. With a fresh signed quota snapshot and verified
-  global ledger, the main pool can target 6, 8, 10, or 12 non-Spark agent slots
-  across sessions. Prewarm is read-only evidence work.
-- A free slot is refilled only after a validated terminal event. Commentary
-  updates never trigger polling or speculative refill.
-- The coordinator retains dispatch, integration, risk, and acceptance ownership.
-  A Sol lane is used only when the exact host-attested route warrants
-  architecture, difficult diagnosis, or independent terminal review. Terra and
-  Luna handle their exact attested routes; no route silently substitutes a model.
-- Spark is a narrow severe-blocker lane. It requires a reproducible critical
-  path blocker, a bounded decoupling change, a clear stop condition, and
-  explicit entitlement; it is not a routine default.
+- `ultra` and `--enable` only select the shape of the blocked result; they do
+  not activate scheduling.
+- The public compiler/CLI does not consume host status, quota requests, live
+  quota, index evidence, or a worktree root.
+- It never dispatches a session, creates a worktree, refills a slot, or runs a
+  command. No in-repository execution path exists for those actions.
+- An external Desktop-host bridge may later provide attested project authority,
+  host/quota consumption, and execution. That is a future contract, not a
+  shipped implementation or a claim that any Desktop host source exists.
 
-### Live account quota reminder
+### Live account quota boundary
 
-The host must opt into the official local Codex account source when quota
-balancing is part of a dispatch. `--live-quota` reads the main and Spark pools
-through `codex app-server --stdio`, binds the fresh signed snapshot to the
-quota request, and fails closed to `usage_unknown` on source, freshness, or
-signature errors:
-
-    python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
-
-The detailed producer contract is in
-[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py).
-It never reads `auth.json`, cookies, or private HTTP endpoints; its sample
-cache path is user-configurable through `--quota-state-path` (for example, a
-project cache on another configured drive). If no path is supplied, it follows
-`CODEX_TASK_TEMP`; it never silently falls back to an unapproved temporary
-directory.
+Live account quota is not a current public Fast Lane capability. Passing
+`--live-quota`, `--quota-input`, or `--quota-state-path` to this release does
+not read an account source, consume quota evidence, or alter its zero-assignment
+result. The existing
+[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)
+is reference material for the future external Desktop-host bridge contract;
+this repository does not supply or invoke that bridge.
 
 ## Safety and scope boundaries
 
