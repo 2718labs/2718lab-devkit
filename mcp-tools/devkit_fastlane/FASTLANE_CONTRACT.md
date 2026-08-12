@@ -104,6 +104,15 @@ schema/hash 篡改、项目/绑定/workspace/snapshot 不同，或者 execution/
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 预览。增加 Desktop-host durable registry、跨进程
 authority 传递或公开 MCP 参数属于后续 host 合同，不能由工作包 JSON 假装已经存在。
 
+同一限制覆盖 `bootstrap --apply` 及 import-callable `apply_bootstrap_plan`：当前公开入口在构建
+caller-supplied bootstrap plan 或调用 worktree mutation 前，无条件以
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 失败关闭，因而不能到达
+`git worktree add`。不带 `--apply` 的 `bootstrap` 仍只输出 dry-run 诊断计划；其中的 project、
+root、worktree 和任何 JSON 都不是 sealed V2 execution context。唯一保留的 mutation primitive 是
+module-private host adapter，它需要由 live V2 authority 为精确 canonical bootstrap plan 封存的
+opaque capability，并在 mutation 前再次比较 live authority；本合同没有提供获取或传入该 capability
+的 CLI、MCP 或 import-callable 参数。
+
 ### 4. 接地后再写
 
 列出不能百分之百确认的接口并逐个查证。查不到时选择可被现有证据支持的保守实现，并明确记录限制；不把编译器当 API 文档。

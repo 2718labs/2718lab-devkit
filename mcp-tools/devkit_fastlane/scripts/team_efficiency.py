@@ -839,7 +839,8 @@ def _hash(value: object, field: str) -> str:
 
 def _project_id(value: object, field: str) -> str:
     text = _text(value, field, maximum=128)
-    if not _PATH_PART.fullmatch(text):
+    parts = text.split("/")
+    if not parts or any(not _PATH_PART.fullmatch(part) for part in parts):
         raise ValueError(f"{field} is invalid")
     return text
 
@@ -1672,15 +1673,89 @@ def _run_worktree_add(argv: list[str], *, check: bool, env: Mapping[str, str]) -
     subprocess.run(argv, check=check, env=dict(env))
 
 
+def _bootstrap_execution_capability_adapter() -> tuple[
+    Callable[..., object],
+    Callable[[Mapping[str, Any], object], dict[str, Any]],
+]:
+    """Keep the capability type and its sealed records out of module globals."""
+
+    class BootstrapExecutionCapability:
+        __slots__ = ()
+
+    sealed_records: dict[object, tuple[dict[str, Any], str]] = {}
+
+    def seal(
+        plan: Mapping[str, Any],
+        *,
+        work_package: Mapping[str, Any],
+    ) -> object:
+        authority, reason_code = _project_authority_preflight(
+            {"work_package": work_package}
+        )
+        if reason_code is not None:
+            raise ValueError(f"NO_SAFE_WORK/{reason_code}")
+        if authority is None:
+            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
+        validated = _validated_bootstrap_plan(plan)
+        if validated["project"] != authority["project_id"]:
+            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
+        capability = BootstrapExecutionCapability()
+        sealed_records[capability] = (dict(authority), _sha256_json(validated))
+        return capability
+
+    def validate(plan: Mapping[str, Any], execution_capability: object) -> dict[str, Any]:
+        """Recheck a registered V2 binding immediately before local mutation."""
+
+        try:
+            sealed = sealed_records.get(execution_capability)
+        except TypeError:
+            sealed = None
+        if sealed is None:
+            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
+        sealed_authority, sealed_plan_hash = sealed
+        validated = _validated_bootstrap_plan(plan)
+        if _sha256_json(validated) != sealed_plan_hash:
+            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
+        live_authority = _live_project_authority()
+        if live_authority is None:
+            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
+        if live_authority != sealed_authority:
+            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
+        if validated["project"] != live_authority["project_id"]:
+            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
+        return validated
+
+    return seal, validate
+
+
+(
+    _seal_bootstrap_execution_capability,
+    _validated_sealed_bootstrap_plan,
+) = _bootstrap_execution_capability_adapter()
+
+
 def apply_bootstrap_plan(
     plan: Mapping[str, Any],
     *,
     runner: Callable[..., object] | None = None,
     probe_runner: Callable[..., object] | None = None,
 ) -> dict[str, Any]:
-    """Apply the one validated argument-vector operation after an absence check."""
+    """Fail closed: public imports cannot authorize a bootstrap mutation."""
 
-    validated = _validated_bootstrap_plan(plan)
+    del plan, runner, probe_runner
+    raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
+
+
+def _apply_bootstrap_plan_after_authority(
+    plan: Mapping[str, Any],
+    execution_capability: object,
+    *,
+    runner: Callable[..., object] | None = None,
+    probe_runner: Callable[..., object] | None = None,
+) -> dict[str, Any]:
+    """Apply one V2-sealed plan through a host-private adapter only."""
+
+    validated = _validated_sealed_bootstrap_plan(plan, execution_capability)
     task_root = _bootstrap_task_root(validated)
     _, root = _project_root(validated["project"], task_root=task_root)
     worktree = _root_bound_path(
@@ -9478,6 +9553,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "bootstrap":
+            if args.apply:
+                # The public CLI has no host-private, sealed V2 execution
+                # context.  Its caller-controlled --project/root/worktree
+                # values must therefore never reach the Git mutation helper.
+                raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
             plan = build_bootstrap_plan(
                 task_id=args.task_id,
                 base_commit=args.base_commit,
@@ -9488,7 +9568,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 worktree=args.worktree,
                 temp_target=args.temp_target,
             )
-            _print_json(apply_bootstrap_plan(plan) if args.apply else plan)
+            _print_json(plan)
         elif args.command == "resume-packet":
             packet = _read_json(args.input, maximum=MAX_PACKET_BYTES)
             print(canonical_resume_packet(packet))

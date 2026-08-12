@@ -23,25 +23,40 @@ root never comes from request JSON or a bootstrap plan: default plans remain
 bootstrap-v1, while a non-default root is bound by a canonical hash in
 bootstrap-v2. A changed configuration fails revalidation before Git runs.
 
-The default output is a canonical dry-run plan. Its only eligible apply vector
+The default output is a canonical dry-run plan. Its canonical worktree vector
 is:
 
 ```text
 git -C <repo> worktree add -b <branch> <worktree> <base-commit>
 ```
 
-`--apply` revalidates that exact plan and requires the worktree target to be
-absent. Before the apply vector, fixed read-only Git probes verify the local
-repository and full base commit. The helper creates or verifies only the
-validated temp target, then creates its own fresh empty worktree leaf before
-passing that exact path to Git. It passes the temp target as `TEMP`, `TMP`, `TMPDIR`, and
-`CODEX_TASK_TEMP` to those child processes. It also pins
+`bootstrap --apply` is deliberately disabled in the public CLI, and the
+import-callable `apply_bootstrap_plan` helper is equally fail-closed. Both
+return `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` before building a
+caller-supplied plan or invoking the worktree helper, so neither can run
+`git worktree add`. Plan-only `bootstrap` remains a non-mutating diagnostic
+command; its emitted project/root/worktree values cannot establish authority.
+
+The module-private host mutation primitive is not a public adapter. It accepts
+only an opaque capability sealed for one exact canonical bootstrap plan after a
+live V2 project-authority comparison, and rechecks that live authority before
+the operation. There is no CLI, MCP field, environment variable, path, or JSON
+input that can create or supply this capability. A future Desktop host bridge
+must retain that private boundary rather than exposing an authority parameter.
+
+After that host-private preflight, the internal operation revalidates the exact
+plan and requires the worktree target to be absent. Fixed read-only Git probes
+verify the local repository and full base commit. The helper creates or verifies
+only the validated temp target, then creates its own fresh empty worktree leaf
+before passing that exact path to Git. It passes the temp target as `TEMP`,
+`TMP`, `TMPDIR`, and `CODEX_TASK_TEMP` to those child processes. It also pins
 `PYTHONPYCACHEPREFIX=<temp>/pycache` and `UV_CACHE_DIR=<temp>/uv-cache`, so
 child caches cannot silently return to C. Creation proceeds one checked path
 component at a time. On Windows it also pins the configured-root ancestry and
-each participating directory, including that fresh worktree leaf, with read-only
-sharing (no write/delete sharing) through creation and the Git vector. A pre-existing
-leaf or inability to pin fails closed rather than falling back to path-only creation.
+each participating directory, including that fresh worktree leaf, with
+read-only sharing (no write/delete sharing) through creation and the Git
+vector. A pre-existing leaf or inability to pin fails closed rather than
+falling back to path-only creation.
 
 ## Resume, status, contracts, and cache metadata
 
@@ -133,6 +148,11 @@ the host record. Missing live authority yields
 `NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`; mismatches or tampering fail before an
 assignment is rendered. The public CLI intentionally has no authority option,
 so it is an inert preview unless a same-process host bridge supplies one.
+That bridge does not expose bootstrap mutation: public `bootstrap --apply` and
+import-callable `apply_bootstrap_plan` are both blocked before any caller plan,
+path, or JSON can reach the worktree helper. Only a module-private adapter can
+use a live-V2-sealed, exact-plan capability, and that capability has no public
+parameter or serialization.
 
 ### Verified Code Atlas evidence
 
