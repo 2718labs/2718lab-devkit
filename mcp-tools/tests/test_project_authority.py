@@ -4,16 +4,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+import devkit_runtime.config as runtime_config_module
 import devkit_runtime.project_authority as project_authority_module
-from devkit_runtime.config import RuntimeConfig
+from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.project_authority import (
     ProjectAuthority,
     ProjectAuthorityError,
     ProjectAuthorityReceipt,
     ProjectPhysicalBinding,
+    RuntimeProjectAuthorityProvider,
 )
 
 
@@ -23,10 +26,12 @@ def test_authority_receipt_reopens_same_physical_project_with_same_identity(
     project_root = tmp_path / "project"
     project_root.mkdir()
 
-    issued = ProjectAuthority.issue(project_root)
+    issued_provider = RuntimeProjectAuthorityProvider.issue(project_root)
+    issued = issued_provider.current()
     persisted = issued.receipt.to_json()
     receipt = ProjectAuthorityReceipt.from_json(persisted)
-    reopened = ProjectAuthority.reopen(project_root, receipt)
+    reopened_provider = RuntimeProjectAuthorityProvider.reopen(project_root, receipt)
+    reopened = reopened_provider.current()
     scratch_root = tmp_path / "scratch"
     scratch_root.mkdir()
     environment = {
@@ -35,11 +40,11 @@ def test_authority_receipt_reopens_same_physical_project_with_same_identity(
     }
     issued_config = RuntimeConfig.load(
         environ=environment,
-        project_authority=issued,
+        authority_provider=issued_provider,
     )
     reopened_config = RuntimeConfig.load(
         environ=environment,
-        project_authority=reopened,
+        authority_provider=reopened_provider,
     )
 
     identity_material = {
@@ -60,6 +65,8 @@ def test_authority_receipt_reopens_same_physical_project_with_same_identity(
 
     assert reopened.project_id == issued.project_id
     assert reopened.receipt == issued.receipt
+    assert issued_config.authority_provider == issued_provider
+    assert reopened_config.authority_provider == reopened_provider
     assert reopened_config.data_root == issued_config.data_root
     assert reopened.project_id == hashlib.sha256(canonical).hexdigest()
     assert persisted == issued.receipt.to_json()
@@ -155,8 +162,10 @@ def test_distinct_project_roots_cannot_collide_through_same_caller_id(
         "token_hex",
         lambda _: "01" * 32,
     )
-    authority_a = ProjectAuthority.issue(project_a)
-    authority_b = ProjectAuthority.issue(project_b)
+    provider_a = RuntimeProjectAuthorityProvider.issue(project_a)
+    provider_b = RuntimeProjectAuthorityProvider.issue(project_b)
+    authority_a = provider_a.current()
+    authority_b = provider_b.current()
     shared_environment = {
         "PLUGIN_DATA": str(tmp_path / "plugin-data"),
         "CODEX_TASK_TEMP": str(tmp_path / "scratch"),
@@ -166,11 +175,11 @@ def test_distinct_project_roots_cannot_collide_through_same_caller_id(
 
     config_a = RuntimeConfig.load(
         environ=shared_environment,
-        project_authority=authority_a,
+        authority_provider=provider_a,
     )
     config_b = RuntimeConfig.load(
         environ=shared_environment,
-        project_authority=authority_b,
+        authority_provider=provider_b,
     )
 
     assert authority_a.project_id != authority_b.project_id
@@ -186,7 +195,8 @@ def test_caller_selected_ids_cannot_choose_authority_ownership(
     project_root.mkdir()
     scratch_root = tmp_path / "scratch"
     scratch_root.mkdir()
-    authority = ProjectAuthority.issue(project_root)
+    provider = RuntimeProjectAuthorityProvider.issue(project_root)
+    authority = provider.current()
     common = {
         "PLUGIN_DATA": str(tmp_path / "plugin-data"),
         "CODEX_TASK_TEMP": str(scratch_root),
@@ -194,11 +204,11 @@ def test_caller_selected_ids_cannot_choose_authority_ownership(
 
     config_a = RuntimeConfig.load(
         environ={**common, "CODEX_PROJECT_ID": "project-a"},
-        project_authority=authority,
+        authority_provider=provider,
     )
     config_b = RuntimeConfig.load(
         environ={**common, "CODEX_PROJECT_ID": "project-b"},
-        project_authority=authority,
+        authority_provider=provider,
     )
 
     assert config_a.project_authority == authority
@@ -226,3 +236,102 @@ def test_legacy_caller_scope_is_explicitly_not_project_authority(
     assert config.project_authority is None
     assert config.storage_layout == "legacy-compat"
     assert config.data_root.parent.name == "scoped-v1"
+
+
+def test_runtime_config_rejects_authority_without_module_minted_provider(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    authority = ProjectAuthority.issue(project_root)
+    environment = {
+        "PLUGIN_DATA": str(tmp_path / "plugin-data"),
+        "CODEX_TASK_TEMP": str(scratch_root),
+    }
+
+    with pytest.raises(RuntimeConfigError) as direct:
+        RuntimeConfig.load(
+            environ=environment,
+            authority_provider=authority,  # type: ignore[arg-type]
+        )
+    assert direct.value.code == "PROJECT_AUTHORITY_PROVIDER_INVALID"
+
+    forged = RuntimeConfig(
+        data_root=tmp_path / "plugin-data" / "projects-v2" / authority.project_id,
+        scratch_root=scratch_root,
+        project_authority=authority,
+        storage_layout="projects-v2",
+    )
+    with pytest.raises(RuntimeConfigError) as manually_constructed:
+        forged.require_project_authority()
+    assert manually_constructed.value.code == "PROJECT_AUTHORITY_PROVIDER_INVALID"
+
+
+def test_runtime_config_rechecks_binding_after_root_safety_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "project"
+    original_root = tmp_path / "original-project"
+    project_root.mkdir()
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    provider = RuntimeProjectAuthorityProvider.issue(project_root)
+    authority = provider.current()
+    plugin_data = tmp_path / "plugin-data"
+    authority_data_root = plugin_data / "projects-v2" / authority.project_id
+    safe_directory_path = runtime_config_module._safe_directory_path
+    replaced = False
+
+    def replace_after_data_root_check(path: Path, *, require_exists: bool) -> bool:
+        nonlocal replaced
+        result = safe_directory_path(path, require_exists=require_exists)
+        if path == authority_data_root and not replaced:
+            project_root.rename(original_root)
+            project_root.mkdir()
+            replaced = True
+        return result
+
+    monkeypatch.setattr(
+        runtime_config_module,
+        "_safe_directory_path",
+        replace_after_data_root_check,
+    )
+
+    with pytest.raises(RuntimeConfigError) as caught:
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(plugin_data),
+                "CODEX_TASK_TEMP": str(scratch_root),
+            },
+            authority_provider=provider,
+        )
+
+    assert replaced
+    assert caught.value.code == "PROJECT_AUTHORITY_INVALID"
+
+
+@pytest.mark.parametrize(
+    "binding",
+    (
+        cast(ProjectPhysicalBinding, {"device_id": "1", "file_id": "2"}),
+        ProjectPhysicalBinding(device_id=cast(int, "1"), file_id=2),
+    ),
+)
+def test_malformed_runtime_receipt_types_fail_with_stable_error(
+    tmp_path: Path,
+    binding: ProjectPhysicalBinding,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    receipt = ProjectAuthorityReceipt(
+        authority_nonce="01" * 32,
+        physical_binding=binding,
+        project_id="02" * 32,
+    )
+
+    with pytest.raises(ProjectAuthorityError) as caught:
+        ProjectAuthority.reopen(project_root, receipt)
+
+    assert caught.value.code == "PROJECT_AUTHORITY_RECEIPT_INVALID"

@@ -10,7 +10,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from devkit_runtime.project_authority import ProjectAuthority, ProjectAuthorityError
+from devkit_runtime.project_authority import (
+    ProjectAuthority,
+    ProjectAuthorityError,
+    RuntimeProjectAuthorityProvider,
+)
 
 _SCOPE_DIRECTORY = "scoped-v1"
 _PROJECT_DIRECTORY = "projects-v2"
@@ -39,6 +43,21 @@ class RuntimeConfig:
     scratch_root: Path
     project_authority: ProjectAuthority | None = None
     storage_layout: str = "legacy-compat"
+    authority_provider: RuntimeProjectAuthorityProvider | None = None
+
+    def require_project_authority(self) -> ProjectAuthority:
+        """Revalidate the module-minted provider at a runtime trust boundary."""
+
+        authority = _current_project_authority(self.authority_provider)
+        if (
+            authority != self.project_authority
+            or self.storage_layout != _PROJECT_DIRECTORY
+            or self.data_root.parent.name != _PROJECT_DIRECTORY
+            or self.data_root.name != authority.project_id
+            or self.scratch_root.name != authority.project_id
+        ):
+            raise RuntimeConfigError("PROJECT_AUTHORITY_PROVIDER_INVALID")
+        return authority
 
     @property
     def orchestrator_database(self) -> Path:
@@ -82,7 +101,7 @@ class RuntimeConfig:
         *,
         environ: Mapping[str, str] | None = None,
         protected_roots: Iterable[str | Path] = (),
-        project_authority: ProjectAuthority | None = None,
+        authority_provider: RuntimeProjectAuthorityProvider | None = None,
     ) -> RuntimeConfig:
         values = os.environ if environ is None else environ
         plugin_data = values.get("PLUGIN_DATA")
@@ -94,15 +113,13 @@ class RuntimeConfig:
                 data_base = _absolute_path(codex_home) / "data" / "2718lab-devkit"
             else:
                 data_base = Path.home() / ".codex" / "data" / "2718lab-devkit"
-        if project_authority is None:
+        if authority_provider is None:
+            project_authority = None
             scope = _resolve_scope(values)
             data_root = _scoped_root(data_base, scope)
             storage_layout = "legacy-compat"
         else:
-            try:
-                project_authority.revalidate()
-            except ProjectAuthorityError as exc:
-                raise RuntimeConfigError("PROJECT_AUTHORITY_INVALID") from exc
+            project_authority = _current_project_authority(authority_provider)
             scope = None
             data_root = _authority_root(data_base, project_authority)
             storage_layout = _PROJECT_DIRECTORY
@@ -115,7 +132,7 @@ class RuntimeConfig:
             raise RuntimeConfigError("DATA_ROOT_INVALID")
         if any(_paths_overlap(data_root, root) for root in protected):
             raise RuntimeConfigError("DATA_ROOT_INVALID")
-        return cls(
+        config = cls(
             data_root=data_root,
             scratch_root=_resolve_scratch(
                 values,
@@ -126,7 +143,11 @@ class RuntimeConfig:
             ),
             project_authority=project_authority,
             storage_layout=storage_layout,
+            authority_provider=authority_provider,
         )
+        if authority_provider is not None:
+            config.require_project_authority()
+        return config
 
 
 def _absolute_path(value: str | Path) -> Path:
@@ -134,6 +155,17 @@ def _absolute_path(value: str | Path) -> Path:
     if not path.is_absolute():
         raise RuntimeConfigError("DATA_ROOT_INVALID")
     return Path(os.path.abspath(path))
+
+
+def _current_project_authority(
+    provider: RuntimeProjectAuthorityProvider | None,
+) -> ProjectAuthority:
+    if type(provider) is not RuntimeProjectAuthorityProvider:
+        raise RuntimeConfigError("PROJECT_AUTHORITY_PROVIDER_INVALID")
+    try:
+        return provider.current()
+    except ProjectAuthorityError as exc:
+        raise RuntimeConfigError("PROJECT_AUTHORITY_INVALID") from exc
 
 
 def _resolve_scratch(

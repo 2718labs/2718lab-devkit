@@ -17,6 +17,7 @@ _RECEIPT_SCHEMA = "2718lab/project-authority-receipt/v1"
 _BINDING_SCHEME = "os-stat-directory-v1"
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 _CONSTRUCTION_TOKEN = object()
+_PROVIDER_CONSTRUCTION_TOKEN = object()
 
 
 class ProjectAuthorityError(RuntimeError):
@@ -44,7 +45,10 @@ class ProjectPhysicalBinding:
 
 @dataclass(frozen=True)
 class ProjectAuthorityReceipt:
-    """Non-secret receipt persisted and selected only by the host."""
+    """Non-secret serialized receipt requiring an external trusted-host registry.
+
+    This value has no built-in persistence or authority-selection behavior.
+    """
 
     authority_nonce: str
     physical_binding: ProjectPhysicalBinding
@@ -96,7 +100,7 @@ class ProjectAuthorityReceipt:
 
 @dataclass(frozen=True, init=False)
 class ProjectAuthority:
-    """A live authority after binding a trusted receipt to a physical root."""
+    """Validated identity value; alone it is not a runtime trust capability."""
 
     project_root: Path
     receipt: ProjectAuthorityReceipt
@@ -149,6 +153,46 @@ class ProjectAuthority:
             raise ProjectAuthorityError("PROJECT_AUTHORITY_MISMATCH")
 
 
+@dataclass(frozen=True, init=False)
+class RuntimeProjectAuthorityProvider:
+    """Ephemeral module-minted capability for one validated authority.
+
+    Receipt persistence and selection require a separate trusted host registry.
+    This provider intentionally performs neither responsibility.
+    """
+
+    _authority: ProjectAuthority
+
+    def __init__(self, authority: ProjectAuthority, *, _token: object) -> None:
+        if _token is not _PROVIDER_CONSTRUCTION_TOKEN:
+            raise TypeError(
+                "provider must be issued or reopened by the authority module"
+            )
+        object.__setattr__(self, "_authority", authority)
+
+    @classmethod
+    def issue(cls, project_root: str | Path) -> RuntimeProjectAuthorityProvider:
+        return cls(
+            ProjectAuthority.issue(project_root),
+            _token=_PROVIDER_CONSTRUCTION_TOKEN,
+        )
+
+    @classmethod
+    def reopen(
+        cls,
+        project_root: str | Path,
+        receipt: ProjectAuthorityReceipt,
+    ) -> RuntimeProjectAuthorityProvider:
+        return cls(
+            ProjectAuthority.reopen(project_root, receipt),
+            _token=_PROVIDER_CONSTRUCTION_TOKEN,
+        )
+
+    def current(self) -> ProjectAuthority:
+        self._authority.revalidate()
+        return self._authority
+
+
 def _canonical_json(payload: object) -> str:
     return json.dumps(
         payload,
@@ -169,7 +213,13 @@ def _derive_project_id(nonce: str, binding: ProjectPhysicalBinding) -> str:
 
 def _validate_receipt(receipt: ProjectAuthorityReceipt) -> None:
     if (
-        _SHA256_HEX.fullmatch(receipt.authority_nonce) is None
+        type(receipt) is not ProjectAuthorityReceipt
+        or type(receipt.authority_nonce) is not str
+        or type(receipt.project_id) is not str
+        or type(receipt.physical_binding) is not ProjectPhysicalBinding
+        or type(receipt.physical_binding.device_id) is not int
+        or type(receipt.physical_binding.file_id) is not int
+        or _SHA256_HEX.fullmatch(receipt.authority_nonce) is None
         or _SHA256_HEX.fullmatch(receipt.project_id) is None
         or receipt.physical_binding.device_id <= 0
         or receipt.physical_binding.file_id <= 0
