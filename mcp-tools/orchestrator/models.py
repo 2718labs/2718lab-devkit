@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from enum import Enum, StrEnum
 
 
-class WorkflowKind(StrEnum):
+class WorkflowKind(str, Enum):  # noqa: UP042 - public enum type is stable API
     LINEAR = "linear"
     DAG = "dag"
 
 
-class WorkflowState(StrEnum):
+class WorkflowState(str, Enum):  # noqa: UP042 - public enum type is stable API
     NEW = "new"
     RUNNING = "running"
     DONE = "done"
@@ -20,7 +20,7 @@ class WorkflowState(StrEnum):
     CANCELLED = "cancelled"
 
 
-class TaskState(StrEnum):
+class TaskState(str, Enum):  # noqa: UP042 - public enum type is stable API
     NEW = "new"
     READY = "ready"
     RUNNING = "running"
@@ -31,12 +31,12 @@ class TaskState(StrEnum):
     CANCELLED = "cancelled"
 
 
-class TaskKind(StrEnum):
+class TaskKind(str, Enum):  # noqa: UP042 - public enum type is stable API
     GENERAL = "general"
     CODE = "code"
 
 
-class AtlasOutboxState(StrEnum):
+class AtlasOutboxState(str, Enum):  # noqa: UP042 - public enum type is stable API
     PENDING = "pending"
     PROJECTED = "projected"
     QUARANTINED = "quarantined"
