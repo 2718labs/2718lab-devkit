@@ -21,7 +21,8 @@ match one of their projects. Win32-normalized aliases (including trailing
 dot/space and reserved device names) are rejected for root-bound targets. The
 root never comes from request JSON or a bootstrap plan: default plans remain
 bootstrap-v1, while a non-default root is bound by a canonical hash in
-bootstrap-v2. A changed configuration fails revalidation before Git runs.
+bootstrap-v2. A changed configuration fails diagnostic revalidation; this
+repository does not launch Git for bootstrap execution.
 
 The default output is a canonical dry-run plan. Its canonical worktree vector
 is:
@@ -37,26 +38,14 @@ caller-supplied plan or invoking the worktree helper, so neither can run
 `git worktree add`. Plan-only `bootstrap` remains a non-mutating diagnostic
 command; its emitted project/root/worktree values cannot establish authority.
 
-The module-private host mutation primitive is not a public adapter. It accepts
-only an opaque capability sealed for one exact canonical bootstrap plan after a
-live V2 project-authority comparison, and rechecks that live authority before
-the operation. There is no CLI, MCP field, environment variable, path, or JSON
-input that can create or supply this capability. A future Desktop host bridge
-must retain that private boundary rather than exposing an authority parameter.
-
-After that host-private preflight, the internal operation revalidates the exact
-plan and requires the worktree target to be absent. Fixed read-only Git probes
-verify the local repository and full base commit. The helper creates or verifies
-only the validated temp target, then creates its own fresh empty worktree leaf
-before passing that exact path to Git. It passes the temp target as `TEMP`,
-`TMP`, `TMPDIR`, and `CODEX_TASK_TEMP` to those child processes. It also pins
-`PYTHONPYCACHEPREFIX=<temp>/pycache` and `UV_CACHE_DIR=<temp>/uv-cache`, so
-child caches cannot silently return to C. Creation proceeds one checked path
-component at a time. On Windows it also pins the configured-root ancestry and
-each participating directory, including that fresh worktree leaf, with
-read-only sharing (no write/delete sharing) through creation and the Git
-vector. A pre-existing leaf or inability to pin fails closed rather than
-falling back to path-only creation.
+There is no currently executable host-authorized worktree path in this
+repository. It contains no private capability registry, runner, Git probe, or
+internal adapter that can turn a plan into a worktree. The displayed vector is
+diagnostic data only, and attempted mutation always returns
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` before a caller-provided runner,
+path, environment, or JSON can have an effect. A Desktop host registry and a
+genuinely external private execution bridge are prerequisites for any future
+apply behavior; neither is implemented or accepted as an input here.
 
 ## Resume, status, contracts, and cache metadata
 
@@ -147,12 +136,11 @@ the host record. Missing live authority yields
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`; v1 yields
 `NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`; mismatches or tampering fail before an
 assignment is rendered. The public CLI intentionally has no authority option,
-so it is an inert preview unless a same-process host bridge supplies one.
-That bridge does not expose bootstrap mutation: public `bootstrap --apply` and
-import-callable `apply_bootstrap_plan` are both blocked before any caller plan,
-path, or JSON can reach the worktree helper. Only a module-private adapter can
-use a live-V2-sealed, exact-plan capability, and that capability has no public
-parameter or serialization.
+so it is an inert preview. A same-process authority provider can only allow
+authority-bound inert planning; it does not create a worktree execution grant.
+Public `bootstrap --apply` and import-callable `apply_bootstrap_plan` are both
+blocked before any caller plan, path, provider override, closure, or JSON can
+reach a worktree helper, because no such helper exists in this repository.
 
 ### Verified Code Atlas evidence
 
@@ -481,12 +469,13 @@ registration, and durable workflow completion remain required.
 
 The compiler proves only request consistency. All execution and read `repo`
 anchors must agree on a canonical repo anchor, and worker/read worktrees must
-differ from that anchor. Before executing a descriptor, the host matches the
-request anchor to its trusted shared integration worktree; before `git worktree add`, it rejects a
-mismatch without mutation. After apply, the host re-resolves the created
-target, verifies that it equals the planned worker worktree and shares the
-trusted anchor's Git common directory, and records that post-apply attestation
-as host evidence. The host never substitutes the integration worktree for a
+differ from that anchor. If a future external host bridge executes a descriptor,
+it must match the request anchor to its trusted shared integration worktree and
+reject a mismatch before `git worktree add`. After an external apply, it must
+re-resolve the created target, verify that it equals the planned worker worktree
+and shares the trusted anchor's Git common directory, and record that
+post-apply attestation as host evidence. This repository implements none of
+those mutation steps and never substitutes the integration worktree for a
 worker or read worktree.
 
 Rendered plans contain redacted bounded metadata only: no absolute

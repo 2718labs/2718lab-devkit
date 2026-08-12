@@ -473,33 +473,6 @@ class TeamEfficiencyTests(unittest.TestCase):
             "temp_target": self.fast_lane_task_root / "tasks" / "atlas12b",
         }
 
-    def apply_sealed_bootstrap_plan(self, helper, plan, **kwargs):
-        """Exercise the host-private V2-only mutation primitive in tests."""
-
-        authority = self.project_authority(
-            helper,
-            project_id=str(plan["project"]),
-        )
-        work_package = self.project_bound_work_package(
-            helper,
-            self.decomposition_manifest(),
-            authority=authority,
-        )
-        with mock.patch.object(
-            helper,
-            "_project_authority_provider",
-            new=lambda: authority,
-        ):
-            capability = helper._seal_bootstrap_execution_capability(
-                plan,
-                work_package=work_package,
-            )
-            return helper._apply_bootstrap_plan_after_authority(
-                plan,
-                capability,
-                **kwargs,
-            )
-
     def resume_packet(self) -> dict[str, object]:
         return {
             "workflow_id": "atlas-v03",
@@ -4487,13 +4460,9 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_fast_lane_has_no_external_side_effect(self) -> None:
         helper = load_efficiency()
         request = self.fully_bound_fast_lane_manual_request(helper)
+        self.assertFalse(hasattr(helper, "subprocess"))
 
         with (
-            mock.patch.object(
-                helper.subprocess,
-                "run",
-                side_effect=AssertionError("compile must not run subprocesses"),
-            ),
             mock.patch.object(
                 helper,
                 "apply_bootstrap_plan",
@@ -5780,7 +5749,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "NO_SAFE_WORK",
             "PROJECT_AUTHORITY_UNAVAILABLE",
             "apply_bootstrap_plan",
-            "opaque capability",
+            "不存在可执行的",
             "worker effort 禁止 `ultra`",
             "prewarm 始终是独立的只读证据角色",
             "归档不是 adapter 操作",
@@ -5820,7 +5789,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "post-apply attestation",
             "bootstrap --apply",
             "import-callable `apply_bootstrap_plan`",
-            "opaque capability",
+            "no currently executable host-authorized worktree path",
             "parked endpoint bootstrap",
             "inert",
             "inert dispatch descriptors",
@@ -5871,9 +5840,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             set(plan["workflow_fields"]),
         )
 
-    def test_bootstrap_uses_the_configured_fastlane_task_root_and_rejects_a_change(
-        self,
-    ) -> None:
+    def test_bootstrap_plan_binds_the_configured_fastlane_task_root(self) -> None:
         helper = load_efficiency()
         replacement_root = self.fast_lane_task_root / "replacement-root"
         replacement_root.mkdir()
@@ -5888,14 +5855,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "temp_target": project_root / "tasks" / "atlas12b",
             }
         )
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-        probes: list[tuple[list[str], bool, dict[str, str]]] = []
-
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            calls.append((argv, check, env))
-
-        def probe_runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            probes.append((argv, check, env))
 
         with mock.patch.dict(
             os.environ,
@@ -5906,39 +5865,14 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertIsInstance(plan["task_root_hash"], str)
             self.assertNotIn("task_root", plan)
             self.assertEqual(configured_root / "t", Path(plan["temp_target"]).parent)
-            applied = self.apply_sealed_bootstrap_plan(
-                helper,
-                plan,
-                runner=runner,
-                probe_runner=probe_runner,
-            )
-
-        self.assertEqual("applied", applied["mode"])
-        self.assertEqual(1, len(calls))
-        for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
-            self.assertEqual(str(plan["temp_target"]), environment["CODEX_TASK_TEMP"])
-            self.assertEqual(
-                str(Path(plan["temp_target"]) / "p"),
-                environment["PYTHONPYCACHEPREFIX"],
-            )
-            self.assertEqual(
-                str(Path(plan["temp_target"]) / "u"),
-                environment["UV_CACHE_DIR"],
-            )
+            self.assertEqual(plan, helper._validated_bootstrap_plan(plan))
 
         with mock.patch.dict(
             os.environ,
             {"CODEX_FASTLANE_TASK_ROOT": str(replacement_root)},
         ):
             with self.assertRaises(ValueError):
-                self.apply_sealed_bootstrap_plan(
-                    helper,
-                    plan,
-                    runner=runner,
-                    probe_runner=probe_runner,
-                )
-
-        self.assertEqual(1, len(calls))
+                helper._validated_bootstrap_plan(plan)
 
     def test_bootstrap_uses_a_short_hash_bound_cache_leaf_for_deep_worktrees(
         self,
@@ -5955,15 +5889,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "temp_target": project_root / "tasks" / "deep-task-temp",
             }
         )
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-        probes: list[tuple[list[str], bool, dict[str, str]]] = []
-
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            calls.append((argv, check, env))
-
-        def probe_runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            probes.append((argv, check, env))
-
         with mock.patch.dict(
             os.environ,
             {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
@@ -5986,34 +5911,10 @@ class TeamEfficiencyTests(unittest.TestCase):
                 ),
                 helper.MAX_PYTHON_CACHE_PATH_LENGTH,
             )
-            self.apply_sealed_bootstrap_plan(
-                helper,
-                plan,
-                runner=runner,
-                probe_runner=probe_runner,
-            )
 
-        self.assertEqual(1, len(calls))
-        for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
-            for name in (
-                "CODEX_TASK_TEMP",
-                "TEMP",
-                "TMP",
-                "TMPDIR",
-                "PYTHONPYCACHEPREFIX",
-                "UV_CACHE_DIR",
-            ):
-                with self.subTest(name=name):
-                    self.assertTrue(
-                        Path(environment[name])
-                        .resolve(strict=False)
-                        .is_relative_to(configured_root.resolve())
-                    )
-            self.assertEqual(str(cache_leaf), environment["CODEX_TASK_TEMP"])
-            self.assertEqual(str(cache_leaf / "p"), environment["PYTHONPYCACHEPREFIX"])
-            self.assertEqual(str(cache_leaf / "u"), environment["UV_CACHE_DIR"])
-
-    def test_bootstrap_rejects_a_preexisting_short_cache_leaf(self) -> None:
+    def test_bootstrap_apply_is_unavailable_even_with_a_preexisting_cache_leaf(
+        self,
+    ) -> None:
         helper = load_efficiency()
         configured_root = self.fast_lane_task_root
         target = self.bootstrap_kwargs()
@@ -6034,10 +5935,9 @@ class TeamEfficiencyTests(unittest.TestCase):
             plan = helper.build_bootstrap_plan(**target)
             Path(plan["temp_target"]).mkdir(parents=True)
             with self.assertRaisesRegex(
-                ValueError, "temp_target target already exists"
+                ValueError, "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE"
             ):
-                self.apply_sealed_bootstrap_plan(
-                    helper,
+                helper.apply_bootstrap_plan(
                     plan,
                     runner=lambda *_args, **_kwargs: None,
                     probe_runner=lambda *_args, **_kwargs: None,
@@ -6171,7 +6071,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                     project_root=project_root,
                 )
 
-    def test_bootstrap_rejects_a_reparse_project_before_build_and_apply(self) -> None:
+    def test_bootstrap_rejects_a_reparse_project_before_diagnostic_build(self) -> None:
         helper = load_efficiency()
         configured_root = self.fast_lane_task_root
         project = "reparse-project"
@@ -6189,13 +6089,11 @@ class TeamEfficiencyTests(unittest.TestCase):
             os.environ,
             {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
         ):
-            plan = helper.build_bootstrap_plan(**target)
             project_root.mkdir()
 
             def reparse_project(path: Path, *, missing_ok: bool = False) -> bool:
                 return path == project_root
 
-            calls: list[tuple[list[str], bool, dict[str, str]]] = []
             with mock.patch.object(
                 helper,
                 "_path_has_reparse_point",
@@ -6203,125 +6101,25 @@ class TeamEfficiencyTests(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     helper.build_bootstrap_plan(**target)
-                with self.assertRaises(ValueError):
-                    self.apply_sealed_bootstrap_plan(
-                        helper,
-                        plan,
-                        runner=lambda argv, *, check, env: calls.append(
-                            (argv, check, env)
-                        ),
-                        probe_runner=lambda argv, *, check, env: None,
-                    )
 
-        self.assertEqual([], calls)
-
-    def test_bootstrap_apply_rechecks_root_bound_descendants_before_mutation(
-        self,
-    ) -> None:
+    def test_bootstrap_module_has_no_in_repo_worktree_executor(self) -> None:
         helper = load_efficiency()
-        configured_root = self.fast_lane_task_root
-        project = "race-checked-project"
-        project_root = configured_root / project
-        target = self.bootstrap_kwargs()
-        target.update(
-            {
-                "project": project,
-                "worktree": project_root / "worktrees" / "atlas12b-team-efficiency",
-                "temp_target": project_root / "tasks" / "atlas12b",
-            }
-        )
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
 
-        with mock.patch.dict(
-            os.environ,
-            {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
+        for name in (
+            "_seal_bootstrap_execution_capability",
+            "_validated_sealed_bootstrap_plan",
+            "_apply_bootstrap_plan_after_authority",
+            "_run_git_probe",
+            "_run_worktree_add",
+            "_PinnedDirectoryTree",
+            "_pin_windows_directory",
+            "_create_verified_directory",
+            "_create_fresh_verified_directory",
+            "_bootstrap_task_root",
+            "subprocess",
         ):
-            plan = helper.build_bootstrap_plan(**target)
-
-            def reparse_worktree_parent(
-                path: Path,
-                *,
-                missing_ok: bool = False,
-            ) -> bool:
-                return path == project_root / "worktrees"
-
-            with mock.patch.object(
-                helper,
-                "_path_has_reparse_point",
-                side_effect=reparse_worktree_parent,
-            ):
-                with self.assertRaises(ValueError):
-                    self.apply_sealed_bootstrap_plan(
-                        helper,
-                        plan,
-                        runner=lambda argv, *, check, env: calls.append(
-                            (argv, check, env)
-                        ),
-                        probe_runner=lambda argv, *, check, env: None,
-                    )
-
-        self.assertEqual([], calls)
-
-    def test_bootstrap_apply_pins_root_bound_directories_through_runner(self) -> None:
-        helper = load_efficiency()
-        configured_root = self.fast_lane_task_root
-        project = "pinned-project"
-        project_root = configured_root / project
-        target = self.bootstrap_kwargs()
-        target.update(
-            {
-                "project": project,
-                "worktree": project_root / "worktrees" / "atlas12b-team-efficiency",
-                "temp_target": project_root / "tasks" / "atlas12b",
-            }
-        )
-        pinned: list[tuple[Path, str]] = []
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-
-        def pin(path: Path, field: str) -> None:
-            pinned.append((path, field))
-            return None
-
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            pinned_paths = {path for path, _field in pinned}
-            self.assertIn(configured_root, pinned_paths)
-            self.assertIn(project_root, pinned_paths)
-            self.assertIn(Path(plan["temp_target"]).parent, pinned_paths)
-            self.assertIn(Path(plan["temp_target"]), pinned_paths)
-            self.assertIn(project_root / "worktrees", pinned_paths)
-            self.assertIn(
-                project_root / "worktrees" / "atlas12b-team-efficiency",
-                pinned_paths,
-            )
-            self.assertTrue(
-                (project_root / "worktrees" / "atlas12b-team-efficiency").is_dir()
-            )
-            self.assertEqual(
-                [],
-                list(
-                    (project_root / "worktrees" / "atlas12b-team-efficiency").iterdir()
-                ),
-            )
-            calls.append((argv, check, env))
-
-        with mock.patch.dict(
-            os.environ,
-            {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
-        ):
-            plan = helper.build_bootstrap_plan(**target)
-            with mock.patch.object(
-                helper,
-                "_pin_windows_directory",
-                side_effect=pin,
-            ):
-                self.apply_sealed_bootstrap_plan(
-                    helper,
-                    plan,
-                    runner=runner,
-                    probe_runner=lambda argv, *, check, env: None,
-                )
-
-        self.assertEqual(1, len(calls))
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(helper, name))
 
     def test_bootstrap_is_portable_to_any_compliant_codex_project_root(self) -> None:
         helper = load_efficiency()
@@ -6349,49 +6147,32 @@ class TeamEfficiencyTests(unittest.TestCase):
             Path(plan["temp_target"]).parent,
         )
 
-    def test_bootstrap_apply_uses_the_validated_argument_vector_only(self) -> None:
+    def test_bootstrap_plan_validation_retains_the_canonical_argument_vector(
+        self,
+    ) -> None:
         helper = load_efficiency()
         apply_target = self.bootstrap_kwargs()
         apply_target["worktree"] = self.fast_lane_task_root / "apply-worktree"
         plan = helper.build_bootstrap_plan(**apply_target)
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-        probes: list[tuple[list[str], bool, dict[str, str]]] = []
+        validated = helper._validated_bootstrap_plan(plan)
 
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            calls.append((argv, check, env))
-
-        def probe_runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            probes.append((argv, check, env))
-
-        applied = self.apply_sealed_bootstrap_plan(
-            helper,
-            plan,
-            runner=runner,
-            probe_runner=probe_runner,
-        )
-
-        self.assertEqual("applied", applied["mode"])
-        self.assertEqual([(plan["command_argv"], True, calls[0][2])], calls)
+        self.assertEqual(plan, validated)
         self.assertEqual(
             [
-                ["git", "-C", str(self.repo), "rev-parse", "--git-dir"],
-                [
-                    "git",
-                    "-C",
-                    str(self.repo),
-                    "rev-parse",
-                    "--verify",
-                    f"{'a' * 40}^{{commit}}",
-                ],
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "add",
+                "-b",
+                "feature/code-atlas-v1-team-efficiency",
+                str(apply_target["worktree"]),
+                "a" * 40,
             ],
-            [argv for argv, _check, _env in probes],
+            validated["command_argv"],
         )
-        for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
-            for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
-                self.assertEqual(str(plan["temp_target"]), environment[name])
-        self.assertTrue(Path(plan["temp_target"]).is_dir())
 
-    def test_bootstrap_apply_stops_before_worktree_add_when_preflight_fails(
+    def test_bootstrap_apply_stops_before_any_probe_or_worktree_runner(
         self,
     ) -> None:
         helper = load_efficiency()
@@ -6400,23 +6181,24 @@ class TeamEfficiencyTests(unittest.TestCase):
         plan = helper.build_bootstrap_plan(**apply_target)
         applied: list[list[str]] = []
 
-        def failed_probe(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            raise subprocess.CalledProcessError(1, argv)
+        def forbidden_probe(*_arguments: object, **_kwargs: object) -> None:
+            raise AssertionError("public apply must not invoke a Git probe")
 
         def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
             applied.append(argv)
 
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.apply_sealed_bootstrap_plan(
-                helper,
+        with self.assertRaisesRegex(
+            ValueError, "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE"
+        ):
+            helper.apply_bootstrap_plan(
                 plan,
                 runner=runner,
-                probe_runner=failed_probe,
+                probe_runner=forbidden_probe,
             )
 
         self.assertEqual([], applied)
 
-    def test_bootstrap_rejects_traversal_and_existing_target_before_apply(self) -> None:
+    def test_bootstrap_rejects_traversal_and_apply_stays_unavailable(self) -> None:
         helper = load_efficiency()
         unsafe_branch = self.bootstrap_kwargs()
         unsafe_branch["branch"] = "feature/../escape"
@@ -6438,9 +6220,10 @@ class TeamEfficiencyTests(unittest.TestCase):
         plan = helper.build_bootstrap_plan(**existing_target)
         target = Path(plan["worktree"])
         target.mkdir(parents=True, exist_ok=True)
-        with self.assertRaises(ValueError):
-            self.apply_sealed_bootstrap_plan(
-                helper,
+        with self.assertRaisesRegex(
+            ValueError, "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE"
+        ):
+            helper.apply_bootstrap_plan(
                 plan,
                 runner=lambda *_args, **_kwargs: None,
             )
@@ -7743,19 +7526,14 @@ class TeamEfficiencyTests(unittest.TestCase):
             str(observed_error),
         )
 
-    def test_private_bootstrap_capability_rechecks_live_v2_authority(self) -> None:
+    def test_provider_override_and_closure_forgery_cannot_reach_worktree_runner(
+        self,
+    ) -> None:
+        """No same-process provider override can revive an in-repo executor."""
+
         helper = load_efficiency()
         plan = helper.build_bootstrap_plan(**self.bootstrap_kwargs())
         authority = self.project_authority(helper)
-        work_package = self.project_bound_work_package(
-            helper,
-            self.decomposition_manifest(),
-            authority=authority,
-        )
-        changed_authority = self.project_authority(
-            helper,
-            project_id="other-project",
-        )
         worktree_add_calls: list[list[str]] = []
 
         with mock.patch.object(
@@ -7763,81 +7541,12 @@ class TeamEfficiencyTests(unittest.TestCase):
             "_project_authority_provider",
             new=lambda: authority,
         ):
-            capability = helper._seal_bootstrap_execution_capability(
-                plan,
-                work_package=work_package,
-            )
-
-        with mock.patch.object(
-            helper,
-            "_project_authority_provider",
-            new=lambda: changed_authority,
-        ):
-            with self.assertRaisesRegex(
-                ValueError,
-                "NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH",
-            ):
-                helper._apply_bootstrap_plan_after_authority(
-                    plan,
-                    capability,
-                    runner=lambda argv, *, check, env: worktree_add_calls.append(
-                        argv
-                    ),
-                    probe_runner=lambda _argv, *, check, env: None,
-                )
-
-        self.assertEqual([], worktree_add_calls)
-
-    def test_private_bootstrap_adapter_rejects_forged_capability_before_mutation(
-        self,
-    ) -> None:
-        helper = load_efficiency()
-        plan = helper.build_bootstrap_plan(**self.bootstrap_kwargs())
-        worktree_add_calls: list[list[str]] = []
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE",
-        ):
-            helper._apply_bootstrap_plan_after_authority(
-                plan,
-                object(),
-                runner=lambda argv, *, check, env: worktree_add_calls.append(argv),
-                probe_runner=lambda _argv, *, check, env: None,
-            )
-
-        self.assertEqual([], worktree_add_calls)
-
-    def test_private_bootstrap_adapter_rejects_caller_constructed_capability(
-        self,
-    ) -> None:
-        helper = load_efficiency()
-        plan = helper.build_bootstrap_plan(**self.bootstrap_kwargs())
-        authority = self.project_authority(helper)
-        worktree_add_calls: list[list[str]] = []
-        work_package = self.project_bound_work_package(
-            helper,
-            self.decomposition_manifest(),
-            authority=authority,
-        )
-
-        with mock.patch.object(
-            helper,
-            "_project_authority_provider",
-            new=lambda: authority,
-        ):
-            genuine_capability = helper._seal_bootstrap_execution_capability(
-                plan,
-                work_package=work_package,
-            )
-            forged_capability = type(genuine_capability)()
             with self.assertRaisesRegex(
                 ValueError,
                 "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE",
             ):
-                helper._apply_bootstrap_plan_after_authority(
+                helper.apply_bootstrap_plan(
                     plan,
-                    forged_capability,
                     runner=lambda argv, *, check, env: worktree_add_calls.append(
                         argv
                     ),
@@ -7845,6 +7554,13 @@ class TeamEfficiencyTests(unittest.TestCase):
                 )
 
         self.assertEqual([], worktree_add_calls)
+        for name in (
+            "_seal_bootstrap_execution_capability",
+            "_validated_sealed_bootstrap_plan",
+            "_apply_bootstrap_plan_after_authority",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(helper, name))
 
     def test_cli_bootstrap_plan_only_remains_non_mutating(self) -> None:
         helper = load_efficiency()

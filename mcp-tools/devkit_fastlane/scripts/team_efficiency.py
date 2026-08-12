@@ -10,7 +10,6 @@ import json
 import os
 import re
 import stat
-import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -1225,186 +1224,6 @@ def _task_root_bound_path(value: object, field: str, *, task_root: Path) -> Path
     return resolved
 
 
-def _pin_windows_directory(path: Path, field: str) -> int | None:
-    if os.name != "nt":
-        return None
-    import ctypes
-    from ctypes import wintypes
-
-    class _ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("dwFileAttributes", wintypes.DWORD),
-            ("ftCreationTime", wintypes.FILETIME),
-            ("ftLastAccessTime", wintypes.FILETIME),
-            ("ftLastWriteTime", wintypes.FILETIME),
-            ("dwVolumeSerialNumber", wintypes.DWORD),
-            ("nFileSizeHigh", wintypes.DWORD),
-            ("nFileSizeLow", wintypes.DWORD),
-            ("nNumberOfLinks", wintypes.DWORD),
-            ("nFileIndexHigh", wintypes.DWORD),
-            ("nFileIndexLow", wintypes.DWORD),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.GetFileInformationByHandle.argtypes = (
-        wintypes.HANDLE,
-        ctypes.POINTER(_ByHandleFileInformation),
-    )
-    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.CreateFileW(
-        str(path),
-        0x0080,
-        0x0001,
-        None,
-        3,
-        0x02000000 | 0x00200000,
-        None,
-    )
-    invalid = ctypes.c_void_p(-1).value
-    if handle == invalid:
-        raise ValueError(f"{field} cannot be pinned without delete sharing")
-    information = _ByHandleFileInformation()
-    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
-        kernel32.CloseHandle(handle)
-        raise ValueError(f"{field} cannot be inspected through its pinned handle")
-    if information.dwFileAttributes & 0x0400:
-        kernel32.CloseHandle(handle)
-        raise ValueError(f"{field} must not use reparse points")
-    return int(handle)
-
-
-class _PinnedDirectoryTree:
-    def __init__(self) -> None:
-        self._handles: list[int] = []
-        self._identities: set[str] = set()
-
-    def __enter__(self) -> _PinnedDirectoryTree:
-        return self
-
-    def __exit__(self, *_arguments: object) -> None:
-        if os.name != "nt":
-            return
-        import ctypes
-        from ctypes import wintypes
-
-        close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-        for handle in reversed(self._handles):
-            close_handle(handle)
-        self._handles.clear()
-        self._identities.clear()
-
-    def pin(self, path: Path, field: str) -> None:
-        identity = str(path).casefold()
-        if identity in self._identities:
-            return
-        handle = _pin_windows_directory(path, field)
-        if handle is not None:
-            self._handles.append(handle)
-        self._identities.add(identity)
-
-    def pin_ancestors(self, path: Path, field: str) -> None:
-        current = path
-        while True:
-            self.pin(current, field)
-            parent = current.parent
-            if parent == current:
-                return
-            current = parent
-
-
-def _create_verified_directory(
-    path: Path,
-    *,
-    task_root: Path,
-    project_root: Path,
-    field: str,
-    allow_project_root: bool = False,
-    pins: _PinnedDirectoryTree,
-) -> Path:
-    if path == project_root:
-        if not allow_project_root:
-            raise ValueError(f"{field} must be below the task root")
-    else:
-        _strictly_below(path, project_root, field)
-    _reject_reparse_points_below(path, task_root, field)
-    if not task_root.is_dir() or _path_has_reparse_point(task_root):
-        raise ValueError("configured task root cannot be safely created below")
-    pins.pin_ancestors(task_root, "configured task root")
-    try:
-        relative = path.relative_to(task_root)
-    except ValueError as error:
-        raise ValueError(f"{field} must stay below the task root") from error
-
-    current = task_root
-    for part in relative.parts:
-        if not current.is_dir() or _path_has_reparse_point(current):
-            raise ValueError(f"{field} must not use reparse points")
-        pins.pin(current, field)
-        current = current / part
-        try:
-            current.mkdir()
-        except FileExistsError:
-            pass
-        if not current.is_dir() or _path_has_reparse_point(current):
-            raise ValueError(f"{field} must not use reparse points")
-        pins.pin(current, field)
-        resolved_current = current.resolve(strict=True)
-        try:
-            resolved_current.relative_to(task_root)
-        except ValueError as error:
-            raise ValueError(f"{field} must stay below the task root") from error
-
-    verified = path.resolve(strict=True)
-    if verified == project_root:
-        if not allow_project_root:
-            raise ValueError(f"{field} must be below the task root")
-    else:
-        _strictly_below(verified, project_root, field)
-    if not verified.is_dir():
-        raise ValueError(f"{field} must be a directory")
-    return verified
-
-
-def _create_fresh_verified_directory(
-    path: Path,
-    *,
-    task_root: Path,
-    project_root: Path,
-    field: str,
-    pins: _PinnedDirectoryTree,
-) -> Path:
-    _strictly_below(path, project_root, field)
-    _reject_reparse_points_below(path, task_root, field)
-    try:
-        path.mkdir()
-    except FileExistsError:
-        raise ValueError(f"{field} target already exists") from None
-    except OSError as error:
-        raise ValueError(f"{field} cannot be created") from error
-    if not path.is_dir() or _path_has_reparse_point(path):
-        raise ValueError(f"{field} must not use reparse points")
-    pins.pin(path, field)
-    verified = path.resolve(strict=True)
-    _strictly_below(verified, project_root, field)
-    if not verified.is_dir():
-        raise ValueError(f"{field} must be a directory")
-    return verified
-
-
 def _is_default_fastlane_task_root(root: Path) -> bool:
     return (
         str(root).casefold()
@@ -1483,19 +1302,6 @@ def _enforce_python_cache_path_budget(
         write_scope=write_scope,
     ) > (MAX_PYTHON_CACHE_PATH_LENGTH):
         raise ValueError("configured fast-lane task root is not approved")
-
-
-def _bootstrap_task_root(plan: Mapping[str, Any]) -> Path:
-    root = _configured_fastlane_task_root()
-    if plan["schema"] == "team-efficiency/bootstrap-v1":
-        if not _is_default_fastlane_task_root(root):
-            raise ValueError("bootstrap plan task root changed")
-        return root
-    if plan["schema"] == "team-efficiency/bootstrap-v2":
-        if plan["task_root_hash"] != _fastlane_task_root_hash(root):
-            raise ValueError("bootstrap plan task root changed")
-        return root
-    raise ValueError("bootstrap plan is not eligible for apply")
 
 
 def build_bootstrap_plan(
@@ -1592,6 +1398,8 @@ def build_bootstrap_plan(
 
 
 def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebuild and compare an inert bootstrap descriptor without executing it."""
+
     candidate = _mapping(plan, "bootstrap plan")
     schema = candidate.get("schema")
     if schema == "team-efficiency/bootstrap-v1":
@@ -1599,9 +1407,9 @@ def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     elif schema == "team-efficiency/bootstrap-v2":
         _exact_keys(candidate, _BOOTSTRAP_V2_FIELDS, "bootstrap plan")
     else:
-        raise ValueError("bootstrap plan is not eligible for apply")
+        raise ValueError("bootstrap plan is not a valid diagnostic descriptor")
     if candidate["mode"] != "dry_run":
-        raise ValueError("bootstrap plan is not eligible for apply")
+        raise ValueError("bootstrap plan is not a valid diagnostic descriptor")
     rebuilt = build_bootstrap_plan(
         task_id=candidate["task_id"],
         base_commit=candidate["base_commit"],
@@ -1618,203 +1426,16 @@ def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     return rebuilt
 
 
-def _temporary_environment(
-    plan: Mapping[str, Any],
-) -> tuple[dict[str, str], Path, Path, Path]:
-    task_root = _bootstrap_task_root(plan)
-    _, root = _project_root(plan["project"], task_root=task_root)
-    temp_target = _task_root_bound_path(
-        plan["temp_target"],
-        "temp_target",
-        task_root=task_root,
-    )
-    environment = os.environ.copy()
-    target_text = str(temp_target)
-    for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
-        environment[name] = target_text
-    environment["PYTHONPYCACHEPREFIX"] = str(temp_target / "p")
-    environment["UV_CACHE_DIR"] = str(temp_target / "u")
-    return environment, temp_target, root, task_root
-
-
-def _create_verified_temp_target(
-    temp_target: Path,
-    task_root: Path,
-    pins: _PinnedDirectoryTree,
-) -> Path:
-    _create_verified_directory(
-        temp_target.parent,
-        task_root=task_root,
-        project_root=task_root,
-        field="temp_target parent",
-        allow_project_root=True,
-        pins=pins,
-    )
-    return _create_fresh_verified_directory(
-        temp_target,
-        task_root=task_root,
-        project_root=task_root,
-        field="temp_target",
-        pins=pins,
-    )
-
-
-def _run_git_probe(argv: list[str], *, check: bool, env: Mapping[str, str]) -> None:
-    subprocess.run(
-        argv,
-        check=check,
-        env=dict(env),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def _run_worktree_add(argv: list[str], *, check: bool, env: Mapping[str, str]) -> None:
-    subprocess.run(argv, check=check, env=dict(env))
-
-
-def _bootstrap_execution_capability_adapter() -> tuple[
-    Callable[..., object],
-    Callable[[Mapping[str, Any], object], dict[str, Any]],
-]:
-    """Keep the capability type and its sealed records out of module globals."""
-
-    class BootstrapExecutionCapability:
-        __slots__ = ()
-
-    sealed_records: dict[object, tuple[dict[str, Any], str]] = {}
-
-    def seal(
-        plan: Mapping[str, Any],
-        *,
-        work_package: Mapping[str, Any],
-    ) -> object:
-        authority, reason_code = _project_authority_preflight(
-            {"work_package": work_package}
-        )
-        if reason_code is not None:
-            raise ValueError(f"NO_SAFE_WORK/{reason_code}")
-        if authority is None:
-            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
-        validated = _validated_bootstrap_plan(plan)
-        if validated["project"] != authority["project_id"]:
-            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
-        capability = BootstrapExecutionCapability()
-        sealed_records[capability] = (dict(authority), _sha256_json(validated))
-        return capability
-
-    def validate(plan: Mapping[str, Any], execution_capability: object) -> dict[str, Any]:
-        """Recheck a registered V2 binding immediately before local mutation."""
-
-        try:
-            sealed = sealed_records.get(execution_capability)
-        except TypeError:
-            sealed = None
-        if sealed is None:
-            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
-        sealed_authority, sealed_plan_hash = sealed
-        validated = _validated_bootstrap_plan(plan)
-        if _sha256_json(validated) != sealed_plan_hash:
-            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
-        live_authority = _live_project_authority()
-        if live_authority is None:
-            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
-        if live_authority != sealed_authority:
-            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
-        if validated["project"] != live_authority["project_id"]:
-            raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_MISMATCH")
-        return validated
-
-    return seal, validate
-
-
-(
-    _seal_bootstrap_execution_capability,
-    _validated_sealed_bootstrap_plan,
-) = _bootstrap_execution_capability_adapter()
-
-
 def apply_bootstrap_plan(
     plan: Mapping[str, Any],
     *,
     runner: Callable[..., object] | None = None,
     probe_runner: Callable[..., object] | None = None,
 ) -> dict[str, Any]:
-    """Fail closed: public imports cannot authorize a bootstrap mutation."""
+    """Fail closed: this repository has no executable bootstrap authority bridge."""
 
     del plan, runner, probe_runner
     raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
-
-
-def _apply_bootstrap_plan_after_authority(
-    plan: Mapping[str, Any],
-    execution_capability: object,
-    *,
-    runner: Callable[..., object] | None = None,
-    probe_runner: Callable[..., object] | None = None,
-) -> dict[str, Any]:
-    """Apply one V2-sealed plan through a host-private adapter only."""
-
-    validated = _validated_sealed_bootstrap_plan(plan, execution_capability)
-    task_root = _bootstrap_task_root(validated)
-    _, root = _project_root(validated["project"], task_root=task_root)
-    worktree = _root_bound_path(
-        validated["worktree"],
-        "worktree",
-        task_root=task_root,
-        project_root=root,
-    )
-    if worktree.exists():
-        raise ValueError("worktree target already exists")
-    environment, temp_target, root, task_root = _temporary_environment(validated)
-    with _PinnedDirectoryTree() as pins:
-        verified_temp_target = _create_verified_temp_target(
-            temp_target,
-            task_root,
-            pins,
-        )
-        for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
-            environment[name] = str(verified_temp_target)
-        environment["PYTHONPYCACHEPREFIX"] = str(verified_temp_target / "p")
-        environment["UV_CACHE_DIR"] = str(verified_temp_target / "u")
-        selected_probe = probe_runner if probe_runner is not None else _run_git_probe
-        selected_probe(
-            ["git", "-C", validated["repo"], "rev-parse", "--git-dir"],
-            check=True,
-            env=environment,
-        )
-        selected_probe(
-            [
-                "git",
-                "-C",
-                validated["repo"],
-                "rev-parse",
-                "--verify",
-                f"{validated['base_commit']}^{{commit}}",
-            ],
-            check=True,
-            env=environment,
-        )
-        _create_verified_directory(
-            worktree.parent,
-            task_root=task_root,
-            project_root=root,
-            field="worktree parent",
-            allow_project_root=True,
-            pins=pins,
-        )
-        worktree = _create_fresh_verified_directory(
-            worktree,
-            task_root=task_root,
-            project_root=root,
-            field="worktree",
-            pins=pins,
-        )
-        selected_runner = runner if runner is not None else _run_worktree_add
-        selected_runner(validated["command_argv"], check=True, env=environment)
-    applied = dict(validated)
-    applied["mode"] = "applied"
-    return applied
 
 
 def _summary(value: object, field: str) -> dict[str, str]:

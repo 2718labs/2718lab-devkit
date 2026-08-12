@@ -108,10 +108,10 @@ authority 传递或公开 MCP 参数属于后续 host 合同，不能由工作�
 caller-supplied bootstrap plan 或调用 worktree mutation 前，无条件以
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 失败关闭，因而不能到达
 `git worktree add`。不带 `--apply` 的 `bootstrap` 仍只输出 dry-run 诊断计划；其中的 project、
-root、worktree 和任何 JSON 都不是 sealed V2 execution context。唯一保留的 mutation primitive 是
-module-private host adapter，它需要由 live V2 authority 为精确 canonical bootstrap plan 封存的
-opaque capability，并在 mutation 前再次比较 live authority；本合同没有提供获取或传入该 capability
-的 CLI、MCP 或 import-callable 参数。
+root、worktree 和任何 JSON 都不是 sealed V2 execution context。仓库当前不存在可执行的
+host-authorized worktree path：没有 module-private capability、runner、Git probe 或 adapter 可绕过
+该关闭结果。Desktop host registry 与真正私有的跨边界 execution bridge 是外部前置条件；它们尚未在
+本仓库实现，也不能用 Python module attribute、closure 或 caller-supplied JSON 伪装。
 
 ### 4. 接地后再写
 
