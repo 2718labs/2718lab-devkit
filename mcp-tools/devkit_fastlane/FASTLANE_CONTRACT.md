@@ -99,7 +99,13 @@ durable registry 或真正私有的跨边界 authority bridge，因此没有任�
 attribute、closure、环境变量、请求 JSON、repo/task root、路径名或 caller-supplied ID 可被当作
 live authority。公开 `compile_fast_lane` 与 `fast-lane` CLI 对 structurally valid V2 一律产出
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`，零本地 assignment、零队列、零外部派发；V2
-envelope/hash 无效时是 `PROJECT_BINDING_INVALID`，v1 保持 `LEGACY_PROJECT_UNBOUND`。增加
+envelope/hash 无效、其内层 canonical v1 `package` 不能完成纯诊断解析，或 fast-lane request
+壳的 schema/key/字节边界无效时，必须是 `PROJECT_BINDING_INVALID`；v1 保持
+`LEGACY_PROJECT_UNBOUND`。这些结构预检不读取 host、quota 或 index 输入，也不触及 scheduler。
+公开 MCP request 若试图携带明确的 host-private 字段（如 `host_status`、quota 或 index
+evidence），则是适配器输入违规，必须在编译前以 `FASTLANE_REQUEST_INVALID` 拒绝，而不是把
+该值当作可诊断的计划输入。
+增加
 Desktop-host durable registry、跨进程 authority 传递或公开 MCP 参数属于后续外部 host 合同，不能由
 工作包 JSON 或 Python 私有命名假装已经存在。
 

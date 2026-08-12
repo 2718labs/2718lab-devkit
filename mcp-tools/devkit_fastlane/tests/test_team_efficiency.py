@@ -2241,6 +2241,120 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertEqual([], result["assignments"])
         self.assertNotEqual(first["source_plan_hash"], second["source_plan_hash"])
 
+    def test_fast_lane_v2_rejects_hash_consistent_invalid_inner_package_before_authority(
+        self,
+    ) -> None:
+        """A V2 envelope cannot hide an invalid V1 payload behind its hash."""
+
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        malformed = copy.deepcopy(request["work_package"])
+        malformed["package"]["capacity"] = 0
+        malformed["package_payload_hash"] = helper._sha256_json(malformed["package"])
+        invalid_shell = {
+            **request,
+            "schema": "team-efficiency/fast-lane-request-unknown",
+            "work_package": malformed,
+        }
+
+        with self.assertRaisesRegex(ValueError, "capacity is out of bounds"):
+            helper.decompose(malformed)
+
+        with (
+            mock.patch.object(
+                helper,
+                "_validated_fast_lane_host_status",
+                side_effect=AssertionError("invalid binding must not read host status"),
+            ),
+            mock.patch.object(
+                helper,
+                "_fast_lane_main_capacity_evidence",
+                side_effect=AssertionError("invalid binding must not read quota"),
+            ),
+            mock.patch.object(
+                helper,
+                "_fast_lane_apply_index_evidence",
+                side_effect=AssertionError("invalid binding must not bind index evidence"),
+            ),
+        ):
+            inner_result = helper.compile_fast_lane(
+                {**request, "work_package": malformed},
+                reasoning_effort="ultra",
+                host_status=object(),
+                quota_request=object(),
+                index_evidence=object(),
+            )
+            shell_result = helper.compile_fast_lane(
+                invalid_shell,
+                reasoning_effort="ultra",
+                host_status=object(),
+                quota_request=object(),
+                index_evidence=object(),
+            )
+
+        for result in (inner_result, shell_result):
+            with self.subTest(result=result["source_plan_hash"]):
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+                self.assertEqual(
+                    "PROJECT_BINDING_INVALID",
+                    result["idle_slots"][0]["reason_code"],
+                )
+                self.assertEqual([], result["assignments"])
+                self.assertEqual([], result["ready_queue"])
+                self.assertEqual([], result["review_queue"])
+                self.assertEqual([], result["prewarm_queue"])
+                self.assertEqual([], result["design_queue"])
+                self.assertEqual(
+                    [], result["cross_session_dispatch_projection"]["assignments"]
+                )
+
+    def test_fast_lane_cli_invalid_shell_and_inner_v2_are_binding_invalid(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        request["schema"] = "team-efficiency/fast-lane-request-unknown"
+        request["work_package"]["package"]["capacity"] = 0
+        request["work_package"]["package_payload_hash"] = helper._sha256_json(
+            request["work_package"]["package"]
+        )
+        request_path = self.temp / "invalid-fast-lane-v2.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--host-status",
+                str(self.temp / "must-not-read-host-status.json"),
+                "--quota-input",
+                str(self.temp / "must-not-read-quota.json"),
+                "--live-quota",
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        result = json.loads(output)
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "PROJECT_BINDING_INVALID", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
+        self.assertEqual([], result["ready_queue"])
+        self.assertEqual([], result["review_queue"])
+        self.assertEqual([], result["prewarm_queue"])
+        self.assertEqual([], result["design_queue"])
+        self.assertEqual(
+            [], result["cross_session_dispatch_projection"]["assignments"]
+        )
+
     def test_fast_lane_v2_rejects_copy_and_binding_tampering_before_assignment(
         self,
     ) -> None:
@@ -3427,16 +3541,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                     "max",
                 ],
             ),
-            (
-                "embedded",
-                [
-                    "fast-lane",
-                    "--input",
-                    str(embedded_effort_path),
-                    "--reasoning-effort",
-                    "ultra",
-                ],
-            ),
         )
         for name, arguments in cases:
             with self.subTest(name=name):
@@ -3445,6 +3549,27 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual("", output)
                 self.assertTrue(errors.startswith("error: "))
                 self.assertLessEqual(len(errors), 256)
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(embedded_effort_path),
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        embedded_result = json.loads(output)
+        self.assertEqual("blocked", embedded_result["status"])
+        self.assertEqual("NO_SAFE_WORK", embedded_result["decision_code"])
+        self.assertEqual(
+            "PROJECT_BINDING_INVALID",
+            embedded_result["idle_slots"][0]["reason_code"],
+        )
+        self.assertEqual([], embedded_result["assignments"])
 
     def test_fast_lane_cli_uses_explicit_dispatch_not_decompose_fallback(self) -> None:
         helper = load_efficiency()

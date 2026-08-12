@@ -139,6 +139,19 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
         "scheduler_state",
     }
 )
+_FAST_LANE_REQUEST_HOST_PRIVATE_FIELDS = frozenset(
+    {
+        "host_status",
+        "quota_request",
+        "quota_trusted_key_resolver",
+        "quota_evaluation_time_utc_z",
+        "quota_verified_route_result_hashes",
+        "quota_verified_lease_scope_bindings",
+        "index_evidence",
+        "trusted_index_evidence_hashes",
+        "index_evaluation_time_utc_z",
+    }
+)
 _WORK_PACKAGE_V2_FIELDS = frozenset(
     {
         "schema",
@@ -887,7 +900,7 @@ def _validated_work_package_v2(value: object) -> dict[str, Any]:
 
 
 def _project_execution_block_details(
-    request: Mapping[str, Any],
+    request: object,
 ) -> tuple[str, dict[str, Any] | None]:
     """Return the public compiler's fixed boundary result and V2 hash input.
 
@@ -897,7 +910,24 @@ def _project_execution_block_details(
     one, so every V2 execution request stays inert.
     """
 
-    package = request.get("work_package")
+    try:
+        raw_request = _mapping(request, "fast-lane request")
+    except (TypeError, ValueError):
+        return "PROJECT_BINDING_INVALID", None
+
+    if _FAST_LANE_REQUEST_HOST_PRIVATE_FIELDS.intersection(raw_request):
+        raise ValueError("fast-lane request must not contain host-private inputs")
+
+    try:
+        _exact_keys(raw_request, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+        if raw_request["schema"] != "team-efficiency/fast-lane-request-v1":
+            return "PROJECT_BINDING_INVALID", None
+        if len(_json_bytes(raw_request)) > MAX_MANIFEST_INPUT_BYTES:
+            return "PROJECT_BINDING_INVALID", None
+    except (KeyError, TypeError, ValueError):
+        return "PROJECT_BINDING_INVALID", None
+
+    package = raw_request.get("work_package")
     if not isinstance(package, Mapping):
         return "PROJECT_BINDING_INVALID", None
     if package.get("schema") == "team-efficiency/work-package-v1":
@@ -905,6 +935,11 @@ def _project_execution_block_details(
     if package.get("schema") == _WORK_PACKAGE_V2_SCHEMA:
         try:
             v2 = _validated_work_package_v2(package)
+            # Validate the canonical V1 payload before classifying the V2
+            # envelope as merely missing external authority.  This is a pure
+            # diagnostic parse: it cannot reach scheduler, host, quota, index,
+            # worktree, or dispatch logic.
+            _decompose_v1(v2["package"])
         except (TypeError, ValueError):
             return "PROJECT_BINDING_INVALID", None
         return (
@@ -8986,9 +9021,7 @@ def compile_fast_lane(
         index_evaluation_time_utc_z,
     )
     activation = _fast_lane_activation(reasoning_effort, enable)
-    raw_request = _mapping(request, "fast-lane request")
-    _exact_keys(raw_request, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
-    reason_code, source_identity = _project_execution_block_details(raw_request)
+    reason_code, source_identity = _project_execution_block_details(request)
     return _fast_lane_project_fence_blocked_plan(
         activation,
         reason_code=reason_code,
@@ -9093,7 +9126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # arguments remain parse-compatible, but cannot establish an
             # execution context or influence this inert result.
             result = compile_fast_lane(
-                _mapping(request, "fast-lane request"),
+                request,
                 reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),
                 enable=args.enable,
             )

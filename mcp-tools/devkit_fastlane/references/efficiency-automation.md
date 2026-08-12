@@ -137,7 +137,13 @@ registry or external private bridge, so its public `compile_fast_lane` and
 activate V2: a structurally valid V2 request always yields
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` with zero assignments, local
 queues, and external-session assignments. An invalid V2 envelope/hash yields
-`PROJECT_BINDING_INVALID`; v1 yields `NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`.
+`PROJECT_BINDING_INVALID`; so does an inner canonical-v1 `package` that fails
+pure diagnostic parsing, or an invalid fast-lane request schema/key/byte shell.
+Those checks occur before any host, quota, or index input is read. V1 yields
+`NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`.
+An MCP request that explicitly carries host-private fields such as `host_status`,
+quota, or index evidence is not a diagnostic plan shell: the public adapter must
+reject it as `FASTLANE_REQUEST_INVALID` before compilation.
 Public `bootstrap --apply` and import-callable `apply_bootstrap_plan` are both
 blocked before any caller plan, path, provider override, closure, or JSON can
 reach a worktree helper, because no such helper exists in this repository.
