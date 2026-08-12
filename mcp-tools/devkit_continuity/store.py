@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,18 @@ class _AttachedPublication:
     receipt: ContinuityReceipt
 
 
+class _AttachedTransactionScope:
+    """Opaque identity for one module-managed finalizer transaction scope."""
+
+    __slots__ = ()
+
+
+class _AttachedScopeSavepoint:
+    """Opaque token for one module-named nested finalization savepoint."""
+
+    __slots__ = ()
+
+
 @dataclass(slots=True)
 class _AttachedTransactionScopeState:
     """Mutable state held only for one lexical finalization scope."""
@@ -58,12 +70,17 @@ class _AttachedTransactionScopeState:
     _active: bool = True
     _allow_transaction_control: bool = False
     _transaction_control_attempted: bool = False
+    _savepoints: list[_AttachedScopeSavepoint] = field(default_factory=list)
 
 
-class _AttachedTransactionScope:
-    """Opaque identity for one module-managed finalizer transaction scope."""
+@dataclass(slots=True)
+class _AttachedScopeSavepointState:
+    """Module-private binding of one opaque token to its generated SQL name."""
 
-    __slots__ = ()
+    _scope: _AttachedTransactionScope
+    _scope_state: _AttachedTransactionScopeState
+    _name: str
+    _active: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +92,9 @@ class _AttachedProjectionMarker:
 
 _ATTACHED_TRANSACTION_SCOPES: dict[
     _AttachedTransactionScope, _AttachedTransactionScopeState
+] = {}
+_ATTACHED_SCOPE_SAVEPOINTS: dict[
+    _AttachedScopeSavepoint, _AttachedScopeSavepointState
 ] = {}
 
 
@@ -1066,17 +1086,22 @@ def _attached_immediate_transaction_scope(
         try:
             yield scope
         except BaseException:
+            _invalidate_attached_scope_savepoints(state)
             _finish_attached_transaction_scope(connection, state, commit=False)
             raise
         if state._transaction_control_attempted:
+            _invalidate_attached_scope_savepoints(state)
             _finish_attached_transaction_scope(connection, state, commit=False)
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        _invalidate_attached_scope_savepoints(state)
         _finish_attached_transaction_scope(connection, state, commit=True)
     except ContinuityStoreError:
         raise
     except (sqlite3.Error, OSError) as error:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
     finally:
+        if state is not None:
+            _invalidate_attached_scope_savepoints(state)
         if scope is not None:
             _ATTACHED_TRANSACTION_SCOPES.pop(scope, None)
         if connection is not None:
@@ -1189,45 +1214,96 @@ def _apply_attached_projection_marker(
 
 
 def _open_attached_scope_savepoint(
-    scope: _AttachedTransactionScope, name: str
-) -> None:
-    """Open one caller-owned nested savepoint without exposing the connection."""
-
-    _execute_attached_scope_savepoint(scope, "SAVEPOINT", name)
-
-
-def _rollback_attached_scope_savepoint(
-    scope: _AttachedTransactionScope, name: str
-) -> None:
-    """Roll back to one caller-owned nested savepoint without root control."""
-
-    _execute_attached_scope_savepoint(scope, "ROLLBACK TO SAVEPOINT", name)
-
-
-def _release_attached_scope_savepoint(
-    scope: _AttachedTransactionScope, name: str
-) -> None:
-    """Release one caller-owned nested savepoint without root control."""
-
-    _execute_attached_scope_savepoint(scope, "RELEASE SAVEPOINT", name)
-
-
-def _execute_attached_scope_savepoint(
-    scope: _AttachedTransactionScope, command: str, name: str
-) -> None:
-    """Execute a fixed nested-savepoint command and discard its SQLite cursor."""
+    scope: _AttachedTransactionScope,
+) -> _AttachedScopeSavepoint:
+    """Open one module-named nested savepoint and return its opaque token."""
 
     state = _state_for_attached_scope(scope)
     connection = _require_active_attached_scope(scope, state._continuity_database)
-    connection.execute(f"{command} {_attached_savepoint_identifier(name)}")
+    token = _AttachedScopeSavepoint()
+    name = f"continuity_scope_savepoint_{secrets.token_hex(16)}"
+    try:
+        connection.execute(f"SAVEPOINT {name}")
+    except sqlite3.Error as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    _ATTACHED_SCOPE_SAVEPOINTS[token] = _AttachedScopeSavepointState(
+        scope, state, name
+    )
+    state._savepoints.append(token)
+    return token
 
 
-def _attached_savepoint_identifier(name: object) -> str:
-    """Return one narrowly validated nested-savepoint identifier."""
+def _rollback_attached_scope_savepoint(
+    token: _AttachedScopeSavepoint,
+) -> None:
+    """Roll back through one opaque module-named nested savepoint."""
 
-    if type(name) is not str or not name.isidentifier():
+    state = _state_for_attached_scope_savepoint(token)
+    connection = _require_active_attached_scope(
+        state._scope, state._scope_state._continuity_database
+    )
+    try:
+        connection.execute(f"ROLLBACK TO SAVEPOINT {state._name}")
+    except sqlite3.Error as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+
+
+def _release_attached_scope_savepoint(
+    token: _AttachedScopeSavepoint,
+) -> None:
+    """Release one opaque module-named nested savepoint."""
+
+    state = _state_for_attached_scope_savepoint(token)
+    connection = _require_active_attached_scope(
+        state._scope, state._scope_state._continuity_database
+    )
+    try:
+        connection.execute(f"RELEASE SAVEPOINT {state._name}")
+    except sqlite3.Error as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    _invalidate_attached_scope_savepoint(token, state)
+
+
+def _state_for_attached_scope_savepoint(
+    token: object,
+) -> _AttachedScopeSavepointState:
+    """Resolve only a live opaque token held by the active scope registry."""
+
+    if type(token) is not _AttachedScopeSavepoint:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    return name
+    state = _ATTACHED_SCOPE_SAVEPOINTS.get(token)
+    if (
+        state is None
+        or not state._active
+        or not state._scope_state._active
+        or not state._scope_state._savepoints
+        or state._scope_state._savepoints[-1] is not token
+        or _ATTACHED_TRANSACTION_SCOPES.get(state._scope) is not state._scope_state
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    return state
+
+
+def _invalidate_attached_scope_savepoint(
+    token: _AttachedScopeSavepoint, state: _AttachedScopeSavepointState
+) -> None:
+    """Forget one released opaque token without emitting more SQLite SQL."""
+
+    state._active = False
+    _ATTACHED_SCOPE_SAVEPOINTS.pop(token, None)
+    state._scope_state._savepoints.pop()
+
+
+def _invalidate_attached_scope_savepoints(
+    scope_state: _AttachedTransactionScopeState,
+) -> None:
+    """Invalidate every token when its root scope begins its terminal transition."""
+
+    for token in tuple(scope_state._savepoints):
+        state = _ATTACHED_SCOPE_SAVEPOINTS.pop(token, None)
+        if state is not None:
+            state._active = False
+    scope_state._savepoints.clear()
 
 
 def _require_attached_transaction_preconditions(

@@ -2171,6 +2171,94 @@ def test_attached_scope_has_no_caller_selected_table_or_column_surface(
     assert publication.attempt.key == key
 
 
+@pytest.mark.parametrize(
+    "caller_name",
+    (
+        "caller_nested",
+        "continuity_attached_publication_collision",
+        "malformed-name",
+    ),
+)
+def test_attached_scope_savepoint_has_no_caller_selected_name_surface(
+    tmp_path: Path, caller_name: str
+) -> None:
+    config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
+    with continuity_store._attached_immediate_transaction_scope(
+        main_database=main_database, continuity_database=config.continuity_database
+    ) as scope:
+        raw_connection = continuity_store._state_for_attached_scope(scope)._connection
+        traced: list[str] = []
+        raw_connection.set_trace_callback(traced.append)
+        try:
+            with pytest.raises(TypeError):
+                continuity_store._open_attached_scope_savepoint(scope, caller_name)
+        finally:
+            raw_connection.set_trace_callback(None)
+        assert all(caller_name not in statement for statement in traced)
+        publication = _attached_scope_call(scope, config, frozen, view)
+
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM projections").fetchone()[0] == 0
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 1
+    assert publication.attempt.key == key
+
+
+def test_attached_scope_savepoint_token_rejects_forgery_and_reuse(
+    tmp_path: Path,
+) -> None:
+    config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
+    with continuity_store._attached_immediate_transaction_scope(
+        main_database=main_database, continuity_database=config.continuity_database
+    ) as scope:
+        forged_token = continuity_store._AttachedScopeSavepoint()
+        with pytest.raises(ContinuityStoreError) as forged_error:
+            continuity_store._rollback_attached_scope_savepoint(forged_token)
+        assert forged_error.value.code == "CONTINUITY_STORE_UNPREPARED"
+
+        token = continuity_store._open_attached_scope_savepoint(scope)
+        continuity_store._release_attached_scope_savepoint(token)
+        with pytest.raises(ContinuityStoreError) as reused_error:
+            continuity_store._rollback_attached_scope_savepoint(token)
+        assert reused_error.value.code == "CONTINUITY_STORE_UNPREPARED"
+        publication = _attached_scope_call(scope, config, frozen, view)
+
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM projections").fetchone()[0] == 0
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 1
+    assert publication.attempt.key == key
+
+
+def test_attached_scope_savepoint_tokens_require_lifo_release(
+    tmp_path: Path,
+) -> None:
+    config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
+    with continuity_store._attached_immediate_transaction_scope(
+        main_database=main_database, continuity_database=config.continuity_database
+    ) as scope:
+        first = continuity_store._open_attached_scope_savepoint(scope)
+        second = continuity_store._open_attached_scope_savepoint(scope)
+        with pytest.raises(ContinuityStoreError) as error:
+            continuity_store._release_attached_scope_savepoint(first)
+        assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+        continuity_store._release_attached_scope_savepoint(second)
+        continuity_store._release_attached_scope_savepoint(first)
+        publication = _attached_scope_call(scope, config, frozen, view)
+
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM projections").fetchone()[0] == 0
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 1
+    assert publication.attempt.key == key
+
+
 def test_attached_scope_rejects_stale_scope_after_lexical_exit_before_writes(
     tmp_path: Path,
 ) -> None:
@@ -2200,7 +2288,7 @@ def test_attached_scope_rejects_stale_scope_after_lexical_exit_before_writes(
     assert key == frozen.key
 
 
-def test_attached_scope_preserves_caller_nested_savepoint_across_publication(
+def test_attached_scope_token_savepoint_preserves_outer_transaction_across_publication(
     tmp_path: Path,
 ) -> None:
     config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
@@ -2208,11 +2296,11 @@ def test_attached_scope_preserves_caller_nested_savepoint_across_publication(
         main_database=main_database, continuity_database=config.continuity_database
     ) as scope:
         _insert_attached_main_marker(scope, "outside-nested")
-        continuity_store._open_attached_scope_savepoint(scope, "caller_nested")
+        savepoint = continuity_store._open_attached_scope_savepoint(scope)
         _insert_attached_main_marker(scope, "inside-nested")
         publication = _attached_scope_call(scope, config, frozen, view)
-        continuity_store._rollback_attached_scope_savepoint(scope, "caller_nested")
-        continuity_store._release_attached_scope_savepoint(scope, "caller_nested")
+        continuity_store._rollback_attached_scope_savepoint(savepoint)
+        continuity_store._release_attached_scope_savepoint(savepoint)
 
     with sqlite3.connect(main_database) as check:
         assert check.execute("SELECT marker FROM projections").fetchone()[0] == "outside-nested"
