@@ -1724,6 +1724,54 @@ def test_attached_publication_requires_live_connection_bound_transaction_proof(
     assert key == frozen.key
 
 
+def test_attached_transaction_proof_rejects_reuse_after_outer_commit_and_deferred_begin(
+    tmp_path: Path,
+) -> None:
+    config, key, view, frozen, main_database, connection = _attached_frozen_transaction(
+        tmp_path
+    )
+    proof = _begin_attached_transaction(connection, config)
+    publication: continuity_store._AttachedPublication | None = None
+    try:
+        connection.commit()
+        connection.execute("BEGIN DEFERRED")
+        with pytest.raises(ContinuityStoreError) as error:
+            _attached_call(connection, config, frozen, view, proof)
+        assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+        assert connection.in_transaction
+        assert connection.execute("SELECT COUNT(*) FROM projections").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM continuity.receipts WHERE kind='published'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT COUNT(*) FROM continuity.pointers").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM continuity.attempts WHERE state='published'"
+            ).fetchone()[0]
+            == 0
+        )
+        connection.rollback()
+
+        fresh_proof = _begin_attached_transaction(connection, config)
+        connection.execute("INSERT INTO projections(marker) VALUES('fresh-after-replay')")
+        publication = _attached_call(connection, config, frozen, view, fresh_proof)
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert publication is not None
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT marker FROM projections").fetchone()[0] == "fresh-after-replay"
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 1
+    assert publication.attempt.key == key
+
+
 def test_attached_begin_capability_rejects_deferred_transaction_despite_released_competing_lock(
     tmp_path: Path,
 ) -> None:

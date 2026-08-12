@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,6 +31,7 @@ _SCHEMA_VERSION = "3"
 _IMMUTABLE_TABLES = ("continuity_keys", "views", "entries", "receipts", "attempts")
 _TRUSTED_SCHEMAS = frozenset(("main", "continuity"))
 _ATTACHED_TRANSACTION_PROOF_NONCE = object()
+_ATTACHED_TRANSACTION_SAVEPOINT_PREFIX = "continuity_attached_proof_"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,11 +54,12 @@ class _AttachedPublication:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class _AttachedTransactionProof:
-    """Opaque evidence that this exact connection began the attached UoW."""
+    """Opaque evidence for one exact connection and root transaction lifetime."""
 
     _connection: sqlite3.Connection
     _connection_identity: int
     _nonce: object
+    _savepoint: str
 
 
 _V1_TABLE_SQL = {
@@ -972,9 +975,7 @@ def _publish_attached_exact_in_transaction(
             )
             if _attached_exact_pointer(connection, expected_frozen.key) != pointer:
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-            _require_attached_transaction_proof(
-                connection, continuity_database, transaction_proof
-            )
+            _require_attached_transaction_preconditions(connection, continuity_database)
             connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             savepoint_open = False
             return _AttachedPublication(terminal, pointer, published_receipt)
@@ -1002,9 +1003,10 @@ def _begin_attached_immediate_transaction(
     """Begin and prove the caller's one attached ``BEGIN IMMEDIATE`` boundary.
 
     The successful return is an opaque capability bound to this exact live
-    connection.  If validation after the new begin fails, this helper rolls
-    back only the transaction it just created; it never rolls back a caller
-    transaction that was already active.
+    connection and its root transaction by a helper-owned savepoint.  If
+    validation after the new begin fails, this helper rolls back only the
+    transaction it just created; it never rolls back a caller transaction
+    that was already active.
     """
 
     if connection.in_transaction:
@@ -1018,8 +1020,10 @@ def _begin_attached_immediate_transaction(
         began = True
         _require_attached_transaction_preconditions(connection, continuity_database)
         _verify_v3_schema(connection, schema="continuity")
+        savepoint = _new_attached_transaction_savepoint()
+        connection.execute(f"SAVEPOINT {savepoint}")
         return _AttachedTransactionProof(
-            connection, id(connection), _ATTACHED_TRANSACTION_PROOF_NONCE
+            connection, id(connection), _ATTACHED_TRANSACTION_PROOF_NONCE, savepoint
         )
     except Exception as error:
         if began and connection.in_transaction:
@@ -1041,7 +1045,7 @@ def _require_attached_transaction_proof(
     continuity_database: Path,
     transaction_proof: _AttachedTransactionProof,
 ) -> None:
-    """Reject anything not minted at this connection's exact begin boundary."""
+    """Verify and consume the proof minted at this connection's exact begin."""
 
     if (
         type(transaction_proof) is not _AttachedTransactionProof
@@ -1051,6 +1055,13 @@ def _require_attached_transaction_proof(
     ):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     _require_attached_transaction_preconditions(connection, continuity_database)
+    connection.execute(f"RELEASE SAVEPOINT {transaction_proof._savepoint}")
+
+
+def _new_attached_transaction_savepoint() -> str:
+    """Return a trusted private identifier whose lifetime is one SQLite UoW."""
+
+    return f"{_ATTACHED_TRANSACTION_SAVEPOINT_PREFIX}{secrets.token_hex(16)}"
 
 
 def _require_attached_transaction_preconditions(
