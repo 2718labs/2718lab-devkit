@@ -14,7 +14,7 @@ import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 MAX_PACKET_BYTES = 16 * 1024
 MAX_STATUS_BYTES = 32 * 1024
@@ -152,18 +152,7 @@ _WORK_PACKAGE_V2_FIELDS = frozenset(
 _PROJECT_FENCE_FIELDS = frozenset(
     {"schema", "project_id", "binding_digest", "binding_version"}
 )
-_PROJECT_AUTHORITY_FIELDS = frozenset(
-    {
-        "schema",
-        "project_id",
-        "binding_digest",
-        "binding_version",
-        "workspace_id",
-        "input_snapshot_id",
-    }
-)
 _PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
-_PROJECT_AUTHORITY_SCHEMA = "team-efficiency/project-authority-v1"
 _WORK_PACKAGE_V2_SCHEMA = "team-efficiency/work-package-v2"
 _FAST_LANE_EXECUTION_CONTEXT_FIELDS = frozenset(
     {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"}
@@ -867,29 +856,6 @@ def _validated_project_fence(value: object, field: str) -> dict[str, Any]:
     }
 
 
-def _validated_project_authority(value: object) -> dict[str, Any]:
-    source = _mapping(value, "project authority")
-    _exact_keys(source, _PROJECT_AUTHORITY_FIELDS, "project authority")
-    if source["schema"] != _PROJECT_AUTHORITY_SCHEMA:
-        raise ValueError("project authority schema is invalid")
-    fence = _validated_project_fence(
-        {
-            "schema": _PROJECT_FENCE_SCHEMA,
-            "project_id": source["project_id"],
-            "binding_digest": source["binding_digest"],
-            "binding_version": source["binding_version"],
-        },
-        "project authority fence",
-    )
-    return {
-        **fence,
-        "workspace_id": _hash(source["workspace_id"], "project authority.workspace_id"),
-        "input_snapshot_id": _hash(
-            source["input_snapshot_id"], "project authority.input_snapshot_id"
-        ),
-    }
-
-
 def _validated_work_package_v2(value: object) -> dict[str, Any]:
     source = _mapping(value, "work-package v2 envelope")
     _exact_keys(source, _WORK_PACKAGE_V2_FIELDS, "work-package v2 envelope")
@@ -920,51 +886,36 @@ def _validated_work_package_v2(value: object) -> dict[str, Any]:
 }
 
 
-class _ProjectAuthorityProvider(Protocol):
-    """Host-only source of the current, already-attested project record."""
+def _project_execution_block_details(
+    request: Mapping[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    """Return the public compiler's fixed boundary result and V2 hash input.
 
-    def __call__(self) -> Mapping[str, Any] | None: ...
+    V2 envelopes remain canonical diagnostic input, but this repository has
+    no externally private Desktop authority bridge.  A Python module global,
+    closure, environment value, or caller-supplied record cannot stand in for
+    one, so every V2 execution request stays inert.
+    """
 
-
-# The Desktop host installs this narrowly scoped provider while it owns a
-# current ProjectAuthority.  A package cannot substitute a caller-controlled
-# environment value or path for this live record.
-_project_authority_provider: _ProjectAuthorityProvider | None = None
-
-
-def _live_project_authority() -> dict[str, Any] | None:
-    provider = _project_authority_provider
-    if provider is None:
-        return None
-    try:
-        supplied = provider()
-        if supplied is None:
-            return None
-        return _validated_project_authority(supplied)
-    except (TypeError, ValueError):
-        return None
-
-
-def _project_authority_preflight(request: Mapping[str, Any]) -> tuple[
-    dict[str, Any] | None, str | None
-]:
     package = request.get("work_package")
     if not isinstance(package, Mapping):
-        return None, "PROJECT_BINDING_INVALID"
+        return "PROJECT_BINDING_INVALID", None
     if package.get("schema") == "team-efficiency/work-package-v1":
-        return None, "LEGACY_PROJECT_UNBOUND"
-    if package.get("schema") != _WORK_PACKAGE_V2_SCHEMA:
-        return None, "PROJECT_BINDING_INVALID"
-    try:
-        declared = _validated_work_package_v2(package)["project_authority"]
-    except (TypeError, ValueError):
-        return None, "PROJECT_BINDING_INVALID"
-    live = _live_project_authority()
-    if live is None:
-        return None, "PROJECT_AUTHORITY_UNAVAILABLE"
-    if declared != live:
-        return None, "PROJECT_AUTHORITY_MISMATCH"
-    return live, None
+        return "LEGACY_PROJECT_UNBOUND", None
+    if package.get("schema") == _WORK_PACKAGE_V2_SCHEMA:
+        try:
+            v2 = _validated_work_package_v2(package)
+        except (TypeError, ValueError):
+            return "PROJECT_BINDING_INVALID", None
+        return (
+            "PROJECT_AUTHORITY_UNAVAILABLE",
+            {
+                "schema": "team-efficiency/project-fence-blocked-v2",
+                "package_payload_hash": v2["package_payload_hash"],
+                "project_authority": v2["project_authority"],
+            },
+        )
+    return "PROJECT_BINDING_INVALID", None
 
 
 def _relative_scope(value: object, field: str) -> str:
@@ -4809,18 +4760,10 @@ def _validated_fast_lane_execution_context(
     value: object,
     unit: Mapping[str, Any],
     integration_state: Mapping[str, Any],
-    *,
-    expected_project_id: str | None = None,
 ) -> dict[str, Any]:
     context = _mapping(value, "execution context")
     _exact_keys(context, _FAST_LANE_EXECUTION_CONTEXT_FIELDS, "execution context")
     task_id = _task_id(context["task_id"], "execution context.task_id")
-    raw_plan = _mapping(context["bootstrap_plan"], "execution context.bootstrap_plan")
-    if (
-        expected_project_id is not None
-        and raw_plan.get("project") != expected_project_id
-    ):
-        raise ValueError("execution context project does not match project authority")
     plan = _validated_bootstrap_plan(context["bootstrap_plan"])
     if task_id != plan["task_id"]:
         raise ValueError("execution context task does not match bootstrap plan")
@@ -4922,8 +4865,6 @@ def _validated_fast_lane_contexts(
     read_value: object,
     source_plan: Mapping[str, Any],
     scheduler_state: Mapping[str, Any],
-    *,
-    project_authority: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     execution_records = _bounded_records(
         execution_value,
@@ -4962,12 +4903,6 @@ def _validated_fast_lane_contexts(
     temp_targets: set[str] = set()
     repo_anchor: str | None = None
     project_roots: list[Path] = []
-    expected_project_id = (
-        None
-        if project_authority is None
-        else _project_id(project_authority["project_id"], "project authority.project_id")
-    )
-
     for index, record in enumerate(execution_records):
         field = f"execution_contexts[{index}]"
         context = _mapping(record, field)
@@ -4980,11 +4915,8 @@ def _validated_fast_lane_contexts(
             record,
             units_by_task_id[task_id],
             integration_state,
-            expected_project_id=expected_project_id,
         )
         plan = normalized["bootstrap_plan"]
-        if expected_project_id is not None and plan["project"] != expected_project_id:
-            raise ValueError("execution context project does not match project authority")
         repo = _absolute_path(plan["repo"], f"{field}.bootstrap_plan.repo")
         worktree = _absolute_path(plan["worktree"], f"{field}.bootstrap_plan.worktree")
         temp_target = _absolute_path(
@@ -5036,11 +4968,6 @@ def _validated_fast_lane_contexts(
             integration_state,
         )
         role = normalized["role"]
-        if (
-            expected_project_id is not None
-            and normalized["project"] != expected_project_id
-        ):
-            raise ValueError("read context project does not match project authority")
         key = (task_id, role)
         if key in read_keys:
             raise ValueError("read_contexts contains duplicate task roles")
@@ -6670,8 +6597,14 @@ def _validated_fast_lane_request(
     request: Mapping[str, Any],
     *,
     host_routing_context: Mapping[str, Any] | None = None,
-    project_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Normalize pure scheduler data without granting execution authority.
+
+    This supports structural validation and future bridge implementation only.
+    Public ``compile_fast_lane`` intentionally does not call it while no
+    external Desktop authority bridge exists.
+    """
+
     candidate = _mapping(request, "fast-lane request")
     _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
     if candidate["schema"] != "team-efficiency/fast-lane-request-v1":
@@ -6768,7 +6701,6 @@ def _validated_fast_lane_request(
         candidate["read_contexts"],
         effective_source_plan,
         candidate["scheduler_state"],
-        project_authority=project_authority,
     )
     scheduler_state, remediation_request = _validated_fast_lane_scheduler_state(
         candidate["scheduler_state"],
@@ -8014,20 +7946,26 @@ def _fast_lane_stopped_plan(
 
 
 def _fast_lane_project_fence_blocked_plan(
-    activation: Mapping[str, Any], *, reason_code: str
+    activation: Mapping[str, Any],
+    *,
+    reason_code: str,
+    source_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return an inert plan before any package context can create work.
 
     The package compiler has no authority to infer a project from an
-    environment variable or an unchecked path.  Until a host supplies the
-    V2 project fence, keep every execution, worktree, and recovery action out
-    of the plan.
+    environment variable or an unchecked path.  Until an external Desktop
+    bridge exists, keep every execution, worktree, recovery, and dispatch
+    action out of the plan.
     """
 
     source_plan_hash = _sha256_json(
         {
             "schema": "team-efficiency/project-fence-preflight-v1",
             "reason_code": reason_code,
+            "source_identity": (
+                None if source_identity is None else dict(source_identity)
+            ),
         }
     )
     result: dict[str, Any] = {
@@ -8070,6 +8008,13 @@ def _fast_lane_project_fence_blocked_plan(
 def _render_fast_lane_plan(
     validated: Mapping[str, Any], activation: Mapping[str, Any]
 ) -> dict[str, Any]:
+    """Render a pure descriptor for structural validation, never a grant.
+
+    This function cannot create live assignments, worktrees, or sessions.  The
+    public compiler remains fenced above it until an external Desktop bridge
+    is implemented and accepted.
+    """
+
     source_plan = _mapping(validated["source_plan"], "source plan")
     if source_plan["status"] == "needs_design":
         return _fast_lane_needs_design_plan(validated, activation)
@@ -8766,6 +8711,8 @@ def _apply_fast_lane_cross_session_projection(
     occupancy: Mapping[str, Any] | None,
     quota_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Attach pure projection data; public compiler does not reach this path."""
+
     projection = _fast_lane_cross_session_projection(
         result,
         reference_result=reference_result,
@@ -8851,6 +8798,8 @@ def _fast_lane_apply_index_evidence(
     trusted_index_evidence_hashes: Iterable[str],
     index_evaluation_time_utc_z: str | None,
 ) -> dict[str, Any]:
+    """Bind structural evidence only; it is not public execution ingress."""
+
     assignments_value = result["assignments"]
     if not isinstance(assignments_value, Sequence) or isinstance(
         assignments_value, (str, bytes, bytearray)
@@ -9018,100 +8967,33 @@ def compile_fast_lane(
     trusted_index_evidence_hashes: Iterable[str] = (),
     index_evaluation_time_utc_z: str | None = None,
 ) -> dict[str, Any]:
+    """Fail closed until an external Desktop project-authority bridge exists.
+
+    The signature remains stable for the MCP adapter, but no request field,
+    host-status record, quota record, index record, module attribute, or
+    Python closure can authorize scheduling from this repository.
+    """
+
+    del (
+        host_status,
+        quota_request,
+        quota_trusted_key_resolver,
+        quota_evaluation_time_utc_z,
+        quota_verified_route_result_hashes,
+        quota_verified_lease_scope_bindings,
+        index_evidence,
+        trusted_index_evidence_hashes,
+        index_evaluation_time_utc_z,
+    )
     activation = _fast_lane_activation(reasoning_effort, enable)
     raw_request = _mapping(request, "fast-lane request")
     _exact_keys(raw_request, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
-    project_authority, project_authority_reason = _project_authority_preflight(
-        raw_request
+    reason_code, source_identity = _project_execution_block_details(raw_request)
+    return _fast_lane_project_fence_blocked_plan(
+        activation,
+        reason_code=reason_code,
+        source_identity=source_identity,
     )
-    if project_authority_reason is not None:
-        return _fast_lane_project_fence_blocked_plan(
-            activation,
-            reason_code=project_authority_reason,
-        )
-    status = (
-        None if host_status is None else _validated_fast_lane_host_status(host_status)
-    )
-    validated = _validated_fast_lane_request(
-        request,
-        host_routing_context=(None if status is None else status["routing_context"]),
-        project_authority=project_authority,
-    )
-    occupancy: dict[str, Any] | None = None
-    if status is not None:
-        scheduler_state = validated["scheduler_state"]
-        occupancy = _fast_lane_host_slot_occupancy_audit(
-            workflow_id=status["workflow_id"],
-            source_plan_hash=validated["source_plan_hash"],
-            phase=scheduler_state["phase"],
-            running_assignments=scheduler_state["running_assignments"],
-            host_bindings=status["host_bindings"],
-            current_leases=status["current_leases"],
-        )
-        active_slots = set(occupancy["active_slot_ids"])
-        filtered_assignments = [
-            assignment
-            for assignment in scheduler_state["running_assignments"]
-            if assignment["slot_id"] in active_slots
-        ]
-        if len(filtered_assignments) != len(scheduler_state["running_assignments"]):
-            validated = {
-                **validated,
-                "scheduler_state": {
-                    **scheduler_state,
-                    "running_assignments": filtered_assignments,
-                },
-            }
-    result = _render_fast_lane_plan(validated, activation)
-    if occupancy is not None:
-        refill_plan = {
-            **result["refill_plan"],
-            "occupancy_audit": occupancy,
-        }
-        result = {**result, "refill_plan": refill_plan}
-        result["plan_hash"] = _sha256_json(
-            {key: value for key, value in result.items() if key != "plan_hash"}
-        )
-        _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
-        if len(_json_bytes(result)) > MAX_MANIFEST_BYTES:
-            raise ValueError("fast-lane plan exceeds its byte budget")
-    reference_result = result
-    quota_evidence = _fast_lane_main_capacity_evidence(
-        quota_request,
-        trusted_key_resolver=quota_trusted_key_resolver,
-        evaluation_time_utc_z=quota_evaluation_time_utc_z,
-        verified_route_result_hashes=quota_verified_route_result_hashes,
-        verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
-    )
-    if quota_request is not None:
-        decision = _fast_lane_quota_decision(
-            quota_request,
-            trusted_key_resolver=quota_trusted_key_resolver,
-            evaluation_time_utc_z=quota_evaluation_time_utc_z,
-            verified_route_result_hashes=quota_verified_route_result_hashes,
-            verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
-        )
-        result = _apply_fast_lane_quota_balance(
-            result,
-            quota_request=quota_request,
-            quota_decision=decision,
-        )
-    result = _apply_fast_lane_cross_session_projection(
-        result,
-        reference_result=reference_result,
-        host_status=status,
-        occupancy=occupancy,
-        quota_evidence=quota_evidence,
-    )
-    try:
-        return _fast_lane_apply_index_evidence(
-            result,
-            index_evidence=index_evidence,
-            trusted_index_evidence_hashes=trusted_index_evidence_hashes,
-            index_evaluation_time_utc_z=index_evaluation_time_utc_z,
-        )
-    except (KeyError, TypeError, ValueError):
-        return _fast_lane_index_evidence_fail_closed(result)
 
 
 def _read_json(path_text: str, *, maximum: int) -> Any:
@@ -9205,85 +9087,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_json(make_cache_metadata(inputs))
         elif args.command == "fast-lane":
             request = _read_json(args.input, maximum=MAX_MANIFEST_INPUT_BYTES)
-            host_status = (
-                None
-                if args.host_status is None
-                else _mapping(
-                    _read_json(
-                        args.host_status,
-                        maximum=MAX_FAST_LANE_HOST_STATUS_BYTES,
-                    ),
-                    "host status",
-                )
-            )
-            if args.quota_input is None and args.quota_evaluation_time is not None:
-                raise ValueError("quota evaluation time requires quota input")
-            if (
-                args.quota_input is not None
-                and args.quota_evaluation_time is None
-                and not args.live_quota
-            ):
-                raise ValueError("quota input requires an evaluation time")
-            quota_request = (
-                None
-                if args.quota_input is None
-                else _mapping(
-                    _read_json(
-                        args.quota_input,
-                        maximum=MAX_FAST_LANE_HOST_STATUS_BYTES,
-                    ),
-                    "quota request",
-                )
-            )
-            quota_resolver = None
-            quota_evaluation_time = args.quota_evaluation_time
-            if args.live_quota:
-                if quota_request is None:
-                    raise ValueError("live quota requires quota input")
-                quota_module = _codex_account_quota_module()
-                try:
-                    base_snapshot = _mapping(
-                        quota_request.get("snapshot"), "quota request snapshot"
-                    )
-                    capacity = _mapping(
-                        base_snapshot.get("capacity"), "quota request capacity"
-                    )
-                    provider = quota_module.CodexQuotaProvider(
-                        executable=args.codex_executable,
-                        timeout_seconds=args.quota_timeout,
-                        state_path=(
-                            None
-                            if args.quota_state_path is None
-                            else Path(args.quota_state_path)
-                        ),
-                    )
-                    evidence = provider.read(capacity=capacity)
-                    quota_request = quota_module.attach_snapshot(
-                        quota_request, evidence
-                    )
-                    quota_resolver = evidence.key_resolver
-                    if quota_evaluation_time is None:
-                        quota_evaluation_time = str(
-                            evidence.snapshot["observed_at_utc_z"]
-                        )
-                except quota_module.CodexQuotaError:
-                    # A live source failure is a safe scheduler result, not a
-                    # reason to invent a percentage or start new work.
-                    print(
-                        "quota source unavailable; using usage_unknown",
-                        file=sys.stderr,
-                    )
-                    quota_resolver = _unavailable_quota_key
-                    if quota_evaluation_time is None:
-                        quota_evaluation_time = _utc_now_z()
+            # Until an external Desktop authority bridge exists, the public
+            # CLI must not read caller-supplied host/quota inputs or launch a
+            # local quota provider in a futile attempt to activate work.  The
+            # arguments remain parse-compatible, but cannot establish an
+            # execution context or influence this inert result.
             result = compile_fast_lane(
                 _mapping(request, "fast-lane request"),
                 reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),
                 enable=args.enable,
-                host_status=host_status,
-                quota_request=quota_request,
-                quota_trusted_key_resolver=quota_resolver,
-                quota_evaluation_time_utc_z=quota_evaluation_time,
             )
             _print_json(result)
         else:

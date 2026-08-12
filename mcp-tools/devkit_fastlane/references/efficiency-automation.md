@@ -108,8 +108,8 @@ traversal, unknown-dependency, and cyclic manifests are rejected.
 
 `work-package-v1` remains diagnostic-only input for `decompose` and
 `plan-waves`; it never authorizes assignment, worktree creation, claim, resume,
-or durable recovery. Executable `fast-lane` calls require the exact
-`team-efficiency/work-package-v2` envelope:
+or durable recovery. The exact `team-efficiency/work-package-v2` envelope is
+still canonical diagnostic input and the required future external-host contract:
 
 ```json
 {
@@ -127,20 +127,26 @@ or durable recovery. Executable `fast-lane` calls require the exact
 }
 ```
 
-The compiler incorporates this full binding into `source_plan_hash`. It obtains
-the live `team-efficiency/project-authority-v1` record only from its internal
-host bridge and compares the entire structured record. The manifest provides
-an expected fence, never authority; no environment project ID, root path,
-worktree path, task-root component, or caller-supplied identifier can replace
-the host record. Missing live authority yields
-`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`; v1 yields
-`NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`; mismatches or tampering fail before an
-assignment is rendered. The public CLI intentionally has no authority option,
-so it is an inert preview. A same-process authority provider can only allow
-authority-bound inert planning; it does not create a worktree execution grant.
+The diagnostic decomposition and inert public blocked-plan hash incorporate
+this full binding into `source_plan_hash`. The manifest provides structural fence data, never
+authority; no environment project ID, root path, worktree path, task-root
+component, caller-supplied identifier, Python module attribute, or closure can
+replace a live host record. This repository has no Desktop-host durable
+registry or external private bridge, so its public `compile_fast_lane` and
+`fast-lane` CLI do not compare against an in-process provider and cannot
+activate V2: a structurally valid V2 request always yields
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` with zero assignments, local
+queues, and external-session assignments. An invalid V2 envelope/hash yields
+`PROJECT_BINDING_INVALID`; v1 yields `NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`.
 Public `bootstrap --apply` and import-callable `apply_bootstrap_plan` are both
 blocked before any caller plan, path, provider override, closure, or JSON can
 reach a worktree helper, because no such helper exists in this repository.
+
+Host-status, quota, and index payloads remain bounded future-bridge contract
+data. The current public CLI parses its stable command surface but does not use
+those caller inputs to create authority, schedule work, read a live quota
+provider, or bypass the inert result. Only an externally implemented and
+accepted Desktop bridge could perform live authority comparison in the future.
 
 ### Verified Code Atlas evidence
 
@@ -434,9 +440,9 @@ read-only role and is not a name for this bootstrap.
 Prewarm is read-only evidence, not acceptance evidence: a later writer may
 reuse it only after current-basis delta revalidation passes.
 
-### Live account quota
+### Live account quota (future external bridge contract)
 
-When quota balancing participates in dispatch, the host uses
+When a future external bridge participates in dispatch, the host may use
 `--live-quota` so the planner receives a fresh signed snapshot from the local
 Codex app-server. The adapter calls only
 `account/read` (with `refreshToken=false`) and `account/rateLimits/read`, then
@@ -446,9 +452,10 @@ binds the exact `codex` main pool and the exact
 stays in memory and it never reads `auth.json`, cookies, or a private HTTP
 endpoint.
 
-The base quota request must carry the host-bound `snapshot.capacity`. The live
-adapter replaces only the snapshot, recomputes `request_hash`, and calls the
-pure compiler with the in-memory key resolver:
+The base quota request must carry the host-bound `snapshot.capacity`. A future
+live adapter may replace only the snapshot, recompute `request_hash`, and call
+the pure structural validators with the in-memory key resolver. The current
+public CLI does not run this provider or activate a compiler route:
 
 ```text
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra

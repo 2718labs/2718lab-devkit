@@ -88,21 +88,20 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 状态的 Fast Lane 编译调用，遇到 v1 必须返回 `NO_SAFE_WORK` 和
 `LEGACY_PROJECT_UNBOUND`，零 assignment、零队列、零外部派发。
 
-可执行载荷必须是 `team-efficiency/work-package-v2` exact-key envelope，包含原始 canonical v1
+未来外部 Desktop bridge 如要消费的载荷必须是 `team-efficiency/work-package-v2` exact-key envelope，包含原始 canonical v1
 `package`、其 `package_payload_hash`、`project_fence`（仅 `project_id`、
 `binding_digest`、`binding_version`）、`workspace_id` 与 `input_snapshot_id`。V2 的
 source-plan hash 必须包含该整个 binding，因此相同 task/workflow 在不同项目、workspace 或输入
 snapshot 下不能共用计划、lease、receipt 或恢复状态。
 
-manifest 中的 fence 只是期望值，绝不是 authority：Fast Lane 仅能比较宿主在同一进程通过内部
-ProjectAuthority bridge 提供的 live structured record。不得从 `CODEX_PROJECT_*`、请求 JSON、
-repo root、task root、路径名或任意 caller-supplied ID 推断或替代 live authority。缺 bridge、
-schema/hash 篡改、项目/绑定/workspace/snapshot 不同，或者 execution/read context 的 project
-与 live `project_id` 不同，都必须在 scheduler、worktree、claim 或 dispatch 前失败关闭。
-
-当前公开 CLI 不接收 authority 参数；它对没有 host bridge 的 V2 请求只产出
-`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 预览。增加 Desktop-host durable registry、跨进程
-authority 传递或公开 MCP 参数属于后续 host 合同，不能由工作包 JSON 假装已经存在。
+manifest 中的 fence 只是可验证的结构与 hash 输入，绝不是 authority。当前仓库没有 Desktop-host
+durable registry 或真正私有的跨边界 authority bridge，因此没有任何同进程 provider、module
+attribute、closure、环境变量、请求 JSON、repo/task root、路径名或 caller-supplied ID 可被当作
+live authority。公开 `compile_fast_lane` 与 `fast-lane` CLI 对 structurally valid V2 一律产出
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`，零本地 assignment、零队列、零外部派发；V2
+envelope/hash 无效时是 `PROJECT_BINDING_INVALID`，v1 保持 `LEGACY_PROJECT_UNBOUND`。增加
+Desktop-host durable registry、跨进程 authority 传递或公开 MCP 参数属于后续外部 host 合同，不能由
+工作包 JSON 或 Python 私有命名假装已经存在。
 
 同一限制覆盖 `bootstrap --apply` 及 import-callable `apply_bootstrap_plan`：当前公开入口在构建
 caller-supplied bootstrap plan 或调用 worktree mutation 前，无条件以
@@ -123,13 +122,13 @@ host-authorized worktree path：没有 module-private capability、runner、Git 
 
 #### Ultra Fast Lane
 
-对实质性的 Ultra 任务，host 调用：
+下面是未来外部 Desktop bridge 的 host 合同形状：
 
 ```text
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
-`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。当前仓库的公开 `fast-lane` CLI/API 不消费 host-status、quota 或 index 输入来激活该合同：在外部 Desktop authority bridge 实现并验收前，它始终输出 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 的零 assignment/队列预览。下文的 descriptor、route、quota 与 host dispatch 约束只定义未来 bridge 的接入要求，不是本仓库存在的执行通路。`fast-lane` 本身不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
 
 host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
 `routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整
@@ -170,16 +169,17 @@ terminal boundary 做一次 output query；worker 只消费 packet，不调用
 不匹配时停止该 assignment。这样索引安全约束仍在，但不会把低价值的索引仪式交给
 LLM 自己编排。
 
-额度遥测优先由 host-private inherited-handle bridge 传递：先发送
+未来 bridge 的额度遥测优先由 host-private inherited-handle bridge 传递：先发送
 `kind="quota_snapshot_request"`（`host-quota-snapshot-request-v1`），再接收绑定同一
 `request_id` 的 `kind="quota_snapshot"`（`host-quota-snapshot-response-v1`）。响应内层必须是
 `host-quota-snapshot-v1`，并由 `fastlane_quota_balance` 继续验证快照哈希、签名、租约世代与
-120 秒 freshness。host 需要在同一进程内接入
+120 秒 freshness。未来 host 需要在同一进程内接入
 `scripts/codex_account_quota.py` 的 `CodexQuotaProvider`：它只调用官方
 `codex app-server --stdio` 的 JSONL `initialize`、`account/read`（`refreshToken=false`）和
 `account/rateLimits/read`，严格按 `limitId="codex"` 与
 `limitName="GPT-5.3-Codex-Spark"` 取主池/Spark 池，HMAC key 只留内存；不读
-`auth.json`、cookie、环境变量邮箱或私有 HTTP 接口。可执行入口为：
+`auth.json`、cookie、环境变量邮箱或私有 HTTP 接口。它不是当前公开 CLI 的可执行入口；未来 bridge
+可按下列形状接入：
 
 ```text
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
