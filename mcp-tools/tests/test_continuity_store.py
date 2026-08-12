@@ -1563,9 +1563,7 @@ def test_attached_scope_commits_exact_terminal_graph_with_main_marker(
     with continuity_store._attached_immediate_transaction_scope(
         main_database=main_database, continuity_database=config.continuity_database
     ) as scope:
-        continuity_store._execute_attached_scope(
-            scope, "INSERT INTO projections(marker) VALUES('committed')"
-        )
+        _insert_attached_main_marker(scope, "committed")
         publication = _attached_scope_call(scope, config, frozen, view)
 
     assert publication.attempt == ContinuityAttempt(
@@ -1620,8 +1618,9 @@ def test_attached_scope_rejects_deferred_begin_before_publication(
         with continuity_store._attached_immediate_transaction_scope(
             main_database=main_database, continuity_database=config.continuity_database
         ) as scope:
+            raw_connection = continuity_store._state_for_attached_scope(scope)._connection
             with pytest.raises(sqlite3.DatabaseError):
-                continuity_store._execute_attached_scope(scope, "BEGIN DEFERRED")
+                raw_connection.execute("BEGIN DEFERRED")
             with pytest.raises(ContinuityStoreError) as error:
                 _attached_scope_call(scope, config, frozen, view)
             assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
@@ -1666,9 +1665,7 @@ def test_attached_scope_rejects_reuse_after_lexical_commit_and_new_scope(
     with continuity_store._attached_immediate_transaction_scope(
         main_database=main_database, continuity_database=config.continuity_database
     ) as fresh_scope:
-        continuity_store._execute_attached_scope(
-            fresh_scope, "INSERT INTO projections(marker) VALUES('fresh-after-replay')"
-        )
+        _insert_attached_main_marker(fresh_scope, "fresh-after-replay")
         publication = _attached_scope_call(fresh_scope, config, frozen, view)
 
     with sqlite3.connect(main_database) as check:
@@ -1737,26 +1734,10 @@ def test_attached_publication_savepoint_preserves_outer_transaction_after_termin
     with continuity_store._attached_immediate_transaction_scope(
         main_database=main_database, continuity_database=config.continuity_database
     ) as scope:
-        continuity_store._execute_attached_scope(
-            scope, "INSERT INTO projections(marker) VALUES('savepoint-survives')"
-        )
+        _insert_attached_main_marker(scope, "savepoint-survives")
         with pytest.raises(ContinuityStoreError) as error:
             _attached_scope_call(scope, config, frozen, view)
         assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
-        assert continuity_store._execute_attached_scope(
-            scope, "SELECT marker FROM projections"
-        ).fetchone()[0] == "savepoint-survives"
-        assert continuity_store._execute_attached_scope(
-            scope,
-            "SELECT COUNT(*) FROM continuity.receipts WHERE kind='published'"
-        ).fetchone()[0] == 0
-        assert continuity_store._execute_attached_scope(
-            scope, "SELECT COUNT(*) FROM continuity.pointers"
-        ).fetchone()[0] == 0
-        assert continuity_store._execute_attached_scope(
-            scope,
-            "SELECT COUNT(*) FROM continuity.attempts WHERE state='published'"
-        ).fetchone()[0] == 0
 
     with sqlite3.connect(config.continuity_database) as check:
         assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 0
@@ -1779,9 +1760,7 @@ def test_attached_publication_outer_rollback_removes_prefix_after_terminal_write
         with continuity_store._attached_immediate_transaction_scope(
             main_database=main_database, continuity_database=config.continuity_database
         ) as scope:
-            continuity_store._execute_attached_scope(
-                scope, "INSERT INTO projections(marker) VALUES('outer-rollback')"
-            )
+            _insert_attached_main_marker(scope, "outer-rollback")
             with pytest.raises(ContinuityStoreError) as error:
                 _attached_scope_call(scope, config, frozen, view)
             assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
@@ -1805,9 +1784,7 @@ def test_attached_publication_uses_continuity_alias_not_same_named_main_tables(
     with continuity_store._attached_immediate_transaction_scope(
         main_database=main_database, continuity_database=config.continuity_database
     ) as scope:
-        continuity_store._execute_attached_scope(
-            scope, "INSERT INTO projections(marker) VALUES('alias')"
-        )
+        _insert_attached_main_marker(scope, "alias")
         publication = _attached_scope_call(scope, config, frozen, view)
 
     with sqlite3.connect(main_database) as check:
@@ -1860,32 +1837,30 @@ def test_attached_publication_rejects_premature_mismatched_pointer_without_mutat
     tmp_path: Path,
 ) -> None:
     config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
-    with pytest.raises(RuntimeError, match="abort scope"):
-        with continuity_store._attached_immediate_transaction_scope(
-            main_database=main_database, continuity_database=config.continuity_database
-        ) as scope:
-            continuity_store._execute_attached_scope(
-                scope,
-                "INSERT INTO continuity.pointers(key_hash,workflow_id,code_task_id,"
-                "code_task_version,view_id,pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
-                (
-                    key.key_hash,
-                    key.workflow_id,
-                    key.code_task_id,
-                    key.code_task_version,
-                    view.view_id,
-                    1,
-                    1,
-                ),
-            )
-            with pytest.raises(ContinuityStoreError) as error:
-                _attached_scope_call(scope, config, frozen, view)
-            assert error.value.code == "CONTINUITY_STATE_CONFLICT"
-            raise RuntimeError("abort scope")
+    with sqlite3.connect(config.continuity_database) as setup:
+        setup.execute(
+            "INSERT INTO pointers(key_hash,workflow_id,code_task_id,"
+            "code_task_version,view_id,pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
+            (
+                key.key_hash,
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                view.view_id,
+                1,
+                1,
+            ),
+        )
+    with continuity_store._attached_immediate_transaction_scope(
+        main_database=main_database, continuity_database=config.continuity_database
+    ) as scope:
+        with pytest.raises(ContinuityStoreError) as error:
+            _attached_scope_call(scope, config, frozen, view)
+        assert error.value.code == "CONTINUITY_STATE_CONFLICT"
 
     with sqlite3.connect(config.continuity_database) as check:
         assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 0
-        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 1
         assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 0
 
 
@@ -1894,22 +1869,21 @@ def test_attached_publication_rejects_malformed_existing_published_receipt(
 ) -> None:
     config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
     published = ContinuityReceipt.create(key=key, view_id=view.view_id, kind="published")
-    with pytest.raises(RuntimeError, match="abort scope"):
+    with sqlite3.connect(config.continuity_database) as setup:
+        setup.execute(
+            "INSERT INTO receipts(receipt_hash,key_hash,view_id,kind,receipt_json) "
+            "VALUES(?,?,?,?,?)",
+            (published.receipt_hash, key.key_hash, view.view_id, "published", "{}"),
+        )
+    with pytest.raises(ContinuityStoreError) as error:
         with continuity_store._attached_immediate_transaction_scope(
             main_database=main_database, continuity_database=config.continuity_database
-        ) as scope:
-            continuity_store._execute_attached_scope(
-                scope,
-                "INSERT INTO continuity.receipts(receipt_hash,key_hash,view_id,kind,receipt_json) "
-                "VALUES(?,?,?,?,?)",
-                (published.receipt_hash, key.key_hash, view.view_id, "published", "{}"),
-            )
-            with pytest.raises(ContinuityStoreError):
-                _attached_scope_call(scope, config, frozen, view)
-            raise RuntimeError("abort scope")
+        ):
+            pytest.fail("scope admitted malformed published receipt")
+    assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
 
     with sqlite3.connect(config.continuity_database) as check:
-        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 1
         assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 0
         assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 0
 
@@ -2021,14 +1995,6 @@ def test_attached_publication_rejects_post_publication_stale_frozen_evidence_wit
         with pytest.raises(ContinuityStoreError) as error:
             _attached_scope_call(retry_scope, config, candidate_frozen, candidate_view)
         assert error.value.code == "CONTINUITY_STATE_CONFLICT"
-        assert continuity_store._execute_attached_scope(
-            retry_scope, "SELECT COUNT(*) FROM continuity.attempts WHERE state='published'"
-        ).fetchone()[0] == 1
-        assert continuity_store._execute_attached_scope(
-            retry_scope,
-            "SELECT pointer_version FROM continuity.pointers WHERE key_hash=?",
-            (key.key_hash,),
-        ).fetchone()[0] == publication.pointer.pointer_version
 
     with sqlite3.connect(config.continuity_database) as check:
         assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 1
@@ -2070,6 +2036,15 @@ def _attached_scope_call(
     )
 
 
+def _insert_attached_main_marker(
+    scope: continuity_store._AttachedTransactionScope, marker: str
+) -> None:
+    continuity_store._apply_attached_projection_marker(
+        scope,
+        continuity_store._AttachedProjectionMarker(marker),
+    )
+
+
 def test_attached_scope_hides_connection_and_fences_root_control_before_dml(
     tmp_path: Path,
 ) -> None:
@@ -2079,11 +2054,12 @@ def test_attached_scope_hides_connection_and_fences_root_control_before_dml(
             main_database=main_database, continuity_database=config.continuity_database
         ) as scope:
             assert not hasattr(scope, "_connection")
+            raw_connection = continuity_store._state_for_attached_scope(scope)._connection
             with pytest.raises(sqlite3.DatabaseError):
-                continuity_store._execute_attached_scope(scope, "COMMIT")
+                raw_connection.execute("COMMIT")
             with pytest.raises(ContinuityStoreError) as marker_error:
-                continuity_store._execute_attached_scope(
-                    scope, "INSERT INTO projections(marker) VALUES('fenced')"
+                _insert_attached_main_marker(
+                    scope, "fenced"
                 )
             assert marker_error.value.code == "CONTINUITY_STORE_UNPREPARED"
             with pytest.raises(ContinuityStoreError) as publication_error:
@@ -2098,6 +2074,101 @@ def test_attached_scope_hides_connection_and_fences_root_control_before_dml(
         assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 0
         assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 0
     assert key == frozen.key
+
+
+def test_attached_scope_main_mutation_cannot_leak_commit_rebind_and_publish_prefix(
+    tmp_path: Path,
+) -> None:
+    """A typed scope mutation returns no capability and a fenced raw commit rolls back."""
+
+    config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
+    with pytest.raises(ContinuityStoreError) as scope_error:
+        with continuity_store._attached_immediate_transaction_scope(
+            main_database=main_database, continuity_database=config.continuity_database
+        ) as scope:
+            result = continuity_store._apply_attached_projection_marker(
+                scope,
+                continuity_store._AttachedProjectionMarker("cursor-leak"),
+            )
+            assert result is None
+            assert not hasattr(scope, "_connection")
+            assert not hasattr(result, "connection")
+            assert not hasattr(continuity_store, "_execute_attached_scope")
+
+            # This private test probe models a connection acquired outside the
+            # intended scope API.  The fence must still invalidate before C/O DML.
+            raw_connection = continuity_store._state_for_attached_scope(scope)._connection
+            with pytest.raises(sqlite3.DatabaseError):
+                raw_connection.commit()
+            with pytest.raises(sqlite3.DatabaseError):
+                raw_connection.execute("BEGIN DEFERRED")
+            with pytest.raises(ContinuityStoreError) as mutation_error:
+                continuity_store._apply_attached_projection_marker(
+                    scope,
+                    continuity_store._AttachedProjectionMarker("must-not-write"),
+                )
+            assert mutation_error.value.code == "CONTINUITY_STORE_UNPREPARED"
+            with pytest.raises(ContinuityStoreError) as publication_error:
+                _attached_scope_call(scope, config, frozen, view)
+            assert publication_error.value.code == "CONTINUITY_STORE_UNPREPARED"
+    assert scope_error.value.code == "CONTINUITY_STORE_UNPREPARED"
+
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM projections").fetchone()[0] == 0
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 0
+    assert key == frozen.key
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        object(),
+        continuity_store._AttachedProjectionMarker(marker=object()),
+    ),
+)
+def test_attached_scope_rejects_unsupported_main_finalization_command_without_writes(
+    tmp_path: Path, command: object
+) -> None:
+    config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
+    with continuity_store._attached_immediate_transaction_scope(
+        main_database=main_database, continuity_database=config.continuity_database
+    ) as scope:
+        with pytest.raises(ContinuityStoreError) as error:
+            continuity_store._apply_attached_projection_marker(scope, command)
+        assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+        publication = _attached_scope_call(scope, config, frozen, view)
+
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM projections").fetchone()[0] == 0
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 1
+    assert publication.attempt.key == key
+
+
+@pytest.mark.parametrize("field", ("table", "columns"))
+def test_attached_scope_has_no_caller_selected_table_or_column_surface(
+    tmp_path: Path, field: str
+) -> None:
+    config, key, view, frozen, main_database = _attached_scope_fixture(tmp_path)
+    with continuity_store._attached_immediate_transaction_scope(
+        main_database=main_database, continuity_database=config.continuity_database
+    ) as scope:
+        with pytest.raises(TypeError):
+            continuity_store._AttachedProjectionMarker("forged", **{field: "forged"})
+        publication = _attached_scope_call(scope, config, frozen, view)
+
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM projections").fetchone()[0] == 0
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 1
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 1
+    assert publication.attempt.key == key
 
 
 def test_attached_scope_rejects_stale_scope_after_lexical_exit_before_writes(
@@ -2136,23 +2207,12 @@ def test_attached_scope_preserves_caller_nested_savepoint_across_publication(
     with continuity_store._attached_immediate_transaction_scope(
         main_database=main_database, continuity_database=config.continuity_database
     ) as scope:
-        continuity_store._execute_attached_scope(
-            scope, "INSERT INTO projections(marker) VALUES('outside-nested')"
-        )
-        continuity_store._execute_attached_scope(scope, "SAVEPOINT caller_nested")
-        continuity_store._execute_attached_scope(
-            scope, "INSERT INTO projections(marker) VALUES('inside-nested')"
-        )
+        _insert_attached_main_marker(scope, "outside-nested")
+        continuity_store._open_attached_scope_savepoint(scope, "caller_nested")
+        _insert_attached_main_marker(scope, "inside-nested")
         publication = _attached_scope_call(scope, config, frozen, view)
-        continuity_store._execute_attached_scope(scope, "ROLLBACK TO SAVEPOINT caller_nested")
-        continuity_store._execute_attached_scope(scope, "RELEASE SAVEPOINT caller_nested")
-        assert continuity_store._execute_attached_scope(
-            scope, "SELECT marker FROM projections"
-        ).fetchone()[0] == "outside-nested"
-        assert continuity_store._execute_attached_scope(
-            scope,
-            "SELECT COUNT(*) FROM continuity.receipts WHERE kind='published'"
-        ).fetchone()[0] == 0
+        continuity_store._rollback_attached_scope_savepoint(scope, "caller_nested")
+        continuity_store._release_attached_scope_savepoint(scope, "caller_nested")
 
     with sqlite3.connect(main_database) as check:
         assert check.execute("SELECT marker FROM projections").fetchone()[0] == "outside-nested"
@@ -2175,15 +2235,14 @@ def test_attached_scope_fences_root_transaction_control_before_publication(
         with continuity_store._attached_immediate_transaction_scope(
             main_database=main_database, continuity_database=config.continuity_database
         ) as scope:
+            raw_connection = continuity_store._state_for_attached_scope(scope)._connection
             with pytest.raises(sqlite3.DatabaseError):
-                continuity_store._execute_attached_scope(scope, "COMMIT")
+                raw_connection.execute("COMMIT")
             if control == "sql_commit_rebegin":
                 with pytest.raises(sqlite3.DatabaseError):
-                    continuity_store._execute_attached_scope(scope, "BEGIN DEFERRED")
+                    raw_connection.execute("BEGIN DEFERRED")
             with pytest.raises(ContinuityStoreError) as marker_error:
-                continuity_store._execute_attached_scope(
-                    scope, "INSERT INTO projections(marker) VALUES('fenced')"
-                )
+                _insert_attached_main_marker(scope, "fenced")
             assert marker_error.value.code == "CONTINUITY_STORE_UNPREPARED"
             with pytest.raises(ContinuityStoreError) as publication_error:
                 _attached_scope_call(scope, config, frozen, view)
@@ -2200,9 +2259,7 @@ def test_attached_scope_fences_root_transaction_control_before_publication(
     with continuity_store._attached_immediate_transaction_scope(
         main_database=main_database, continuity_database=config.continuity_database
     ) as fresh_scope:
-        continuity_store._execute_attached_scope(
-            fresh_scope, "INSERT INTO projections(marker) VALUES('fresh')"
-        )
+        _insert_attached_main_marker(fresh_scope, "fresh")
         publication = _attached_scope_call(fresh_scope, config, frozen, view)
 
     with sqlite3.connect(main_database) as check:
@@ -2252,26 +2309,10 @@ def test_attached_scope_commits_outer_marker_after_post_pointer_fault(
     with continuity_store._attached_immediate_transaction_scope(
         main_database=main_database, continuity_database=config.continuity_database
     ) as scope:
-        continuity_store._execute_attached_scope(
-            scope, "INSERT INTO projections(marker) VALUES('continuation')"
-        )
+        _insert_attached_main_marker(scope, "continuation")
         with pytest.raises(ContinuityStoreError) as error:
             _attached_scope_call(scope, config, frozen, view)
         assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
-        assert continuity_store._execute_attached_scope(
-            scope, "SELECT marker FROM projections"
-        ).fetchone()[0] == "continuation"
-        assert continuity_store._execute_attached_scope(
-            scope,
-            "SELECT COUNT(*) FROM continuity.receipts WHERE kind='published'"
-        ).fetchone()[0] == 0
-        assert continuity_store._execute_attached_scope(
-            scope, "SELECT COUNT(*) FROM continuity.pointers"
-        ).fetchone()[0] == 0
-        assert continuity_store._execute_attached_scope(
-            scope,
-            "SELECT COUNT(*) FROM continuity.attempts WHERE state='published'"
-        ).fetchone()[0] == 0
 
     with sqlite3.connect(main_database) as check:
         assert check.execute("SELECT marker FROM projections").fetchone()[0] == "continuation"
@@ -2295,9 +2336,7 @@ def test_attached_scope_rolls_back_outer_marker_after_post_pointer_fault(
         with continuity_store._attached_immediate_transaction_scope(
             main_database=main_database, continuity_database=config.continuity_database
         ) as scope:
-            continuity_store._execute_attached_scope(
-                scope, "INSERT INTO projections(marker) VALUES('rollback')"
-            )
+            _insert_attached_main_marker(scope, "rollback")
             with pytest.raises(ContinuityStoreError) as error:
                 _attached_scope_call(scope, config, frozen, view)
             assert error.value.code == "CONTINUITY_STORE_UNPREPARED"

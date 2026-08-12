@@ -66,6 +66,13 @@ class _AttachedTransactionScope:
     __slots__ = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _AttachedProjectionMarker:
+    """The sole CP-E main-finalization relation available to an attached scope."""
+
+    marker: str
+
+
 _ATTACHED_TRANSACTION_SCOPES: dict[
     _AttachedTransactionScope, _AttachedTransactionScopeState
 ] = {}
@@ -1169,16 +1176,58 @@ def _require_active_attached_scope(
     return connection
 
 
-def _execute_attached_scope(
-    scope: _AttachedTransactionScope,
-    statement: str,
-    parameters: tuple[object, ...] = (),
-) -> sqlite3.Cursor:
-    """Execute finalizer-owned DML without exposing its SQLite connection."""
+def _apply_attached_projection_marker(
+    scope: _AttachedTransactionScope, command: _AttachedProjectionMarker
+) -> None:
+    """Insert the one fixed CP-E O finalization marker without capability output."""
+
+    if type(command) is not _AttachedProjectionMarker or type(command.marker) is not str:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    state = _state_for_attached_scope(scope)
+    connection = _require_active_attached_scope(scope, state._continuity_database)
+    connection.execute("INSERT INTO main.projections(marker) VALUES(?)", (command.marker,))
+
+
+def _open_attached_scope_savepoint(
+    scope: _AttachedTransactionScope, name: str
+) -> None:
+    """Open one caller-owned nested savepoint without exposing the connection."""
+
+    _execute_attached_scope_savepoint(scope, "SAVEPOINT", name)
+
+
+def _rollback_attached_scope_savepoint(
+    scope: _AttachedTransactionScope, name: str
+) -> None:
+    """Roll back to one caller-owned nested savepoint without root control."""
+
+    _execute_attached_scope_savepoint(scope, "ROLLBACK TO SAVEPOINT", name)
+
+
+def _release_attached_scope_savepoint(
+    scope: _AttachedTransactionScope, name: str
+) -> None:
+    """Release one caller-owned nested savepoint without root control."""
+
+    _execute_attached_scope_savepoint(scope, "RELEASE SAVEPOINT", name)
+
+
+def _execute_attached_scope_savepoint(
+    scope: _AttachedTransactionScope, command: str, name: str
+) -> None:
+    """Execute a fixed nested-savepoint command and discard its SQLite cursor."""
 
     state = _state_for_attached_scope(scope)
     connection = _require_active_attached_scope(scope, state._continuity_database)
-    return connection.execute(statement, parameters)
+    connection.execute(f"{command} {_attached_savepoint_identifier(name)}")
+
+
+def _attached_savepoint_identifier(name: object) -> str:
+    """Return one narrowly validated nested-savepoint identifier."""
+
+    if type(name) is not str or not name.isidentifier():
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    return name
 
 
 def _require_attached_transaction_preconditions(
