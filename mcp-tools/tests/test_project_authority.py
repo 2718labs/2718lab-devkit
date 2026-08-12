@@ -10,6 +10,7 @@ import pytest
 
 import devkit_runtime.config as runtime_config_module
 import devkit_runtime.project_authority as project_authority_module
+from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.project_authority import (
     ProjectAuthority,
@@ -335,3 +336,114 @@ def test_malformed_runtime_receipt_types_fail_with_stable_error(
         ProjectAuthority.reopen(project_root, receipt)
 
     assert caught.value.code == "PROJECT_AUTHORITY_RECEIPT_INVALID"
+
+
+@pytest.mark.parametrize("read_only", (True, False))
+def test_runtime_root_revalidates_project_authority_before_each_uow_open(
+    tmp_path: Path,
+    read_only: bool,
+) -> None:
+    project_root = tmp_path / "project"
+    original_root = tmp_path / "original-project"
+    project_root.mkdir()
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    provider = RuntimeProjectAuthorityProvider.issue(project_root)
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "plugin-data"),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        },
+        authority_provider=provider,
+    )
+    factory_calls: list[bool] = []
+    root = RuntimeRoot(
+        config,
+        uow_factory=lambda *, config, read_only: factory_calls.append(read_only),
+    )
+    project_root.rename(original_root)
+    project_root.mkdir()
+
+    with pytest.raises(RuntimeConfigError) as caught:
+        root.open_uow(read_only=read_only)
+
+    assert caught.value.code == "PROJECT_AUTHORITY_INVALID"
+    assert factory_calls == []
+
+
+@pytest.mark.parametrize("read_only", (True, False))
+def test_runtime_root_rejects_forged_projects_v2_config_before_uow_factory(
+    tmp_path: Path,
+    read_only: bool,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    authority = ProjectAuthority.issue(project_root)
+    forged = RuntimeConfig(
+        data_root=tmp_path / "plugin-data" / "projects-v2" / authority.project_id,
+        scratch_root=tmp_path / "scratch" / "projects-v2" / authority.project_id,
+        project_authority=authority,
+        storage_layout="projects-v2",
+    )
+    factory_calls: list[bool] = []
+    root = RuntimeRoot(
+        forged,
+        uow_factory=lambda *, config, read_only: factory_calls.append(read_only),
+    )
+
+    with pytest.raises(RuntimeConfigError) as caught:
+        root.open_uow(read_only=read_only)
+
+    assert caught.value.code == "PROJECT_AUTHORITY_PROVIDER_INVALID"
+    assert factory_calls == []
+
+
+@pytest.mark.parametrize("read_only", (True, False))
+def test_runtime_root_rejects_authority_disguised_as_legacy_config(
+    tmp_path: Path,
+    read_only: bool,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    authority = ProjectAuthority.issue(project_root)
+    forged = RuntimeConfig(
+        data_root=tmp_path / "plugin-data",
+        scratch_root=tmp_path / "scratch",
+        project_authority=authority,
+        storage_layout="legacy-compat",
+    )
+    factory_calls: list[bool] = []
+    root = RuntimeRoot(
+        forged,
+        uow_factory=lambda *, config, read_only: factory_calls.append(read_only),
+    )
+
+    with pytest.raises(RuntimeConfigError) as caught:
+        root.open_uow(read_only=read_only)
+
+    assert caught.value.code == "PROJECT_AUTHORITY_PROVIDER_INVALID"
+    assert factory_calls == []
+
+
+@pytest.mark.parametrize("read_only", (True, False))
+def test_runtime_root_keeps_explicit_legacy_config_openable(
+    tmp_path: Path,
+    read_only: bool,
+) -> None:
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "plugin-data"),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+    opened: list[bool] = []
+    uow = object()
+    root = RuntimeRoot(
+        config,
+        uow_factory=lambda *, config, read_only: opened.append(read_only) or uow,
+    )
+
+    assert root.open_uow(read_only=read_only) is uow
+    assert opened == [read_only]
