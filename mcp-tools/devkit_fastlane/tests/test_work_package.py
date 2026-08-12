@@ -202,6 +202,11 @@ class WorkPackageValidationTests(unittest.TestCase):
 
         self.assertEqual([], errors)
 
+    def test_shape_validator_is_explicitly_diagnostic_only(self) -> None:
+        validator = load_validator()
+
+        self.assertIn("diagnostic-only", validator.__doc__ or "")
+
     def test_legacy_package_explicitly_preserves_strict_index_false(self) -> None:
         self.write_valid_package()
         validator = load_validator()

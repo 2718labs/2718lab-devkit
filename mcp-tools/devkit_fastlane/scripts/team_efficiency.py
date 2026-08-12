@@ -15,7 +15,7 @@ import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 MAX_PACKET_BYTES = 16 * 1024
 MAX_STATUS_BYTES = 32 * 1024
@@ -140,6 +140,32 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
         "scheduler_state",
     }
 )
+_WORK_PACKAGE_V2_FIELDS = frozenset(
+    {
+        "schema",
+        "package",
+        "package_payload_hash",
+        "project_fence",
+        "workspace_id",
+        "input_snapshot_id",
+    }
+)
+_PROJECT_FENCE_FIELDS = frozenset(
+    {"schema", "project_id", "binding_digest", "binding_version"}
+)
+_PROJECT_AUTHORITY_FIELDS = frozenset(
+    {
+        "schema",
+        "project_id",
+        "binding_digest",
+        "binding_version",
+        "workspace_id",
+        "input_snapshot_id",
+    }
+)
+_PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
+_PROJECT_AUTHORITY_SCHEMA = "team-efficiency/project-authority-v1"
+_WORK_PACKAGE_V2_SCHEMA = "team-efficiency/work-package-v2"
 _FAST_LANE_EXECUTION_CONTEXT_FIELDS = frozenset(
     {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"}
 )
@@ -809,6 +835,136 @@ def _hash(value: object, field: str) -> str:
     if not _SHA256.fullmatch(text):
         raise ValueError(f"{field} must be a sha256 hash")
     return text.lower()
+
+
+def _project_id(value: object, field: str) -> str:
+    text = _text(value, field, maximum=128)
+    if not _PATH_PART.fullmatch(text):
+        raise ValueError(f"{field} is invalid")
+    return text
+
+
+def _binding_version(value: object, field: str) -> int:
+    if type(value) is not int or not 1 <= value <= 2**31 - 1:
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _validated_project_fence(value: object, field: str) -> dict[str, Any]:
+    source = _mapping(value, field)
+    _exact_keys(source, _PROJECT_FENCE_FIELDS, field)
+    if source["schema"] != _PROJECT_FENCE_SCHEMA:
+        raise ValueError(f"{field}.schema is invalid")
+    return {
+        "schema": _PROJECT_FENCE_SCHEMA,
+        "project_id": _project_id(source["project_id"], f"{field}.project_id"),
+        "binding_digest": _hash(
+            source["binding_digest"], f"{field}.binding_digest"
+        ),
+        "binding_version": _binding_version(
+            source["binding_version"], f"{field}.binding_version"
+        ),
+    }
+
+
+def _validated_project_authority(value: object) -> dict[str, Any]:
+    source = _mapping(value, "project authority")
+    _exact_keys(source, _PROJECT_AUTHORITY_FIELDS, "project authority")
+    if source["schema"] != _PROJECT_AUTHORITY_SCHEMA:
+        raise ValueError("project authority schema is invalid")
+    fence = _validated_project_fence(
+        {
+            "schema": _PROJECT_FENCE_SCHEMA,
+            "project_id": source["project_id"],
+            "binding_digest": source["binding_digest"],
+            "binding_version": source["binding_version"],
+        },
+        "project authority fence",
+    )
+    return {
+        **fence,
+        "workspace_id": _hash(source["workspace_id"], "project authority.workspace_id"),
+        "input_snapshot_id": _hash(
+            source["input_snapshot_id"], "project authority.input_snapshot_id"
+        ),
+    }
+
+
+def _validated_work_package_v2(value: object) -> dict[str, Any]:
+    source = _mapping(value, "work-package v2 envelope")
+    _exact_keys(source, _WORK_PACKAGE_V2_FIELDS, "work-package v2 envelope")
+    if source["schema"] != _WORK_PACKAGE_V2_SCHEMA:
+        raise ValueError("work-package v2 schema is invalid")
+    package = _mapping(source["package"], "work-package v2 package")
+    if package.get("schema") != "team-efficiency/work-package-v1":
+        raise ValueError("work-package v2 package must be canonical v1 payload")
+    payload = dict(package)
+    package_payload_hash = _hash(
+        source["package_payload_hash"], "work-package v2 package_payload_hash"
+    )
+    if _sha256_json(payload) != package_payload_hash:
+        raise ValueError("work-package v2 package_payload_hash does not match payload")
+    fence = _validated_project_fence(source["project_fence"], "work-package v2 project_fence")
+    return {
+        "package": payload,
+        "package_payload_hash": package_payload_hash,
+        "project_authority": {
+            **fence,
+            "workspace_id": _hash(
+                source["workspace_id"], "work-package v2 workspace_id"
+            ),
+            "input_snapshot_id": _hash(
+                source["input_snapshot_id"], "work-package v2 input_snapshot_id"
+            ),
+        },
+}
+
+
+class _ProjectAuthorityProvider(Protocol):
+    """Host-only source of the current, already-attested project record."""
+
+    def __call__(self) -> Mapping[str, Any] | None: ...
+
+
+# The Desktop host installs this narrowly scoped provider while it owns a
+# current ProjectAuthority.  A package cannot substitute a caller-controlled
+# environment value or path for this live record.
+_project_authority_provider: _ProjectAuthorityProvider | None = None
+
+
+def _live_project_authority() -> dict[str, Any] | None:
+    provider = _project_authority_provider
+    if provider is None:
+        return None
+    try:
+        supplied = provider()
+        if supplied is None:
+            return None
+        return _validated_project_authority(supplied)
+    except (TypeError, ValueError):
+        return None
+
+
+def _project_authority_preflight(request: Mapping[str, Any]) -> tuple[
+    dict[str, Any] | None, str | None
+]:
+    package = request.get("work_package")
+    if not isinstance(package, Mapping):
+        return None, "PROJECT_BINDING_INVALID"
+    if package.get("schema") == "team-efficiency/work-package-v1":
+        return None, "LEGACY_PROJECT_UNBOUND"
+    if package.get("schema") != _WORK_PACKAGE_V2_SCHEMA:
+        return None, "PROJECT_BINDING_INVALID"
+    try:
+        declared = _validated_work_package_v2(package)["project_authority"]
+    except (TypeError, ValueError):
+        return None, "PROJECT_BINDING_INVALID"
+    live = _live_project_authority()
+    if live is None:
+        return None, "PROJECT_AUTHORITY_UNAVAILABLE"
+    if declared != live:
+        return None, "PROJECT_AUTHORITY_MISMATCH"
+    return live, None
 
 
 def _relative_scope(value: object, field: str) -> str:
@@ -4110,7 +4266,7 @@ def _scheduled_plan(
     }
 
 
-def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
+def _decompose_v1(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Compile manual boundaries or verified Code Atlas evidence into safe waves."""
 
     source = _mapping(manifest, "work-package manifest")
@@ -4235,6 +4391,26 @@ def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
         source_kind=source_kind,
         units=units,
     )
+
+
+def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Compile a package for diagnostics without authorizing host execution.
+
+    V1 remains a diagnostics-compatible payload.  V2 adds the immutable
+    project binding to the resulting source plan so any executable caller has
+    a hash that changes with the intended project/workspace/input fence.
+    """
+
+    source = _mapping(manifest, "work-package manifest")
+    if source.get("schema") != _WORK_PACKAGE_V2_SCHEMA:
+        return _decompose_v1(source)
+    v2 = _validated_work_package_v2(source)
+    plan = _decompose_v1(v2["package"])
+    return {
+        **plan,
+        "project_authority": v2["project_authority"],
+        "package_payload_hash": v2["package_payload_hash"],
+    }
 
 
 def plan_waves(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -4937,10 +5113,18 @@ def _validated_fast_lane_execution_context(
     value: object,
     unit: Mapping[str, Any],
     integration_state: Mapping[str, Any],
+    *,
+    expected_project_id: str | None = None,
 ) -> dict[str, Any]:
     context = _mapping(value, "execution context")
     _exact_keys(context, _FAST_LANE_EXECUTION_CONTEXT_FIELDS, "execution context")
     task_id = _task_id(context["task_id"], "execution context.task_id")
+    raw_plan = _mapping(context["bootstrap_plan"], "execution context.bootstrap_plan")
+    if (
+        expected_project_id is not None
+        and raw_plan.get("project") != expected_project_id
+    ):
+        raise ValueError("execution context project does not match project authority")
     plan = _validated_bootstrap_plan(context["bootstrap_plan"])
     if task_id != plan["task_id"]:
         raise ValueError("execution context task does not match bootstrap plan")
@@ -5042,6 +5226,8 @@ def _validated_fast_lane_contexts(
     read_value: object,
     source_plan: Mapping[str, Any],
     scheduler_state: Mapping[str, Any],
+    *,
+    project_authority: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     execution_records = _bounded_records(
         execution_value,
@@ -5080,6 +5266,11 @@ def _validated_fast_lane_contexts(
     temp_targets: set[str] = set()
     repo_anchor: str | None = None
     project_roots: list[Path] = []
+    expected_project_id = (
+        None
+        if project_authority is None
+        else _project_id(project_authority["project_id"], "project authority.project_id")
+    )
 
     for index, record in enumerate(execution_records):
         field = f"execution_contexts[{index}]"
@@ -5093,8 +5284,11 @@ def _validated_fast_lane_contexts(
             record,
             units_by_task_id[task_id],
             integration_state,
+            expected_project_id=expected_project_id,
         )
         plan = normalized["bootstrap_plan"]
+        if expected_project_id is not None and plan["project"] != expected_project_id:
+            raise ValueError("execution context project does not match project authority")
         repo = _absolute_path(plan["repo"], f"{field}.bootstrap_plan.repo")
         worktree = _absolute_path(plan["worktree"], f"{field}.bootstrap_plan.worktree")
         temp_target = _absolute_path(
@@ -5146,6 +5340,11 @@ def _validated_fast_lane_contexts(
             integration_state,
         )
         role = normalized["role"]
+        if (
+            expected_project_id is not None
+            and normalized["project"] != expected_project_id
+        ):
+            raise ValueError("read context project does not match project authority")
         key = (task_id, role)
         if key in read_keys:
             raise ValueError("read_contexts contains duplicate task roles")
@@ -6772,7 +6971,10 @@ def _validated_fast_lane_scheduler_state(
 
 
 def _validated_fast_lane_request(
-    request: Mapping[str, Any], *, host_routing_context: Mapping[str, Any] | None = None
+    request: Mapping[str, Any],
+    *,
+    host_routing_context: Mapping[str, Any] | None = None,
+    project_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate = _mapping(request, "fast-lane request")
     _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
@@ -6870,6 +7072,7 @@ def _validated_fast_lane_request(
         candidate["read_contexts"],
         effective_source_plan,
         candidate["scheduler_state"],
+        project_authority=project_authority,
     )
     scheduler_state, remediation_request = _validated_fast_lane_scheduler_state(
         candidate["scheduler_state"],
@@ -8114,6 +8317,60 @@ def _fast_lane_stopped_plan(
     )
 
 
+def _fast_lane_project_fence_blocked_plan(
+    activation: Mapping[str, Any], *, reason_code: str
+) -> dict[str, Any]:
+    """Return an inert plan before any package context can create work.
+
+    The package compiler has no authority to infer a project from an
+    environment variable or an unchecked path.  Until a host supplies the
+    V2 project fence, keep every execution, worktree, and recovery action out
+    of the plan.
+    """
+
+    source_plan_hash = _sha256_json(
+        {
+            "schema": "team-efficiency/project-fence-preflight-v1",
+            "reason_code": reason_code,
+        }
+    )
+    result: dict[str, Any] = {
+        "schema": "team-efficiency/fast-lane-plan-v1",
+        "status": "blocked",
+        "decision_code": "NO_SAFE_WORK",
+        "activation": dict(activation),
+        "source_plan_hash": source_plan_hash,
+        "phase": "execution",
+        "main_lane": _fast_lane_main_lane(
+            activation,
+            next_action=None,
+        ),
+        "subagent_capacity": len(FAST_LANE_SLOT_IDS),
+        "assignments": [],
+        "ready_queue": [],
+        "review_queue": [],
+        "prewarm_queue": [],
+        "design_queue": [],
+        "invalidated_evidence_task_ids": [],
+        "idle_slots": _fast_lane_idle_slots(reason_code),
+        "refill_plan": _fast_lane_refill_plan(),
+        "terminal_protocol": _fast_lane_terminal_protocol({"units": []}),
+        "workflow_policy": _fast_lane_workflow_policy(),
+        "cross_session_dispatch_projection": _fast_lane_cross_session_projection(
+            {"source_plan_hash": source_plan_hash},
+            reference_result={},
+            host_status=None,
+            occupancy=None,
+            quota_evidence=_fast_lane_main_capacity_evidence_unknown(
+                "quota_usage_unknown"
+            ),
+        ),
+    }
+    result["plan_hash"] = _sha256_json(result)
+    _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    return result
+
+
 def _render_fast_lane_plan(
     validated: Mapping[str, Any], activation: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -9066,12 +9323,23 @@ def compile_fast_lane(
     index_evaluation_time_utc_z: str | None = None,
 ) -> dict[str, Any]:
     activation = _fast_lane_activation(reasoning_effort, enable)
+    raw_request = _mapping(request, "fast-lane request")
+    _exact_keys(raw_request, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+    project_authority, project_authority_reason = _project_authority_preflight(
+        raw_request
+    )
+    if project_authority_reason is not None:
+        return _fast_lane_project_fence_blocked_plan(
+            activation,
+            reason_code=project_authority_reason,
+        )
     status = (
         None if host_status is None else _validated_fast_lane_host_status(host_status)
     )
     validated = _validated_fast_lane_request(
         request,
         host_routing_context=(None if status is None else status["routing_context"]),
+        project_authority=project_authority,
     )
     occupancy: dict[str, Any] | None = None
     if status is not None:

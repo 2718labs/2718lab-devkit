@@ -81,6 +81,29 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 
 如果 MCP 不可用，允许按 `references/work-packages.md` 使用文件降级，但必须标记 `DEGRADED_SKILL_ONLY`，关闭并发写入和崩溃恢复承诺，并向用户说明这不等价于完整插件。
 
+### 3.1 工作包项目隔离（V2）
+
+`team-efficiency/work-package-v1` 是可读、可分解的诊断载荷，不是执行授权。它可以被
+`decompose`/`plan-waves` 显示，但任何会创建 assignment、worktree、claim、resume 或恢复持久
+状态的 Fast Lane 编译调用，遇到 v1 必须返回 `NO_SAFE_WORK` 和
+`LEGACY_PROJECT_UNBOUND`，零 assignment、零队列、零外部派发。
+
+可执行载荷必须是 `team-efficiency/work-package-v2` exact-key envelope，包含原始 canonical v1
+`package`、其 `package_payload_hash`、`project_fence`（仅 `project_id`、
+`binding_digest`、`binding_version`）、`workspace_id` 与 `input_snapshot_id`。V2 的
+source-plan hash 必须包含该整个 binding，因此相同 task/workflow 在不同项目、workspace 或输入
+snapshot 下不能共用计划、lease、receipt 或恢复状态。
+
+manifest 中的 fence 只是期望值，绝不是 authority：Fast Lane 仅能比较宿主在同一进程通过内部
+ProjectAuthority bridge 提供的 live structured record。不得从 `CODEX_PROJECT_*`、请求 JSON、
+repo root、task root、路径名或任意 caller-supplied ID 推断或替代 live authority。缺 bridge、
+schema/hash 篡改、项目/绑定/workspace/snapshot 不同，或者 execution/read context 的 project
+与 live `project_id` 不同，都必须在 scheduler、worktree、claim 或 dispatch 前失败关闭。
+
+当前公开 CLI 不接收 authority 参数；它对没有 host bridge 的 V2 请求只产出
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 预览。增加 Desktop-host durable registry、跨进程
+authority 传递或公开 MCP 参数属于后续 host 合同，不能由工作包 JSON 假装已经存在。
+
 ### 4. 接地后再写
 
 列出不能百分之百确认的接口并逐个查证。查不到时选择可被现有证据支持的保守实现，并明确记录限制；不把编译器当 API 文档。

@@ -1,8 +1,10 @@
 """Validate a layered 2718lab work package.
 
 A package separates the product-facing direction from coordinator metadata and
-agent-scoped implementation cards. The validator intentionally checks shape,
-not business correctness.
+agent-scoped implementation cards. This validator is diagnostic-only: it
+checks shape, not business correctness, live ProjectAuthority, assignment,
+worktree creation, or crash-resume eligibility. Those executable boundaries
+belong to the Fast Lane compiler and its host bridge.
 """
 
 from __future__ import annotations

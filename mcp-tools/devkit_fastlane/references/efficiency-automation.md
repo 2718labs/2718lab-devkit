@@ -100,6 +100,40 @@ evidence, complexity, and explicit execution contracts. Equal paths and
 ancestor/descendant paths conflict. Unsafe, wildcard-like, absolute,
 traversal, unknown-dependency, and cyclic manifests are rejected.
 
+### Project-bound execution envelope
+
+`work-package-v1` remains diagnostic-only input for `decompose` and
+`plan-waves`; it never authorizes assignment, worktree creation, claim, resume,
+or durable recovery. Executable `fast-lane` calls require the exact
+`team-efficiency/work-package-v2` envelope:
+
+```json
+{
+  "schema": "team-efficiency/work-package-v2",
+  "package": { "schema": "team-efficiency/work-package-v1" },
+  "package_payload_hash": "sha256:<canonical-v1-payload>",
+  "project_fence": {
+    "schema": "team-efficiency/project-fence-v1",
+    "project_id": "opaque-project-id",
+    "binding_digest": "sha256:<host-binding>",
+    "binding_version": 1
+  },
+  "workspace_id": "sha256:<workspace>",
+  "input_snapshot_id": "sha256:<input-snapshot>"
+}
+```
+
+The compiler incorporates this full binding into `source_plan_hash`. It obtains
+the live `team-efficiency/project-authority-v1` record only from its internal
+host bridge and compares the entire structured record. The manifest provides
+an expected fence, never authority; no environment project ID, root path,
+worktree path, task-root component, or caller-supplied identifier can replace
+the host record. Missing live authority yields
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`; v1 yields
+`NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`; mismatches or tampering fail before an
+assignment is rendered. The public CLI intentionally has no authority option,
+so it is an inert preview unless a same-process host bridge supplies one.
+
 ### Verified Code Atlas evidence
 
 Code Atlas planning requires decomposition atlas_evidence and one of two real
