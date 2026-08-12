@@ -1887,6 +1887,46 @@ def test_attached_publication_savepoint_preserves_outer_transaction_after_termin
         assert check.execute("SELECT marker FROM projections").fetchone()[0] == "savepoint-survives"
 
 
+def test_attached_publication_outer_rollback_removes_prefix_after_terminal_write_fault(
+    tmp_path: Path,
+) -> None:
+    config, key, view, frozen, main_database, connection = _attached_frozen_transaction(
+        tmp_path
+    )
+    transaction_proof = _begin_attached_transaction(connection, config)
+
+    def deny_terminal_attempt(
+        action: int, first: str | None, _second: str | None, database: str | None, _source: str | None
+    ) -> int:
+        if (
+            action == sqlite3.SQLITE_INSERT
+            and first == "attempts"
+            and database == "continuity"
+        ):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    try:
+        connection.execute("INSERT INTO projections(marker) VALUES('outer-rollback')")
+        connection.set_authorizer(deny_terminal_attempt)
+        with pytest.raises(ContinuityStoreError) as error:
+            _attached_call(connection, config, frozen, view, transaction_proof)
+        assert error.value.code == "CONTINUITY_STORE_UNPREPARED"
+        connection.set_authorizer(None)
+        assert connection.in_transaction
+        connection.rollback()
+    finally:
+        connection.close()
+
+    with sqlite3.connect(config.continuity_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM receipts WHERE kind='published'").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM pointers").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM attempts WHERE state='published'").fetchone()[0] == 0
+    with sqlite3.connect(main_database) as check:
+        assert check.execute("SELECT COUNT(*) FROM projections WHERE marker='outer-rollback'").fetchone()[0] == 0
+    assert key == frozen.key
+
+
 def test_attached_publication_uses_continuity_alias_not_same_named_main_tables(
     tmp_path: Path,
 ) -> None:
