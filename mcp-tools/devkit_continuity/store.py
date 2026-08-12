@@ -60,43 +60,11 @@ class _AttachedScopeSavepoint:
     __slots__ = ()
 
 
-@dataclass(slots=True)
-class _AttachedTransactionScopeState:
-    """Mutable state held only for one lexical finalization scope."""
-
-    _connection: sqlite3.Connection
-    _main_database: Path
-    _continuity_database: Path
-    _active: bool = True
-    _allow_transaction_control: bool = False
-    _transaction_control_attempted: bool = False
-    _savepoints: list[_AttachedScopeSavepoint] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class _AttachedScopeSavepointState:
-    """Module-private binding of one opaque token to its generated SQL name."""
-
-    _scope: _AttachedTransactionScope
-    _scope_state: _AttachedTransactionScopeState
-    _name: str
-    _active: bool = True
-
-
 @dataclass(frozen=True, slots=True)
 class _AttachedProjectionMarker:
     """The sole CP-E main-finalization relation available to an attached scope."""
 
     marker: str
-
-
-_ATTACHED_TRANSACTION_SCOPES: dict[
-    _AttachedTransactionScope, _AttachedTransactionScopeState
-] = {}
-_ATTACHED_SCOPE_SAVEPOINTS: dict[
-    _AttachedScopeSavepoint, _AttachedScopeSavepointState
-] = {}
-
 
 _V1_TABLE_SQL = {
     "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
@@ -927,383 +895,451 @@ class ContinuityStore:
         )
 
 
-def _publish_attached_exact_in_transaction(
-    scope: _AttachedTransactionScope,
-    *,
-    continuity_database: Path,
-    expected_frozen: ContinuityAttempt,
-    view: FrozenView,
-) -> _AttachedPublication:
-    """Publish one exact frozen view through an active finalizer scope.
+def _build_attached_scope_api() -> tuple[Any, ...]:
+    """Create the closed attached-finalizer API around an unreachable registry.
 
-    The scope owns the root ``BEGIN IMMEDIATE`` and its final commit or
-    rollback.  This helper deliberately never controls that outer transaction:
-    its private savepoint only removes a partial Continuity prefix when a later
-    C write fails.
+    The returned callables deliberately capture the live connection and all
+    state in this lexical registry.  No callable installed in the module can
+    resolve a scope/token into a connection, state object, cursor, or row.
     """
 
-    connection = _connection_for_attached_scope(scope)
-    original_row_factory = connection.row_factory
-    connection.row_factory = sqlite3.Row
-    try:
-        _require_active_attached_scope(scope, continuity_database)
-        _verify_v3_schema(connection, schema="continuity")
-        if type(expected_frozen) is not ContinuityAttempt or type(view) is not FrozenView:
-            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-        if (
-            expected_frozen.state != "frozen"
-            or expected_frozen.view_id != view.view_id
-            or expected_frozen.key != view.key
-        ):
-            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+    @dataclass(slots=True)
+    class ScopeState:
+        connection: sqlite3.Connection
+        main_database: Path
+        continuity_database: Path
+        active: bool = True
+        allow_transaction_control: bool = False
+        transaction_control_attempted: bool = False
+        savepoints: list[_AttachedScopeSavepoint] = field(default_factory=list)
 
-        persisted_view = _attached_exact_view(connection, expected_frozen.key, view)
-        if persisted_view != view:
-            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-        frozen_receipt = _attached_exact_receipt(
-            connection, expected_frozen.key, view.view_id, "frozen"
-        )
-        if expected_frozen.receipt_hash != frozen_receipt.receipt_hash:
-            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-        history = _attached_attempt_history(connection, expected_frozen.key)
-        if not history:
-            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-        current = history[-1]
+    @dataclass(slots=True)
+    class SavepointState:
+        scope: _AttachedTransactionScope
+        scope_state: ScopeState
+        name: str
+        active: bool = True
 
-        if current.state == "published":
-            published_receipt = _attached_exact_receipt(
-                connection, expected_frozen.key, view.view_id, "published"
-            )
-            pointer = _attached_exact_pointer(connection, expected_frozen.key)
-            if (
-                current.fence_epoch != expected_frozen.fence_epoch
-                or current.view_id != view.view_id
-                or current.receipt_hash != published_receipt.receipt_hash
-                or len(history) < 2
-                or history[-2] != expected_frozen
-                or pointer is None
-                or pointer.view_id != view.view_id
-                or pointer.fence_epoch != expected_frozen.fence_epoch
-            ):
-                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-            return _AttachedPublication(current, pointer, published_receipt)
-        if current != expected_frozen:
-            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-        if _attached_exact_pointer(connection, expected_frozen.key) is not None:
-            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+    @dataclass(slots=True)
+    class ContextRequest:
+        scope: _AttachedTransactionScope
+        main_database: Path
+        continuity_database: Path
+        entered: bool = False
 
-        savepoint = f"continuity_attached_publication_{secrets.token_hex(16)}"
-        savepoint_open = False
+    scopes: dict[_AttachedTransactionScope, ScopeState] = {}
+    savepoints: dict[_AttachedScopeSavepoint, SavepointState] = {}
+    requests: dict[object, ContextRequest] = {}
+
+    def validate_scope(
+        scope: object,
+        state: ScopeState | None,
+        continuity_database: Path,
+    ) -> None:
+        """Reject anything except the live, fixed, fenced scope in-place."""
+
+        if type(scope) is not _AttachedTransactionScope or state is None or not state.active:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         try:
-            connection.execute(f"SAVEPOINT {savepoint}")
-            savepoint_open = True
-            published_receipt = ContinuityReceipt.create(
-                key=expected_frozen.key, view_id=view.view_id, kind="published"
-            )
-            _insert_or_prove_attached_receipt(connection, published_receipt)
-            pointer = _advance_attached_pointer(
-                connection, expected_frozen.key, view, expected_frozen.fence_epoch
-            )
-            terminal = _append_attached_published_attempt(
-                connection, expected_frozen, published_receipt
-            )
-            if _attached_exact_pointer(connection, expected_frozen.key) != pointer:
-                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-            _require_active_attached_scope(scope, continuity_database)
-            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
-            savepoint_open = False
-            return _AttachedPublication(terminal, pointer, published_receipt)
-        except Exception:
-            if savepoint_open:
-                try:
-                    connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
-                except sqlite3.Error as rollback_error:
-                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from rollback_error
-            raise
-    except ContinuityStoreError:
-        raise
-    except (sqlite3.Error, OSError, RuntimeError) as error:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    except (ContinuityError, KeyError, TypeError, ValueError) as error:
-        raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT") from error
-    finally:
-        connection.row_factory = original_row_factory
-
-
-@contextmanager
-def _attached_immediate_transaction_scope(
-    *, main_database: Path, continuity_database: Path
-) -> Iterator[_AttachedTransactionScope]:
-    """Open, fence, and own one dedicated attached finalizer transaction.
-
-    This private scope always opens a new stdlib SQLite connection, so it never
-    replaces a callback owned by a caller.  Root transaction control is fenced
-    while the body runs; the scope performs the only commit or rollback itself.
-    """
-
-    connection: sqlite3.Connection | None = None
-    state: _AttachedTransactionScopeState | None = None
-    scope: _AttachedTransactionScope | None = None
-    try:
-        try:
-            expected_main = main_database.resolve(strict=True)
-            expected_continuity = continuity_database.resolve(strict=True)
+            requested_continuity = continuity_database.resolve(strict=True)
         except (OSError, RuntimeError) as error:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-        if not expected_main.is_file() or not expected_continuity.is_file():
+        if (
+            requested_continuity != state.continuity_database
+            or state.transaction_control_attempted
+        ):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-        _require_delete_journal_invariant(expected_main)
-        _require_delete_journal_invariant(expected_continuity)
-        connection = sqlite3.connect(
-            f"file:{expected_main.as_posix()}?mode=rw&cache=private",
-            uri=True,
-            timeout=0,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA main.synchronous=FULL")
-        connection.execute("ATTACH DATABASE ? AS continuity", (str(expected_continuity),))
-        connection.execute("PRAGMA continuity.synchronous=FULL")
-        _require_attached_connection_preconditions(
-            connection,
-            expected_continuity,
-            expected_main_database=expected_main,
-        )
-        connection.execute("BEGIN IMMEDIATE")
-        state = _AttachedTransactionScopeState(
-            connection, expected_main, expected_continuity
-        )
-        connection.set_authorizer(_attached_transaction_control_fence(state))
         _require_attached_transaction_preconditions(
-            connection,
-            expected_continuity,
-            expected_main_database=expected_main,
+            state.connection,
+            state.continuity_database,
+            expected_main_database=state.main_database,
         )
-        _verify_v3_schema(connection, schema="continuity")
-        scope = _AttachedTransactionScope()
-        _ATTACHED_TRANSACTION_SCOPES[scope] = state
-        try:
-            yield scope
-        except BaseException:
-            _invalidate_attached_scope_savepoints(state)
-            _finish_attached_transaction_scope(connection, state, commit=False)
-            raise
-        if state._transaction_control_attempted:
-            _invalidate_attached_scope_savepoints(state)
-            _finish_attached_transaction_scope(connection, state, commit=False)
+
+    def invalidate_savepoint(
+        token: _AttachedScopeSavepoint, token_state: SavepointState
+    ) -> None:
+        token_state.active = False
+        savepoints.pop(token, None)
+        token_state.scope_state.savepoints.pop()
+
+    def invalidate_savepoints(scope_state: ScopeState) -> None:
+        for token in tuple(scope_state.savepoints):
+            token_state = savepoints.pop(token, None)
+            if token_state is not None:
+                token_state.active = False
+        scope_state.savepoints.clear()
+
+    def complete_scope(scope: _AttachedTransactionScope, *, commit: bool) -> None:
+        state = scopes.get(scope) if type(scope) is _AttachedTransactionScope else None
+        if state is None or not state.active:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-        _invalidate_attached_scope_savepoints(state)
-        _finish_attached_transaction_scope(connection, state, commit=True)
-    except ContinuityStoreError:
-        raise
-    except (sqlite3.Error, OSError) as error:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    finally:
-        if state is not None:
-            _invalidate_attached_scope_savepoints(state)
-        if scope is not None:
-            _ATTACHED_TRANSACTION_SCOPES.pop(scope, None)
-        if connection is not None:
-            if state is not None and state._active:
-                try:
-                    _finish_attached_transaction_scope(connection, state, commit=False)
-                except sqlite3.Error:
-                    pass
+        connection = state.connection
+        try:
+            invalidate_savepoints(state)
+            if state.transaction_control_attempted:
+                perform_root_transition(connection, state, commit=False)
+                if commit:
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+            else:
+                perform_root_transition(connection, state, commit=commit)
+        except ContinuityStoreError:
+            raise
+        except (sqlite3.Error, OSError) as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        finally:
+            invalidate_savepoints(state)
+            scopes.pop(scope, None)
             try:
                 connection.set_authorizer(None)
             finally:
                 connection.close()
 
-
-def _attached_transaction_control_fence(
-    state: _AttachedTransactionScopeState,
-) -> Any:
-    """Deny caller root transaction control without constraining savepoints."""
-
-    def authorize(
-        action: int,
-        _first: str | None,
-        _second: str | None,
-        _database: str | None,
-        _source: str | None,
-    ) -> int:
-        if action == sqlite3.SQLITE_TRANSACTION and not state._allow_transaction_control:
-            state._transaction_control_attempted = True
-            return sqlite3.SQLITE_DENY
-        return sqlite3.SQLITE_OK
-
-    return authorize
-
-
-def _finish_attached_transaction_scope(
-    connection: sqlite3.Connection,
-    state: _AttachedTransactionScopeState,
-    *,
-    commit: bool,
-) -> None:
-    """Perform the sole root transaction transition and invalidate the scope."""
-
-    state._allow_transaction_control = True
-    try:
-        if not connection.in_transaction:
+    def perform_root_transition(
+        connection: sqlite3.Connection, state: ScopeState, *, commit: bool
+    ) -> None:
+        state.allow_transaction_control = True
+        try:
+            if not connection.in_transaction:
+                if commit:
+                    raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+                return
             if commit:
+                connection.commit()
+            else:
+                connection.rollback()
+        finally:
+            state.allow_transaction_control = False
+            state.active = False
+
+    def begin_scope(
+        scope: _AttachedTransactionScope,
+        main_database: Path,
+        continuity_database: Path,
+    ) -> None:
+        connection: sqlite3.Connection | None = None
+        state: ScopeState | None = None
+        opened = False
+        try:
+            try:
+                expected_main = main_database.resolve(strict=True)
+                expected_continuity = continuity_database.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+            if not expected_main.is_file() or not expected_continuity.is_file():
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-            return
-        if commit:
-            connection.commit()
-        else:
-            connection.rollback()
-    finally:
-        state._allow_transaction_control = False
-        state._active = False
+            _require_delete_journal_invariant(expected_main)
+            _require_delete_journal_invariant(expected_continuity)
+            connection = sqlite3.connect(
+                f"file:{expected_main.as_posix()}?mode=rw&cache=private",
+                uri=True,
+                timeout=0,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA main.synchronous=FULL")
+            connection.execute("ATTACH DATABASE ? AS continuity", (str(expected_continuity),))
+            connection.execute("PRAGMA continuity.synchronous=FULL")
+            _require_attached_connection_preconditions(
+                connection,
+                expected_continuity,
+                expected_main_database=expected_main,
+            )
+            if connection.in_transaction:
+                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+            connection.execute("BEGIN IMMEDIATE")
+            state = ScopeState(connection, expected_main, expected_continuity)
+            scopes[scope] = state
 
+            def authorize(
+                action: int,
+                _first: str | None,
+                _second: str | None,
+                _database: str | None,
+                _source: str | None,
+            ) -> int:
+                active_state = scopes.get(scope)
+                if (
+                    action == sqlite3.SQLITE_TRANSACTION
+                    and active_state is not None
+                    and not active_state.allow_transaction_control
+                ):
+                    active_state.transaction_control_attempted = True
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
 
-def _connection_for_attached_scope(scope: object) -> sqlite3.Connection:
-    """Return only a live scope's dedicated connection without touching stale ones."""
+            connection.set_authorizer(authorize)
+            _require_attached_transaction_preconditions(
+                connection,
+                expected_continuity,
+                expected_main_database=expected_main,
+            )
+            _verify_v3_schema(connection, schema="continuity")
+            opened = True
+        except ContinuityStoreError:
+            raise
+        except (sqlite3.Error, OSError) as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        finally:
+            if not opened:
+                if state is not None:
+                    invalidate_savepoints(state)
+                    scopes.pop(scope, None)
+                if connection is not None:
+                    try:
+                        connection.set_authorizer(None)
+                        if connection.in_transaction:
+                            connection.rollback()
+                    except sqlite3.Error:
+                        pass
+                    finally:
+                        connection.close()
 
-    state = _state_for_attached_scope(scope)
-    return state._connection
+    class ScopeContext:
+        """Attribute-free context handle; its request remains registry-private."""
 
+        __slots__ = ()
 
-def _state_for_attached_scope(scope: object) -> _AttachedTransactionScopeState:
-    """Resolve an opaque active scope only through the module-private registry."""
+        def __enter__(self) -> _AttachedTransactionScope:
+            request = requests.get(self)
+            if request is None or request.entered:
+                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+            try:
+                begin_scope(
+                    request.scope,
+                    request.main_database,
+                    request.continuity_database,
+                )
+            except BaseException:
+                requests.pop(self, None)
+                raise
+            request.entered = True
+            return request.scope
 
-    if type(scope) is not _AttachedTransactionScope:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    state = _ATTACHED_TRANSACTION_SCOPES.get(scope)
-    if state is None or not state._active:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    return state
+        def __exit__(
+            self,
+            exception_type: type[BaseException] | None,
+            _exception: BaseException | None,
+            _traceback: Any,
+        ) -> bool:
+            request = requests.pop(self, None)
+            if request is None or not request.entered:
+                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+            complete_scope(request.scope, commit=exception_type is None)
+            return False
 
+    def attached_immediate_transaction_scope(
+        *, main_database: Path, continuity_database: Path
+    ) -> ScopeContext:
+        context = ScopeContext()
+        requests[context] = ContextRequest(
+            _AttachedTransactionScope(), main_database, continuity_database
+        )
+        return context
 
-def _require_active_attached_scope(
-    scope: object, continuity_database: Path
-) -> sqlite3.Connection:
-    """Prove scope identity, transaction liveness, and fixed storage bindings."""
+    def publish_attached_exact_in_transaction(
+        scope: _AttachedTransactionScope,
+        *,
+        continuity_database: Path,
+        expected_frozen: ContinuityAttempt,
+        view: FrozenView,
+    ) -> _AttachedPublication:
+        """Publish exact C evidence without controlling the lexical root txn."""
 
-    state = _state_for_attached_scope(scope)
-    connection = state._connection
-    try:
-        requested_continuity = continuity_database.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    if (
-        requested_continuity != state._continuity_database
-        or state._transaction_control_attempted
-    ):
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    _require_attached_transaction_preconditions(
-        connection,
-        state._continuity_database,
-        expected_main_database=state._main_database,
+        state = scopes.get(scope) if type(scope) is _AttachedTransactionScope else None
+        validate_scope(scope, state, continuity_database)
+        assert state is not None
+        connection = state.connection
+        original_row_factory = connection.row_factory
+        connection.row_factory = sqlite3.Row
+        try:
+            _verify_v3_schema(connection, schema="continuity")
+            if type(expected_frozen) is not ContinuityAttempt or type(view) is not FrozenView:
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+            if (
+                expected_frozen.state != "frozen"
+                or expected_frozen.view_id != view.view_id
+                or expected_frozen.key != view.key
+            ):
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+
+            persisted_view = _attached_exact_view(connection, expected_frozen.key, view)
+            if persisted_view != view:
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+            frozen_receipt = _attached_exact_receipt(
+                connection, expected_frozen.key, view.view_id, "frozen"
+            )
+            if expected_frozen.receipt_hash != frozen_receipt.receipt_hash:
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+            history = _attached_attempt_history(connection, expected_frozen.key)
+            if not history:
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+            current = history[-1]
+
+            if current.state == "published":
+                published_receipt = _attached_exact_receipt(
+                    connection, expected_frozen.key, view.view_id, "published"
+                )
+                pointer = _attached_exact_pointer(connection, expected_frozen.key)
+                if (
+                    current.fence_epoch != expected_frozen.fence_epoch
+                    or current.view_id != view.view_id
+                    or current.receipt_hash != published_receipt.receipt_hash
+                    or len(history) < 2
+                    or history[-2] != expected_frozen
+                    or pointer is None
+                    or pointer.view_id != view.view_id
+                    or pointer.fence_epoch != expected_frozen.fence_epoch
+                ):
+                    raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+                return _AttachedPublication(current, pointer, published_receipt)
+            if current != expected_frozen:
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+            if _attached_exact_pointer(connection, expected_frozen.key) is not None:
+                raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+
+            savepoint = f"continuity_attached_publication_{secrets.token_hex(16)}"
+            savepoint_open = False
+            try:
+                connection.execute(f"SAVEPOINT {savepoint}")
+                savepoint_open = True
+                published_receipt = ContinuityReceipt.create(
+                    key=expected_frozen.key, view_id=view.view_id, kind="published"
+                )
+                _insert_or_prove_attached_receipt(connection, published_receipt)
+                pointer = _advance_attached_pointer(
+                    connection, expected_frozen.key, view, expected_frozen.fence_epoch
+                )
+                terminal = _append_attached_published_attempt(
+                    connection, expected_frozen, published_receipt
+                )
+                if _attached_exact_pointer(connection, expected_frozen.key) != pointer:
+                    raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
+                validate_scope(scope, state, continuity_database)
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                savepoint_open = False
+                return _AttachedPublication(terminal, pointer, published_receipt)
+            except Exception:
+                if savepoint_open:
+                    try:
+                        connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    except sqlite3.Error as rollback_error:
+                        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from rollback_error
+                raise
+        except ContinuityStoreError:
+            raise
+        except (sqlite3.Error, OSError, RuntimeError) as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        except (ContinuityError, KeyError, TypeError, ValueError) as error:
+            raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT") from error
+        finally:
+            connection.row_factory = original_row_factory
+
+    def apply_attached_projection_marker(
+        scope: _AttachedTransactionScope, command: _AttachedProjectionMarker
+    ) -> None:
+        """Apply the one closed CP-E O finalization command with no capability."""
+
+        if type(command) is not _AttachedProjectionMarker or type(command.marker) is not str:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        state = scopes.get(scope) if type(scope) is _AttachedTransactionScope else None
+        if state is None:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        validate_scope(scope, state, state.continuity_database)
+        try:
+            state.connection.execute(
+                "INSERT INTO main.projections(marker) VALUES(?)", (command.marker,)
+            )
+        except sqlite3.Error as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+
+    def open_attached_scope_savepoint(
+        scope: _AttachedTransactionScope,
+    ) -> _AttachedScopeSavepoint:
+        """Open a module-generated savepoint and return only its opaque token."""
+
+        state = scopes.get(scope) if type(scope) is _AttachedTransactionScope else None
+        if state is None:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        validate_scope(scope, state, state.continuity_database)
+        token = _AttachedScopeSavepoint()
+        name = f"continuity_scope_savepoint_{secrets.token_hex(16)}"
+        try:
+            state.connection.execute(f"SAVEPOINT {name}")
+        except sqlite3.Error as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        savepoints[token] = SavepointState(scope, state, name)
+        state.savepoints.append(token)
+        return token
+
+    def rollback_attached_scope_savepoint(token: _AttachedScopeSavepoint) -> None:
+        """Roll back the current opaque module savepoint without exposing its name."""
+
+        token_state = savepoints.get(token) if type(token) is _AttachedScopeSavepoint else None
+        if (
+            token_state is None
+            or not token_state.active
+            or not token_state.scope_state.savepoints
+            or token_state.scope_state.savepoints[-1] is not token
+            or scopes.get(token_state.scope) is not token_state.scope_state
+        ):
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        validate_scope(
+            token_state.scope,
+            token_state.scope_state,
+            token_state.scope_state.continuity_database,
+        )
+        try:
+            token_state.scope_state.connection.execute(
+                f"ROLLBACK TO SAVEPOINT {token_state.name}"
+            )
+        except sqlite3.Error as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+
+    def release_attached_scope_savepoint(token: _AttachedScopeSavepoint) -> None:
+        """Release the current opaque module savepoint without exposing its name."""
+
+        token_state = savepoints.get(token) if type(token) is _AttachedScopeSavepoint else None
+        if (
+            token_state is None
+            or not token_state.active
+            or not token_state.scope_state.savepoints
+            or token_state.scope_state.savepoints[-1] is not token
+            or scopes.get(token_state.scope) is not token_state.scope_state
+        ):
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        validate_scope(
+            token_state.scope,
+            token_state.scope_state,
+            token_state.scope_state.continuity_database,
+        )
+        try:
+            token_state.scope_state.connection.execute(
+                f"RELEASE SAVEPOINT {token_state.name}"
+            )
+        except sqlite3.Error as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        invalidate_savepoint(token, token_state)
+
+    return (
+        attached_immediate_transaction_scope,
+        publish_attached_exact_in_transaction,
+        apply_attached_projection_marker,
+        open_attached_scope_savepoint,
+        rollback_attached_scope_savepoint,
+        release_attached_scope_savepoint,
     )
-    return connection
 
 
-def _apply_attached_projection_marker(
-    scope: _AttachedTransactionScope, command: _AttachedProjectionMarker
-) -> None:
-    """Insert the one fixed CP-E O finalization marker without capability output."""
-
-    if type(command) is not _AttachedProjectionMarker or type(command.marker) is not str:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    state = _state_for_attached_scope(scope)
-    connection = _require_active_attached_scope(scope, state._continuity_database)
-    connection.execute("INSERT INTO main.projections(marker) VALUES(?)", (command.marker,))
-
-
-def _open_attached_scope_savepoint(
-    scope: _AttachedTransactionScope,
-) -> _AttachedScopeSavepoint:
-    """Open one module-named nested savepoint and return its opaque token."""
-
-    state = _state_for_attached_scope(scope)
-    connection = _require_active_attached_scope(scope, state._continuity_database)
-    token = _AttachedScopeSavepoint()
-    name = f"continuity_scope_savepoint_{secrets.token_hex(16)}"
-    try:
-        connection.execute(f"SAVEPOINT {name}")
-    except sqlite3.Error as error:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    _ATTACHED_SCOPE_SAVEPOINTS[token] = _AttachedScopeSavepointState(
-        scope, state, name
-    )
-    state._savepoints.append(token)
-    return token
-
-
-def _rollback_attached_scope_savepoint(
-    token: _AttachedScopeSavepoint,
-) -> None:
-    """Roll back through one opaque module-named nested savepoint."""
-
-    state = _state_for_attached_scope_savepoint(token)
-    connection = _require_active_attached_scope(
-        state._scope, state._scope_state._continuity_database
-    )
-    try:
-        connection.execute(f"ROLLBACK TO SAVEPOINT {state._name}")
-    except sqlite3.Error as error:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-
-
-def _release_attached_scope_savepoint(
-    token: _AttachedScopeSavepoint,
-) -> None:
-    """Release one opaque module-named nested savepoint."""
-
-    state = _state_for_attached_scope_savepoint(token)
-    connection = _require_active_attached_scope(
-        state._scope, state._scope_state._continuity_database
-    )
-    try:
-        connection.execute(f"RELEASE SAVEPOINT {state._name}")
-    except sqlite3.Error as error:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    _invalidate_attached_scope_savepoint(token, state)
-
-
-def _state_for_attached_scope_savepoint(
-    token: object,
-) -> _AttachedScopeSavepointState:
-    """Resolve only a live opaque token held by the active scope registry."""
-
-    if type(token) is not _AttachedScopeSavepoint:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    state = _ATTACHED_SCOPE_SAVEPOINTS.get(token)
-    if (
-        state is None
-        or not state._active
-        or not state._scope_state._active
-        or not state._scope_state._savepoints
-        or state._scope_state._savepoints[-1] is not token
-        or _ATTACHED_TRANSACTION_SCOPES.get(state._scope) is not state._scope_state
-    ):
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    return state
-
-
-def _invalidate_attached_scope_savepoint(
-    token: _AttachedScopeSavepoint, state: _AttachedScopeSavepointState
-) -> None:
-    """Forget one released opaque token without emitting more SQLite SQL."""
-
-    state._active = False
-    _ATTACHED_SCOPE_SAVEPOINTS.pop(token, None)
-    state._scope_state._savepoints.pop()
-
-
-def _invalidate_attached_scope_savepoints(
-    scope_state: _AttachedTransactionScopeState,
-) -> None:
-    """Invalidate every token when its root scope begins its terminal transition."""
-
-    for token in tuple(scope_state._savepoints):
-        state = _ATTACHED_SCOPE_SAVEPOINTS.pop(token, None)
-        if state is not None:
-            state._active = False
-    scope_state._savepoints.clear()
+(
+    _attached_immediate_transaction_scope,
+    _publish_attached_exact_in_transaction,
+    _apply_attached_projection_marker,
+    _open_attached_scope_savepoint,
+    _rollback_attached_scope_savepoint,
+    _release_attached_scope_savepoint,
+) = _build_attached_scope_api()
+del _build_attached_scope_api
 
 
 def _require_attached_transaction_preconditions(
