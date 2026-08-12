@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
+import os
 import secrets
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -61,10 +64,15 @@ class _AttachedScopeSavepoint:
 
 
 @dataclass(frozen=True, slots=True)
-class _AttachedProjectionMarker:
-    """The sole CP-E main-finalization relation available to an attached scope."""
+class _LocalDatabaseEvidence:
+    """Recheckable local-file identity, never a live SQLite capability."""
 
-    marker: str
+    path: Path
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 _V1_TABLE_SQL = {
     "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
@@ -321,6 +329,181 @@ def _require_delete_journal_invariant(database: Path) -> None:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     for sidecar in _wal_sidecars(database):
         _require_absent(sidecar)
+
+
+_WINDOWS_LOCAL_DRIVE_TYPES = frozenset((2, 3, 6))
+_WINDOWS_REPARSE_POINT = 0x0400
+
+
+def _require_reparse_free_path(path: Path) -> Path:
+    """Reject lexical links/reparse components before a database path is resolved."""
+
+    try:
+        lexical = Path(os.path.abspath(path))
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    if os.name == "nt" and (not lexical.drive or lexical.drive.startswith("\\\\")):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    current = lexical
+    while True:
+        try:
+            status = os.lstat(current)
+            mode = status.st_mode
+            attributes = getattr(status, "st_file_attributes", 0)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        if (
+            type(mode) is not int
+            or type(attributes) is not int
+            or stat.S_ISLNK(mode)
+            or attributes & _WINDOWS_REPARSE_POINT
+        ):
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        if current == current.parent:
+            return lexical
+        current = current.parent
+
+
+def _require_local_volume(path: Path) -> None:
+    """Require a positively classified local Windows volume before SQLite opens."""
+
+    try:
+        platform = os.name
+        drive = path.drive
+    except AttributeError as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    if platform != "nt":
+        # The stdlib does not provide an equivalent portable local-versus-
+        # remote filesystem classifier.  This attached atomic scope therefore
+        # fails closed rather than treating a matching st_dev as local proof.
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    if not isinstance(drive, str) or not drive or drive.startswith("\\\\"):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    try:
+        drive_type = ctypes.windll.kernel32.GetDriveTypeW(path.anchor)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    if type(drive_type) is not int or drive_type not in _WINDOWS_LOCAL_DRIVE_TYPES:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+
+
+def _local_database_evidence(database: Path) -> _LocalDatabaseEvidence:
+    """Resolve one regular, non-reparse local database into stable stat evidence."""
+
+    lexical = _require_reparse_free_path(database)
+    try:
+        resolved = lexical.resolve(strict=True)
+        resolved_lstat = os.lstat(resolved)
+        resolved_stat = os.stat(resolved)
+        resolved_stat_mode = resolved_stat.st_mode
+        resolved_lstat_mode = resolved_lstat.st_mode
+        resolved_stat_device = resolved_stat.st_dev
+        resolved_stat_inode = resolved_stat.st_ino
+        resolved_lstat_device = resolved_lstat.st_dev
+        resolved_lstat_inode = resolved_lstat.st_ino
+        resolved_stat_size = resolved_stat.st_size
+        resolved_stat_mtime_ns = resolved_stat.st_mtime_ns
+        resolved_stat_ctime_ns = resolved_stat.st_ctime_ns
+        resolved_lstat_attributes = getattr(resolved_lstat, "st_file_attributes", 0)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    _require_local_volume(resolved)
+    if (
+        type(resolved_stat_mode) is not int
+        or type(resolved_lstat_mode) is not int
+        or type(resolved_lstat_attributes) is not int
+        or not stat.S_ISREG(resolved_stat_mode)
+        or stat.S_ISLNK(resolved_lstat_mode)
+        or resolved_lstat_attributes & _WINDOWS_REPARSE_POINT
+        or type(resolved_stat_device) is not int
+        or type(resolved_stat_inode) is not int
+        or type(resolved_lstat_device) is not int
+        or type(resolved_lstat_inode) is not int
+        or type(resolved_stat_size) is not int
+        or type(resolved_stat_mtime_ns) is not int
+        or type(resolved_stat_ctime_ns) is not int
+        or resolved_stat_device < 0
+        or resolved_stat_inode <= 0
+        or resolved_stat_size < 0
+        or (resolved_lstat_device, resolved_lstat_inode)
+        != (resolved_stat_device, resolved_stat_inode)
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    return _LocalDatabaseEvidence(
+        resolved,
+        resolved_stat_device,
+        resolved_stat_inode,
+        resolved_stat_size,
+        resolved_stat_mtime_ns,
+        resolved_stat_ctime_ns,
+    )
+
+
+def _same_local_database_evidence(
+    main_database: Path, continuity_database: Path
+) -> tuple[_LocalDatabaseEvidence, _LocalDatabaseEvidence]:
+    """Prove two distinct resolved databases inhabit one local filesystem device."""
+
+    main = _local_database_evidence(main_database)
+    continuity = _local_database_evidence(continuity_database)
+    if (
+        main.device != continuity.device
+        or (main.device, main.inode) == (continuity.device, continuity.inode)
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    return main, continuity
+
+
+def _require_same_local_database_recheck(
+    expected_main: _LocalDatabaseEvidence,
+    expected_continuity: _LocalDatabaseEvidence,
+) -> tuple[_LocalDatabaseEvidence, _LocalDatabaseEvidence]:
+    """Reread both path identities; this is a recheck, not a held-handle claim."""
+
+    current_main, current_continuity = _same_local_database_evidence(
+        expected_main.path, expected_continuity.path
+    )
+    if (
+        current_main != expected_main
+        or current_continuity != expected_continuity
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    return current_main, current_continuity
+
+
+def _require_open_main_database_recheck(
+    connection: sqlite3.Connection,
+    expected_main: _LocalDatabaseEvidence,
+    expected_continuity: _LocalDatabaseEvidence,
+) -> None:
+    """Recheck immediately after main opens and before an ATTACH can occur.
+
+    CPython's sqlite3 API does not expose a held OS file handle/identity for
+    the opened database.  The initial pre-open proof plus this post-open
+    recheck narrows that handoff; the attached pre-BEGIN and typed-operation
+    checks below repeat the same evidence rather than claiming race freedom.
+    """
+
+    current_main, _current_continuity = _require_same_local_database_recheck(
+        expected_main, expected_continuity
+    )
+    try:
+        databases = tuple(connection.execute("PRAGMA database_list"))
+        attached = {
+            row[1]: row[2]
+            for row in databases
+            if len(row) == 3 and isinstance(row[1], str) and isinstance(row[2], str)
+        }
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    if set(attached) != {"main"}:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    try:
+        attached_main = _local_database_evidence(Path(attached["main"]))
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+    if attached_main != current_main:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
 
 
 def _journal_mode(connection: sqlite3.Connection) -> str:
@@ -896,11 +1079,13 @@ class ContinuityStore:
 
 
 def _build_attached_scope_api() -> tuple[Any, ...]:
-    """Create the closed attached-finalizer API around an unreachable registry.
+    """Create the closed attached-finalizer API around a named-API-hidden registry.
 
     The returned callables deliberately capture the live connection and all
     state in this lexical registry.  No callable installed in the module can
     resolve a scope/token into a connection, state object, cursor, or row.
+    The boundary is the ordinary intended Python API: hostile same-process
+    reflection of function closure cells is explicitly out of this contract.
     """
 
     @dataclass(slots=True)
@@ -908,6 +1093,8 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
         connection: sqlite3.Connection
         main_database: Path
         continuity_database: Path
+        main_evidence: _LocalDatabaseEvidence
+        continuity_evidence: _LocalDatabaseEvidence
         active: bool = True
         allow_transaction_control: bool = False
         transaction_control_attempted: bool = False
@@ -949,6 +1136,9 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
             or state.transaction_control_attempted
         ):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+        _require_same_local_database_recheck(
+            state.main_evidence, state.continuity_evidence
+        )
         _require_attached_transaction_preconditions(
             state.connection,
             state.continuity_database,
@@ -1020,13 +1210,11 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
         state: ScopeState | None = None
         opened = False
         try:
-            try:
-                expected_main = main_database.resolve(strict=True)
-                expected_continuity = continuity_database.resolve(strict=True)
-            except (OSError, RuntimeError) as error:
-                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-            if not expected_main.is_file() or not expected_continuity.is_file():
-                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+            expected_main_evidence, expected_continuity_evidence = (
+                _same_local_database_evidence(main_database, continuity_database)
+            )
+            expected_main = expected_main_evidence.path
+            expected_continuity = expected_continuity_evidence.path
             _require_delete_journal_invariant(expected_main)
             _require_delete_journal_invariant(expected_continuity)
             connection = sqlite3.connect(
@@ -1034,11 +1222,20 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
                 uri=True,
                 timeout=0,
             )
+            _require_open_main_database_recheck(
+                connection, expected_main_evidence, expected_continuity_evidence
+            )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA main.synchronous=FULL")
+            _require_same_local_database_recheck(
+                expected_main_evidence, expected_continuity_evidence
+            )
             connection.execute("ATTACH DATABASE ? AS continuity", (str(expected_continuity),))
             connection.execute("PRAGMA continuity.synchronous=FULL")
+            _require_same_local_database_recheck(
+                expected_main_evidence, expected_continuity_evidence
+            )
             _require_attached_connection_preconditions(
                 connection,
                 expected_continuity,
@@ -1047,7 +1244,16 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
             if connection.in_transaction:
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
             connection.execute("BEGIN IMMEDIATE")
-            state = ScopeState(connection, expected_main, expected_continuity)
+            _require_same_local_database_recheck(
+                expected_main_evidence, expected_continuity_evidence
+            )
+            state = ScopeState(
+                connection,
+                expected_main,
+                expected_continuity,
+                expected_main_evidence,
+                expected_continuity_evidence,
+            )
             scopes[scope] = state
 
             def authorize(
@@ -1235,24 +1441,6 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
         finally:
             connection.row_factory = original_row_factory
 
-    def apply_attached_projection_marker(
-        scope: _AttachedTransactionScope, command: _AttachedProjectionMarker
-    ) -> None:
-        """Apply the one closed CP-E O finalization command with no capability."""
-
-        if type(command) is not _AttachedProjectionMarker or type(command.marker) is not str:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-        state = scopes.get(scope) if type(scope) is _AttachedTransactionScope else None
-        if state is None:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-        validate_scope(scope, state, state.continuity_database)
-        try:
-            state.connection.execute(
-                "INSERT INTO main.projections(marker) VALUES(?)", (command.marker,)
-            )
-        except sqlite3.Error as error:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-
     def open_attached_scope_savepoint(
         scope: _AttachedTransactionScope,
     ) -> _AttachedScopeSavepoint:
@@ -1324,7 +1512,6 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
     return (
         attached_immediate_transaction_scope,
         publish_attached_exact_in_transaction,
-        apply_attached_projection_marker,
         open_attached_scope_savepoint,
         rollback_attached_scope_savepoint,
         release_attached_scope_savepoint,
@@ -1334,7 +1521,6 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
 (
     _attached_immediate_transaction_scope,
     _publish_attached_exact_in_transaction,
-    _apply_attached_projection_marker,
     _open_attached_scope_savepoint,
     _rollback_attached_scope_savepoint,
     _release_attached_scope_savepoint,
@@ -1365,40 +1551,51 @@ def _require_attached_connection_preconditions(
     *,
     expected_main_database: Path | None = None,
 ) -> None:
-    """Prove fixed C attachment and caller-set physical connection invariants."""
+    """Prove fixed aliases and repeat local-volume evidence after ATTACH.
+
+    This is deliberately a recheck-level proof: stdlib sqlite exposes no held
+    OS handle identity to bind a pathname check to SQLite's opened file.  The
+    scope validates before open, after main open/before ATTACH, after ATTACH/
+    before BEGIN, and again before every typed C operation.
+    """
 
     try:
-        expected = continuity_database.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
+        databases = tuple(connection.execute("PRAGMA database_list"))
+        attached = {
+            row["name"]: row["file"]
+            for row in databases
+            if isinstance(row["name"], str) and isinstance(row["file"], str)
+        }
+    except (sqlite3.Error, KeyError, TypeError, ValueError) as error:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    if not expected.is_file():
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    databases = tuple(connection.execute("PRAGMA database_list"))
-    attached = {
-        row["name"]: row["file"]
-        for row in databases
-        if isinstance(row["name"], str) and isinstance(row["file"], str)
-    }
     if set(attached) != {"main", "continuity"}:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     try:
-        attached_main_database = Path(attached["main"]).resolve(strict=True)
-        attached_continuity = Path(attached["continuity"]).resolve(strict=True)
-    except (KeyError, OSError, RuntimeError) as error:
+        expected_main_source = (
+            expected_main_database
+            if expected_main_database is not None
+            else Path(attached["main"])
+        )
+        expected_main, expected_continuity = _same_local_database_evidence(
+            expected_main_source, continuity_database
+        )
+        attached_main, attached_continuity = _same_local_database_evidence(
+            Path(attached["main"]), Path(attached["continuity"])
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    if attached_continuity != expected or not attached_main_database.is_file():
+    if (
+        attached_main != expected_main
+        or attached_continuity != expected_continuity
+    ):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    if expected_main_database is not None:
-        try:
-            resolved_main = expected_main_database.resolve(strict=True)
-        except (OSError, RuntimeError) as error:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-        if resolved_main != attached_main_database:
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
     if foreign_keys is None or foreign_keys[0] != 1:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    for schema, database in (("main", attached_main_database), ("continuity", expected)):
+    for schema, database in (
+        ("main", attached_main.path),
+        ("continuity", attached_continuity.path),
+    ):
         _require_delete_journal_invariant(database)
         if _journal_mode_for_schema(connection, schema) != "delete":
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
