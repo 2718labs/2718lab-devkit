@@ -29,6 +29,7 @@ from .models import (
 _SCHEMA_VERSION = "3"
 _IMMUTABLE_TABLES = ("continuity_keys", "views", "entries", "receipts", "attempts")
 _TRUSTED_SCHEMAS = frozenset(("main", "continuity"))
+_ATTACHED_TRANSACTION_PROOF_NONCE = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +48,17 @@ class _AttachedPublication:
     attempt: ContinuityAttempt
     pointer: ContinuityPointer
     receipt: ContinuityReceipt
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _AttachedTransactionProof:
+    """Opaque evidence that this exact connection began the attached UoW."""
+
+    _connection: sqlite3.Connection
+    _connection_identity: int
+    _nonce: object
+
+
 _V1_TABLE_SQL = {
     "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
     "views": "CREATE TABLE views (view_id TEXT PRIMARY KEY NOT NULL, key_hash TEXT UNIQUE NOT NULL, manifest_hash TEXT NOT NULL, cas_root_hash TEXT NOT NULL, manifest_json TEXT NOT NULL)",
@@ -882,20 +894,22 @@ def _publish_attached_exact_in_transaction(
     continuity_database: Path,
     expected_frozen: ContinuityAttempt,
     view: FrozenView,
+    transaction_proof: _AttachedTransactionProof,
 ) -> _AttachedPublication:
     """Publish one exact frozen view through the caller-owned attached transaction.
 
-    The Runtime finalizer owns the outer ``BEGIN IMMEDIATE`` over ``main`` and
-    the already attached, fixed ``continuity`` alias.  This helper deliberately
-    never owns that transaction: its private savepoint only removes a partial
-    Continuity prefix when a later C write fails.
+    The caller must first obtain an opaque proof at the actual attached
+    ``BEGIN IMMEDIATE`` boundary.  This helper deliberately never begins,
+    commits, or rolls back that outer transaction: its private savepoint only
+    removes a partial Continuity prefix when a later C write fails.
     """
 
     original_row_factory = connection.row_factory
     connection.row_factory = sqlite3.Row
     try:
-        _require_attached_transaction_preconditions(connection, continuity_database)
-        _require_attached_immediate_lock(continuity_database)
+        _require_attached_transaction_proof(
+            connection, continuity_database, transaction_proof
+        )
         _verify_v3_schema(connection, schema="continuity")
         if type(expected_frozen) is not ContinuityAttempt or type(view) is not FrozenView:
             raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
@@ -958,7 +972,9 @@ def _publish_attached_exact_in_transaction(
             )
             if _attached_exact_pointer(connection, expected_frozen.key) != pointer:
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
-            _require_attached_transaction_preconditions(connection, continuity_database)
+            _require_attached_transaction_proof(
+                connection, continuity_database, transaction_proof
+            )
             connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             savepoint_open = False
             return _AttachedPublication(terminal, pointer, published_receipt)
@@ -980,13 +996,78 @@ def _publish_attached_exact_in_transaction(
         connection.row_factory = original_row_factory
 
 
+def _begin_attached_immediate_transaction(
+    connection: sqlite3.Connection, *, continuity_database: Path
+) -> _AttachedTransactionProof:
+    """Begin and prove the caller's one attached ``BEGIN IMMEDIATE`` boundary.
+
+    The successful return is an opaque capability bound to this exact live
+    connection.  If validation after the new begin fails, this helper rolls
+    back only the transaction it just created; it never rolls back a caller
+    transaction that was already active.
+    """
+
+    if connection.in_transaction:
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    original_row_factory = connection.row_factory
+    began = False
+    connection.row_factory = sqlite3.Row
+    try:
+        _require_attached_connection_preconditions(connection, continuity_database)
+        connection.execute("BEGIN IMMEDIATE")
+        began = True
+        _require_attached_transaction_preconditions(connection, continuity_database)
+        _verify_v3_schema(connection, schema="continuity")
+        return _AttachedTransactionProof(
+            connection, id(connection), _ATTACHED_TRANSACTION_PROOF_NONCE
+        )
+    except Exception as error:
+        if began and connection.in_transaction:
+            try:
+                connection.rollback()
+            except sqlite3.Error as rollback_error:
+                raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from rollback_error
+        if isinstance(error, ContinuityStoreError):
+            raise
+        if isinstance(error, (sqlite3.Error, OSError, RuntimeError)):
+            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
+        raise
+    finally:
+        connection.row_factory = original_row_factory
+
+
+def _require_attached_transaction_proof(
+    connection: sqlite3.Connection,
+    continuity_database: Path,
+    transaction_proof: _AttachedTransactionProof,
+) -> None:
+    """Reject anything not minted at this connection's exact begin boundary."""
+
+    if (
+        type(transaction_proof) is not _AttachedTransactionProof
+        or transaction_proof._connection is not connection
+        or transaction_proof._connection_identity != id(connection)
+        or transaction_proof._nonce is not _ATTACHED_TRANSACTION_PROOF_NONCE
+    ):
+        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    _require_attached_transaction_preconditions(connection, continuity_database)
+
+
 def _require_attached_transaction_preconditions(
     connection: sqlite3.Connection, continuity_database: Path
 ) -> None:
-    """Prove the fixed C alias and caller-set connection/storage invariants."""
+    """Prove an active fixed-alias transaction has all storage invariants."""
 
     if not connection.in_transaction:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
+    _require_attached_connection_preconditions(connection, continuity_database)
+
+
+def _require_attached_connection_preconditions(
+    connection: sqlite3.Connection, continuity_database: Path
+) -> None:
+    """Prove fixed C attachment and caller-set physical connection invariants."""
+
     try:
         expected = continuity_database.resolve(strict=True)
     except (OSError, RuntimeError) as error:
@@ -1018,43 +1099,6 @@ def _require_attached_transaction_preconditions(
         synchronous = connection.execute(f"PRAGMA {schema}.synchronous").fetchone()
         if synchronous is None or synchronous[0] != 2:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-
-
-def _require_attached_immediate_lock(continuity_database: Path) -> None:
-    """Prove the caller's attached Continuity database is already write-locked.
-
-    The stdlib exposes only ``Connection.in_transaction`` and cannot tell a
-    deferred transaction from ``BEGIN IMMEDIATE``.  A short independent
-    ``BEGIN IMMEDIATE`` probe closes that gap without changing caller state or
-    database contents: it must be denied by the caller's C reservation.
-    """
-
-    probe: sqlite3.Connection | None = None
-    try:
-        probe = sqlite3.connect(
-            f"file:{continuity_database.resolve(strict=True).as_posix()}?mode=rw&cache=private",
-            uri=True,
-            timeout=0,
-        )
-        try:
-            probe.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError as error:
-            code = getattr(error, "sqlite_errorcode", None)
-            if isinstance(code, int) and code & 0xFF in {
-                sqlite3.SQLITE_BUSY,
-                sqlite3.SQLITE_LOCKED,
-            }:
-                return
-            raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-        probe.rollback()
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-    except ContinuityStoreError:
-        raise
-    except (sqlite3.Error, OSError, RuntimeError) as error:
-        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    finally:
-        if probe is not None:
-            probe.close()
 
 
 def _journal_mode_for_schema(connection: sqlite3.Connection, schema: str) -> str:
