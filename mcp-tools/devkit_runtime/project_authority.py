@@ -19,6 +19,7 @@ _PROJECT_FENCE_DOMAIN = "2718lab/project-fence/v1"
 _PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
 _PROJECT_FENCE_BINDING_VERSION = 1
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+_SHA256_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CONSTRUCTION_TOKEN = object()
 
 
@@ -248,7 +249,7 @@ def _derive_project_fence(authority: ProjectAuthority) -> ProjectFence:
         "physical_binding": receipt.physical_binding._identity_payload(),
         "project_id": receipt.project_id,
     }
-    binding_digest = hashlib.sha256(
+    binding_digest = "sha256:" + hashlib.sha256(
         _canonical_json(material).encode("ascii")
     ).hexdigest()
     return _new_project_fence(
@@ -311,7 +312,7 @@ def _validate_project_fence_fields(
         or type(project_id) is not str
         or _SHA256_HEX.fullmatch(project_id) is None
         or type(binding_digest) is not str
-        or _SHA256_HEX.fullmatch(binding_digest) is None
+        or _SHA256_HASH.fullmatch(binding_digest) is None
         or type(binding_version) is not int
         or binding_version != _PROJECT_FENCE_BINDING_VERSION
     ):

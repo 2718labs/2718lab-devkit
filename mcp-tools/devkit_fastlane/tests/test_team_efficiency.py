@@ -689,10 +689,13 @@ class TeamEfficiencyTests(unittest.TestCase):
         }
 
     def project_binding(self, helper, *, project_id: str | None = None) -> dict[str, object]:
+        logical_project = self.project if project_id is None else project_id
         return {
-            "project_id": self.project if project_id is None else project_id,
+            "project_id": hashlib.sha256(
+                f"team-efficiency/project-fence-project-id/v1\0{logical_project}".encode()
+            ).hexdigest(),
             "binding_digest": helper._sha256_json(
-                {"project_id": self.project if project_id is None else project_id}
+                {"project_id": logical_project}
             ),
             "binding_version": 1,
             "workspace_id": helper._sha256_json({"workspace": self.project}),
@@ -2428,6 +2431,37 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper._sha256_json(package),
             first["package_payload_hash"],
         )
+
+    def test_project_fence_wire_contract_matches_runtime_authority(self) -> None:
+        helper = load_efficiency()
+        from devkit_runtime.project_authority import ProjectAuthority
+
+        project_root = self.temp / "authority-project"
+        project_root.mkdir()
+        runtime_fence = ProjectAuthority.issue(project_root).project_fence()
+
+        parsed = helper._validated_project_fence(
+            {
+                "schema": runtime_fence.schema,
+                "project_id": runtime_fence.project_id,
+                "binding_digest": runtime_fence.binding_digest,
+                "binding_version": runtime_fence.binding_version,
+            },
+            "project_fence",
+        )
+
+        self.assertEqual(runtime_fence.project_id, parsed["project_id"])
+        self.assertEqual(runtime_fence.binding_digest, parsed["binding_digest"])
+        with self.assertRaisesRegex(ValueError, "project_id is invalid"):
+            helper._validated_project_fence(
+                {**parsed, "project_id": "caller-selected-project"},
+                "project_fence",
+            )
+        with self.assertRaisesRegex(ValueError, "binding_version is invalid"):
+            helper._validated_project_fence(
+                {**parsed, "binding_version": 2},
+                "project_fence",
+            )
 
     def test_fast_lane_v2_execution_project_alias_stays_inert_without_host_bridge(
         self,

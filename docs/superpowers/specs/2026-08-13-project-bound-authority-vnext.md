@@ -66,9 +66,9 @@ Future stores use one canonical, path-free project fence:
 
 ```text
 schema = team-efficiency/project-fence-v1
-project_id
-binding_digest
-binding_version
+project_id = lowercase 64-hex
+binding_digest = sha256: lowercase 64-hex
+binding_version = 1
 ```
 
 It is derived only after the host-admitted authority is physically revalidated.

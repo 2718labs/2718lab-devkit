@@ -80,7 +80,7 @@ def test_project_fence_is_canonical_and_deterministic_across_reopen(
         },
         "project_id": issued.project_id,
     }
-    expected_digest = hashlib.sha256(
+    expected_digest = "sha256:" + hashlib.sha256(
         json.dumps(
             expected_material,
             ensure_ascii=True,
