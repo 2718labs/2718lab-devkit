@@ -5,9 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import devkit_runtime.uow as uow_module
 from devkit_atlas.models import AtlasError
