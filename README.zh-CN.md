@@ -1,16 +1,16 @@
 [English](README.md)
 
-# 2718lab DevKit —— MCP-only v1.0.0-rc4
+# 2718lab DevKit —— MCP-only v1.0.0
 
-[![版本](https://img.shields.io/badge/version-v1.0.0--rc4-blue)](./.codex-plugin/plugin.json)
+[![版本](https://img.shields.io/badge/version-v1.0.0-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit 是一个本地、仅 stdio 传输的 MCP 服务器，提供有边界的
 项目索引、Atlas 证据、Relay 生命周期协调和确定性的 Fast Lane 规划。
-本仓库承载版本化的 v1.0.0-rc4 包；已提交的 manifest 和 allowlist 定义
+本仓库承载版本化的 v1.0.0 包；已提交的 manifest 和 allowlist 定义
 公开产物范围，下面的安装、构建和验证章节给出支持的工作流。
 
-RC4 保留刻意 fail-closed 的 Fast Lane 预览。当前公共编译器和 CLI 固定返回
+当前版本保留刻意 fail-closed 的 Fast Lane 预览。公共编译器和 CLI 固定返回
 `NO_SAFE_WORK` 与零 assignments：不会消费 host-status、quota 或实时账号输入，
 也没有 worktree 执行路径。Ultra、实时额度和宿主消费属于未来外部
 Desktop-host bridge 合同的要求；本仓库并未提供该 bridge。
@@ -148,7 +148,7 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0-rc4.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的公共运行面
@@ -245,9 +245,9 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 ## 版本
 
-本仓库代表版本化的 v1.0.0-rc4 包。发布说明见
+本仓库代表版本化的 v1.0.0 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
-和锁定依赖为准。由 tag 触发的发布工作流只会在声明的 gates 通过后发布匹配的
+和锁定依赖为准。由维护者在 main 上触发的发布工作流只会在声明的 gates 通过后发布匹配的
 GitHub Release。
 
 ## 许可证

@@ -1,17 +1,17 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — MCP-only v1.0.0-rc4
+# 2718lab DevKit — MCP-only v1.0.0
 
-[![version](https://img.shields.io/badge/version-v1.0.0--rc4-blue)](./.codex-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-v1.0.0-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit is a local, stdio-only MCP server for bounded project indexing,
 Atlas evidence, Relay lifecycle coordination, and deterministic Fast Lane
-planning. This repository carries the versioned v1.0.0-rc4 package. The
+planning. This repository carries the versioned v1.0.0 package. The
 checked-in manifest and allowlist define the public package surface; the install,
 build, and verification sections below describe the supported workflow.
 
-RC4 retains a deliberately fail-closed Fast Lane preview. The public compiler
+The current release retains a deliberately fail-closed Fast Lane preview. The public compiler
 and CLI return `NO_SAFE_WORK` with zero assignments: they do not consume host
 status, quota, or live-account inputs, and have no worktree execution path.
 Ultra, live quota, and host consumption are future requirements of an external
@@ -163,7 +163,7 @@ handles or falls back to an unrelated local start.
 The allowlisted builder creates a deterministic ZIP outside the plugin source
 tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0-rc4.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
@@ -282,10 +282,10 @@ freeze a transient regression count.
 
 ## Version
 
-This repository represents the versioned v1.0.0-rc4 package. Release notes are
+This repository represents the versioned v1.0.0 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
-artifact allowlist, and locked dependency set. The tag-triggered release
-workflow publishes the matching GitHub Release only after the declared gates
+artifact allowlist, and locked dependency set. The maintainer-dispatched main
+release workflow publishes the matching GitHub Release only after the declared gates
 pass.
 
 ## License

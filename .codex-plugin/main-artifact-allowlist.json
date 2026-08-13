@@ -30,6 +30,7 @@
     "mcp-tools/devkit_atlas",
     "mcp-tools/devkit_relay",
     "mcp-tools/devkit_runtime",
+    "mcp-tools/devkit_continuity",
     "mcp-tools/orchestrator",
     "mcp-tools/project_index"
   ]

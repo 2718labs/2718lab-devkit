@@ -68,6 +68,9 @@ def _build_and_extract_primary_artifact(tmp_path: Path) -> Path:
     assert (
         extracted_root / "mcp-tools" / "devkit_runtime" / "composition.py"
     ).is_file()
+    assert (
+        extracted_root / "mcp-tools" / "devkit_continuity" / "service.py"
+    ).is_file()
     return extracted_root
 
 
