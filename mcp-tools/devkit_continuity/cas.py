@@ -9,7 +9,7 @@ import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 if os.name == "nt":
     import ctypes
@@ -37,7 +37,9 @@ class ContinuityCas:
         self._native_backend = native_backend
 
     @classmethod
-    def open_prepared(cls, root: Path, scratch_root: Path, read_only: bool) -> ContinuityCas:
+    def open_prepared(
+        cls, root: Path, scratch_root: Path, read_only: bool
+    ) -> ContinuityCas:
         if os.name == "nt":
             try:
                 backend = _open_native_backend(root, read_only=read_only)
@@ -60,7 +62,9 @@ class ContinuityCas:
         _validate(content_hash, byte_length, body)
         if self._native_backend is not None:
             try:
-                return self._native_backend.put_verified(content_hash, byte_length, body)
+                return self._native_backend.put_verified(
+                    content_hash, byte_length, body
+                )
             except ContinuityCasError:
                 raise
             except Exception as error:
@@ -81,7 +85,11 @@ class ContinuityCas:
             stage = stage_directory / (
                 content_hash[7:] + "." + secrets.token_hex(16) + ".stage"
             )
-            descriptor = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            descriptor = os.open(
+                stage,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
             stage_owned = True
             try:
                 os.write(descriptor, body)
@@ -113,7 +121,11 @@ class ContinuityCas:
                     raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
 
     def read_verified(self, content_hash: str, byte_length: int) -> bytes:
-        if not is_hash_id(content_hash) or type(byte_length) is not int or byte_length < 0:
+        if (
+            not is_hash_id(content_hash)
+            or type(byte_length) is not int
+            or byte_length < 0
+        ):
             raise ContinuityCasError("CONTINUITY_CAS_INVALID")
         if self._native_backend is not None:
             try:
@@ -150,7 +162,12 @@ class ContinuityCas:
         digest = target.name
         if len(digest) != 64 or target != self._target("sha256:" + digest):
             raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
-        for part in (self.root, self.root / "sha256", target.parent.parent, target.parent):
+        for part in (
+            self.root,
+            self.root / "sha256",
+            target.parent.parent,
+            target.parent,
+        ):
             _safe_root(part, create=False)
 
     @staticmethod
@@ -158,9 +175,7 @@ class ContinuityCas:
         try:
             descriptor = os.open(
                 path,
-                os.O_RDONLY
-                | getattr(os, "O_BINARY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
             )
             try:
                 status = os.fstat(descriptor)
@@ -263,7 +278,9 @@ class _WindowsHandleCasBackend:
         digest = _digest_component(content_hash)
         try:
             with self._tree(digest, create=True) as (handles, staging, target_parent):
-                existing = self._try_read_target(handles, target_parent, digest, content_hash, byte_length)
+                existing = self._try_read_target(
+                    handles, target_parent, digest, content_hash, byte_length
+                )
                 if existing is not None:
                     return content_hash
                 stage = None
@@ -284,7 +301,9 @@ class _WindowsHandleCasBackend:
                     self._read_handle(stage, content_hash, byte_length)
                     self._revalidate_tree(handles)
                     published = self._api.link(stage, target_parent, digest)
-                    expected_identity = getattr(stage, "identity", None) if published else None
+                    expected_identity = (
+                        getattr(stage, "identity", None) if published else None
+                    )
                     self._read_target(
                         handles,
                         target_parent,
@@ -306,19 +325,27 @@ class _WindowsHandleCasBackend:
             raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
 
     def read_verified(self, content_hash: str, byte_length: int) -> bytes:
-        if not is_hash_id(content_hash) or type(byte_length) is not int or byte_length < 0:
+        if (
+            not is_hash_id(content_hash)
+            or type(byte_length) is not int
+            or byte_length < 0
+        ):
             raise ContinuityCasError("CONTINUITY_CAS_INVALID")
         digest = _digest_component(content_hash)
         try:
             with self._tree(digest, create=False) as (handles, _staging, target_parent):
-                return self._read_target(handles, target_parent, digest, content_hash, byte_length)
+                return self._read_target(
+                    handles, target_parent, digest, content_hash, byte_length
+                )
         except ContinuityCasError:
             raise
         except Exception as error:
             raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
 
     @contextmanager
-    def _tree(self, digest: str, *, create: bool) -> Iterator[tuple[tuple[Any, ...], Any | None, Any]]:
+    def _tree(
+        self, digest: str, *, create: bool
+    ) -> Iterator[tuple[tuple[Any, ...], Any | None, Any]]:
         handles: list[Any] = []
         root = self._root_handle
         if root is None:
@@ -380,7 +407,9 @@ class _WindowsHandleCasBackend:
         byte_length: int,
     ) -> bytes | None:
         try:
-            return self._read_target(handles, target_parent, digest, content_hash, byte_length)
+            return self._read_target(
+                handles, target_parent, digest, content_hash, byte_length
+            )
         except FileNotFoundError:
             return None
 
@@ -400,7 +429,10 @@ class _WindowsHandleCasBackend:
         )
         try:
             body = self._read_handle(target, content_hash, byte_length)
-            if expected_identity is not None and getattr(target, "identity", None) != expected_identity:
+            if (
+                expected_identity is not None
+                and getattr(target, "identity", None) != expected_identity
+            ):
                 raise OSError("published CAS target identity changed")
             return body
         finally:
@@ -642,13 +674,15 @@ if os.name == "nt":
                 None,
             )
             value = ctypes.cast(raw, ctypes.c_void_p).value
-            if value in {None, _INVALID_HANDLE_VALUE}:
+            if value is None or value == _INVALID_HANDLE_VALUE:
                 self._raise_last_error()
             handle = _WindowsNativeHandle(int(value), directory=True)
             try:
                 self.revalidate(handle, directory=True)
                 self._check_filesystem(handle)
-                self._root_volume = handle.identity[0] if handle.identity is not None else None
+                self._root_volume = (
+                    handle.identity[0] if handle.identity is not None else None
+                )
                 return handle
             except Exception:
                 self.close(handle)
@@ -668,7 +702,9 @@ if os.name == "nt":
             _require_component(name)
             text = ctypes.create_unicode_buffer(name)
             encoded = name.encode("utf-16-le")
-            unicode_name = _UNICODE_STRING(len(encoded), len(encoded), ctypes.cast(text, wintypes.LPWSTR))
+            unicode_name = _UNICODE_STRING(
+                len(encoded), len(encoded), ctypes.cast(text, wintypes.LPWSTR)
+            )
             attributes = _OBJECT_ATTRIBUTES(
                 ctypes.sizeof(_OBJECT_ATTRIBUTES),
                 wintypes.HANDLE(parent.value),
@@ -694,7 +730,11 @@ if os.name == "nt":
                 desired = _FILE_READ_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE
                 if create:
                     desired |= _FILE_WRITE_DATA | _FILE_WRITE_ATTRIBUTES | _DELETE
-                disposition = _FILE_CREATE if exclusive else (_FILE_OPEN_IF if create else _FILE_OPEN)
+                disposition = (
+                    _FILE_CREATE
+                    if exclusive
+                    else (_FILE_OPEN_IF if create else _FILE_OPEN)
+                )
                 options = (
                     _FILE_NON_DIRECTORY_FILE
                     | _FILE_SYNCHRONOUS_IO_NONALERT
@@ -702,10 +742,16 @@ if os.name == "nt":
                 )
                 if delete_on_close:
                     if not create:
-                        raise OSError("native CAS delete-on-close requires an owned stage")
+                        raise OSError(
+                            "native CAS delete-on-close requires an owned stage"
+                        )
                     options |= _FILE_DELETE_ON_CLOSE
                 file_attributes = _FILE_ATTRIBUTE_NORMAL
-            share = _FILE_SHARE_READ if delete_on_close else _FILE_SHARE_READ | _FILE_SHARE_WRITE
+            share = (
+                _FILE_SHARE_READ
+                if delete_on_close
+                else _FILE_SHARE_READ | _FILE_SHARE_WRITE
+            )
             status = self._nt_create(
                 ctypes.byref(raw),
                 desired,
@@ -727,7 +773,7 @@ if os.name == "nt":
                     raise FileNotFoundError(name)
                 raise _NativeNtStatus(int(status))
             value = ctypes.cast(raw, ctypes.c_void_p).value
-            if value in {None, _INVALID_HANDLE_VALUE}:
+            if value is None or value == _INVALID_HANDLE_VALUE:
                 raise OSError("native returned invalid handle")
             handle = _WindowsNativeHandle(int(value), directory=directory)
             try:
@@ -854,7 +900,9 @@ if os.name == "nt":
                 self._raise_last_error()
             handle.closed = True
 
-        def _inspect(self, handle: _WindowsNativeHandle) -> tuple[tuple[int, bytes], int, bool]:
+        def _inspect(
+            self, handle: _WindowsNativeHandle
+        ) -> tuple[tuple[int, bytes], int, bool]:
             file_id = _FILE_ID_INFO_VALUE()
             attributes = _FILE_ATTRIBUTE_TAG_INFO_VALUE()
             standard = _FILE_STANDARD_INFO_VALUE()
@@ -909,7 +957,7 @@ if os.name == "nt":
                 raise OSError("unsupported CAS filesystem")
 
         @staticmethod
-        def _raise_last_error() -> None:
+        def _raise_last_error() -> NoReturn:
             raise OSError(ctypes.get_last_error(), "native Windows CAS I/O failed")
 
 
@@ -941,7 +989,9 @@ def _open_native_backend(
     api = _load_windows_native_api()
     if api is None:
         return None
-    backend = _WindowsHandleCasBackend(root, api, read_only=read_only, create_root=create_root)
+    backend = _WindowsHandleCasBackend(
+        root, api, read_only=read_only, create_root=create_root
+    )
     try:
         backend.verify_prepared()
         return backend
@@ -951,7 +1001,12 @@ def _open_native_backend(
 
 
 def _validate(content_hash: object, byte_length: object, body: object) -> None:
-    if not is_hash_id(content_hash) or type(byte_length) is not int or byte_length < 0 or type(body) is not bytes:
+    if (
+        not is_hash_id(content_hash)
+        or type(byte_length) is not int
+        or byte_length < 0
+        or type(body) is not bytes
+    ):
         raise ContinuityCasError("CONTINUITY_CAS_INVALID")
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     if digest != content_hash or len(body) != byte_length:
@@ -969,7 +1024,9 @@ def _bootstrap_cas(root: Path, scratch_root: Path) -> ContinuityCas:
             raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE") from error
         if backend is None:
             raise ContinuityCasError("CONTINUITY_CAS_UNAVAILABLE")
-        return ContinuityCas(root, scratch_root, read_only=False, native_backend=backend)
+        return ContinuityCas(
+            root, scratch_root, read_only=False, native_backend=backend
+        )
     _safe_root(root, create=True)
     _safe_root(scratch_root, create=True)
     return ContinuityCas(root, scratch_root, read_only=False)

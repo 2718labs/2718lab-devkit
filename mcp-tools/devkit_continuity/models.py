@@ -58,7 +58,9 @@ class ContinuityKey:
             self.ingestion_key,
         ):
             _require_identifier(value)
-        _require_nonnegative_integer(self.code_task_version, "CODE_TASK_VERSION_INVALID")
+        _require_nonnegative_integer(
+            self.code_task_version, "CODE_TASK_VERSION_INVALID"
+        )
         _require_hash(self.payload_hash)
         _require_hash(self.evidence_binding_hash)
 
@@ -135,7 +137,10 @@ class ChangedNode:
         attributes = _attribute_tuple(self.attributes)
         _require_text(self.extractor_id)
         _require_text(self.extractor_version)
-        if not isinstance(self.provenance, str) or self.provenance not in _PROVENANCE_VALUES:
+        if (
+            not isinstance(self.provenance, str)
+            or self.provenance not in _PROVENANCE_VALUES
+        ):
             raise ContinuityError("NODE_PROVENANCE_INVALID")
         _require_nonnegative_integer(self.start_byte, "NODE_BYTE_SPAN_INVALID")
         _require_nonnegative_integer(self.end_byte, "NODE_BYTE_SPAN_INVALID")
@@ -384,7 +389,10 @@ def _validate_replay_binding(
         "output_query_trace_id": query_id,
         "verification_artifact_hashes": verification_artifact_hashes,
     }
-    if canonical_hash(request) != request_hash or canonical_hash(evidence) != evidence_hash:
+    if (
+        canonical_hash(request) != request_hash
+        or canonical_hash(evidence) != evidence_hash
+    ):
         raise ContinuityError("REPLAY_BINDING_INVALID")
 
 
@@ -427,13 +435,19 @@ class FrozenView:
         execution_receipt_ids = _identifier_tuple(self.execution_receipt_ids)
         _require_optional_hash(self.request_hash)
         _require_optional_hash(self.evidence_hash)
-        changed_nodes = _typed_tuple(self.changed_nodes, ChangedNode, "CHANGED_NODE_INVALID")
-        coverage_gaps = _typed_tuple(self.coverage_gaps, CoverageGap, "COVERAGE_GAP_INVALID")
+        changed_nodes = _typed_tuple(
+            self.changed_nodes, ChangedNode, "CHANGED_NODE_INVALID"
+        )
+        coverage_gaps = _typed_tuple(
+            self.coverage_gaps, CoverageGap, "COVERAGE_GAP_INVALID"
+        )
         receipts = _typed_tuple(
             self.execution_receipts, BoundExecutionReceipt, "EXECUTION_RECEIPT_INVALID"
         )
         replay_metadata = self.replay_metadata
-        if replay_metadata is not None and not isinstance(replay_metadata, ReplayMetadata):
+        if replay_metadata is not None and not isinstance(
+            replay_metadata, ReplayMetadata
+        ):
             raise ContinuityError("REPLAY_METADATA_INVALID")
         if replay_metadata is not None:
             _validate_replay_binding(
@@ -515,9 +529,7 @@ class FrozenView:
         ordered_queries = _identifier_tuple(query_ids)
         ordered_artifacts = _hash_tuple(verification_artifact_hashes)
         ordered_receipt_ids = _identifier_tuple(execution_receipt_ids)
-        ordered_nodes = _typed_tuple(
-            changed_nodes, ChangedNode, "CHANGED_NODE_INVALID"
-        )
+        ordered_nodes = _typed_tuple(changed_nodes, ChangedNode, "CHANGED_NODE_INVALID")
         ordered_gaps = _typed_tuple(coverage_gaps, CoverageGap, "COVERAGE_GAP_INVALID")
         ordered_receipts = _typed_tuple(
             execution_receipts, BoundExecutionReceipt, "EXECUTION_RECEIPT_INVALID"
@@ -532,7 +544,9 @@ class FrozenView:
             raise ContinuityError("ENTRIES_DUPLICATE")
         _require_optional_hash(request_hash)
         _require_optional_hash(evidence_hash)
-        if replay_metadata is not None and not isinstance(replay_metadata, ReplayMetadata):
+        if replay_metadata is not None and not isinstance(
+            replay_metadata, ReplayMetadata
+        ):
             raise ContinuityError("REPLAY_METADATA_INVALID")
         if replay_metadata is not None:
             _validate_replay_binding(
@@ -623,7 +637,11 @@ class ContinuityAttempt:
         _require_positive_integer(self.fence_epoch, "FENCE_EPOCH_INVALID")
         _require_identifier(self.state)
         if self.view_id is None or self.receipt_hash is None:
-            if self.state != "claimed" or self.view_id is not None or self.receipt_hash is not None:
+            if (
+                self.state != "claimed"
+                or self.view_id is not None
+                or self.receipt_hash is not None
+            ):
                 raise ContinuityError("ATTEMPT_BINDING_INVALID")
             return
         _require_hash(self.view_id)
@@ -642,7 +660,9 @@ class ContinuityPointer:
     def __post_init__(self) -> None:
         _require_identifier(self.workflow_id)
         _require_identifier(self.code_task_id)
-        _require_nonnegative_integer(self.code_task_version, "CODE_TASK_VERSION_INVALID")
+        _require_nonnegative_integer(
+            self.code_task_version, "CODE_TASK_VERSION_INVALID"
+        )
         _require_hash(self.view_id)
         _require_positive_integer(self.pointer_version, "POINTER_VERSION_INVALID")
         _require_positive_integer(self.fence_epoch, "FENCE_EPOCH_INVALID")
@@ -683,14 +703,20 @@ def _require_hash(value: object) -> None:
 def _require_identifier(value: object) -> None:
     if not isinstance(value, str) or not value:
         raise ContinuityError("IDENTIFIER_INVALID")
-    if any(0xD800 <= ord(character) <= 0xDFFF or ord(character) < 0x20 for character in value):
+    if any(
+        0xD800 <= ord(character) <= 0xDFFF or ord(character) < 0x20
+        for character in value
+    ):
         raise ContinuityError("IDENTIFIER_INVALID")
 
 
 def _require_text(value: object) -> None:
     if not isinstance(value, str):
         raise ContinuityError("TEXT_INVALID")
-    if any(ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF for character in value):
+    if any(
+        ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
         raise ContinuityError("TEXT_INVALID")
 
 

@@ -55,10 +55,7 @@ def cas_root_identity(entries: Sequence[Any]) -> str:
     """Return the domain-separated CAS root for already ordered entries."""
     return _domain_identity(
         _CAS_ROOT_DOMAIN,
-        [
-            _entry_value(entry)
-            for entry in entries
-        ],
+        [_entry_value(entry) for entry in entries],
     )
 
 
@@ -117,7 +114,9 @@ def canonical_frozen_view_manifest(
     _require_optional_hash(request_hash)
     _require_optional_hash(evidence_hash)
     manifest = {
-        "schema": _MANIFEST_SCHEMA_V1 if replay_metadata is None else _MANIFEST_SCHEMA_V2,
+        "schema": _MANIFEST_SCHEMA_V1
+        if replay_metadata is None
+        else _MANIFEST_SCHEMA_V2,
         "key": _key_value(key),
         "entries": list(entry_values),
         "input_snapshot_ids": _identifier_list(input_snapshot_ids),

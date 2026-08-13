@@ -33,6 +33,8 @@ from .models import (
 _SCHEMA_VERSION = "3"
 _IMMUTABLE_TABLES = ("continuity_keys", "views", "entries", "receipts", "attempts")
 _TRUSTED_SCHEMAS = frozenset(("main", "continuity"))
+
+
 @dataclass(frozen=True, slots=True)
 class _ReplayState:
     """Verified private durable state required before a CAS replay read."""
@@ -73,6 +75,7 @@ class _LocalDatabaseEvidence:
     size: int
     mtime_ns: int
     ctime_ns: int
+
 
 _V1_TABLE_SQL = {
     "schema_metadata": "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
@@ -191,7 +194,9 @@ _V2_COLUMN_CONTRACTS = {
 _V1_FOREIGN_KEY_CONTRACTS = {
     "schema_metadata": (),
     "views": (),
-    "entries": ((0, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),),
+    "entries": (
+        (0, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),
+    ),
     "receipts": (),
     "attempts": (),
     "pointers": (),
@@ -199,24 +204,71 @@ _V1_FOREIGN_KEY_CONTRACTS = {
 _V2_FOREIGN_KEY_CONTRACTS = {
     "schema_metadata": (),
     "continuity_keys": (),
-    "views": ((0, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),),
+    "views": (
+        (
+            0,
+            0,
+            "continuity_keys",
+            "key_hash",
+            "key_hash",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
+    ),
     "entries": _V1_FOREIGN_KEY_CONTRACTS["entries"],
     "receipts": (
         (0, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),
         (0, 1, "views", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
-        (1, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (
+            1,
+            0,
+            "continuity_keys",
+            "key_hash",
+            "key_hash",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
     ),
     "attempts": (
-        (0, 0, "receipts", "receipt_hash", "receipt_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (
+            0,
+            0,
+            "receipts",
+            "receipt_hash",
+            "receipt_hash",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
         (0, 1, "receipts", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
         (1, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),
         (1, 1, "views", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
-        (2, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (
+            2,
+            0,
+            "continuity_keys",
+            "key_hash",
+            "key_hash",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
     ),
     "pointers": (
         (0, 0, "views", "view_id", "view_id", "NO ACTION", "NO ACTION", "NONE"),
         (0, 1, "views", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
-        (1, 0, "continuity_keys", "key_hash", "key_hash", "NO ACTION", "NO ACTION", "NONE"),
+        (
+            1,
+            0,
+            "continuity_keys",
+            "key_hash",
+            "key_hash",
+            "NO ACTION",
+            "NO ACTION",
+            "NONE",
+        ),
     ),
 }
 _V1_INDEX_CONTRACTS = {
@@ -230,11 +282,18 @@ _V1_INDEX_CONTRACTS = {
 _V2_INDEX_CONTRACTS = {
     "schema_metadata": _V1_INDEX_CONTRACTS["schema_metadata"],
     "continuity_keys": (("pk", ("key_hash",)), ("u", ("key_json",))),
-    "views": (("pk", ("view_id",)), ("u", ("key_hash",)), ("u", ("view_id", "key_hash"))),
+    "views": (
+        ("pk", ("view_id",)),
+        ("u", ("key_hash",)),
+        ("u", ("view_id", "key_hash")),
+    ),
     "entries": _V1_INDEX_CONTRACTS["entries"],
     "receipts": (("pk", ("receipt_hash",)), ("u", ("receipt_hash", "key_hash"))),
     "attempts": _V1_INDEX_CONTRACTS["attempts"],
-    "pointers": (("pk", ("key_hash",)), ("u", ("workflow_id", "code_task_id", "code_task_version"))),
+    "pointers": (
+        ("pk", ("key_hash",)),
+        ("u", ("workflow_id", "code_task_id", "code_task_version")),
+    ),
 }
 _V3_COLUMN_CONTRACTS = {
     **_V2_COLUMN_CONTRACTS,
@@ -446,9 +505,9 @@ def _same_local_database_evidence(
 
     main = _local_database_evidence(main_database)
     continuity = _local_database_evidence(continuity_database)
-    if (
-        main.device != continuity.device
-        or (main.device, main.inode) == (continuity.device, continuity.inode)
+    if main.device != continuity.device or (main.device, main.inode) == (
+        continuity.device,
+        continuity.inode,
     ):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     return main, continuity
@@ -463,10 +522,7 @@ def _require_same_local_database_recheck(
     current_main, current_continuity = _same_local_database_evidence(
         expected_main.path, expected_continuity.path
     )
-    if (
-        current_main != expected_main
-        or current_continuity != expected_continuity
-    ):
+    if current_main != expected_main or current_continuity != expected_continuity:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     return current_main, current_continuity
 
@@ -550,7 +606,9 @@ class ContinuityStore:
         self._connection.row_factory = sqlite3.Row
 
     @classmethod
-    def open_readonly(cls, database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
+    def open_readonly(
+        cls, database: Path, cas_root: Path, scratch_root: Path
+    ) -> ContinuityStore:
         try:
             _verify_prepared_cas(cas_root, scratch_root, read_only=True)
         except Exception as error:
@@ -558,7 +616,9 @@ class ContinuityStore:
         return cls._open(database, read_only=True)
 
     @classmethod
-    def open_readwrite(cls, database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
+    def open_readwrite(
+        cls, database: Path, cas_root: Path, scratch_root: Path
+    ) -> ContinuityStore:
         try:
             _verify_prepared_cas(cas_root, scratch_root, read_only=False)
         except Exception as error:
@@ -604,7 +664,9 @@ class ContinuityStore:
             if current is not None and current.state not in {"expired", "abandoned"}:
                 return current
             epoch = 1 if current is None else current.fence_epoch + 1
-            return self._append_attempt_row(key, epoch, self._next_sequence(key), "claimed", None, None)
+            return self._append_attempt_row(
+                key, epoch, self._next_sequence(key), "claimed", None, None
+            )
 
     def freeze_attempt_atomic(
         self, attempt: ContinuityAttempt, view: FrozenView, receipt: ContinuityReceipt
@@ -612,12 +674,18 @@ class ContinuityStore:
         """Atomically bind a claimed attempt to its immutable view and receipt."""
         with self._atomic():
             self._ensure_exact_current(attempt)
-            if view.key.key_hash != attempt.key.key_hash or receipt.key.key_hash != attempt.key.key_hash:
+            if (
+                view.key.key_hash != attempt.key.key_hash
+                or receipt.key.key_hash != attempt.key.key_hash
+            ):
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
             if receipt.view_id != view.view_id or receipt.kind != "frozen":
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
             if attempt.state == "frozen":
-                if attempt.view_id == view.view_id and attempt.receipt_hash == receipt.receipt_hash:
+                if (
+                    attempt.view_id == view.view_id
+                    and attempt.receipt_hash == receipt.receipt_hash
+                ):
                     return attempt
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
             if attempt.state != "claimed":
@@ -643,13 +711,19 @@ class ContinuityStore:
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
             if attempt.state == "published":
                 pointer = self.pointer_for(attempt.key)
-                if pointer is not None and pointer.view_id == view.view_id and pointer.fence_epoch == attempt.fence_epoch:
+                if (
+                    pointer is not None
+                    and pointer.view_id == view.view_id
+                    and pointer.fence_epoch == attempt.fence_epoch
+                ):
                     return pointer
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
             if attempt.state != "frozen" or attempt.view_id != view.view_id:
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
             self._require_view_row(view)
-            receipt = ContinuityReceipt.create(key=attempt.key, view_id=view.view_id, kind="published")
+            receipt = ContinuityReceipt.create(
+                key=attempt.key, view_id=view.view_id, kind="published"
+            )
             self._insert_receipt_row(receipt, _receipt_json(receipt))
             pointer = self._advance_pointer(attempt.key, view, attempt.fence_epoch)
             self._append_attempt_row(
@@ -819,7 +893,11 @@ class ContinuityStore:
         """Prove a terminal C candidate without requiring replay v2 metadata."""
 
         attempt = self._replay_current_attempt(key)
-        if attempt.state != "published" or attempt.view_id is None or attempt.receipt_hash is None:
+        if (
+            attempt.state != "published"
+            or attempt.view_id is None
+            or attempt.receipt_hash is None
+        ):
             return None
         view = self._replay_view(key, attempt.view_id)
         receipt = self._replay_receipt(key, view.view_id, "published")
@@ -843,9 +921,8 @@ class ContinuityStore:
             row["payload_hash"],
             row["evidence_binding_hash"],
         )
-        if (
-            row["key_hash"] != key.key_hash
-            or row["key_json"] != canonical_json(key.to_dict())
+        if row["key_hash"] != key.key_hash or row["key_json"] != canonical_json(
+            key.to_dict()
         ):
             raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
         return key
@@ -930,15 +1007,11 @@ class ContinuityStore:
             row["pointer_version"],
             row["fence_epoch"],
         )
-        if (
-            row["key_hash"] != key.key_hash
-            or (
-                pointer.workflow_id,
-                pointer.code_task_id,
-                pointer.code_task_version,
-            )
-            != (key.workflow_id, key.code_task_id, key.code_task_version)
-        ):
+        if row["key_hash"] != key.key_hash or (
+            pointer.workflow_id,
+            pointer.code_task_id,
+            pointer.code_task_version,
+        ) != (key.workflow_id, key.code_task_id, key.code_task_version):
             raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
         return pointer
 
@@ -984,14 +1057,26 @@ class ContinuityStore:
 
     def _ensure_key_row(self, key: ContinuityKey) -> None:
         key_json = canonical_json(key.to_dict())
-        row = self._connection.execute("SELECT key_json FROM continuity_keys WHERE key_hash=?", (key.key_hash,)).fetchone()
+        row = self._connection.execute(
+            "SELECT key_json FROM continuity_keys WHERE key_hash=?", (key.key_hash,)
+        ).fetchone()
         if row is not None:
             if row["key_json"] != key_json:
                 raise ContinuityStoreError("CONTINUITY_KEY_CONFLICT")
             return
         self._connection.execute(
             "INSERT INTO continuity_keys(key_hash,key_json,workflow_id,code_task_id,code_task_version,acceptance_id,ingestion_key,payload_hash,evidence_binding_hash) VALUES(?,?,?,?,?,?,?,?,?)",
-            (key.key_hash, key_json, key.workflow_id, key.code_task_id, key.code_task_version, key.acceptance_id, key.ingestion_key, key.payload_hash, key.evidence_binding_hash),
+            (
+                key.key_hash,
+                key_json,
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                key.acceptance_id,
+                key.ingestion_key,
+                key.payload_hash,
+                key.evidence_binding_hash,
+            ),
         )
 
     def _current_attempt_row(self, key: ContinuityKey) -> ContinuityAttempt | None:
@@ -1001,7 +1086,9 @@ class ContinuityStore:
         ).fetchone()
         if row is None:
             return None
-        return ContinuityAttempt(key, row["fence_epoch"], row["state"], row["view_id"], row["receipt_hash"])
+        return ContinuityAttempt(
+            key, row["fence_epoch"], row["state"], row["view_id"], row["receipt_hash"]
+        )
 
     def _ensure_exact_current(self, attempt: ContinuityAttempt) -> None:
         current = self._current_attempt_row(attempt.key)
@@ -1009,54 +1096,123 @@ class ContinuityStore:
             raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
 
     def _next_sequence(self, key: ContinuityKey) -> int:
-        return int(self._connection.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM attempts WHERE key_hash=?", (key.key_hash,)).fetchone()[0])
+        return int(
+            self._connection.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM attempts WHERE key_hash=?",
+                (key.key_hash,),
+            ).fetchone()[0]
+        )
 
-    def _append_attempt_row(self, key: ContinuityKey, fence_epoch: int, sequence: int, state: str, view_id: str | None, receipt_hash: str | None) -> ContinuityAttempt:
+    def _append_attempt_row(
+        self,
+        key: ContinuityKey,
+        fence_epoch: int,
+        sequence: int,
+        state: str,
+        view_id: str | None,
+        receipt_hash: str | None,
+    ) -> ContinuityAttempt:
         attempt = ContinuityAttempt(key, fence_epoch, state, view_id, receipt_hash)
         self._connection.execute(
             "INSERT INTO attempts(key_hash,key_json,fence_epoch,sequence,state,view_id,receipt_hash) VALUES(?,?,?,?,?,?,?)",
-            (key.key_hash, canonical_json(key.to_dict()), fence_epoch, sequence, state, view_id, receipt_hash),
+            (
+                key.key_hash,
+                canonical_json(key.to_dict()),
+                fence_epoch,
+                sequence,
+                state,
+                view_id,
+                receipt_hash,
+            ),
         )
         return attempt
 
     def _insert_view_rows(self, view: FrozenView) -> None:
-        row = self._connection.execute("SELECT view_id,manifest_json FROM views WHERE key_hash=?", (view.key.key_hash,)).fetchone()
+        row = self._connection.execute(
+            "SELECT view_id,manifest_json FROM views WHERE key_hash=?",
+            (view.key.key_hash,),
+        ).fetchone()
         if row is not None:
-            if row["view_id"] != view.view_id or row["manifest_json"] != view.manifest_json:
+            if (
+                row["view_id"] != view.view_id
+                or row["manifest_json"] != view.manifest_json
+            ):
                 raise ContinuityStoreError("CONTINUITY_VIEW_CONFLICT")
             return
         self._connection.execute(
             "INSERT INTO views(view_id,key_hash,manifest_hash,cas_root_hash,manifest_json) VALUES(?,?,?,?,?)",
-            (view.view_id, view.key.key_hash, view.manifest_hash, view.cas_root_hash, view.manifest_json),
+            (
+                view.view_id,
+                view.key.key_hash,
+                view.manifest_hash,
+                view.cas_root_hash,
+                view.manifest_json,
+            ),
         )
         self._connection.executemany(
             "INSERT INTO entries(view_id,role,path,content_hash,byte_length) VALUES(?,?,?,?,?)",
-            [(view.view_id, item.role, item.path, item.content_hash, item.byte_length) for item in view.entries],
+            [
+                (
+                    view.view_id,
+                    item.role,
+                    item.path,
+                    item.content_hash,
+                    item.byte_length,
+                )
+                for item in view.entries
+            ],
         )
 
     def _require_view_row(self, view: FrozenView) -> None:
-        row = self._connection.execute("SELECT manifest_json FROM views WHERE view_id=? AND key_hash=?", (view.view_id, view.key.key_hash)).fetchone()
+        row = self._connection.execute(
+            "SELECT manifest_json FROM views WHERE view_id=? AND key_hash=?",
+            (view.view_id, view.key.key_hash),
+        ).fetchone()
         if row is None or row["manifest_json"] != view.manifest_json:
             raise ContinuityStoreError("CONTINUITY_VIEW_CONFLICT")
 
-    def _insert_receipt_row(self, receipt: ContinuityReceipt, receipt_json: str) -> None:
-        row = self._connection.execute("SELECT receipt_json FROM receipts WHERE receipt_hash=?", (receipt.receipt_hash,)).fetchone()
+    def _insert_receipt_row(
+        self, receipt: ContinuityReceipt, receipt_json: str
+    ) -> None:
+        row = self._connection.execute(
+            "SELECT receipt_json FROM receipts WHERE receipt_hash=?",
+            (receipt.receipt_hash,),
+        ).fetchone()
         if row is not None:
             if row["receipt_json"] != receipt_json:
                 raise ContinuityStoreError("CONTINUITY_RECEIPT_CONFLICT")
             return
         self._connection.execute(
             "INSERT INTO receipts(receipt_hash,key_hash,view_id,kind,receipt_json) VALUES(?,?,?,?,?)",
-            (receipt.receipt_hash, receipt.key.key_hash, receipt.view_id, receipt.kind, receipt_json),
+            (
+                receipt.receipt_hash,
+                receipt.key.key_hash,
+                receipt.view_id,
+                receipt.kind,
+                receipt_json,
+            ),
         )
 
-    def _advance_pointer(self, key: ContinuityKey, view: FrozenView, new_fence_epoch: int) -> ContinuityPointer:
-        if view.key.key_hash != key.key_hash or type(new_fence_epoch) is not int or new_fence_epoch < 1:
+    def _advance_pointer(
+        self, key: ContinuityKey, view: FrozenView, new_fence_epoch: int
+    ) -> ContinuityPointer:
+        if (
+            view.key.key_hash != key.key_hash
+            or type(new_fence_epoch) is not int
+            or new_fence_epoch < 1
+        ):
             raise ContinuityStoreError("CONTINUITY_POINTER_CONFLICT")
         current = self.pointer_for(key)
         if current is None:
             self._insert_pointer_row(key, view, new_fence_epoch)
-            return ContinuityPointer(key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, 1, new_fence_epoch)
+            return ContinuityPointer(
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                view.view_id,
+                1,
+                new_fence_epoch,
+            )
         if new_fence_epoch < current.fence_epoch:
             raise ContinuityStoreError("CONTINUITY_POINTER_CONFLICT")
         if new_fence_epoch == current.fence_epoch:
@@ -1065,16 +1221,40 @@ class ContinuityStore:
             return current
         changed = self._connection.execute(
             "UPDATE pointers SET view_id=?,pointer_version=?,fence_epoch=? WHERE key_hash=? AND pointer_version=? AND fence_epoch=?",
-            (view.view_id, current.pointer_version + 1, new_fence_epoch, key.key_hash, current.pointer_version, current.fence_epoch),
+            (
+                view.view_id,
+                current.pointer_version + 1,
+                new_fence_epoch,
+                key.key_hash,
+                current.pointer_version,
+                current.fence_epoch,
+            ),
         ).rowcount
         if changed != 1:
             raise ContinuityStoreError("CONTINUITY_POINTER_CONFLICT")
-        return ContinuityPointer(key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, current.pointer_version + 1, new_fence_epoch)
+        return ContinuityPointer(
+            key.workflow_id,
+            key.code_task_id,
+            key.code_task_version,
+            view.view_id,
+            current.pointer_version + 1,
+            new_fence_epoch,
+        )
 
-    def _insert_pointer_row(self, key: ContinuityKey, view: FrozenView, fence_epoch: int) -> None:
+    def _insert_pointer_row(
+        self, key: ContinuityKey, view: FrozenView, fence_epoch: int
+    ) -> None:
         self._connection.execute(
             "INSERT INTO pointers(key_hash,workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
-            (key.key_hash, key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, 1, fence_epoch),
+            (
+                key.key_hash,
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                view.view_id,
+                1,
+                fence_epoch,
+            ),
         )
 
 
@@ -1125,7 +1305,11 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
     ) -> None:
         """Reject anything except the live, fixed, fenced scope in-place."""
 
-        if type(scope) is not _AttachedTransactionScope or state is None or not state.active:
+        if (
+            type(scope) is not _AttachedTransactionScope
+            or state is None
+            or not state.active
+        ):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         try:
             requested_continuity = continuity_database.resolve(strict=True)
@@ -1231,7 +1415,9 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
             _require_same_local_database_recheck(
                 expected_main_evidence, expected_continuity_evidence
             )
-            connection.execute("ATTACH DATABASE ? AS continuity", (str(expected_continuity),))
+            connection.execute(
+                "ATTACH DATABASE ? AS continuity", (str(expected_continuity),)
+            )
             connection.execute("PRAGMA continuity.synchronous=FULL")
             _require_same_local_database_recheck(
                 expected_main_evidence, expected_continuity_evidence
@@ -1359,7 +1545,10 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
         connection.row_factory = sqlite3.Row
         try:
             _verify_v3_schema(connection, schema="continuity")
-            if type(expected_frozen) is not ContinuityAttempt or type(view) is not FrozenView:
+            if (
+                type(expected_frozen) is not ContinuityAttempt
+                or type(view) is not FrozenView
+            ):
                 raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
             if (
                 expected_frozen.state != "frozen"
@@ -1430,7 +1619,9 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
                         connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                         connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                     except sqlite3.Error as rollback_error:
-                        raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from rollback_error
+                        raise ContinuityStoreError(
+                            "CONTINUITY_STORE_UNPREPARED"
+                        ) from rollback_error
                 raise
         except ContinuityStoreError:
             raise
@@ -1463,7 +1654,9 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
     def rollback_attached_scope_savepoint(token: _AttachedScopeSavepoint) -> None:
         """Roll back the current opaque module savepoint without exposing its name."""
 
-        token_state = savepoints.get(token) if type(token) is _AttachedScopeSavepoint else None
+        token_state = (
+            savepoints.get(token) if type(token) is _AttachedScopeSavepoint else None
+        )
         if (
             token_state is None
             or not token_state.active
@@ -1487,7 +1680,9 @@ def _build_attached_scope_api() -> tuple[Any, ...]:
     def release_attached_scope_savepoint(token: _AttachedScopeSavepoint) -> None:
         """Release the current opaque module savepoint without exposing its name."""
 
-        token_state = savepoints.get(token) if type(token) is _AttachedScopeSavepoint else None
+        token_state = (
+            savepoints.get(token) if type(token) is _AttachedScopeSavepoint else None
+        )
         if (
             token_state is None
             or not token_state.active
@@ -1584,10 +1779,7 @@ def _require_attached_connection_preconditions(
         )
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
-    if (
-        attached_main != expected_main
-        or attached_continuity != expected_continuity
-    ):
+    if attached_main != expected_main or attached_continuity != expected_continuity:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
     if foreign_keys is None or foreign_keys[0] != 1:
@@ -1605,7 +1797,9 @@ def _require_attached_connection_preconditions(
 
 
 def _journal_mode_for_schema(connection: sqlite3.Connection, schema: str) -> str:
-    row = connection.execute(f"PRAGMA {_schema_identifier(schema)}.journal_mode").fetchone()
+    row = connection.execute(
+        f"PRAGMA {_schema_identifier(schema)}.journal_mode"
+    ).fetchone()
     if row is None or len(row) != 1 or not isinstance(row[0], str):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     return row[0].lower()
@@ -1622,7 +1816,9 @@ def _attached_exact_view(
     if row is None:
         raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
     entries = tuple(
-        FrozenEntry(item["role"], item["path"], item["content_hash"], item["byte_length"])
+        FrozenEntry(
+            item["role"], item["path"], item["content_hash"], item["byte_length"]
+        )
         for item in connection.execute(
             "SELECT role,path,content_hash,byte_length FROM continuity.entries "
             "WHERE view_id=? ORDER BY role,path,content_hash",
@@ -1671,7 +1867,11 @@ def _attached_attempt_history(
             raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
         history.append(
             ContinuityAttempt(
-                key, row["fence_epoch"], row["state"], row["view_id"], row["receipt_hash"]
+                key,
+                row["fence_epoch"],
+                row["state"],
+                row["view_id"],
+                row["receipt_hash"],
             )
         )
     return tuple(history)
@@ -1695,15 +1895,11 @@ def _attached_exact_pointer(
         row["pointer_version"],
         row["fence_epoch"],
     )
-    if (
-        row["key_hash"] != key.key_hash
-        or (
-            pointer.workflow_id,
-            pointer.code_task_id,
-            pointer.code_task_version,
-        )
-        != (key.workflow_id, key.code_task_id, key.code_task_version)
-    ):
+    if row["key_hash"] != key.key_hash or (
+        pointer.workflow_id,
+        pointer.code_task_id,
+        pointer.code_task_version,
+    ) != (key.workflow_id, key.code_task_id, key.code_task_version):
         raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
     return pointer
 
@@ -1737,7 +1933,10 @@ def _insert_or_prove_attached_receipt(
             receipt_json,
         ),
     )
-    if _attached_exact_receipt(connection, receipt.key, receipt.view_id, receipt.kind) != receipt:
+    if (
+        _attached_exact_receipt(connection, receipt.key, receipt.view_id, receipt.kind)
+        != receipt
+    ):
         raise ContinuityStoreError("CONTINUITY_STATE_CONFLICT")
 
 
@@ -1763,7 +1962,12 @@ def _advance_attached_pointer(
             ),
         )
         pointer = ContinuityPointer(
-            key.workflow_id, key.code_task_id, key.code_task_version, view.view_id, 1, fence_epoch
+            key.workflow_id,
+            key.code_task_id,
+            key.code_task_version,
+            view.view_id,
+            1,
+            fence_epoch,
         )
     elif fence_epoch < current.fence_epoch or (
         fence_epoch == current.fence_epoch and current.view_id != view.view_id
@@ -1832,10 +2036,14 @@ def _append_attached_published_attempt(
 
 
 def _receipt_json(receipt: ContinuityReceipt) -> str:
-    return canonical_json({"key": receipt.key.to_dict(), "view_id": receipt.view_id, "kind": receipt.kind})
+    return canonical_json(
+        {"key": receipt.key.to_dict(), "view_id": receipt.view_id, "kind": receipt.kind}
+    )
 
 
-def _verify_prepared_cas(cas_root: Path, scratch_root: Path, *, read_only: bool) -> None:
+def _verify_prepared_cas(
+    cas_root: Path, scratch_root: Path, *, read_only: bool
+) -> None:
     """Close verification-only native CAS roots before opening SQLite."""
     cas = ContinuityCas.open_prepared(cas_root, scratch_root, read_only=read_only)
     try:
@@ -1853,7 +2061,9 @@ def _bootstrap_prepared_cas(cas_root: Path, scratch_root: Path) -> None:
         cas.close()
 
 
-def _bootstrap_store(database: Path, cas_root: Path, scratch_root: Path) -> ContinuityStore:
+def _bootstrap_store(
+    database: Path, cas_root: Path, scratch_root: Path
+) -> ContinuityStore:
     """Runtime-private creation/migration seam; ordinary openers never create."""
     connection: sqlite3.Connection | None = None
     try:
@@ -1937,7 +2147,9 @@ def _qualified(schema: str, table: str) -> str:
     return f"{_schema_identifier(schema)}.{table}"
 
 
-def _schema_version(connection: sqlite3.Connection, *, schema: str = "main") -> str | None:
+def _schema_version(
+    connection: sqlite3.Connection, *, schema: str = "main"
+) -> str | None:
     identifier = _schema_identifier(schema)
     rows = connection.execute(
         f"SELECT type FROM {identifier}.sqlite_master WHERE name='schema_metadata'"
@@ -1954,14 +2166,20 @@ def _schema_version(connection: sqlite3.Connection, *, schema: str = "main") -> 
     return rows[0][1]
 
 
-def _create_v3_schema(connection: sqlite3.Connection, *, seal_triggers: bool = True) -> None:
+def _create_v3_schema(
+    connection: sqlite3.Connection, *, seal_triggers: bool = True
+) -> None:
     for statement in _V3_TABLE_SQL.values():
         connection.execute(statement)
-    connection.execute("INSERT INTO schema_metadata(key,value) VALUES('schema_version','3')")
+    connection.execute(
+        "INSERT INTO schema_metadata(key,value) VALUES('schema_version','3')"
+    )
     for table in _IMMUTABLE_TABLES:
         _create_immutable_triggers(connection, table, ("UPDATE", "DELETE"))
     if seal_triggers:
-        _create_immutable_triggers(connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE"))
+        _create_immutable_triggers(
+            connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE")
+        )
 
 
 def _create_immutable_triggers(
@@ -1994,15 +2212,21 @@ def _migrate_v1_to_v3(connection: sqlite3.Connection) -> None:
         "INSERT INTO v1_audit_seals(audit_id,source_version,content_hash,schema_hash) VALUES(?,?,?,?)",
         ("v1", 1, _audit_content_hash(connection), _audit_schema_hash(connection)),
     )
-    _create_immutable_triggers(connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE"))
+    _create_immutable_triggers(
+        connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE")
+    )
     _copy_verified_v1_state_to_v3(connection, keys)
 
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     """Upgrade only a strictly verified v2 database with no unauditable snapshot."""
     connection.execute(_V3_TABLE_SQL["v1_audit_seals"])
-    connection.execute("UPDATE schema_metadata SET value='3' WHERE key='schema_version'")
-    _create_immutable_triggers(connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE"))
+    connection.execute(
+        "UPDATE schema_metadata SET value='3' WHERE key='schema_version'"
+    )
+    _create_immutable_triggers(
+        connection, "v1_audit_seals", ("INSERT", "UPDATE", "DELETE")
+    )
 
 
 def _copy_verified_v1_state_to_v3(
@@ -2011,19 +2235,44 @@ def _copy_verified_v1_state_to_v3(
     for key in keys.values():
         connection.execute(
             "INSERT INTO continuity_keys(key_hash,key_json,workflow_id,code_task_id,code_task_version,acceptance_id,ingestion_key,payload_hash,evidence_binding_hash) VALUES(?,?,?,?,?,?,?,?,?)",
-            (key.key_hash, canonical_json(key.to_dict()), key.workflow_id, key.code_task_id, key.code_task_version, key.acceptance_id, key.ingestion_key, key.payload_hash, key.evidence_binding_hash),
+            (
+                key.key_hash,
+                canonical_json(key.to_dict()),
+                key.workflow_id,
+                key.code_task_id,
+                key.code_task_version,
+                key.acceptance_id,
+                key.ingestion_key,
+                key.payload_hash,
+                key.evidence_binding_hash,
+            ),
         )
     for table in ("views", "entries", "receipts", "attempts"):
         columns = ",".join(_column_names(connection, f"{table}_v1"))
-        connection.execute(f"INSERT INTO {table}({columns}) SELECT {columns} FROM {table}_v1")
+        connection.execute(
+            f"INSERT INTO {table}({columns}) SELECT {columns} FROM {table}_v1"
+        )
     for row in connection.execute("SELECT * FROM pointers_v1"):
-        candidates = [key for key in keys.values() if (key.workflow_id, key.code_task_id, key.code_task_version) == (row["workflow_id"], row["code_task_id"], row["code_task_version"])]
+        candidates = [
+            key
+            for key in keys.values()
+            if (key.workflow_id, key.code_task_id, key.code_task_version)
+            == (row["workflow_id"], row["code_task_id"], row["code_task_version"])
+        ]
         if len(candidates) != 1:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         key = candidates[0]
         connection.execute(
             "INSERT INTO pointers(key_hash,workflow_id,code_task_id,code_task_version,view_id,pointer_version,fence_epoch) VALUES(?,?,?,?,?,?,?)",
-            (key.key_hash, row["workflow_id"], row["code_task_id"], row["code_task_version"], row["view_id"], row["pointer_version"], row["fence_epoch"]),
+            (
+                key.key_hash,
+                row["workflow_id"],
+                row["code_task_id"],
+                row["code_task_version"],
+                row["view_id"],
+                row["pointer_version"],
+                row["fence_epoch"],
+            ),
         )
 
 
@@ -2037,12 +2286,20 @@ def _validate_v1_state(
         keys = _v1_keys(connection, suffix, schema=schema)
         views = _v1_views(connection, keys, suffix, schema=schema)
         receipts = _v1_receipts(connection, keys, views, suffix, schema=schema)
-        attempts = _v1_attempts(connection, keys, views, receipts, suffix, schema=schema)
+        attempts = _v1_attempts(
+            connection, keys, views, receipts, suffix, schema=schema
+        )
         _validate_v1_pointers(connection, keys, views, attempts, suffix, schema=schema)
         return keys
     except ContinuityStoreError:
         raise
-    except (ContinuityError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+    except (
+        ContinuityError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
 
 
@@ -2056,7 +2313,10 @@ def _v1_keys(
     ):
         value = json.loads(row["key_json"])
         key = ContinuityKey(**value)
-        if key.key_hash != row["key_hash"] or canonical_json(key.to_dict()) != row["key_json"]:
+        if (
+            key.key_hash != row["key_hash"]
+            or canonical_json(key.to_dict()) != row["key_json"]
+        ):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         existing = keys.get(key.key_hash)
         if existing is not None and existing != key:
@@ -2078,7 +2338,9 @@ def _v1_views(
         "ORDER BY view_id,role,path,content_hash"
     ):
         entries.setdefault(row["view_id"], []).append(
-            FrozenEntry(row["role"], row["path"], row["content_hash"], row["byte_length"])
+            FrozenEntry(
+                row["role"], row["path"], row["content_hash"], row["byte_length"]
+            )
         )
     views: dict[str, FrozenView] = {}
     for row in connection.execute(
@@ -2107,7 +2369,9 @@ def _v1_frozen_view(
 
 
 def _frozen_view_from_manifest(
-    key: ContinuityKey, row: sqlite3.Row | dict[str, Any], entries: tuple[FrozenEntry, ...]
+    key: ContinuityKey,
+    row: sqlite3.Row | dict[str, Any],
+    entries: tuple[FrozenEntry, ...],
 ) -> FrozenView:
     """Rebuild one persisted v1 or v2 view with no permissive fields."""
     try:
@@ -2140,16 +2404,21 @@ def _frozen_view_from_manifest(
             if set(manifest) != common_fields | {"replay_metadata"}:
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
             metadata = manifest["replay_metadata"]
-            if not isinstance(metadata, dict) or set(metadata) != {
-                "task_kind",
-                "intent_id",
-                "workspace_hash",
-                "write_scope",
-                "indexed_diff_hash",
-                "language",
-                "framework",
-                "checkpoint_hash",
-            } or not isinstance(metadata["write_scope"], list):
+            if (
+                not isinstance(metadata, dict)
+                or set(metadata)
+                != {
+                    "task_kind",
+                    "intent_id",
+                    "workspace_hash",
+                    "write_scope",
+                    "indexed_diff_hash",
+                    "language",
+                    "framework",
+                    "checkpoint_hash",
+                }
+                or not isinstance(metadata["write_scope"], list)
+            ):
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
             replay_metadata = ReplayMetadata(
                 task_kind=metadata["task_kind"],
@@ -2163,10 +2432,9 @@ def _frozen_view_from_manifest(
             )
         else:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-        if (
-            manifest["key"] != key.to_dict()
-            or manifest["entries"] != [item.to_dict() for item in entries]
-        ):
+        if manifest["key"] != key.to_dict() or manifest["entries"] != [
+            item.to_dict() for item in entries
+        ]:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         view = FrozenView.create(
             key=key,
@@ -2197,7 +2465,13 @@ def _frozen_view_from_manifest(
         )
     except ContinuityStoreError:
         raise
-    except (ContinuityError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+    except (
+        ContinuityError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
     if (
         view.view_id != row["view_id"]
@@ -2285,7 +2559,9 @@ def _v1_receipts(
         view = views.get(row["view_id"])
         if key is None or view is None or view.key != key:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-        receipt = ContinuityReceipt(key, row["view_id"], row["receipt_hash"], row["kind"])
+        receipt = ContinuityReceipt(
+            key, row["view_id"], row["receipt_hash"], row["kind"]
+        )
         if row["receipt_json"] != _receipt_json(receipt):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         receipts[receipt.receipt_hash] = receipt
@@ -2312,16 +2588,31 @@ def _v1_attempts(
         attempt = ContinuityAttempt(
             key, row["fence_epoch"], row["state"], row["view_id"], row["receipt_hash"]
         )
-        if type(row["sequence"]) is not int or row["sequence"] != len(attempts.get(key.key_hash, ())) + 1:
+        if (
+            type(row["sequence"]) is not int
+            or row["sequence"] != len(attempts.get(key.key_hash, ())) + 1
+        ):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         if attempt.state != "claimed":
             view = views.get(attempt.view_id or "")
             receipt = receipts.get(attempt.receipt_hash or "")
-            if view is None or receipt is None or view.key != key or receipt.key != key or receipt.view_id != attempt.view_id:
+            if (
+                view is None
+                or receipt is None
+                or view.key != key
+                or receipt.key != key
+                or receipt.view_id != attempt.view_id
+            ):
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-            if attempt.state in {"frozen", "published"} and receipt.kind != attempt.state:
+            if (
+                attempt.state in {"frozen", "published"}
+                and receipt.kind != attempt.state
+            ):
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-            if attempt.state in {"expired", "abandoned"} and receipt.kind not in {"frozen", "published"}:
+            if attempt.state in {"expired", "abandoned"} and receipt.kind not in {
+                "frozen",
+                "published",
+            }:
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         attempts.setdefault(key.key_hash, []).append(attempt)
     verified = {key_hash: tuple(history) for key_hash, history in attempts.items()}
@@ -2379,7 +2670,8 @@ def _validate_v1_pointers(
         if views.get(pointer.view_id) is None or views[pointer.view_id].key != key:
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         if not any(
-            attempt.fence_epoch == pointer.fence_epoch and attempt.view_id == pointer.view_id
+            attempt.fence_epoch == pointer.fence_epoch
+            and attempt.view_id == pointer.view_id
             for attempt in attempts.get(key.key_hash, ())
         ):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
@@ -2461,7 +2753,9 @@ def _validate_live_state(
             view = views.get(row["view_id"])
             if key is None or view is None or view.key != key:
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
-            receipt = ContinuityReceipt(key, row["view_id"], row["receipt_hash"], row["kind"])
+            receipt = ContinuityReceipt(
+                key, row["view_id"], row["receipt_hash"], row["kind"]
+            )
             if row["receipt_json"] != _receipt_json(receipt):
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
             receipts[receipt.receipt_hash] = receipt
@@ -2543,7 +2837,13 @@ def _validate_live_state(
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     except ContinuityStoreError:
         raise
-    except (ContinuityError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+    except (
+        ContinuityError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED") from error
 
 
@@ -2582,7 +2882,10 @@ def _column_names(
 
 
 def _verify_v1_schema(connection: sqlite3.Connection, *, schema: str = "main") -> None:
-    if _schema_version(connection, schema=schema) != "1" or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+    if (
+        _schema_version(connection, schema=schema) != "1"
+        or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1
+    ):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     _verify_schema_contract(
         connection,
@@ -2597,7 +2900,10 @@ def _verify_v1_schema(connection: sqlite3.Connection, *, schema: str = "main") -
 
 
 def _verify_v2_schema(connection: sqlite3.Connection, *, schema: str = "main") -> None:
-    if _schema_version(connection, schema=schema) != "2" or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+    if (
+        _schema_version(connection, schema=schema) != "2"
+        or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1
+    ):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     _verify_schema_contract(
         connection,
@@ -2613,7 +2919,10 @@ def _verify_v2_schema(connection: sqlite3.Connection, *, schema: str = "main") -
 
 
 def _verify_v3_schema(connection: sqlite3.Connection, *, schema: str = "main") -> None:
-    if _schema_version(connection, schema=schema) != "3" or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+    if (
+        _schema_version(connection, schema=schema) != "3"
+        or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1
+    ):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     audit_present = _verify_schema_contract(
         connection,
@@ -2648,7 +2957,9 @@ def _verify_schema_contract(
     *,
     table_sql: dict[str, str],
     column_contracts: dict[str, tuple[tuple[int, str, str, int, None, int, int], ...]],
-    foreign_key_contracts: dict[str, tuple[tuple[int, int, str, str, str, str, str, str], ...]],
+    foreign_key_contracts: dict[
+        str, tuple[tuple[int, int, str, str, str, str, str, str], ...]
+    ],
     index_contracts: dict[str, tuple[tuple[str, tuple[str, ...]], ...]],
     immutable_tables: tuple[str, ...],
     allow_v1_audit: bool,
@@ -2680,15 +2991,18 @@ def _verify_table_contracts(
     *,
     table_sql: dict[str, str],
     column_contracts: dict[str, tuple[tuple[int, str, str, int, None, int, int], ...]],
-    foreign_key_contracts: dict[str, tuple[tuple[int, int, str, str, str, str, str, str], ...]],
+    foreign_key_contracts: dict[
+        str, tuple[tuple[int, int, str, str, str, str, str, str], ...]
+    ],
     index_contracts: dict[str, tuple[tuple[str, tuple[str, ...]], ...]],
     check_foreign_keys: bool,
     schema: str = "main",
 ) -> None:
     identifier = _schema_identifier(schema)
-    if check_foreign_keys and connection.execute(
-        f"PRAGMA {identifier}.foreign_key_check"
-    ).fetchall():
+    if (
+        check_foreign_keys
+        and connection.execute(f"PRAGMA {identifier}.foreign_key_check").fetchall()
+    ):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     for table, expected_sql in table_sql.items():
         if _normalized_schema_sql(
@@ -2742,7 +3056,7 @@ def _verify_schema_objects(
     if frozenset(actual_tables) not in allowed_table_sets:
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     audit_present = bool(set(_V1_AUDIT_TABLES) & actual_tables)
-    expected_actions = {
+    expected_actions: dict[str, tuple[str, ...]] = {
         table: ("UPDATE", "DELETE") for table in immutable_tables
     }
     expected_actions.update(
@@ -2766,10 +3080,9 @@ def _verify_schema_objects(
         for action in actions:
             name = f"{table}_immutable_{action.lower()}"
             trigger_sql = actual_triggers[name]
-            if (
-                not isinstance(trigger_sql, str)
-                or _normalize_sql(trigger_sql) != _immutable_trigger_sql(table, action)
-            ):
+            if not isinstance(trigger_sql, str) or _normalize_sql(
+                trigger_sql
+            ) != _immutable_trigger_sql(table, action):
                 raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
     if any(kind not in {"table", "trigger"} for kind, _name, _table, _sql in objects):
         raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
@@ -2814,7 +3127,11 @@ def _audit_content_hash(connection: sqlite3.Connection, *, schema: str = "main")
     tables: list[dict[str, Any]] = []
     for table, columns in _V1_COLUMN_CONTRACTS.items():
         names = tuple(column[1] for column in columns)
-        primary_key = tuple(column[1] for column in sorted(columns, key=lambda column: column[5]) if column[5])
+        primary_key = tuple(
+            column[1]
+            for column in sorted(columns, key=lambda column: column[5])
+            if column[5]
+        )
         query = (
             f"SELECT {','.join(names)} FROM {_qualified(schema, f'{table}_v1')} "
             f"ORDER BY {','.join(primary_key)}"
@@ -2826,7 +3143,9 @@ def _audit_content_hash(connection: sqlite3.Connection, *, schema: str = "main")
                 "rows": [list(row) for row in connection.execute(query)],
             }
         )
-    return canonical_hash({"schema": "continuity-v1-audit-content/v1", "tables": tables})
+    return canonical_hash(
+        {"schema": "continuity-v1-audit-content/v1", "tables": tables}
+    )
 
 
 def _audit_schema_hash(connection: sqlite3.Connection, *, schema: str = "main") -> str:
@@ -2845,7 +3164,9 @@ def _audit_schema_hash(connection: sqlite3.Connection, *, schema: str = "main") 
         )
         if name in names
     ]
-    return canonical_hash({"schema": "continuity-v1-audit-schema/v1", "objects": records})
+    return canonical_hash(
+        {"schema": "continuity-v1-audit-schema/v1", "objects": records}
+    )
 
 
 def _normalized_schema_sql(
@@ -2881,10 +3202,9 @@ def _verify_index_contract(
             for item in connection.execute(f"PRAGMA {identifier}.index_xinfo({row[1]})")
         )
         key_columns = tuple(item[2] for item in xinfo if item[5] == 1)
-        if (
-            any(not isinstance(name, str) or name not in column_ids for name in key_columns)
-            or xinfo != _expected_index_xinfo(column_ids, key_columns)
-        ):
+        if any(
+            not isinstance(name, str) or name not in column_ids for name in key_columns
+        ) or xinfo != _expected_index_xinfo(column_ids, key_columns):
             raise ContinuityStoreError("CONTINUITY_STORE_UNPREPARED")
         actual.append((row[3], key_columns))
     if tuple(sorted(actual, key=repr)) != tuple(sorted(expected, key=repr)):

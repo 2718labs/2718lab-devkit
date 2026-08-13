@@ -48,11 +48,15 @@ class ContinuityService:
     def claim_or_reuse(self, key: ContinuityKey) -> ContinuityAttempt:
         return self.store.claim_or_reuse_atomic(key)
 
-    def freeze(self, attempt: ContinuityAttempt, request: Any, evidence: Any) -> FrozenView:
+    def freeze(
+        self, attempt: ContinuityAttempt, request: Any, evidence: Any
+    ) -> FrozenView:
         view = self._typed_view(attempt.key, request, evidence)
         if view.key.key_hash != attempt.key.key_hash:
             raise ContinuityStoreError("CONTINUITY_VIEW_CONFLICT")
-        receipt = ContinuityReceipt.create(key=attempt.key, view_id=view.view_id, kind="frozen")
+        receipt = ContinuityReceipt.create(
+            key=attempt.key, view_id=view.view_id, kind="frozen"
+        )
         self.store.freeze_attempt_atomic(attempt, view, receipt)
         return view
 
@@ -144,10 +148,7 @@ class ContinuityService:
             state.attempt.state != "published"
             or state.attempt.view_id != view_id
             or state.attempt.fence_epoch != fence_epoch
-            or (
-                expected_attempt is not None
-                and state.attempt != expected_attempt
-            )
+            or (expected_attempt is not None and state.attempt != expected_attempt)
             or pointer is None
             or (
                 pointer.workflow_id,
@@ -244,7 +245,9 @@ class ContinuityService:
                         CheckpointFile(entry.path, entry.content_hash, body)
                     )
                 elif entry.role == "after_file":
-                    after_files.append(SnapshotFile(entry.path, entry.content_hash, body))
+                    after_files.append(
+                        SnapshotFile(entry.path, entry.content_hash, body)
+                    )
                 else:
                     raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT")
             extraction = ExtractionRequest(
@@ -324,7 +327,9 @@ class ContinuityService:
             raise ContinuityStoreError("CONTINUITY_REPLAY_CONFLICT") from error
         return _ReplayMaterialization(attempt, view, request, evidence, extraction)
 
-    def _typed_view(self, key: ContinuityKey, request: Any, evidence: Any) -> FrozenView:
+    def _typed_view(
+        self, key: ContinuityKey, request: Any, evidence: Any
+    ) -> FrozenView:
         from devkit_atlas.extractors import ExtractionRequest
         from devkit_atlas.models import AtlasError
         from devkit_atlas.service import (
@@ -332,6 +337,7 @@ class ContinuityService:
             AcceptedAtlasProjectionRequest,
             AtlasService,
         )
+
         if (
             type(request) is not AcceptedAtlasProjectionRequest
             or type(evidence) is not AcceptedAtlasProjectionEvidence
@@ -361,7 +367,8 @@ class ContinuityService:
             or evidence.checkpoint_hash != request.checkpoint_hash
             or evidence.indexed_diff_hash != request.indexed_diff_hash
             or evidence.output_query_trace_id != request.output_query_trace_id
-            or evidence.verification_artifact_hashes != request.verification_artifact_hashes
+            or evidence.verification_artifact_hashes
+            != request.verification_artifact_hashes
             or extraction.workflow_id != request.workflow_id
             or extraction.task_id != request.code_task_id
             or extraction.acceptance_id != request.acceptance_id
@@ -407,7 +414,11 @@ class ContinuityService:
                     body = getattr(item, "body", None)
                     content_hash = getattr(item, "content_hash", None)
                     path = getattr(item, "path", None)
-                    if type(body) is not bytes:
+                    if (
+                        type(body) is not bytes
+                        or type(path) is not str
+                        or type(content_hash) is not str
+                    ):
                         raise ContinuityError("CONTINUITY_INPUT_INVALID")
                     entry = FrozenEntry(role, path, content_hash, len(body))
                     if "sha256:" + hashlib.sha256(body).hexdigest() != content_hash:
@@ -446,7 +457,8 @@ class ContinuityService:
                 evidence_hash=canonical_hash(_evidence(evidence)),
                 replay_metadata=replay_metadata,
                 changed_nodes=tuple(
-                    ChangedNode.from_index_node(node) for node in extraction.changed_nodes
+                    ChangedNode.from_index_node(node)
+                    for node in extraction.changed_nodes
                 ),
                 coverage_gaps=tuple(
                     CoverageGap(gap.path, gap.code, gap.message)
@@ -462,8 +474,41 @@ class ContinuityService:
 
 
 def _public_request(request: Any) -> dict[str, Any]:
-    return {name: getattr(request, name) for name in ("ingestion_key", "payload_hash", "acceptance_id", "workflow_id", "code_task_id", "code_task_version", "input_snapshot_id", "output_snapshot_id", "indexed_diff_hash", "intent_id", "language", "framework", "checkpoint_id", "checkpoint_hash", "output_query_trace_id", "verification_artifact_hashes", "execution_receipt_ids", "evidence_binding_hash")}
+    return {
+        name: getattr(request, name)
+        for name in (
+            "ingestion_key",
+            "payload_hash",
+            "acceptance_id",
+            "workflow_id",
+            "code_task_id",
+            "code_task_version",
+            "input_snapshot_id",
+            "output_snapshot_id",
+            "indexed_diff_hash",
+            "intent_id",
+            "language",
+            "framework",
+            "checkpoint_id",
+            "checkpoint_hash",
+            "output_query_trace_id",
+            "verification_artifact_hashes",
+            "execution_receipt_ids",
+            "evidence_binding_hash",
+        )
+    }
 
 
 def _evidence(evidence: Any) -> dict[str, Any]:
-    return {name: getattr(evidence, name) for name in ("code_task_version", "language", "framework", "checkpoint_hash", "indexed_diff_hash", "output_query_trace_id", "verification_artifact_hashes")}
+    return {
+        name: getattr(evidence, name)
+        for name in (
+            "code_task_version",
+            "language",
+            "framework",
+            "checkpoint_hash",
+            "indexed_diff_hash",
+            "output_query_trace_id",
+            "verification_artifact_hashes",
+        )
+    }
