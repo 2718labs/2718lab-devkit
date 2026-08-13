@@ -128,6 +128,18 @@ def test_ci_workflow_is_mcp_only_and_uses_runner_local_fast_lane_storage() -> No
     assert "D:\\bun\\tmp\\codex\\2718lab-devkit-ci\\fast-lane" not in workflow
 
 
+def test_ci_and_release_static_checks_cover_continuity_runtime() -> None:
+    workflows = (
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
+        (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        ),
+    )
+
+    for workflow in workflows:
+        assert "devkit_continuity" in workflow
+
+
 def test_workflow_test_tool_versions_are_pinned() -> None:
     continuous_integration = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"

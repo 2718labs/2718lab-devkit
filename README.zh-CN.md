@@ -243,8 +243,8 @@ mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
     cd mcp-tools
     uv run --locked pytest -q
     uv lock --check
-    uv run --locked ruff check devkit_atlas/service.py devkit_runtime/atlas_acceptance.py orchestrator/service.py project_index/checkpoints.py project_index/service.py project_index/store.py
-    uv run --locked python -m compileall -q devkit_atlas devkit_runtime orchestrator project_index
+    uv run --locked ruff check devkit_atlas/service.py devkit_continuity devkit_runtime/atlas_acceptance.py orchestrator/service.py project_index/checkpoints.py project_index/service.py project_index/store.py
+    uv run --locked python -m compileall -q devkit_atlas devkit_continuity devkit_runtime orchestrator project_index
 
 CI 和全新产物检查才是当前测试计数的唯一来源。它们验证精确 17 工具清单、
 空 prompt/resource 列表、协议干净的 stdout、正常和拒绝调用、缺失宿主能力时的

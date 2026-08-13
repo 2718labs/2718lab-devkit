@@ -169,6 +169,7 @@ jobs:
           uv sync --locked --all-groups
           uv run --locked ruff check \
             devkit_atlas/service.py \
+            devkit_continuity \
             devkit_runtime/atlas_acceptance.py \
             orchestrator/service.py \
             project_index/checkpoints.py \
@@ -176,12 +177,13 @@ jobs:
             project_index/store.py
           uv run --locked ruff format --check \
             devkit_atlas/service.py \
+            devkit_continuity \
             devkit_runtime/atlas_acceptance.py \
             orchestrator/service.py \
             project_index/checkpoints.py \
             project_index/service.py \
             project_index/store.py
-          uv run --locked pyright server.py
+          uv run --locked pyright server.py devkit_continuity
           uv run --locked python -m py_compile server.py
           uv run --locked pytest -q
 

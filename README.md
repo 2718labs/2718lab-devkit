@@ -281,8 +281,8 @@ Run the release verification from the revision being built:
     cd mcp-tools
     uv run --locked pytest -q
     uv lock --check
-    uv run --locked ruff check devkit_atlas/service.py devkit_runtime/atlas_acceptance.py orchestrator/service.py project_index/checkpoints.py project_index/service.py project_index/store.py
-    uv run --locked python -m compileall -q devkit_atlas devkit_runtime orchestrator project_index
+    uv run --locked ruff check devkit_atlas/service.py devkit_continuity devkit_runtime/atlas_acceptance.py orchestrator/service.py project_index/checkpoints.py project_index/service.py project_index/store.py
+    uv run --locked python -m compileall -q devkit_atlas devkit_continuity devkit_runtime orchestrator project_index
 
 CI and fresh-artifact checks are the source of truth for current test counts.
 They verify the exact 17-tool inventory, empty prompt/resource lists,
