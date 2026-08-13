@@ -62,6 +62,7 @@ _TASK_ID = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|FLR1-[0-9a-f]{24})$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _GIT_ID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _SHA256 = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+_PROJECT_FENCE_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PROJECT_FENCE_PROJECT_ID = re.compile(r"^[0-9a-f]{64}$")
 _UTC_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _PATH_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -839,6 +840,13 @@ def _hash(value: object, field: str) -> str:
     return text.lower()
 
 
+def _project_fence_digest(value: object, field: str) -> str:
+    text = _text(value, field, maximum=80)
+    if _PROJECT_FENCE_SHA256.fullmatch(text) is None:
+        raise ValueError(f"{field} must be a sha256 hash")
+    return text
+
+
 def _project_fence_project_id(value: object, field: str) -> str:
     text = _text(value, field, maximum=64)
     if _PROJECT_FENCE_PROJECT_ID.fullmatch(text) is None:
@@ -862,7 +870,7 @@ def _validated_project_fence(value: object, field: str) -> dict[str, Any]:
         "project_id": _project_fence_project_id(
             source["project_id"], f"{field}.project_id"
         ),
-        "binding_digest": _hash(
+        "binding_digest": _project_fence_digest(
             source["binding_digest"], f"{field}.binding_digest"
         ),
         "binding_version": _binding_version(

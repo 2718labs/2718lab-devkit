@@ -2462,6 +2462,14 @@ class TeamEfficiencyTests(unittest.TestCase):
                 {**parsed, "binding_version": 2},
                 "project_fence",
             )
+        with self.assertRaisesRegex(ValueError, "binding_digest must be a sha256 hash"):
+            helper._validated_project_fence(
+                {
+                    **parsed,
+                    "binding_digest": "sha256:" + "AB" * 32,
+                },
+                "project_fence",
+            )
 
     def test_fast_lane_v2_execution_project_alias_stays_inert_without_host_bridge(
         self,
