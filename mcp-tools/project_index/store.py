@@ -700,7 +700,9 @@ class ProjectIndexStore:
             "SELECT * FROM project_index_snapshots WHERE snapshot_id = ?",
             (snapshot_id,),
         ).fetchone()
-        return None if row is None else self._with_packages(self._snapshot_from_row(row))
+        return (
+            None if row is None else self._with_packages(self._snapshot_from_row(row))
+        )
 
     def latest_snapshot(self, workspace_id: str) -> IndexSnapshot | None:
         row = self._connection.execute(

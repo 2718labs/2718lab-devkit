@@ -288,9 +288,7 @@ class ProjectIndexService:
         snapshot = IndexSnapshot(
             snapshot_id=snapshot_id,
             workspace=workspace_id,
-            state=IndexState.INDEX_PARTIAL
-            if gaps
-            else IndexState.INDEX_READY,
+            state=IndexState.INDEX_PARTIAL if gaps else IndexState.INDEX_READY,
             file_count=len(files),
             blob_count=len({source.content_hash for source in files}),
             reused_blob_count=len(reused_hashes),
@@ -478,9 +476,7 @@ class ProjectIndexService:
             )
 
         selected_package_ids = _normalize_package_ids(package_ids)
-        selector_ids = (
-            () if selected_package_ids is None else selected_package_ids
-        )
+        selector_ids = () if selected_package_ids is None else selected_package_ids
         selected_packages = (
             ()
             if selected_package_ids is None
@@ -496,7 +492,9 @@ class ProjectIndexService:
         package_roots = tuple(package.root_path for package in selected_packages)
         if selected_packages:
             if any(
-                not _scope_is_fully_included(package.root_path, self._store.include_paths(snapshot_id))
+                not _scope_is_fully_included(
+                    package.root_path, self._store.include_paths(snapshot_id)
+                )
                 for package in selected_packages
             ):
                 raise IndexError(
@@ -520,9 +518,7 @@ class ProjectIndexService:
                 raise IndexError(
                     "INDEX_STALE", "project index snapshot does not match the workspace"
                 )
-            source_text = {
-                source.path: source.text or "" for source in current_files
-            }
+            source_text = {source.path: source.text or "" for source in current_files}
         else:
             source_text = self._verified_source_text(root, expected_hashes)
         eligible = tuple(node for node in nodes if not kinds or node.kind in kinds)
@@ -572,9 +568,7 @@ class ProjectIndexService:
         query_gaps = self._store.gaps(snapshot_id)
         if selected_packages:
             query_gaps = tuple(
-                gap
-                for gap in query_gaps
-                if _path_in_any_scope(gap.path, package_roots)
+                gap for gap in query_gaps if _path_in_any_scope(gap.path, package_roots)
             )
         gaps, _, gap_truncated = _bounded_items(query_gaps, byte_budget, used_bytes)
         truncated = (
@@ -585,8 +579,10 @@ class ProjectIndexService:
             or gap_truncated
         )
         result_state = (
-            IndexState.INDEX_PARTIAL if query_gaps else IndexState.INDEX_READY
-        ) if selected_packages else snapshot.state
+            (IndexState.INDEX_PARTIAL if query_gaps else IndexState.INDEX_READY)
+            if selected_packages
+            else snapshot.state
+        )
         trace_id = _trace_identifier(
             snapshot_id,
             query,
@@ -780,9 +776,7 @@ class ProjectIndexService:
         snapshot = self._require_snapshot(
             workspace_id, snapshot_id, allow_historical=True
         )
-        packages = tuple(
-            sorted(snapshot.packages, key=package_descriptor_sort_key)
-        )
+        packages = tuple(sorted(snapshot.packages, key=package_descriptor_sort_key))
         total_count = len(packages)
         if normalized_offset > total_count:
             raise IndexError(
@@ -1395,8 +1389,7 @@ def _scope_is_fully_included(scope: str, include_paths: Sequence[str]) -> bool:
     if not scope:
         return False
     return any(
-        scope == include or scope.startswith(f"{include}/")
-        for include in include_paths
+        scope == include or scope.startswith(f"{include}/") for include in include_paths
     )
 
 
@@ -1456,7 +1449,9 @@ def _select_packages(
     packages: Sequence[PackageDescriptor], package_ids: Sequence[str]
 ) -> tuple[PackageDescriptor, ...]:
     descriptors = {package.package_id: package for package in packages}
-    missing = tuple(package_id for package_id in package_ids if package_id not in descriptors)
+    missing = tuple(
+        package_id for package_id in package_ids if package_id not in descriptors
+    )
     if missing:
         raise IndexError("NOT_FOUND", "project index package was not found")
     return tuple(descriptors[package_id] for package_id in package_ids)

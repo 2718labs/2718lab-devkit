@@ -533,6 +533,8 @@ def project_index_status(
         )
         if package_page is None or status.state is IndexState.INDEX_UNAVAILABLE:
             return status
+        if snapshot_id is None:
+            raise _RequestError("INVALID_QUERY")
         page_offset, page_limit = package_page
         return IndexStatusResult(
             status=status,
@@ -779,7 +781,9 @@ def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
 @mcp.tool(annotations=_tool_annotations("fastlane_compile"))
 def fastlane_compile(
     request: dict[str, object],
-    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] = "ultra",
+    reasoning_effort: Literal[
+        "low", "medium", "high", "xhigh", "max", "ultra"
+    ] = "ultra",
     enable: bool = False,
 ) -> dict[str, object]:
     """Compile inert Fast Lane descriptors without receiving host-private evidence.

@@ -7,7 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -26,7 +26,7 @@ from project_index.store import ProjectIndexStore, StoreError  # noqa: E402
 
 @dataclass(frozen=True)
 class _CustomProjectDatabaseConfig(RuntimeConfig):
-    project_database: Path
+    project_database: Path = field(kw_only=True)
 
     @property
     def project_index_database(self) -> Path:
