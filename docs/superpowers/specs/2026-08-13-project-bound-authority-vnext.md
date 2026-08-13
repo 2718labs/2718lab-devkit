@@ -65,7 +65,7 @@ project.
 Future stores use one canonical, path-free project fence:
 
 ```text
-schema = project-fence/v1
+schema = team-efficiency/project-fence-v1
 project_id
 binding_digest
 binding_version
