@@ -785,6 +785,12 @@ def test_public_envelope_rejects_oversize_data() -> None:
             RuntimeContractError("DATA_ROOT_INVALID", "internal root"),
             "DATA_ROOT_INVALID",
         ),
+        (
+            RuntimeContractError(
+                "PROJECT_AUTHORITY_UNAVAILABLE", "host grant unavailable"
+            ),
+            "PROJECT_AUTHORITY_UNAVAILABLE",
+        ),
         (IndexError("INDEX_STALE", "internal index"), "INDEX_STALE"),
         (RelayPlanError("invalid_request"), "RELAY_PLAN_INVALID"),
         (ValueError("invalid"), "INVALID_REQUEST"),

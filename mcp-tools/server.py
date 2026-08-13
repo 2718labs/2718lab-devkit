@@ -253,6 +253,7 @@ def _runtime_failure(
         if error.code in {
             "DATA_ROOT_INVALID",
             "DATA_ROOT_UNAVAILABLE",
+            "PROJECT_AUTHORITY_UNAVAILABLE",
             "PROJECT_SCOPE_INVALID",
         }:
             return _failure(error.code)

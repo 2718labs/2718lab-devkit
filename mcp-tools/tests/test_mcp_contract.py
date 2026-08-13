@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import server
 from devkit_runtime.bootstrap import RuntimeBootstrap
 from devkit_runtime.composition import RuntimeRoot
-from devkit_runtime.config import RuntimeConfig
+from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.tool_result import RESULT_SCHEMA, TOOL_ANNOTATIONS
 from project_index.models import (
     IndexSnapshot,
@@ -139,6 +139,29 @@ def test_public_server_exposes_exact_locked_seventeen_tool_surface() -> None:
     assert frozenset(tools) == EXPECTED_TOOL_NAMES
     assert asyncio.run(server.mcp.list_prompts()) == []
     assert asyncio.run(server.mcp.list_resources()) == []
+
+
+def test_future_strict_authority_unavailable_has_a_stable_public_envelope() -> None:
+    unavailable = server._runtime_failure(
+        RuntimeConfigError("PROJECT_AUTHORITY_UNAVAILABLE")
+    )
+    malformed = server._runtime_failure(
+        RuntimeConfigError("PROJECT_AUTHORITY_PROVIDER_INVALID")
+    )
+
+    assert unavailable == {
+        "schema": RESULT_SCHEMA,
+        "ok": False,
+        "error": {
+            "code": "PROJECT_AUTHORITY_UNAVAILABLE",
+            "message": "request rejected",
+        },
+    }
+    assert malformed == {
+        "schema": RESULT_SCHEMA,
+        "ok": False,
+        "error": {"code": "INTERNAL_ERROR", "message": "request rejected"},
+    }
 
 
 def test_all_tool_annotations_match_the_locked_table() -> None:
