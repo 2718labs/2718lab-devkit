@@ -20,8 +20,6 @@ _PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
 _PROJECT_FENCE_BINDING_VERSION = 1
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 _CONSTRUCTION_TOKEN = object()
-_PROVIDER_CONSTRUCTION_TOKEN = object()
-_FENCE_CONSTRUCTION_TOKEN = object()
 
 
 class ProjectAuthorityError(RuntimeError):
@@ -123,20 +121,9 @@ class ProjectFence:
         project_id: str,
         binding_digest: str,
         binding_version: int,
-        _token: object,
     ) -> None:
-        if _token is not _FENCE_CONSTRUCTION_TOKEN:
-            raise TypeError("ProjectFence must be derived from ProjectAuthority")
-        _validate_project_fence_fields(
-            schema=schema,
-            project_id=project_id,
-            binding_digest=binding_digest,
-            binding_version=binding_version,
-        )
-        object.__setattr__(self, "schema", schema)
-        object.__setattr__(self, "project_id", project_id)
-        object.__setattr__(self, "binding_digest", binding_digest)
-        object.__setattr__(self, "binding_version", binding_version)
+        del schema, project_id, binding_digest, binding_version
+        raise TypeError("ProjectFence must be derived from ProjectAuthority")
 
 
 @dataclass(frozen=True, init=False)
@@ -201,27 +188,23 @@ class ProjectAuthority:
 
 @dataclass(frozen=True, init=False)
 class RuntimeProjectAuthorityProvider:
-    """Ephemeral module-minted capability for one validated authority.
+    """Reserved host-admission carrier unavailable to the plugin alone.
 
-    Receipt persistence and selection require a separate trusted host registry.
-    This provider intentionally performs neither responsibility.
+    A future Desktop host bridge may replace this closed construction path with
+    a process-bound admission protocol.  Receipt self-consistency is not
+    sufficient to create a runtime provider in this process.
     """
 
     _authority: ProjectAuthority
 
     def __init__(self, authority: ProjectAuthority, *, _token: object) -> None:
-        if _token is not _PROVIDER_CONSTRUCTION_TOKEN:
-            raise TypeError(
-                "provider must be issued or reopened by the authority module"
-            )
-        object.__setattr__(self, "_authority", authority)
+        del authority, _token
+        raise ProjectAuthorityError("PROJECT_AUTHORITY_UNAVAILABLE")
 
     @classmethod
     def issue(cls, project_root: str | Path) -> RuntimeProjectAuthorityProvider:
-        return cls(
-            ProjectAuthority.issue(project_root),
-            _token=_PROVIDER_CONSTRUCTION_TOKEN,
-        )
+        del project_root
+        raise ProjectAuthorityError("PROJECT_AUTHORITY_UNAVAILABLE")
 
     @classmethod
     def reopen(
@@ -229,10 +212,8 @@ class RuntimeProjectAuthorityProvider:
         project_root: str | Path,
         receipt: ProjectAuthorityReceipt,
     ) -> RuntimeProjectAuthorityProvider:
-        return cls(
-            ProjectAuthority.reopen(project_root, receipt),
-            _token=_PROVIDER_CONSTRUCTION_TOKEN,
-        )
+        del project_root, receipt
+        raise ProjectAuthorityError("PROJECT_AUTHORITY_UNAVAILABLE")
 
     def current(self) -> ProjectAuthority:
         self._authority.revalidate()
@@ -270,13 +251,33 @@ def _derive_project_fence(authority: ProjectAuthority) -> ProjectFence:
     binding_digest = hashlib.sha256(
         _canonical_json(material).encode("ascii")
     ).hexdigest()
-    return ProjectFence(
+    return _new_project_fence(
         schema=_PROJECT_FENCE_SCHEMA,
         project_id=receipt.project_id,
         binding_digest=binding_digest,
         binding_version=_PROJECT_FENCE_BINDING_VERSION,
-        _token=_FENCE_CONSTRUCTION_TOKEN,
     )
+
+
+def _new_project_fence(
+    *,
+    schema: str,
+    project_id: str,
+    binding_digest: str,
+    binding_version: int,
+) -> ProjectFence:
+    _validate_project_fence_fields(
+        schema=schema,
+        project_id=project_id,
+        binding_digest=binding_digest,
+        binding_version=binding_version,
+    )
+    fence = object.__new__(ProjectFence)
+    object.__setattr__(fence, "schema", schema)
+    object.__setattr__(fence, "project_id", project_id)
+    object.__setattr__(fence, "binding_digest", binding_digest)
+    object.__setattr__(fence, "binding_version", binding_version)
+    return fence
 
 
 def _validate_receipt(receipt: ProjectAuthorityReceipt) -> None:

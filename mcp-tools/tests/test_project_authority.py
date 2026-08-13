@@ -8,7 +8,6 @@ from typing import cast
 
 import pytest
 
-import devkit_runtime.config as runtime_config_module
 import devkit_runtime.project_authority as project_authority_module
 from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
@@ -28,26 +27,10 @@ def test_authority_receipt_reopens_same_physical_project_with_same_identity(
     project_root = tmp_path / "project"
     project_root.mkdir()
 
-    issued_provider = RuntimeProjectAuthorityProvider.issue(project_root)
-    issued = issued_provider.current()
+    issued = ProjectAuthority.issue(project_root)
     persisted = issued.receipt.to_json()
     receipt = ProjectAuthorityReceipt.from_json(persisted)
-    reopened_provider = RuntimeProjectAuthorityProvider.reopen(project_root, receipt)
-    reopened = reopened_provider.current()
-    scratch_root = tmp_path / "scratch"
-    scratch_root.mkdir()
-    environment = {
-        "PLUGIN_DATA": str(tmp_path / "plugin-data"),
-        "CODEX_TASK_TEMP": str(scratch_root),
-    }
-    issued_config = RuntimeConfig.load(
-        environ=environment,
-        authority_provider=issued_provider,
-    )
-    reopened_config = RuntimeConfig.load(
-        environ=environment,
-        authority_provider=reopened_provider,
-    )
+    reopened = ProjectAuthority.reopen(project_root, receipt)
 
     identity_material = {
         "authority_nonce": receipt.authority_nonce,
@@ -67,9 +50,7 @@ def test_authority_receipt_reopens_same_physical_project_with_same_identity(
 
     assert reopened.project_id == issued.project_id
     assert reopened.receipt == issued.receipt
-    assert issued_config.authority_provider == issued_provider
-    assert reopened_config.authority_provider == reopened_provider
-    assert reopened_config.data_root == issued_config.data_root
+    assert reopened.project_fence() == issued.project_fence()
     assert reopened.project_id == hashlib.sha256(canonical).hexdigest()
     assert persisted == issued.receipt.to_json()
 
@@ -185,6 +166,53 @@ def test_project_fence_has_no_caller_construction_or_json_rehydration_api() -> N
     assert not hasattr(ProjectFence, "from_project_root")
 
 
+def test_project_fence_has_no_module_construction_token() -> None:
+    assert not hasattr(project_authority_module, "_FENCE_CONSTRUCTION_TOKEN")
+
+
+def test_public_provider_minting_cannot_activate_projects_v2_without_host_grant(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    plugin_data = tmp_path / "plugin-data"
+    scratch_root = tmp_path / "scratch"
+    project_root.mkdir()
+    scratch_root.mkdir()
+
+    with pytest.raises(ProjectAuthorityError) as caught:
+        RuntimeProjectAuthorityProvider.issue(project_root)
+
+    assert caught.value.code == "PROJECT_AUTHORITY_UNAVAILABLE"
+    assert not plugin_data.exists()
+
+
+def test_public_provider_reopen_cannot_activate_projects_v2_without_host_grant(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    receipt = ProjectAuthority.issue(project_root).receipt
+
+    with pytest.raises(ProjectAuthorityError) as caught:
+        RuntimeProjectAuthorityProvider.reopen(project_root, receipt)
+
+    assert caught.value.code == "PROJECT_AUTHORITY_UNAVAILABLE"
+
+
+def test_provider_constructor_has_no_module_token_without_host_grant(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    authority = ProjectAuthority.issue(project_root)
+
+    assert not hasattr(project_authority_module, "_PROVIDER_CONSTRUCTION_TOKEN")
+    with pytest.raises(ProjectAuthorityError) as caught:
+        RuntimeProjectAuthorityProvider(authority, _token=object())
+
+    assert caught.value.code == "PROJECT_AUTHORITY_UNAVAILABLE"
+
+
 def test_authority_cannot_be_issued_without_an_existing_directory(
     tmp_path: Path,
 ) -> None:
@@ -275,41 +303,21 @@ def test_distinct_project_roots_cannot_collide_through_same_caller_id(
         "token_hex",
         lambda _: "01" * 32,
     )
-    provider_a = RuntimeProjectAuthorityProvider.issue(project_a)
-    provider_b = RuntimeProjectAuthorityProvider.issue(project_b)
-    authority_a = provider_a.current()
-    authority_b = provider_b.current()
-    shared_environment = {
-        "PLUGIN_DATA": str(tmp_path / "plugin-data"),
-        "CODEX_TASK_TEMP": str(tmp_path / "scratch"),
-        "CODEX_PROJECT_ID": "caller-selected-id",
-    }
-    (tmp_path / "scratch").mkdir()
-
-    config_a = RuntimeConfig.load(
-        environ=shared_environment,
-        authority_provider=provider_a,
-    )
-    config_b = RuntimeConfig.load(
-        environ=shared_environment,
-        authority_provider=provider_b,
-    )
+    authority_a = ProjectAuthority.issue(project_a)
+    authority_b = ProjectAuthority.issue(project_b)
 
     assert authority_a.project_id != authority_b.project_id
-    assert config_a.data_root != config_b.data_root
-    assert config_a.data_root.parent.name == "projects-v2"
-    assert config_b.data_root.parent.name == "projects-v2"
+    assert authority_a.project_fence() != authority_b.project_fence()
 
 
-def test_caller_selected_ids_cannot_choose_authority_ownership(
+def test_caller_selected_ids_remain_legacy_scope_without_host_admission(
     tmp_path: Path,
 ) -> None:
     project_root = tmp_path / "project"
     project_root.mkdir()
     scratch_root = tmp_path / "scratch"
     scratch_root.mkdir()
-    provider = RuntimeProjectAuthorityProvider.issue(project_root)
-    authority = provider.current()
+    authority = ProjectAuthority.issue(project_root)
     common = {
         "PLUGIN_DATA": str(tmp_path / "plugin-data"),
         "CODEX_TASK_TEMP": str(scratch_root),
@@ -317,19 +325,18 @@ def test_caller_selected_ids_cannot_choose_authority_ownership(
 
     config_a = RuntimeConfig.load(
         environ={**common, "CODEX_PROJECT_ID": "project-a"},
-        authority_provider=provider,
     )
     config_b = RuntimeConfig.load(
         environ={**common, "CODEX_PROJECT_ID": "project-b"},
-        authority_provider=provider,
     )
 
-    assert config_a.project_authority == authority
-    assert config_b.project_authority == authority
-    assert config_a.data_root == config_b.data_root
-    assert config_a.data_root == (
-        tmp_path / "plugin-data" / "projects-v2" / authority.project_id
-    )
+    assert config_a.project_authority is None
+    assert config_b.project_authority is None
+    assert config_a.storage_layout == "legacy-compat"
+    assert config_b.storage_layout == "legacy-compat"
+    assert config_a.data_root != config_b.data_root
+    assert authority.project_id not in str(config_a.data_root)
+    assert authority.project_id not in str(config_b.data_root)
 
 
 def test_legacy_caller_scope_is_explicitly_not_project_authority(
@@ -382,49 +389,6 @@ def test_runtime_config_rejects_authority_without_module_minted_provider(
     assert manually_constructed.value.code == "PROJECT_AUTHORITY_PROVIDER_INVALID"
 
 
-def test_runtime_config_rechecks_binding_after_root_safety_traversal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    project_root = tmp_path / "project"
-    original_root = tmp_path / "original-project"
-    project_root.mkdir()
-    scratch_root = tmp_path / "scratch"
-    scratch_root.mkdir()
-    provider = RuntimeProjectAuthorityProvider.issue(project_root)
-    authority = provider.current()
-    plugin_data = tmp_path / "plugin-data"
-    authority_data_root = plugin_data / "projects-v2" / authority.project_id
-    safe_directory_path = runtime_config_module._safe_directory_path
-    replaced = False
-
-    def replace_after_data_root_check(path: Path, *, require_exists: bool) -> bool:
-        nonlocal replaced
-        result = safe_directory_path(path, require_exists=require_exists)
-        if path == authority_data_root and not replaced:
-            project_root.rename(original_root)
-            project_root.mkdir()
-            replaced = True
-        return result
-
-    monkeypatch.setattr(
-        runtime_config_module,
-        "_safe_directory_path",
-        replace_after_data_root_check,
-    )
-
-    with pytest.raises(RuntimeConfigError) as caught:
-        RuntimeConfig.load(
-            environ={
-                "PLUGIN_DATA": str(plugin_data),
-                "CODEX_TASK_TEMP": str(scratch_root),
-            },
-            authority_provider=provider,
-        )
-
-    assert replaced
-    assert caught.value.code == "PROJECT_AUTHORITY_INVALID"
-
-
 @pytest.mark.parametrize(
     "binding",
     (
@@ -448,39 +412,6 @@ def test_malformed_runtime_receipt_types_fail_with_stable_error(
         ProjectAuthority.reopen(project_root, receipt)
 
     assert caught.value.code == "PROJECT_AUTHORITY_RECEIPT_INVALID"
-
-
-@pytest.mark.parametrize("read_only", (True, False))
-def test_runtime_root_revalidates_project_authority_before_each_uow_open(
-    tmp_path: Path,
-    read_only: bool,
-) -> None:
-    project_root = tmp_path / "project"
-    original_root = tmp_path / "original-project"
-    project_root.mkdir()
-    scratch_root = tmp_path / "scratch"
-    scratch_root.mkdir()
-    provider = RuntimeProjectAuthorityProvider.issue(project_root)
-    config = RuntimeConfig.load(
-        environ={
-            "PLUGIN_DATA": str(tmp_path / "plugin-data"),
-            "CODEX_TASK_TEMP": str(scratch_root),
-        },
-        authority_provider=provider,
-    )
-    factory_calls: list[bool] = []
-    root = RuntimeRoot(
-        config,
-        uow_factory=lambda *, config, read_only: factory_calls.append(read_only),
-    )
-    project_root.rename(original_root)
-    project_root.mkdir()
-
-    with pytest.raises(RuntimeConfigError) as caught:
-        root.open_uow(read_only=read_only)
-
-    assert caught.value.code == "PROJECT_AUTHORITY_INVALID"
-    assert factory_calls == []
 
 
 @pytest.mark.parametrize("read_only", (True, False))
