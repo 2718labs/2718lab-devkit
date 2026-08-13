@@ -61,6 +61,7 @@ jobs:
         run: >-
           uv run --locked ruff check
           devkit_atlas/service.py
+          devkit_continuity
           devkit_runtime/atlas_acceptance.py
           orchestrator/service.py
           project_index/checkpoints.py
@@ -71,6 +72,7 @@ jobs:
         run: >-
           uv run --locked ruff format --check
           devkit_atlas/service.py
+          devkit_continuity
           devkit_runtime/atlas_acceptance.py
           orchestrator/service.py
           project_index/checkpoints.py
@@ -78,7 +80,7 @@ jobs:
           project_index/store.py
 
       - name: Server type check
-        run: uv run --locked pyright server.py
+        run: uv run --locked pyright server.py devkit_continuity
 
       - name: Server syntax check
         run: uv run --locked python -m py_compile server.py

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-
 PROVENANCE_VALUES = frozenset({"observed", "resolved", "declared"})
 WORKSPACE_BINDING_STATES = frozenset({"active", "historical_unverified"})
 
@@ -78,6 +77,30 @@ class CoverageGap:
 
 
 @dataclass(frozen=True)
+class PackageDescriptor:
+    """One immutable logical package boundary captured by a snapshot."""
+
+    package_id: str
+    ecosystem: str
+    name: str
+    root_path: str
+    manifest_path: str
+    manifest_hash: str
+
+
+@dataclass(frozen=True)
+class PackagePage:
+    """One immutable, snapshot-bound page of package descriptors."""
+
+    snapshot_id: str
+    offset: int
+    limit: int
+    total_count: int
+    packages: tuple[PackageDescriptor, ...]
+    next_offset: int | None
+
+
+@dataclass(frozen=True)
 class SourceWindow:
     path: str
     start_line: int
@@ -102,6 +125,7 @@ class IndexSnapshot:
     head: str | None = None
     workspace_id: str = ""
     binding_state: str = "active"
+    packages: tuple[PackageDescriptor, ...] = ()
 
     def __post_init__(self) -> None:
         if self.binding_state not in WORKSPACE_BINDING_STATES:
@@ -118,12 +142,21 @@ class IndexSnapshot:
 
 
 @dataclass(frozen=True)
+class IndexSyncResult:
+    """A newly synchronized snapshot and its first bounded package page."""
+
+    snapshot: IndexSnapshot
+    package_page: PackagePage
+
+
+@dataclass(frozen=True)
 class SnapshotFacts:
     snapshot: IndexSnapshot
     file_hashes: tuple[tuple[str, str], ...]
     nodes: tuple[IndexNode, ...]
     edges: tuple[IndexEdge, ...]
     gaps: tuple[CoverageGap, ...]
+    packages: tuple[PackageDescriptor, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -143,6 +176,14 @@ class IndexStatus:
     changed_paths: tuple[str, ...] = ()
     gaps: tuple[CoverageGap, ...] = ()
     binding_state: str = "active"
+
+
+@dataclass(frozen=True)
+class IndexStatusResult:
+    """An optional, explicit package catalog page paired with index status."""
+
+    status: IndexStatus
+    package_page: PackagePage | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +217,7 @@ class QueryReceipt:
     returned_source_windows: tuple[tuple[str, int, int, str], ...]
     gaps: tuple[CoverageGap, ...]
     truncated: bool
+    package_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

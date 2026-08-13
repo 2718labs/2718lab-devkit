@@ -81,6 +81,43 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 
 如果 MCP 不可用，允许按 `references/work-packages.md` 使用文件降级，但必须标记 `DEGRADED_SKILL_ONLY`，关闭并发写入和崩溃恢复承诺，并向用户说明这不等价于完整插件。
 
+### 3.1 工作包项目隔离（V2）
+
+`team-efficiency/work-package-v1` 是可读、可分解的诊断载荷，不是执行授权。它可以被
+`decompose`/`plan-waves` 显示，但任何会创建 assignment、worktree、claim、resume 或恢复持久
+状态的 Fast Lane 编译调用，遇到 v1 必须返回 `NO_SAFE_WORK` 和
+`LEGACY_PROJECT_UNBOUND`，零 assignment、零队列、零外部派发。
+
+未来外部 Desktop bridge 如要消费的载荷必须是 `team-efficiency/work-package-v2` exact-key envelope，包含原始 canonical v1
+`package`、其 `package_payload_hash`、`project_fence`（仅 `project_id`、
+`binding_digest`、`binding_version`）、`workspace_id` 与 `input_snapshot_id`。V2 的
+source-plan hash 必须包含该整个 binding，因此相同 task/workflow 在不同项目、workspace 或输入
+snapshot 下不能共用计划、lease、receipt 或恢复状态。
+
+manifest 中的 fence 只是可验证的结构与 hash 输入，绝不是 authority。当前仓库没有 Desktop-host
+durable registry 或真正私有的跨边界 authority bridge，因此没有任何同进程 provider、module
+attribute、closure、环境变量、请求 JSON、repo/task root、路径名或 caller-supplied ID 可被当作
+live authority。公开 `compile_fast_lane` 与 `fast-lane` CLI 对 structurally valid V2 一律产出
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`，零本地 assignment、零队列、零外部派发；V2
+envelope/hash 无效、其内层 canonical v1 `package` 不能完成纯诊断解析，或 fast-lane request
+壳的 schema/key/字节边界无效时，必须是 `PROJECT_BINDING_INVALID`；v1 保持
+`LEGACY_PROJECT_UNBOUND`。这些结构预检不读取 host、quota 或 index 输入，也不触及 scheduler。
+公开 MCP request 若试图携带明确的 host-private 字段（如 `host_status`、quota 或 index
+evidence），则是适配器输入违规，必须在编译前以 `FASTLANE_REQUEST_INVALID` 拒绝，而不是把
+该值当作可诊断的计划输入。
+增加
+Desktop-host durable registry、跨进程 authority 传递或公开 MCP 参数属于后续外部 host 合同，不能由
+工作包 JSON 或 Python 私有命名假装已经存在。
+
+同一限制覆盖 `bootstrap --apply` 及 import-callable `apply_bootstrap_plan`：当前公开入口在构建
+caller-supplied bootstrap plan 或调用 worktree mutation 前，无条件以
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 失败关闭，因而不能到达
+`git worktree add`。不带 `--apply` 的 `bootstrap` 仍只输出 dry-run 诊断计划；其中的 project、
+root、worktree 和任何 JSON 都不是 sealed V2 execution context。仓库当前不存在可执行的
+host-authorized worktree path：没有 module-private capability、runner、Git probe 或 adapter 可绕过
+该关闭结果。Desktop host registry 与真正私有的跨边界 execution bridge 是外部前置条件；它们尚未在
+本仓库实现，也不能用 Python module attribute、closure 或 caller-supplied JSON 伪装。
+
 ### 4. 接地后再写
 
 列出不能百分之百确认的接口并逐个查证。查不到时选择可被现有证据支持的保守实现，并明确记录限制；不把编译器当 API 文档。
@@ -91,13 +128,13 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 
 #### Ultra Fast Lane
 
-对实质性的 Ultra 任务，host 调用：
+下面是未来外部 Desktop bridge 的 host 合同形状：
 
 ```text
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
-`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。`fast-lane` 只编译确定性的 inert dispatch descriptors：它不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。当前仓库的公开 `fast-lane` CLI/API 不消费 host-status、quota 或 index 输入来激活该合同：在外部 Desktop authority bridge 实现并验收前，它始终输出 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 的零 assignment/队列预览。下文的 descriptor、route、quota 与 host dispatch 约束只定义未来 bridge 的接入要求，不是本仓库存在的执行通路。`fast-lane` 本身不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
 
 host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
 `routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整
@@ -138,16 +175,17 @@ terminal boundary 做一次 output query；worker 只消费 packet，不调用
 不匹配时停止该 assignment。这样索引安全约束仍在，但不会把低价值的索引仪式交给
 LLM 自己编排。
 
-额度遥测优先由 host-private inherited-handle bridge 传递：先发送
+未来 bridge 的额度遥测优先由 host-private inherited-handle bridge 传递：先发送
 `kind="quota_snapshot_request"`（`host-quota-snapshot-request-v1`），再接收绑定同一
 `request_id` 的 `kind="quota_snapshot"`（`host-quota-snapshot-response-v1`）。响应内层必须是
 `host-quota-snapshot-v1`，并由 `fastlane_quota_balance` 继续验证快照哈希、签名、租约世代与
-120 秒 freshness。host 需要在同一进程内接入
+120 秒 freshness。未来 host 需要在同一进程内接入
 `scripts/codex_account_quota.py` 的 `CodexQuotaProvider`：它只调用官方
 `codex app-server --stdio` 的 JSONL `initialize`、`account/read`（`refreshToken=false`）和
 `account/rateLimits/read`，严格按 `limitId="codex"` 与
 `limitName="GPT-5.3-Codex-Spark"` 取主池/Spark 池，HMAC key 只留内存；不读
-`auth.json`、cookie、环境变量邮箱或私有 HTTP 接口。可执行入口为：
+`auth.json`、cookie、环境变量邮箱或私有 HTTP 接口。它不是当前公开 CLI 的可执行入口；未来 bridge
+可按下列形状接入：
 
 ```text
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra

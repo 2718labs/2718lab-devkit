@@ -10,7 +10,6 @@ import json
 import os
 import re
 import stat
-import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -63,6 +62,8 @@ _TASK_ID = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|FLR1-[0-9a-f]{24})$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _GIT_ID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _SHA256 = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+_PROJECT_FENCE_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PROJECT_FENCE_PROJECT_ID = re.compile(r"^[0-9a-f]{64}$")
 _UTC_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _PATH_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -140,6 +141,34 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
         "scheduler_state",
     }
 )
+_FAST_LANE_REQUEST_HOST_PRIVATE_FIELDS = frozenset(
+    {
+        "host_status",
+        "quota_request",
+        "quota_trusted_key_resolver",
+        "quota_evaluation_time_utc_z",
+        "quota_verified_route_result_hashes",
+        "quota_verified_lease_scope_bindings",
+        "index_evidence",
+        "trusted_index_evidence_hashes",
+        "index_evaluation_time_utc_z",
+    }
+)
+_WORK_PACKAGE_V2_FIELDS = frozenset(
+    {
+        "schema",
+        "package",
+        "package_payload_hash",
+        "project_fence",
+        "workspace_id",
+        "input_snapshot_id",
+    }
+)
+_PROJECT_FENCE_FIELDS = frozenset(
+    {"schema", "project_id", "binding_digest", "binding_version"}
+)
+_PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
+_WORK_PACKAGE_V2_SCHEMA = "team-efficiency/work-package-v2"
 _FAST_LANE_EXECUTION_CONTEXT_FIELDS = frozenset(
     {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"}
 )
@@ -811,6 +840,131 @@ def _hash(value: object, field: str) -> str:
     return text.lower()
 
 
+def _project_fence_digest(value: object, field: str) -> str:
+    text = _text(value, field, maximum=80)
+    if _PROJECT_FENCE_SHA256.fullmatch(text) is None:
+        raise ValueError(f"{field} must be a sha256 hash")
+    return text
+
+
+def _project_fence_project_id(value: object, field: str) -> str:
+    text = _text(value, field, maximum=64)
+    if _PROJECT_FENCE_PROJECT_ID.fullmatch(text) is None:
+        raise ValueError(f"{field} is invalid")
+    return text
+
+
+def _binding_version(value: object, field: str) -> int:
+    if type(value) is not int or value != 1:
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _validated_project_fence(value: object, field: str) -> dict[str, Any]:
+    source = _mapping(value, field)
+    _exact_keys(source, _PROJECT_FENCE_FIELDS, field)
+    if source["schema"] != _PROJECT_FENCE_SCHEMA:
+        raise ValueError(f"{field}.schema is invalid")
+    return {
+        "schema": _PROJECT_FENCE_SCHEMA,
+        "project_id": _project_fence_project_id(
+            source["project_id"], f"{field}.project_id"
+        ),
+        "binding_digest": _project_fence_digest(
+            source["binding_digest"], f"{field}.binding_digest"
+        ),
+        "binding_version": _binding_version(
+            source["binding_version"], f"{field}.binding_version"
+        ),
+    }
+
+
+def _validated_work_package_v2(value: object) -> dict[str, Any]:
+    source = _mapping(value, "work-package v2 envelope")
+    _exact_keys(source, _WORK_PACKAGE_V2_FIELDS, "work-package v2 envelope")
+    if source["schema"] != _WORK_PACKAGE_V2_SCHEMA:
+        raise ValueError("work-package v2 schema is invalid")
+    package = _mapping(source["package"], "work-package v2 package")
+    if package.get("schema") != "team-efficiency/work-package-v1":
+        raise ValueError("work-package v2 package must be canonical v1 payload")
+    payload = dict(package)
+    package_payload_hash = _hash(
+        source["package_payload_hash"], "work-package v2 package_payload_hash"
+    )
+    if _sha256_json(payload) != package_payload_hash:
+        raise ValueError("work-package v2 package_payload_hash does not match payload")
+    fence = _validated_project_fence(
+        source["project_fence"], "work-package v2 project_fence"
+    )
+    return {
+        "package": payload,
+        "package_payload_hash": package_payload_hash,
+        "project_authority": {
+            **fence,
+            "workspace_id": _hash(
+                source["workspace_id"], "work-package v2 workspace_id"
+            ),
+            "input_snapshot_id": _hash(
+                source["input_snapshot_id"], "work-package v2 input_snapshot_id"
+            ),
+        },
+    }
+
+
+def _project_execution_block_details(
+    request: object,
+) -> tuple[str, dict[str, Any] | None]:
+    """Return the public compiler's fixed boundary result and V2 hash input.
+
+    V2 envelopes remain canonical diagnostic input, but this repository has
+    no externally private Desktop authority bridge.  A Python module global,
+    closure, environment value, or caller-supplied record cannot stand in for
+    one, so every V2 execution request stays inert.
+    """
+
+    try:
+        raw_request = _mapping(request, "fast-lane request")
+    except (TypeError, ValueError):
+        return "PROJECT_BINDING_INVALID", None
+
+    if _FAST_LANE_REQUEST_HOST_PRIVATE_FIELDS.intersection(raw_request):
+        raise ValueError("fast-lane request must not contain host-private inputs")
+
+    try:
+        _exact_keys(raw_request, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+        if raw_request["schema"] != "team-efficiency/fast-lane-request-v1":
+            return "PROJECT_BINDING_INVALID", None
+        if len(_json_bytes(raw_request)) > MAX_MANIFEST_INPUT_BYTES:
+            return "PROJECT_BINDING_INVALID", None
+    except (KeyError, TypeError, ValueError):
+        return "PROJECT_BINDING_INVALID", None
+
+    package = raw_request.get("work_package")
+    if not isinstance(package, Mapping):
+        return "PROJECT_BINDING_INVALID", None
+    if package.get("schema") == "team-efficiency/work-package-v1":
+        return "LEGACY_PROJECT_UNBOUND", None
+    if package.get("schema") == _WORK_PACKAGE_V2_SCHEMA:
+        try:
+            v2 = _validated_work_package_v2(package)
+            # Validate the canonical V1 payload before classifying the V2
+            # envelope as merely missing external authority.  This is a pure
+            # diagnostic parse: it cannot reach scheduler, host, quota, index,
+            # worktree, or dispatch logic.
+            _decompose_v1(v2["package"])
+        except (TypeError, ValueError):
+            return "PROJECT_BINDING_INVALID", None
+        return (
+            "PROJECT_AUTHORITY_UNAVAILABLE",
+            {
+                "schema": "team-efficiency/project-fence-blocked-v2",
+                "package_payload_hash": v2["package_payload_hash"],
+                "project_authority": v2["project_authority"],
+            },
+        )
+    return "PROJECT_BINDING_INVALID", None
+
+
 def _relative_scope(value: object, field: str) -> str:
     text = _text(value, field, maximum=256)
     if text.startswith("/") or "\\" in text or ":" in text:
@@ -1068,186 +1222,6 @@ def _task_root_bound_path(value: object, field: str, *, task_root: Path) -> Path
     return resolved
 
 
-def _pin_windows_directory(path: Path, field: str) -> int | None:
-    if os.name != "nt":
-        return None
-    import ctypes
-    from ctypes import wintypes
-
-    class _ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("dwFileAttributes", wintypes.DWORD),
-            ("ftCreationTime", wintypes.FILETIME),
-            ("ftLastAccessTime", wintypes.FILETIME),
-            ("ftLastWriteTime", wintypes.FILETIME),
-            ("dwVolumeSerialNumber", wintypes.DWORD),
-            ("nFileSizeHigh", wintypes.DWORD),
-            ("nFileSizeLow", wintypes.DWORD),
-            ("nNumberOfLinks", wintypes.DWORD),
-            ("nFileIndexHigh", wintypes.DWORD),
-            ("nFileIndexLow", wintypes.DWORD),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.GetFileInformationByHandle.argtypes = (
-        wintypes.HANDLE,
-        ctypes.POINTER(_ByHandleFileInformation),
-    )
-    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.CreateFileW(
-        str(path),
-        0x0080,
-        0x0001,
-        None,
-        3,
-        0x02000000 | 0x00200000,
-        None,
-    )
-    invalid = ctypes.c_void_p(-1).value
-    if handle == invalid:
-        raise ValueError(f"{field} cannot be pinned without delete sharing")
-    information = _ByHandleFileInformation()
-    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
-        kernel32.CloseHandle(handle)
-        raise ValueError(f"{field} cannot be inspected through its pinned handle")
-    if information.dwFileAttributes & 0x0400:
-        kernel32.CloseHandle(handle)
-        raise ValueError(f"{field} must not use reparse points")
-    return int(handle)
-
-
-class _PinnedDirectoryTree:
-    def __init__(self) -> None:
-        self._handles: list[int] = []
-        self._identities: set[str] = set()
-
-    def __enter__(self) -> _PinnedDirectoryTree:
-        return self
-
-    def __exit__(self, *_arguments: object) -> None:
-        if os.name != "nt":
-            return
-        import ctypes
-        from ctypes import wintypes
-
-        close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-        for handle in reversed(self._handles):
-            close_handle(handle)
-        self._handles.clear()
-        self._identities.clear()
-
-    def pin(self, path: Path, field: str) -> None:
-        identity = str(path).casefold()
-        if identity in self._identities:
-            return
-        handle = _pin_windows_directory(path, field)
-        if handle is not None:
-            self._handles.append(handle)
-        self._identities.add(identity)
-
-    def pin_ancestors(self, path: Path, field: str) -> None:
-        current = path
-        while True:
-            self.pin(current, field)
-            parent = current.parent
-            if parent == current:
-                return
-            current = parent
-
-
-def _create_verified_directory(
-    path: Path,
-    *,
-    task_root: Path,
-    project_root: Path,
-    field: str,
-    allow_project_root: bool = False,
-    pins: _PinnedDirectoryTree,
-) -> Path:
-    if path == project_root:
-        if not allow_project_root:
-            raise ValueError(f"{field} must be below the task root")
-    else:
-        _strictly_below(path, project_root, field)
-    _reject_reparse_points_below(path, task_root, field)
-    if not task_root.is_dir() or _path_has_reparse_point(task_root):
-        raise ValueError("configured task root cannot be safely created below")
-    pins.pin_ancestors(task_root, "configured task root")
-    try:
-        relative = path.relative_to(task_root)
-    except ValueError as error:
-        raise ValueError(f"{field} must stay below the task root") from error
-
-    current = task_root
-    for part in relative.parts:
-        if not current.is_dir() or _path_has_reparse_point(current):
-            raise ValueError(f"{field} must not use reparse points")
-        pins.pin(current, field)
-        current = current / part
-        try:
-            current.mkdir()
-        except FileExistsError:
-            pass
-        if not current.is_dir() or _path_has_reparse_point(current):
-            raise ValueError(f"{field} must not use reparse points")
-        pins.pin(current, field)
-        resolved_current = current.resolve(strict=True)
-        try:
-            resolved_current.relative_to(task_root)
-        except ValueError as error:
-            raise ValueError(f"{field} must stay below the task root") from error
-
-    verified = path.resolve(strict=True)
-    if verified == project_root:
-        if not allow_project_root:
-            raise ValueError(f"{field} must be below the task root")
-    else:
-        _strictly_below(verified, project_root, field)
-    if not verified.is_dir():
-        raise ValueError(f"{field} must be a directory")
-    return verified
-
-
-def _create_fresh_verified_directory(
-    path: Path,
-    *,
-    task_root: Path,
-    project_root: Path,
-    field: str,
-    pins: _PinnedDirectoryTree,
-) -> Path:
-    _strictly_below(path, project_root, field)
-    _reject_reparse_points_below(path, task_root, field)
-    try:
-        path.mkdir()
-    except FileExistsError:
-        raise ValueError(f"{field} target already exists") from None
-    except OSError as error:
-        raise ValueError(f"{field} cannot be created") from error
-    if not path.is_dir() or _path_has_reparse_point(path):
-        raise ValueError(f"{field} must not use reparse points")
-    pins.pin(path, field)
-    verified = path.resolve(strict=True)
-    _strictly_below(verified, project_root, field)
-    if not verified.is_dir():
-        raise ValueError(f"{field} must be a directory")
-    return verified
-
-
 def _is_default_fastlane_task_root(root: Path) -> bool:
     return (
         str(root).casefold()
@@ -1326,19 +1300,6 @@ def _enforce_python_cache_path_budget(
         write_scope=write_scope,
     ) > (MAX_PYTHON_CACHE_PATH_LENGTH):
         raise ValueError("configured fast-lane task root is not approved")
-
-
-def _bootstrap_task_root(plan: Mapping[str, Any]) -> Path:
-    root = _configured_fastlane_task_root()
-    if plan["schema"] == "team-efficiency/bootstrap-v1":
-        if not _is_default_fastlane_task_root(root):
-            raise ValueError("bootstrap plan task root changed")
-        return root
-    if plan["schema"] == "team-efficiency/bootstrap-v2":
-        if plan["task_root_hash"] != _fastlane_task_root_hash(root):
-            raise ValueError("bootstrap plan task root changed")
-        return root
-    raise ValueError("bootstrap plan is not eligible for apply")
 
 
 def build_bootstrap_plan(
@@ -1435,6 +1396,8 @@ def build_bootstrap_plan(
 
 
 def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebuild and compare an inert bootstrap descriptor without executing it."""
+
     candidate = _mapping(plan, "bootstrap plan")
     schema = candidate.get("schema")
     if schema == "team-efficiency/bootstrap-v1":
@@ -1442,9 +1405,9 @@ def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     elif schema == "team-efficiency/bootstrap-v2":
         _exact_keys(candidate, _BOOTSTRAP_V2_FIELDS, "bootstrap plan")
     else:
-        raise ValueError("bootstrap plan is not eligible for apply")
+        raise ValueError("bootstrap plan is not a valid diagnostic descriptor")
     if candidate["mode"] != "dry_run":
-        raise ValueError("bootstrap plan is not eligible for apply")
+        raise ValueError("bootstrap plan is not a valid diagnostic descriptor")
     rebuilt = build_bootstrap_plan(
         task_id=candidate["task_id"],
         base_commit=candidate["base_commit"],
@@ -1461,129 +1424,16 @@ def _validated_bootstrap_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     return rebuilt
 
 
-def _temporary_environment(
-    plan: Mapping[str, Any],
-) -> tuple[dict[str, str], Path, Path, Path]:
-    task_root = _bootstrap_task_root(plan)
-    _, root = _project_root(plan["project"], task_root=task_root)
-    temp_target = _task_root_bound_path(
-        plan["temp_target"],
-        "temp_target",
-        task_root=task_root,
-    )
-    environment = os.environ.copy()
-    target_text = str(temp_target)
-    for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
-        environment[name] = target_text
-    environment["PYTHONPYCACHEPREFIX"] = str(temp_target / "p")
-    environment["UV_CACHE_DIR"] = str(temp_target / "u")
-    return environment, temp_target, root, task_root
-
-
-def _create_verified_temp_target(
-    temp_target: Path,
-    task_root: Path,
-    pins: _PinnedDirectoryTree,
-) -> Path:
-    _create_verified_directory(
-        temp_target.parent,
-        task_root=task_root,
-        project_root=task_root,
-        field="temp_target parent",
-        allow_project_root=True,
-        pins=pins,
-    )
-    return _create_fresh_verified_directory(
-        temp_target,
-        task_root=task_root,
-        project_root=task_root,
-        field="temp_target",
-        pins=pins,
-    )
-
-
-def _run_git_probe(argv: list[str], *, check: bool, env: Mapping[str, str]) -> None:
-    subprocess.run(
-        argv,
-        check=check,
-        env=dict(env),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def _run_worktree_add(argv: list[str], *, check: bool, env: Mapping[str, str]) -> None:
-    subprocess.run(argv, check=check, env=dict(env))
-
-
 def apply_bootstrap_plan(
     plan: Mapping[str, Any],
     *,
     runner: Callable[..., object] | None = None,
     probe_runner: Callable[..., object] | None = None,
 ) -> dict[str, Any]:
-    """Apply the one validated argument-vector operation after an absence check."""
+    """Fail closed: this repository has no executable bootstrap authority bridge."""
 
-    validated = _validated_bootstrap_plan(plan)
-    task_root = _bootstrap_task_root(validated)
-    _, root = _project_root(validated["project"], task_root=task_root)
-    worktree = _root_bound_path(
-        validated["worktree"],
-        "worktree",
-        task_root=task_root,
-        project_root=root,
-    )
-    if worktree.exists():
-        raise ValueError("worktree target already exists")
-    environment, temp_target, root, task_root = _temporary_environment(validated)
-    with _PinnedDirectoryTree() as pins:
-        verified_temp_target = _create_verified_temp_target(
-            temp_target,
-            task_root,
-            pins,
-        )
-        for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
-            environment[name] = str(verified_temp_target)
-        environment["PYTHONPYCACHEPREFIX"] = str(verified_temp_target / "p")
-        environment["UV_CACHE_DIR"] = str(verified_temp_target / "u")
-        selected_probe = probe_runner if probe_runner is not None else _run_git_probe
-        selected_probe(
-            ["git", "-C", validated["repo"], "rev-parse", "--git-dir"],
-            check=True,
-            env=environment,
-        )
-        selected_probe(
-            [
-                "git",
-                "-C",
-                validated["repo"],
-                "rev-parse",
-                "--verify",
-                f"{validated['base_commit']}^{{commit}}",
-            ],
-            check=True,
-            env=environment,
-        )
-        _create_verified_directory(
-            worktree.parent,
-            task_root=task_root,
-            project_root=root,
-            field="worktree parent",
-            allow_project_root=True,
-            pins=pins,
-        )
-        worktree = _create_fresh_verified_directory(
-            worktree,
-            task_root=task_root,
-            project_root=root,
-            field="worktree",
-            pins=pins,
-        )
-        selected_runner = runner if runner is not None else _run_worktree_add
-        selected_runner(validated["command_argv"], check=True, env=environment)
-    applied = dict(validated)
-    applied["mode"] = "applied"
-    return applied
+    del plan, runner, probe_runner
+    raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
 
 
 def _summary(value: object, field: str) -> dict[str, str]:
@@ -4110,7 +3960,7 @@ def _scheduled_plan(
     }
 
 
-def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
+def _decompose_v1(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Compile manual boundaries or verified Code Atlas evidence into safe waves."""
 
     source = _mapping(manifest, "work-package manifest")
@@ -4235,6 +4085,26 @@ def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
         source_kind=source_kind,
         units=units,
     )
+
+
+def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Compile a package for diagnostics without authorizing host execution.
+
+    V1 remains a diagnostics-compatible payload.  V2 adds the immutable
+    project binding to the resulting source plan so any executable caller has
+    a hash that changes with the intended project/workspace/input fence.
+    """
+
+    source = _mapping(manifest, "work-package manifest")
+    if source.get("schema") != _WORK_PACKAGE_V2_SCHEMA:
+        return _decompose_v1(source)
+    v2 = _validated_work_package_v2(source)
+    plan = _decompose_v1(v2["package"])
+    return {
+        **plan,
+        "project_authority": v2["project_authority"],
+        "package_payload_hash": v2["package_payload_hash"],
+    }
 
 
 def plan_waves(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -5080,7 +4950,6 @@ def _validated_fast_lane_contexts(
     temp_targets: set[str] = set()
     repo_anchor: str | None = None
     project_roots: list[Path] = []
-
     for index, record in enumerate(execution_records):
         field = f"execution_contexts[{index}]"
         context = _mapping(record, field)
@@ -6772,8 +6641,17 @@ def _validated_fast_lane_scheduler_state(
 
 
 def _validated_fast_lane_request(
-    request: Mapping[str, Any], *, host_routing_context: Mapping[str, Any] | None = None
+    request: Mapping[str, Any],
+    *,
+    host_routing_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Normalize pure scheduler data without granting execution authority.
+
+    This supports structural validation and future bridge implementation only.
+    Public ``compile_fast_lane`` intentionally does not call it while no
+    external Desktop authority bridge exists.
+    """
+
     candidate = _mapping(request, "fast-lane request")
     _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
     if candidate["schema"] != "team-efficiency/fast-lane-request-v1":
@@ -8114,9 +7992,76 @@ def _fast_lane_stopped_plan(
     )
 
 
+def _fast_lane_project_fence_blocked_plan(
+    activation: Mapping[str, Any],
+    *,
+    reason_code: str,
+    source_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return an inert plan before any package context can create work.
+
+    The package compiler has no authority to infer a project from an
+    environment variable or an unchecked path.  Until an external Desktop
+    bridge exists, keep every execution, worktree, recovery, and dispatch
+    action out of the plan.
+    """
+
+    source_plan_hash = _sha256_json(
+        {
+            "schema": "team-efficiency/project-fence-preflight-v1",
+            "reason_code": reason_code,
+            "source_identity": (
+                None if source_identity is None else dict(source_identity)
+            ),
+        }
+    )
+    result: dict[str, Any] = {
+        "schema": "team-efficiency/fast-lane-plan-v1",
+        "status": "blocked",
+        "decision_code": "NO_SAFE_WORK",
+        "activation": dict(activation),
+        "source_plan_hash": source_plan_hash,
+        "phase": "execution",
+        "main_lane": _fast_lane_main_lane(
+            activation,
+            next_action=None,
+        ),
+        "subagent_capacity": len(FAST_LANE_SLOT_IDS),
+        "assignments": [],
+        "ready_queue": [],
+        "review_queue": [],
+        "prewarm_queue": [],
+        "design_queue": [],
+        "invalidated_evidence_task_ids": [],
+        "idle_slots": _fast_lane_idle_slots(reason_code),
+        "refill_plan": _fast_lane_refill_plan(),
+        "terminal_protocol": _fast_lane_terminal_protocol({"units": []}),
+        "workflow_policy": _fast_lane_workflow_policy(),
+        "cross_session_dispatch_projection": _fast_lane_cross_session_projection(
+            {"source_plan_hash": source_plan_hash},
+            reference_result={},
+            host_status=None,
+            occupancy=None,
+            quota_evidence=_fast_lane_main_capacity_evidence_unknown(
+                "quota_usage_unknown"
+            ),
+        ),
+    }
+    result["plan_hash"] = _sha256_json(result)
+    _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    return result
+
+
 def _render_fast_lane_plan(
     validated: Mapping[str, Any], activation: Mapping[str, Any]
 ) -> dict[str, Any]:
+    """Render a pure descriptor for structural validation, never a grant.
+
+    This function cannot create live assignments, worktrees, or sessions.  The
+    public compiler remains fenced above it until an external Desktop bridge
+    is implemented and accepted.
+    """
+
     source_plan = _mapping(validated["source_plan"], "source plan")
     if source_plan["status"] == "needs_design":
         return _fast_lane_needs_design_plan(validated, activation)
@@ -8813,6 +8758,8 @@ def _apply_fast_lane_cross_session_projection(
     occupancy: Mapping[str, Any] | None,
     quota_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Attach pure projection data; public compiler does not reach this path."""
+
     projection = _fast_lane_cross_session_projection(
         result,
         reference_result=reference_result,
@@ -8898,6 +8845,8 @@ def _fast_lane_apply_index_evidence(
     trusted_index_evidence_hashes: Iterable[str],
     index_evaluation_time_utc_z: str | None,
 ) -> dict[str, Any]:
+    """Bind structural evidence only; it is not public execution ingress."""
+
     assignments_value = result["assignments"]
     if not isinstance(assignments_value, Sequence) or isinstance(
         assignments_value, (str, bytes, bytearray)
@@ -9065,89 +9014,31 @@ def compile_fast_lane(
     trusted_index_evidence_hashes: Iterable[str] = (),
     index_evaluation_time_utc_z: str | None = None,
 ) -> dict[str, Any]:
-    activation = _fast_lane_activation(reasoning_effort, enable)
-    status = (
-        None if host_status is None else _validated_fast_lane_host_status(host_status)
-    )
-    validated = _validated_fast_lane_request(
-        request,
-        host_routing_context=(None if status is None else status["routing_context"]),
-    )
-    occupancy: dict[str, Any] | None = None
-    if status is not None:
-        scheduler_state = validated["scheduler_state"]
-        occupancy = _fast_lane_host_slot_occupancy_audit(
-            workflow_id=status["workflow_id"],
-            source_plan_hash=validated["source_plan_hash"],
-            phase=scheduler_state["phase"],
-            running_assignments=scheduler_state["running_assignments"],
-            host_bindings=status["host_bindings"],
-            current_leases=status["current_leases"],
-        )
-        active_slots = set(occupancy["active_slot_ids"])
-        filtered_assignments = [
-            assignment
-            for assignment in scheduler_state["running_assignments"]
-            if assignment["slot_id"] in active_slots
-        ]
-        if len(filtered_assignments) != len(scheduler_state["running_assignments"]):
-            validated = {
-                **validated,
-                "scheduler_state": {
-                    **scheduler_state,
-                    "running_assignments": filtered_assignments,
-                },
-            }
-    result = _render_fast_lane_plan(validated, activation)
-    if occupancy is not None:
-        refill_plan = {
-            **result["refill_plan"],
-            "occupancy_audit": occupancy,
-        }
-        result = {**result, "refill_plan": refill_plan}
-        result["plan_hash"] = _sha256_json(
-            {key: value for key, value in result.items() if key != "plan_hash"}
-        )
-        _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
-        if len(_json_bytes(result)) > MAX_MANIFEST_BYTES:
-            raise ValueError("fast-lane plan exceeds its byte budget")
-    reference_result = result
-    quota_evidence = _fast_lane_main_capacity_evidence(
+    """Fail closed until an external Desktop project-authority bridge exists.
+
+    The signature remains stable for the MCP adapter, but no request field,
+    host-status record, quota record, index record, module attribute, or
+    Python closure can authorize scheduling from this repository.
+    """
+
+    del (
+        host_status,
         quota_request,
-        trusted_key_resolver=quota_trusted_key_resolver,
-        evaluation_time_utc_z=quota_evaluation_time_utc_z,
-        verified_route_result_hashes=quota_verified_route_result_hashes,
-        verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+        quota_trusted_key_resolver,
+        quota_evaluation_time_utc_z,
+        quota_verified_route_result_hashes,
+        quota_verified_lease_scope_bindings,
+        index_evidence,
+        trusted_index_evidence_hashes,
+        index_evaluation_time_utc_z,
     )
-    if quota_request is not None:
-        decision = _fast_lane_quota_decision(
-            quota_request,
-            trusted_key_resolver=quota_trusted_key_resolver,
-            evaluation_time_utc_z=quota_evaluation_time_utc_z,
-            verified_route_result_hashes=quota_verified_route_result_hashes,
-            verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
-        )
-        result = _apply_fast_lane_quota_balance(
-            result,
-            quota_request=quota_request,
-            quota_decision=decision,
-        )
-    result = _apply_fast_lane_cross_session_projection(
-        result,
-        reference_result=reference_result,
-        host_status=status,
-        occupancy=occupancy,
-        quota_evidence=quota_evidence,
+    activation = _fast_lane_activation(reasoning_effort, enable)
+    reason_code, source_identity = _project_execution_block_details(request)
+    return _fast_lane_project_fence_blocked_plan(
+        activation,
+        reason_code=reason_code,
+        source_identity=source_identity,
     )
-    try:
-        return _fast_lane_apply_index_evidence(
-            result,
-            index_evidence=index_evidence,
-            trusted_index_evidence_hashes=trusted_index_evidence_hashes,
-            index_evaluation_time_utc_z=index_evaluation_time_utc_z,
-        )
-    except (KeyError, TypeError, ValueError):
-        return _fast_lane_index_evidence_fail_closed(result)
 
 
 def _read_json(path_text: str, *, maximum: int) -> Any:
@@ -9210,6 +9101,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "bootstrap":
+            if args.apply:
+                # The public CLI has no host-private, sealed V2 execution
+                # context.  Its caller-controlled --project/root/worktree
+                # values must therefore never reach the Git mutation helper.
+                raise ValueError("NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE")
             plan = build_bootstrap_plan(
                 task_id=args.task_id,
                 base_commit=args.base_commit,
@@ -9220,7 +9116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 worktree=args.worktree,
                 temp_target=args.temp_target,
             )
-            _print_json(apply_bootstrap_plan(plan) if args.apply else plan)
+            _print_json(plan)
         elif args.command == "resume-packet":
             packet = _read_json(args.input, maximum=MAX_PACKET_BYTES)
             print(canonical_resume_packet(packet))
@@ -9236,85 +9132,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_json(make_cache_metadata(inputs))
         elif args.command == "fast-lane":
             request = _read_json(args.input, maximum=MAX_MANIFEST_INPUT_BYTES)
-            host_status = (
-                None
-                if args.host_status is None
-                else _mapping(
-                    _read_json(
-                        args.host_status,
-                        maximum=MAX_FAST_LANE_HOST_STATUS_BYTES,
-                    ),
-                    "host status",
-                )
-            )
-            if args.quota_input is None and args.quota_evaluation_time is not None:
-                raise ValueError("quota evaluation time requires quota input")
-            if (
-                args.quota_input is not None
-                and args.quota_evaluation_time is None
-                and not args.live_quota
-            ):
-                raise ValueError("quota input requires an evaluation time")
-            quota_request = (
-                None
-                if args.quota_input is None
-                else _mapping(
-                    _read_json(
-                        args.quota_input,
-                        maximum=MAX_FAST_LANE_HOST_STATUS_BYTES,
-                    ),
-                    "quota request",
-                )
-            )
-            quota_resolver = None
-            quota_evaluation_time = args.quota_evaluation_time
-            if args.live_quota:
-                if quota_request is None:
-                    raise ValueError("live quota requires quota input")
-                quota_module = _codex_account_quota_module()
-                try:
-                    base_snapshot = _mapping(
-                        quota_request.get("snapshot"), "quota request snapshot"
-                    )
-                    capacity = _mapping(
-                        base_snapshot.get("capacity"), "quota request capacity"
-                    )
-                    provider = quota_module.CodexQuotaProvider(
-                        executable=args.codex_executable,
-                        timeout_seconds=args.quota_timeout,
-                        state_path=(
-                            None
-                            if args.quota_state_path is None
-                            else Path(args.quota_state_path)
-                        ),
-                    )
-                    evidence = provider.read(capacity=capacity)
-                    quota_request = quota_module.attach_snapshot(
-                        quota_request, evidence
-                    )
-                    quota_resolver = evidence.key_resolver
-                    if quota_evaluation_time is None:
-                        quota_evaluation_time = str(
-                            evidence.snapshot["observed_at_utc_z"]
-                        )
-                except quota_module.CodexQuotaError:
-                    # A live source failure is a safe scheduler result, not a
-                    # reason to invent a percentage or start new work.
-                    print(
-                        "quota source unavailable; using usage_unknown",
-                        file=sys.stderr,
-                    )
-                    quota_resolver = _unavailable_quota_key
-                    if quota_evaluation_time is None:
-                        quota_evaluation_time = _utc_now_z()
+            # Until an external Desktop authority bridge exists, the public
+            # CLI must not read caller-supplied host/quota inputs or launch a
+            # local quota provider in a futile attempt to activate work.  The
+            # arguments remain parse-compatible, but cannot establish an
+            # execution context or influence this inert result.
             result = compile_fast_lane(
-                _mapping(request, "fast-lane request"),
+                request,
                 reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),
                 enable=args.enable,
-                host_status=host_status,
-                quota_request=quota_request,
-                quota_trusted_key_resolver=quota_resolver,
-                quota_evaluation_time_utc_z=quota_evaluation_time,
             )
             _print_json(result)
         else:

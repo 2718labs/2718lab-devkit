@@ -20,6 +20,44 @@ only after the CI and artifact checks pass.
   Code Assist review policy. Dosu size labeling is documented as its external
   GitHub App integration so it remains a single label writer.
 
+## [1.0.0] - 2026-08-13
+
+### Added
+
+- Added verified Continuity replay and typed frozen-view recovery, including
+  deterministic receipt, pointer, and CAS verification before replayed Atlas
+  projection is allowed.
+- Added release-grade project-index package pagination and package-bound MCP
+  selectors, with the locked 17-tool public surface retained.
+- Added canonical project-fence and host-admission handoff contracts for a
+  future Desktop-attested vNext data plane.
+
+### Changed
+
+- Promoted the MCP-only primary package from RC4 to the first stable `1.0.0`
+  release.
+- Public Fast Lane compilation and bootstrap are intentionally authority-inert
+  until a Desktop host supplies a private, project-attested admission grant;
+  public calls return a zero-assignment fail-closed preview rather than
+  selecting a project from caller input.
+
+### Fixed
+
+- Hardened Windows-native Continuity CAS traversal, publication, cleanup, and
+  cross-store finalization primitives against reparse, stale-fence, journal,
+  and recovery races.
+- Normalized future strict-admission failure handling to the path-neutral
+  `PROJECT_AUTHORITY_UNAVAILABLE` public envelope without exposing internal
+  provider details.
+
+### Security
+
+- Tightened immutable replay, receipt, command, and physical SQLite proof
+  checks; invalid or unavailable evidence fails closed without falling back to
+  live workspace authority.
+- Kept Desktop project-registry issuance and vNext project-bound writes
+  disabled in this repository until the external host contract exists.
+
 ## [1.0.0-rc4] - 2026-08-03
 
 ### Fixed

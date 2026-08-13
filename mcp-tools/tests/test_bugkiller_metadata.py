@@ -30,11 +30,11 @@ def load_json(relative_path: str) -> dict[str, Any]:
 
 
 class BugkillerMetadataTests(unittest.TestCase):
-    def test_primary_plugin_manifest_is_rc4_and_has_no_prompt_runtime_surface(
+    def test_primary_plugin_manifest_is_stable_v1_and_has_no_prompt_runtime_surface(
         self,
     ) -> None:
         codex = load_json(".codex-plugin/plugin.json")
-        self.assertEqual("1.0.0-rc4", codex["version"])
+        self.assertEqual("1.0.0", codex["version"])
         self.assertEqual("./.mcp.json", codex["mcpServers"])
         for legacy_surface in ("skills", "agents", "commands", "hooks"):
             self.assertNotIn(legacy_surface, codex)

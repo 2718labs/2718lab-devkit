@@ -21,27 +21,31 @@ match one of their projects. Win32-normalized aliases (including trailing
 dot/space and reserved device names) are rejected for root-bound targets. The
 root never comes from request JSON or a bootstrap plan: default plans remain
 bootstrap-v1, while a non-default root is bound by a canonical hash in
-bootstrap-v2. A changed configuration fails revalidation before Git runs.
+bootstrap-v2. A changed configuration fails diagnostic revalidation; this
+repository does not launch Git for bootstrap execution.
 
-The default output is a canonical dry-run plan. Its only eligible apply vector
+The default output is a canonical dry-run plan. Its canonical worktree vector
 is:
 
 ```text
 git -C <repo> worktree add -b <branch> <worktree> <base-commit>
 ```
 
-`--apply` revalidates that exact plan and requires the worktree target to be
-absent. Before the apply vector, fixed read-only Git probes verify the local
-repository and full base commit. The helper creates or verifies only the
-validated temp target, then creates its own fresh empty worktree leaf before
-passing that exact path to Git. It passes the temp target as `TEMP`, `TMP`, `TMPDIR`, and
-`CODEX_TASK_TEMP` to those child processes. It also pins
-`PYTHONPYCACHEPREFIX=<temp>/pycache` and `UV_CACHE_DIR=<temp>/uv-cache`, so
-child caches cannot silently return to C. Creation proceeds one checked path
-component at a time. On Windows it also pins the configured-root ancestry and
-each participating directory, including that fresh worktree leaf, with read-only
-sharing (no write/delete sharing) through creation and the Git vector. A pre-existing
-leaf or inability to pin fails closed rather than falling back to path-only creation.
+`bootstrap --apply` is deliberately disabled in the public CLI, and the
+import-callable `apply_bootstrap_plan` helper is equally fail-closed. Both
+return `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` before building a
+caller-supplied plan or invoking the worktree helper, so neither can run
+`git worktree add`. Plan-only `bootstrap` remains a non-mutating diagnostic
+command; its emitted project/root/worktree values cannot establish authority.
+
+There is no currently executable host-authorized worktree path in this
+repository. It contains no private capability registry, runner, Git probe, or
+internal adapter that can turn a plan into a worktree. The displayed vector is
+diagnostic data only, and attempted mutation always returns
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` before a caller-provided runner,
+path, environment, or JSON can have an effect. A Desktop host registry and a
+genuinely external private execution bridge are prerequisites for any future
+apply behavior; neither is implemented or accepted as an input here.
 
 ## Resume, status, contracts, and cache metadata
 
@@ -99,6 +103,56 @@ boundary, a non-empty relative write scope, declared dependencies, required
 evidence, complexity, and explicit execution contracts. Equal paths and
 ancestor/descendant paths conflict. Unsafe, wildcard-like, absolute,
 traversal, unknown-dependency, and cyclic manifests are rejected.
+
+### Project-bound execution envelope
+
+`work-package-v1` remains diagnostic-only input for `decompose` and
+`plan-waves`; it never authorizes assignment, worktree creation, claim, resume,
+or durable recovery. The exact `team-efficiency/work-package-v2` envelope is
+still canonical diagnostic input and the required future external-host contract:
+
+```json
+{
+  "schema": "team-efficiency/work-package-v2",
+  "package": { "schema": "team-efficiency/work-package-v1" },
+  "package_payload_hash": "sha256:<canonical-v1-payload>",
+  "project_fence": {
+    "schema": "team-efficiency/project-fence-v1",
+    "project_id": "opaque-project-id",
+    "binding_digest": "sha256:<host-binding>",
+    "binding_version": 1
+  },
+  "workspace_id": "sha256:<workspace>",
+  "input_snapshot_id": "sha256:<input-snapshot>"
+}
+```
+
+The diagnostic decomposition and inert public blocked-plan hash incorporate
+this full binding into `source_plan_hash`. The manifest provides structural fence data, never
+authority; no environment project ID, root path, worktree path, task-root
+component, caller-supplied identifier, Python module attribute, or closure can
+replace a live host record. This repository has no Desktop-host durable
+registry or external private bridge, so its public `compile_fast_lane` and
+`fast-lane` CLI do not compare against an in-process provider and cannot
+activate V2: a structurally valid V2 request always yields
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` with zero assignments, local
+queues, and external-session assignments. An invalid V2 envelope/hash yields
+`PROJECT_BINDING_INVALID`; so does an inner canonical-v1 `package` that fails
+pure diagnostic parsing, or an invalid fast-lane request schema/key/byte shell.
+Those checks occur before any host, quota, or index input is read. V1 yields
+`NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`.
+An MCP request that explicitly carries host-private fields such as `host_status`,
+quota, or index evidence is not a diagnostic plan shell: the public adapter must
+reject it as `FASTLANE_REQUEST_INVALID` before compilation.
+Public `bootstrap --apply` and import-callable `apply_bootstrap_plan` are both
+blocked before any caller plan, path, provider override, closure, or JSON can
+reach a worktree helper, because no such helper exists in this repository.
+
+Host-status, quota, and index payloads remain bounded future-bridge contract
+data. The current public CLI parses its stable command surface but does not use
+those caller inputs to create authority, schedule work, read a live quota
+provider, or bypass the inert result. Only an externally implemented and
+accepted Desktop bridge could perform live authority comparison in the future.
 
 ### Verified Code Atlas evidence
 
@@ -392,9 +446,9 @@ read-only role and is not a name for this bootstrap.
 Prewarm is read-only evidence, not acceptance evidence: a later writer may
 reuse it only after current-basis delta revalidation passes.
 
-### Live account quota
+### Live account quota (future external bridge contract)
 
-When quota balancing participates in dispatch, the host uses
+When a future external bridge participates in dispatch, the host may use
 `--live-quota` so the planner receives a fresh signed snapshot from the local
 Codex app-server. The adapter calls only
 `account/read` (with `refreshToken=false`) and `account/rateLimits/read`, then
@@ -404,9 +458,10 @@ binds the exact `codex` main pool and the exact
 stays in memory and it never reads `auth.json`, cookies, or a private HTTP
 endpoint.
 
-The base quota request must carry the host-bound `snapshot.capacity`. The live
-adapter replaces only the snapshot, recomputes `request_hash`, and calls the
-pure compiler with the in-memory key resolver:
+The base quota request must carry the host-bound `snapshot.capacity`. A future
+live adapter may replace only the snapshot, recompute `request_hash`, and call
+the pure structural validators with the in-memory key resolver. The current
+public CLI does not run this provider or activate a compiler route:
 
 ```text
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
@@ -427,12 +482,13 @@ registration, and durable workflow completion remain required.
 
 The compiler proves only request consistency. All execution and read `repo`
 anchors must agree on a canonical repo anchor, and worker/read worktrees must
-differ from that anchor. Before executing a descriptor, the host matches the
-request anchor to its trusted shared integration worktree; before `git worktree add`, it rejects a
-mismatch without mutation. After apply, the host re-resolves the created
-target, verifies that it equals the planned worker worktree and shares the
-trusted anchor's Git common directory, and records that post-apply attestation
-as host evidence. The host never substitutes the integration worktree for a
+differ from that anchor. If a future external host bridge executes a descriptor,
+it must match the request anchor to its trusted shared integration worktree and
+reject a mismatch before `git worktree add`. After an external apply, it must
+re-resolve the created target, verify that it equals the planned worker worktree
+and shares the trusted anchor's Git common directory, and record that
+post-apply attestation as host evidence. This repository implements none of
+those mutation steps and never substitutes the integration worktree for a
 worker or read worktree.
 
 Rendered plans contain redacted bounded metadata only: no absolute

@@ -26,6 +26,25 @@ from orchestrator.store import (
 )
 
 
+def _replace_schema_metadata_with_legacy_version(
+    connection: sqlite3.Connection,
+    version: str,
+) -> None:
+    connection.execute("DROP TABLE schema_metadata")
+    connection.execute(
+        """
+        CREATE TABLE schema_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+        ("schema_version", version),
+    )
+
+
 class SQLiteStoreServiceApiTests(unittest.TestCase):
     _WORKSPACE_ID = "sha256:" + "1" * 64
 
@@ -95,9 +114,7 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE task_index_bindings DROP COLUMN workspace_id"
             )
-            connection.execute(
-                "UPDATE schema_metadata SET value = '5' WHERE key = 'schema_version'"
-            )
+            _replace_schema_metadata_with_legacy_version(connection, "5")
             connection.commit()
         finally:
             connection.close()
@@ -390,16 +407,14 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
         try:
             connection.execute("DROP TABLE IF EXISTS code_task_receipt_owners")
             connection.execute("DROP TABLE IF EXISTS code_task_receipt_attestations")
-            connection.execute(
-                "UPDATE schema_metadata SET value = '4' WHERE key = 'schema_version'"
-            )
+            _replace_schema_metadata_with_legacy_version(connection, "4")
             connection.commit()
         finally:
             connection.close()
 
         migrated = SQLiteStore(legacy_database)
         try:
-            self.assertEqual(10, migrated.schema_version())
+            self.assertEqual(13, migrated.schema_version())
             table_names = {
                 str(row["name"])
                 for row in migrated._connection.execute(
@@ -434,7 +449,7 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM events WHERE task_id = ?", ("legacy-v5-task",)
             ).fetchone()[0]
 
-            self.assertEqual(10, migrated.schema_version())
+            self.assertEqual(13, migrated.schema_version())
             self.assertIn("workspace_id", columns)
             self.assertEqual("D:/legacy-secret-workspace", row["workspace_root"])
             self.assertEqual("", row["workspace_id"])
@@ -507,7 +522,7 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
 
         reopened = SQLiteStore(legacy_database)
         try:
-            self.assertEqual(10, reopened.schema_version())
+            self.assertEqual(13, reopened.schema_version())
             with self.assertRaises(StrictIndexError):
                 reopened.get_index_binding("legacy-v5-task")
         finally:

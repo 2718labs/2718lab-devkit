@@ -49,6 +49,7 @@ def test_atlas_runtime_is_self_contained_without_a_skills_tree(tmp_path: Path) -
     runtime_root.mkdir()
     for package in (
         "devkit_atlas",
+        "devkit_continuity",
         "devkit_relay",
         "devkit_runtime",
         "orchestrator",

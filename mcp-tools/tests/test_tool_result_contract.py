@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_atlas.models import (  # noqa: E402
     AcceptanceProjection,
+    AtlasError,
     AtlasNode,
     AtlasStatus,
     GraphQueryResult,
@@ -58,6 +59,10 @@ from project_index.models import (  # noqa: E402
     IndexSnapshot,
     IndexState,
     IndexStatus,
+    IndexStatusResult,
+    IndexSyncResult,
+    PackageDescriptor,
+    PackagePage,
     QueryResult,
     SourceWindow,
 )
@@ -90,6 +95,24 @@ def test_success_and_failure_envelopes_have_exact_top_level_keys() -> None:
     }
     assert set(success) == {"schema", "ok", "data"}
     assert set(failure) == {"schema", "ok", "error"}
+
+
+@pytest.mark.parametrize(
+    "code",
+    ("ATLAS_EVIDENCE_UNAVAILABLE", "ATLAS_EVIDENCE_CONFLICT"),
+)
+def test_continuity_evidence_failures_keep_the_generic_secret_free_envelope(
+    code: str,
+) -> None:
+    result = result_from_exception(AtlasError(code, "C:/private/cas/sha256/secret"))
+
+    assert result == {
+        "schema": RESULT_SCHEMA,
+        "ok": False,
+        "error": {"code": code, "message": "request rejected"},
+    }
+    assert "private" not in str(result)
+    assert "secret" not in str(result)
 
 
 @pytest.mark.parametrize("value", [None, [], "text", 1, True])
@@ -189,6 +212,14 @@ def test_annotation_table_is_exact(tool: str, expected: tuple[bool, ...]) -> Non
 
 
 def test_index_projectors_are_closed_and_source_windows_never_include_text() -> None:
+    package = PackageDescriptor(
+        package_id="sha256:" + "e" * 64,
+        ecosystem="python",
+        name="demo",
+        root_path="packages/demo",
+        manifest_path="packages/demo/pyproject.toml",
+        manifest_hash="sha256:" + "f" * 64,
+    )
     snapshot = IndexSnapshot(
         snapshot_id="snapshot-1",
         workspace="workspace-1",
@@ -202,6 +233,7 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
         gap_count=1,
         manifest_hash="sha256:" + "a" * 64,
         parser_set_hash="sha256:" + "b" * 64,
+        packages=(package,),
     )
     status = IndexStatus(
         workspace="workspace-1",
@@ -255,6 +287,7 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
         "manifest_hash",
         "parser_set_hash",
         "binding_state",
+        "package_page",
     }
     assert set(status_data) == {
         "workspace_id",
@@ -276,6 +309,23 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
         "gaps",
         "truncated",
     }
+    assert sync_data["package_page"] == {
+        "offset": 0,
+        "limit": 128,
+        "total_count": 1,
+        "returned_count": 1,
+        "packages": [
+            {
+                "package_id": "sha256:" + "e" * 64,
+                "ecosystem": "python",
+                "name": "demo",
+                "relative_root": "packages/demo",
+                "manifest_path": "packages/demo/pyproject.toml",
+                "manifest_hash": "sha256:" + "f" * 64,
+                "representation": "full",
+            }
+        ],
+    }
     assert query_data["source_windows"] == [
         {
             "path": "src/a.py",
@@ -286,6 +336,160 @@ def test_index_projectors_are_closed_and_source_windows_never_include_text() -> 
     ]
     assert "text" not in str(query_data)
     assert "print('must stay private')" not in str(query_data)
+
+
+def test_package_scope_partial_index_failure_is_not_rewritten_as_unavailable() -> None:
+    assert result_from_exception(IndexError("INDEX_PARTIAL", "private detail")) == {
+        "schema": RESULT_SCHEMA,
+        "ok": False,
+        "error": {"code": "INDEX_PARTIAL", "message": "request rejected"},
+    }
+
+
+def test_index_sync_projector_allows_an_unnamed_package_descriptor() -> None:
+    snapshot = IndexSnapshot(
+        snapshot_id="snapshot-unnamed",
+        workspace="workspace-1",
+        workspace_id="workspace-1",
+        state=IndexState.INDEX_READY,
+        file_count=1,
+        blob_count=1,
+        reused_blob_count=0,
+        node_count=0,
+        edge_count=0,
+        gap_count=0,
+        packages=(
+            PackageDescriptor(
+                package_id="sha256:" + "a" * 64,
+                ecosystem="python",
+                name="",
+                root_path="packages/unnamed",
+                manifest_path="packages/unnamed/pyproject.toml",
+                manifest_hash="sha256:" + "b" * 64,
+            ),
+        ),
+    )
+
+    data = _data(project_index_sync(snapshot))
+
+    assert data["package_page"]["packages"][0]["name"] == ""
+
+
+def test_index_sync_projector_lists_package_catalog_beyond_generic_list_bound() -> None:
+    packages = tuple(
+        PackageDescriptor(
+            package_id=f"sha256:{index:064x}",
+            ecosystem="node",
+            name=f"package-{index}",
+            root_path=f"packages/package-{index:03d}",
+            manifest_path=f"packages/package-{index:03d}/package.json",
+            manifest_hash=f"sha256:{index + 1024:064x}",
+        )
+        for index in range(513)
+    )
+    snapshot = IndexSnapshot(
+        snapshot_id="snapshot-large-catalog",
+        workspace="workspace-1",
+        workspace_id="workspace-1",
+        state=IndexState.INDEX_READY,
+        file_count=513,
+        blob_count=513,
+        reused_blob_count=0,
+        node_count=0,
+        edge_count=0,
+        gap_count=0,
+        packages=packages,
+    )
+
+    data = _data(project_index_sync(snapshot))
+
+    assert "packages" not in data
+    assert data["package_page"]["total_count"] == 513
+    assert data["package_page"]["returned_count"] == 128
+    assert data["package_page"]["next_offset"] == 128
+    assert data["package_page"]["packages"][127]["package_id"] == (
+        "sha256:" + f"{127:064x}"
+    )
+
+
+def test_package_catalog_pages_are_safe_and_make_forward_progress() -> None:
+    unsafe_name = "line\nbreak"
+    unsafe_root = "C:/host/private"
+    unsafe_manifest = "../private/package.json"
+    packages = tuple(
+        PackageDescriptor(
+            package_id=f"sha256:{position:064x}",
+            ecosystem="node",
+            name=unsafe_name if position == 0 else "n" * 4096,
+            root_path=unsafe_root if position == 0 else f"packages/pkg-{position}",
+            manifest_path=(
+                unsafe_manifest
+                if position == 0
+                else f"packages/pkg-{position}/package.json"
+            ),
+            manifest_hash=f"sha256:{position + 10_000:064x}",
+        )
+        for position in range(513)
+    )
+    snapshot = IndexSnapshot(
+        snapshot_id="snapshot-1",
+        workspace="workspace-1",
+        workspace_id="workspace-1",
+        state=IndexState.INDEX_READY,
+        file_count=513,
+        blob_count=513,
+        reused_blob_count=0,
+        node_count=0,
+        edge_count=0,
+        gap_count=0,
+        packages=packages,
+    )
+    first_page = PackagePage(
+        snapshot_id="snapshot-1",
+        offset=0,
+        limit=128,
+        total_count=513,
+        packages=packages[:128],
+        next_offset=128,
+    )
+    continuation = PackagePage(
+        snapshot_id="snapshot-1",
+        offset=128,
+        limit=128,
+        total_count=513,
+        packages=packages[128:256],
+        next_offset=256,
+    )
+    status = IndexStatus(
+        workspace="workspace-1",
+        snapshot_id="snapshot-1",
+        state=IndexState.INDEX_READY,
+    )
+
+    sync_data = _data(project_index_sync(IndexSyncResult(snapshot, first_page)))
+    status_data = _data(
+        project_index_status(IndexStatusResult(status, continuation))
+    )
+
+    first = sync_data["package_page"]
+    descriptor = first["packages"][0]
+    assert "packages" not in sync_data
+    assert first["offset"] == 0
+    assert first["returned_count"] == 128
+    assert first["next_offset"] == 128
+    assert descriptor["representation"] == "digested"
+    assert set(descriptor["field_digests"]) == {
+        "name",
+        "relative_root",
+        "manifest_path",
+    }
+    assert unsafe_name not in str(sync_data)
+    assert unsafe_root not in str(sync_data)
+    assert unsafe_manifest not in str(sync_data)
+    assert "root_path" not in str(sync_data)
+    assert status_data["package_page"]["offset"] == 128
+    assert status_data["package_page"]["returned_count"] == 128
+    assert status_data["package_page"]["next_offset"] == 256
 
 
 def test_checkpoint_projectors_reject_legacy_workspace_root() -> None:
@@ -580,6 +784,12 @@ def test_public_envelope_rejects_oversize_data() -> None:
         (
             RuntimeContractError("DATA_ROOT_INVALID", "internal root"),
             "DATA_ROOT_INVALID",
+        ),
+        (
+            RuntimeContractError(
+                "PROJECT_AUTHORITY_UNAVAILABLE", "host grant unavailable"
+            ),
+            "PROJECT_AUTHORITY_UNAVAILABLE",
         ),
         (IndexError("INDEX_STALE", "internal index"), "INDEX_STALE"),
         (RelayPlanError("invalid_request"), "RELAY_PLAN_INVALID"),

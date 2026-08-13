@@ -26,6 +26,7 @@ from devkit_runtime.tool_result import (
 )
 from devkit_runtime.uow import RuntimeUnitOfWork
 from project_index.checkpoints import WorkspaceOwnership
+from project_index.models import IndexState, IndexStatusResult, IndexSyncResult
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 mcp = FastMCP(name="2718lab-devkit")
@@ -187,6 +188,7 @@ class _RequestError(ValueError):
 _TModel = TypeVar("_TModel", bound=BaseModel)
 _RUNTIME_ROOT: RuntimeRoot | None = None
 _TASK_LEASE_AUTHORITY: _TaskLeaseAuthority | None = None
+_MAX_PACKAGE_PAGE_LIMIT = 128
 
 
 def _tool_annotations(name: str) -> ToolAnnotations:
@@ -251,6 +253,7 @@ def _runtime_failure(
         if error.code in {
             "DATA_ROOT_INVALID",
             "DATA_ROOT_UNAVAILABLE",
+            "PROJECT_AUTHORITY_UNAVAILABLE",
             "PROJECT_SCOPE_INVALID",
         }:
             return _failure(error.code)
@@ -297,6 +300,31 @@ def _task_lease(value: TaskLeaseRef | None) -> TaskLeaseRef | None:
     if value is None:
         return None
     return _parse_model(value, TaskLeaseRef, code="INVALID_REQUEST")
+
+
+def _package_page_request(
+    offset: int | None,
+    limit: int | None,
+    *,
+    require_snapshot: bool,
+    snapshot_id: str | None,
+) -> tuple[int, int] | None:
+    """Validate an explicit package catalog page before opening a UoW."""
+
+    if offset is None and limit is None:
+        return None
+    if (
+        offset is None
+        or limit is None
+        or type(offset) is not int
+        or type(limit) is not int
+        or offset < 0
+        or not 1 <= limit <= _MAX_PACKAGE_PAGE_LIMIT
+    ):
+        raise _RequestError("INVALID_QUERY")
+    if require_snapshot and (type(snapshot_id) is not str or not snapshot_id):
+        raise _RequestError("INVALID_QUERY")
+    return offset, limit
 
 
 def _model_payload(value: BaseModel) -> dict[str, object]:
@@ -430,11 +458,18 @@ def project_index_sync(
     include_paths: list[str] | None = None,
     task_lease: TaskLeaseRef | None = None,
     bind_as: Literal["output"] | None = None,
+    package_page_limit: int = 128,
 ) -> dict[str, object]:
     """Synchronize one registered workspace without accepting a second root."""
 
     try:
         lease = _task_lease(task_lease)
+        package_page = _package_page_request(
+            0,
+            package_page_limit,
+            require_snapshot=False,
+            snapshot_id=None,
+        )
         if (lease is None) != (bind_as is None):
             raise _RequestError("INVALID_REQUEST")
     except _RequestError as error:
@@ -445,13 +480,25 @@ def project_index_sync(
         snapshot = uow.project_checkpoint.project_index.sync(
             workspace_id, include_paths
         )
+        if package_page is None:
+            raise _RequestError("INVALID_QUERY")
+        page_offset, page_limit = package_page
+        result = IndexSyncResult(
+            snapshot=snapshot,
+            package_page=uow.project_checkpoint.project_index.package_page(
+                workspace_id,
+                snapshot.snapshot_id,
+                offset=page_offset,
+                limit=page_limit,
+            ),
+        )
         if authority is not None:
             if lease is None:
                 raise _RequestError("INVALID_REQUEST")
             authority.bind_output_snapshot(
                 lease, workspace_id=workspace_id, snapshot=snapshot
             )
-        return snapshot
+        return result
 
     return _invoke("project_index_sync", read_only=False, operation=operation)
 
@@ -461,15 +508,48 @@ def project_index_status(
     workspace_id: str,
     snapshot_id: str | None = None,
     required_paths: list[str] | None = None,
+    package_ids: list[str] | None = None,
+    package_page_offset: int | None = None,
+    package_page_limit: int | None = None,
 ) -> dict[str, object]:
     """Read verified index status through the opaque workspace boundary."""
+
+    try:
+        package_page = _package_page_request(
+            package_page_offset,
+            package_page_limit,
+            require_snapshot=True,
+            snapshot_id=snapshot_id,
+        )
+    except _RequestError as error:
+        return _failure(error.code)
+
+    def operation(uow: RuntimeUnitOfWork) -> object:
+        status = uow.project_checkpoint.project_index.status(
+            workspace_id,
+            snapshot_id,
+            required_paths,
+            package_ids=None if package_ids is None else tuple(package_ids),
+        )
+        if package_page is None or status.state is IndexState.INDEX_UNAVAILABLE:
+            return status
+        if snapshot_id is None:
+            raise _RequestError("INVALID_QUERY")
+        page_offset, page_limit = package_page
+        return IndexStatusResult(
+            status=status,
+            package_page=uow.project_checkpoint.project_index.package_page(
+                workspace_id,
+                snapshot_id,
+                offset=page_offset,
+                limit=page_limit,
+            ),
+        )
 
     return _invoke(
         "project_index_status",
         read_only=True,
-        operation=lambda uow: uow.project_checkpoint.project_index.status(
-            workspace_id, snapshot_id, required_paths
-        ),
+        operation=operation,
     )
 
 
@@ -487,6 +567,7 @@ def project_index_query(
     byte_budget: int = 32768,
     allow_miss_escape: bool = False,
     task_lease: TaskLeaseRef | None = None,
+    package_ids: list[str] | None = None,
 ) -> dict[str, object]:
     """Run a receipt-persisting bounded query against one workspace id."""
 
@@ -509,6 +590,7 @@ def project_index_query(
             source_lines=source_lines,
             byte_budget=byte_budget,
             allow_miss_escape=allow_miss_escape,
+            package_ids=None if package_ids is None else tuple(package_ids),
         )
         if authority is not None:
             if lease is None:
@@ -673,7 +755,7 @@ def atlas_accept(
     return _invoke(
         "atlas_accept",
         read_only=False,
-        operation=lambda uow: uow.atlas.accept(
+        operation=lambda uow: uow.accept_atlas(
             workflow_id, code_task_id, acceptance_id, ingestion_key
         ),
         invalid_code="ATLAS_REQUEST_INVALID",
@@ -699,7 +781,9 @@ def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
 @mcp.tool(annotations=_tool_annotations("fastlane_compile"))
 def fastlane_compile(
     request: dict[str, object],
-    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] = "ultra",
+    reasoning_effort: Literal[
+        "low", "medium", "high", "xhigh", "max", "ultra"
+    ] = "ultra",
     enable: bool = False,
 ) -> dict[str, object]:
     """Compile inert Fast Lane descriptors without receiving host-private evidence.

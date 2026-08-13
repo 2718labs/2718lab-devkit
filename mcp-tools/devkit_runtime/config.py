@@ -10,7 +10,14 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from devkit_runtime.project_authority import (
+    ProjectAuthority,
+    ProjectAuthorityError,
+    RuntimeProjectAuthorityProvider,
+)
+
 _SCOPE_DIRECTORY = "scoped-v1"
+_PROJECT_DIRECTORY = "projects-v2"
 _SCOPE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _PROJECT_ROOT_ENV_NAMES = ("CODEX_PROJECT_ROOT", "CODEX_WORKSPACE_ROOT")
 _PROJECT_ID_ENV_NAMES = (
@@ -34,6 +41,23 @@ class RuntimeConfig:
 
     data_root: Path
     scratch_root: Path
+    project_authority: ProjectAuthority | None = None
+    storage_layout: str = "legacy-compat"
+    authority_provider: RuntimeProjectAuthorityProvider | None = None
+
+    def require_project_authority(self) -> ProjectAuthority:
+        """Revalidate the module-minted provider at a runtime trust boundary."""
+
+        authority = _current_project_authority(self.authority_provider)
+        if (
+            authority != self.project_authority
+            or self.storage_layout != _PROJECT_DIRECTORY
+            or self.data_root.parent.name != _PROJECT_DIRECTORY
+            or self.data_root.name != authority.project_id
+            or self.scratch_root.name != authority.project_id
+        ):
+            raise RuntimeConfigError("PROJECT_AUTHORITY_PROVIDER_INVALID")
+        return authority
 
     @property
     def orchestrator_database(self) -> Path:
@@ -46,6 +70,14 @@ class RuntimeConfig:
     @property
     def checkpoint_cas_root(self) -> Path:
         return self.data_root / "checkpoint-cas"
+
+    @property
+    def continuity_database(self) -> Path:
+        return self.data_root / "continuity.sqlite3"
+
+    @property
+    def continuity_cas_root(self) -> Path:
+        return self.data_root / "continuity-cas"
 
     @property
     def atlas_database(self) -> Path:
@@ -69,6 +101,7 @@ class RuntimeConfig:
         *,
         environ: Mapping[str, str] | None = None,
         protected_roots: Iterable[str | Path] = (),
+        authority_provider: RuntimeProjectAuthorityProvider | None = None,
     ) -> RuntimeConfig:
         values = os.environ if environ is None else environ
         plugin_data = values.get("PLUGIN_DATA")
@@ -80,19 +113,41 @@ class RuntimeConfig:
                 data_base = _absolute_path(codex_home) / "data" / "2718lab-devkit"
             else:
                 data_base = Path.home() / ".codex" / "data" / "2718lab-devkit"
-        scope = _resolve_scope(values)
-        data_root = _scoped_root(data_base, scope)
+        if authority_provider is None:
+            project_authority = None
+            scope = _resolve_scope(values)
+            data_root = _scoped_root(data_base, scope)
+            storage_layout = "legacy-compat"
+        else:
+            project_authority = _current_project_authority(authority_provider)
+            scope = None
+            data_root = _authority_root(data_base, project_authority)
+            storage_layout = _PROJECT_DIRECTORY
         protected = tuple(_absolute_path(item) for item in protected_roots)
+        if project_authority is not None:
+            protected = (*protected, project_authority.project_root)
         if not _safe_directory_path(data_root, require_exists=False) or any(
             not _safe_directory_path(root, require_exists=False) for root in protected
         ):
             raise RuntimeConfigError("DATA_ROOT_INVALID")
         if any(_paths_overlap(data_root, root) for root in protected):
             raise RuntimeConfigError("DATA_ROOT_INVALID")
-        return cls(
+        config = cls(
             data_root=data_root,
-            scratch_root=_resolve_scratch(values, data_root, protected, scope),
+            scratch_root=_resolve_scratch(
+                values,
+                data_root,
+                protected,
+                scope,
+                project_authority,
+            ),
+            project_authority=project_authority,
+            storage_layout=storage_layout,
+            authority_provider=authority_provider,
         )
+        if authority_provider is not None:
+            config.require_project_authority()
+        return config
 
 
 def _absolute_path(value: str | Path) -> Path:
@@ -102,11 +157,23 @@ def _absolute_path(value: str | Path) -> Path:
     return Path(os.path.abspath(path))
 
 
+def _current_project_authority(
+    provider: RuntimeProjectAuthorityProvider | None,
+) -> ProjectAuthority:
+    if type(provider) is not RuntimeProjectAuthorityProvider:
+        raise RuntimeConfigError("PROJECT_AUTHORITY_PROVIDER_INVALID")
+    try:
+        return provider.current()
+    except ProjectAuthorityError as exc:
+        raise RuntimeConfigError("PROJECT_AUTHORITY_INVALID") from exc
+
+
 def _resolve_scratch(
     values: Mapping[str, str],
     data_root: Path,
     protected_roots: tuple[Path, ...],
     scope: tuple[str, str] | None,
+    project_authority: ProjectAuthority | None,
 ) -> Path:
     for name in ("CODEX_TASK_TEMP", "TMPDIR", "TEMP", "TMP"):
         configured = values.get(name)
@@ -114,14 +181,26 @@ def _resolve_scratch(
             scratch_base = _absolute_path(configured)
             if not _safe_existing_directory(scratch_base):
                 raise RuntimeConfigError("DATA_ROOT_INVALID")
-            scratch_root = _scoped_root(scratch_base, scope)
+            scratch_root = (
+                _scoped_root(scratch_base, scope)
+                if project_authority is None
+                else _authority_root(scratch_base, project_authority)
+            )
             if not _safe_directory_path(scratch_root, require_exists=False) or any(
                 _paths_overlap(scratch_root, root)
                 for root in (data_root, *protected_roots)
             ):
                 raise RuntimeConfigError("DATA_ROOT_INVALID")
             return scratch_root
-    fallback = data_root.parent / ".2718lab-devkit-scratch"
+    if project_authority is None:
+        fallback = data_root.parent / ".2718lab-devkit-scratch"
+    else:
+        fallback = (
+            data_root.parent.parent
+            / ".2718lab-devkit-scratch"
+            / _PROJECT_DIRECTORY
+            / project_authority.project_id
+        )
     if not _safe_directory_path(fallback, require_exists=False) or any(
         _paths_overlap(fallback, root) for root in (data_root, *protected_roots)
     ):
@@ -157,6 +236,10 @@ def _scoped_root(base: Path, scope: tuple[str, str] | None) -> Path:
     kind, value = scope
     digest = hashlib.sha256(f"{kind}\0{value}".encode()).hexdigest()
     return base / _SCOPE_DIRECTORY / f"{kind}-{digest}"
+
+
+def _authority_root(base: Path, authority: ProjectAuthority) -> Path:
+    return base / _PROJECT_DIRECTORY / authority.project_id
 
 
 def _safe_existing_directory(path: Path) -> bool:

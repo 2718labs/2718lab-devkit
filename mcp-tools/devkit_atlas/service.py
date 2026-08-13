@@ -257,6 +257,15 @@ class AcceptedAtlasProjectionEvidence:
     extraction_request: ExtractionRequest
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedAcceptedProjection:
+    """Private, authority-derived input for one reader-free Atlas projection."""
+
+    request: AcceptedAtlasProjectionRequest
+    evidence: AcceptedAtlasProjectionEvidence
+    extraction: ExtractionRequest
+
+
 class AcceptanceEvidenceReader(Protocol):
     """Read verified checkpoint/index/receipt evidence for one accepted task."""
 
@@ -886,7 +895,7 @@ class AtlasService:
 
     def _read_accepted_evidence(
         self, request: AcceptedAtlasProjectionRequest
-    ) -> ExtractionRequest:
+    ) -> AcceptedAtlasProjectionEvidence:
         reader = self._acceptance_evidence_reader
         if reader is None:
             raise AtlasError("acceptance_evidence_unavailable")
@@ -896,7 +905,47 @@ class AtlasService:
             raise
         except Exception as exc:
             raise AtlasError("acceptance_evidence_unavailable") from exc
-        return self._validate_reader_evidence(request, evidence)
+        if type(evidence) is not AcceptedAtlasProjectionEvidence:
+            raise AtlasError("acceptance_evidence_conflict")
+        return evidence
+
+    def _prepare_projection_from_request(
+        self,
+        request: AcceptedAtlasProjectionRequest,
+        evidence: AcceptedAtlasProjectionEvidence,
+    ) -> _PreparedAcceptedProjection:
+        """Validate a reader result once, without re-entering the reader."""
+
+        request = self._validate_accepted_projection_request(request)
+        self._require_canonical_core_key(request)
+        extraction_request = self._validate_reader_evidence(request, evidence)
+        return _PreparedAcceptedProjection(request, evidence, extraction_request)
+
+    def _prepare_accepted_projection(
+        self,
+        workflow_id: str,
+        code_task_id: str,
+        acceptance_id: str,
+        ingestion_key: str,
+    ) -> _PreparedAcceptedProjection:
+        """Rebuild and read one authoritative acceptance exactly once each."""
+
+        reader = self._acceptance_evidence_reader
+        if reader is None:
+            raise AtlasError("acceptance_evidence_unavailable")
+        try:
+            request = reader.rebuild(
+                workflow_id,
+                code_task_id,
+                acceptance_id,
+                ingestion_key,
+            )
+            evidence = self._read_accepted_evidence(request)
+            return self._prepare_projection_from_request(request, evidence)
+        except (AtlasError, StoreConflictError):
+            raise
+        except Exception as exc:
+            raise AtlasError("acceptance_evidence_unavailable") from exc
 
     @staticmethod
     def _episode_records(
@@ -1040,17 +1089,14 @@ class AtlasService:
     ) -> AcceptanceProjection:
         """Project exactly one public Atlas acceptance through immutable evidence."""
 
-        reader = self._acceptance_evidence_reader
-        if reader is None:
-            raise AtlasError("ATLAS_EVIDENCE_UNAVAILABLE")
         try:
-            request = reader.rebuild(
+            prepared = self._prepare_accepted_projection(
                 workflow_id,
                 code_task_id,
                 acceptance_id,
                 ingestion_key,
             )
-            return self.project_acceptance(request)
+            return self._project_prepared_acceptance(prepared)
         except AtlasError as error:
             if error.code in {
                 "ATLAS_EVIDENCE_UNAVAILABLE",
@@ -1074,7 +1120,27 @@ class AtlasService:
             if existing.payload_hash != request.payload_hash:
                 raise StoreConflictError("ingestion receipt conflict")
         self._require_canonical_core_key(request)
-        extraction_request = self._read_accepted_evidence(request)
+        prepared = self._prepare_projection_from_request(
+            request, self._read_accepted_evidence(request)
+        )
+        return self._project_prepared_acceptance(prepared)
+
+    def _project_prepared_acceptance(
+        self, prepared: _PreparedAcceptedProjection
+    ) -> AcceptanceProjection:
+        """Project a private prepared input without any evidence-reader access."""
+
+        if type(prepared) is not _PreparedAcceptedProjection:
+            raise AtlasError("invalid_acceptance_projection")
+        request = self._validate_accepted_projection_request(prepared.request)
+        self._require_canonical_core_key(request)
+        extraction_request = self._validate_reader_evidence(request, prepared.evidence)
+        if extraction_request != prepared.extraction:
+            raise AtlasError("acceptance_evidence_conflict")
+        existing = self._store.get_ingestion_receipt(request.ingestion_key)
+        if existing is not None:
+            if existing.payload_hash != request.payload_hash:
+                raise StoreConflictError("ingestion receipt conflict")
         if existing is not None:
             if not self._existing_receipt_has_binding(request, existing):
                 raise StoreConflictError("ingestion evidence binding conflict")

@@ -70,6 +70,7 @@ class RuntimeRoot:
         """Create a new call-owned UoW without caching a connection."""
 
         self._assert_open_in_current_process()
+        self._assert_project_authority_for_uow()
         if self._uow_factory is not None:
             return cast(
                 RuntimeUnitOfWork,
@@ -118,6 +119,21 @@ class RuntimeRoot:
             raise RuntimeConfigError("RUNTIME_CLOSED")
         if os.getpid() != self._process_id:
             raise RuntimeConfigError("RUNTIME_PROCESS_MISMATCH")
+
+    def _assert_project_authority_for_uow(self) -> None:
+        """Fence each UoW open against an invalid projects-v2 authority."""
+
+        if self._config.storage_layout == "legacy-compat":
+            if (
+                self._config.project_authority is not None
+                or self._config.authority_provider is not None
+            ):
+                raise RuntimeConfigError("PROJECT_AUTHORITY_PROVIDER_INVALID")
+            return
+        if self._config.storage_layout == "projects-v2":
+            self._config.require_project_authority()
+            return
+        raise RuntimeConfigError("PROJECT_AUTHORITY_PROVIDER_INVALID")
 
 
 def _provider_is_available(provider: object | None) -> bool:

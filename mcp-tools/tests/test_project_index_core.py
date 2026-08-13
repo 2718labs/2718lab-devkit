@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -20,11 +21,12 @@ from devkit_runtime.bootstrap import RuntimeBootstrap  # noqa: E402
 from devkit_runtime.config import RuntimeConfig  # noqa: E402
 from devkit_runtime.project_checkpoint import open_project_checkpoint_rw  # noqa: E402
 from project_index import IndexError, IndexState, ProjectIndexService  # noqa: E402
+from project_index.store import ProjectIndexStore, StoreError  # noqa: E402
 
 
 @dataclass(frozen=True)
 class _CustomProjectDatabaseConfig(RuntimeConfig):
-    project_database: Path
+    project_database: Path = field(kw_only=True)
 
     @property
     def project_index_database(self) -> Path:
@@ -424,6 +426,610 @@ def test_required_paths_accept_directory_scopes(tmp_path: Path) -> None:
     assert status.state is IndexState.INDEX_STALE
     assert status.changed_paths == ("scope/module.py",)
     service.close()
+
+
+def test_coverage_required_scope_must_be_fully_contained_by_sync_includes(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    captured = workspace / "packages" / "foo"
+    captured.mkdir(parents=True)
+    (captured / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id, include_paths=("packages/foo",))
+
+    sibling = workspace / "packages" / "bar"
+    sibling.mkdir()
+    (sibling / "new.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    status = service.status(
+        workspace_id, snapshot.snapshot_id, required_paths=("packages",)
+    )
+
+    assert status.state is IndexState.INDEX_PARTIAL
+    assert status.missing_paths == ("packages",)
+    with pytest.raises(IndexError) as captured_error:
+        service.assert_current(
+            workspace_id, snapshot.snapshot_id, required_paths=("packages",)
+        )
+    assert captured_error.value.code == "INDEX_STALE"
+    service.close()
+
+
+def test_sync_discovers_persists_and_rebuilds_snapshot_bound_packages(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text(
+        '[project]\nname = "root-python"\n', encoding="utf-8"
+    )
+    web = workspace / "packages" / "web"
+    web.mkdir(parents=True)
+    (web / "package.json").write_text(
+        '{"name":"web-client"}\n', encoding="utf-8"
+    )
+    (web / "entry.py").write_text("def web_marker():\n    return 1\n", encoding="utf-8")
+    core = workspace / "crates" / "core"
+    core.mkdir(parents=True)
+    (core / "Cargo.toml").write_text(
+        '[package]\nname = "core-lib"\n', encoding="utf-8"
+    )
+    (core / "entry.py").write_text("def core_marker():\n    return 1\n", encoding="utf-8")
+    unsupported = workspace / "tooling"
+    unsupported.mkdir()
+    (unsupported / "pyproject.toml").write_text(
+        '[tool.black]\nline-length = 88\n', encoding="utf-8"
+    )
+    invalid = workspace / "broken"
+    invalid.mkdir()
+    (invalid / "package.json").write_text("{", encoding="utf-8")
+
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    first = service.sync(workspace_id)
+
+    descriptors = first.packages
+    assert [item.ecosystem for item in descriptors] == ["python", "cargo", "node"]
+    assert [item.name for item in descriptors] == ["root-python", "core-lib", "web-client"]
+    assert [item.root_path for item in descriptors] == ["", "crates/core", "packages/web"]
+    assert [item.manifest_path for item in descriptors] == [
+        "pyproject.toml",
+        "crates/core/Cargo.toml",
+        "packages/web/package.json",
+    ]
+    assert service_module._manifest_hash((), (), descriptors) == service_module._manifest_hash(
+        (), (), tuple(reversed(descriptors))
+    )
+    assert len({item.package_id for item in descriptors}) == len(descriptors)
+    assert all(item.manifest_hash.startswith("sha256:") for item in descriptors)
+    assert any(
+        gap.path == "tooling/pyproject.toml"
+        and gap.code == "PACKAGE_MANIFEST_UNSUPPORTED"
+        for gap in service.snapshot_facts(workspace_id, first.snapshot_id).gaps
+    )
+    assert any(
+        gap.path == "broken/package.json" and gap.code == "PACKAGE_MANIFEST_INVALID"
+        for gap in service.snapshot_facts(workspace_id, first.snapshot_id).gaps
+    )
+    assert service.snapshot_facts(workspace_id, first.snapshot_id).packages == descriptors
+
+    service.close()
+    reopened = _service(tmp_path)
+    assert reopened.snapshot_facts(workspace_id, first.snapshot_id).packages == descriptors
+    assert reopened.sync(workspace_id).packages == descriptors
+    (web / "package.json").write_text(
+        '{"name":"web-client-renamed"}\n', encoding="utf-8"
+    )
+    changed = reopened.sync(workspace_id)
+    assert changed.snapshot_id != first.snapshot_id
+    assert changed.manifest_hash != first.manifest_hash
+    assert changed.packages != descriptors
+    reopened.close()
+
+
+def test_package_descriptors_are_root_first_after_persistence(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        '{"name":"root-node"}\n', encoding="utf-8"
+    )
+    (workspace / "pyproject.toml").write_text(
+        '[project]\nname = "root-python"\n', encoding="utf-8"
+    )
+    first_nested = workspace / "a" / "deep"
+    first_nested.mkdir(parents=True)
+    (first_nested / "Cargo.toml").write_text(
+        '[package]\nname = "first-cargo"\n', encoding="utf-8"
+    )
+    last_nested = workspace / "z" / "nested"
+    last_nested.mkdir(parents=True)
+    (last_nested / "package.json").write_text(
+        '{"name":"last-node"}\n', encoding="utf-8"
+    )
+
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+    descriptors = snapshot.packages
+    assert [
+        (item.root_path, item.manifest_path, item.ecosystem, item.name)
+        for item in descriptors
+    ] == [
+        ("", "package.json", "node", "root-node"),
+        ("", "pyproject.toml", "python", "root-python"),
+        ("a/deep", "a/deep/Cargo.toml", "cargo", "first-cargo"),
+        ("z/nested", "z/nested/package.json", "node", "last-node"),
+    ]
+    assert service_module._manifest_hash((), (), descriptors) == service_module._manifest_hash(
+        (), (), tuple(reversed(descriptors))
+    )
+
+    service.close()
+    reopened = _service(tmp_path)
+    assert reopened.snapshot_facts(workspace_id, snapshot.snapshot_id).packages == descriptors
+    reopened.close()
+
+
+def test_package_query_is_ordered_scoped_and_receipt_bound(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text(
+        '[project]\nname = "root"\n', encoding="utf-8"
+    )
+    left = workspace / "packages" / "left"
+    left.mkdir(parents=True)
+    (left / "pyproject.toml").write_text(
+        '[project]\nname = "left"\n', encoding="utf-8"
+    )
+    (left / "module.py").write_text(
+        "def left_marker():\n    return 1\n", encoding="utf-8"
+    )
+    right = workspace / "packages" / "right"
+    right.mkdir(parents=True)
+    (right / "package.json").write_text(
+        '{"name":"right"}\n', encoding="utf-8"
+    )
+    (right / "module.py").write_text(
+        "def right_marker():\n    return 1\n", encoding="utf-8"
+    )
+    broken = workspace / "packages" / "broken"
+    broken.mkdir(parents=True)
+    (broken / "package.json").write_text(
+        '{"name":"secret-manifest-token"', encoding="utf-8"
+    )
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+    packages = {item.name: item for item in snapshot.packages}
+    assert all(
+        "secret-manifest-token" not in gap.message
+        for gap in service.snapshot_facts(workspace_id, snapshot.snapshot_id).gaps
+    )
+    root_id = packages["root"].package_id
+    left_id = packages["left"].package_id
+    right_id = packages["right"].package_id
+    selected_union = tuple(sorted((left_id, right_id)))
+
+    union = service.query(
+        workspace_id,
+        snapshot.snapshot_id,
+        "marker",
+        package_ids=selected_union,
+        max_nodes=100,
+        source_lines=0,
+    )
+    assert all(
+        node.path.startswith(("packages/left/", "packages/right/"))
+        for node in union.nodes
+    )
+    assert service.get_query_receipt(union.trace_id).package_ids == selected_union
+
+    selected = service.query(
+        workspace_id,
+        snapshot.snapshot_id,
+        "marker",
+        package_ids=(left_id,),
+        max_nodes=100,
+        source_lines=4,
+    )
+    assert selected.nodes
+    assert selected.state is IndexState.INDEX_READY
+    assert all(node.path.startswith("packages/left/") for node in selected.nodes)
+    assert all(window.path.startswith("packages/left/") for window in selected.source_windows)
+    receipt = service.get_query_receipt(selected.trace_id)
+    assert receipt.package_ids == (left_id,)
+    selected_status = service.status(
+        workspace_id, snapshot.snapshot_id, package_ids=(left_id,)
+    )
+    assert selected_status.state is IndexState.INDEX_READY
+    assert selected_status.gaps == ()
+
+    (right / "module.py").write_text(
+        "def right_marker():\n    return 2\n", encoding="utf-8"
+    )
+    repeated = service.query(
+        workspace_id,
+        snapshot.snapshot_id,
+        "marker",
+        package_ids=(left_id,),
+        max_nodes=100,
+        source_lines=0,
+    )
+    assert all(node.path.startswith("packages/left/") for node in repeated.nodes)
+    with pytest.raises(IndexError) as stale:
+        service.query(workspace_id, snapshot.snapshot_id, "marker")
+    assert stale.value.code == "INDEX_STALE"
+    with pytest.raises(IndexError) as root_stale:
+        service.query(
+            workspace_id,
+            snapshot.snapshot_id,
+            "marker",
+            package_ids=(root_id,),
+        )
+    assert root_stale.value.code == "INDEX_STALE"
+
+    unordered = tuple(sorted((left_id, right_id), reverse=True))
+    with pytest.raises(IndexError) as unordered_error:
+        service.query(
+            workspace_id, snapshot.snapshot_id, "marker", package_ids=unordered
+        )
+    assert unordered_error.value.code == "INVALID_QUERY"
+    with pytest.raises(IndexError) as duplicate_error:
+        service.query(
+            workspace_id,
+            snapshot.snapshot_id,
+            "marker",
+            package_ids=(left_id, left_id),
+        )
+    assert duplicate_error.value.code == "INVALID_QUERY"
+    with pytest.raises(IndexError) as duplicate_status_error:
+        service.status(
+            workspace_id,
+            snapshot.snapshot_id,
+            package_ids=(left_id, left_id),
+        )
+    assert duplicate_status_error.value.code == "INVALID_QUERY"
+    with pytest.raises(IndexError) as unknown_error:
+        service.query(
+            workspace_id,
+            snapshot.snapshot_id,
+            "marker",
+            package_ids=("sha256:" + "0" * 64,),
+        )
+    assert unknown_error.value.code == "NOT_FOUND"
+    service.close()
+
+
+def test_package_ids_require_none_for_legacy_full_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "module.py").write_text(
+        "def marker():\n    return 1\n", encoding="utf-8"
+    )
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    with pytest.raises(IndexError) as empty_status:
+        service.status(workspace_id, snapshot.snapshot_id, package_ids=())
+    assert empty_status.value.code == "INVALID_QUERY"
+    with pytest.raises(IndexError) as empty_query:
+        service.query(
+            workspace_id,
+            snapshot.snapshot_id,
+            "marker",
+            package_ids=[],
+        )
+    assert empty_query.value.code == "INVALID_QUERY"
+
+    default_status = service.status(workspace_id, snapshot.snapshot_id)
+    none_status = service.status(workspace_id, snapshot.snapshot_id, package_ids=None)
+    assert none_status == default_status
+    default_query = service.query(
+        workspace_id, snapshot.snapshot_id, "marker", source_lines=0
+    )
+    none_query = service.query(
+        workspace_id,
+        snapshot.snapshot_id,
+        "marker",
+        source_lines=0,
+        package_ids=None,
+    )
+    assert none_query == default_query
+    assert service.get_query_receipt(none_query.trace_id).package_ids == ()
+    service.close()
+
+
+def test_package_page_retrieves_a_snapshot_bound_catalog_beyond_512(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    for index in range(513):
+        package = workspace / "packages" / f"package-{index:03d}"
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            f'{{"name":"package-{index:03d}"}}\n', encoding="utf-8"
+        )
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    first = service.package_page(
+        workspace_id, snapshot.snapshot_id, offset=0, limit=128
+    )
+    assert first.snapshot_id == snapshot.snapshot_id
+    assert first.total_count == 513
+    assert first.offset == 0
+    assert first.limit == 128
+    assert first.next_offset == 128
+    assert first.packages == snapshot.packages[:128]
+
+    pages = [first]
+    while pages[-1].next_offset is not None:
+        pages.append(
+            service.package_page(
+                workspace_id,
+                snapshot.snapshot_id,
+                offset=pages[-1].next_offset,
+                limit=128,
+            )
+        )
+    assert tuple(page.offset for page in pages) == (0, 128, 256, 384, 512)
+    assert all(page.limit == 128 for page in pages)
+    assert pages[-1].next_offset is None
+    assert pages[-1].packages == snapshot.packages[512:]
+    assert tuple(
+        package for page in pages for package in page.packages
+    ) == snapshot.packages
+
+    (workspace / "packages" / "package-000" / "package.json").write_text(
+        '{"name":"changed-after-snapshot"}\n', encoding="utf-8"
+    )
+    assert (
+        service.package_page(workspace_id, snapshot.snapshot_id, offset=0, limit=1)
+        .packages
+        == snapshot.packages[:1]
+    )
+    service.close()
+
+
+@pytest.mark.parametrize(
+    ("offset", "limit"),
+    ((-1, 1), (0, 0), (0, 129), (True, 1), (0, True)),
+)
+def test_package_page_rejects_invalid_pagination_parameters(
+    tmp_path: Path, offset: int, limit: int
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "package.json").write_text('{"name":"root"}\n', encoding="utf-8")
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    with pytest.raises(IndexError) as captured:
+        service.package_page(
+            workspace_id, snapshot.snapshot_id, offset=offset, limit=limit
+        )
+    assert captured.value.code == "INVALID_QUERY"
+    service.close()
+
+
+def test_package_page_permits_the_end_offset_and_rejects_past_the_catalog(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "package.json").write_text('{"name":"root"}\n', encoding="utf-8")
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+
+    end = service.package_page(
+        workspace_id, snapshot.snapshot_id, offset=1, limit=1
+    )
+    assert end.packages == ()
+    assert end.next_offset is None
+
+    with pytest.raises(IndexError) as captured:
+        service.package_page(workspace_id, snapshot.snapshot_id, offset=2, limit=1)
+    assert captured.value.code == "INVALID_QUERY"
+    service.close()
+
+
+def test_package_selector_rejects_a_boundary_not_fully_covered_by_snapshot(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    package = workspace / "packages" / "one"
+    package.mkdir(parents=True)
+    (package / "pyproject.toml").write_text(
+        '[project]\nname = "one"\n', encoding="utf-8"
+    )
+    (package / "module.py").write_text("def one():\n    return 1\n", encoding="utf-8")
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(
+        workspace_id, include_paths=("packages/one/pyproject.toml",)
+    )
+    package_id = snapshot.packages[0].package_id
+
+    assert (
+        service.status(workspace_id, snapshot.snapshot_id, package_ids=(package_id,)).state
+        is IndexState.INDEX_PARTIAL
+    )
+    with pytest.raises(IndexError) as uncovered:
+        service.query(
+            workspace_id,
+            snapshot.snapshot_id,
+            "one",
+            package_ids=(package_id,),
+        )
+    assert uncovered.value.code == "INDEX_PARTIAL"
+    service.close()
+
+
+def test_schema_v4_migrates_to_package_descriptor_relation(tmp_path: Path) -> None:
+    config = _runtime_config(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "legacy.py").write_text(
+        "def legacy_marker():\n    return 1\n", encoding="utf-8"
+    )
+    service = open_project_checkpoint_rw(
+        config.project_index_database,
+        config.checkpoint_cas_root,
+        scratch_root=config.scratch_root,
+    ).project_index
+    workspace_id = service.project_index_register(workspace)
+    snapshot = service.sync(workspace_id)
+    result = service.query(workspace_id, snapshot.snapshot_id, "legacy_marker")
+    service.close()
+
+    connection = sqlite3.connect(config.project_index_database)
+    try:
+        schema_version = connection.execute(
+            "SELECT value FROM project_index_metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert schema_version == ("5",)
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "project_index_snapshot_packages" in tables
+
+        connection.execute("DROP TABLE project_index_snapshot_packages")
+        connection.execute(
+            "ALTER TABLE project_index_query_receipts DROP COLUMN package_ids"
+        )
+        connection.execute(
+            "UPDATE project_index_metadata SET value = '4' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    RuntimeBootstrap.run(config)
+    migrated = ProjectIndexStore(config.project_index_database)
+    try:
+        assert migrated.schema_version() == 5
+        migrated_snapshot = migrated.get_snapshot_for_workspace(
+            workspace_id, snapshot.snapshot_id
+        )
+        assert migrated_snapshot is not None
+        assert migrated_snapshot.binding_state == "active"
+        assert migrated_snapshot.packages == ()
+        receipt = migrated.get_query_receipt(result.trace_id)
+        assert receipt is not None
+        assert receipt.package_ids == ()
+        assert (
+            migrated._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'project_index_snapshot_packages'"
+            ).fetchone()
+            is not None
+        )
+        columns = {
+            row["name"]
+            for row in migrated._connection.execute(
+                "PRAGMA table_info(project_index_query_receipts)"
+            )
+        }
+        assert "package_ids" in columns
+    finally:
+        migrated.close()
+
+
+@pytest.mark.parametrize(
+    ("table_name", "replacement_schema"),
+    (
+        (
+            "project_index_snapshot_packages",
+            """
+            CREATE TABLE project_index_snapshot_packages (
+                snapshot_id TEXT NOT NULL
+                    REFERENCES project_index_snapshots(snapshot_id),
+                package_id TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                name TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                manifest_path TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL
+                    REFERENCES project_index_blobs(content_hash),
+                PRIMARY KEY (snapshot_id, manifest_path),
+                UNIQUE (snapshot_id, package_id)
+            )
+            """,
+        ),
+        (
+            "project_index_snapshot_packages",
+            """
+            CREATE TABLE project_index_snapshot_packages (
+                snapshot_id TEXT NOT NULL,
+                package_id TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                name TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                manifest_path TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, package_id),
+                UNIQUE (snapshot_id, manifest_path)
+            )
+            """,
+        ),
+        (
+            "project_index_query_receipts",
+            """
+            CREATE TABLE project_index_query_receipts (
+                trace_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL
+                    REFERENCES project_index_snapshots(snapshot_id),
+                query_text TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                node_kinds TEXT NOT NULL,
+                relations TEXT NOT NULL,
+                max_nodes INTEGER NOT NULL,
+                max_depth INTEGER NOT NULL,
+                source_lines INTEGER NOT NULL,
+                byte_budget INTEGER NOT NULL,
+                allow_miss_escape INTEGER NOT NULL,
+                miss_escape_used INTEGER NOT NULL,
+                returned_node_ids TEXT NOT NULL,
+                returned_edge_ids TEXT NOT NULL,
+                returned_source_windows TEXT NOT NULL,
+                gaps TEXT NOT NULL,
+                truncated INTEGER NOT NULL
+            )
+            """,
+        ),
+    ),
+    ids=("package-key-shape", "package-foreign-keys", "receipt-package-ids"),
+)
+def test_prepared_handoff_rejects_malformed_package_schema(
+    tmp_path: Path,
+    table_name: str,
+    replacement_schema: str,
+) -> None:
+    config = _runtime_config(tmp_path)
+    RuntimeBootstrap.run(config)
+    connection = sqlite3.connect(config.project_index_database)
+    try:
+        connection.execute(f"DROP TABLE {table_name}")
+        connection.execute(replacement_schema)
+        connection.commit()
+    finally:
+        connection.close()
+
+    prepared = sqlite3.connect(config.project_index_database)
+    try:
+        with pytest.raises(StoreError, match="project index store is not prepared"):
+            ProjectIndexStore.from_prepared_connection(
+                config.project_index_database, prepared
+            )
+    finally:
+        prepared.close()
 
 
 def test_nodes_and_edges_expose_auditable_utf8_spans(tmp_path: Path) -> None:

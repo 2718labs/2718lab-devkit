@@ -13,6 +13,7 @@ from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.relay_runtime import RelayRuntime
 from devkit_runtime.uow import RuntimeAdapterFactories, RuntimeUnitOfWork
+from orchestrator.store import SQLiteStore, StoreError
 
 
 def test_runtime_config_load_prefers_plugin_data_without_writing(
@@ -246,7 +247,7 @@ def test_runtime_config_rejects_reparse_scratch(
     assert caught.value.code == "DATA_ROOT_INVALID"
 
 
-def test_explicit_bootstrap_is_idempotent_and_prepares_wal_stores(
+def test_explicit_bootstrap_is_idempotent_and_prepares_expected_journal_stores(
     tmp_path: Path,
 ) -> None:
     data_root = tmp_path / "data"
@@ -284,9 +285,15 @@ def test_explicit_bootstrap_is_idempotent_and_prepares_wal_stores(
     assert len(first_key) == 32
     assert prepared_registry == [config.relay_proof_registry_database]
 
-    for database in databases[:-1]:
+    expected_journal_modes = {
+        config.orchestrator_database: "delete",
+        config.project_index_database: "wal",
+        config.atlas_database: "wal",
+        config.relay_database: "wal",
+    }
+    for database, expected_mode in expected_journal_modes.items():
         with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as conn:
-            assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+            assert conn.execute("PRAGMA journal_mode").fetchone() == (expected_mode,)
 
     RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
     assert config.relay_capability_key.read_bytes() == first_key
@@ -516,7 +523,16 @@ def test_runtime_root_wires_fresh_call_scoped_typed_adapters(tmp_path: Path) -> 
         assert read_only is True
         return resource("atlas-store")
 
-    def build_atlas(*, atlas_store: Resource, project_checkpoint: Resource) -> object:
+    def open_continuity(*, config: RuntimeConfig, read_only: bool) -> Resource:
+        raise AssertionError("read-only UoW must not open the continuity writer")
+
+    def build_atlas(
+        *,
+        atlas_store: Resource,
+        project_checkpoint: Resource,
+        acceptance_evidence_reader: object | None = None,
+    ) -> object:
+        assert acceptance_evidence_reader is None
         return ("atlas", atlas_store.name, project_checkpoint.name)
 
     def build_registry(
@@ -540,6 +556,7 @@ def test_runtime_root_wires_fresh_call_scoped_typed_adapters(tmp_path: Path) -> 
         adapter_factories=RuntimeAdapterFactories(
             open_project_checkpoint=open_project_checkpoint,
             open_atlas_store=open_atlas_store,
+            open_continuity=open_continuity,
             build_atlas=build_atlas,
             build_registry=build_registry,
             open_relay=open_relay,
@@ -566,6 +583,58 @@ def test_runtime_root_wires_fresh_call_scoped_typed_adapters(tmp_path: Path) -> 
     with pytest.raises(RuntimeConfigError) as caught:
         first.relay
     assert caught.value.code == "RUNTIME_CLOSED"
+
+
+def test_write_uow_lazily_owns_continuity_adapter_and_closes_it_once(
+    tmp_path: Path,
+) -> None:
+    class Resource:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "data"),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+    continuity = Resource()
+    calls: list[bool] = []
+
+    def open_continuity(*, config: RuntimeConfig, read_only: bool) -> Resource:
+        assert config.data_root == tmp_path / "data"
+        calls.append(read_only)
+        return continuity
+
+    factories = RuntimeAdapterFactories(
+        open_project_checkpoint=lambda **_kwargs: Resource(),
+        open_atlas_store=lambda **_kwargs: Resource(),
+        open_continuity=open_continuity,
+        build_atlas=lambda **_kwargs: object(),
+        build_registry=lambda **_kwargs: object(),
+        open_relay=lambda **_kwargs: Resource(),
+    )
+    uow = RuntimeUnitOfWork(
+        config=config,
+        read_only=False,
+        factories=factories,
+        capability_broker=None,
+        integration_attestor=None,
+        tool_results=object(),
+    )
+
+    assert uow._continuity_service() is continuity  # noqa: SLF001 - ownership seam
+    assert uow._continuity_service() is continuity  # noqa: SLF001 - ownership seam
+    uow.close()
+    uow.close()
+
+    assert calls == [False]
+    assert continuity.closed == 1
 
 
 def test_runtime_root_default_uow_is_lazy_and_pid_guarded(
@@ -672,3 +741,1207 @@ def test_default_write_uow_preserves_relay_zero_write_broker_gate(
     with sqlite3.connect(config.relay_database.as_uri() + "?mode=ro", uri=True) as conn:
         after = conn.execute("SELECT COUNT(*) FROM relay_v3_runs").fetchone()
     assert after == before
+
+
+@pytest.mark.parametrize(
+    "outbox_schema",
+    (
+        """
+        CREATE TABLE atlas_ingestion_outbox (
+            ingestion_key TEXT PRIMARY KEY,
+            payload_hash TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            last_error_code TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE atlas_ingestion_outbox (
+            ingestion_key TEXT NOT NULL,
+            acceptance_id TEXT NOT NULL UNIQUE
+                REFERENCES code_task_acceptances(acceptance_id),
+            payload_hash TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            last_error_code TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+    ),
+    ids=("missing-acceptance-binding", "missing-key-payload-identity"),
+)
+def test_default_write_uow_rejects_malformed_atlas_outbox_schema(
+    tmp_path: Path, outbox_schema: str
+) -> None:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.execute(outbox_schema)
+        connection.commit()
+    finally:
+        connection.close()
+
+    root = RuntimeRoot(config)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            with root.open_uow(read_only=False) as uow:
+                _ = uow.atlas
+    finally:
+        root.shutdown()
+
+
+def _atlas_outbox_schema(
+    *,
+    include_payload_json: bool = True,
+    partial_unique_indexes: bool = False,
+    nullable_column: str | None = None,
+    equality_check: str = "CHECK (ingestion_key = payload_hash)",
+    state_check: str = "CHECK (state IN ('pending', 'projected', 'quarantined'))",
+    attempt_check: str = "CHECK (attempt_count BETWEEN 0 AND 16)",
+) -> str:
+    def not_null(column: str) -> str:
+        return "" if nullable_column == column else " NOT NULL"
+
+    payload_json = (
+        f"payload_json TEXT{not_null('payload_json')},"
+        if include_payload_json
+        else ""
+    )
+    if partial_unique_indexes:
+        acceptance_id = (
+            f"acceptance_id TEXT{not_null('acceptance_id')} "
+            "REFERENCES code_task_acceptances(acceptance_id),"
+        )
+        payload_hash = f"payload_hash TEXT{not_null('payload_hash')},"
+        unique_indexes = """
+            CREATE UNIQUE INDEX atlas_outbox_acceptance_partial
+                ON atlas_ingestion_outbox(acceptance_id)
+                WHERE state = 'pending';
+            CREATE UNIQUE INDEX atlas_outbox_payload_partial
+                ON atlas_ingestion_outbox(payload_hash)
+                WHERE state = 'pending';
+        """
+    else:
+        acceptance_id = (
+            f"acceptance_id TEXT{not_null('acceptance_id')} UNIQUE "
+            "REFERENCES code_task_acceptances(acceptance_id),"
+        )
+        payload_hash = f"payload_hash TEXT{not_null('payload_hash')} UNIQUE,"
+        unique_indexes = ""
+    return f"""
+        CREATE TABLE atlas_ingestion_outbox (
+            ingestion_key TEXT PRIMARY KEY,
+            {acceptance_id}
+            {payload_json}
+            {payload_hash}
+            state TEXT{not_null('state')} {state_check},
+            attempt_count INTEGER{not_null('attempt_count')} {attempt_check},
+            last_error_code TEXT{not_null('last_error_code')},
+            reason_codes_json TEXT{not_null('reason_codes_json')},
+            created_at TEXT{not_null('created_at')},
+            updated_at TEXT{not_null('updated_at')},
+            {equality_check}
+        );
+        {unique_indexes}
+    """
+
+
+def _runtime_with_malformed_atlas_outbox(
+    tmp_path: Path, outbox_schema: str
+) -> RuntimeConfig:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.executescript(outbox_schema)
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize(
+    "outbox_schema",
+    (
+        _atlas_outbox_schema(include_payload_json=False),
+        _atlas_outbox_schema(partial_unique_indexes=True),
+        _atlas_outbox_schema(
+            equality_check="CHECK (1) /* CHECK (ingestion_key = payload_hash) */"
+        ),
+        _atlas_outbox_schema(
+            state_check=(
+                "CHECK (1) "
+                "/* CHECK (state IN ('pending', 'projected', 'quarantined')) */"
+            )
+        ),
+        _atlas_outbox_schema(
+            attempt_check=(
+                "CHECK (1) /* CHECK (attempt_count BETWEEN 0 AND 16) */"
+            )
+        ),
+    ),
+    ids=(
+        "missing-payload-json",
+        "partial-unique-indexes",
+        "comment-forged-key-payload-check",
+        "comment-forged-state-check",
+        "comment-forged-attempt-check",
+    ),
+)
+def test_default_write_uow_rejects_atlas_outbox_validation_bypasses(
+    tmp_path: Path, outbox_schema: str
+) -> None:
+    config = _runtime_with_malformed_atlas_outbox(tmp_path, outbox_schema)
+    root = RuntimeRoot(config)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            with root.open_uow(read_only=False) as uow:
+                _ = uow.atlas
+    finally:
+        root.shutdown()
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_entry_points_reject_malformed_current_outbox_schema(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_malformed_atlas_outbox(
+        tmp_path, _atlas_outbox_schema(include_payload_json=False)
+    )
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+        return
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            SQLiteStore.from_prepared_connection(connection)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "nullable_column",
+    (
+        "ingestion_key",
+        "acceptance_id",
+        "payload_json",
+        "payload_hash",
+        "state",
+        "attempt_count",
+        "last_error_code",
+        "reason_codes_json",
+        "created_at",
+        "updated_at",
+    ),
+)
+def test_default_write_uow_rejects_nullable_atlas_outbox_columns(
+    tmp_path: Path, nullable_column: str
+) -> None:
+    config = _runtime_with_malformed_atlas_outbox(
+        tmp_path, _atlas_outbox_schema(nullable_column=nullable_column)
+    )
+    root = RuntimeRoot(config)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            with root.open_uow(read_only=False) as uow:
+                _ = uow.atlas
+    finally:
+        root.shutdown()
+
+
+def test_prepared_sqlite_store_enables_foreign_keys_on_raw_connection(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    connection = sqlite3.connect(config.orchestrator_database)
+    store = SQLiteStore.from_prepared_connection(connection)
+    try:
+        assert store.foreign_keys_enabled()
+    finally:
+        store.close()
+
+
+def _insert_legacy_atlas_acceptance(
+    connection: sqlite3.Connection, *, suffix: str
+) -> tuple[str, str]:
+    timestamp = "2026-08-09T00:00:00Z"
+    workflow_id = "legacy-workflow"
+    task_id = f"legacy-task-{suffix}"
+    acceptance_id = f"sha256:{suffix * 64}"
+    connection.execute(
+        """
+        INSERT INTO workflows (
+            id, kind, title, product_summary, state, version, policy_version,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        (
+            workflow_id,
+            "general",
+            "legacy workflow",
+            "legacy outbox migration fixture",
+            "active",
+            1,
+            "legacy",
+            timestamp,
+            timestamp,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks (
+            id, workflow_id, title, owner_role, state, write_scope, card_hash,
+            result_hash, version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workflow_id,
+            "legacy task",
+            "writer",
+            "pending",
+            "mcp-tools/orchestrator/store.py",
+            f"sha256:{'c' * 64}",
+            f"sha256:{'d' * 64}",
+            1,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO code_task_acceptances (
+            acceptance_id, workflow_id, code_task_id, code_task_version,
+            input_snapshot_id, output_snapshot_id, indexed_diff_hash, intent_id,
+            language, framework, payload_json, payload_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            acceptance_id,
+            workflow_id,
+            task_id,
+            1,
+            f"sha256:{'e' * 64}",
+            f"sha256:{'f' * 64}",
+            f"sha256:{'0' * 64}",
+            "legacy",
+            "python",
+            "pytest",
+            "{}",
+            acceptance_id,
+            timestamp,
+        ),
+    )
+    return acceptance_id, timestamp
+
+
+def _legacy_v10_atlas_outbox_database(
+    tmp_path: Path, *, ingestion_key: str | None
+) -> tuple[Path, str, str]:
+    database = tmp_path / "legacy-atlas-outbox.sqlite3"
+    bootstrap = SQLiteStore(database)
+    bootstrap.close()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        acceptance_id, timestamp = _insert_legacy_atlas_acceptance(
+            connection, suffix="a"
+        )
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            ("schema_version", "10"),
+        )
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.executescript(_atlas_outbox_schema())
+        connection.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ingestion_key,
+                acceptance_id,
+                "{}",
+                acceptance_id,
+                "pending",
+                0,
+                "",
+                "[]",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, acceptance_id, timestamp
+
+
+def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
+    tmp_path: Path,
+) -> None:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, acceptance_id, timestamp = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=ingestion_key
+    )
+
+    store = SQLiteStore(database)
+    try:
+        connection = store._connection
+        assert connection is not None
+        assert store.schema_version() == 13
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        assert columns["ingestion_key"] == 1
+        projection_guard = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'atlas_finalizations_require_projected_outbox' "
+            "AND tbl_name = 'atlas_finalizations'"
+        ).fetchone()
+        assert projection_guard is not None and projection_guard[0] == 1
+        finalization_identity = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_atlas_outbox_finalization_identity'"
+        ).fetchone()
+        assert finalization_identity is not None and finalization_identity[0] == 1
+        assert tuple(
+            connection.execute(
+                """
+                SELECT ingestion_key, acceptance_id, payload_hash, state, attempt_count
+                FROM atlas_ingestion_outbox
+                """
+            ).fetchone()
+        ) == (
+            ingestion_key,
+            acceptance_id,
+            acceptance_id,
+            "pending",
+            0,
+        )
+
+        next_acceptance_id, _ = _insert_legacy_atlas_acceptance(
+            connection, suffix="b"
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="NOT NULL constraint failed: atlas_ingestion_outbox.ingestion_key",
+        ):
+            connection.execute(
+                """
+                INSERT INTO atlas_ingestion_outbox (
+                    ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                    attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    next_acceptance_id,
+                    "{}",
+                    next_acceptance_id,
+                    "pending",
+                    0,
+                    "",
+                    "[]",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+        ).fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_sqlite_store_fails_closed_for_legacy_null_outbox_key(tmp_path: Path) -> None:
+    database, _, _ = _legacy_v10_atlas_outbox_database(tmp_path, ingestion_key=None)
+
+    with pytest.raises(StoreError, match="legacy atlas outbox row is invalid"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT ingestion_key FROM atlas_ingestion_outbox"
+        ).fetchone()[0] is None
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "10"
+    finally:
+        connection.close()
+
+
+def test_sqlite_store_fails_closed_for_noncanonical_finalization_guard_during_v10_outbox_rebuild(
+    tmp_path: Path,
+) -> None:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, _, _ = _legacy_v10_atlas_outbox_database(
+        tmp_path,
+        ingestion_key=ingestion_key,
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "DROP TRIGGER atlas_finalizations_require_projected_outbox"
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER atlas_finalizations_require_projected_outbox
+            BEFORE INSERT ON atlas_finalizations
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("10",)
+        columns = {
+            str(row[1]): int(row[3])
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        assert columns["ingestion_key"] == 0
+    finally:
+        connection.close()
+
+
+def _legacy_v10_incomplete_atlas_outbox_database(
+    tmp_path: Path,
+) -> tuple[Path, str, str]:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, acceptance_id, timestamp = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=ingestion_key
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.executescript(_atlas_outbox_schema(include_payload_json=False))
+        connection.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_hash, state, attempt_count,
+                last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ingestion_key,
+                acceptance_id,
+                acceptance_id,
+                "pending",
+                0,
+                "",
+                "[]",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, ingestion_key, acceptance_id
+
+
+def test_sqlite_store_rolls_back_incomplete_v10_outbox_upgrade(
+    tmp_path: Path,
+) -> None:
+    database, ingestion_key, acceptance_id = _legacy_v10_incomplete_atlas_outbox_database(
+        tmp_path
+    )
+
+    with pytest.raises(StoreError):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        assert "payload_json" not in columns
+        assert columns["ingestion_key"] == 0
+        metadata_columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert metadata_columns["key"] == 0
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_metadata_v12'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "10"
+        assert tuple(
+            connection.execute(
+                """
+                SELECT ingestion_key, acceptance_id, payload_hash, state, attempt_count
+                FROM atlas_ingestion_outbox
+                """
+            ).fetchone()
+        ) == (
+            ingestion_key,
+            acceptance_id,
+            acceptance_id,
+            "pending",
+            0,
+        )
+    finally:
+        connection.close()
+
+
+def _malformed_v11_nullable_atlas_outbox_database(
+    tmp_path: Path,
+) -> tuple[Path, str, str]:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, acceptance_id, _ = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=ingestion_key
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+            ("11",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, ingestion_key, acceptance_id
+
+
+def test_sqlite_store_preserves_malformed_v11_nullable_outbox(
+    tmp_path: Path,
+) -> None:
+    database, ingestion_key, acceptance_id = _malformed_v11_nullable_atlas_outbox_database(
+        tmp_path
+    )
+
+    with pytest.raises(StoreError):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        assert columns["ingestion_key"] == 0
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "11"
+        assert tuple(
+            connection.execute(
+                """
+                SELECT ingestion_key, acceptance_id, payload_hash, state, attempt_count
+                FROM atlas_ingestion_outbox
+                """
+            ).fetchone()
+        ) == (
+            ingestion_key,
+            acceptance_id,
+            acceptance_id,
+            "pending",
+            0,
+        )
+    finally:
+        connection.close()
+
+
+def _bootstrapped_runtime_config(tmp_path: Path) -> RuntimeConfig:
+    data_root = tmp_path / "data"
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir()
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(data_root),
+            "CODEX_TASK_TEMP": str(scratch_root),
+        }
+    )
+
+    def prepare_proof_registry(database_path: Path) -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS registry_marker (id INTEGER)"
+            )
+
+    RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
+    return config
+
+
+def test_runtime_bootstrap_prepares_private_continuity_storage(tmp_path: Path) -> None:
+    config = _bootstrapped_runtime_config(tmp_path)
+    assert config.continuity_database.exists()
+    assert config.continuity_cas_root.is_dir()
+
+
+def _runtime_with_orphaned_atlas_outbox(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    ingestion_key = f"sha256:{'a' * 64}"
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        assert not connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ingestion_key,
+                f"sha256:{'b' * 64}",
+                "{}",
+                ingestion_key,
+                "pending",
+                0,
+                "",
+                "[]",
+                "2026-08-09T00:00:00Z",
+                "2026-08-09T00:00:00Z",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_orphaned_atlas_outbox_foreign_key(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_orphaned_atlas_outbox(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+        return
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore.from_prepared_connection(connection)
+            store.close()
+    finally:
+        connection.close()
+
+
+def _runtime_with_noncanonical_schema_metadata(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute("CREATE TABLE schema_metadata (key TEXT, value TEXT)")
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            (("schema_version", "11"), ("schema_version", "10")),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_noncanonical_schema_metadata(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_noncanonical_schema_metadata(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+        return
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore.from_prepared_connection(connection)
+            store.close()
+    finally:
+        connection.close()
+
+
+def _runtime_with_null_schema_metadata_key(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            (("schema_version", "11"), (None, "invalid-null-key")),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_null_schema_metadata_key(
+    tmp_path: Path, entry_point: str
+) -> None:
+    config = _runtime_with_null_schema_metadata_key(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+    else:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+                store = SQLiteStore.from_prepared_connection(connection)
+                store.close()
+        finally:
+            connection.close()
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        columns = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 0
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key IS NULL"
+        ).fetchone()[0] == "invalid-null-key"
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "11"
+    finally:
+        connection.close()
+
+
+def _legacy_metadata_database(
+    tmp_path: Path,
+    *,
+    version: str,
+    rows: tuple[tuple[str, str], ...] | None = None,
+) -> Path:
+    database = tmp_path / f"legacy-schema-metadata-{version}.sqlite3"
+    bootstrap = SQLiteStore(database)
+    bootstrap.close()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        metadata_rows = (("schema_version", version),) if rows is None else rows
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            metadata_rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database
+
+
+@pytest.mark.parametrize("legacy_version", ("10", "11"))
+def test_sqlite_store_migrates_trustworthy_legacy_schema_metadata(
+    tmp_path: Path, legacy_version: str
+) -> None:
+    database = _legacy_metadata_database(tmp_path, version=legacy_version)
+
+    store = SQLiteStore(database)
+    try:
+        columns = {
+            str(row["name"]): int(row["notnull"])
+            for row in store._connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 1
+        assert store.schema_version() == 13
+        assert tuple(
+            tuple(row)
+            for row in store._connection.execute(
+                "SELECT key, value FROM schema_metadata"
+            )
+        ) == (("schema_version", "13"),)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected_rows"),
+    (
+        ((), ()),
+        (
+            (("schema_version", "11"), ("legacy_marker", "preserved")),
+            (("legacy_marker", "preserved"), ("schema_version", "11")),
+        ),
+    ),
+    ids=("empty", "extra-row"),
+)
+def test_sqlite_store_rejects_untrusted_legacy_schema_metadata(
+    tmp_path: Path,
+    rows: tuple[tuple[str, str], ...],
+    expected_rows: tuple[tuple[str, str], ...],
+) -> None:
+    database = _legacy_metadata_database(tmp_path, version="11", rows=rows)
+
+    with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        columns = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 0
+        assert tuple(
+            connection.execute(
+                "SELECT key, value FROM schema_metadata ORDER BY key, value"
+            )
+        ) == expected_rows
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_metadata_v12'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def _runtime_with_strict_schema_metadata_rows(
+    tmp_path: Path,
+    rows: tuple[tuple[str, str], ...],
+) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DELETE FROM schema_metadata")
+        connection.executemany(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+@pytest.mark.parametrize(
+    ("rows", "expected_rows"),
+    (
+        (
+            (("schema_version", "11"),),
+            (("schema_version", "11"),),
+        ),
+        (
+            (("schema_version", "14"),),
+            (("schema_version", "14"),),
+        ),
+        ((), ()),
+        (
+            (("schema_version", "12"), ("legacy_marker", "preserved")),
+            (("legacy_marker", "preserved"), ("schema_version", "12")),
+        ),
+    ),
+    ids=("legacy-version", "future-version", "empty", "extra-row"),
+)
+def test_sqlite_store_rejects_noncanonical_strict_schema_metadata(
+    tmp_path: Path,
+    entry_point: str,
+    rows: tuple[tuple[str, str], ...],
+    expected_rows: tuple[tuple[str, str], ...],
+) -> None:
+    config = _runtime_with_strict_schema_metadata_rows(tmp_path, rows)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+    else:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+                store = SQLiteStore.from_prepared_connection(connection)
+                store.close()
+        finally:
+            connection.close()
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        columns = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(schema_metadata)")
+        }
+        assert columns["key"] == 1
+        assert tuple(
+            connection.execute(
+                "SELECT key, value FROM schema_metadata ORDER BY key, value"
+            )
+        ) == expected_rows
+    finally:
+        connection.close()
+
+
+def _runtime_with_generated_schema_metadata_column(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL,
+                generated_marker TEXT GENERATED ALWAYS AS (key || value) VIRTUAL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            ("schema_version", "12"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_generated_schema_metadata_column(
+    tmp_path: Path,
+    entry_point: str,
+) -> None:
+    config = _runtime_with_generated_schema_metadata_column(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+    else:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+                store = SQLiteStore.from_prepared_connection(connection)
+                store.close()
+        finally:
+            connection.close()
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    connection.row_factory = sqlite3.Row
+    try:
+        assert {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_xinfo(schema_metadata)")
+        } == {"key", "value", "generated_marker"}
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()["value"] == "12"
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_metadata_v12'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def _runtime_with_generated_schema_metadata_value(tmp_path: Path) -> RuntimeConfig:
+    config = _bootstrapped_runtime_config(tmp_path)
+    connection = sqlite3.connect(config.orchestrator_database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT NOT NULL PRIMARY KEY,
+                value TEXT GENERATED ALWAYS AS (
+                    CASE key WHEN 'schema_version' THEN '12' ELSE '' END
+                ) STORED NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata (key) VALUES (?)",
+            ("schema_version",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return config
+
+
+@pytest.mark.parametrize("entry_point", ("constructor", "prepared"))
+def test_sqlite_store_rejects_generated_schema_metadata_value(
+    tmp_path: Path,
+    entry_point: str,
+) -> None:
+    config = _runtime_with_generated_schema_metadata_value(tmp_path)
+    if entry_point == "constructor":
+        with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+            store = SQLiteStore(config.orchestrator_database)
+            store.close()
+    else:
+        connection = sqlite3.connect(config.orchestrator_database)
+        try:
+            with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+                store = SQLiteStore.from_prepared_connection(connection)
+                store.close()
+        finally:
+            connection.close()
+
+    connection = sqlite3.connect(config.orchestrator_database)
+    connection.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"]): (int(row["notnull"]), int(row["hidden"]))
+            for row in connection.execute("PRAGMA table_xinfo(schema_metadata)")
+        }
+        assert columns == {"key": (1, 0), "value": (1, 3)}
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()["value"] == "12"
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_metadata_v12'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def _legacy_database_with_generated_schema_metadata_value(tmp_path: Path) -> Path:
+    database = tmp_path / "legacy-generated-schema-metadata-value.sqlite3"
+    bootstrap = SQLiteStore(database)
+    bootstrap.close()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TABLE schema_metadata")
+        connection.execute(
+            """
+            CREATE TABLE schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT GENERATED ALWAYS AS (
+                    CASE key WHEN 'schema_version' THEN '11' ELSE '' END
+                ) STORED NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata (key) VALUES (?)",
+            ("schema_version",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database
+
+
+def test_sqlite_store_rejects_legacy_generated_schema_metadata_value(
+    tmp_path: Path,
+) -> None:
+    database = _legacy_database_with_generated_schema_metadata_value(tmp_path)
+
+    with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"]): (int(row["notnull"]), int(row["hidden"]))
+            for row in connection.execute("PRAGMA table_xinfo(schema_metadata)")
+        }
+        assert columns == {"key": (0, 0), "value": (1, 3)}
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()["value"] == "11"
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_metadata_v12'"
+        ).fetchone() is None
+    finally:
+        connection.close()

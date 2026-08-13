@@ -567,6 +567,12 @@ class TeamEfficiencyTests(unittest.TestCase):
         work_package = copy.deepcopy(
             self.decomposition_manifest() if work_package is None else work_package
         )
+        authority = self.project_binding(helper)
+        work_package = self.project_bound_work_package(
+            helper,
+            work_package,
+            authority=authority,
+        )
         source_plan = helper.decompose(work_package)
         integration_commit = "a" * 40
         integration_tree = "b" * 40
@@ -681,6 +687,87 @@ class TeamEfficiencyTests(unittest.TestCase):
                 },
             },
         }
+
+    def project_binding(
+        self, helper, *, project_id: str | None = None
+    ) -> dict[str, object]:
+        logical_project = self.project if project_id is None else project_id
+        return {
+            "project_id": hashlib.sha256(
+                f"team-efficiency/project-fence-project-id/v1\0{logical_project}".encode()
+            ).hexdigest(),
+            "binding_digest": helper._sha256_json({"project_id": logical_project}),
+            "binding_version": 1,
+            "workspace_id": helper._sha256_json({"workspace": self.project}),
+            "input_snapshot_id": helper._sha256_json({"input_snapshot": self.project}),
+        }
+
+    def project_bound_work_package(
+        self,
+        helper,
+        package: dict[str, object],
+        *,
+        authority: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        live = self.project_binding(helper) if authority is None else authority
+        payload = copy.deepcopy(package)
+        return {
+            "schema": "team-efficiency/work-package-v2",
+            "package": payload,
+            "package_payload_hash": helper._sha256_json(payload),
+            "project_fence": {
+                "schema": "team-efficiency/project-fence-v1",
+                "project_id": live["project_id"],
+                "binding_digest": live["binding_digest"],
+                "binding_version": live["binding_version"],
+            },
+            "workspace_id": live["workspace_id"],
+            "input_snapshot_id": live["input_snapshot_id"],
+        }
+
+    def project_bound_fast_lane_request(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        authority: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        bound = copy.deepcopy(request)
+        live = self.project_binding(helper) if authority is None else authority
+        existing_package = bound["work_package"]
+        if (
+            isinstance(existing_package, dict)
+            and existing_package.get("schema") == "team-efficiency/work-package-v2"
+        ):
+            return bound, live
+        original_plan = helper.decompose(bound["work_package"])
+        original_source_plan_hash = helper._sha256_json(original_plan)
+        bound["work_package"] = self.project_bound_work_package(
+            helper,
+            bound["work_package"],
+            authority=live,
+        )
+        bound_source_plan_hash = helper._sha256_json(
+            helper.decompose(bound["work_package"])
+        )
+
+        def replace_bound_source_hash(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key == "source_plan_hash" and child == original_source_plan_hash:
+                        value[key] = bound_source_plan_hash
+                    else:
+                        replace_bound_source_hash(child)
+            elif isinstance(value, list):
+                for child in value:
+                    replace_bound_source_hash(child)
+
+        replace_bound_source_hash(bound)
+        for context in bound["execution_contexts"]:
+            context["workspace_input_snapshot_id"] = live["input_snapshot_id"]
+        for context in bound["read_contexts"]:
+            context["workspace_input_snapshot_id"] = live["input_snapshot_id"]
+        return bound, live
 
     def fast_lane_contexts_empty_request(self, helper) -> dict[str, object]:
         return self.fast_lane_request(helper, include_contexts=False)
@@ -1011,6 +1098,16 @@ class TeamEfficiencyTests(unittest.TestCase):
         quota_verified_route_result_hashes=(),
         quota_verified_lease_scope_bindings=(),
     ) -> dict[str, object]:
+        """Exercise pure scheduler construction without public execution ingress.
+
+        The production ``compile_fast_lane`` entry point is deliberately
+        fail-closed until a Desktop-owned authority bridge exists.  Routing,
+        index, quota, and projection unit tests retain coverage through the
+        existing pure validators/renderers only; this fixture never represents
+        a caller-visible execution plan.
+        """
+
+        request, _ = self.project_bound_fast_lane_request(helper, request)
         default_status = self.fast_lane_host_status(helper, request)
         if host_status is None:
             effective_status = default_status
@@ -1031,7 +1128,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             quota_verified_route_result_hashes=quota_verified_route_result_hashes,
             quota_verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
         )
-        return helper.compile_fast_lane(
+        return self.fast_lane_diagnostic_compile(
+            helper,
             request,
             reasoning_effort=reasoning_effort,
             enable=enable,
@@ -1048,6 +1146,58 @@ class TeamEfficiencyTests(unittest.TestCase):
             index_evaluation_time_utc_z="2026-08-03T12:00:00Z",
         )
 
+    def fast_lane_diagnostic_compile(
+        self,
+        helper,
+        request: dict[str, object],
+        *,
+        reasoning_effort: str,
+        enable: bool = False,
+        host_status: dict[str, object] | None = None,
+        quota_request: dict[str, object] | None = None,
+        quota_trusted_key_resolver=None,
+        quota_evaluation_time_utc_z: str | None = None,
+        quota_verified_route_result_hashes=(),
+        quota_verified_lease_scope_bindings=(),
+        index_evidence: list[dict[str, object]] | None = None,
+        trusted_index_evidence_hashes: set[str] | None = None,
+        index_evaluation_time_utc_z: str | None = None,
+    ) -> dict[str, object]:
+        """Run pure scheduler data transforms for unit coverage only."""
+
+        default_status = self.fast_lane_host_status(helper, request)
+        effective_status = (
+            default_status if host_status is None else copy.deepcopy(host_status)
+        )
+        effective_status.setdefault(
+            "routing_context", default_status["routing_context"]
+        )
+        result = self.fast_lane_index_evidence_draft(
+            helper,
+            request,
+            host_status=effective_status,
+            reasoning_effort=reasoning_effort,
+            enable=enable,
+            quota_request=quota_request,
+            quota_trusted_key_resolver=quota_trusted_key_resolver,
+            quota_evaluation_time_utc_z=quota_evaluation_time_utc_z,
+            quota_verified_route_result_hashes=quota_verified_route_result_hashes,
+            quota_verified_lease_scope_bindings=quota_verified_lease_scope_bindings,
+        )
+        try:
+            return helper._fast_lane_apply_index_evidence(
+                result,
+                index_evidence=index_evidence,
+                trusted_index_evidence_hashes=(
+                    ()
+                    if trusted_index_evidence_hashes is None
+                    else trusted_index_evidence_hashes
+                ),
+                index_evaluation_time_utc_z=index_evaluation_time_utc_z,
+            )
+        except (KeyError, TypeError, ValueError):
+            return helper._fast_lane_index_evidence_fail_closed(result)
+
     def compile_fast_lane_with_index_evidence(
         self,
         helper,
@@ -1059,12 +1209,11 @@ class TeamEfficiencyTests(unittest.TestCase):
         reasoning_effort: str = "ultra",
         enable: bool = False,
     ) -> dict[str, object]:
-        """Call the compiler's host-only index-evidence ingress.
+        """Exercise index-evidence validation through the pure test fixture.
 
-        The compatibility branch exists only to make the first RED assert the
-        old compiler's unsafe behavior rather than turn a missing keyword-only
-        ingress into a test harness error.  The feature branch always invokes
-        the real compiler directly with the exact host inputs.
+        Production ingress is permanently inert until an external Desktop
+        bridge exists.  This preserves narrow structural test coverage without
+        granting Python code a public scheduler route.
         """
 
         if (
@@ -1077,7 +1226,9 @@ class TeamEfficiencyTests(unittest.TestCase):
                 reasoning_effort=reasoning_effort,
                 enable=enable,
             )
-        return helper.compile_fast_lane(
+        request, _ = self.project_bound_fast_lane_request(helper, request)
+        return self.fast_lane_diagnostic_compile(
+            helper,
             request,
             reasoning_effort=reasoning_effort,
             enable=enable,
@@ -1341,12 +1492,16 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def fast_lane_code_atlas_request(self, helper) -> dict[str, object]:
         work_package = self.code_atlas_manifest()
-        source_plan = helper.decompose(work_package)
+        authority = self.project_binding(helper)
+        bound_work_package = self.project_bound_work_package(
+            helper, work_package, authority=authority
+        )
+        source_plan = helper.decompose(bound_work_package)
         integration_commit = "a" * 40
         integration_tree = "b" * 40
         packet_test = work_package["packet"]["tests"][0]
         request = self.fast_lane_contexts_empty_request(helper)
-        request["work_package"] = work_package
+        request["work_package"] = bound_work_package
         request["target_gates"] = []
         request["execution_contexts"] = []
         request["read_contexts"] = []
@@ -1930,6 +2085,405 @@ class TeamEfficiencyTests(unittest.TestCase):
                     {"reasoning_effort": effort, "reason": "explicit_opt_in"},
                     helper._fast_lane_activation(effort, True),
                 )
+
+    def test_fast_lane_legacy_work_package_cannot_create_assignments(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        request["work_package"] = request["work_package"]["package"]
+
+        result = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+        )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "LEGACY_PROJECT_UNBOUND", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
+
+    def test_fast_lane_legacy_resume_state_cannot_retain_or_start_assignments(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_running_request(helper)
+        request["work_package"] = request["work_package"]["package"]
+
+        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "LEGACY_PROJECT_UNBOUND", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
+
+    def test_fast_lane_v2_without_live_authority_is_inert(self) -> None:
+        helper = load_efficiency()
+
+        result = helper.compile_fast_lane(
+            self.fast_lane_schedule_request(helper),
+            reasoning_effort="ultra",
+        )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "PROJECT_AUTHORITY_UNAVAILABLE", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
+
+    def test_fast_lane_v2_forged_provider_cannot_activate_execution(self) -> None:
+        """A same-process module override is not an external host bridge."""
+
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        authority = self.project_binding(helper)
+        request, authority = self.project_bound_fast_lane_request(
+            helper, request, authority=authority
+        )
+        host_status = self.fast_lane_host_status(helper, request)
+        index_evidence = self.fast_lane_index_evidence(
+            helper,
+            request,
+            host_status=host_status,
+            reasoning_effort="ultra",
+        )
+
+        # This was a real bypass: before the R3 repair, the compiler consumed
+        # this caller-controlled module attribute and returned active work.
+        with mock.patch.object(
+            helper,
+            "_project_authority_provider",
+            lambda: authority,
+            create=True,
+        ):
+            result = helper.compile_fast_lane(
+                request,
+                reasoning_effort="ultra",
+                host_status=host_status,
+                index_evidence=index_evidence,
+                trusted_index_evidence_hashes={
+                    str(record["evidence_hash"]) for record in index_evidence
+                },
+                index_evaluation_time_utc_z="2026-08-03T12:00:00Z",
+            )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "PROJECT_AUTHORITY_UNAVAILABLE", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
+        self.assertEqual([], result["ready_queue"])
+        self.assertEqual([], result["review_queue"])
+        self.assertEqual([], result["prewarm_queue"])
+        self.assertEqual([], result["design_queue"])
+        self.assertEqual([], result["cross_session_dispatch_projection"]["assignments"])
+        self.assertFalse(hasattr(helper, "_project_authority_provider"))
+        self.assertFalse(hasattr(helper, "_live_project_authority"))
+        self.assertFalse(hasattr(helper, "_ProjectAuthorityProvider"))
+
+    def test_fast_lane_v2_keeps_structural_binding_but_public_compile_is_inert(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        request, _ = self.project_bound_fast_lane_request(helper, request)
+        host_status = self.fast_lane_host_status(helper, request)
+        index_evidence = self.fast_lane_index_evidence(
+            helper,
+            request,
+            host_status=host_status,
+            reasoning_effort="ultra",
+        )
+
+        result = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            host_status=host_status,
+            index_evidence=index_evidence,
+            trusted_index_evidence_hashes={
+                str(record["evidence_hash"]) for record in index_evidence
+            },
+            index_evaluation_time_utc_z="2026-08-03T12:00:00Z",
+        )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "PROJECT_AUTHORITY_UNAVAILABLE", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
+        self.assertIn("project_authority", helper.decompose(request["work_package"]))
+
+    def test_fast_lane_v2_blocked_plan_hash_keeps_project_binding_distinct(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        first_request = self.fast_lane_schedule_request(helper)
+        original_package = first_request["work_package"]["package"]
+        second_request = copy.deepcopy(first_request)
+        second_request["work_package"] = self.project_bound_work_package(
+            helper,
+            original_package,
+            authority=self.project_binding(helper, project_id="other-project"),
+        )
+
+        first = helper.compile_fast_lane(first_request, reasoning_effort="ultra")
+        second = helper.compile_fast_lane(second_request, reasoning_effort="ultra")
+
+        for result in (first, second):
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+            self.assertEqual(
+                "PROJECT_AUTHORITY_UNAVAILABLE",
+                result["idle_slots"][0]["reason_code"],
+            )
+            self.assertEqual([], result["assignments"])
+        self.assertNotEqual(first["source_plan_hash"], second["source_plan_hash"])
+
+    def test_fast_lane_v2_rejects_hash_consistent_invalid_inner_package_before_authority(
+        self,
+    ) -> None:
+        """A V2 envelope cannot hide an invalid V1 payload behind its hash."""
+
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        malformed = copy.deepcopy(request["work_package"])
+        malformed["package"]["capacity"] = 0
+        malformed["package_payload_hash"] = helper._sha256_json(malformed["package"])
+        invalid_shell = {
+            **request,
+            "schema": "team-efficiency/fast-lane-request-unknown",
+            "work_package": malformed,
+        }
+
+        with self.assertRaisesRegex(ValueError, "capacity is out of bounds"):
+            helper.decompose(malformed)
+
+        with (
+            mock.patch.object(
+                helper,
+                "_validated_fast_lane_host_status",
+                side_effect=AssertionError("invalid binding must not read host status"),
+            ),
+            mock.patch.object(
+                helper,
+                "_fast_lane_main_capacity_evidence",
+                side_effect=AssertionError("invalid binding must not read quota"),
+            ),
+            mock.patch.object(
+                helper,
+                "_fast_lane_apply_index_evidence",
+                side_effect=AssertionError(
+                    "invalid binding must not bind index evidence"
+                ),
+            ),
+        ):
+            inner_result = helper.compile_fast_lane(
+                {**request, "work_package": malformed},
+                reasoning_effort="ultra",
+                host_status=object(),
+                quota_request=object(),
+                index_evidence=object(),
+            )
+            shell_result = helper.compile_fast_lane(
+                invalid_shell,
+                reasoning_effort="ultra",
+                host_status=object(),
+                quota_request=object(),
+                index_evidence=object(),
+            )
+
+        for result in (inner_result, shell_result):
+            with self.subTest(result=result["source_plan_hash"]):
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+                self.assertEqual(
+                    "PROJECT_BINDING_INVALID",
+                    result["idle_slots"][0]["reason_code"],
+                )
+                self.assertEqual([], result["assignments"])
+                self.assertEqual([], result["ready_queue"])
+                self.assertEqual([], result["review_queue"])
+                self.assertEqual([], result["prewarm_queue"])
+                self.assertEqual([], result["design_queue"])
+                self.assertEqual(
+                    [], result["cross_session_dispatch_projection"]["assignments"]
+                )
+
+    def test_fast_lane_cli_invalid_shell_and_inner_v2_are_binding_invalid(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        request["schema"] = "team-efficiency/fast-lane-request-unknown"
+        request["work_package"]["package"]["capacity"] = 0
+        request["work_package"]["package_payload_hash"] = helper._sha256_json(
+            request["work_package"]["package"]
+        )
+        request_path = self.temp / "invalid-fast-lane-v2.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(request_path),
+                "--host-status",
+                str(self.temp / "must-not-read-host-status.json"),
+                "--quota-input",
+                str(self.temp / "must-not-read-quota.json"),
+                "--live-quota",
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        result = json.loads(output)
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "PROJECT_BINDING_INVALID", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
+        self.assertEqual([], result["ready_queue"])
+        self.assertEqual([], result["review_queue"])
+        self.assertEqual([], result["prewarm_queue"])
+        self.assertEqual([], result["design_queue"])
+        self.assertEqual([], result["cross_session_dispatch_projection"]["assignments"])
+
+    def test_fast_lane_v2_rejects_copy_and_binding_tampering_before_assignment(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        authority = self.project_binding(helper)
+        request, authority = self.project_bound_fast_lane_request(
+            helper, request, authority=authority
+        )
+        package = request["work_package"]
+
+        workspace_tampered = copy.deepcopy(package)
+        workspace_tampered["workspace_id"] = helper._sha256_json({"workspace": "other"})
+        snapshot_tampered = copy.deepcopy(package)
+        snapshot_tampered["input_snapshot_id"] = helper._sha256_json(
+            {"snapshot": "other"}
+        )
+        payload_tampered = copy.deepcopy(package)
+        payload_tampered["package"]["goal"] = "Copied package altered after sealing"
+        copied = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+        )
+        malformed = helper.compile_fast_lane(
+            {**request, "work_package": workspace_tampered},
+            reasoning_effort="ultra",
+        )
+        snapshot = helper.compile_fast_lane(
+            {**request, "work_package": snapshot_tampered},
+            reasoning_effort="ultra",
+        )
+        payload = helper.compile_fast_lane(
+            {**request, "work_package": payload_tampered},
+            reasoning_effort="ultra",
+        )
+
+        for result in (copied, malformed, snapshot, payload):
+            with self.subTest(result=result["idle_slots"][0]["reason_code"]):
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+                self.assertEqual([], result["assignments"])
+
+    def test_fast_lane_v2_project_fence_changes_source_plan_hash(self) -> None:
+        helper = load_efficiency()
+        package = self.fast_lane_schedule_request(helper)["work_package"]["package"]
+
+        first = helper.decompose(self.project_bound_work_package(helper, package))
+        second = helper.decompose(
+            self.project_bound_work_package(
+                helper,
+                package,
+                authority=self.project_binding(helper, project_id="other-project"),
+            )
+        )
+        third = helper.decompose(
+            self.project_bound_work_package(
+                helper,
+                package,
+                authority={
+                    **self.project_binding(helper),
+                    "workspace_id": helper._sha256_json({"workspace": "other"}),
+                },
+            )
+        )
+
+        self.assertNotEqual(helper._sha256_json(first), helper._sha256_json(second))
+        self.assertNotEqual(helper._sha256_json(first), helper._sha256_json(third))
+        self.assertEqual(
+            helper._sha256_json(package),
+            first["package_payload_hash"],
+        )
+
+    def test_project_fence_wire_contract_matches_runtime_authority(self) -> None:
+        helper = load_efficiency()
+        from devkit_runtime.project_authority import ProjectAuthority
+
+        project_root = self.temp / "authority-project"
+        project_root.mkdir()
+        runtime_fence = ProjectAuthority.issue(project_root).project_fence()
+
+        parsed = helper._validated_project_fence(
+            {
+                "schema": runtime_fence.schema,
+                "project_id": runtime_fence.project_id,
+                "binding_digest": runtime_fence.binding_digest,
+                "binding_version": runtime_fence.binding_version,
+            },
+            "project_fence",
+        )
+
+        self.assertEqual(runtime_fence.project_id, parsed["project_id"])
+        self.assertEqual(runtime_fence.binding_digest, parsed["binding_digest"])
+        with self.assertRaisesRegex(ValueError, "project_id is invalid"):
+            helper._validated_project_fence(
+                {**parsed, "project_id": "caller-selected-project"},
+                "project_fence",
+            )
+        with self.assertRaisesRegex(ValueError, "binding_version is invalid"):
+            helper._validated_project_fence(
+                {**parsed, "binding_version": 2},
+                "project_fence",
+            )
+        with self.assertRaisesRegex(ValueError, "binding_digest must be a sha256 hash"):
+            helper._validated_project_fence(
+                {
+                    **parsed,
+                    "binding_digest": "sha256:" + "AB" * 32,
+                },
+                "project_fence",
+            )
+
+    def test_fast_lane_v2_execution_project_alias_stays_inert_without_host_bridge(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        request["execution_contexts"][0]["bootstrap_plan"]["project"] = "other-project"
+
+        result = helper.compile_fast_lane(request, reasoning_effort="ultra")
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual(
+            "PROJECT_AUTHORITY_UNAVAILABLE", result["idle_slots"][0]["reason_code"]
+        )
+        self.assertEqual([], result["assignments"])
 
     def test_fast_lane_ultra_emits_lane_zero_and_three_useful_slots(self) -> None:
         helper = load_efficiency()
@@ -3025,16 +3579,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                     "max",
                 ],
             ),
-            (
-                "embedded",
-                [
-                    "fast-lane",
-                    "--input",
-                    str(embedded_effort_path),
-                    "--reasoning-effort",
-                    "ultra",
-                ],
-            ),
         )
         for name, arguments in cases:
             with self.subTest(name=name):
@@ -3043,6 +3587,27 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual("", output)
                 self.assertTrue(errors.startswith("error: "))
                 self.assertLessEqual(len(errors), 256)
+
+        exit_code, output, errors = self.run_fast_lane_cli(
+            helper,
+            [
+                "fast-lane",
+                "--input",
+                str(embedded_effort_path),
+                "--reasoning-effort",
+                "ultra",
+            ],
+        )
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        embedded_result = json.loads(output)
+        self.assertEqual("blocked", embedded_result["status"])
+        self.assertEqual("NO_SAFE_WORK", embedded_result["decision_code"])
+        self.assertEqual(
+            "PROJECT_BINDING_INVALID",
+            embedded_result["idle_slots"][0]["reason_code"],
+        )
+        self.assertEqual([], embedded_result["assignments"])
 
     def test_fast_lane_cli_uses_explicit_dispatch_not_decompose_fallback(self) -> None:
         helper = load_efficiency()
@@ -3121,9 +3686,11 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "ultra",
             ],
         )
-        self.assertEqual(2, exit_code)
-        self.assertEqual("", output)
-        self.assertTrue(errors.startswith("error: "))
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        malformed_result = json.loads(output)
+        self.assertEqual("NO_SAFE_WORK", malformed_result["decision_code"])
+        self.assertEqual([], malformed_result["assignments"])
 
     def test_fast_lane_cli_fails_closed_for_partial_or_unknown_routes(self) -> None:
         helper = load_efficiency()
@@ -3532,9 +4099,11 @@ class TeamEfficiencyTests(unittest.TestCase):
                         "ultra",
                     ],
                 )
-                self.assertEqual(2, exit_code)
-                self.assertEqual("", output)
-                self.assertTrue(errors.startswith("error: "))
+                self.assertEqual(0, exit_code)
+                self.assertEqual("", errors)
+                result = json.loads(output)
+                self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+                self.assertEqual([], result["assignments"])
 
     def test_fast_lane_validates_exact_target_gates_and_driver_identity(self) -> None:
         helper = load_efficiency()
@@ -3808,9 +4377,11 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "ultra",
             ],
         )
-        self.assertEqual(2, exit_code)
-        self.assertEqual("", output)
-        self.assertEqual("error: ATLAS_GATE_UNVERIFIED\n", errors)
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", errors)
+        result = json.loads(output)
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+        self.assertEqual([], result["assignments"])
 
     def test_fast_lane_rejects_unsafe_gates_and_unbound_contexts(self) -> None:
         helper = load_efficiency()
@@ -4167,13 +4738,9 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_fast_lane_has_no_external_side_effect(self) -> None:
         helper = load_efficiency()
         request = self.fully_bound_fast_lane_manual_request(helper)
+        self.assertFalse(hasattr(helper, "subprocess"))
 
         with (
-            mock.patch.object(
-                helper.subprocess,
-                "run",
-                side_effect=AssertionError("compile must not run subprocesses"),
-            ),
             mock.patch.object(
                 helper,
                 "apply_bootstrap_plan",
@@ -5458,6 +6025,9 @@ class TeamEfficiencyTests(unittest.TestCase):
             "routing_context_hash",
             "routing_result_hash",
             "NO_SAFE_WORK",
+            "PROJECT_AUTHORITY_UNAVAILABLE",
+            "apply_bootstrap_plan",
+            "不存在可执行的",
             "worker effort 禁止 `ultra`",
             "prewarm 始终是独立的只读证据角色",
             "归档不是 adapter 操作",
@@ -5495,6 +6065,9 @@ class TeamEfficiencyTests(unittest.TestCase):
             "git worktree add",
             "Git common directory",
             "post-apply attestation",
+            "bootstrap --apply",
+            "import-callable `apply_bootstrap_plan`",
+            "no currently executable host-authorized worktree path",
             "parked endpoint bootstrap",
             "inert",
             "inert dispatch descriptors",
@@ -5545,9 +6118,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             set(plan["workflow_fields"]),
         )
 
-    def test_bootstrap_uses_the_configured_fastlane_task_root_and_rejects_a_change(
-        self,
-    ) -> None:
+    def test_bootstrap_plan_binds_the_configured_fastlane_task_root(self) -> None:
         helper = load_efficiency()
         replacement_root = self.fast_lane_task_root / "replacement-root"
         replacement_root.mkdir()
@@ -5562,14 +6133,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "temp_target": project_root / "tasks" / "atlas12b",
             }
         )
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-        probes: list[tuple[list[str], bool, dict[str, str]]] = []
-
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            calls.append((argv, check, env))
-
-        def probe_runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            probes.append((argv, check, env))
 
         with mock.patch.dict(
             os.environ,
@@ -5580,37 +6143,14 @@ class TeamEfficiencyTests(unittest.TestCase):
             self.assertIsInstance(plan["task_root_hash"], str)
             self.assertNotIn("task_root", plan)
             self.assertEqual(configured_root / "t", Path(plan["temp_target"]).parent)
-            applied = helper.apply_bootstrap_plan(
-                plan,
-                runner=runner,
-                probe_runner=probe_runner,
-            )
-
-        self.assertEqual("applied", applied["mode"])
-        self.assertEqual(1, len(calls))
-        for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
-            self.assertEqual(str(plan["temp_target"]), environment["CODEX_TASK_TEMP"])
-            self.assertEqual(
-                str(Path(plan["temp_target"]) / "p"),
-                environment["PYTHONPYCACHEPREFIX"],
-            )
-            self.assertEqual(
-                str(Path(plan["temp_target"]) / "u"),
-                environment["UV_CACHE_DIR"],
-            )
+            self.assertEqual(plan, helper._validated_bootstrap_plan(plan))
 
         with mock.patch.dict(
             os.environ,
             {"CODEX_FASTLANE_TASK_ROOT": str(replacement_root)},
         ):
             with self.assertRaises(ValueError):
-                helper.apply_bootstrap_plan(
-                    plan,
-                    runner=runner,
-                    probe_runner=probe_runner,
-                )
-
-        self.assertEqual(1, len(calls))
+                helper._validated_bootstrap_plan(plan)
 
     def test_bootstrap_uses_a_short_hash_bound_cache_leaf_for_deep_worktrees(
         self,
@@ -5627,15 +6167,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                 "temp_target": project_root / "tasks" / "deep-task-temp",
             }
         )
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-        probes: list[tuple[list[str], bool, dict[str, str]]] = []
-
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            calls.append((argv, check, env))
-
-        def probe_runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            probes.append((argv, check, env))
-
         with mock.patch.dict(
             os.environ,
             {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
@@ -5658,33 +6189,10 @@ class TeamEfficiencyTests(unittest.TestCase):
                 ),
                 helper.MAX_PYTHON_CACHE_PATH_LENGTH,
             )
-            helper.apply_bootstrap_plan(
-                plan,
-                runner=runner,
-                probe_runner=probe_runner,
-            )
 
-        self.assertEqual(1, len(calls))
-        for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
-            for name in (
-                "CODEX_TASK_TEMP",
-                "TEMP",
-                "TMP",
-                "TMPDIR",
-                "PYTHONPYCACHEPREFIX",
-                "UV_CACHE_DIR",
-            ):
-                with self.subTest(name=name):
-                    self.assertTrue(
-                        Path(environment[name])
-                        .resolve(strict=False)
-                        .is_relative_to(configured_root.resolve())
-                    )
-            self.assertEqual(str(cache_leaf), environment["CODEX_TASK_TEMP"])
-            self.assertEqual(str(cache_leaf / "p"), environment["PYTHONPYCACHEPREFIX"])
-            self.assertEqual(str(cache_leaf / "u"), environment["UV_CACHE_DIR"])
-
-    def test_bootstrap_rejects_a_preexisting_short_cache_leaf(self) -> None:
+    def test_bootstrap_apply_is_unavailable_even_with_a_preexisting_cache_leaf(
+        self,
+    ) -> None:
         helper = load_efficiency()
         configured_root = self.fast_lane_task_root
         target = self.bootstrap_kwargs()
@@ -5705,7 +6213,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             plan = helper.build_bootstrap_plan(**target)
             Path(plan["temp_target"]).mkdir(parents=True)
             with self.assertRaisesRegex(
-                ValueError, "temp_target target already exists"
+                ValueError, "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE"
             ):
                 helper.apply_bootstrap_plan(
                     plan,
@@ -5841,7 +6349,7 @@ class TeamEfficiencyTests(unittest.TestCase):
                     project_root=project_root,
                 )
 
-    def test_bootstrap_rejects_a_reparse_project_before_build_and_apply(self) -> None:
+    def test_bootstrap_rejects_a_reparse_project_before_diagnostic_build(self) -> None:
         helper = load_efficiency()
         configured_root = self.fast_lane_task_root
         project = "reparse-project"
@@ -5859,13 +6367,11 @@ class TeamEfficiencyTests(unittest.TestCase):
             os.environ,
             {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
         ):
-            plan = helper.build_bootstrap_plan(**target)
             project_root.mkdir()
 
             def reparse_project(path: Path, *, missing_ok: bool = False) -> bool:
                 return path == project_root
 
-            calls: list[tuple[list[str], bool, dict[str, str]]] = []
             with mock.patch.object(
                 helper,
                 "_path_has_reparse_point",
@@ -5873,122 +6379,25 @@ class TeamEfficiencyTests(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     helper.build_bootstrap_plan(**target)
-                with self.assertRaises(ValueError):
-                    helper.apply_bootstrap_plan(
-                        plan,
-                        runner=lambda argv, *, check, env: calls.append(
-                            (argv, check, env)
-                        ),
-                        probe_runner=lambda argv, *, check, env: None,
-                    )
 
-        self.assertEqual([], calls)
-
-    def test_bootstrap_apply_rechecks_root_bound_descendants_before_mutation(
-        self,
-    ) -> None:
+    def test_bootstrap_module_has_no_in_repo_worktree_executor(self) -> None:
         helper = load_efficiency()
-        configured_root = self.fast_lane_task_root
-        project = "race-checked-project"
-        project_root = configured_root / project
-        target = self.bootstrap_kwargs()
-        target.update(
-            {
-                "project": project,
-                "worktree": project_root / "worktrees" / "atlas12b-team-efficiency",
-                "temp_target": project_root / "tasks" / "atlas12b",
-            }
-        )
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
 
-        with mock.patch.dict(
-            os.environ,
-            {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
+        for name in (
+            "_seal_bootstrap_execution_capability",
+            "_validated_sealed_bootstrap_plan",
+            "_apply_bootstrap_plan_after_authority",
+            "_run_git_probe",
+            "_run_worktree_add",
+            "_PinnedDirectoryTree",
+            "_pin_windows_directory",
+            "_create_verified_directory",
+            "_create_fresh_verified_directory",
+            "_bootstrap_task_root",
+            "subprocess",
         ):
-            plan = helper.build_bootstrap_plan(**target)
-
-            def reparse_worktree_parent(
-                path: Path,
-                *,
-                missing_ok: bool = False,
-            ) -> bool:
-                return path == project_root / "worktrees"
-
-            with mock.patch.object(
-                helper,
-                "_path_has_reparse_point",
-                side_effect=reparse_worktree_parent,
-            ):
-                with self.assertRaises(ValueError):
-                    helper.apply_bootstrap_plan(
-                        plan,
-                        runner=lambda argv, *, check, env: calls.append(
-                            (argv, check, env)
-                        ),
-                        probe_runner=lambda argv, *, check, env: None,
-                    )
-
-        self.assertEqual([], calls)
-
-    def test_bootstrap_apply_pins_root_bound_directories_through_runner(self) -> None:
-        helper = load_efficiency()
-        configured_root = self.fast_lane_task_root
-        project = "pinned-project"
-        project_root = configured_root / project
-        target = self.bootstrap_kwargs()
-        target.update(
-            {
-                "project": project,
-                "worktree": project_root / "worktrees" / "atlas12b-team-efficiency",
-                "temp_target": project_root / "tasks" / "atlas12b",
-            }
-        )
-        pinned: list[tuple[Path, str]] = []
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-
-        def pin(path: Path, field: str) -> None:
-            pinned.append((path, field))
-            return None
-
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            pinned_paths = {path for path, _field in pinned}
-            self.assertIn(configured_root, pinned_paths)
-            self.assertIn(project_root, pinned_paths)
-            self.assertIn(Path(plan["temp_target"]).parent, pinned_paths)
-            self.assertIn(Path(plan["temp_target"]), pinned_paths)
-            self.assertIn(project_root / "worktrees", pinned_paths)
-            self.assertIn(
-                project_root / "worktrees" / "atlas12b-team-efficiency",
-                pinned_paths,
-            )
-            self.assertTrue(
-                (project_root / "worktrees" / "atlas12b-team-efficiency").is_dir()
-            )
-            self.assertEqual(
-                [],
-                list(
-                    (project_root / "worktrees" / "atlas12b-team-efficiency").iterdir()
-                ),
-            )
-            calls.append((argv, check, env))
-
-        with mock.patch.dict(
-            os.environ,
-            {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
-        ):
-            plan = helper.build_bootstrap_plan(**target)
-            with mock.patch.object(
-                helper,
-                "_pin_windows_directory",
-                side_effect=pin,
-            ):
-                helper.apply_bootstrap_plan(
-                    plan,
-                    runner=runner,
-                    probe_runner=lambda argv, *, check, env: None,
-                )
-
-        self.assertEqual(1, len(calls))
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(helper, name))
 
     def test_bootstrap_is_portable_to_any_compliant_codex_project_root(self) -> None:
         helper = load_efficiency()
@@ -6016,48 +6425,32 @@ class TeamEfficiencyTests(unittest.TestCase):
             Path(plan["temp_target"]).parent,
         )
 
-    def test_bootstrap_apply_uses_the_validated_argument_vector_only(self) -> None:
+    def test_bootstrap_plan_validation_retains_the_canonical_argument_vector(
+        self,
+    ) -> None:
         helper = load_efficiency()
         apply_target = self.bootstrap_kwargs()
         apply_target["worktree"] = self.fast_lane_task_root / "apply-worktree"
         plan = helper.build_bootstrap_plan(**apply_target)
-        calls: list[tuple[list[str], bool, dict[str, str]]] = []
-        probes: list[tuple[list[str], bool, dict[str, str]]] = []
+        validated = helper._validated_bootstrap_plan(plan)
 
-        def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            calls.append((argv, check, env))
-
-        def probe_runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            probes.append((argv, check, env))
-
-        applied = helper.apply_bootstrap_plan(
-            plan,
-            runner=runner,
-            probe_runner=probe_runner,
-        )
-
-        self.assertEqual("applied", applied["mode"])
-        self.assertEqual([(plan["command_argv"], True, calls[0][2])], calls)
+        self.assertEqual(plan, validated)
         self.assertEqual(
             [
-                ["git", "-C", str(self.repo), "rev-parse", "--git-dir"],
-                [
-                    "git",
-                    "-C",
-                    str(self.repo),
-                    "rev-parse",
-                    "--verify",
-                    f"{'a' * 40}^{{commit}}",
-                ],
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "add",
+                "-b",
+                "feature/code-atlas-v1-team-efficiency",
+                str(apply_target["worktree"]),
+                "a" * 40,
             ],
-            [argv for argv, _check, _env in probes],
+            validated["command_argv"],
         )
-        for environment in [calls[0][2], *(env for _argv, _check, env in probes)]:
-            for name in ("TEMP", "TMP", "TMPDIR", "CODEX_TASK_TEMP"):
-                self.assertEqual(str(plan["temp_target"]), environment[name])
-        self.assertTrue(Path(plan["temp_target"]).is_dir())
 
-    def test_bootstrap_apply_stops_before_worktree_add_when_preflight_fails(
+    def test_bootstrap_apply_stops_before_any_probe_or_worktree_runner(
         self,
     ) -> None:
         helper = load_efficiency()
@@ -6066,22 +6459,24 @@ class TeamEfficiencyTests(unittest.TestCase):
         plan = helper.build_bootstrap_plan(**apply_target)
         applied: list[list[str]] = []
 
-        def failed_probe(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
-            raise subprocess.CalledProcessError(1, argv)
+        def forbidden_probe(*_arguments: object, **_kwargs: object) -> None:
+            raise AssertionError("public apply must not invoke a Git probe")
 
         def runner(argv: list[str], *, check: bool, env: dict[str, str]) -> None:
             applied.append(argv)
 
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaisesRegex(
+            ValueError, "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE"
+        ):
             helper.apply_bootstrap_plan(
                 plan,
                 runner=runner,
-                probe_runner=failed_probe,
+                probe_runner=forbidden_probe,
             )
 
         self.assertEqual([], applied)
 
-    def test_bootstrap_rejects_traversal_and_existing_target_before_apply(self) -> None:
+    def test_bootstrap_rejects_traversal_and_apply_stays_unavailable(self) -> None:
         helper = load_efficiency()
         unsafe_branch = self.bootstrap_kwargs()
         unsafe_branch["branch"] = "feature/../escape"
@@ -6103,8 +6498,13 @@ class TeamEfficiencyTests(unittest.TestCase):
         plan = helper.build_bootstrap_plan(**existing_target)
         target = Path(plan["worktree"])
         target.mkdir(parents=True, exist_ok=True)
-        with self.assertRaises(ValueError):
-            helper.apply_bootstrap_plan(plan, runner=lambda *_args, **_kwargs: None)
+        with self.assertRaisesRegex(
+            ValueError, "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE"
+        ):
+            helper.apply_bootstrap_plan(
+                plan,
+                runner=lambda *_args, **_kwargs: None,
+            )
 
     def test_resume_packet_is_canonical_bounded_and_secret_safe(self) -> None:
         helper = load_efficiency()
@@ -7299,6 +7699,181 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual([], plan["units"])
         self.assertEqual([], plan["waves"])
 
+    def test_cli_bootstrap_apply_fails_closed_before_worktree_mutation(self) -> None:
+        """A public CLI flag must not reach the bootstrap worktree mutation."""
+
+        helper = load_efficiency()
+        target = self.bootstrap_kwargs()
+        apply_calls: list[dict[str, object]] = []
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        def mutation_probe(plan: object, **_kwargs: object) -> dict[str, str]:
+            apply_calls.append(dict(plan))
+            return {"mode": "applied"}
+
+        with (
+            mock.patch.object(
+                helper,
+                "apply_bootstrap_plan",
+                side_effect=mutation_probe,
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            exit_code = helper.main(
+                [
+                    "bootstrap",
+                    "--task-id",
+                    str(target["task_id"]),
+                    "--base-commit",
+                    str(target["base_commit"]),
+                    "--branch",
+                    str(target["branch"]),
+                    "--write-scope",
+                    str(target["write_scope"][0]),
+                    "--repo",
+                    str(target["repo"]),
+                    "--project",
+                    str(target["project"]),
+                    "--worktree",
+                    str(target["worktree"]),
+                    "--temp-target",
+                    str(target["temp_target"]),
+                    "--apply",
+                ]
+            )
+
+        self.assertEqual(
+            [],
+            apply_calls,
+            "the probe represents the pre-git-worktree-add mutation boundary",
+        )
+        self.assertEqual(2, exit_code)
+        self.assertEqual("", output.getvalue())
+        self.assertEqual(
+            "error: NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE\n",
+            errors.getvalue(),
+        )
+
+    def test_public_apply_bootstrap_plan_fails_closed_before_worktree_mutation(
+        self,
+    ) -> None:
+        """The import-callable helper cannot treat a caller plan as authority."""
+
+        helper = load_efficiency()
+        worktree_add_calls: list[list[str]] = []
+        observed_error: ValueError | None = None
+
+        with tempfile.TemporaryDirectory(dir=r"D:\bun\tmp\codex") as temporary_root:
+            configured_root = Path(temporary_root)
+            project = "direct-apply-project"
+            project_root = configured_root / project
+            target = self.bootstrap_kwargs()
+            target.update(
+                {
+                    "project": project,
+                    "worktree": project_root / "worktrees" / "direct-apply",
+                    "temp_target": project_root / "tasks" / "direct-apply",
+                }
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_FASTLANE_TASK_ROOT": str(configured_root)},
+            ):
+                plan = helper.build_bootstrap_plan(**target)
+                try:
+                    helper.apply_bootstrap_plan(
+                        plan,
+                        runner=lambda argv, *, check, env: worktree_add_calls.append(
+                            argv
+                        ),
+                        probe_runner=lambda _argv, *, check, env: None,
+                    )
+                except ValueError as error:
+                    observed_error = error
+
+        self.assertEqual(
+            [],
+            worktree_add_calls,
+            "the fake runner represents the git worktree add mutation boundary",
+        )
+        self.assertIsNotNone(observed_error)
+        self.assertEqual(
+            "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE",
+            str(observed_error),
+        )
+
+    def test_provider_override_and_closure_forgery_cannot_reach_worktree_runner(
+        self,
+    ) -> None:
+        """No provider symbol or in-repo executor can revive bootstrap apply."""
+
+        helper = load_efficiency()
+        plan = helper.build_bootstrap_plan(**self.bootstrap_kwargs())
+        worktree_add_calls: list[list[str]] = []
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE",
+        ):
+            helper.apply_bootstrap_plan(
+                plan,
+                runner=lambda argv, *, check, env: worktree_add_calls.append(argv),
+                probe_runner=lambda _argv, *, check, env: None,
+            )
+
+        self.assertEqual([], worktree_add_calls)
+        for name in (
+            "_ProjectAuthorityProvider",
+            "_project_authority_provider",
+            "_live_project_authority",
+            "_project_authority_preflight",
+            "_seal_bootstrap_execution_capability",
+            "_validated_sealed_bootstrap_plan",
+            "_apply_bootstrap_plan_after_authority",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(helper, name))
+
+    def test_cli_bootstrap_plan_only_remains_non_mutating(self) -> None:
+        helper = load_efficiency()
+        target = self.bootstrap_kwargs()
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(
+                helper,
+                "apply_bootstrap_plan",
+                side_effect=AssertionError("plan-only CLI must not apply"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = helper.main(
+                [
+                    "bootstrap",
+                    "--task-id",
+                    str(target["task_id"]),
+                    "--base-commit",
+                    str(target["base_commit"]),
+                    "--branch",
+                    str(target["branch"]),
+                    "--write-scope",
+                    str(target["write_scope"][0]),
+                    "--repo",
+                    str(target["repo"]),
+                    "--project",
+                    str(target["project"]),
+                    "--worktree",
+                    str(target["worktree"]),
+                    "--temp-target",
+                    str(target["temp_target"]),
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("dry_run", json.loads(output.getvalue())["mode"])
+
     def test_cli_canonicalizes_resume_packet_and_skill_links_the_reference(
         self,
     ) -> None:
@@ -7307,7 +7882,14 @@ class TeamEfficiencyTests(unittest.TestCase):
         packet_path.write_text(json.dumps(self.resume_packet()), encoding="utf-8")
         output = io.StringIO()
 
-        with contextlib.redirect_stdout(output):
+        with (
+            mock.patch.object(
+                helper,
+                "apply_bootstrap_plan",
+                side_effect=AssertionError("resume CLI must not apply bootstrap"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
             exit_code = helper.main(["resume-packet", "--input", str(packet_path)])
 
         self.assertEqual(0, exit_code)
@@ -7349,7 +7931,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         self.assert_fast_lane_index_evidence_fail_closed(legacy)
 
-        enforced = helper.compile_fast_lane(
+        enforced = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=host_status,
@@ -7410,14 +7993,12 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertEqual("", errors)
         result = json.loads(output)
-        self.assertEqual(
-            "usage_unknown", result["refill_plan"]["quota_balance"]["status"]
-        )
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
         self.assertFalse(
             any(item["action"] == "start" for item in result["assignments"])
         )
 
-    def test_fast_lane_live_quota_source_failure_is_fail_closed(self) -> None:
+    def test_fast_lane_live_quota_input_cannot_bypass_authority_boundary(self) -> None:
         helper = load_efficiency()
         request = self.fast_lane_schedule_request(helper)
         host_status = self.fast_lane_host_status(helper, request)
@@ -7446,29 +8027,35 @@ class TeamEfficiencyTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        exit_code, output, errors = self.run_fast_lane_cli(
+        with mock.patch.object(
             helper,
-            [
-                "fast-lane",
-                "--input",
-                str(request_path),
-                "--host-status",
-                str(host_status_path),
-                "--quota-input",
-                str(quota_path),
-                "--live-quota",
-                "--codex-executable",
-                str(self.temp / "missing-codex"),
-                "--reasoning-effort",
-                "ultra",
-            ],
-        )
+            "_codex_account_quota_module",
+            side_effect=AssertionError("inert CLI must not open the quota provider"),
+        ):
+            exit_code, output, errors = self.run_fast_lane_cli(
+                helper,
+                [
+                    "fast-lane",
+                    "--input",
+                    str(request_path),
+                    "--host-status",
+                    str(host_status_path),
+                    "--quota-input",
+                    str(quota_path),
+                    "--live-quota",
+                    "--codex-executable",
+                    str(self.temp / "missing-codex"),
+                    "--reasoning-effort",
+                    "ultra",
+                ],
+            )
 
         self.assertEqual(0, exit_code)
-        self.assertIn("quota source unavailable", errors)
+        self.assertEqual("", errors)
         result = json.loads(output)
+        self.assertEqual("NO_SAFE_WORK", result["decision_code"])
         self.assertEqual(
-            "usage_unknown", result["refill_plan"]["quota_balance"]["status"]
+            "PROJECT_AUTHORITY_UNAVAILABLE", result["idle_slots"][0]["reason_code"]
         )
         self.assertFalse(
             any(item["action"] == "start" for item in result["assignments"])
@@ -7897,7 +8484,8 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         foreign_host = copy.deepcopy(host_status)
         foreign_host["routing_context"]["routes"].pop()
-        foreign = helper.compile_fast_lane(
+        foreign = self.compile_fast_lane(
+            helper,
             request,
             reasoning_effort="ultra",
             host_status=foreign_host,
