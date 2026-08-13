@@ -664,7 +664,6 @@ def test_builder_rejects_junction_or_symlink_escape(tmp_path: Path) -> None:
     if os.name == "nt":
         created = subprocess.run(
             ["cmd", "/d", "/c", "mklink", "/J", str(link), str(outside)],
-            text=True,
             capture_output=True,
             check=False,
         )
