@@ -7023,8 +7023,10 @@ class SQLiteStore:
                     ),
                 )
 
-    @staticmethod
-    def _migrate_atlas_outbox_ingestion_key_not_null(cursor: sqlite3.Cursor) -> None:
+    @classmethod
+    def _migrate_atlas_outbox_ingestion_key_not_null(
+        cls, cursor: sqlite3.Cursor
+    ) -> None:
         """Rebuild the legacy outbox because SQLite cannot alter a primary key nullability."""
 
         try:
@@ -7159,6 +7161,9 @@ class SQLiteStore:
                 FROM atlas_ingestion_outbox
                 """
             )
+            cls._drop_atlas_finalization_projection_trigger_for_outbox_rebuild(
+                cursor
+            )
             cursor.execute("DROP TABLE atlas_ingestion_outbox")
             cursor.execute(
                 "ALTER TABLE atlas_ingestion_outbox_v11 RENAME TO atlas_ingestion_outbox"
@@ -7169,10 +7174,65 @@ class SQLiteStore:
                     ON atlas_ingestion_outbox(state, created_at, ingestion_key)
                 """
             )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX idx_atlas_outbox_finalization_identity
+                    ON atlas_ingestion_outbox(
+                        acceptance_id, ingestion_key, payload_hash
+                    )
+                """
+            )
+            cls._restore_atlas_finalization_projection_trigger_after_outbox_rebuild(
+                cursor
+            )
         except sqlite3.IntegrityError as error:
             raise StoreError("legacy atlas outbox row is invalid") from error
         except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
+
+    @staticmethod
+    def _drop_atlas_finalization_projection_trigger_for_outbox_rebuild(
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Remove only the verified projection guard while its outbox is rebuilt."""
+
+        trigger_name = "atlas_finalizations_require_projected_outbox"
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()
+        expected_tokens = _atlas_finalization_trigger_tokens()[trigger_name]
+        if row is None or type(row["sql"]) is not str:
+            raise StoreError("orchestrator store is not prepared")
+        if _sqlite_schema_tokens(str(row["sql"])) != expected_tokens:
+            raise StoreError("orchestrator store is not prepared")
+        cursor.execute(f"DROP TRIGGER {trigger_name}")
+
+    @staticmethod
+    def _restore_atlas_finalization_projection_trigger_after_outbox_rebuild(
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Restore the canonical O v13 projected-outbox guard after the swap."""
+
+        _execute_schema_statements(
+            cursor,
+            """
+            CREATE TRIGGER atlas_finalizations_require_projected_outbox
+            BEFORE INSERT ON atlas_finalizations
+            WHEN NOT EXISTS (
+                SELECT 1 FROM atlas_ingestion_outbox AS outbox
+                WHERE outbox.acceptance_id = NEW.acceptance_id
+                  AND outbox.ingestion_key = NEW.ingestion_key
+                  AND outbox.payload_hash = NEW.payload_hash
+                  AND outbox.state = 'projected'
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'atlas finalization requires projected exact outbox'
+                );
+            END;
+            """,
+        )
 
     def _create_schema(self) -> None:
         with self._transaction() as cursor:

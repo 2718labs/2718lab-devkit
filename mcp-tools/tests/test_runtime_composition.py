@@ -247,7 +247,7 @@ def test_runtime_config_rejects_reparse_scratch(
     assert caught.value.code == "DATA_ROOT_INVALID"
 
 
-def test_explicit_bootstrap_is_idempotent_and_prepares_wal_stores(
+def test_explicit_bootstrap_is_idempotent_and_prepares_expected_journal_stores(
     tmp_path: Path,
 ) -> None:
     data_root = tmp_path / "data"
@@ -285,9 +285,15 @@ def test_explicit_bootstrap_is_idempotent_and_prepares_wal_stores(
     assert len(first_key) == 32
     assert prepared_registry == [config.relay_proof_registry_database]
 
-    for database in databases[:-1]:
+    expected_journal_modes = {
+        config.orchestrator_database: "delete",
+        config.project_index_database: "wal",
+        config.atlas_database: "wal",
+        config.relay_database: "wal",
+    }
+    for database, expected_mode in expected_journal_modes.items():
         with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as conn:
-            assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+            assert conn.execute("PRAGMA journal_mode").fetchone() == (expected_mode,)
 
     RuntimeBootstrap.run(config, proof_registry_bootstrap=prepare_proof_registry)
     assert config.relay_capability_key.read_bytes() == first_key
@@ -1148,16 +1154,27 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
 
     store = SQLiteStore(database)
     try:
-        assert store.schema_version() == 12
+        connection = store._connection
+        assert connection is not None
+        assert store.schema_version() == 13
         columns = {
             str(row["name"]): int(row["notnull"])
-            for row in store._connection.execute(
-                "PRAGMA table_info(atlas_ingestion_outbox)"
-            )
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
         }
         assert columns["ingestion_key"] == 1
+        projection_guard = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'atlas_finalizations_require_projected_outbox' "
+            "AND tbl_name = 'atlas_finalizations'"
+        ).fetchone()
+        assert projection_guard is not None and projection_guard[0] == 1
+        finalization_identity = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_atlas_outbox_finalization_identity'"
+        ).fetchone()
+        assert finalization_identity is not None and finalization_identity[0] == 1
         assert tuple(
-            store._connection.execute(
+            connection.execute(
                 """
                 SELECT ingestion_key, acceptance_id, payload_hash, state, attempt_count
                 FROM atlas_ingestion_outbox
@@ -1172,13 +1189,13 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
         )
 
         next_acceptance_id, _ = _insert_legacy_atlas_acceptance(
-            store._connection, suffix="b"
+            connection, suffix="b"
         )
         with pytest.raises(
             sqlite3.IntegrityError,
             match="NOT NULL constraint failed: atlas_ingestion_outbox.ingestion_key",
         ):
-            store._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO atlas_ingestion_outbox (
                     ingestion_key, acceptance_id, payload_json, payload_hash, state,
@@ -1198,7 +1215,7 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
                     timestamp,
                 ),
             )
-        assert store._connection.execute(
+        assert connection.execute(
             "SELECT COUNT(*) FROM atlas_ingestion_outbox"
         ).fetchone()[0] == 1
     finally:
@@ -1219,6 +1236,49 @@ def test_sqlite_store_fails_closed_for_legacy_null_outbox_key(tmp_path: Path) ->
         assert connection.execute(
             "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
         ).fetchone()[0] == "10"
+    finally:
+        connection.close()
+
+
+def test_sqlite_store_fails_closed_for_noncanonical_finalization_guard_during_v10_outbox_rebuild(
+    tmp_path: Path,
+) -> None:
+    ingestion_key = f"sha256:{'a' * 64}"
+    database, _, _ = _legacy_v10_atlas_outbox_database(
+        tmp_path,
+        ingestion_key=ingestion_key,
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "DROP TRIGGER atlas_finalizations_require_projected_outbox"
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER atlas_finalizations_require_projected_outbox
+            BEFORE INSERT ON atlas_finalizations
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("10",)
+        columns = {
+            str(row[1]): int(row[3])
+            for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
+        }
+        assert columns["ingestion_key"] == 0
     finally:
         connection.close()
 
@@ -1583,13 +1643,13 @@ def test_sqlite_store_migrates_trustworthy_legacy_schema_metadata(
             for row in store._connection.execute("PRAGMA table_info(schema_metadata)")
         }
         assert columns["key"] == 1
-        assert store.schema_version() == 12
+        assert store.schema_version() == 13
         assert tuple(
             tuple(row)
             for row in store._connection.execute(
                 "SELECT key, value FROM schema_metadata"
             )
-        ) == (("schema_version", "12"),)
+        ) == (("schema_version", "13"),)
     finally:
         store.close()
 
@@ -1662,8 +1722,8 @@ def _runtime_with_strict_schema_metadata_rows(
             (("schema_version", "11"),),
         ),
         (
-            (("schema_version", "13"),),
-            (("schema_version", "13"),),
+            (("schema_version", "14"),),
+            (("schema_version", "14"),),
         ),
         ((), ()),
         (
