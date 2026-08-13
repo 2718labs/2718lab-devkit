@@ -688,20 +688,18 @@ class TeamEfficiencyTests(unittest.TestCase):
             },
         }
 
-    def project_binding(self, helper, *, project_id: str | None = None) -> dict[str, object]:
+    def project_binding(
+        self, helper, *, project_id: str | None = None
+    ) -> dict[str, object]:
         logical_project = self.project if project_id is None else project_id
         return {
             "project_id": hashlib.sha256(
                 f"team-efficiency/project-fence-project-id/v1\0{logical_project}".encode()
             ).hexdigest(),
-            "binding_digest": helper._sha256_json(
-                {"project_id": logical_project}
-            ),
+            "binding_digest": helper._sha256_json({"project_id": logical_project}),
             "binding_version": 1,
             "workspace_id": helper._sha256_json({"workspace": self.project}),
-            "input_snapshot_id": helper._sha256_json(
-                {"input_snapshot": self.project}
-            ),
+            "input_snapshot_id": helper._sha256_json({"input_snapshot": self.project}),
         }
 
     def project_bound_work_package(
@@ -2116,7 +2114,9 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["status"])
         self.assertEqual("NO_SAFE_WORK", result["decision_code"])
-        self.assertEqual("LEGACY_PROJECT_UNBOUND", result["idle_slots"][0]["reason_code"])
+        self.assertEqual(
+            "LEGACY_PROJECT_UNBOUND", result["idle_slots"][0]["reason_code"]
+        )
         self.assertEqual([], result["assignments"])
 
     def test_fast_lane_v2_without_live_authority_is_inert(self) -> None:
@@ -2180,9 +2180,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual([], result["review_queue"])
         self.assertEqual([], result["prewarm_queue"])
         self.assertEqual([], result["design_queue"])
-        self.assertEqual(
-            [], result["cross_session_dispatch_projection"]["assignments"]
-        )
+        self.assertEqual([], result["cross_session_dispatch_projection"]["assignments"])
         self.assertFalse(hasattr(helper, "_project_authority_provider"))
         self.assertFalse(hasattr(helper, "_live_project_authority"))
         self.assertFalse(hasattr(helper, "_ProjectAuthorityProvider"))
@@ -2214,7 +2212,9 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["status"])
         self.assertEqual("NO_SAFE_WORK", result["decision_code"])
-        self.assertEqual("PROJECT_AUTHORITY_UNAVAILABLE", result["idle_slots"][0]["reason_code"])
+        self.assertEqual(
+            "PROJECT_AUTHORITY_UNAVAILABLE", result["idle_slots"][0]["reason_code"]
+        )
         self.assertEqual([], result["assignments"])
         self.assertIn("project_authority", helper.decompose(request["work_package"]))
 
@@ -2277,7 +2277,9 @@ class TeamEfficiencyTests(unittest.TestCase):
             mock.patch.object(
                 helper,
                 "_fast_lane_apply_index_evidence",
-                side_effect=AssertionError("invalid binding must not bind index evidence"),
+                side_effect=AssertionError(
+                    "invalid binding must not bind index evidence"
+                ),
             ),
         ):
             inner_result = helper.compile_fast_lane(
@@ -2354,9 +2356,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual([], result["review_queue"])
         self.assertEqual([], result["prewarm_queue"])
         self.assertEqual([], result["design_queue"])
-        self.assertEqual(
-            [], result["cross_session_dispatch_projection"]["assignments"]
-        )
+        self.assertEqual([], result["cross_session_dispatch_projection"]["assignments"])
 
     def test_fast_lane_v2_rejects_copy_and_binding_tampering_before_assignment(
         self,
@@ -2370,9 +2370,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         package = request["work_package"]
 
         workspace_tampered = copy.deepcopy(package)
-        workspace_tampered["workspace_id"] = helper._sha256_json(
-            {"workspace": "other"}
-        )
+        workspace_tampered["workspace_id"] = helper._sha256_json({"workspace": "other"})
         snapshot_tampered = copy.deepcopy(package)
         snapshot_tampered["input_snapshot_id"] = helper._sha256_json(
             {"snapshot": "other"}
@@ -2476,9 +2474,7 @@ class TeamEfficiencyTests(unittest.TestCase):
     ) -> None:
         helper = load_efficiency()
         request = self.fast_lane_schedule_request(helper)
-        request["execution_contexts"][0]["bootstrap_plan"]["project"] = (
-            "other-project"
-        )
+        request["execution_contexts"][0]["bootstrap_plan"]["project"] = "other-project"
 
         result = helper.compile_fast_lane(request, reasoning_effort="ultra")
 

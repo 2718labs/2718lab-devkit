@@ -893,7 +893,9 @@ def _validated_work_package_v2(value: object) -> dict[str, Any]:
     )
     if _sha256_json(payload) != package_payload_hash:
         raise ValueError("work-package v2 package_payload_hash does not match payload")
-    fence = _validated_project_fence(source["project_fence"], "work-package v2 project_fence")
+    fence = _validated_project_fence(
+        source["project_fence"], "work-package v2 project_fence"
+    )
     return {
         "package": payload,
         "package_payload_hash": package_payload_hash,
@@ -906,7 +908,7 @@ def _validated_work_package_v2(value: object) -> dict[str, Any]:
                 source["input_snapshot_id"], "work-package v2 input_snapshot_id"
             ),
         },
-}
+    }
 
 
 def _project_execution_block_details(
