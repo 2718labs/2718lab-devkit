@@ -15,9 +15,13 @@ from typing import Any
 _AUTHORITY_DOMAIN = "2718lab/project-authority/v1"
 _RECEIPT_SCHEMA = "2718lab/project-authority-receipt/v1"
 _BINDING_SCHEME = "os-stat-directory-v1"
+_PROJECT_FENCE_DOMAIN = "2718lab/project-fence/v1"
+_PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
+_PROJECT_FENCE_BINDING_VERSION = 1
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 _CONSTRUCTION_TOKEN = object()
 _PROVIDER_CONSTRUCTION_TOKEN = object()
+_FENCE_CONSTRUCTION_TOKEN = object()
 
 
 class ProjectAuthorityError(RuntimeError):
@@ -99,6 +103,43 @@ class ProjectAuthorityReceipt:
 
 
 @dataclass(frozen=True, init=False)
+class ProjectFence:
+    """Canonical project-binding value, not a host-attested capability.
+
+    It is available only from a revalidated ``ProjectAuthority`` and has no
+    JSON or project-root construction API.  A trusted external host must still
+    decide which authority receipt may be reopened or used at runtime.
+    """
+
+    binding_digest: str
+    binding_version: int
+    project_id: str
+    schema: str
+
+    def __init__(
+        self,
+        *,
+        schema: str,
+        project_id: str,
+        binding_digest: str,
+        binding_version: int,
+        _token: object,
+    ) -> None:
+        if _token is not _FENCE_CONSTRUCTION_TOKEN:
+            raise TypeError("ProjectFence must be derived from ProjectAuthority")
+        _validate_project_fence_fields(
+            schema=schema,
+            project_id=project_id,
+            binding_digest=binding_digest,
+            binding_version=binding_version,
+        )
+        object.__setattr__(self, "schema", schema)
+        object.__setattr__(self, "project_id", project_id)
+        object.__setattr__(self, "binding_digest", binding_digest)
+        object.__setattr__(self, "binding_version", binding_version)
+
+
+@dataclass(frozen=True, init=False)
 class ProjectAuthority:
     """Validated identity value; alone it is not a runtime trust capability."""
 
@@ -151,6 +192,11 @@ class ProjectAuthority:
         _validate_receipt(self.receipt)
         if _stable_physical_binding(self.project_root) != self.receipt.physical_binding:
             raise ProjectAuthorityError("PROJECT_AUTHORITY_MISMATCH")
+
+    def project_fence(self) -> ProjectFence:
+        """Revalidate this authority and derive its canonical project fence."""
+
+        return _derive_project_fence(self)
 
 
 @dataclass(frozen=True, init=False)
@@ -211,6 +257,28 @@ def _derive_project_id(nonce: str, binding: ProjectPhysicalBinding) -> str:
     return hashlib.sha256(_canonical_json(material).encode("ascii")).hexdigest()
 
 
+def _derive_project_fence(authority: ProjectAuthority) -> ProjectFence:
+    authority.revalidate()
+    receipt = authority.receipt
+    material = {
+        "authority_nonce": receipt.authority_nonce,
+        "binding_version": _PROJECT_FENCE_BINDING_VERSION,
+        "domain": _PROJECT_FENCE_DOMAIN,
+        "physical_binding": receipt.physical_binding._identity_payload(),
+        "project_id": receipt.project_id,
+    }
+    binding_digest = hashlib.sha256(
+        _canonical_json(material).encode("ascii")
+    ).hexdigest()
+    return ProjectFence(
+        schema=_PROJECT_FENCE_SCHEMA,
+        project_id=receipt.project_id,
+        binding_digest=binding_digest,
+        binding_version=_PROJECT_FENCE_BINDING_VERSION,
+        _token=_FENCE_CONSTRUCTION_TOKEN,
+    )
+
+
 def _validate_receipt(receipt: ProjectAuthorityReceipt) -> None:
     if (
         type(receipt) is not ProjectAuthorityReceipt
@@ -227,6 +295,26 @@ def _validate_receipt(receipt: ProjectAuthorityReceipt) -> None:
         != _derive_project_id(receipt.authority_nonce, receipt.physical_binding)
     ):
         raise ProjectAuthorityError("PROJECT_AUTHORITY_RECEIPT_INVALID")
+
+
+def _validate_project_fence_fields(
+    *,
+    schema: str,
+    project_id: str,
+    binding_digest: str,
+    binding_version: int,
+) -> None:
+    if (
+        type(schema) is not str
+        or schema != _PROJECT_FENCE_SCHEMA
+        or type(project_id) is not str
+        or _SHA256_HEX.fullmatch(project_id) is None
+        or type(binding_digest) is not str
+        or _SHA256_HEX.fullmatch(binding_digest) is None
+        or type(binding_version) is not int
+        or binding_version != _PROJECT_FENCE_BINDING_VERSION
+    ):
+        raise ProjectAuthorityError("PROJECT_FENCE_INVALID")
 
 
 def _receipt_string(payload: dict[str, Any], name: str) -> str:

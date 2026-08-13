@@ -16,6 +16,7 @@ from devkit_runtime.project_authority import (
     ProjectAuthority,
     ProjectAuthorityError,
     ProjectAuthorityReceipt,
+    ProjectFence,
     ProjectPhysicalBinding,
     RuntimeProjectAuthorityProvider,
 )
@@ -71,6 +72,117 @@ def test_authority_receipt_reopens_same_physical_project_with_same_identity(
     assert reopened_config.data_root == issued_config.data_root
     assert reopened.project_id == hashlib.sha256(canonical).hexdigest()
     assert persisted == issued.receipt.to_json()
+
+
+def test_project_fence_is_canonical_and_deterministic_across_reopen(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+
+    issued = ProjectAuthority.issue(project_root)
+    reopened = ProjectAuthority.reopen(
+        project_root,
+        ProjectAuthorityReceipt.from_json(issued.receipt.to_json()),
+    )
+
+    issued_fence = issued.project_fence()
+    reopened_fence = reopened.project_fence()
+    expected_material = {
+        "authority_nonce": issued.receipt.authority_nonce,
+        "binding_version": 1,
+        "domain": "2718lab/project-fence/v1",
+        "physical_binding": {
+            "device_id": str(issued.receipt.physical_binding.device_id),
+            "file_id": str(issued.receipt.physical_binding.file_id),
+            "scheme": "os-stat-directory-v1",
+        },
+        "project_id": issued.project_id,
+    }
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            expected_material,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+
+    assert issued_fence == reopened_fence
+    assert issued_fence.schema == "team-efficiency/project-fence-v1"
+    assert issued_fence.project_id == issued.project_id
+    assert issued_fence.binding_digest == expected_digest
+    assert issued_fence.binding_version == 1
+    assert isinstance(issued_fence, ProjectFence)
+
+
+def test_project_fence_changes_when_authority_receipt_or_binding_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    nonces = iter(("01" * 32, "01" * 32, "02" * 32))
+    monkeypatch.setattr(
+        project_authority_module.secrets,
+        "token_hex",
+        lambda _: next(nonces),
+    )
+
+    same_binding_new_receipt = ProjectAuthority.issue(project_a)
+    different_binding_same_receipt_nonce = ProjectAuthority.issue(project_b)
+    replacement_receipt = ProjectAuthority.issue(project_a)
+
+    assert (
+        same_binding_new_receipt.project_fence()
+        != replacement_receipt.project_fence()
+    )
+    assert (
+        same_binding_new_receipt.project_fence()
+        != different_binding_same_receipt_nonce.project_fence()
+    )
+
+
+def test_project_fence_revalidates_authority_and_is_not_a_runtime_provider(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    original_root = tmp_path / "original-project"
+    scratch_root = tmp_path / "scratch"
+    project_root.mkdir()
+    scratch_root.mkdir()
+    authority = ProjectAuthority.issue(project_root)
+    fence = authority.project_fence()
+    project_root.rename(original_root)
+    project_root.mkdir()
+
+    with pytest.raises(ProjectAuthorityError) as revalidated:
+        authority.project_fence()
+    assert revalidated.value.code == "PROJECT_AUTHORITY_MISMATCH"
+
+    with pytest.raises(RuntimeConfigError) as provider:
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "plugin-data"),
+                "CODEX_TASK_TEMP": str(scratch_root),
+            },
+            authority_provider=fence,  # type: ignore[arg-type]
+        )
+    assert provider.value.code == "PROJECT_AUTHORITY_PROVIDER_INVALID"
+
+
+def test_project_fence_has_no_caller_construction_or_json_rehydration_api() -> None:
+    with pytest.raises(TypeError):
+        ProjectFence(
+            schema="team-efficiency/project-fence-v1",
+            project_id="01" * 32,
+            binding_digest="02" * 32,
+            binding_version=1,
+        )
+
+    assert not hasattr(ProjectFence, "from_json")
+    assert not hasattr(ProjectFence, "from_project_root")
 
 
 def test_authority_cannot_be_issued_without_an_existing_directory(
