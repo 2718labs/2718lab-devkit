@@ -1,15 +1,17 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — MCP-only v1.0.0
+# 2718lab DevKit — Codex + MCP v1.0.0
 
 [![version](https://img.shields.io/badge/version-v1.0.0-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-2718lab DevKit is a local, stdio-only MCP server for bounded project indexing,
-Atlas evidence, Relay lifecycle coordination, and deterministic Fast Lane
-planning. This repository carries the versioned v1.0.0 package. The
-checked-in manifest and allowlist define the public package surface; the install,
-build, and verification sections below describe the supported workflow.
+2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
+runtime for bounded project indexing, Atlas evidence, Relay lifecycle
+coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
+of reference manuals. This repository carries the versioned v1.0.0 package.
+The checked-in manifest and allowlist define the executable runtime surface;
+the manual map, install, build, and verification sections below describe the
+supported workflow.
 
 The current release retains a deliberately fail-closed Fast Lane preview. The public compiler
 and CLI return `NO_SAFE_WORK` with zero assignments: they do not consume host
@@ -36,8 +38,11 @@ Desktop-host bridge contract; no such bridge is provided by this repository.
 - Relay validates explicit work packages and exposes lifecycle state. Python
   returns structured host actions; the Codex host remains responsible for
   worktree bootstrap and agent dispatch.
-- The primary package is MCP-only: it exposes exactly 17 tools, no MCP prompts,
-  no MCP resources, no static prompt agents, and no model runner.
+- The executable MCP runtime exposes exactly 17 tools, no MCP prompts, no MCP
+  resources, no static prompt agents, and no model runner.
+- The optional Codex Skill bundle is part of DevKit's documentation surface. It
+  provides short, module-specific manuals without becoming a second runtime or
+  an executable prompt/agent surface.
 - Fast Lane is a pure MCP runtime compiler. Its public surface is presently
   authority-inert and fail-closed: it emits no assignments and never spawns
   agents, edits Git, runs commands, or executes worktrees. Host/private quota
@@ -82,17 +87,20 @@ flowchart TD
 
 ## Codex manual map
 
-The local plugin includes an optional, documentation-only Codex manual bundle:
-one short navigator (`skills/devkit-overview`), one workflow-design manual
-(`skills/workflow-design`, default Fast Lane policy), and seven separate
-module manuals. A task loads only the manual it needs:
+DevKit deliberately has two separate surfaces: the MCP runtime performs
+bounded tool work, while the local plugin includes an optional,
+documentation-only Codex manual bundle. The bundle has one short navigator
+(`skills/devkit-overview`), one workflow-design manual (`skills/workflow-design`,
+default Fast Lane policy), and six separate module manuals. A task loads only
+the manual it needs:
 
-`fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
+`fast-lane-routing` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`.
 
 These skills are reference manuals, not MCP tools or executable prompt surfaces.
 They contain no slash commands, agent profiles, starter templates, validators,
-or dispatch code; they are deliberately excluded from the MCP-only primary ZIP.
+or dispatch code. The lean runtime ZIP deliberately excludes them, but that
+packaging boundary does not make DevKit a runtime-only product.
 
 ## Documentation map
 
@@ -105,6 +113,8 @@ re-reading the whole repository:
 - [Work-package and task-card rules](mcp-tools/devkit_fastlane/references/work-packages.md)
 - [Orchestration runtime contract](mcp-tools/devkit_fastlane/references/orchestration-runtime.md)
 - [Team and lane patterns](mcp-tools/devkit_fastlane/references/team-patterns.md)
+- [Repository automation and review](docs/governance/repository-automation.md)
+- [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) · [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Historical design records](docs/superpowers/README.md) — context only; they can mention
   retired components and are not the current implementation contract.
 - [Release history](CHANGELOG.md)
@@ -167,13 +177,13 @@ tree. Choose an output directory outside the source tree:
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
-.codex-plugin/main-artifact-allowlist.json. Its public runtime remains
-MCP-only; the ZIP also carries the Fast Lane contract, required references and
-policy assets, the `team_efficiency.py` compatibility entry point, its routing
-and quota-balance modules, and the host-only official-account quota producer.
-It deliberately excludes the optional skill bundle, command helpers, hooks,
-CI files, host-private state, prompts, static agents, and arbitrary repository
-files.
+.codex-plugin/main-artifact-allowlist.json. Its executable runtime surface is
+the MCP server; the ZIP also carries the Fast Lane contract, required references
+and policy assets, the `team_efficiency.py` compatibility entry point, its
+routing and quota-balance modules, and the host-only official-account quota
+producer. It deliberately excludes the optional Skill manual bundle, command
+helpers, hooks, CI files, host-private state, prompts, static agents, and
+arbitrary repository files.
 
 Run Fast Lane through its executable entry point to inspect its fail-closed
 result:
@@ -284,9 +294,9 @@ freeze a transient regression count.
 
 This repository represents the versioned v1.0.0 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
-artifact allowlist, and locked dependency set. The maintainer-dispatched main
-release workflow publishes the matching GitHub Release only after the declared gates
-pass.
+artifact allowlist, and locked dependency set. A maintainer dispatches Release
+from current `main`; it validates all declared gates, creates the annotated tag,
+and publishes the matching GitHub Release. Pushing a tag alone does not publish.
 
 ## License
 

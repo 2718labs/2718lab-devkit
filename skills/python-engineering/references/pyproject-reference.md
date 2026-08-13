@@ -26,7 +26,7 @@ mytool = "my_tool.cli:main"
 
 **陷阱**:
 - `name` 含连字符时,顶层 `import` 语句必须用下划线版本(`my-tool` → `import my_tool`)。这是 PyPA 打包规范的规范化规则,不是 uv 特有行为。
-- `version` **不带 `v` 前缀**。注意这与 AstrBot `metadata.yaml` 里 `version: v1.0.0` 必须带 `v` 前缀的约定正好相反——两套生态的约定不要混用,写错一个都会导致对应工具链解析异常或过审失败。
+- `version` **不带 `v` 前缀**。仓库级发布 tag 可以使用 `v1.0.0` 前缀；不要把 tag 文本直接复制到 PEP 440 的项目版本字段。
 - `dependencies` 里的开发/测试专用工具(ruff、pyright、pytest 等)**不要**放在这里,放 `[dependency-groups]`(见第 2 节),否则最终用户 `pip install` 你的包时会被迫连带装上这些开发工具。
 
 来源:[PEP 621](https://peps.python.org/pep-0621/)、[packaging.python.org: pyproject.toml 规范](https://packaging.python.org/en/latest/specifications/pyproject-toml/)

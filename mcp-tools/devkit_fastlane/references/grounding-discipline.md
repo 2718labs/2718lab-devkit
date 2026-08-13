@@ -22,17 +22,16 @@
 - 写 `import` 语句时犹豫"这个包是不是叫这个名字"
 - 参数名/参数顺序是"大概是这样"、"应该是叫 xxx"式的猜测
 - 心里念叨"这个版本好像行为不一样,但记不清具体差异"
-- 想抄一个印象里"很像"的相邻框架的写法(例如把 NoneBot 的写法套到 AstrBot 上)
+- 想抄一个印象里"很像"的相邻框架的写法，而没有先核对当前项目的实际依赖
 - 写完一段后自己想"编译器/解释器会告诉我错在哪",准备先跑再说
 
 ## 3. 路由表:领域 → 该读的 sibling skill
 
 | 领域 | 读哪个 skill | 具体文件 |
 |---|---|---|
-| AstrBot 插件开发 | `astrbot-plugin-dev` | `references/api-reference.md`(API 签名)、`references/guidelines.md`(团队规范) |
 | MCP server 开发 | `mcp-server-dev` | `references/api-fastmcp-sdk.md`、`references/api-fastmcp-standalone.md`、`references/packaging-and-integration.md` |
 | 通用 Python 工程(代码质量/测试/打包) | `python-engineering` | `references/guidelines.md`(团队代码质量守则)、`references/toolchain-commands.md`(uv/ruff/pyright/pytest 命令速查)、`references/pyproject-reference.md`(打包与 [tool.*] 配置键) |
-| 开源仓库运营(许可证/版本/Release/CI/插件市场提交) | `oss-repo-ops` | `references/astrbot-market.md`(插件市场提交)、`references/release-workflow.md`(版本/tag/Release/CI)、`references/repo-hygiene.md`(README/LICENSE/CHANGELOG 卫生) |
+| 开源仓库运营(许可证/版本/Release/CI/审查自动化) | `oss-repo-ops` | `references/release-workflow.md`(版本/tag/Release/CI)、`references/repo-hygiene.md`(README/LICENSE/CHANGELOG 与自动化卫生) |
 
 路由表本身会过期(sibling runtime 增删文件),不确定时先读 `FASTLANE_CONTRACT.md` 顶部配套文件说明,以那里的实际列表为准。
 

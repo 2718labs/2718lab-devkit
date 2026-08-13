@@ -12,7 +12,6 @@ task, cache, project, or workflow state into another project.
 | --- | --- |
 | Fast Lane plan fields and host boundary | \`fast-lane-routing\` |
 | Workflow design (default Fast Lane policy) | \`workflow-design\` |
-| AstrBot | \`astrbot-plugin-dev\` |
 | Bugkiller | \`bugkiller\` |
 | Code Atlas | \`code-atlas\` |
 | Python MCP | \`mcp-server-dev\` |

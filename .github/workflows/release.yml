@@ -1,44 +1,80 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing v-prefixed tag to publish
+        description: New v-prefixed release tag to create from the current main commit
         required: true
         type: string
+      channel:
+        description: Release channel; prerelease requires a hyphenated version
+        required: true
+        default: prerelease
+        type: choice
+        options:
+          - prerelease
+          - production
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   metadata:
-    name: Validate release metadata
+    name: Validate main commit and release metadata
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.validate.outputs.tag }}
       version: ${{ steps.validate.outputs.version }}
       prerelease: ${{ steps.validate.outputs.prerelease }}
+      channel: ${{ steps.validate.outputs.channel }}
+      commit: ${{ steps.validate.outputs.commit }}
+      tag_state: ${{ steps.validate.outputs.tag_state }}
     steps:
-      - name: Check out tagged revision
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check out the selected main revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
 
-      - name: Validate tag, manifests, and changelog
+      - name: Validate release boundary, versions, and changelog
         id: validate
+        shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = "refs/heads/main"
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+          test "${GITHUB_SHA}" = "$(git rev-parse origin/main)"
+          RELEASE_TAG_STATE=new
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{}")" = "${GITHUB_SHA}"
+            test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
+            if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft >/dev/null 2>&1; then
+              if [ "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" != "true" ]; then
+                echo "release tag already has a published release: ${RELEASE_TAG}" >&2
+                exit 1
+              fi
+            fi
+            RELEASE_TAG_STATE=resume
+          fi
+          export RELEASE_TAG_STATE
           python - <<'PY'
           import json
           import os
@@ -47,10 +83,17 @@ jobs:
           from pathlib import Path
 
           tag = os.environ["RELEASE_TAG"].strip()
+          channel = os.environ["RELEASE_CHANNEL"].strip()
           if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", tag):
               raise SystemExit(f"invalid release tag: {tag!r}")
+          if channel not in {"prerelease", "production"}:
+              raise SystemExit(f"invalid release channel: {channel!r}")
 
           version = tag[1:]
+          prerelease = "-" in version
+          if prerelease != (channel == "prerelease"):
+              raise SystemExit("release channel must match whether the version is prerelease")
+
           plugin = json.loads(Path(".codex-plugin/plugin.json").read_text())
           if plugin.get("version") != version:
               raise SystemExit(
@@ -69,14 +112,6 @@ jobs:
                   f"mcp-tools version {mcp_version!r} does not match {version!r}"
               )
 
-          with Path("extensions/astrbot/pyproject.toml").open("rb") as handle:
-              astrbot_version = tomllib.load(handle)["project"]["version"]
-          if pep440(astrbot_version) != pep440(version):
-              raise SystemExit(
-                  f"extensions/astrbot version {astrbot_version!r} "
-                  f"does not match {version!r}"
-              )
-
           changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
           if not re.search(rf"^## \[v?{re.escape(version)}\]", changelog, re.M):
               raise SystemExit(f"CHANGELOG.md has no entry for {version}")
@@ -84,9 +119,11 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(
                   f"tag={tag}\nversion={version}\n"
-                  f"prerelease={str('-' in version).lower()}\n"
+                  f"prerelease={str(prerelease).lower()}\nchannel={channel}\n"
+                  f"commit={os.environ['GITHUB_SHA']}\n"
+                  f"tag_state={os.environ['RELEASE_TAG_STATE']}\n"
               )
-          print(f"validated release {tag}")
+          print(f"validated release {tag} from {os.environ['GITHUB_SHA']}")
           PY
 
   mcp-runtime:
@@ -97,10 +134,10 @@ jobs:
       run:
         working-directory: mcp-tools
     steps:
-      - name: Check out tagged revision
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check out validated main revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit }}
 
       - name: Configure MCP task-local runtime storage
         shell: pwsh
@@ -118,7 +155,7 @@ jobs:
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
 
@@ -148,37 +185,24 @@ jobs:
           uv run --locked python -m py_compile server.py
           uv run --locked pytest -q
 
-  quality:
-    name: Re-run AstrBot and Linux artifact gates
+  primary-artifact:
+    name: Re-run primary artifact contract
     needs: metadata
     runs-on: ubuntu-latest
     steps:
-      - name: Check out tagged revision
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check out validated main revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit }}
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
 
-      - name: Install uv
-        run: python -m pip install --disable-pip-version-check uv==0.11.28
-
-      - name: Check AstrBot extension
-        working-directory: extensions/astrbot
-        run: |
-          uv lock --check
-          uv sync --locked --all-groups
-          uv run --locked ruff check .
-          uv run --locked ruff format --check .
-          uv run --locked pyright
-          uv run --locked pytest -q
-
       - name: Check Linux primary artifact contract
         run: |
-          python -m pip install --disable-pip-version-check pytest
+          python -m pip install --disable-pip-version-check pytest==9.1.1
           python -m pytest -q mcp-tools/tests/test_primary_artifact.py
 
   fast-lane:
@@ -189,13 +213,13 @@ jobs:
       run:
         working-directory: mcp-tools/devkit_fastlane
     steps:
-      - name: Check out tagged revision
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check out validated main revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit }}
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
 
@@ -205,7 +229,6 @@ jobs:
         run: |
           $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-release\fast-lane'
           New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'pip-cache') | Out-Null
-          New-Item -ItemType Directory -Force -Path 'D:\bun\tmp\codex\2718-devkit\worktrees\atlas12b-team-efficiency' | Out-Null
           @(
             "CODEX_TASK_TEMP=$root"
             "TEMP=$(Join-Path $root 'tmp')"
@@ -216,7 +239,7 @@ jobs:
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Fast Lane test tools
-        run: python -m pip install --disable-pip-version-check pytest ruff==0.16.1
+        run: python -m pip install --disable-pip-version-check pytest==9.1.1 ruff==0.16.1
 
       - name: Ruff check
         run: >-
@@ -247,21 +270,22 @@ jobs:
           tests/test_fastlane_quota_balance.py
 
   publish:
-    name: Build and publish GitHub Release
-    needs: [metadata, mcp-runtime, quality, fast-lane]
+    name: Create GitHub Release
+    needs: [metadata, mcp-runtime, primary-artifact, fast-lane]
     runs-on: ubuntu-latest
+    environment: ${{ needs.metadata.outputs.channel }}
     permissions:
       contents: write
     steps:
-      - name: Check out tagged revision
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check out validated main revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
 
@@ -285,7 +309,7 @@ jobs:
           echo "path=${output}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload primary release package
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: 2718lab-devkit-primary-${{ needs.metadata.outputs.version }}
           path: |
@@ -294,80 +318,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Build AstrBot extension distributions
-        id: astrbot
-        working-directory: extensions/astrbot
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
-        run: |
-          set -euo pipefail
-          output="${RUNNER_TEMP}/astrbot-dist"
-          uv build --no-create-gitignore --out-dir "${output}"
-          test -n "$(find "${output}" -maxdepth 1 -type f -name '*.whl' -print -quit)"
-          test -n "$(find "${output}" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          checksum="${RUNNER_TEMP}/2718lab-devkit-astrbot-${RELEASE_VERSION}.sha256"
-          sha256sum "${output}"/*.whl "${output}"/*.tar.gz | tee "${checksum}"
-          echo "dir=${output}" >> "${GITHUB_OUTPUT}"
-          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
-
-      - name: Validate AstrBot release distributions
-        working-directory: extensions/astrbot
-        shell: bash
-        env:
-          ASTRBOT_DIR: ${{ steps.astrbot.outputs.dir }}
-          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
-        run: |
-          python - <<'PY'
-          import os
-          import tarfile
-          import zipfile
-          from pathlib import Path
-
-          directory = Path(os.environ["ASTRBOT_DIR"])
-          release_version = os.environ["RELEASE_VERSION"]
-          pep440_version = release_version.replace("-", "")
-          wheels = sorted(directory.glob("*.whl"))
-          sources = sorted(directory.glob("*.tar.gz"))
-          if len(wheels) != 1 or len(sources) != 1:
-              raise SystemExit("expected exactly one wheel and one source distribution")
-
-          with zipfile.ZipFile(wheels[0]) as wheel:
-              wheel_members = set(wheel.namelist())
-              if "devkit_astrbot/__init__.py" not in wheel_members:
-                  raise SystemExit("wheel misses devkit_astrbot package")
-              wheel_metadata = next(
-                  name for name in wheel_members if name.endswith(".dist-info/METADATA")
-              )
-              if f"Version: {pep440_version}" not in wheel.read(wheel_metadata).decode():
-                  raise SystemExit("wheel metadata version mismatch")
-
-          with tarfile.open(sources[0]) as source:
-              source_members = source.getnames()
-              if not any(
-                  name.endswith("/src/devkit_astrbot/__init__.py")
-                  for name in source_members
-              ):
-                  raise SystemExit("source distribution misses devkit_astrbot package")
-              metadata = next(name for name in source_members if name.endswith("/PKG-INFO"))
-              content = source.extractfile(metadata)
-              if content is None or f"Version: {pep440_version}" not in content.read().decode():
-                  raise SystemExit("source distribution metadata version mismatch")
-          print("validated AstrBot wheel and source distribution")
-          PY
-
-      - name: Upload AstrBot release distributions
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: 2718lab-devkit-astrbot-${{ needs.metadata.outputs.version }}
-          path: |
-            ${{ steps.astrbot.outputs.dir }}/*.whl
-            ${{ steps.astrbot.outputs.dir }}/*.tar.gz
-            ${{ steps.astrbot.outputs.checksum }}
-          if-no-files-found: error
-          retention-days: 14
-
       - name: Extract release notes
+        shell: bash
         env:
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
@@ -384,13 +336,86 @@ jobs:
           print(match.group(1).strip())
           PY
 
-      - name: Create GitHub Release
+      - name: Create immutable annotated tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.metadata.outputs.commit }}
+          RELEASE_TAG_STATE: ${{ needs.metadata.outputs.tag_state }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          test "${RELEASE_COMMIT}" = "$(git rev-parse origin/main)"
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            test "${RELEASE_TAG_STATE}" = "resume"
+          else
+            test "${RELEASE_TAG_STATE}" = "new"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${RELEASE_TAG}" "${RELEASE_COMMIT}" -m "${RELEASE_TAG}"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}"
+          fi
+
+          git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{}")" = "${RELEASE_COMMIT}"
+          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
+          if [ "${RELEASE_TAG_STATE}" = "resume" ] && gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft >/dev/null 2>&1; then
+            if [ "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "release recovery requires a draft release" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Create or resume draft GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.metadata.outputs.commit }}
+          RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{}")" = "${RELEASE_COMMIT}"
+          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
+          release_args=()
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft >/dev/null 2>&1; then
+            test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" = "true"
+            gh release edit "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes-file "${RUNNER_TEMP}/release-notes.md" \
+              "${release_args[@]}"
+          else
+            gh release create "${RELEASE_TAG}" \
+              --draft \
+              --verify-tag \
+              --title "${RELEASE_TAG}" \
+              --notes-file "${RUNNER_TEMP}/release-notes.md" \
+              "${release_args[@]}"
+          fi
+
+      - name: Upload release assets
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           ARTIFACT: ${{ steps.build.outputs.path }}
-          ASTRBOT_DIR: ${{ steps.astrbot.outputs.dir }}
-          ASTRBOT_CHECKSUM: ${{ steps.astrbot.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          gh release upload "${RELEASE_TAG}" \
+            "${ARTIFACT}" \
+            "${ARTIFACT}.sha256" \
+            --clobber
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
           set -euo pipefail
@@ -398,12 +423,8 @@ jobs:
           if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
             release_args+=(--prerelease)
           fi
-          gh release create "${RELEASE_TAG}" \
-            "${ARTIFACT}" \
-            "${ARTIFACT}.sha256" \
-            "${ASTRBOT_DIR}"/*.whl \
-            "${ASTRBOT_DIR}"/*.tar.gz \
-            "${ASTRBOT_CHECKSUM}" \
+          gh release edit "${RELEASE_TAG}" \
+            --draft=false \
             --verify-tag \
             --title "${RELEASE_TAG}" \
             --notes-file "${RUNNER_TEMP}/release-notes.md" \

@@ -1,14 +1,15 @@
 [English](README.md)
 
-# 2718lab DevKit —— MCP-only v1.0.0
+# 2718lab DevKit —— Codex + MCP v1.0.0
 
 [![版本](https://img.shields.io/badge/version-v1.0.0-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-2718lab DevKit 是一个本地、仅 stdio 传输的 MCP 服务器，提供有边界的
-项目索引、Atlas 证据、Relay 生命周期协调和确定性的 Fast Lane 规划。
-本仓库承载版本化的 v1.0.0 包；已提交的 manifest 和 allowlist 定义
-公开产物范围，下面的安装、构建和验证章节给出支持的工作流。
+2718lab DevKit 是一个 Codex-first 工程工具包：它包含一个本地、仅 stdio
+传输的 MCP 运行时，用于有边界的项目索引、Atlas 证据、Relay 生命周期协调和
+确定性的 Fast Lane 规划；同时还包含一组精简的 Skill 说明书。本仓库承载版本化的
+v1.0.0 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
+安装、构建和验证章节共同给出支持的工作流。
 
 当前版本保留刻意 fail-closed 的 Fast Lane 预览。公共编译器和 CLI 固定返回
 `NO_SAFE_WORK` 与零 assignments：不会消费 host-status、quota 或实时账号输入，
@@ -29,8 +30,10 @@ Desktop-host bridge 合同的要求；本仓库并未提供该 bridge。
 - Atlas 提供有边界的图查询、实现包准备、惰性渲染和持久化验收投影。
 - Relay 验证显式工作包并暴露生命周期状态。Python 只返回结构化宿主
   动作；工作树准备和 agent 调度仍由 Codex 宿主负责。
-- 主包是 MCP-only：精确暴露 17 个工具，不暴露 MCP prompts、MCP
-  resources、静态 prompt agent 或模型运行器。
+- 可执行 MCP 运行时精确暴露 17 个工具，不暴露 MCP prompts、MCP resources、
+  静态 prompt agent 或模型运行器。
+- 可选的 Codex Skill bundle 是 DevKit 的说明书表面，提供简短的模块化手册；
+  它不构成第二个运行时，也不是可执行的 prompt/agent 表面。
 - Fast Lane 是 MCP runtime 中的纯本地编译器。其公共面当前没有调度权限并且
   fail-closed：不会产生 assignment，也不会 spawn agent、修改 Git、运行命令或
   执行 worktree。宿主/私有 quota 消费预留给未来的外部 Desktop-host bridge 合同。
@@ -73,15 +76,17 @@ flowchart TD
 
 ## Codex 说明书导航
 
-本地插件包含可选的、仅供查阅的 Codex 说明书 bundle：一个短总览
+DevKit 刻意分为两个表面：MCP 运行时执行有界工具工作，本地插件则包含可选的、
+仅供查阅的 Codex 说明书 bundle。该 bundle 有一个短总览
 （`skills/devkit-overview`）、一个工作流设计说明书
-（`skills/workflow-design`，默认 Fast Lane 策略）和七份独立模块说明书。按需加载：
+（`skills/workflow-design`，默认 Fast Lane 策略）和六份独立模块说明书。按需加载：
 
-`fast-lane-routing` · `astrbot-plugin-dev` · `bugkiller` · `code-atlas` ·
+`fast-lane-routing` · `bugkiller` · `code-atlas` ·
 `mcp-server-dev` · `oss-repo-ops` · `python-engineering`。
 
 Skills 是说明书，不是 MCP 工具或可执行的 prompt surface。它们不含 slash command、
-agent profile、脚手架模板、校验器或调度代码，并且刻意不进入 MCP-only 主 ZIP。
+agent profile、脚手架模板、校验器或调度代码。精简的运行时 ZIP 刻意不带入这些
+说明书，但这个打包边界不代表 DevKit 只包含 MCP 运行时。
 
 ## 文档导航
 
@@ -93,6 +98,8 @@ agent profile、脚手架模板、校验器或调度代码，并且刻意不进�
 - [工作包与任务卡规则](mcp-tools/devkit_fastlane/references/work-packages.md)
 - [编排运行时契约](mcp-tools/devkit_fastlane/references/orchestration-runtime.md)
 - [团队与 lane 模式](mcp-tools/devkit_fastlane/references/team-patterns.md)
+- [仓库自动化与审查](docs/governance/repository-automation.md)
+- [参与贡献](CONTRIBUTING.md) · [安全报告](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md)
 - [历史设计记录](docs/superpowers/README.md)：仅供追溯，可能提及已退出的组件，
   不是当前实现契约。
 - [发布历史](CHANGELOG.md)
@@ -151,11 +158,11 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
     python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
-.codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的公共运行面
-仍是 MCP-only；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
+.codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
+表面是 MCP 服务器；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
 `team_efficiency.py` 兼容入口、其路由与额度平衡模块，以及宿主专用官方账号
-额度采集模块。它明确不包含可选 skill bundle、命令辅助文件、hooks、CI 文件、
-宿主私有状态、prompts、静态 agent 或任意仓库文件。
+额度采集模块。它明确不包含可选的 Skill 说明书 bundle、命令辅助文件、hooks、CI
+文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
 
 Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 
@@ -247,8 +254,8 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 本仓库代表版本化的 v1.0.0 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
-和锁定依赖为准。由维护者在 main 上触发的发布工作流只会在声明的 gates 通过后发布匹配的
-GitHub Release。
+和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
+后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。
 
 ## 许可证
 
