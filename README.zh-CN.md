@@ -180,10 +180,15 @@ Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 
 持久化数据留在本地。RuntimeConfig 按以下顺序解析数据根：
 
-1. 宿主显式提供的绝对目录 PLUGIN_DATA。
-2. CODEX_HOME/data/2718lab-devkit。
-3. 默认 Codex 数据目录：
+1. 宿主为本安装显式提供的绝对目录 `CODEX_DEVKIT_DATA_ROOT`。
+2. 宿主显式提供的绝对目录 `PLUGIN_DATA`。
+3. `CODEX_HOME/data/2718lab-devkit`。
+4. 默认 Codex 数据目录：
    %USERPROFILE%\.codex\data\2718lab-devkit。
+
+便携式本地安装应把 `CODEX_DEVKIT_DATA_ROOT` 设为持久的 G: 盘路径，
+例如 `G:\CodexData\.codex\data\2718lab-devkit`。这个覆盖项与旧版
+`PLUGIN_DATA` 分开，避免旧检出意外打开正式运行时的数据库。
 
 当宿主提供 CODEX_PROJECT_ROOT 或 CODEX_WORKSPACE_ROOT 时，持久化根会在
 `scoped-v1` 下按该项目根的 SHA-256 身份继续分域。没有项目根时，

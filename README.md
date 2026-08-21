@@ -205,10 +205,17 @@ worktree configuration has been accepted.
 
 Persistent data is local. RuntimeConfig resolves the data root in this order:
 
-1. PLUGIN_DATA, when the host explicitly provides an absolute directory.
-2. CODEX_HOME/data/2718lab-devkit.
-3. The default Codex data directory:
+1. `CODEX_DEVKIT_DATA_ROOT`, when the host explicitly provides an absolute
+   directory for this installation.
+2. PLUGIN_DATA, when the host explicitly provides an absolute directory.
+3. CODEX_HOME/data/2718lab-devkit.
+4. The default Codex data directory:
    %USERPROFILE%\.codex\data\2718lab-devkit.
+
+For a portable local installation, set `CODEX_DEVKIT_DATA_ROOT` to a durable
+G: path (for example `G:\CodexData\.codex\data\2718lab-devkit`). This
+override is intentionally separate from the legacy `PLUGIN_DATA` root so an
+older checkout cannot open the stable runtime's database by accident.
 
 When the host provides CODEX_PROJECT_ROOT or CODEX_WORKSPACE_ROOT, the durable
 root is further scoped below `scoped-v1` by a SHA-256 identity of that project

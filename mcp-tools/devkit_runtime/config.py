@@ -18,6 +18,7 @@ from devkit_runtime.project_authority import (
 
 _SCOPE_DIRECTORY = "scoped-v1"
 _PROJECT_DIRECTORY = "projects-v2"
+_DATA_ROOT_ENV = "CODEX_DEVKIT_DATA_ROOT"
 _SCOPE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _PROJECT_ROOT_ENV_NAMES = ("CODEX_PROJECT_ROOT", "CODEX_WORKSPACE_ROOT")
 _PROJECT_ID_ENV_NAMES = (
@@ -104,15 +105,19 @@ class RuntimeConfig:
         authority_provider: RuntimeProjectAuthorityProvider | None = None,
     ) -> RuntimeConfig:
         values = os.environ if environ is None else environ
-        plugin_data = values.get("PLUGIN_DATA")
-        if plugin_data:
-            data_base = _absolute_path(plugin_data)
+        explicit_data_root = values.get(_DATA_ROOT_ENV)
+        if explicit_data_root:
+            data_base = _absolute_path(explicit_data_root)
         else:
-            codex_home = values.get("CODEX_HOME")
-            if codex_home:
-                data_base = _absolute_path(codex_home) / "data" / "2718lab-devkit"
+            plugin_data = values.get("PLUGIN_DATA")
+            if plugin_data:
+                data_base = _absolute_path(plugin_data)
             else:
-                data_base = Path.home() / ".codex" / "data" / "2718lab-devkit"
+                codex_home = values.get("CODEX_HOME")
+                if codex_home:
+                    data_base = _absolute_path(codex_home) / "data" / "2718lab-devkit"
+                else:
+                    data_base = Path.home() / ".codex" / "data" / "2718lab-devkit"
         if authority_provider is None:
             project_authority = None
             scope = _resolve_scope(values)

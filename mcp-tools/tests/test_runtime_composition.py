@@ -33,6 +33,27 @@ def test_runtime_config_load_prefers_plugin_data_without_writing(
     assert not codex_home.exists()
 
 
+def test_runtime_config_load_prefers_explicit_devkit_data_root(
+    tmp_path: Path,
+) -> None:
+    explicit_root = tmp_path / "g-drive-devkit-data"
+    legacy_plugin_data = tmp_path / "legacy-plugin-data"
+    codex_home = tmp_path / "codex-home"
+
+    config = RuntimeConfig.load(
+        environ={
+            "CODEX_DEVKIT_DATA_ROOT": str(explicit_root),
+            "PLUGIN_DATA": str(legacy_plugin_data),
+            "CODEX_HOME": str(codex_home),
+        }
+    )
+
+    assert config.data_root == explicit_root
+    assert not explicit_root.exists()
+    assert not legacy_plugin_data.exists()
+    assert not codex_home.exists()
+
+
 def test_runtime_config_scopes_shared_plugin_data_by_project_root(
     tmp_path: Path,
 ) -> None:

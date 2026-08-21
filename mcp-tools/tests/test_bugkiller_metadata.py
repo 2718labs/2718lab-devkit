@@ -69,6 +69,7 @@ class BugkillerMetadataTests(unittest.TestCase):
             [
                 "CODEX_DEVKIT_HOST_BRIDGE_FD",
                 "CODEX_DEVKIT_HOST_BRIDGE_HANDLE",
+                "CODEX_DEVKIT_DATA_ROOT",
                 "CODEX_PROJECT_ROOT",
                 "CODEX_WORKSPACE_ROOT",
                 "CODEX_PROJECT_ID",

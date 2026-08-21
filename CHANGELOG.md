@@ -36,6 +36,9 @@ only after the CI and artifact checks pass.
 
 - Promoted the MCP-only primary package from RC4 to the first stable `1.0.0`
   release.
+- Added an explicit `CODEX_DEVKIT_DATA_ROOT` override so the installed runtime
+  can keep its project-scoped index on a durable non-C drive without reusing a
+  legacy `PLUGIN_DATA` database.
 - Public Fast Lane compilation and bootstrap are intentionally authority-inert
   until a Desktop host supplies a private, project-attested admission grant;
   public calls return a zero-assignment fail-closed preview rather than
