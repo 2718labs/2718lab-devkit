@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,11 @@ from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import server
 from devkit_relay.compiler import RelayPlanError
+from devkit_runtime.composition import RuntimeRoot
+from devkit_runtime.config import RuntimeConfig
+from devkit_runtime.relay_runtime import RelayRuntimeError
 from server import RelayCompileRequest, _compile_host_relay_request
 
 _NOW = 1_700_000_000
@@ -181,7 +186,7 @@ class _BootstrapAuthority:
         self.verified: list[str] = []
         self.capability_valid = capability_valid
 
-    def verify_bootstrap_capability(self, attestation: dict[str, object]) -> bool:
+    def verify_bootstrap_capability(self, attestation: Mapping[str, object]) -> bool:
         self.verified.append(str(attestation["attestation_hash"]))
         return self.capability_valid
 
@@ -197,6 +202,114 @@ def test_public_relay_compile_model_rejects_v2_v3_authority_fields() -> None:
 
     with pytest.raises(ValidationError):
         RelayCompileRequest.model_validate(request)
+
+
+def test_host_private_production_composition_requires_injected_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    opened: list[object] = []
+
+    def unexpected_uow(**_kwargs: object) -> object:
+        opened.append(object())
+        return opened[-1]
+
+    root = RuntimeRoot(
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "data"),
+                "CODEX_TASK_TEMP": str(scratch),
+            }
+        ),
+        uow_factory=unexpected_uow,
+    )
+    monkeypatch.setattr("server._RUNTIME_ROOT", root)
+
+    with pytest.raises(RelayRuntimeError) as rejected:
+        server._compile_host_relay_request_from_runtime(
+            _v3_request(), bootstrap_authority=None, clock=lambda: _NOW
+        )
+
+    assert rejected.value.code == "BOOTSTRAP_HOST_AUTHORITY_UNAVAILABLE"
+    assert opened == []
+
+
+def test_host_private_production_composition_rejects_non_bootstrap_schema() -> None:
+    with pytest.raises(RelayRuntimeError) as rejected:
+        server._compile_host_relay_request_from_runtime(
+            _v1_request(),
+            bootstrap_authority=_BootstrapAuthority(),
+            clock=lambda: _NOW,
+        )
+
+    assert rejected.value.code == "BOOTSTRAP_HOST_REQUEST_INVALID"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    (
+        "2718lab-devkit/relay-compile-request-v2",
+        "2718lab-devkit/relay-compile-request-v3",
+    ),
+)
+def test_host_private_production_composition_runs_bootstrap_receipt_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema: str
+) -> None:
+    class BootstrapUow:
+        def __init__(self, project_index: _ProjectIndex) -> None:
+            self.project_checkpoint = SimpleNamespace(project_index=project_index)
+            self.atlas_store = _AtlasStore()
+            self.closed = False
+
+        def __enter__(self) -> BootstrapUow:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.closed = True
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    project_index = _ProjectIndex()
+    opened: list[BootstrapUow] = []
+    read_modes: list[bool] = []
+
+    def open_bootstrap_uow(*, read_only: bool, **_kwargs: object) -> BootstrapUow:
+        read_modes.append(read_only)
+        uow = BootstrapUow(project_index)
+        opened.append(uow)
+        return uow
+
+    root = RuntimeRoot(
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "data"),
+                "CODEX_TASK_TEMP": str(scratch),
+            }
+        ),
+        uow_factory=open_bootstrap_uow,
+    )
+    monkeypatch.setattr("server._RUNTIME_ROOT", root)
+    request = _v3_request()
+    if schema.endswith("-v2"):
+        request["schema"] = schema
+        request.pop("scheduler_topology")
+
+    plan = server._compile_host_relay_request_from_runtime(
+        request,
+        bootstrap_authority=_BootstrapAuthority(),
+        clock=lambda: _NOW,
+    )
+
+    assert read_modes == [False]
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert project_index.calls == [
+        ("register", "G:/host-private/bootstrap-root"),
+        ("sync", "sha256:" + "1" * 64),
+    ]
+    assert plan["schema"] == schema.replace("compile-request", "plan")
+    assert "G:/host-private/bootstrap-root" not in repr(plan)
 
 
 def test_host_v3_bootstrap_compiles_descriptor_then_recompiles_from_receipt() -> None:

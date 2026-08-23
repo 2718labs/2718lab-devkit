@@ -317,6 +317,32 @@ def _compile_host_relay_request(
     recompile["bootstrap_receipt"] = receipt
     return cast(dict[str, object], compile_plan(recompile, registry_resolver=registry))
 
+
+def _compile_host_relay_request_from_runtime(
+    request: Mapping[str, object],
+    *,
+    bootstrap_authority: _BootstrapTransportAuthority | None,
+    clock: Callable[[], float],
+) -> dict[str, object]:
+    """Host-private production composition for the V2/V3 bootstrap chain."""
+
+    if bootstrap_authority is None:
+        raise RelayRuntimeError("BOOTSTRAP_HOST_AUTHORITY_UNAVAILABLE")
+    if request.get("schema") not in {
+        "2718lab-devkit/relay-compile-request-v2",
+        "2718lab-devkit/relay-compile-request-v3",
+    }:
+        raise RelayRuntimeError("BOOTSTRAP_HOST_REQUEST_INVALID")
+    with _runtime_root().open_uow(read_only=False) as uow:
+        return _compile_host_relay_request(
+            request,
+            bootstrap_authority=bootstrap_authority,
+            project_index=uow.project_checkpoint.project_index,
+            atlas_store=uow.atlas_store,
+            clock=clock,
+        )
+
+
 class _RequestError(ValueError):
     """A bounded, public request failure raised before a persistent operation."""
 
