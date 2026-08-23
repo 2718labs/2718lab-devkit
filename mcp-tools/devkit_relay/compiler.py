@@ -19,6 +19,8 @@ _REQUEST_SCHEMA = "2718lab-devkit/relay-compile-request-v1"
 _PLAN_SCHEMA = "2718lab-devkit/relay-plan-v1"
 _REQUEST_SCHEMA_V2 = "2718lab-devkit/relay-compile-request-v2"
 _PLAN_SCHEMA_V2 = "2718lab-devkit/relay-plan-v2"
+_REQUEST_SCHEMA_V3 = "2718lab-devkit/relay-compile-request-v3"
+_PLAN_SCHEMA_V3 = "2718lab-devkit/relay-plan-v3"
 _RUNTIME_POLICY_ID = "2718lab-devkit/relay-runtime-policy-v1"
 
 _REQUEST_FIELDS = frozenset(
@@ -34,6 +36,10 @@ _REQUEST_FIELDS = frozenset(
 )
 _REQUEST_FIELDS_V2 = _REQUEST_FIELDS | frozenset({"project_binding"})
 _REQUEST_FIELDS_V2_RECOMPILE = _REQUEST_FIELDS_V2 | frozenset(
+    {"bootstrap_receipt"}
+)
+_REQUEST_FIELDS_V3 = _REQUEST_FIELDS_V2 | frozenset({"scheduler_topology"})
+_REQUEST_FIELDS_V3_RECOMPILE = _REQUEST_FIELDS_V3 | frozenset(
     {"bootstrap_receipt"}
 )
 _TASK_FIELDS = frozenset(
@@ -156,6 +162,24 @@ _RECOMPILED_PROJECT_BINDING_FIELDS = frozenset(
     }
 )
 _SPLIT_POLICY_FIELDS = frozenset({"mode", "max_depth", "child_scopes"})
+_SCHEDULER_TOPOLOGY_FIELDS = frozenset(
+    {
+        "schema",
+        "max_writers_per_scheduler",
+        "max_parallel_writers",
+        "groups",
+    }
+)
+_SCHEDULER_GROUP_FIELDS = frozenset(
+    {
+        "scheduler_id",
+        "coordinator_lease_id",
+        "worktree_identity",
+        "writer_task_ids",
+        "prewarm_task_ids",
+    }
+)
+_SCHEDULER_TOPOLOGY_SCHEMA = "2718lab-devkit/scheduler-topology-v1"
 
 _ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _HASH = re.compile(r"sha256:[0-9a-f]{64}")
@@ -176,6 +200,8 @@ _MAX_LIST_ITEMS = 32
 _MAX_TEXT_LENGTH = 2_048
 _MAX_TITLE_LENGTH = 256
 _MAX_RETRY_ATTEMPTS = 3
+_MAX_WRITERS_PER_SCHEDULER = 3
+_MAX_PARALLEL_WRITERS = 9
 
 
 class RelayPlanError(ValueError):
@@ -219,6 +245,12 @@ def _hash_identifier(value: object, code: str) -> str:
     if type(value) is not str or _HASH.fullmatch(value) is None:
         raise RelayPlanError(code)
     return value
+
+
+def _opaque_identity(value: object, code: str) -> str:
+    if _is_hash(value):
+        return str(value)
+    return _identifier(value, code)
 
 
 def _commit_identifier(value: object) -> str:
@@ -1382,6 +1414,138 @@ def _compile_plan_v2(
     return {**plan, "plan_hash": canonical_hash(plan)}
 
 
+def _normalize_scheduler_topology(
+    value: object, *, tasks: list[Mapping[str, object]]
+) -> dict[str, object]:
+    """Bind V3's opaque scheduler groups to the compiled staged tasks."""
+
+    topology = _exact_fields(
+        value, _SCHEDULER_TOPOLOGY_FIELDS, "invalid_scheduler_topology"
+    )
+    if (
+        topology["schema"] != _SCHEDULER_TOPOLOGY_SCHEMA
+        or type(topology["max_writers_per_scheduler"]) is not int
+        or topology["max_writers_per_scheduler"] != _MAX_WRITERS_PER_SCHEDULER
+        or type(topology["max_parallel_writers"]) is not int
+        or topology["max_parallel_writers"] != _MAX_PARALLEL_WRITERS
+        or type(topology["groups"]) is not list
+        or not topology["groups"]
+        or len(topology["groups"]) > _MAX_LIST_ITEMS
+    ):
+        raise RelayPlanError("invalid_scheduler_topology")
+
+    writers = {
+        task["task_id"]: task
+        for task in tasks
+        if task.get("stage") == "a1_writer"
+    }
+    prewarms = {
+        task["task_id"]: task
+        for task in tasks
+        if task.get("stage") == "a3_prewarm"
+    }
+    split_children: dict[str, list[str]] = {}
+    for task_id, task in writers.items():
+        parent_id = task.get("split_parent_task_id")
+        if type(parent_id) is str:
+            split_children.setdefault(parent_id, []).append(task_id)
+
+    normalized_groups: list[dict[str, object]] = []
+    assigned_writers: set[str] = set()
+    assigned_prewarms: set[str] = set()
+    scheduler_ids: set[str] = set()
+    lease_ids: set[str] = set()
+    worktree_ids: set[str] = set()
+    for raw_group in topology["groups"]:
+        group = _exact_fields(raw_group, _SCHEDULER_GROUP_FIELDS, "invalid_scheduler_topology")
+        scheduler_id = _opaque_identity(group["scheduler_id"], "invalid_scheduler_topology")
+        lease_id = _opaque_identity(
+            group["coordinator_lease_id"], "invalid_scheduler_topology"
+        )
+        worktree_identity = _opaque_identity(
+            group["worktree_identity"], "invalid_scheduler_topology"
+        )
+        if (
+            scheduler_id in scheduler_ids
+            or lease_id in lease_ids
+            or worktree_identity in worktree_ids
+        ):
+            raise RelayPlanError("invalid_scheduler_topology")
+        scheduler_ids.add(scheduler_id)
+        lease_ids.add(lease_id)
+        worktree_ids.add(worktree_identity)
+        writer_ids = _identifier_list(
+            group["writer_task_ids"],
+            "invalid_scheduler_topology",
+            maximum=_MAX_WRITERS_PER_SCHEDULER,
+        )
+        prewarm_ids = _identifier_list(
+            group["prewarm_task_ids"], "invalid_scheduler_topology"
+        )
+        expanded_writer_ids: list[str] = []
+        for task_id in writer_ids:
+            members = [task_id] if task_id in writers else split_children.get(task_id, [])
+            if not members or any(member in assigned_writers for member in members):
+                raise RelayPlanError("invalid_scheduler_topology")
+            assigned_writers.update(members)
+            expanded_writer_ids.extend(members)
+        if len(expanded_writer_ids) > _MAX_WRITERS_PER_SCHEDULER:
+            raise RelayPlanError("invalid_scheduler_topology")
+        if any(task_id not in prewarms or task_id in assigned_prewarms for task_id in prewarm_ids):
+            raise RelayPlanError("invalid_scheduler_topology")
+        assigned_prewarms.update(prewarm_ids)
+        normalized_groups.append(
+            {
+                "scheduler_id": scheduler_id,
+                "coordinator_lease_id": lease_id,
+                "worktree_identity": worktree_identity,
+                "writer_task_ids": sorted(expanded_writer_ids),
+                "prewarm_task_ids": prewarm_ids,
+            }
+        )
+    if assigned_writers != set(writers) or assigned_prewarms != set(prewarms):
+        raise RelayPlanError("invalid_scheduler_topology")
+    if len(assigned_writers) > _MAX_PARALLEL_WRITERS:
+        raise RelayPlanError("invalid_scheduler_topology")
+    return {
+        "schema": _SCHEDULER_TOPOLOGY_SCHEMA,
+        "max_writers_per_scheduler": _MAX_WRITERS_PER_SCHEDULER,
+        "max_parallel_writers": _MAX_PARALLEL_WRITERS,
+        "groups": sorted(normalized_groups, key=lambda group: str(group["scheduler_id"])),
+    }
+
+
+def _compile_plan_v3(
+    request: Mapping[str, Any],
+    registry_resolver: RegistryResolver | RegistryCallback | object | None,
+) -> dict[str, Any]:
+    request_fields = (
+        _REQUEST_FIELDS_V3_RECOMPILE
+        if "bootstrap_receipt" in request
+        else _REQUEST_FIELDS_V3
+    )
+    _exact_fields(request, request_fields, "unknown_request_fields")
+    v2_request = {
+        key: value
+        for key, value in request.items()
+        if key != "scheduler_topology"
+    }
+    v2_request["schema"] = _REQUEST_SCHEMA_V2
+    compiled = _compile_plan_v2(v2_request, registry_resolver)
+    plan_tasks = compiled["tasks"]
+    if type(plan_tasks) is not list:
+        raise RelayPlanError("invalid_scheduler_topology")
+    topology = _normalize_scheduler_topology(
+        request["scheduler_topology"], tasks=plan_tasks
+    )
+    plan = {
+        **{key: value for key, value in compiled.items() if key != "plan_hash"},
+        "schema": _PLAN_SCHEMA_V3,
+        "scheduler_topology": topology,
+    }
+    return {**plan, "plan_hash": canonical_hash(plan)}
+
+
 def validate_stage_evidence(
     task: Mapping[str, object],
     *,
@@ -1421,7 +1585,7 @@ def compile_plan(
     request: Mapping[str, Any],
     registry_resolver: RegistryResolver | RegistryCallback | object | None = None,
 ) -> dict[str, Any]:
-    """Compile a legacy v1 or staged v2 Relay plan without host side effects."""
+    """Compile a legacy, staged, or hierarchy-bound Relay plan without effects."""
 
     if type(request) is not dict:
         raise RelayPlanError("invalid_request")
@@ -1430,4 +1594,6 @@ def compile_plan(
         return _compile_plan_v1(request, registry_resolver=registry_resolver)
     if schema == _REQUEST_SCHEMA_V2:
         return _compile_plan_v2(request, registry_resolver=registry_resolver)
+    if schema == _REQUEST_SCHEMA_V3:
+        return _compile_plan_v3(request, registry_resolver=registry_resolver)
     raise RelayPlanError("invalid_schema")
