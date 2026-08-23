@@ -52,7 +52,7 @@ worktree 执行路径。宿主执行属于未来外部 Desktop-host bridge 合�
 | [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | 显式工作包编译和生命周期宿主动作 | [Relay 工具](#精确-mcp-面) |
 | [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | 运行时路径、checkpoint、持久边界和宿主私有 bridge | [运行时数据与恢复](#运行时数据与崩溃恢复) |
 | [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | 持久化 workflow、task、lease 和生命周期状态 | [workflow 生命周期](mcp-tools/devkit_fastlane/references/efficiency-automation.md#workflow-lifecycle-plan) |
-| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | 确定性路由/Fast Lane 编译器、未来额度 bridge 参考、契约和测试 | [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
+| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | 确定性路由/Fast Lane 编译器、契约和测试 | [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
 | [`.codex-plugin/`](.codex-plugin/) | 插件 manifest、产物 allowlist 和可复现构建器 | [构建主产物](#构建主产物) |
 
 ## 整体工作流
@@ -163,8 +163,8 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
 表面是 MCP 服务器；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
-`team_efficiency.py` 兼容入口、其路由与额度平衡模块，以及宿主专用官方账号
-额度采集模块。它明确不包含可选的 Skill 说明书 bundle、命令辅助文件、hooks、CI
+`team_efficiency.py` 兼容入口及其路由模块。它明确不包含可选的 Skill 说明书 bundle、
+命令辅助文件、hooks、CI
 文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
 
 Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
