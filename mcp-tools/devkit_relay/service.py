@@ -837,9 +837,24 @@ class RelayService:
             if task["stage"] == "a1_writer"
             and task["split_verdict"] != "UNSPLITTABLE_SCOPE_CONFLICT"
         }
-        prewarm_ids = {
-            task["task_id"] for task in tasks if task["stage"] == "a3_prewarm"
-        }
+        split_children: dict[str, set[str]] = {}
+        for task_id in writer_ids:
+            parent_id = task_by_id[task_id]["split_parent_task_id"]
+            if type(parent_id) is str:
+                split_children.setdefault(parent_id, set()).add(task_id)
+        prewarm_targets: dict[str, set[str]] = {}
+        for task in tasks:
+            if task["stage"] != "a3_prewarm":
+                continue
+            target = task["prewarm_for_task_id"]
+            members = (
+                {target}
+                if target in writer_ids
+                else set(split_children.get(target, set()))
+            )
+            if members:
+                prewarm_targets[task["task_id"]] = members
+        prewarm_ids = set(prewarm_targets)
         assigned_writers: dict[str, dict[str, str]] = {}
         assigned_prewarms: set[str] = set()
         for group in topology["groups"]:
@@ -850,6 +865,10 @@ class RelayService:
                 or not group_prewarms <= prewarm_ids
                 or set(assigned_writers) & group_writers
                 or assigned_prewarms & group_prewarms
+                or any(
+                    not prewarm_targets[prewarm_id] <= group_writers
+                    for prewarm_id in group_prewarms
+                )
             ):
                 raise RelayError("RELAY_PLAN_INVALID")
             assignment = {

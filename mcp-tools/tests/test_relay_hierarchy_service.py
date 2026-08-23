@@ -166,6 +166,19 @@ def test_v3_topology_preserves_group_isolated_writer_assignments() -> None:
     assert persisted_topology == submitted["scheduler_topology"]
 
 
+def test_v3_rejects_prewarm_bound_to_another_scheduler_group() -> None:
+    relay = RelayService(CaptureStore(), capability_secret=b"hierarchy-test-secret")
+    submitted = _plan(
+        groups=[
+            _group("scheduler-alpha", ["writer-alpha"], []),
+            _group("scheduler-beta", ["writer-beta"], ["prewarm-alpha"]),
+        ]
+    )
+
+    with pytest.raises(RelayError, match="RELAY_PLAN_INVALID"):
+        relay.start_create(submitted, idempotency_key="cross-group-prewarm")
+
+
 def test_v3_accepts_sha256_opaque_group_identities_without_rewriting_the_plan() -> None:
     store = CaptureStore()
     relay = RelayService(store, capability_secret=b"hierarchy-test-secret")

@@ -200,7 +200,7 @@ def test_schema_six_migrates_to_seven_but_unknown_version_is_rejected(
 
     connection = sqlite3.connect(database)
     connection.execute(
-        "UPDATE relay_v3_schema_metadata SET value = '8' WHERE key = 'schema_version'"
+        "UPDATE relay_v3_schema_metadata SET value = '9' WHERE key = 'schema_version'"
     )
     connection.commit()
     connection.close()
@@ -211,7 +211,9 @@ def test_schema_six_migrates_to_seven_but_unknown_version_is_rejected(
     assert raised.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
 
 
-@pytest.mark.parametrize(("old_version", "expected_version"), [("5", "6"), ("6", "7")])
+@pytest.mark.parametrize(
+    ("old_version", "expected_version"), [("5", "6"), ("6", "7"), ("7", "8")]
+)
 def test_known_legacy_schema_versions_migrate_in_order(
     tmp_path: Path, old_version: str, expected_version: str
 ) -> None:
@@ -250,10 +252,178 @@ def test_known_legacy_schema_versions_migrate_in_order(
         )
 
 
-def test_real_service_to_store_uses_host_projection_fence_and_host_capacity(
+def test_schema_seven_migrates_capacity_check_before_real_service_store_create(
     tmp_path: Path,
 ) -> None:
-    store = RelayStore(tmp_path / "relay.sqlite3", host_writer_capacity=1)
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded_relay = RelayService(seeded, capability_secret=b"hierarchy-test-secret")
+    seeded_relay.start_create(_plan(), idempotency_key="seeded-v7-capacity-three")
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        """
+        CREATE TABLE relay_v3_runs_v7 (
+            run_id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL UNIQUE,
+            plan_hash TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            input_snapshot_id TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            integration_head TEXT NOT NULL,
+            integration_version INTEGER NOT NULL CHECK (integration_version >= 0),
+            capacity INTEGER NOT NULL CHECK (typeof(capacity) = 'integer')
+                CHECK (capacity BETWEEN 1 AND 3),
+            schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute("INSERT INTO relay_v3_runs_v7 SELECT * FROM relay_v3_runs")
+    connection.execute("DROP TABLE relay_v3_runs")
+    connection.execute("ALTER TABLE relay_v3_runs_v7 RENAME TO relay_v3_runs")
+    connection.execute(
+        "UPDATE relay_v3_schema_metadata SET value = '7' WHERE key = 'schema_version'"
+    )
+    connection.commit()
+    connection.close()
+
+    store = RelayStore(database)
+    relay = RelayService(store, capability_secret=b"hierarchy-test-secret")
+    assert store.status("topology-store-v1")["run"]["capacity"] == 3
+    plan = _plan()
+    plan["workflow_id"] = "topology-store-v1-capacity-four"
+    plan["capacity"] = 4
+    plan["plan_hash"] = canonical_hash(
+        {key: value for key, value in plan.items() if key != "plan_hash"}
+    )
+
+    relay.start_create(plan, idempotency_key="migrated-capacity-four")
+
+    assert store.status("topology-store-v1-capacity-four")["run"]["capacity"] == 4
+    assert "capacity BETWEEN 1 AND 9" in str(
+        store._require_connection()
+        .execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_v3_runs'"
+        )
+        .fetchone()[0]
+    )
+
+
+def test_real_service_to_store_never_dispatches_a_prewarm_for_unsplittable_writer(
+    tmp_path: Path,
+) -> None:
+    store = RelayStore(tmp_path / "relay.sqlite3")
+    relay = RelayService(store, capability_secret=b"hierarchy-test-secret")
+    plan = _plan()
+    tasks = plan["tasks"]
+    assert isinstance(tasks, list)
+    tasks[0]["split_verdict"] = "UNSPLITTABLE_SCOPE_CONFLICT"
+    prewarm = _task("prewarm-blocked")
+    prewarm.update(
+        {
+            "kind": "prewarm",
+            "stage": "a3_prewarm",
+            "write_scope": [],
+            "route": {
+                "route_class": "luna_medium",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "medium",
+            },
+            "prewarm_for_task_id": "writer-0",
+        }
+    )
+    tasks.append(prewarm)
+    tasks.sort(key=lambda task: str(task["task_id"]))
+    topology = plan["scheduler_topology"]
+    assert isinstance(topology, dict)
+    groups = topology["groups"]
+    assert isinstance(groups, list)
+    groups[0]["writer_task_ids"] = ["writer-1", "writer-2"]
+    queues = plan["queues"]
+    assert isinstance(queues, dict)
+    queues["writer_ready"] = ["writer-1", "writer-2", "writer-3"]
+    queues["prewarm_ready"] = []
+    queues["unsplittable"] = ["writer-0"]
+    plan["plan_hash"] = canonical_hash(
+        {key: value for key, value in plan.items() if key != "plan_hash"}
+    )
+
+    created = relay.start_create(plan, idempotency_key="unsplittable-prewarm")
+
+    assert {action["task_id"] for action in created["host_actions"]} == {
+        "writer-1",
+        "writer-2",
+        "writer-3",
+    }
+
+
+def test_real_service_to_store_emits_a_read_only_slot_for_group_bound_prewarm(
+    tmp_path: Path,
+) -> None:
+    store = RelayStore(tmp_path / "relay.sqlite3")
+    relay = RelayService(store, capability_secret=b"hierarchy-test-secret")
+    plan = _plan()
+    tasks = plan["tasks"]
+    assert isinstance(tasks, list)
+    prewarm = _task("prewarm-readonly")
+    prewarm.update(
+        {
+            "kind": "prewarm",
+            "stage": "a3_prewarm",
+            "write_scope": [],
+            "route": {
+                "route_class": "luna_medium",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "medium",
+            },
+            "prewarm_for_task_id": "writer-0",
+        }
+    )
+    tasks.append(prewarm)
+    tasks.sort(key=lambda task: str(task["task_id"]))
+    topology = plan["scheduler_topology"]
+    assert isinstance(topology, dict)
+    groups = topology["groups"]
+    assert isinstance(groups, list)
+    groups[0]["prewarm_task_ids"] = ["prewarm-readonly"]
+    queues = plan["queues"]
+    assert isinstance(queues, dict)
+    queues["prewarm_ready"] = ["prewarm-readonly"]
+    plan["capacity"] = 5
+    plan["plan_hash"] = canonical_hash(
+        {key: value for key, value in plan.items() if key != "plan_hash"}
+    )
+
+    created = relay.start_create(plan, idempotency_key="read-only-prewarm")
+    action = next(
+        item
+        for item in created["host_actions"]
+        if item["task_id"] == "prewarm-readonly"
+    )
+
+    assert "host_scheduler_topology" not in action
+    assert set(action["relay_host_scheduler_slot"]) == {
+        "schema",
+        "plan_hash",
+        "topology_hash",
+        "group_binding_hash",
+        "scheduler_id",
+        "coordinator_lease_id",
+        "worktree_identity",
+        "writer_slot",
+        "read_only",
+    }
+    assert action["relay_host_scheduler_slot"]["writer_slot"] is None
+    assert action["relay_host_scheduler_slot"]["read_only"] is True
+
+
+def test_real_service_to_store_persists_capacity_four_and_emits_bound_slot(
+    tmp_path: Path,
+) -> None:
+    store = RelayStore(tmp_path / "relay.sqlite3")
     relay = RelayService(store, capability_secret=b"hierarchy-test-secret")
     plan = _plan()
     plan["capacity"] = 4
@@ -263,17 +433,29 @@ def test_real_service_to_store_uses_host_projection_fence_and_host_capacity(
 
     created = relay.start_create(plan, idempotency_key="host-fence")
 
-    assert len(created["host_actions"]) == 1
-    action = created["host_actions"][0]
-    projection = action["host_scheduler_topology"]
-    assert projection == {
-        "schema": "2718lab-devkit/host-scheduler-topology-v1",
-        "relay_plan_hash": plan["plan_hash"],
+    assert len(created["host_actions"]) == 4
+    action = next(
+        item for item in created["host_actions"] if item["task_id"] == "writer-0"
+    )
+    assert "host_scheduler_topology" not in action
+    slot = action["relay_host_scheduler_slot"]
+    assert slot == {
+        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+        "plan_hash": plan["plan_hash"],
+        "topology_hash": canonical_hash(plan["scheduler_topology"]),
+        "group_binding_hash": canonical_hash(
+            {
+                "scheduler_id": "scheduler-alpha",
+                "coordinator_lease_id": "lease-alpha",
+                "worktree_identity": "worktree-alpha",
+                "writer_task_ids": ["writer-0", "writer-1", "writer-2"],
+                "prewarm_task_ids": [],
+            }
+        ),
         "scheduler_id": "scheduler-alpha",
         "coordinator_lease_id": "lease-alpha",
         "worktree_identity": "worktree-alpha",
         "writer_slot": 1,
-        "host_writer_capacity": 1,
         "read_only": False,
     }
-    assert store.status("topology-store-v1")["run"]["capacity"] == 1
+    assert store.status("topology-store-v1")["run"]["capacity"] == 4

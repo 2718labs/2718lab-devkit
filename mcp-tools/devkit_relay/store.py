@@ -108,7 +108,7 @@ class RelayFinalizationConflict(RelayStoreError):
 class RelayStore:
     """Own the atomic durable state behind Relay's five public tools."""
 
-    _SCHEMA_VERSION = 7
+    _SCHEMA_VERSION = 8
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
     def __init__(self, database: str | Path, *, host_writer_capacity: int = 9) -> None:
@@ -117,6 +117,8 @@ class RelayStore:
         self._database = str(database)
         self._host_writer_capacity = host_writer_capacity
         self._migrating_v5_to_v6 = False
+        self._migrating_v6_to_v7 = False
+        self._migrating_v7_to_v8 = False
         self._connection: sqlite3.Connection | None = sqlite3.connect(
             self._database, isolation_level=None
         )
@@ -1961,9 +1963,9 @@ class RelayStore:
             }
         if recovery is not None:
             action["recovery"] = dict(recovery)
-        projection = self._host_scheduler_projection(cursor, run, task)
-        if projection is not None:
-            action["host_scheduler_topology"] = projection
+        slot = self._host_scheduler_projection(cursor, run, task)
+        if slot is not None:
+            action["relay_host_scheduler_slot"] = slot
         cursor.execute(
             """
             INSERT INTO relay_v3_actions
@@ -1991,7 +1993,7 @@ class RelayStore:
     def _host_scheduler_projection(
         self, cursor: sqlite3.Cursor, run: RelayRun, task: RelayTask
     ) -> dict[str, object] | None:
-        """Project hashed Relay topology into a host-only action fence."""
+        """Project one SQLite-verified Relay group into the host slot schema."""
 
         rows = cursor.execute(
             """
@@ -2001,8 +2003,29 @@ class RelayStore:
             """,
             (run.run_id,),
         ).fetchall()
-        if not rows:
+        plan_row = cursor.execute(
+            "SELECT plan_hash, plan_json FROM relay_v3_runs WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone()
+        if plan_row is None or str(plan_row["plan_hash"]) != run.plan_hash:
+            raise RelayStorageFailure()
+        plan = _decode_json_object(str(plan_row["plan_json"]))
+        if plan.get("plan_hash") != run.plan_hash:
+            raise RelayStorageFailure()
+        try:
+            topology = self._validate_scheduler_topology(plan)
+        except RelayStoreError as error:
+            raise RelayStorageFailure() from error
+        if topology is None:
+            if rows:
+                raise RelayStorageFailure()
             return None
+        if not rows:
+            raise RelayStorageFailure()
+        groups = {str(group["scheduler_id"]): group for group in topology}
+        if len(groups) != len(rows):
+            raise RelayStorageFailure()
+        topology_hash = canonical_hash(plan["scheduler_topology"])
         target = task.task_id
         if task.kind == "design":
             raw_target = task.contract.get("design_for_task_id")
@@ -2012,17 +2035,46 @@ class RelayStore:
         for row in rows:
             writers = _decode_string_list(str(row["writer_task_ids_json"]))
             prewarms = _decode_string_list(str(row["prewarm_task_ids_json"]))
-            if target not in writers and task.task_id not in prewarms:
-                continue
-            is_writer = task.kind == "implementation"
-            return {
-                "schema": "2718lab-devkit/host-scheduler-topology-v1",
-                "relay_plan_hash": run.plan_hash,
+            binding = {
                 "scheduler_id": str(row["scheduler_id"]),
                 "coordinator_lease_id": str(row["coordinator_lease_id"]),
                 "worktree_identity": str(row["worktree_identity"]),
-                "writer_slot": writers.index(task.task_id) + 1 if is_writer else None,
-                "host_writer_capacity": self._host_writer_capacity,
+                "writer_task_ids": writers,
+                "prewarm_task_ids": prewarms,
+            }
+            if groups.get(binding["scheduler_id"]) != binding:
+                raise RelayStorageFailure()
+            if target not in writers and task.task_id not in prewarms:
+                continue
+            is_writer = task.kind == "implementation"
+            writer_slot: int | None = None
+            if is_writer:
+                slot_row = cursor.execute(
+                    """
+                    SELECT slot FROM relay_v3_scheduler_writer_slots
+                    WHERE run_id = ? AND scheduler_id = ? AND task_id = ?
+                    """,
+                    (run.run_id, binding["scheduler_id"], task.task_id),
+                ).fetchone()
+                if slot_row is None:
+                    raise RelayStorageFailure()
+                candidate_slot = slot_row["slot"]
+                if (
+                    type(candidate_slot) is not int
+                    or not 1 <= candidate_slot <= 3
+                    or candidate_slot != writers.index(task.task_id) + 1
+                ):
+                    raise RelayStorageFailure()
+                writer_slot = candidate_slot
+            return {
+                "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+                "plan_hash": run.plan_hash,
+                "topology_hash": topology_hash,
+                "group_binding_hash": canonical_hash(binding),
+                "scheduler_id": binding["scheduler_id"],
+                "coordinator_lease_id": binding["coordinator_lease_id"],
+                "worktree_identity": binding["worktree_identity"],
+                "writer_slot": writer_slot,
                 "read_only": not is_writer,
             }
         raise RelayStorageFailure()
@@ -2196,16 +2248,19 @@ class RelayStore:
             (run_id, RelayTaskState.READY.value, RelayTaskState.PREPARED.value),
         ).fetchall()
         tasks = tuple(self._task_from_row(row) for row in rows)
-        task_by_id = {task.task_id: task for task in tasks}
+        all_tasks = {
+            task.task_id: task
+            for task in self._tasks_for_run(cursor, run_id)
+        }
         return tuple(
             task
             for task in tasks
             if not (
                 task.kind == "prewarm"
                 and isinstance(task.contract.get("prewarm_for_task_id"), str)
-                and task_by_id.get(str(task.contract["prewarm_for_task_id"]))
+                and all_tasks.get(str(task.contract["prewarm_for_task_id"]))
                 is not None
-                and task_by_id[str(task.contract["prewarm_for_task_id"])].contract.get(
+                and all_tasks[str(task.contract["prewarm_for_task_id"])].contract.get(
                     "split_verdict"
                 )
                 == "UNSPLITTABLE_SCOPE_CONFLICT"
@@ -2293,18 +2348,18 @@ class RelayStore:
             or payload.get("task_contract") != task.task_contract()
         ):
             raise RelayStorageFailure()
-        projection = self._host_scheduler_projection(cursor, run, task)
-        if projection is None:
-            if "host_scheduler_topology" in payload:
+        slot = self._host_scheduler_projection(cursor, run, task)
+        if slot is None:
+            if "relay_host_scheduler_slot" in payload:
                 raise RelayStorageFailure()
-        elif payload.get("host_scheduler_topology") != projection:
+        elif payload.get("relay_host_scheduler_slot") != slot:
             raise RelayStorageFailure()
         context: dict[str, object] = {
             "route": _task_route(task),
             "task_contract": task.task_contract(),
         }
-        if projection is not None:
-            context["host_scheduler_topology"] = projection
+        if slot is not None:
+            context["relay_host_scheduler_slot"] = slot
         if task.kind == "implementation":
             bootstrap = payload.get("worktree_bootstrap")
             if type(bootstrap) is not dict:
@@ -3037,7 +3092,7 @@ class RelayStore:
     @staticmethod
     def _run_from_row(row: sqlite3.Row) -> RelayRun:
         capacity = row["capacity"]
-        if type(capacity) is not int or not 1 <= capacity <= 3:
+        if type(capacity) is not int or not 1 <= capacity <= 9:
             raise RelayStorageFailure()
         integration_head = row["integration_head"]
         integration_version = row["integration_version"]
@@ -3206,6 +3261,32 @@ class RelayStore:
             not _opaque_topology_value(task.get("task_id")) for task in tasks
         ):
             raise RelayTopologyInvalid()
+        implementation_ids = {
+            str(task["task_id"])
+            for task in tasks
+            if task.get("kind") == "implementation"
+            and task.get("split_verdict") != "UNSPLITTABLE_SCOPE_CONFLICT"
+        }
+        split_children: dict[str, set[str]] = {}
+        for task_id in implementation_ids:
+            parent_id = task_index[task_id].get("split_parent_task_id")
+            if type(parent_id) is str:
+                split_children.setdefault(parent_id, set()).add(task_id)
+        prewarm_targets: dict[str, set[str]] = {}
+        for task in tasks:
+            if task.get("kind") != "prewarm":
+                continue
+            target = task.get("prewarm_for_task_id")
+            members = (
+                {target}
+                if type(target) is str and target in implementation_ids
+                else set(split_children.get(target, set()))
+                if type(target) is str
+                else set()
+            )
+            if members:
+                prewarm_targets[str(task["task_id"])] = members
+        prewarm_ids = set(prewarm_targets)
 
         groups: list[dict[str, object]] = []
         scheduler_ids: set[str] = set()
@@ -3263,6 +3344,7 @@ class RelayStore:
                 if (
                     task_id not in task_index
                     or task_index[task_id].get("kind") != "implementation"
+                    or task_id not in implementation_ids
                 ):
                     raise RelayTopologyInvalid()
                 if task_id in writer_owner:
@@ -3272,6 +3354,8 @@ class RelayStore:
                 if (
                     task_id not in task_index
                     or task_index[task_id].get("kind") != "prewarm"
+                    or task_id not in prewarm_ids
+                    or not prewarm_targets[task_id] <= set(writers)
                 ):
                     raise RelayTopologyInvalid()
                 if task_id in prewarm_owner:
@@ -3287,15 +3371,6 @@ class RelayStore:
                 }
             )
 
-        implementation_ids = {
-            str(task["task_id"])
-            for task in tasks
-            if task.get("kind") == "implementation"
-            and task.get("split_verdict") != "UNSPLITTABLE_SCOPE_CONFLICT"
-        }
-        prewarm_ids = {
-            str(task["task_id"]) for task in tasks if task.get("kind") == "prewarm"
-        }
         if (
             set(writer_owner) != implementation_ids
             or set(prewarm_owner) != prewarm_ids
@@ -3380,10 +3455,13 @@ class RelayStore:
             if len(rows) != 1 or str(rows[0]["value"]) not in {
                 "5",
                 "6",
+                "7",
                 str(self._SCHEMA_VERSION),
             }:
                 raise RelaySchemaIncompatible()
             self._migrating_v5_to_v6 = str(rows[0]["value"]) == "5"
+            self._migrating_v6_to_v7 = str(rows[0]["value"]) == "6"
+            self._migrating_v7_to_v8 = str(rows[0]["value"]) == "7"
         except RelaySchemaIncompatible:
             raise
         except sqlite3.Error as error:
@@ -3411,7 +3489,7 @@ class RelayStore:
                         CHECK (integration_version >= 0),
                     capacity INTEGER NOT NULL
                         CHECK (typeof(capacity) = 'integer')
-                        CHECK (capacity BETWEEN 1 AND 3),
+                        CHECK (capacity BETWEEN 1 AND 9),
                     schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
                     created_at TEXT NOT NULL
                 );
@@ -3661,7 +3739,24 @@ class RelayStore:
                 """,
                 ("schema_version", str(self._SCHEMA_VERSION)),
             )
-            if self._migrating_v5_to_v6:
+            if self._migrating_v7_to_v8:
+                self._migrate_runs_capacity_to_v8()
+                connection.execute(
+                    """
+                    UPDATE relay_v3_schema_metadata SET value = '8'
+                    WHERE key = ? AND value = '7'
+                    """,
+                    ("schema_version",),
+                )
+            elif self._migrating_v6_to_v7:
+                connection.execute(
+                    """
+                    UPDATE relay_v3_schema_metadata SET value = '7'
+                    WHERE key = ? AND value = '6'
+                    """,
+                    ("schema_version",),
+                )
+            elif self._migrating_v5_to_v6:
                 connection.execute(
                     """
                     UPDATE relay_v3_schema_metadata SET value = '6'
@@ -3669,16 +3764,50 @@ class RelayStore:
                     """,
                     ("schema_version",),
                 )
-            else:
-                connection.execute(
-                    """
-                    UPDATE relay_v3_schema_metadata SET value = ?
-                    WHERE key = ? AND value = '6'
-                    """,
-                    (str(self._SCHEMA_VERSION), "schema_version"),
-                )
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
+
+    def _migrate_runs_capacity_to_v8(self) -> None:
+        """Upgrade the durable run-capacity check without weakening foreign keys."""
+
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("relay_v3_runs",),
+        ).fetchone()
+        if row is None or "capacity BETWEEN 1 AND 9" in str(row["sql"]):
+            return
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE relay_v3_runs_v8 (
+                    run_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL UNIQUE,
+                    plan_hash TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    input_snapshot_id TEXT NOT NULL,
+                    base_commit TEXT NOT NULL,
+                    integration_head TEXT NOT NULL,
+                    integration_version INTEGER NOT NULL
+                        CHECK (integration_version >= 0),
+                    capacity INTEGER NOT NULL
+                        CHECK (typeof(capacity) = 'integer')
+                        CHECK (capacity BETWEEN 1 AND 9),
+                    schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO relay_v3_runs_v8
+                SELECT * FROM relay_v3_runs;
+                DROP TABLE relay_v3_runs;
+                ALTER TABLE relay_v3_runs_v8 RENAME TO relay_v3_runs;
+                """
+            )
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RelaySchemaIncompatible()
 
     def _assert_schema_shape(self) -> None:
         connection = self._require_connection()

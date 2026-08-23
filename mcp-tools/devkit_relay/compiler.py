@@ -1451,7 +1451,7 @@ def _normalize_scheduler_topology(
         if task.get("split_verdict") != "UNSPLITTABLE_SCOPE_CONFLICT"
     }
     unsplittable_writers = set(all_writers) - set(writers)
-    prewarms = {
+    all_prewarms = {
         task["task_id"]: task
         for task in tasks
         if task.get("stage") == "a3_prewarm"
@@ -1461,6 +1461,21 @@ def _normalize_scheduler_topology(
         parent_id = task.get("split_parent_task_id")
         if type(parent_id) is str:
             split_children.setdefault(parent_id, []).append(task_id)
+    prewarm_targets: dict[str, set[str]] = {}
+    for task_id, task in all_prewarms.items():
+        target = task.get("prewarm_for_task_id")
+        members = (
+            {target}
+            if type(target) is str and target in writers
+            else set(split_children.get(target, []))
+            if type(target) is str
+            else set()
+        )
+        if members:
+            prewarm_targets[task_id] = members
+    prewarms = {
+        task_id: task for task_id, task in all_prewarms.items() if task_id in prewarm_targets
+    }
 
     normalized_groups: list[dict[str, object]] = []
     assigned_writers: set[str] = set()
@@ -1505,16 +1520,24 @@ def _normalize_scheduler_topology(
             expanded_writer_ids.extend(members)
         if len(expanded_writer_ids) > _MAX_WRITERS_PER_SCHEDULER:
             raise RelayPlanError("invalid_scheduler_topology")
-        if any(task_id not in prewarms or task_id in assigned_prewarms for task_id in prewarm_ids):
-            raise RelayPlanError("invalid_scheduler_topology")
-        assigned_prewarms.update(prewarm_ids)
+        normalized_prewarms: list[str] = []
+        for task_id in prewarm_ids:
+            if task_id not in prewarms:
+                continue
+            if (
+                task_id in assigned_prewarms
+                or not prewarm_targets[task_id] <= set(expanded_writer_ids)
+            ):
+                raise RelayPlanError("invalid_scheduler_topology")
+            assigned_prewarms.add(task_id)
+            normalized_prewarms.append(task_id)
         normalized_groups.append(
             {
                 "scheduler_id": scheduler_id,
                 "coordinator_lease_id": lease_id,
                 "worktree_identity": worktree_identity,
                 "writer_task_ids": sorted(expanded_writer_ids),
-                "prewarm_task_ids": prewarm_ids,
+                "prewarm_task_ids": normalized_prewarms,
             }
         )
     if assigned_writers != set(writers) or assigned_prewarms != set(prewarms):
