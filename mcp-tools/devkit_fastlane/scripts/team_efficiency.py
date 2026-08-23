@@ -34,6 +34,8 @@ MAX_GATE_TIMEOUT_SECONDS = 3600
 MAX_FAST_LANE_ROUTE_REQUEST_BYTES = 32 * 1024
 MAX_FAST_LANE_HOST_STATUS_BYTES = 3 * 1024 * 1024
 FAST_LANE_SLOT_IDS = ("slot-1", "slot-2", "slot-3")
+MAX_FAST_LANE_WRITERS_PER_SCHEDULER = 3
+MAX_FAST_LANE_TOTAL_WRITERS = 9
 MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS = 9
 MAX_FAST_LANE_INDEX_EVIDENCE_RECORDS = (
     len(FAST_LANE_SLOT_IDS) + MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS
@@ -48,8 +50,9 @@ FAST_LANE_REASONING_EFFORTS = frozenset(
 _FAST_LANE_DEFERRED_ROUTE_REASONS = frozenset(
     {"dependency_not_ready", "scope_conflict_active"}
 )
-_DEFAULT_FASTLANE_TASK_ROOT = Path(r"D:\bun\tmp\codex")
+_DEFAULT_FASTLANE_TASK_ROOT = Path(r"G:\2718lab\_codex\.codex-task-temp")
 _FASTLANE_TASK_ROOT_ENV = "CODEX_FASTLANE_TASK_ROOT"
+MAX_BOOTSTRAP_ATTESTATION_TTL_SECONDS = 120
 MAX_PYTHON_CACHE_PATH_LENGTH = 240
 _SHORT_TASK_CACHE_DIRECTORY = "t"
 _SHORT_TASK_CACHE_HASH_LENGTH = 16
@@ -134,6 +137,7 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
     {
         "schema",
         "work_package",
+        "project_binding",
         "target_gates",
         "execution_contexts",
         "read_contexts",
@@ -144,14 +148,18 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
 _FAST_LANE_REQUEST_HOST_PRIVATE_FIELDS = frozenset(
     {
         "host_status",
+        "index_evidence",
+        "trusted_index_evidence_hashes",
+        "index_evaluation_time_utc_z",
+    }
+)
+_FAST_LANE_LEGACY_QUOTA_DESCRIPTOR_FIELDS = frozenset(
+    {
         "quota_request",
         "quota_trusted_key_resolver",
         "quota_evaluation_time_utc_z",
         "quota_verified_route_result_hashes",
         "quota_verified_lease_scope_bindings",
-        "index_evidence",
-        "trusted_index_evidence_hashes",
-        "index_evaluation_time_utc_z",
     }
 )
 _WORK_PACKAGE_V2_FIELDS = frozenset(
@@ -169,6 +177,61 @@ _PROJECT_FENCE_FIELDS = frozenset(
 )
 _PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
 _WORK_PACKAGE_V2_SCHEMA = "team-efficiency/work-package-v2"
+_PROJECT_BINDING_SCHEMA = "2718lab-devkit/project-binding-v1"
+_BOOTSTRAP_ATTESTATION_SCHEMA = "2718lab-devkit/new-project-bootstrap-attestation-v1"
+_PROJECT_BINDING_FIELDS = frozenset(
+    {
+        "schema",
+        "mode",
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+        "attestation",
+        "binding_hash",
+    }
+)
+_BOOTSTRAP_ATTESTATION_FIELDS = frozenset(
+    {
+        "schema",
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+        "initial_manifest_hash",
+        "initial_entry_count",
+        "state",
+        "capability_epoch",
+        "capability_hash",
+        "attested_input_snapshot_id",
+        "issued_at",
+        "expires_at",
+        "attestation_hash",
+    }
+)
+_BOOTSTRAP_INDEX_DESCRIPTOR_FIELDS = frozenset(
+    {
+        "schema",
+        "kind",
+        "access",
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+        "initial_manifest_hash",
+        "capability_epoch",
+        "capability_hash",
+        "attested_input_snapshot_id",
+        "attestation_hash",
+        "binding_hash",
+    }
+)
+_BOOTSTRAP_INDEX_PLAN_FIELDS = frozenset(
+    {"schema", "status", "decision_code", "bootstrap_queue", "plan_hash"}
+)
 _FAST_LANE_EXECUTION_CONTEXT_FIELDS = frozenset(
     {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"}
 )
@@ -489,6 +552,7 @@ _FAST_LANE_PLAN_FIELDS = frozenset(
         "main_lane",
         "subagent_capacity",
         "assignments",
+        "bootstrap_queue",
         "ready_queue",
         "review_queue",
         "prewarm_queue",
@@ -499,6 +563,7 @@ _FAST_LANE_PLAN_FIELDS = frozenset(
         "terminal_protocol",
         "workflow_policy",
         "cross_session_dispatch_projection",
+        "scheduler_topology",
         "plan_hash",
     }
 )
@@ -512,13 +577,6 @@ _FAST_LANE_CROSS_SESSION_PROJECTION_FIELDS = frozenset(
         "local_active_count",
         "local_free",
         "main_pool_scope",
-        "global_main_target",
-        "global_main_active",
-        "global_main_free",
-        "global_main_free_after_local_starts",
-        "quota_evidence_hash",
-        "quota_snapshot_hash",
-        "quota_decision_hash",
         "dispatch_policy",
         "external_agent_count",
         "external_assignment_ids",
@@ -614,11 +672,6 @@ _FAST_LANE_EXTERNAL_LEASE_PREDECESSOR_FIELDS = frozenset(
         "role",
         "context_hash",
         "routing_result_hash",
-        "quota_evidence_hash",
-        "quota_snapshot_hash",
-        "quota_decision_hash",
-        "ledger_epoch",
-        "active_lease_set_hash",
     }
 )
 _FAST_LANE_PHASES = frozenset(
@@ -840,6 +893,19 @@ def _hash(value: object, field: str) -> str:
     return text.lower()
 
 
+class _BootstrapAttestationTimestampError(ValueError):
+    """Classify a syntactically exact bootstrap binding with invalid freshness."""
+
+
+def _bootstrap_attestation_timestamp(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _BootstrapAttestationTimestampError(f"{field} is invalid")
+    result = float(value)
+    if result != result or result in {float("inf"), float("-inf")}:
+        raise _BootstrapAttestationTimestampError(f"{field} is invalid")
+    return result
+
+
 def _project_fence_digest(value: object, field: str) -> str:
     text = _text(value, field, maximum=80)
     if _PROJECT_FENCE_SHA256.fullmatch(text) is None:
@@ -911,6 +977,122 @@ def _validated_work_package_v2(value: object) -> dict[str, Any]:
     }
 
 
+def _validated_project_binding(value: object) -> dict[str, Any]:
+    """Validate Task 2's exact opaque project-binding-v1 wrapper locally."""
+
+    source = _mapping(value, "project binding")
+    _exact_keys(source, _PROJECT_BINDING_FIELDS, "project binding")
+    if source["schema"] != _PROJECT_BINDING_SCHEMA:
+        raise ValueError("project binding schema is unknown")
+    mode = _text(source["mode"], "project binding.mode", maximum=32)
+    if mode not in {"indexed", "new_empty_bootstrap"}:
+        raise ValueError("project binding mode is unknown")
+    attestation_source = _mapping(source["attestation"], "project binding.attestation")
+    _exact_keys(
+        attestation_source,
+        _BOOTSTRAP_ATTESTATION_FIELDS,
+        "project binding.attestation",
+    )
+    if attestation_source["schema"] != _BOOTSTRAP_ATTESTATION_SCHEMA:
+        raise ValueError("project binding attestation schema is unknown")
+    if (
+        type(attestation_source["initial_entry_count"]) is not int
+        or not 0 <= attestation_source["initial_entry_count"] <= MAX_MANIFEST_UNITS
+    ):
+        raise ValueError("project binding initial entry count is invalid")
+    if (
+        type(attestation_source["capability_epoch"]) is not int
+        or not 1 <= attestation_source["capability_epoch"] <= 2**63 - 1
+    ):
+        raise ValueError("project binding capability epoch is invalid")
+    attestation = {
+        "schema": _BOOTSTRAP_ATTESTATION_SCHEMA,
+        "workflow_id": _text(
+            attestation_source["workflow_id"],
+            "project binding attestation.workflow_id",
+            maximum=256,
+        ),
+        "workspace_id": _hash(
+            attestation_source["workspace_id"],
+            "project binding attestation.workspace_id",
+        ),
+        "repository_id": _hash(
+            attestation_source["repository_id"],
+            "project binding attestation.repository_id",
+        ),
+        "project_id": _hash(
+            attestation_source["project_id"],
+            "project binding attestation.project_id",
+        ),
+        "bootstrap_root_identity": _hash(
+            attestation_source["bootstrap_root_identity"],
+            "project binding attestation.bootstrap_root_identity",
+        ),
+        "initial_manifest_hash": _hash(
+            attestation_source["initial_manifest_hash"],
+            "project binding attestation.initial_manifest_hash",
+        ),
+        "initial_entry_count": attestation_source["initial_entry_count"],
+        "state": _text(
+            attestation_source["state"], "project binding attestation.state", maximum=32
+        ),
+        "capability_epoch": attestation_source["capability_epoch"],
+        "capability_hash": _hash(
+            attestation_source["capability_hash"],
+            "project binding attestation.capability_hash",
+        ),
+        "attested_input_snapshot_id": _hash(
+            attestation_source["attested_input_snapshot_id"],
+            "project binding attestation.attested_input_snapshot_id",
+        ),
+        "issued_at": attestation_source["issued_at"],
+        "expires_at": attestation_source["expires_at"],
+    }
+    _bootstrap_attestation_timestamp(
+        attestation["issued_at"], "project binding attestation.issued_at"
+    )
+    _bootstrap_attestation_timestamp(
+        attestation["expires_at"], "project binding attestation.expires_at"
+    )
+    attestation_hash = _hash(
+        attestation_source["attestation_hash"],
+        "project binding attestation.attestation_hash",
+    )
+    if not hmac.compare_digest(attestation_hash, _sha256_json(attestation)):
+        raise ValueError("project binding attestation hash is unknown")
+    attestation = {**attestation, "attestation_hash": attestation_hash}
+    normalized = {
+        "schema": _PROJECT_BINDING_SCHEMA,
+        "mode": mode,
+        "workflow_id": _text(
+            source["workflow_id"], "project binding.workflow_id", maximum=256
+        ),
+        "workspace_id": _hash(source["workspace_id"], "project binding.workspace_id"),
+        "repository_id": _hash(
+            source["repository_id"], "project binding.repository_id"
+        ),
+        "project_id": _hash(source["project_id"], "project binding.project_id"),
+        "bootstrap_root_identity": _hash(
+            source["bootstrap_root_identity"],
+            "project binding.bootstrap_root_identity",
+        ),
+        "attestation": attestation,
+    }
+    for field in (
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+    ):
+        if normalized[field] != attestation[field]:
+            raise ValueError("project binding identities do not match attestation")
+    binding_hash = _hash(source["binding_hash"], "project binding.binding_hash")
+    if not hmac.compare_digest(binding_hash, _sha256_json(normalized)):
+        raise ValueError("project binding hash is unknown")
+    return {**normalized, "binding_hash": binding_hash}
+
+
 def _project_execution_block_details(
     request: object,
 ) -> tuple[str, dict[str, Any] | None]:
@@ -929,6 +1111,9 @@ def _project_execution_block_details(
 
     if _FAST_LANE_REQUEST_HOST_PRIVATE_FIELDS.intersection(raw_request):
         raise ValueError("fast-lane request must not contain host-private inputs")
+
+    if "project_binding" not in raw_request:
+        return "BOOTSTRAP_ATTESTATION_REQUIRED", None
 
     try:
         _exact_keys(raw_request, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
@@ -949,11 +1134,53 @@ def _project_execution_block_details(
             v2 = _validated_work_package_v2(package)
             # Validate the canonical V1 payload before classifying the V2
             # envelope as merely missing external authority.  This is a pure
-            # diagnostic parse: it cannot reach scheduler, host, quota, index,
+            # diagnostic parse: it cannot reach scheduler, host, or index,
             # worktree, or dispatch logic.
             _decompose_v1(v2["package"])
         except (TypeError, ValueError):
             return "PROJECT_BINDING_INVALID", None
+        try:
+            binding = _validated_project_binding(raw_request["project_binding"])
+        except _BootstrapAttestationTimestampError:
+            return "BOOTSTRAP_ATTESTATION_STALE", None
+        except (TypeError, ValueError):
+            return "BOOTSTRAP_ATTESTATION_UNKNOWN", None
+        if (
+            binding["workspace_id"] != v2["project_authority"]["workspace_id"]
+            or binding["project_id"]
+            != f"sha256:{v2['project_authority']['project_id']}"
+            or binding["attestation"]["attested_input_snapshot_id"]
+            != v2["project_authority"]["input_snapshot_id"]
+        ):
+            return "BOOTSTRAP_ATTESTATION_MISMATCH", None
+        if binding["mode"] == "new_empty_bootstrap":
+            attestation = binding["attestation"]
+            if (
+                attestation["state"] != "new_empty"
+                or attestation["initial_entry_count"] != 0
+            ):
+                return "BOOTSTRAP_PROJECT_NOT_EMPTY", None
+            issued = _bootstrap_attestation_timestamp(
+                attestation["issued_at"], "project binding attestation.issued_at"
+            )
+            expires = _bootstrap_attestation_timestamp(
+                attestation["expires_at"], "project binding attestation.expires_at"
+            )
+            now = datetime.now(UTC).timestamp()
+            if (
+                now >= expires
+                or issued > now
+                or expires <= issued
+                or expires - issued > MAX_BOOTSTRAP_ATTESTATION_TTL_SECONDS
+            ):
+                return "BOOTSTRAP_ATTESTATION_STALE", None
+            return (
+                "BOOTSTRAP_INDEX_READY",
+                {
+                    "schema": "team-efficiency/new-empty-bootstrap-source-v1",
+                    "binding": binding,
+                },
+            )
         return (
             "PROJECT_AUTHORITY_UNAVAILABLE",
             {
@@ -1126,6 +1353,58 @@ def _reject_reparse_points_below(path: Path, root: Path, field: str) -> None:
             raise ValueError(f"{field} must not use reparse points")
 
 
+def _trusted_hosted_runner_temp() -> Path | None:
+    if (
+        os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("RUNNER_OS") != "Windows"
+        or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        return None
+    configured = os.environ.get("RUNNER_TEMP")
+    if not configured or configured != configured.strip():
+        return None
+    normalized = configured.replace("/", "\\")
+    if normalized.startswith("\\\\"):
+        return None
+    candidate = Path(configured)
+    if (
+        not candidate.is_absolute()
+        or candidate == Path(candidate.anchor)
+        or any(part == ".." for part in candidate.parts)
+        or any(part.rstrip(" .") != part for part in candidate.parts[1:])
+        or not candidate.is_dir()
+    ):
+        return None
+    current = candidate
+    while True:
+        if _path_has_reparse_point(current):
+            return None
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    resolved = candidate.resolve(strict=True)
+    if (
+        not resolved.is_absolute()
+        or resolved == Path(resolved.anchor)
+        or any(part.rstrip(" .") != part for part in resolved.parts[1:])
+    ):
+        return None
+    return resolved
+
+
+def _is_approved_fastlane_task_root(
+    candidate: Path, hosted_runner_temp: Path | None
+) -> bool:
+    if hosted_runner_temp is not None:
+        try:
+            relative = candidate.relative_to(hosted_runner_temp)
+        except ValueError:
+            return False
+        return bool(relative.parts)
+    return candidate.drive.casefold() == "g:" and candidate != Path(candidate.anchor)
+
+
 def _configured_fastlane_task_root() -> Path:
     configured = os.environ.get(_FASTLANE_TASK_ROOT_ENV)
     if configured is None:
@@ -1145,7 +1424,8 @@ def _configured_fastlane_task_root() -> Path:
         or any(part.rstrip(" .") != part for part in candidate.parts[1:])
     ):
         raise ValueError("configured fast-lane task root must be absolute")
-    if candidate.drive.casefold() == "c:" or candidate == Path(candidate.anchor):
+    hosted_runner_temp = _trusted_hosted_runner_temp()
+    if not _is_approved_fastlane_task_root(candidate, hosted_runner_temp):
         raise ValueError("configured fast-lane task root is not approved")
     if not candidate.is_dir():
         raise ValueError("configured fast-lane task root must be an existing directory")
@@ -1160,10 +1440,8 @@ def _configured_fastlane_task_root() -> Path:
             break
         current = parent
     resolved = candidate.resolve(strict=True)
-    if (
-        resolved.drive.casefold() == "c:"
-        or resolved == Path(resolved.anchor)
-        or any(part.rstrip(" .") != part for part in resolved.parts[1:])
+    if not _is_approved_fastlane_task_root(resolved, hosted_runner_temp) or any(
+        part.rstrip(" .") != part for part in resolved.parts[1:]
     ):
         raise ValueError("configured fast-lane task root is not approved")
     return resolved
@@ -1353,8 +1631,11 @@ def build_bootstrap_plan(
         project=normalized_project,
         write_scope=normalized_scope,
     )
+    # The pycache tree already embeds the absolute, isolated worktree path.
+    # Keep its prefix at the fenced task root so the G-drive migration retains
+    # the existing Win32 path-length safety margin for deep projects.
     _enforce_python_cache_path_budget(
-        temp_path / "p",
+        task_root / "p",
         worktree_path,
         write_scope=normalized_scope,
     )
@@ -3672,6 +3953,278 @@ def _conflict_graph(units: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
                 graph[left["task_id"]].append(right["task_id"])
                 graph[right["task_id"]].append(left["task_id"])
     return {task_id: sorted(neighbors) for task_id, neighbors in sorted(graph.items())}
+
+
+_FAST_LANE_TOPOLOGY_FIELDS = frozenset(
+    {
+        "schema",
+        "plan_binding_hash",
+        "host_capacity",
+        "max_writers_per_scheduler",
+        "max_writers_total",
+        "groups",
+        "topology_hash",
+    }
+)
+_FAST_LANE_TOPOLOGY_GROUP_FIELDS = frozenset(
+    {
+        "group_id",
+        "scheduler_id",
+        "coordinator_lease_id",
+        "worktree_identity",
+        "writer_task_ids",
+        "prewarm_task_ids",
+    }
+)
+
+
+def _fast_lane_scheduler_topology(
+    *,
+    plan_binding_hash: object,
+    host_capacity: object,
+    groups: object,
+) -> dict[str, Any]:
+    """Seal an auditable, non-executing scheduler topology.
+
+    The topology deliberately contains hashes rather than scheduler leases or
+    filesystem paths.  It may describe at most three scheduler groups and is
+    admissible only when every proposed participant fits current host capacity.
+    Scope claims are validation-only input and never leave this opaque receipt.
+    """
+
+    binding_hash = _hash(plan_binding_hash, "topology.plan_binding_hash")
+    if not isinstance(host_capacity, int) or isinstance(host_capacity, bool):
+        raise ValueError("topology.host_capacity must be an integer")
+    if not 0 <= host_capacity <= MAX_FAST_LANE_TOTAL_WRITERS:
+        raise ValueError("topology.host_capacity is out of bounds")
+    if not isinstance(groups, Sequence) or isinstance(groups, (str, bytes, bytearray)):
+        raise ValueError("topology.groups must be a list")
+    if len(groups) > MAX_FAST_LANE_TOTAL_WRITERS // MAX_FAST_LANE_WRITERS_PER_SCHEDULER:
+        raise ValueError("topology.groups is out of bounds")
+
+    normalized: list[dict[str, Any]] = []
+    writer_ids: set[str] = set()
+    participant_ids: set[str] = set()
+    for index, raw_group in enumerate(groups):
+        group = _mapping(raw_group, f"topology.groups[{index}]")
+        allowed = set(_FAST_LANE_TOPOLOGY_GROUP_FIELDS) | {
+            "writer_scope_claims",
+            "declared_child_splits",
+        }
+        unknown = set(group) - allowed
+        missing = set(_FAST_LANE_TOPOLOGY_GROUP_FIELDS) - set(group)
+        if unknown or missing:
+            raise ValueError("topology group schema is invalid")
+        group_id = _text(
+            group["group_id"], f"topology.groups[{index}].group_id", maximum=1
+        )
+        if group_id != chr(ord("A") + index):
+            raise ValueError("topology groups must be ordered A/B/C")
+        writers = _normalised_list(
+            group["writer_task_ids"],
+            f"topology.groups[{index}].writer_task_ids",
+            _task_id,
+            maximum=MAX_FAST_LANE_WRITERS_PER_SCHEDULER,
+        )
+        prewarms = _normalised_list(
+            group["prewarm_task_ids"],
+            f"topology.groups[{index}].prewarm_task_ids",
+            _task_id,
+            maximum=MAX_LIST_ITEMS,
+        )
+        if set(writers) & set(prewarms):
+            raise ValueError("topology task cannot be both writer and read-only")
+        if writer_ids & set(writers) or participant_ids & set(prewarms):
+            raise ValueError("topology task appears in multiple groups")
+
+        claims_value = group.get("writer_scope_claims")
+        scopes: dict[str, list[str]] = {}
+        if claims_value is not None:
+            claims = _mapping(
+                claims_value, f"topology.groups[{index}].writer_scope_claims"
+            )
+            if set(claims) != set(writers):
+                raise ValueError("topology writer scope claims must match writers")
+            scopes = {
+                task_id: _normalised_scopes(
+                    claims[task_id], f"topology scope {task_id}"
+                )
+                for task_id in writers
+            }
+            if any(
+                _scope_conflicts(scopes[left], scopes[right])
+                for position, left in enumerate(writers)
+                for right in writers[position + 1 :]
+            ):
+                # Scheduler workers may only receive already-declared,
+                # strictly reduced child scopes.  This compiler does not infer
+                # a split from an overlap, so overlap is an auditable stop.
+                raise ValueError("UNSPLITTABLE")
+        if "declared_child_splits" in group:
+            splits = group["declared_child_splits"]
+            if not isinstance(splits, Sequence) or isinstance(
+                splits, (str, bytes, bytearray)
+            ):
+                raise ValueError("topology.declared_child_splits must be a list")
+            if len(splits) > len(writers) or (splits and not scopes):
+                raise ValueError("UNSPLITTABLE")
+            seen_children: set[str] = set()
+            for split_index, raw_split in enumerate(splits):
+                split = _mapping(
+                    raw_split,
+                    f"topology.groups[{index}].declared_child_splits[{split_index}]",
+                )
+                _exact_keys(
+                    split,
+                    frozenset(
+                        {
+                            "parent_task_id",
+                            "child_task_id",
+                            "parent_scope",
+                            "child_scope",
+                        }
+                    ),
+                    "declared child split",
+                )
+                child_task_id = _task_id(
+                    split["child_task_id"], "declared child split.child_task_id"
+                )
+                _task_id(split["parent_task_id"], "declared child split.parent_task_id")
+                parent_scope = _normalised_scopes(
+                    split["parent_scope"], "declared child split.parent_scope"
+                )
+                child_scope = _normalised_scopes(
+                    split["child_scope"], "declared child split.child_scope"
+                )
+                if (
+                    child_task_id not in writers
+                    or child_task_id in seen_children
+                    or child_scope != scopes[child_task_id]
+                    or child_scope == parent_scope
+                    or not all(
+                        any(
+                            child.split("/")[: len(parent.split("/"))]
+                            == parent.split("/")
+                            and child != parent
+                            for parent in parent_scope
+                        )
+                        for child in child_scope
+                    )
+                ):
+                    raise ValueError("UNSPLITTABLE")
+                seen_children.add(child_task_id)
+
+        normalized.append(
+            {
+                "group_id": group_id,
+                "scheduler_id": _hash(group["scheduler_id"], "topology.scheduler_id"),
+                "coordinator_lease_id": _hash(
+                    group["coordinator_lease_id"], "topology.coordinator_lease_id"
+                ),
+                "worktree_identity": _hash(
+                    group["worktree_identity"], "topology.worktree_identity"
+                ),
+                "writer_task_ids": writers,
+                "prewarm_task_ids": prewarms,
+            }
+        )
+        writer_ids.update(writers)
+        participant_ids.update(writers)
+        participant_ids.update(prewarms)
+    if (
+        len(writer_ids) > MAX_FAST_LANE_TOTAL_WRITERS
+        or len(participant_ids) > host_capacity
+    ):
+        raise ValueError("topology exceeds host capacity")
+
+    topology: dict[str, Any] = {
+        "schema": "2718lab-devkit/scheduler-topology-v1",
+        "plan_binding_hash": binding_hash,
+        "host_capacity": host_capacity,
+        "max_writers_per_scheduler": MAX_FAST_LANE_WRITERS_PER_SCHEDULER,
+        "max_writers_total": MAX_FAST_LANE_TOTAL_WRITERS,
+        "groups": normalized,
+    }
+    topology["topology_hash"] = _sha256_json(topology)
+    _exact_keys(topology, _FAST_LANE_TOPOLOGY_FIELDS, "scheduler topology")
+    return topology
+
+
+def _fast_lane_plan_topology(
+    validated: Mapping[str, Any],
+    assignments: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bind current, actually admissible assignments to Topology V1."""
+
+    source_plan_hash = _hash(validated["source_plan_hash"], "source plan hash")
+    phase = _fast_lane_phase(validated["scheduler_state"])
+    active = [
+        assignment
+        for assignment in assignments
+        if assignment.get("action", "retain") in {"start", "retain"}
+    ]
+    writers = sorted(
+        str(assignment["task_id"])
+        for assignment in active
+        if assignment.get("role") == "execution"
+    )
+    readers = sorted(
+        str(assignment["task_id"])
+        for assignment in active
+        if assignment.get("role") != "execution"
+    )
+    unit_by_task_id = _fast_lane_unit_index(validated["source_plan"])
+    worktree_contexts = sorted(
+        _hash(assignment["context_hash"], "assignment context hash")
+        for assignment in active
+        if assignment.get("role") == "execution"
+    )
+    binding = _sha256_json(
+        {
+            "source_plan_hash": source_plan_hash,
+            "phase": phase,
+            "assignments": [
+                {
+                    "task_id": assignment["task_id"],
+                    "role": assignment["role"],
+                    "assignment_token": assignment["assignment_token"],
+                    "context_hash": assignment["context_hash"],
+                }
+                for assignment in active
+            ],
+        }
+    )
+    if not active:
+        return _fast_lane_scheduler_topology(
+            plan_binding_hash=binding, host_capacity=len(FAST_LANE_SLOT_IDS), groups=[]
+        )
+    return _fast_lane_scheduler_topology(
+        plan_binding_hash=binding,
+        host_capacity=len(FAST_LANE_SLOT_IDS),
+        groups=[
+            {
+                "group_id": "A",
+                "scheduler_id": _sha256_json(
+                    {"source_plan_hash": source_plan_hash, "group_id": "A"}
+                ),
+                "coordinator_lease_id": _sha256_json(
+                    {
+                        "source_plan_hash": source_plan_hash,
+                        "phase": phase,
+                        "slot_epochs": validated["scheduler_state"]["slot_epochs"],
+                    }
+                ),
+                "worktree_identity": _sha256_json(worktree_contexts),
+                "writer_task_ids": writers,
+                "prewarm_task_ids": readers,
+                "writer_scope_claims": {
+                    task_id: unit_by_task_id[task_id]["write_scope"]
+                    for task_id in writers
+                },
+                "declared_child_splits": [],
+            }
+        ],
+    )
 
 
 def _maximal_ready_wave(
@@ -7934,6 +8487,7 @@ def _render_fast_lane_status(
         ),
         "subagent_capacity": len(FAST_LANE_SLOT_IDS),
         "assignments": assignments,
+        "bootstrap_queue": [],
         "ready_queue": ready_queue,
         "review_queue": review_queue,
         "prewarm_queue": prewarm_queue,
@@ -7954,10 +8508,8 @@ def _render_fast_lane_status(
             reference_result={},
             host_status=None,
             occupancy=None,
-            quota_evidence=_fast_lane_main_capacity_evidence_unknown(
-                "quota_usage_unknown"
-            ),
         ),
+        "scheduler_topology": _fast_lane_plan_topology(validated, running_assignments),
     }
     result["plan_hash"] = _sha256_json(result)
     _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
@@ -8028,6 +8580,7 @@ def _fast_lane_project_fence_blocked_plan(
         ),
         "subagent_capacity": len(FAST_LANE_SLOT_IDS),
         "assignments": [],
+        "bootstrap_queue": [],
         "ready_queue": [],
         "review_queue": [],
         "prewarm_queue": [],
@@ -8042,13 +8595,53 @@ def _fast_lane_project_fence_blocked_plan(
             reference_result={},
             host_status=None,
             occupancy=None,
-            quota_evidence=_fast_lane_main_capacity_evidence_unknown(
-                "quota_usage_unknown"
+        ),
+        "scheduler_topology": _fast_lane_scheduler_topology(
+            plan_binding_hash=_sha256_json(
+                {"source_plan_hash": source_plan_hash, "status": "blocked"}
             ),
+            host_capacity=0,
+            groups=[],
         ),
     }
     result["plan_hash"] = _sha256_json(result)
     _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    return result
+
+
+def _fast_lane_bootstrap_index_ready_plan(
+    *,
+    source_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Emit only the read-only descriptor for an attested empty project."""
+
+    binding = _mapping(source_identity["binding"], "new-empty bootstrap binding")
+    attestation = _mapping(binding["attestation"], "new-empty bootstrap attestation")
+    descriptor = {
+        "schema": "team-efficiency/bootstrap-index-descriptor-v1",
+        "kind": "bootstrap_index",
+        "access": "read_only",
+        "workflow_id": binding["workflow_id"],
+        "workspace_id": binding["workspace_id"],
+        "repository_id": binding["repository_id"],
+        "project_id": binding["project_id"],
+        "bootstrap_root_identity": binding["bootstrap_root_identity"],
+        "initial_manifest_hash": attestation["initial_manifest_hash"],
+        "capability_epoch": attestation["capability_epoch"],
+        "capability_hash": attestation["capability_hash"],
+        "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "attestation_hash": attestation["attestation_hash"],
+        "binding_hash": binding["binding_hash"],
+    }
+    _exact_keys(descriptor, _BOOTSTRAP_INDEX_DESCRIPTOR_FIELDS, "bootstrap index")
+    result: dict[str, Any] = {
+        "schema": "team-efficiency/bootstrap-index-plan-v1",
+        "status": "bootstrap",
+        "decision_code": "BOOTSTRAP_INDEX_READY",
+        "bootstrap_queue": [descriptor],
+    }
+    result["plan_hash"] = _sha256_json(result)
+    _exact_keys(result, _BOOTSTRAP_INDEX_PLAN_FIELDS, "bootstrap index plan")
     return result
 
 
@@ -8180,291 +8773,12 @@ def _render_fast_lane_plan(
     )
 
 
-def _fast_lane_quota_module() -> Any:
-    script = Path(__file__).with_name("fastlane_quota_balance.py")
-    spec = importlib.util.spec_from_file_location("fastlane_quota_balance", script)
-    if spec is None or spec.loader is None:
-        raise ValueError("quota balance module is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["fastlane_quota_balance"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _codex_account_quota_module() -> Any:
-    script = Path(__file__).with_name("codex_account_quota.py")
-    spec = importlib.util.spec_from_file_location("codex_account_quota", script)
-    if spec is None or spec.loader is None:
-        raise ValueError("Codex account quota provider is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["codex_account_quota"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _utc_now_z() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def _unavailable_quota_key(_key_id: str) -> bytes | None:
-    return None
-
-
-def _fast_lane_quota_unknown() -> dict[str, Any]:
-    decision = {
-        "schema": "2718lab-devkit/fastlane-quota-balance-result-v1",
-        "status": "usage_unknown",
-        "snapshot_hash": None,
-        "ledger_epoch": None,
-        "main_pressure": "unknown",
-        "global_main_target": 6,
-        "main_proposal_ids": [],
-        "spark_proposal_ids": [],
-        "admitted_candidate_ids": [],
-        "held_candidate_ids": [],
-        "route_lock_hashes": [],
-        "reason_codes": ["quota_usage_unknown"],
-        "audit_event_hash": "",
-    }
-    decision["decision_hash"] = _sha256_json(decision)
-    decision["audit_event_hash"] = _sha256_json(
-        {key: value for key, value in decision.items() if key != "audit_event_hash"}
-    )
-    return decision
-
-
-def _fast_lane_quota_decision(
-    quota_request: Mapping[str, Any],
-    *,
-    trusted_key_resolver: Callable[[str], bytes | None] | None,
-    evaluation_time_utc_z: str | None,
-    verified_route_result_hashes: Iterable[str],
-    verified_lease_scope_bindings: Iterable[str],
-) -> dict[str, Any]:
-    if trusted_key_resolver is None or not callable(trusted_key_resolver):
-        return _fast_lane_quota_unknown()
-    if not isinstance(evaluation_time_utc_z, str):
-        return _fast_lane_quota_unknown()
-    try:
-        module = _fast_lane_quota_module()
-        value = module.compile_quota_balance(
-            quota_request,
-            trusted_key_resolver=trusted_key_resolver,
-            evaluation_time_utc_z=evaluation_time_utc_z,
-            verified_route_result_hashes=verified_route_result_hashes,
-            verified_lease_scope_bindings=verified_lease_scope_bindings,
-        )
-    except (OSError, TypeError, ValueError):
-        return _fast_lane_quota_unknown()
-    if not isinstance(value, Mapping):
-        return _fast_lane_quota_unknown()
-    return dict(value)
-
-
-def _fast_lane_quota_start_allowed(
-    assignment: Mapping[str, Any],
-    quota_request: Mapping[str, Any],
-    quota_decision: Mapping[str, Any],
-) -> bool:
-    if assignment.get("action") != "start":
-        return True
-    admitted = quota_decision.get("admitted_candidate_ids")
-    candidates = quota_request.get("candidates")
-    if not isinstance(admitted, Sequence) or isinstance(
-        admitted, (str, bytes, bytearray)
-    ):
-        return False
-    if not isinstance(candidates, Sequence) or isinstance(
-        candidates, (str, bytes, bytearray)
-    ):
-        return False
-    admitted_ids = {item for item in admitted if isinstance(item, str)}
-    for raw_candidate in candidates:
-        if not isinstance(raw_candidate, Mapping):
-            continue
-        if raw_candidate.get("candidate_id") not in admitted_ids:
-            continue
-        route = raw_candidate.get("route_lock")
-        if not isinstance(route, Mapping):
-            continue
-        if (
-            route.get("result_hash") == assignment.get("routing_result_hash")
-            and raw_candidate.get("assignment_epoch")
-            == assignment.get("assignment_epoch")
-            and raw_candidate.get("assignment_token")
-            == assignment.get("assignment_token")
-            and raw_candidate.get("local_slot_id") == assignment.get("slot_id")
-            and raw_candidate.get("write_scope_hash")
-            == assignment.get("write_scope_hash")
-            and raw_candidate.get("input_snapshot_id")
-            == assignment.get("workspace_input_snapshot_id")
-        ):
-            return True
-    return False
-
-
-def _apply_fast_lane_quota_balance(
-    result: Mapping[str, Any],
-    *,
-    quota_request: Mapping[str, Any],
-    quota_decision: Mapping[str, Any],
-) -> dict[str, Any]:
-    assignments = result.get("assignments")
-    if not isinstance(assignments, Sequence) or isinstance(
-        assignments, (str, bytes, bytearray)
-    ):
-        raise TypeError("fast-lane assignments are invalid")
-    filtered_assignments = [
-        dict(assignment)
-        for assignment in assignments
-        if isinstance(assignment, Mapping)
-        and _fast_lane_quota_start_allowed(assignment, quota_request, quota_decision)
-    ]
-    refill_plan = _mapping(result["refill_plan"], "fast-lane refill plan")
-    updated = {
-        **result,
-        "assignments": filtered_assignments,
-        "refill_plan": {**refill_plan, "quota_balance": dict(quota_decision)},
-    }
-    updated["plan_hash"] = _sha256_json(
-        {key: value for key, value in updated.items() if key != "plan_hash"}
-    )
-    _exact_keys(updated, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
-    if len(_json_bytes(updated)) > MAX_MANIFEST_BYTES:
-        raise ValueError("fast-lane plan exceeds its byte budget")
-    return updated
-
-
-def _fast_lane_main_capacity_evidence_unknown(reason: str) -> dict[str, Any]:
-    evidence = {
-        "schema": "2718lab-devkit/fastlane-main-capacity-evidence-v1",
-        "status": "blocked",
-        "snapshot_hash": None,
-        "decision_hash": None,
-        "ledger_epoch": None,
-        "global_main_target": None,
-        "global_main_active": None,
-        "global_main_free": None,
-        "host_main_active": None,
-        "active_lease_set_hash": None,
-        "reason_codes": [reason],
-    }
-    return {**evidence, "evidence_hash": _sha256_json(evidence)}
-
-
-def _validated_fast_lane_main_capacity_evidence(value: object) -> dict[str, Any]:
-    evidence = _mapping(value, "main capacity evidence")
-    expected = frozenset(
-        {
-            "schema",
-            "status",
-            "snapshot_hash",
-            "decision_hash",
-            "ledger_epoch",
-            "global_main_target",
-            "global_main_active",
-            "global_main_free",
-            "host_main_active",
-            "active_lease_set_hash",
-            "reason_codes",
-            "evidence_hash",
-        }
-    )
-    _exact_keys(evidence, expected, "main capacity evidence")
-    if evidence["schema"] != "2718lab-devkit/fastlane-main-capacity-evidence-v1":
-        raise ValueError("main capacity evidence schema is invalid")
-    status = _text(evidence["status"], "main capacity evidence.status", maximum=32)
-    if status not in {"resolved", "blocked"}:
-        raise ValueError("main capacity evidence status is invalid")
-    reasons = _fast_lane_reason_codes(evidence["reason_codes"])
-    if reasons is None:
-        raise ValueError("main capacity evidence reasons are invalid")
-
-    def optional_hash(field: str) -> str | None:
-        item = evidence[field]
-        return None if item is None else _hash(item, f"main capacity evidence.{field}")
-
-    def optional_int(field: str, maximum: int) -> int | None:
-        item = evidence[field]
-        if item is None:
-            return None
-        if type(item) is not int or not 0 <= item <= maximum:
-            raise ValueError(f"main capacity evidence.{field} is invalid")
-        return item
-
-    normalized = {
-        "schema": evidence["schema"],
-        "status": status,
-        "snapshot_hash": optional_hash("snapshot_hash"),
-        "decision_hash": optional_hash("decision_hash"),
-        "ledger_epoch": optional_int("ledger_epoch", 2**63 - 1),
-        "global_main_target": optional_int("global_main_target", 12),
-        "global_main_active": optional_int("global_main_active", 12),
-        "global_main_free": optional_int("global_main_free", 12),
-        "host_main_active": optional_int("host_main_active", 8),
-        "active_lease_set_hash": optional_hash("active_lease_set_hash"),
-        "reason_codes": reasons,
-    }
-    if normalized["status"] == "resolved":
-        if (
-            normalized["global_main_target"] not in {6, 8, 10, 12}
-            or normalized["global_main_active"] is None
-            or normalized["host_main_active"] is None
-            or normalized["ledger_epoch"] is None
-            or normalized["snapshot_hash"] is None
-            or normalized["decision_hash"] is None
-            or normalized["active_lease_set_hash"] is None
-        ):
-            raise ValueError("resolved main capacity evidence is incomplete")
-        expected_free = max(
-            0,
-            normalized["global_main_target"] - normalized["global_main_active"],
-        )
-        if normalized["global_main_free"] != expected_free:
-            raise ValueError("main capacity evidence free count is invalid")
-    supplied_hash = _hash(
-        evidence["evidence_hash"], "main capacity evidence.evidence_hash"
-    )
-    if supplied_hash != _sha256_json(normalized):
-        raise ValueError("main capacity evidence hash is invalid")
-    return {**normalized, "evidence_hash": supplied_hash}
-
-
-def _fast_lane_main_capacity_evidence(
-    quota_request: Mapping[str, Any] | None,
-    *,
-    trusted_key_resolver: Callable[[str], bytes | None] | None,
-    evaluation_time_utc_z: str | None,
-    verified_route_result_hashes: Iterable[str],
-    verified_lease_scope_bindings: Iterable[str],
-) -> dict[str, Any]:
-    if quota_request is None:
-        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
-    if trusted_key_resolver is None or not callable(trusted_key_resolver):
-        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
-    if not isinstance(evaluation_time_utc_z, str):
-        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
-    try:
-        module = _fast_lane_quota_module()
-        evidence = module.compile_main_capacity_evidence(
-            quota_request,
-            trusted_key_resolver=trusted_key_resolver,
-            evaluation_time_utc_z=evaluation_time_utc_z,
-            verified_route_result_hashes=verified_route_result_hashes,
-            verified_lease_scope_bindings=verified_lease_scope_bindings,
-        )
-        return _validated_fast_lane_main_capacity_evidence(evidence)
-    except (OSError, TypeError, ValueError):
-        return _fast_lane_main_capacity_evidence_unknown("quota_usage_unknown")
-
-
 def _fast_lane_cross_session_projection(
     result: Mapping[str, Any],
     *,
     reference_result: Mapping[str, Any],
     host_status: Mapping[str, Any] | None,
     occupancy: Mapping[str, Any] | None,
-    quota_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Compile inert external-agent assignments from already-bound evidence."""
 
@@ -8482,19 +8796,11 @@ def _fast_lane_cross_session_projection(
         if host_status is None
         else _sha256_json({"workflow_id": host_status["workflow_id"]})
     )
-    evidence_hash = quota_evidence.get("evidence_hash")
-    snapshot_hash = quota_evidence.get("snapshot_hash")
-    decision_hash = quota_evidence.get("decision_hash")
-    target = quota_evidence.get("global_main_target")
-    global_active = quota_evidence.get("global_main_active")
-    global_free = quota_evidence.get("global_main_free")
 
     def seal(
         status: str,
         reason_codes: Sequence[str],
         assignments: Sequence[Mapping[str, Any]] = (),
-        *,
-        global_free_after_local_starts: int | None = None,
     ) -> dict[str, Any]:
         normalized_assignments = [dict(item) for item in assignments]
         dispatch_policy = {
@@ -8518,7 +8824,7 @@ def _fast_lane_cross_session_projection(
             "cross-session dispatch policy",
         )
         projection = {
-            "schema": "team-efficiency/fast-lane-cross-session-dispatch-projection-v2",
+            "schema": "team-efficiency/fast-lane-cross-session-dispatch-projection-v3",
             "status": status,
             "dispatch_policy": dispatch_policy,
             "source_plan_hash": source_plan_hash,
@@ -8527,13 +8833,6 @@ def _fast_lane_cross_session_projection(
             "local_active_count": local_active_count,
             "local_free": local_free,
             "main_pool_scope": "all_non_spark_agents_across_sessions",
-            "global_main_target": target,
-            "global_main_active": global_active,
-            "global_main_free": global_free,
-            "global_main_free_after_local_starts": global_free_after_local_starts,
-            "quota_evidence_hash": evidence_hash,
-            "quota_snapshot_hash": snapshot_hash,
-            "quota_decision_hash": decision_hash,
             "external_agent_count": len(normalized_assignments),
             "external_assignment_ids": [
                 item["assignment_id"] for item in normalized_assignments
@@ -8551,16 +8850,6 @@ def _fast_lane_cross_session_projection(
 
     if host_status is None or occupancy is None or local_active_count is None:
         return seal("blocked", ("host_status_unavailable",))
-    if quota_evidence.get("status") != "resolved":
-        reasons = quota_evidence.get("reason_codes")
-        return seal(
-            "blocked",
-            reasons if isinstance(reasons, Sequence) else ("quota_usage_unknown",),
-        )
-    if local_active_count != quota_evidence.get("host_main_active"):
-        return seal("blocked", ("quota_host_status_fenced",))
-    if not isinstance(global_active, int) or global_active < local_active_count:
-        return seal("blocked", ("quota_global_capacity_fenced",))
     if (
         result.get("status") != "active"
         or result.get("decision_code") != "FAST_LANE_ACTIVE"
@@ -8592,48 +8881,23 @@ def _fast_lane_cross_session_projection(
     except (KeyError, TypeError, ValueError):
         return seal("blocked", ("local_assignment_invalid",))
     if reference_starts != admitted_starts:
-        return seal("blocked", ("quota_local_admission_incomplete",))
+        return seal("blocked", ("local_assignment_changed",))
     local_start_count = len(admitted_starts)
     if local_active_count + local_start_count > len(FAST_LANE_SLOT_IDS):
         return seal("blocked", ("local_capacity_overcommitted",))
     if local_active_count + local_start_count < len(FAST_LANE_SLOT_IDS):
         return seal("not_required", ("local_capacity_available",))
-    if not isinstance(global_free, int):
-        return seal("blocked", ("quota_usage_unknown",))
-    global_free_after_starts = max(0, global_free - local_start_count)
 
     queue = reference_result.get("ready_queue")
     if not isinstance(queue, Sequence) or isinstance(queue, (str, bytes, bytearray)):
-        return seal(
-            "blocked",
-            ("cross_session_queue_invalid",),
-            global_free_after_local_starts=global_free_after_starts,
-        )
+        return seal("blocked", ("cross_session_queue_invalid",))
     queued = [item for item in queue if isinstance(item, Mapping)]
     if len(queued) != len(queue):
-        return seal(
-            "blocked",
-            ("cross_session_queue_invalid",),
-            global_free_after_local_starts=global_free_after_starts,
-        )
+        return seal("blocked", ("cross_session_queue_invalid",))
     if not queued:
-        return seal(
-            "not_required",
-            ("no_external_session_required",),
-            global_free_after_local_starts=global_free_after_starts,
-        )
+        return seal("not_required", ("no_external_session_required",))
     if len(queued) > MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS:
-        return seal(
-            "blocked",
-            ("external_assignment_limit_exceeded",),
-            global_free_after_local_starts=global_free_after_starts,
-        )
-    if len(queued) > global_free_after_starts:
-        return seal(
-            "blocked",
-            ("quota_global_capacity_exhausted",),
-            global_free_after_local_starts=global_free_after_starts,
-        )
+        return seal("blocked", ("external_assignment_limit_exceeded",))
 
     try:
         external: list[dict[str, Any]] = []
@@ -8697,11 +8961,6 @@ def _fast_lane_cross_session_projection(
                 "role": role,
                 "context_hash": context_hash,
                 "routing_result_hash": route["routing_result_hash"],
-                "quota_evidence_hash": evidence_hash,
-                "quota_snapshot_hash": snapshot_hash,
-                "quota_decision_hash": decision_hash,
-                "ledger_epoch": quota_evidence["ledger_epoch"],
-                "active_lease_set_hash": quota_evidence["active_lease_set_hash"],
             }
             predecessor["predecessor_hash"] = _sha256_json(predecessor)
             _exact_keys(
@@ -8737,17 +8996,8 @@ def _fast_lane_cross_session_projection(
             )
             external.append(assignment)
     except (KeyError, TypeError, ValueError):
-        return seal(
-            "blocked",
-            ("cross_session_candidate_invalid",),
-            global_free_after_local_starts=global_free_after_starts,
-        )
-    return seal(
-        "external_session_required",
-        ("local_capacity_exhausted",),
-        external,
-        global_free_after_local_starts=global_free_after_starts,
-    )
+        return seal("blocked", ("cross_session_candidate_invalid",))
+    return seal("external_session_required", ("local_capacity_exhausted",), external)
 
 
 def _apply_fast_lane_cross_session_projection(
@@ -8756,7 +9006,6 @@ def _apply_fast_lane_cross_session_projection(
     reference_result: Mapping[str, Any],
     host_status: Mapping[str, Any] | None,
     occupancy: Mapping[str, Any] | None,
-    quota_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Attach pure projection data; public compiler does not reach this path."""
 
@@ -8765,7 +9014,6 @@ def _apply_fast_lane_cross_session_projection(
         reference_result=reference_result,
         host_status=host_status,
         occupancy=occupancy,
-        quota_evidence=quota_evidence,
     )
     updated = {**result, "cross_session_dispatch_projection": projection}
     updated["plan_hash"] = _sha256_json(
@@ -9005,11 +9253,6 @@ def compile_fast_lane(
     reasoning_effort: str,
     enable: bool = False,
     host_status: Mapping[str, Any] | None = None,
-    quota_request: Mapping[str, Any] | None = None,
-    quota_trusted_key_resolver: Callable[[str], bytes | None] | None = None,
-    quota_evaluation_time_utc_z: str | None = None,
-    quota_verified_route_result_hashes: Iterable[str] = (),
-    quota_verified_lease_scope_bindings: Iterable[str] = (),
     index_evidence: Sequence[Mapping[str, Any]] | None = None,
     trusted_index_evidence_hashes: Iterable[str] = (),
     index_evaluation_time_utc_z: str | None = None,
@@ -9017,23 +9260,29 @@ def compile_fast_lane(
     """Fail closed until an external Desktop project-authority bridge exists.
 
     The signature remains stable for the MCP adapter, but no request field,
-    host-status record, quota record, index record, module attribute, or
+    host-status record, index record, module attribute, or
     Python closure can authorize scheduling from this repository.
     """
 
     del (
         host_status,
-        quota_request,
-        quota_trusted_key_resolver,
-        quota_evaluation_time_utc_z,
-        quota_verified_route_result_hashes,
-        quota_verified_lease_scope_bindings,
         index_evidence,
         trusted_index_evidence_hashes,
         index_evaluation_time_utc_z,
     )
     activation = _fast_lane_activation(reasoning_effort, enable)
+    if isinstance(request, Mapping) and (
+        _FAST_LANE_LEGACY_QUOTA_DESCRIPTOR_FIELDS.intersection(request)
+    ):
+        return _fast_lane_project_fence_blocked_plan(
+            activation,
+            reason_code="FASTLANE_SCHEMA_UPGRADE_REQUIRED",
+        )
     reason_code, source_identity = _project_execution_block_details(request)
+    if reason_code == "BOOTSTRAP_INDEX_READY" and source_identity is not None:
+        return _fast_lane_bootstrap_index_ready_plan(
+            source_identity=source_identity,
+        )
     return _fast_lane_project_fence_blocked_plan(
         activation,
         reason_code=reason_code,
@@ -9078,16 +9327,6 @@ def _parser() -> argparse.ArgumentParser:
     fast_lane = commands.add_parser("fast-lane")
     fast_lane.add_argument("--input", required=True)
     fast_lane.add_argument("--host-status")
-    fast_lane.add_argument("--quota-input")
-    fast_lane.add_argument("--quota-evaluation-time")
-    fast_lane.add_argument(
-        "--live-quota",
-        action="store_true",
-        help="read the official local Codex app-server quota source",
-    )
-    fast_lane.add_argument("--codex-executable")
-    fast_lane.add_argument("--quota-state-path")
-    fast_lane.add_argument("--quota-timeout", type=float, default=8.0)
     fast_lane.add_argument("--reasoning-effort", action="append", default=[])
     fast_lane.add_argument("--enable", action="store_true")
 
@@ -9133,10 +9372,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "fast-lane":
             request = _read_json(args.input, maximum=MAX_MANIFEST_INPUT_BYTES)
             # Until an external Desktop authority bridge exists, the public
-            # CLI must not read caller-supplied host/quota inputs or launch a
-            # local quota provider in a futile attempt to activate work.  The
-            # arguments remain parse-compatible, but cannot establish an
-            # execution context or influence this inert result.
+            # CLI must not read caller-supplied host inputs in a futile attempt
+            # to activate work.  It cannot establish an execution context or
+            # influence this inert result.
             result = compile_fast_lane(
                 request,
                 reasoning_effort=_one_fast_lane_effort(args.reasoning_effort),

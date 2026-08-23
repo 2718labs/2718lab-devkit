@@ -1,10 +1,7 @@
 """Private, inert Fast Lane host-boundary adapter.
 
-The current ``HostSession`` surface intentionally does not expose the private
-quota key resolver that ``compile_fast_lane`` requires.  A ``HostQuotaFacts``
-value is therefore not a compiler capability: it is deliberately insufficient
-to start work.  Until a separately accepted session-owned compiler-input seam
-exists, every route stays fail-closed.
+Only an opaque compiler-evidence handle issued by ``HostSession`` may cross
+this boundary. Public capability claims remain insufficient to start work.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ import re
 from collections.abc import Sequence
 from typing import Final
 
-from .host_session import HostCapabilityFact, HostQuotaFacts, HostSession
+from .host_session import HostCapabilityFact, HostSession
 
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 _HASH: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -34,21 +31,13 @@ def prepare_verified_host_facts(
     session: object,
     *,
     capability_facts: Sequence[HostCapabilityFact] | object,
-    quota_facts: object,
 ) -> str:
-    """Accept no substitute for a future session-owned compiler capability.
-
-    This boundary intentionally does not call ``read_quota``, ask the host for
-    a resolver, or treat an arbitrary attestation object as host ownership.
-    ``HostQuotaFacts`` has no retained resolver, so even an otherwise real
-    session result cannot safely become Fast Lane compiler input here.
-    """
+    """Accept no public substitute for session-owned compiler evidence."""
 
     if (
         type(session) is not HostSession
         or not isinstance(capability_facts, Sequence)
         or isinstance(capability_facts, (str, bytes, bytearray))
-        or type(quota_facts) is not HostQuotaFacts
     ):
         return NO_SAFE_WORK
     return NO_SAFE_WORK
@@ -60,7 +49,7 @@ def compile_fast_lane_with_host_facts(
     reasoning_effort: object,
     verified_host_facts: object,
 ) -> str:
-    """Return only ``NO_SAFE_WORK`` until the private quota seam exists."""
+    """Return only ``NO_SAFE_WORK`` at this public, bearer-free boundary."""
 
     del request, reasoning_effort, verified_host_facts
     return NO_SAFE_WORK

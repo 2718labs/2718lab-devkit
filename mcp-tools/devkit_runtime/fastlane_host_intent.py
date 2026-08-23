@@ -14,12 +14,18 @@ from dataclasses import dataclass
 from typing import Final, Literal, cast
 
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
+UNSPLITTABLE: Final = "UNSPLITTABLE"
 
-_SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v1"
-_PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v1"
+_SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
+_RELAY_HOST_SCHEDULER_SLOT_SCHEMA: Final = (
+    "2718lab-devkit/relay-host-scheduler-slot-v1"
+)
+_HOST_TOPOLOGY_SCHEMA: Final = "2718lab-devkit/host-scheduler-topology-v1"
+_PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v2"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _GIT_OBJECT_PATTERN: Final = re.compile(r"[0-9a-f]{40}\Z")
 _IDENTIFIER_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+_OPAQUE_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _COMMON_DIR_PATTERN: Final = re.compile(r"[A-Za-z]:/[A-Za-z0-9._/-]{1,510}\Z")
 _VALID_EFFORTS: Final = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 
@@ -32,7 +38,6 @@ _ROOT_KEYS: Final = frozenset(
         "assignment",
         "route",
         "capability_facts",
-        "quota",
         "packets",
         "source",
         "create",
@@ -59,9 +64,6 @@ _PREDECESSOR_KEYS: Final = frozenset(
         "assignment_id",
         "assignment_token",
         "routing_result_hash",
-        "quota_evidence_hash",
-        "quota_snapshot_hash",
-        "quota_decision_hash",
         "ledger_epoch",
         "active_lease_set_hash",
         "lease_epoch",
@@ -87,16 +89,6 @@ _CAPABILITY_FACT_KEYS: Final = frozenset(
         "state",
         "attestation_hash",
         "capability_binding_hash",
-    }
-)
-_QUOTA_KEYS: Final = frozenset(
-    {
-        "snapshot_hash",
-        "decision_hash",
-        "evidence_hash",
-        "ledger_epoch",
-        "active_lease_set_hash",
-        "quota_binding_hash",
     }
 )
 _PACKET_KEYS: Final = frozenset(
@@ -151,6 +143,41 @@ _LEASE_KEYS: Final = frozenset(
         "lease_binding_hash",
     }
 )
+_RELAY_HOST_SCHEDULER_SLOT_KEYS: Final = frozenset(
+    {
+        "schema",
+        "plan_hash",
+        "topology_hash",
+        "group_binding_hash",
+        "scheduler_id",
+        "coordinator_lease_id",
+        "worktree_identity",
+        "writer_slot",
+        "read_only",
+    }
+)
+_HOST_TOPOLOGY_KEYS: Final = frozenset(
+    {
+        "schema",
+        "relay_plan_hash",
+        "relay_topology_hash",
+        "groups",
+        "projection_hash",
+    }
+)
+_HOST_TOPOLOGY_GROUP_KEYS: Final = frozenset(
+    {
+        "scheduler_id",
+        "coordinator_lease_id",
+        "worktree_identity",
+        "writer_task_ids",
+        "prewarm_task_ids",
+        "relay_group_binding_hash",
+        "attested_capacity",
+        "attestation_hash",
+        "group_binding_hash",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,9 +222,6 @@ class HostExecutionExpectationProjection:
     inherit_current_session_model: bool
     require_explicit_route: bool
     capability_facts: tuple[HostCapabilityExpectation, ...]
-    quota_snapshot_hash: str
-    quota_decision_hash: str
-    quota_evidence_hash: str
     ledger_epoch: int
     active_lease_set_hash: str
     task_packet_hash: str
@@ -241,12 +265,8 @@ class ParsedHostExecutionIntent:
     require_explicit_route: bool
     route_binding_hash: str
     parsed_capability_facts: tuple[ParsedHostCapabilityFact, ...]
-    quota_snapshot_hash: str
-    quota_decision_hash: str
-    quota_evidence_hash: str
     ledger_epoch: int
     active_lease_set_hash: str
-    quota_binding_hash: str
     task_packet_hash: str
     input_packet_hash: str
     index_packet_hash: str
@@ -266,6 +286,47 @@ class ParsedHostExecutionIntent:
     lease_epoch: int
     lease_fencing_token: str
     lease_binding_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedHostSchedulerTopologyGroup:
+    """One Host projection group, bound to Relay evidence and Host capacity."""
+
+    scheduler_id: str
+    coordinator_lease_id: str
+    worktree_identity: str
+    writer_task_ids: tuple[str, ...]
+    prewarm_task_ids: tuple[str, ...]
+    relay_group_binding_hash: str
+    attested_capacity: int
+    attestation_hash: str
+    group_binding_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedHostSchedulerTopologyProjection:
+    """Non-authorizing Host-only envelope for private topology resolution."""
+
+    schema: str
+    relay_plan_hash: str
+    relay_topology_hash: str
+    groups: tuple[ParsedHostSchedulerTopologyGroup, ...]
+    projection_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedRelayHostSchedulerSlot:
+    """One untrusted Relay slot; it carries no Host capacity or attestation."""
+
+    schema: str
+    plan_hash: str
+    topology_hash: str
+    group_binding_hash: str
+    scheduler_id: str
+    coordinator_lease_id: str
+    worktree_identity: str
+    writer_slot: int | None
+    read_only: bool
 
 
 def validate_host_execution_intent(
@@ -295,6 +356,39 @@ def parse_host_execution_intent(
     return parsed if parsed is not None else NO_SAFE_WORK
 
 
+def parse_relay_host_scheduler_slot(
+    candidate: object,
+) -> ParsedRelayHostSchedulerSlot | Literal["NO_SAFE_WORK"]:
+    """Parse one Relay slot without treating it as Host authorization."""
+
+    try:
+        parsed = _parse_relay_host_scheduler_slot(candidate)
+    except Exception:
+        return NO_SAFE_WORK
+    return parsed if parsed is not None else NO_SAFE_WORK
+
+
+def parse_host_scheduler_topology_projection(
+    candidate: object,
+) -> ParsedHostSchedulerTopologyProjection | Literal["NO_SAFE_WORK"]:
+    """Parse a Host-owned topology shape; Relay slots cannot satisfy it."""
+
+    try:
+        parsed = _parse_host_scheduler_topology_projection(candidate)
+    except Exception:
+        return NO_SAFE_WORK
+    return parsed if parsed is not None else NO_SAFE_WORK
+
+
+def classify_host_scheduler_topology(
+    candidate: object,
+) -> ParsedHostSchedulerTopologyProjection | str:
+    """Classify only a Host projection without treating it as authority."""
+
+    parsed = parse_host_scheduler_topology_projection(candidate)
+    return parsed if parsed != NO_SAFE_WORK else UNSPLITTABLE
+
+
 def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
     root = _bound_mapping(candidate, _ROOT_KEYS, "intent_hash")
     if root is None or _text(root, "schema") != _SCHEMA:
@@ -316,29 +410,26 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         root["assignment"], _ASSIGNMENT_KEYS, "assignment_binding_hash"
     )
     route = _bound_mapping(root["route"], _ROUTE_KEYS, "route_binding_hash")
-    quota = _bound_mapping(root["quota"], _QUOTA_KEYS, "quota_binding_hash")
     packets = _bound_mapping(root["packets"], _PACKET_KEYS, "packet_binding_hash")
     source = _bound_mapping(root["source"], _SOURCE_KEYS, "source_binding_hash")
     create = _bound_mapping(root["create"], _CREATE_KEYS, "create_binding_hash")
     lease = _bound_mapping(root["lease"], _LEASE_KEYS, "lease_binding_hash")
     if any(
         value is None
-        for value in (assignment, route, quota, packets, source, create, lease)
+        for value in (assignment, route, packets, source, create, lease)
     ):
         return None
 
     assert assignment is not None
     assert route is not None
-    assert quota is not None
     assert packets is not None
     assert source is not None
     assert create is not None
     assert lease is not None
 
     validated_route = _validate_route(route)
-    validated_quota = _validate_quota(quota)
     validated_source = _validate_source(source)
-    if validated_route is None or validated_quota is None or validated_source is None:
+    if validated_route is None or validated_source is None:
         return None
     (
         model,
@@ -350,14 +441,6 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         require_explicit_route,
         route_binding_hash,
     ) = validated_route
-    (
-        quota_snapshot_hash,
-        quota_decision_hash,
-        quota_evidence_hash,
-        ledger_epoch,
-        active_lease_set_hash,
-        quota_binding_hash,
-    ) = validated_quota
     (
         project_id,
         registered_project_id,
@@ -392,15 +475,17 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         assignment_id=assignment_id,
         assignment_token=assignment_token,
         routing_result_hash=routing_result_hash,
-        quota_snapshot_hash=quota_snapshot_hash,
-        quota_decision_hash=quota_decision_hash,
-        quota_evidence_hash=quota_evidence_hash,
-        ledger_epoch=ledger_epoch,
-        active_lease_set_hash=active_lease_set_hash,
     )
     if validated_predecessor is None:
         return None
-    task_id, role, predecessor_hash, lease_epoch = validated_predecessor
+    (
+        task_id,
+        role,
+        predecessor_hash,
+        lease_epoch,
+        ledger_epoch,
+        active_lease_set_hash,
+    ) = validated_predecessor
 
     capability_facts = _validate_capability_facts(root["capability_facts"])
     if capability_facts is None or not _has_candidate_capability_claim(
@@ -486,12 +571,8 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         require_explicit_route=require_explicit_route,
         route_binding_hash=route_binding_hash,
         parsed_capability_facts=capability_facts,
-        quota_snapshot_hash=quota_snapshot_hash,
-        quota_decision_hash=quota_decision_hash,
-        quota_evidence_hash=quota_evidence_hash,
         ledger_epoch=ledger_epoch,
         active_lease_set_hash=active_lease_set_hash,
-        quota_binding_hash=quota_binding_hash,
         task_packet_hash=task_packet_hash,
         input_packet_hash=input_packet_hash,
         index_packet_hash=index_packet_hash,
@@ -511,6 +592,135 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         lease_epoch=lease_epoch,
         lease_fencing_token=lease_fencing_token,
         lease_binding_hash=lease_binding_hash,
+    )
+
+
+def _parse_host_scheduler_topology_projection(
+    candidate: object,
+) -> ParsedHostSchedulerTopologyProjection | None:
+    root = _bound_mapping(candidate, _HOST_TOPOLOGY_KEYS, "projection_hash")
+    if root is None or _text(root, "schema") != _HOST_TOPOLOGY_SCHEMA:
+        return None
+    relay_plan_hash = _valid_hash(root, "relay_plan_hash")
+    relay_topology_hash = _valid_hash(root, "relay_topology_hash")
+    raw_groups = root["groups"]
+    if (
+        relay_plan_hash is None
+        or relay_topology_hash is None
+        or type(raw_groups) is not list
+        or not 1 <= len(raw_groups) <= 9
+    ):
+        return None
+    groups: list[ParsedHostSchedulerTopologyGroup] = []
+    scheduler_ids: set[str] = set()
+    lease_ids: set[str] = set()
+    worktree_ids: set[str] = set()
+    writer_ids: set[str] = set()
+    for raw_group in raw_groups:
+        group = _bound_mapping(
+            raw_group, _HOST_TOPOLOGY_GROUP_KEYS, "group_binding_hash"
+        )
+        if group is None:
+            return None
+        scheduler_id = _valid_identifier(group, "scheduler_id")
+        coordinator_lease_id = _valid_opaque_identity(group, "coordinator_lease_id")
+        worktree_identity = _valid_opaque_identity(group, "worktree_identity")
+        relay_group_binding_hash = _valid_hash(group, "relay_group_binding_hash")
+        attested_capacity = _positive_int(group, "attested_capacity")
+        attestation_hash = _valid_hash(group, "attestation_hash")
+        group_binding_hash = _valid_hash(group, "group_binding_hash")
+        writer_task_ids = _identifier_tuple(group["writer_task_ids"], maximum=3)
+        prewarm_task_ids = _identifier_tuple(group["prewarm_task_ids"], maximum=16)
+        if (
+            scheduler_id is None
+            or coordinator_lease_id is None
+            or worktree_identity is None
+            or relay_group_binding_hash is None
+            or attested_capacity is None
+            or not 1 <= attested_capacity <= 3
+            or attestation_hash is None
+            or group_binding_hash is None
+            or writer_task_ids is None
+            or prewarm_task_ids is None
+            or not writer_task_ids
+            or len(writer_task_ids) > attested_capacity
+            or set(writer_task_ids).intersection(prewarm_task_ids)
+            or scheduler_id in scheduler_ids
+            or coordinator_lease_id in lease_ids
+            or worktree_identity in worktree_ids
+            or writer_ids.intersection(writer_task_ids)
+        ):
+            return None
+        scheduler_ids.add(scheduler_id)
+        lease_ids.add(coordinator_lease_id)
+        worktree_ids.add(worktree_identity)
+        writer_ids.update(writer_task_ids)
+        groups.append(
+            ParsedHostSchedulerTopologyGroup(
+                scheduler_id=scheduler_id,
+                coordinator_lease_id=coordinator_lease_id,
+                worktree_identity=worktree_identity,
+                writer_task_ids=writer_task_ids,
+                prewarm_task_ids=prewarm_task_ids,
+                relay_group_binding_hash=relay_group_binding_hash,
+                attested_capacity=attested_capacity,
+                attestation_hash=attestation_hash,
+                group_binding_hash=group_binding_hash,
+            )
+        )
+    if len(writer_ids) > 9:
+        return None
+    projection_hash = _valid_hash(root, "projection_hash")
+    if projection_hash is None:
+        return None
+    return ParsedHostSchedulerTopologyProjection(
+        schema=_HOST_TOPOLOGY_SCHEMA,
+        relay_plan_hash=relay_plan_hash,
+        relay_topology_hash=relay_topology_hash,
+        groups=tuple(groups),
+        projection_hash=projection_hash,
+    )
+
+
+def _parse_relay_host_scheduler_slot(
+    candidate: object,
+) -> ParsedRelayHostSchedulerSlot | None:
+    root = _exact_mapping(candidate, _RELAY_HOST_SCHEDULER_SLOT_KEYS)
+    if root is None or _text(root, "schema") != _RELAY_HOST_SCHEDULER_SLOT_SCHEMA:
+        return None
+    plan_hash = _valid_hash(root, "plan_hash")
+    topology_hash = _valid_hash(root, "topology_hash")
+    group_binding_hash = _valid_hash(root, "group_binding_hash")
+    scheduler_id = _valid_opaque_identity(root, "scheduler_id")
+    coordinator_lease_id = _valid_opaque_identity(root, "coordinator_lease_id")
+    worktree_identity = _valid_opaque_identity(root, "worktree_identity")
+    writer_slot = root["writer_slot"]
+    read_only = _bool(root, "read_only")
+    if (
+        plan_hash is None
+        or topology_hash is None
+        or group_binding_hash is None
+        or scheduler_id is None
+        or coordinator_lease_id is None
+        or worktree_identity is None
+        or read_only is None
+    ):
+        return None
+    if read_only:
+        if writer_slot is not None:
+            return None
+    elif type(writer_slot) is not int or not 1 <= writer_slot <= 3:
+        return None
+    return ParsedRelayHostSchedulerSlot(
+        schema=_RELAY_HOST_SCHEDULER_SLOT_SCHEMA,
+        plan_hash=plan_hash,
+        topology_hash=topology_hash,
+        group_binding_hash=group_binding_hash,
+        scheduler_id=scheduler_id,
+        coordinator_lease_id=coordinator_lease_id,
+        worktree_identity=worktree_identity,
+        writer_slot=writer_slot,
+        read_only=read_only,
     )
 
 
@@ -547,34 +757,6 @@ def _validate_route(
         inherit_current_session_model,
         require_explicit_route,
         route_binding_hash,
-    )
-
-
-def _validate_quota(
-    quota: dict[str, object],
-) -> tuple[str, str, str, int, str, str] | None:
-    snapshot_hash = _valid_hash(quota, "snapshot_hash")
-    decision_hash = _valid_hash(quota, "decision_hash")
-    evidence_hash = _valid_hash(quota, "evidence_hash")
-    ledger_epoch = _positive_int(quota, "ledger_epoch")
-    active_lease_set_hash = _valid_hash(quota, "active_lease_set_hash")
-    quota_binding_hash = _valid_hash(quota, "quota_binding_hash")
-    if (
-        snapshot_hash is None
-        or decision_hash is None
-        or evidence_hash is None
-        or ledger_epoch is None
-        or active_lease_set_hash is None
-        or quota_binding_hash is None
-    ):
-        return None
-    return (
-        snapshot_hash,
-        decision_hash,
-        evidence_hash,
-        ledger_epoch,
-        active_lease_set_hash,
-        quota_binding_hash,
     )
 
 
@@ -622,23 +804,22 @@ def _validate_predecessor(
     assignment_id: str,
     assignment_token: str,
     routing_result_hash: str,
-    quota_snapshot_hash: str,
-    quota_decision_hash: str,
-    quota_evidence_hash: str,
-    ledger_epoch: int,
-    active_lease_set_hash: str,
-) -> tuple[str, str, str, int] | None:
+) -> tuple[str, str, str, int, int, str] | None:
     if _text(predecessor, "schema") != _PREDECESSOR_SCHEMA:
         return None
     predecessor_hash = _valid_hash(predecessor, "predecessor_hash")
     task_id = _valid_identifier(predecessor, "task_id")
     role = _valid_identifier(predecessor, "role")
     lease_epoch = _positive_int(predecessor, "lease_epoch")
+    ledger_epoch = _positive_int(predecessor, "ledger_epoch")
+    active_lease_set_hash = _valid_hash(predecessor, "active_lease_set_hash")
     if (
         predecessor_hash is None
         or task_id is None
         or role is None
         or lease_epoch is None
+        or ledger_epoch is None
+        or active_lease_set_hash is None
     ):
         return None
     expected_fields = {
@@ -648,15 +829,17 @@ def _validate_predecessor(
         "assignment_id": assignment_id,
         "assignment_token": assignment_token,
         "routing_result_hash": routing_result_hash,
-        "quota_snapshot_hash": quota_snapshot_hash,
-        "quota_decision_hash": quota_decision_hash,
-        "quota_evidence_hash": quota_evidence_hash,
-        "ledger_epoch": ledger_epoch,
-        "active_lease_set_hash": active_lease_set_hash,
     }
     if any(predecessor[field] != value for field, value in expected_fields.items()):
         return None
-    return task_id, role, predecessor_hash, lease_epoch
+    return (
+        task_id,
+        role,
+        predecessor_hash,
+        lease_epoch,
+        ledger_epoch,
+        active_lease_set_hash,
+    )
 
 
 def _validate_capability_facts(
@@ -764,12 +947,6 @@ def matches_host_execution_expectation(
         and expectation_projection.require_explicit_route
         == parsed_intent.require_explicit_route
         and expectation_projection.capability_facts == expected_capability_facts
-        and expectation_projection.quota_snapshot_hash
-        == parsed_intent.quota_snapshot_hash
-        and expectation_projection.quota_decision_hash
-        == parsed_intent.quota_decision_hash
-        and expectation_projection.quota_evidence_hash
-        == parsed_intent.quota_evidence_hash
         and expectation_projection.ledger_epoch == parsed_intent.ledger_epoch
         and expectation_projection.active_lease_set_hash
         == parsed_intent.active_lease_set_hash
@@ -811,9 +988,6 @@ def _is_expectation_projection(
         expectation.predecessor_hash,
         expectation.routing_context_hash,
         expectation.routing_result_hash,
-        expectation.quota_snapshot_hash,
-        expectation.quota_decision_hash,
-        expectation.quota_evidence_hash,
         expectation.active_lease_set_hash,
         expectation.task_packet_hash,
         expectation.input_packet_hash,
@@ -1018,9 +1192,23 @@ def _valid_identifier(mapping: dict[str, object], field: str) -> str | None:
     return value if value is not None and _IDENTIFIER_PATTERN.fullmatch(value) else None
 
 
+def _valid_opaque_identity(mapping: dict[str, object], field: str) -> str | None:
+    value = _text(mapping, field)
+    return value if value is not None and _OPAQUE_ID_PATTERN.fullmatch(value) else None
+
+
 def _valid_model(mapping: dict[str, object], field: str) -> str | None:
     value = _valid_identifier(mapping, field)
     return value if value is not None and value.startswith("gpt-") else None
+
+
+def _identifier_tuple(value: object, *, maximum: int) -> tuple[str, ...] | None:
+    if type(value) is not list or len(value) > maximum:
+        return None
+    normalized = tuple(item for item in value if _is_identifier_value(item))
+    if len(normalized) != len(value) or len(set(normalized)) != len(normalized):
+        return None
+    return normalized
 
 
 def _canonical_repository(value: str | None) -> str | None:

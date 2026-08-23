@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from test_relay_runtime import (
 
 from devkit_relay.canonical import canonical_hash
 from devkit_relay.service import RelayError, RelayService
+from devkit_relay.store import RelaySchemaIncompatible, RelayStore
 
 _EVIDENCE_HASH = "sha256:" + "d" * 64
 _EXTRA_EVIDENCE_HASH = "sha256:" + "9" * 64
@@ -116,6 +118,63 @@ class _NoProofProviderStore:
         raise AssertionError("missing proof provider must be rejected before store")
 
 
+class _FinalizationOrderingStore:
+    """Observe the durable Relay transitions while delegating to the real store."""
+
+    def __init__(self, store: RelayStore, events: list[str]) -> None:
+        self._store = store
+        self._events = events
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def prepare_integration_finalization(
+        self, *args: object, **kwargs: object
+    ) -> object:
+        self._events.append("relay-prepared")
+        return self._store.prepare_integration_finalization(*args, **kwargs)  # type: ignore[arg-type]
+
+    def integrate_candidate(self, *args: object, **kwargs: object) -> object:
+        self._events.append("relay-committed")
+        return self._store.integrate_candidate(*args, **kwargs)  # type: ignore[arg-type]
+
+
+class _PreparedOrderingReservation:
+    """Host reservation with a visible exact-CAS boundary for this test only."""
+
+    def __init__(self, reservation: object, events: list[str]) -> None:
+        self._reservation = reservation
+        self._events = events
+
+    @property
+    def receipt(self) -> object:
+        return self._reservation.receipt  # type: ignore[union-attr]
+
+    @property
+    def fence(self) -> object:
+        return self._reservation.fence  # type: ignore[union-attr]
+
+    def apply_prepared(self, *, evidence: object) -> None:
+        del evidence
+        self._events.append("git-cas")
+
+    def settle(self, *, evidence: object) -> object:
+        return self._reservation.settle(evidence=evidence)  # type: ignore[union-attr]
+
+
+class _PreparedOrderingRegistry(ProofRegistry):
+    """Record host fence persistence separately from the later Git CAS."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    def reserve(self, proof_id: str, expectation: object) -> object:
+        reservation = super().reserve(proof_id, expectation)  # type: ignore[arg-type]
+        self._events.append("host-fence-persisted")
+        return _PreparedOrderingReservation(reservation, self._events)
+
+
 def _missing_proof_request(
     relay: RelayService,
     *,
@@ -199,6 +258,106 @@ def test_missing_proof_provider_preserves_nonintegrate_sol_actions(
 
     assert result == {"action": action}
     assert store.calls == [action]
+
+
+def test_integration_orders_host_fence_prepared_git_cas_and_committed(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry = _PreparedOrderingRegistry(events)
+    store = RelayStore(tmp_path / "finalization-order.sqlite3")
+    relay = RelayService(
+        _FinalizationOrderingStore(store, events),  # type: ignore[arg-type]
+        capability_secret=b"relay-v3-test-secret",
+        integration_proof_resolver=registry,
+    )
+    try:
+        created = relay.start_create(
+            plan(
+                task(
+                    "writer-a",
+                    write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+                )
+            ),
+            idempotency_key="finalization-order",
+        )
+        action = created["host_actions"][0]
+        assert isinstance(action, dict)
+        task_version = bind_worker(relay, action)
+        task_version = _record_evidence(relay, action, task_version)
+        handed_off = relay.handoff(
+            worker_request(
+                action,
+                lifecycle_action="candidate_handoff",
+                capability=issue_worker(
+                    relay, action, lifecycle_action="candidate_handoff"
+                ),
+                expected_task_version=task_version,
+                candidate=_candidate([_EVIDENCE_HASH]),
+            )
+        )
+        candidate_task = handed_off["task"]
+        assert isinstance(candidate_task, dict)
+        lease = action["lease"]
+        assert isinstance(lease, dict)
+        relay.integrate(
+            {
+                "workflow_id": "relay-runtime-v3",
+                "task_id": "writer-a",
+                "action": "review",
+                "epoch": lease["epoch"],
+                "endpoint": "sol-main",
+                "expected_task_version": candidate_task["task_version"],
+                "capability": relay.issue_sol_capability(
+                    workflow_id="relay-runtime-v3",
+                    task_id="writer-a",
+                    action="review",
+                    epoch=int(lease["epoch"]),
+                    endpoint="sol-main",
+                ),
+                "candidate_id": "candidate-a",
+                "review_digest": "sha256:" + "1" * 64,
+            }
+        )
+        expectation = store.integration_expectation(
+            "relay-runtime-v3",
+            "writer-a",
+            epoch=int(lease["epoch"]),
+            expected_task_version=int(candidate_task["task_version"]),
+            candidate_id="candidate-a",
+            proof_id="sha256:" + "0" * 64,
+        )
+        proof_id = registry.register(synthetic_integration_receipt(expectation))
+
+        integrated = relay.integrate(
+            {
+                "workflow_id": "relay-runtime-v3",
+                "task_id": "writer-a",
+                "action": "integrate",
+                "epoch": lease["epoch"],
+                "endpoint": "sol-main",
+                "expected_task_version": candidate_task["task_version"],
+                "capability": relay.issue_sol_capability(
+                    workflow_id="relay-runtime-v3",
+                    task_id="writer-a",
+                    action="integrate",
+                    epoch=int(lease["epoch"]),
+                    endpoint="sol-main",
+                ),
+                "candidate_id": "candidate-a",
+                "integration_proof_id": proof_id,
+            }
+        )
+
+        assert integrated["task"]["state"] == "integrated"
+        assert events == [
+            "host-fence-persisted",
+            "relay-prepared",
+            "git-cas",
+            "relay-committed",
+        ]
+    finally:
+        store.close()
 
 
 def test_candidate_handoff_releases_worker_slot_and_sol_integration_unblocks_dependency(
@@ -673,3 +832,454 @@ def test_interruption_recovery_requires_a_bound_predecessor(tmp_path: Path) -> N
     assert isinstance(replacement, dict)
     assert replacement["recovery"]["kind"] == "interruption_recovery"
     assert replacement["recovery"]["predecessor_action_id"] == action["action_id"]
+
+
+def test_cleanup_becomes_eligible_only_after_later_integration_and_never_deletes_locally(
+    tmp_path: Path,
+) -> None:
+    """Retention uses accepted integration versions, never wall-clock or refill calls."""
+
+    registry = ProofRegistry()
+    relay, store = service(tmp_path, registry)
+    created = relay.start_create(
+        plan(
+            task(
+                "writer-a",
+                priority=100,
+                write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+            ),
+            task(
+                "writer-b",
+                priority=90,
+                dependencies=["writer-a"],
+                write_scope=[{"path": "mcp-tools/b.py", "kind": "file"}],
+            ),
+            capacity=1,
+        ),
+        idempotency_key="cleanup-lifecycle",
+    )
+
+    def integrate(
+        action: dict[str, object],
+        *,
+        candidate_id: str,
+        head_commit: str,
+        final_commit: str,
+        cleanup_policy: dict[str, object] | None = None,
+    ) -> None:
+        task_version = bind_worker(relay, action)
+        task_version = _record_evidence(relay, action, task_version)
+        candidate = {
+            "candidate_id": candidate_id,
+            "branch": f"relay/{candidate_id}",
+            "base_commit": _BASE_COMMIT if candidate_id == "candidate-a" else "1" * 40,
+            "head_commit": head_commit,
+            "diff_hash": "sha256:" + "f" * 64,
+            "evidence_hashes": [_EVIDENCE_HASH],
+            "pr_reference": None,
+        }
+        if cleanup_policy is not None:
+            candidate["cleanup_policy"] = cleanup_policy
+        handed_off = relay.handoff(
+            worker_request(
+                action,
+                lifecycle_action="candidate_handoff",
+                capability=issue_worker(relay, action, lifecycle_action="candidate_handoff"),
+                expected_task_version=task_version,
+                candidate=candidate,
+            )
+        )
+        handed_task = handed_off["task"]
+        assert isinstance(handed_task, dict)
+        lease = action["lease"]
+        assert isinstance(lease, dict)
+        relay.integrate(
+            {
+                "workflow_id": "relay-runtime-v3",
+                "task_id": action["task_id"],
+                "action": "review",
+                "epoch": lease["epoch"],
+                "endpoint": "sol-main",
+                "expected_task_version": handed_task["task_version"],
+                "capability": relay.issue_sol_capability(
+                    workflow_id="relay-runtime-v3",
+                    task_id=str(action["task_id"]),
+                    action="review",
+                    epoch=int(lease["epoch"]),
+                    endpoint="sol-main",
+                ),
+                "candidate_id": candidate_id,
+                "review_digest": "sha256:" + "1" * 64,
+            }
+        )
+        expectation = store.integration_expectation(
+            "relay-runtime-v3",
+            str(action["task_id"]),
+            epoch=int(lease["epoch"]),
+            expected_task_version=int(handed_task["task_version"]),
+            candidate_id=candidate_id,
+            proof_id="sha256:" + "0" * 64,
+        )
+        proof_id = registry.register(
+            synthetic_integration_receipt(expectation, final_commit=final_commit)
+        )
+        relay.integrate(
+            {
+                "workflow_id": "relay-runtime-v3",
+                "task_id": action["task_id"],
+                "action": "integrate",
+                "epoch": lease["epoch"],
+                "endpoint": "sol-main",
+                "expected_task_version": handed_task["task_version"],
+                "capability": relay.issue_sol_capability(
+                    workflow_id="relay-runtime-v3",
+                    task_id=str(action["task_id"]),
+                    action="integrate",
+                    epoch=int(lease["epoch"]),
+                    endpoint="sol-main",
+                ),
+                "candidate_id": candidate_id,
+                "integration_proof_id": proof_id,
+            }
+        )
+
+    branch = "relay/candidate-a"
+    head = "e" * 40
+    cleanup_policy = {
+        "retention_rounds": 1,
+        "delete_merged_branch": True,
+        "remove_disposable_worktree": True,
+        "branch_identity": canonical_hash({"branch": branch, "head_commit": head}),
+        "worktree_identity": "sha256:" + "2" * 64,
+    }
+    actions = created["host_actions"]
+    assert isinstance(actions, list)
+    integrate(
+        actions[0],
+        candidate_id="candidate-a",
+        head_commit=head,
+        final_commit="1" * 40,
+        cleanup_policy=cleanup_policy,
+    )
+
+    with pytest.raises(Exception, match="CLEANUP_NOT_ELIGIBLE"):
+        store.prepare_cleanup_operation(
+            "relay-runtime-v3",
+            "candidate-a",
+            host_recheck={},
+        )
+
+    directive = relay.status("relay-runtime-v3")["refill_directives"][0]
+    assert isinstance(directive, dict)
+    refill = relay.start_refill(
+        "relay-runtime-v3",
+        str(directive["directive_id"]),
+        expected_schedule_version=int(directive["expected_schedule_version"]),
+        idempotency_key="cleanup-lifecycle-refill",
+    )
+    second_action = refill["host_actions"][0]
+    assert isinstance(second_action, dict)
+    integrate(
+        second_action,
+        candidate_id="candidate-b",
+        head_commit="f" * 40,
+        final_commit="2" * 40,
+    )
+
+    ledger = store.cleanup_ledger("relay-runtime-v3", "candidate-a")
+    recheck = {
+        "schema": "2718lab-devkit/host-cleanup-recheck-v1",
+        "candidate_id": "candidate-a",
+        "integration_proof_id": ledger["integration_proof_id"],
+        "integration_version": 2,
+        "integration_head": "2" * 40,
+        "contains_candidate_integration_commit": True,
+        "branch_identity": cleanup_policy["branch_identity"],
+        "worktree_identity": cleanup_policy["worktree_identity"],
+        "branch_is_protected": False,
+        "branch_is_current": False,
+        "active_lease": False,
+        "pending_review": False,
+        "approved_g_task_root": True,
+        "worktree_disposable": True,
+        "rollback_receipt_hash": None,
+        "attestation_hash": "sha256:" + "3" * 64,
+    }
+    protected = dict(recheck)
+    protected["branch_is_protected"] = True
+    with pytest.raises(Exception, match="CLEANUP_HOST_RECHECK_FAILED"):
+        store.prepare_cleanup_operation(
+            "relay-runtime-v3", "candidate-a", host_recheck=protected
+        )
+    operation = store.prepare_cleanup_operation(
+        "relay-runtime-v3", "candidate-a", host_recheck=recheck
+    )
+    assert operation["schema"] == "2718lab-devkit/cleanup-operation-v1"
+    assert operation["delete_merged_branch"] is True
+    assert operation["remove_disposable_worktree"] is True
+    assert not hasattr(store, "delete_branch")
+    rollback = store.record_rollback_receipt(
+        "relay-runtime-v3",
+        "candidate-a",
+        receipt={
+            "schema": "2718lab-devkit/rollback-receipt-v1",
+            "candidate_id": "candidate-a",
+            "integration_proof_id": ledger["integration_proof_id"],
+            "pre_rollback_integration_version": 2,
+            "receipt_hash": "sha256:" + "6" * 64,
+        },
+    )
+    assert rollback["state"] == "CLEANUP_ROLLBACK_OBSERVED"
+    with pytest.raises(Exception, match="CLEANUP_ROLLBACK_OBSERVED"):
+        store.prepare_cleanup_operation(
+            "relay-runtime-v3", "candidate-a", host_recheck=recheck
+        )
+    with pytest.raises(Exception, match="CLEANUP_NOT_ELIGIBLE"):
+        store.cleanup_ledger("relay-runtime-v3", "candidate-b")
+
+
+def test_service_starts_disjoint_v2_a1_a2_a3_stages_without_granting_design_a_write_scope(
+    tmp_path: Path,
+) -> None:
+    compiled = plan(
+        task(
+            "writer",
+            priority=90,
+            write_scope=[{"path": "mcp-tools/writer.py", "kind": "file"}],
+        ),
+        task("design", kind="design", priority=80, required_evidence=[]),
+        task("prewarm", kind="prewarm", priority=70, required_evidence=[]),
+        capacity=3,
+    )
+    tasks = compiled["tasks"]
+    assert isinstance(tasks, list)
+    for item in tasks:
+        if item["task_id"] == "writer":
+            item.update(
+                {
+                    "stage": "a1_writer",
+                    "design_for_task_id": None,
+                    "split_policy": None,
+                    "split_parent_task_id": None,
+                    "split_depth": 0,
+                    "split_verdict": None,
+                }
+            )
+        elif item["task_id"] == "design":
+            item.update(
+                {
+                    "stage": "a2_design",
+                    "design_for_task_id": "writer",
+                    "split_policy": None,
+                    "split_parent_task_id": None,
+                    "split_depth": 0,
+                    "split_verdict": None,
+                }
+            )
+        else:
+            item["route"] = {
+                "route_class": "luna_medium",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "medium",
+            }
+            item.update(
+                {
+                    "stage": "a3_prewarm",
+                    "design_for_task_id": None,
+                    "split_policy": None,
+                    "split_parent_task_id": None,
+                    "split_depth": 0,
+                    "split_verdict": None,
+                    "prewarm_for_task_id": "writer",
+                }
+            )
+    binding = compiled["workspace_binding"]
+    assert isinstance(binding, dict)
+    workspace_id = binding["workspace_id"]
+    input_snapshot_id = binding["input_snapshot_id"]
+    attestation: dict[str, object] = {
+        "schema": "2718lab-devkit/new-project-bootstrap-attestation-v1",
+        "workflow_id": compiled["workflow_id"],
+        "workspace_id": workspace_id,
+        "repository_id": "sha256:" + "1" * 64,
+        "project_id": "sha256:" + "2" * 64,
+        "bootstrap_root_identity": "sha256:" + "3" * 64,
+        "initial_manifest_hash": "sha256:" + "4" * 64,
+        "initial_entry_count": 0,
+        "state": "new_empty",
+        "capability_epoch": 1,
+        "capability_hash": "sha256:" + "5" * 64,
+        "attested_input_snapshot_id": "sha256:" + "6" * 64,
+        "issued_at": 1_700_000_000,
+        "expires_at": 1_700_000_060,
+    }
+    attestation["attestation_hash"] = canonical_hash(attestation)
+    bootstrap_binding: dict[str, object] = {
+        "schema": "2718lab-devkit/project-binding-v1",
+        "mode": "new_empty_bootstrap",
+        "workflow_id": compiled["workflow_id"],
+        "workspace_id": workspace_id,
+        "repository_id": attestation["repository_id"],
+        "project_id": attestation["project_id"],
+        "bootstrap_root_identity": attestation["bootstrap_root_identity"],
+        "attestation": attestation,
+    }
+    bootstrap_binding["binding_hash"] = canonical_hash(bootstrap_binding)
+    receipt: dict[str, object] = {
+        "schema": "2718lab-devkit/project-index-bootstrap-receipt-v1",
+        "attestation_hash": attestation["attestation_hash"],
+        "workspace_id": workspace_id,
+        "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "initial_manifest_hash": attestation["initial_manifest_hash"],
+        "index_snapshot_id": input_snapshot_id,
+        "index_identity": canonical_hash(
+            {
+                "workspace_id": workspace_id,
+                "attested_input_snapshot_id": attestation[
+                    "attested_input_snapshot_id"
+                ],
+                "initial_manifest_hash": attestation["initial_manifest_hash"],
+                "index_snapshot_id": input_snapshot_id,
+            }
+        ),
+        "issued_at": 1_700_000_001,
+        "expires_at": 1_700_000_060,
+    }
+    receipt["receipt_hash"] = canonical_hash(receipt)
+    compiled["schema"] = "2718lab-devkit/relay-plan-v2"
+    compiled["project_binding"] = {
+        "schema": "2718lab-devkit/project-binding-v1",
+        "mode": "indexed",
+        "bootstrap_binding": bootstrap_binding,
+        "bootstrap_receipt": receipt,
+    }
+    compiled["queues"] = {
+        "writer_ready": ["writer"],
+        "design_ready": ["design"],
+        "prewarm_ready": ["prewarm"],
+        "bootstrap_index": [],
+        "review_integration": [],
+        "terminal": [],
+        "unsplittable": [],
+    }
+    compiled["plan_hash"] = canonical_hash(
+        {key: value for key, value in compiled.items() if key != "plan_hash"}
+    )
+    relay, _store = service(tmp_path)
+
+    started = relay.start_create(compiled, idempotency_key="v2-stages")
+
+    assert [item["task_id"] for item in started["host_actions"]] == [
+        "writer",
+        "design",
+        "prewarm",
+    ]
+
+
+def _canonical_v5_fixture(database: Path) -> None:
+    """Create the exact physical V5 authority accepted before migration DDL."""
+
+    original = RelayStore(database)
+    original.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            DROP INDEX relay_v3_cleanup_by_run_state;
+            DROP INDEX relay_v3_scheduler_slots_by_group;
+            DROP TABLE relay_v3_start_delivery_journal;
+            DROP TABLE relay_v3_start_attempts;
+            DROP TABLE relay_v3_scheduler_writer_slots;
+            DROP TABLE relay_v3_scheduler_groups;
+            DROP TABLE relay_v3_cleanup_ledger;
+            DROP TABLE relay_v3_finalization_outcomes;
+            DROP TABLE relay_v3_finalization_journal;
+            DROP TABLE relay_v3_runs;
+
+            CREATE TABLE relay_v3_runs (
+                run_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL UNIQUE,
+                plan_hash TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                input_snapshot_id TEXT NOT NULL,
+                base_commit TEXT NOT NULL,
+                integration_head TEXT NOT NULL,
+                integration_version INTEGER NOT NULL
+                    CHECK (integration_version >= 0),
+                capacity INTEGER NOT NULL
+                    CHECK (typeof(capacity) = 'integer')
+                    CHECK (capacity BETWEEN 1 AND 3),
+                schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE relay_v3_finalization_journal (
+                finalization_id TEXT PRIMARY KEY,
+                reservation_epoch INTEGER NOT NULL
+                    CHECK (reservation_epoch >= 1),
+                integration_proof_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL
+                    CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                base_oid TEXT NOT NULL,
+                final_oid TEXT NOT NULL,
+                fence_hash TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL
+                    CHECK (state IN ('prepared', 'committed', 'aborted')),
+                result_hash TEXT,
+                journal_version INTEGER NOT NULL CHECK (journal_version >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (state = 'committed' AND result_hash IS NOT NULL)
+                    OR (state IN ('prepared', 'aborted') AND result_hash IS NULL)
+                ),
+                UNIQUE (integration_proof_id, reservation_epoch)
+            );
+            CREATE TABLE relay_v3_finalization_outcomes (
+                finalization_id TEXT PRIMARY KEY,
+                fence_hash TEXT NOT NULL UNIQUE,
+                integration_proof_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL
+                    CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                result_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX relay_v3_finalizations_by_proof
+                ON relay_v3_finalization_journal(
+                    integration_proof_id, expectation_hash, state
+                );
+            UPDATE relay_v3_schema_metadata
+            SET value = '5'
+            WHERE key = 'schema_version';
+            """
+        )
+
+
+def test_cleanup_ledger_migrates_only_known_v5_metadata_and_rejects_unknown_schema(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay-migration.sqlite3"
+    _canonical_v5_fixture(database)
+
+    migrated = RelayStore(database)
+    connection = migrated._require_connection()
+    assert connection.execute(
+        "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
+    ).fetchone()[0] == "10"
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'relay_v3_cleanup_ledger'"
+    ).fetchone() is not None
+    migrated.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE relay_v3_schema_metadata SET value = '4' WHERE key = 'schema_version'"
+        )
+    with pytest.raises(RelaySchemaIncompatible):
+        RelayStore(database)

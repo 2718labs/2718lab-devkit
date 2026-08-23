@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_relay.canonical import canonical_hash
 from devkit_relay.store import RelayStore, RelayStoreError
+
+
+def test_readonly_factory_rejects_a_readwrite_connection(tmp_path: Path) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+
+    with pytest.raises(RelayStoreError) as caught:
+        RelayStore.from_readonly_connection(connection)
+
+    assert caught.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
+
+
+def test_readonly_factory_accepts_only_query_only_connection(tmp_path: Path) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA query_only=ON")
+
+    readonly = RelayStore.from_readonly_connection(connection)
+
+    assert readonly.database_fingerprint().startswith("sha256:")
+    assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+    readonly.close()
+
 
 try:
     from devkit_relay.proofs import ProofFinalizationFence
@@ -64,7 +92,64 @@ def _fence(finalization_id: str) -> ProofFinalizationFence:
 
 
 def _insert_prepared(store: RelayStore, fence: ProofFinalizationFence) -> None:
-    store._require_connection().execute(
+    connection = store._require_connection()
+    connection.execute(
+        """
+        INSERT INTO relay_v3_runs
+            (run_id, workflow_id, plan_hash, plan_json, workspace_id,
+             input_snapshot_id, base_commit, integration_head,
+             integration_version, capacity, schedule_version, created_at)
+        VALUES ('run-r7', 'workflow-r7', 'plan-r7', '{}', ?, 'snapshot-r7',
+                ?, ?, 0, 1, 0, '2026-08-01T00:00:00+00:00')
+        """,
+        (fence.workspace_id, fence.base_oid, fence.base_oid),
+    )
+    connection.execute(
+        """
+        INSERT INTO relay_v3_tasks
+            (run_id, task_id, ordinal, kind, priority, task_json,
+             dependencies_json, write_scope_json, state, task_version,
+             scope_owner, candidate_id, last_lease_epoch)
+        VALUES ('run-r7', 'task-r7', 0, 'implementation', 1, '{}', '[]', '[]',
+                'review_integration', 1, 'sol', ?, 1)
+        """,
+        (fence.expectation_key,),
+    )
+    connection.execute(
+        """
+        INSERT INTO relay_v3_candidates
+            (candidate_id, run_id, task_id, originating_epoch, branch,
+             base_commit, head_commit, diff_hash, evidence_hashes_json,
+             pr_reference, status, review_digest, integration_commit,
+             integration_tree, integration_proof_id, created_at, updated_at)
+        VALUES (?, 'run-r7', 'task-r7', 1, 'candidate-r7', ?, ?, 'diff-r7',
+                '[]', NULL, 'reviewed', 'review-r7', NULL, NULL, NULL,
+                '2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00')
+        """,
+        (fence.expectation_key, fence.base_oid, fence.final_oid),
+    )
+    connection.execute(
+        """
+        INSERT INTO relay_v3_integration_proofs
+            (proof_id, run_id, workflow_id, task_id, candidate_id,
+             integration_version, expectation_hash, expectation_json,
+             receipt_json, repository_id, integration_ref,
+             predecessor_commit, final_commit, final_tree, attestor_id,
+             attestor_version, created_at)
+        VALUES (?, 'run-r7', 'workflow-r7', 'task-r7', ?, 1, ?, '{}', '{}',
+                'repository-r7', ?, ?, ?, 'tree-r7', 'attestor-r7', '1.0',
+                '2026-08-01T00:00:00+00:00')
+        """,
+        (
+            fence.integration_proof_id,
+            fence.expectation_key,
+            fence.expectation_hash,
+            fence.target_ref,
+            fence.base_oid,
+            fence.final_oid,
+        ),
+    )
+    connection.execute(
         """
         INSERT INTO relay_v3_finalization_journal
             (finalization_id, reservation_epoch, integration_proof_id, workspace_id,
@@ -116,6 +201,7 @@ def test_finalization_rejects_wrong_fence_hash_without_mutation(tmp_path: Path) 
 def test_finalization_rejects_orphan_outcome_without_mutation(tmp_path: Path) -> None:
     store = RelayStore(tmp_path / "relay.sqlite3")
     fence = _fence("finalization-r7-orphan")
+    _insert_prepared(store, fence)
     connection = store._require_connection()
     connection.execute(
         """

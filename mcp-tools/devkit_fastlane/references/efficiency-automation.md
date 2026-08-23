@@ -5,13 +5,26 @@ coordination data. It validates JSON and emits plans, packets, checks, cache
 metadata, and Markdown. Inputs are data only: the helper never evaluates an
 input as code and has no model or remote-service interface.
 
+## Scheduler topology V1
+
+`2718lab-devkit/scheduler-topology-v1` records auditable opaque identity
+bindings for the plan, lease, and G-drive worktree. A/B/C means the main
+conversation (which reviews and integrates), scheduler, and writer. One
+scheduler has at most a `1:3` writer set. Design and prewarm are read-only,
+not writers, but are limited by actual host slots, host capability, lease, and
+safety gates. Only a `declared-child` split that strictly reduces conflict may
+cross scope; otherwise emit `UNSPLITTABLE_SCOPE_CONFLICT`. It does not restore
+account-usage quota, D-drive temporary roots, or a parent model ceiling, and
+does not weaken host capability, lease, worktree, or safety gates.
+
 ## Bootstrap
 
 `bootstrap` requires a task id, full base commit, safe branch, bounded relative
 write scope, existing repository, project identifier, worktree target, and temp
 target. Its host-configured base root is `CODEX_FASTLANE_TASK_ROOT`, or the
-compatible default `D:\bun\tmp\codex` when unset. A configured root must be an
-existing local absolute non-C, non-volume-root directory without reparse points;
+local default `G:\2718lab\_codex\.codex-task-temp` when unset. 默认 `G:\2718lab\_codex\.codex-task-temp`
+is the local temporary-root baseline. A configured root
+must be an existing local absolute G: non-volume-root directory without reparse points;
 project components and root-bound target components cannot be reparse points;
 the lexical path is checked before canonicalization. Both bootstrap targets and every
 read-context worktree/temp target must be strictly below the declared derived
@@ -23,6 +36,12 @@ root never comes from request JSON or a bootstrap plan: default plans remain
 bootstrap-v1, while a non-default root is bound by a canonical hash in
 bootstrap-v2. A changed configuration fails diagnostic revalidation; this
 repository does not launch Git for bootstrap execution.
+
+For hosted Windows CI, `RUNNER_TEMP` is the explicit host-provided exception:
+the workflow must require it and derive `CODEX_TASK_TEMP`, `TEMP`, `TMP`,
+`TMPDIR`, `PYTHONPYCACHEPREFIX`, and `UV_CACHE_DIR` below that root. This
+exception is not the local default and does not establish an external host
+embedding.
 
 The default output is a canonical dry-run plan. Its canonical worktree vector
 is:
@@ -46,6 +65,15 @@ diagnostic data only, and attempted mutation always returns
 path, environment, or JSON can have an effect. A Desktop host registry and a
 genuinely external private execution bridge are prerequisites for any future
 apply behavior; neither is implemented or accepted as an input here.
+
+An older bootstrap or routing schema is rejected as
+`FASTLANE_SCHEMA_UPGRADE_REQUIRED`; it is never normalized into an executable
+plan. An empty project may produce bootstrap-only index diagnostics, but cannot
+produce an assignment until trusted host index context is available.
+
+The `RuntimeRoot` host-private V2/V3 bootstrap path is covered with injected
+test doubles only. That coverage does not prove an external host embedding or
+an operational/host-integrated GO.
 
 ## Resume, status, contracts, and cache metadata
 
@@ -139,18 +167,18 @@ activate V2: a structurally valid V2 request always yields
 queues, and external-session assignments. An invalid V2 envelope/hash yields
 `PROJECT_BINDING_INVALID`; so does an inner canonical-v1 `package` that fails
 pure diagnostic parsing, or an invalid fast-lane request schema/key/byte shell.
-Those checks occur before any host, quota, or index input is read. V1 yields
+Those checks occur before any host, account-usage, or index input is read. V1 yields
 `NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`.
 An MCP request that explicitly carries host-private fields such as `host_status`,
-quota, or index evidence is not a diagnostic plan shell: the public adapter must
+account-usage, or index evidence is not a diagnostic plan shell: the public adapter must
 reject it as `FASTLANE_REQUEST_INVALID` before compilation.
 Public `bootstrap --apply` and import-callable `apply_bootstrap_plan` are both
 blocked before any caller plan, path, provider override, closure, or JSON can
 reach a worktree helper, because no such helper exists in this repository.
 
-Host-status, quota, and index payloads remain bounded future-bridge contract
+Host-status, account-usage, and index payloads remain bounded future-bridge contract
 data. The current public CLI parses its stable command surface but does not use
-those caller inputs to create authority, schedule work, read a live quota
+those caller inputs to create authority, schedule work, read a live account source
 provider, or bypass the inert result. Only an externally implemented and
 accepted Desktop bridge could perform live authority comparison in the future.
 
@@ -397,22 +425,18 @@ independent session/worktree after its worktree, lease, context, and predecessor
 fences validate. The compiler and skills do not call host dispatch APIs.
 
 `3` is the per-Codex-session child-agent limit. It is not the global main-pool
-limit, and it does not mean three sessions. A fresh, signed quota snapshot sets
-the global main-pool target to exactly `6`, `8`, `10`, or `12` **non-Spark agent
-slots across all sessions**. The global active/free values come from the
-verified cross-session ledger; they are agent counts, never a session count or
-an inferred number of sessions. Spark is a separate pool and is never counted
-in, or used to enlarge, that main-pool total. The compiler derives global free
-capacity only from the verified main snapshot and global ledger evidence, never
-from a caller-supplied capacity number.
+limit, and it does not mean three sessions. Global active/free values come only
+from the verified cross-session ledger; they are agent counts, never a session
+count or an inferred number of sessions. The compiler never derives capacity
+from caller-supplied or account-usage data.
 
 When all three local child slots are fully occupied or admitted and verified
-main-pool agent capacity remains, the plan may contain an inert
+host capacity remains, the plan may contain an inert
 `external_session_required` projection. It is an assignment/lease **plan**, not
 an external host action: it creates no session, worker, target, process, or
 workflow transition. Each deterministic external assignment carries the exact
-task route/context plus a predecessor fence binding the source plan, quota
-snapshot and decision hashes, ledger epoch, active-lease-set hash, and its
+task route/context plus a predecessor fence binding the source plan, route
+decision hashes, ledger epoch, active-lease-set hash, and its
 assignment identity. Every external assignment also carries
 `worktree_required=true`: the independent-session owner must create and bind
 an isolated Git worktree under the approved task root, never the coordinator's
@@ -425,10 +449,9 @@ invent an external assignment. `external_agent_count` counts additional agent
 assignments, not sessions: several assignments may be placed in one validated
 external worktree/session. Unknown, stale, untrusted, receipt-invalid,
 foreign-host, mismatched, or exhausted evidence blocks the projection with no
-assignments. At target `12`, the maximum is nine additional agent assignments
-after three local child admissions (`12 - 3`), never nine sessions; a larger
-queue is blocked rather than truncated. External plans cannot route `ultra` or
-Spark work.
+assignments. A host-defined cap limits additional assignments after three local
+child admissions; it never denotes the number of sessions. A larger queue is
+blocked rather than truncated. External plans cannot route `ultra` or Spark work.
 
 Where the declared lifecycle orders `host_spawn_exact_route` before
 `workflow_claim_with_host_target`, that spawn is a `parked endpoint bootstrap`,
@@ -446,34 +469,11 @@ read-only role and is not a name for this bootstrap.
 Prewarm is read-only evidence, not acceptance evidence: a later writer may
 reuse it only after current-basis delta revalidation passes.
 
-### Live account quota (future external bridge contract)
+### Capacity boundary
 
-When a future external bridge participates in dispatch, the host may use
-`--live-quota` so the planner receives a fresh signed snapshot from the local
-Codex app-server. The adapter calls only
-`account/read` (with `refreshToken=false`) and `account/rateLimits/read`, then
-binds the exact `codex` main pool and the exact
-`GPT-5.3-Codex-Spark` pool into the quota request. The implementation is
-[`codex_account_quota.py`](../scripts/codex_account_quota.py); its HMAC key
-stays in memory and it never reads `auth.json`, cookies, or a private HTTP
-endpoint.
-
-The base quota request must carry the host-bound `snapshot.capacity`. A future
-live adapter may replace only the snapshot, recompute `request_hash`, and call
-the pure structural validators with the in-memory key resolver. The current
-public CLI does not run this provider or activate a compiler route:
-
-```text
-python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
-```
-
-The first sample has no prior slope and therefore records zero delta; later
-samples in the same reset period calculate the bounded 300-second increase.
-Missing pools, malformed JSONL, timeouts, stale signatures, or an unavailable
-source return `usage_unknown` and block new starts. The sample cache is
-non-sensitive and user-configurable through `--quota-state-path` (for example
-a G-drive project cache). If omitted, it follows `CODEX_TASK_TEMP`; it never
-silently falls back to a C-drive temporary directory.
+Fast Lane has no account-usage coordinator integration. A future host
+may attest bounded capacity as part of a separately versioned route contract;
+this repository neither reads that data nor treats it as a caller-supplied input.
 
 The terminal protocol is bounded to one regression (the integration regression
 pass), one blocker review, and at most one global remediation (targeted to the
@@ -498,10 +498,26 @@ external receipt bodies.
 The adapter never archives work. The host may archive only after coordinator-lane acceptance and final evidence binding have completed. Fast Lane scratch files,
 worktrees, ordinary caches, test evidence, and read worktrees must remain below
 the declared project root derived from trusted `CODEX_FASTLANE_TASK_ROOT` (or
-the compatible `D:\bun\tmp\codex` default). This remains the
-bootstrap/read-context boundary, not a claim that every plugin cache is D-only.
-`--quota-state-path`
-remains user-configurable and may use another approved drive. C-drive temporary roots are forbidden.
+the local `G:\2718lab\_codex\.codex-task-temp` default). This remains the 当前 bootstrap/read-context boundary.
+For ordinary local runs, C-drive temporary roots are forbidden; non-G-drive
+local roots are forbidden as well. Hosted Windows CI is the explicit
+`RUNNER_TEMP` exception: its
+workflow must require that root and derive all task-local paths below it. This
+host-provided exception is temporary-path policy, not evidence of an external
+host embedding.
+
+### Retention and cleanup boundary
+
+After merge, the host may record `cleanup_candidate` only when the declared
+retention policy requires `x` consecutive post-merge integration rounds and all
+`x` rounds have been explicitly accepted by the coordinator, no rollback
+occurred in those rounds, a fresh host recheck is current, and durable evidence
+binds the candidate, base, and integration commits to the required review,
+verification, and integration evidence. An observed, pending, inferred, or
+otherwise unverified result is not an accepted round. The candidate record is
+eligibility evidence only, never deletion authorization; the adapter and host
+must not delete any path automatically. Without a declared retention strategy,
+or with any missing gate/evidence, the material is retained permanently.
 
 ## CLI
 

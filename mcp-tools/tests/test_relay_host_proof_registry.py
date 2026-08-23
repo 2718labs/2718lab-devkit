@@ -147,6 +147,16 @@ def _committed_evidence(
     )
 
 
+def _prepared_evidence(fence: ProofFinalizationFence) -> ProofFinalizationEvidence:
+    return ProofFinalizationEvidence(
+        finalization_id=fence.finalization_id,
+        state="prepared",
+        fence_hash=fence.fence_hash,
+        result_hash=None,
+        journal_version=1,
+    )
+
+
 def _aborted_evidence(fence: ProofFinalizationFence) -> ProofFinalizationEvidence:
     return ProofFinalizationEvidence(
         finalization_id=fence.finalization_id,
@@ -227,6 +237,11 @@ def test_attests_registers_reserves_and_consumes_real_git_proof(tmp_path: Path) 
     reservation = registry.reserve(proof_id, expectation)
 
     assert reservation.receipt.proof_id == proof_id
+    assert (
+        _git_oid(repository, target.integration_ref)
+        == reservation.receipt.predecessor_commit
+    )
+    reservation.apply_prepared(evidence=_prepared_evidence(reservation.fence))
     assert (
         _git_oid(repository, target.integration_ref) == reservation.receipt.final_commit
     )
@@ -1203,6 +1218,8 @@ def test_r4_committed_recovery_rolls_forward_and_consumes_once(
     reservation = registry.reserve(proof_id, expectation)
     fence = reservation.fence
 
+    assert _git_oid(repository, target.integration_ref) == fence.base_oid
+    reservation.apply_prepared(evidence=_prepared_evidence(fence))
     assert _git_oid(repository, target.integration_ref) == fence.final_oid
     _git(
         repository,
@@ -1247,14 +1264,13 @@ def test_r5_recovery_reaches_only_terminal_git_and_proof_pairs(
     reservation = registry.reserve(proof_id, expectation)
     fence = reservation.fence
 
-    if ref_before_recovery == "base":
-        _git(
-            repository,
-            "update-ref",
-            target.integration_ref,
-            fence.base_oid,
-            fence.final_oid,
-        )
+    assert _git_oid(repository, target.integration_ref) == fence.base_oid
+    if ref_before_recovery == "final":
+        reservation.apply_prepared(evidence=_prepared_evidence(fence))
+    expected_before_recovery = (
+        fence.final_oid if ref_before_recovery == "final" else fence.base_oid
+    )
+    assert _git_oid(repository, target.integration_ref) == expected_before_recovery
 
     restarted = _registry(database_path, target)
     restarted.recover_finalizations(_TerminalFinalizationAuthority(committed=committed))
@@ -1293,6 +1309,8 @@ def test_r6_stale_epoch_cannot_settle_or_replace_successor_reservation(
     with pytest.raises(IntegrationProofError) as stale_settle:
         successor.settle(evidence=_committed_evidence(stale_fence))
     assert stale_settle.value.code == "RELAY_INTEGRATION_PROOF_CORRUPT"
+    assert _git_oid(repository, target.integration_ref) == successor.fence.base_oid
+    successor.apply_prepared(evidence=_prepared_evidence(successor.fence))
     assert _git_oid(repository, target.integration_ref) == successor.fence.final_oid
     with pytest.raises(IntegrationProofError) as busy:
         registry.reserve(proof_id, expectation)
@@ -1314,7 +1332,9 @@ def test_r7_rejects_corrupt_evidence_and_ref_without_private_leakage(
 
     if fault == "wrong-fence":
         evidence = replace(evidence, fence_hash="sha256:" + "f" * 64)
-    elif fault == "third-oid":
+    else:
+        reservation.apply_prepared(evidence=_prepared_evidence(fence))
+    if fault == "third-oid":
         _git(
             repository,
             "update-ref",
@@ -1324,7 +1344,7 @@ def test_r7_rejects_corrupt_evidence_and_ref_without_private_leakage(
         )
     elif fault == "symbolic":
         _git(repository, "symbolic-ref", target.integration_ref, "refs/heads/main")
-    else:
+    elif fault == "missing":
         _git(repository, "update-ref", "-d", target.integration_ref, fence.final_oid)
 
     with pytest.raises(IntegrationProofError) as rejected:

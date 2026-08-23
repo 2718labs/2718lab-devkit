@@ -1,7 +1,7 @@
 """Pure Fast Lane compiler runtime.
 
-The package emits bounded, inert scheduling descriptors.  A host adapter owns
-model dispatch, worktree operations, quota attestations, and lifecycle writes.
+The package emits bounded, inert scheduling descriptors. A host adapter owns
+model dispatch, worktree operations, capability/lease attestations, and lifecycle writes.
 The large compatibility/CLI module is loaded lazily so importing the public
 MCP server does not import subprocess or host execution helpers.
 """

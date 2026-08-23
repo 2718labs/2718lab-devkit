@@ -1,27 +1,31 @@
 [English](README.md)
 
-# 2718lab DevKit —— Codex + MCP v1.0.0
+# 2718lab DevKit —— Codex + MCP v1.1.0
 
-[![版本](https://img.shields.io/badge/version-v1.0.0-blue)](./.codex-plugin/plugin.json)
+[![版本](https://img.shields.io/badge/version-v1.1.0-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit 是一个 Codex-first 工程工具包：它包含一个本地、仅 stdio
 传输的 MCP 运行时，用于有边界的项目索引、Atlas 证据、Relay 生命周期协调和
 确定性的 Fast Lane 规划；同时还包含一组精简的 Skill 说明书。本仓库承载版本化的
-v1.0.0 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
+v1.1.0 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
 安装、构建和验证章节共同给出支持的工作流。
 
 当前版本保留刻意 fail-closed 的 Fast Lane 预览。公共编译器和 CLI 固定返回
-`NO_SAFE_WORK` 与零 assignments：不会消费 host-status、quota 或实时账号输入，
-也没有 worktree 执行路径。Ultra、实时额度和宿主消费属于未来外部
-Desktop-host bridge 合同的要求；本仓库并未提供该 bridge。
+`NO_SAFE_WORK` 与零 assignments：不会消费 host-status 或实时账号输入，也没有
+worktree 执行路径。宿主执行属于未来外部 Desktop-host bridge 合同的要求。
 
 > [!IMPORTANT]
-> **工作流提醒：** 先用有界证据路由；一个写入范围只允许一个 writer；执行前必须
-> claim 并 bind；只有验证过的终态事件才能 refill；完成集成和验收后才能归档。
-> prewarm 只读，`action="retain"` 不是新 spawn。任务临时目录、缓存、工作树和证据
-> 应放在隔离的用户自有工作区。解析兼容的 Fast Lane quota 输入目前不消费额度。
-> 不要把运行时状态或凭据提交到仓库。
+> **工作流提醒：** 先用有界证据路由。A1/A2/A3 并行只允许发生在互不重叠、独占
+> 的写入范围，并各自使用 G: 盘隔离任务根。执行前必须 claim 并 bind；prewarm
+> 只读，`action="retain"` 不是新 spawn。主对话须经 PR-style 独立审查后再集成，
+> 最后验收和归档。Fast Lane 不使用额度协调器或额度输入。不要把运行时状态或凭据提交到仓库。
+
+> **调度拓扑 V1：** `2718lab-devkit/scheduler-topology-v1` 以 opaque identity
+> 绑定计划、lease 和 G 盘 worktree。A/B/C 分别是主对话审查合并、scheduler 和
+> writer；每个 scheduler 最多 1:3 writers。design/prewarm 只读且仍受实际 host
+> slot、host capability 和 safety gates 约束。跨 scope 只能 declared-child split，
+> 且必须严格降低冲突，否则为 UNSPLITTABLE。
 
 ## 已交付内容
 
@@ -36,7 +40,9 @@ Desktop-host bridge 合同的要求；本仓库并未提供该 bridge。
   它不构成第二个运行时，也不是可执行的 prompt/agent 表面。
 - Fast Lane 是 MCP runtime 中的纯本地编译器。其公共面当前没有调度权限并且
   fail-closed：不会产生 assignment，也不会 spawn agent、修改 Git、运行命令或
-  执行 worktree。宿主/私有 quota 消费预留给未来的外部 Desktop-host bridge 合同。
+  执行 worktree。宿主执行预留给未来的外部 Desktop-host bridge 合同。
+  RuntimeRoot 的 host-private V2/V3 bootstrap 仅由注入的测试替身覆盖；
+  没有 external host embedding 实证，也不声称 operational/host-integrated GO。
 
 ## 核心模块速览
 
@@ -48,7 +54,7 @@ Desktop-host bridge 合同的要求；本仓库并未提供该 bridge。
 | [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | 显式工作包编译和生命周期宿主动作 | [Relay 工具](#精确-mcp-面) |
 | [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | 运行时路径、checkpoint、持久边界和宿主私有 bridge | [运行时数据与恢复](#运行时数据与崩溃恢复) |
 | [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | 持久化 workflow、task、lease 和生命周期状态 | [workflow 生命周期](mcp-tools/devkit_fastlane/references/efficiency-automation.md#workflow-lifecycle-plan) |
-| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | 确定性路由/Fast Lane 编译器、未来额度 bridge 参考、契约和测试 | [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
+| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | 确定性路由/Fast Lane 编译器、契约和测试 | [Fast Lane 契约](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
 | [`.codex-plugin/`](.codex-plugin/) | 插件 manifest、产物 allowlist 和可复现构建器 | [构建主产物](#构建主产物) |
 
 ## 整体工作流
@@ -106,8 +112,7 @@ agent profile、脚手架模板、校验器或调度代码。精简的运行时 
 
 实现入口见
 [Fast Lane 编译器](mcp-tools/devkit_fastlane/scripts/team_efficiency.py)。
-额度采集模块仅保留为未来外部 Desktop-host bridge 合同的参考模块；公共编译器和
-CLI 不会调用它。
+Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协调或推断账号额度。
 
 ## 精确 MCP 面
 
@@ -155,22 +160,21 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.0.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
 表面是 MCP 服务器；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
-`team_efficiency.py` 兼容入口、其路由与额度平衡模块，以及宿主专用官方账号
-额度采集模块。它明确不包含可选的 Skill 说明书 bundle、命令辅助文件、hooks、CI
+`team_efficiency.py` 兼容入口及其路由模块。它明确不包含可选的 Skill 说明书 bundle、
+命令辅助文件、hooks、CI
 文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
 
 Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 
     python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
 
-遗留的 `--host-status`、quota 和 live-quota 开关仅保持解析兼容。当前公共 CLI
-不会读取或消费它们，不会采集额度样本，也不能激活工作。实时额度和 quota cache
-属于未来外部 Desktop-host bridge 合同，不属于本发行版。
+遗留的 host-only 开关仅保持解析兼容。当前公共 CLI 不会读取或消费它们，
+也不能激活工作；本发行版不含账号用量协调器或缓存合同。
 
 `CODEX_FASTLANE_TASK_ROOT` 以及 worktree/cache 位置同样预留给未来由宿主拥有的
 执行 bridge。当前公共编译器既不会创建也不会执行 worktree，不能把它的输出当作
@@ -197,15 +201,37 @@ CODEX_PROJECT_ID、CODEX_WORKSPACE_ID 或 CODEX_THREAD_ID 会提供非路径的
 插件进程把一个项目的 workflow、index 或 receipt 投影到另一个项目。没有范围
 的命令行调用为了兼容性仍使用未加后缀的根；宿主集成应始终提供项目或线程范围。
 
-临时目录依次使用显式提供的 CODEX_TASK_TEMP、TMPDIR、TEMP 或 TMP；都未
-提供时，使用 data 根旁的 .2718lab-devkit-scratch。已配置的临时根也会获得
-与持久化数据相同的范围后缀。运行时会拒绝不安全、重叠、缺失或 reparse-point
-根目录，不会把回退状态写入仓库。
+本机 DevKit 工作必须把 CODEX_TASK_TEMP 以及 TMPDIR/TEMP/TMP/
+PYTHONPYCACHEPREFIX 子路径放在隔离的 G: 盘任务根。已配置的临时根会获得与持久化
+数据相同的范围后缀。Hosted Windows CI 是明确例外：工作流必须先要求
+RUNNER_TEMP，再把 CODEX_TASK_TEMP 及所有任务临时/缓存子路径派生到其下。
+该宿主提供的临时根例外不构成 external host embedding 实证。运行时会拒绝
+不安全、重叠、缺失或 reparse-point 根目录，不会把回退状态写入仓库。
 
 宿主中断后，应从持久化工作流租约、端点、artifact 引用、快照和有界
 receipt 恢复。继续前先重新绑定有效的当前上下文。不得从聊天记录、原始
 日志或无关的新 start 重建权限。独立任务只有在证据、提交、集成和验收
 全部完成后才可归档。
+
+### 留存与清理边界
+
+留存必须是宿主明确声明的策略，不能从成功结果或未经验证的结果推断。
+合并之后，只有在策略规定的连续 `x` 轮后续 integration 均由协调器明确
+接受、这些轮次没有发生 rollback、完成一次新的且仍然有效的 host 重检查，
+并且持久化证据同时具备 candidate、base、integration commit 以及所需的
+review、verification、integration receipt 时，宿主才可记录
+`cleanup_candidate`。pending、仅观察到、推断得到或其他未经验证的结果，
+都不算已接受的轮次。
+
+`cleanup_candidate` 只是可清理候选资格证据，不是删除授权。任何组件都绝不
+自动删除 worktree、cache、receipt、evidence 或用户数据。没有留存策略，或
+任一门槛/证据缺失时，相关材料必须永久保留，直到另有明确且独立授权的清理
+策略。
+
+本地 Windows 的 `C:/` 和所有非 `G:/` 临时根、worktree、cache、evidence
+路径都禁止使用；可信 hosted Windows CI 仅可把宿主提供的 `RUNNER_TEMP`
+作为明确例外，并在其下派生所有任务临时/缓存路径。该例外不构成外部宿主
+embedding 或本地路径放宽的证据。
 
 ## 确定性 Fast Lane
 
@@ -216,19 +242,15 @@ mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
 被阻断。
 
 - `ultra` 和 `--enable` 只选择被阻断结果的形状，不会激活调度。
-- 公共编译器/CLI 不消费 host-status、quota request、实时额度、index evidence 或
-  worktree root。
+- 公共编译器/CLI 不消费 host-status、账号用量、index evidence 或 worktree root。
 - 它不会派发会话、创建 worktree、补位或运行命令；仓库内不存在这些动作的执行路径。
-- 外部 Desktop-host bridge 未来可以提供经证明的项目权限、宿主/额度消费和执行能力。
+- 外部 Desktop-host bridge 未来可以提供经证明的项目权限和执行能力。
   这只是未来合同，不是已交付实现，也不是任何 Desktop host 源码已经存在的声明。
 
-### 实时账号额度边界
+### 账号用量边界
 
-实时账号额度不是当前公共 Fast Lane 能力。向本发行版传入 `--live-quota`、
-`--quota-input` 或 `--quota-state-path` 不会读取账号来源、消费额度证据，也不会改变
-零 assignment 的结果。现有
-[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)
-是未来外部 Desktop-host bridge 合同的参考材料；本仓库不提供也不会调用该 bridge。
+账号用量不是 Fast Lane 的输入或路由机制。本发行版不含账号用量协调器、缓存或
+外部采集器合同。
 
 ## 安全与范围边界
 
@@ -257,7 +279,7 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 ## 版本
 
-本仓库代表版本化的 v1.0.0 包。发布说明见
+本仓库代表版本化的 v1.1.0 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
 和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
 后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。

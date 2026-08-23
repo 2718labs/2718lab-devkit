@@ -334,6 +334,11 @@ class _RegistryReservation(RelayProofReservation):
     def fence(self) -> ProofFinalizationFence:
         return self._fence
 
+    def apply_prepared(self, *, evidence: ProofFinalizationEvidence) -> None:
+        """Apply the exact Git CAS only after Relay durably records PREPARED."""
+
+        self._registry._apply_prepared(self, evidence=evidence)
+
     def settle(self, *, evidence: ProofFinalizationEvidence) -> Settlement:
         self._registry._validate_terminal_evidence(self._fence, evidence)
         if self._terminal_evidence is not None:
@@ -430,16 +435,6 @@ class RelayProofRegistry(IntegrationProofResolver):
         reservation = self._persist_reservation(
             proof_id, expectation, target, target_key
         )
-        try:
-            self._apply_fence_ref(target, reservation.fence, forward=True)
-            self._record_event(
-                reservation.fence,
-                "git_applied_observed",
-                result_hash=None,
-            )
-        except IntegrationProofError:
-            self._forget(reservation)
-            raise
         return reservation
 
     def recover_finalizations(self, authority: RelayFinalizationAuthority) -> None:
@@ -657,6 +652,52 @@ class RelayProofRegistry(IntegrationProofResolver):
             raise _reservation_database_error(error) from None
         finally:
             connection.close()
+
+    def _apply_prepared(
+        self,
+        reservation: _RegistryReservation,
+        *,
+        evidence: ProofFinalizationEvidence,
+    ) -> None:
+        """Perform one exact Git CAS for a still-reserved, Relay-prepared fence."""
+
+        self._ensure_open()
+        with self._active_lock:
+            if reservation._registry is not self:
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            self._validate_prepared_evidence(reservation.fence, evidence)
+            record = self._find_by_proof_id(reservation._proof_id)
+            if (
+                record is None
+                or record.state != "reserved"
+                or record.fence != reservation.fence
+            ):
+                raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
+            target = self._resolve_target(reservation.fence.workspace_id)
+            self._assert_fence_target(reservation.fence, target, record)
+            self._verify_receipt(target, record.receipt)
+            self._apply_fence_ref(target, reservation.fence, forward=True)
+            self._record_event(
+                reservation.fence,
+                "git_applied_observed",
+                result_hash=None,
+            )
+
+    @staticmethod
+    def _validate_prepared_evidence(
+        fence: ProofFinalizationFence, evidence: ProofFinalizationEvidence
+    ) -> None:
+        try:
+            validate_finalization_evidence(evidence)
+        except ValueError as error:
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT") from error
+        if (
+            evidence.state != "prepared"
+            or evidence.finalization_id != fence.finalization_id
+            or evidence.fence_hash != fence.fence_hash
+            or evidence.result_hash is not None
+        ):
+            raise IntegrationProofError("RELAY_INTEGRATION_PROOF_CORRUPT")
 
     @staticmethod
     def _validate_terminal_evidence(

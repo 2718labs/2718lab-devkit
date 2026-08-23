@@ -1,29 +1,21 @@
 """Private fail-closed facts from one inherited host bridge session.
 
-This module deliberately has no dispatch, listener, worktree, or persistence
-operation.  Its only live inputs are a previously authenticated inherited
-bridge and a same-process trusted callback that retains the verifier returned
-by the official Codex quota provider.
+This module deliberately has no dispatch, listener, worktree, persistence, or
+account-usage coordinator. Its live inputs are an authenticated inherited
+bridge plus same-process capability and lease-bound compiler resolvers.
 """
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
 import re
-import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import StrEnum
 from threading import RLock
-from types import MappingProxyType
-from typing import Any, Final, TypeAlias
-
-from devkit_fastlane.scripts.codex_account_quota import QuotaSnapshotEvidence
-from devkit_fastlane.scripts.fastlane_quota_balance import _verified_snapshot
+from typing import Final, TypeAlias
 
 from . import host_envelopes
 from .host_bridge import (
@@ -31,58 +23,20 @@ from .host_bridge import (
     InheritedHandleHostBridge,
     OperationReceipt,
 )
+from .host_scheduler_topology_adapter import (
+    HostAuthoritativeActionFact,
+    HostSchedulerTopologyFact,
+    construct_host_scheduler_topology,
+)
 
 _NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 _HASH_PREFIX: Final = "sha256:"
 _IDENTIFIER: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _REASON_SESSION_UNAVAILABLE: Final = "HOST_SESSION_UNAVAILABLE"
-_REASON_QUOTA_EXPECTATION_UNAVAILABLE: Final = "HOST_QUOTA_EXPECTATION_UNAVAILABLE"
-_REASON_QUOTA_UNAVAILABLE: Final = "HOST_QUOTA_UNAVAILABLE"
 _REASON_CAPABILITY_UNAVAILABLE: Final = "HOST_CAPABILITY_UNAVAILABLE"
 _REASON_EXECUTION_EVIDENCE_UNAVAILABLE: Final = "HOST_EXECUTION_EVIDENCE_UNAVAILABLE"
-
-
-@dataclass(frozen=True)
-class HostQuotaAttestation:
-    """Private, same-process bindings for one bridge-delivered quota snapshot."""
-
-    request_id: str
-    account_id_hash: str
-    source_id_hash: str
-    main_limit_id: str
-    spark_limit_id: str
-    capacity_hash: str
-    snapshot_seq: int
-    evidence: QuotaSnapshotEvidence = field(repr=False)
-
-
-@dataclass(frozen=True)
-class HostQuotaExpectation:
-    """Trusted constructor-time identities that a quota session cannot rebind."""
-
-    account_id_hash: str
-    source_id_hash: str
-    key_id: str
-    main_limit_id: str
-    spark_limit_id: str
-    capacity_hash: str
-    ledger_epoch: int
-    active_lease_set_hash: str
-    snapshot_seq_high_water: int
-
-
-@dataclass(frozen=True)
-class HostQuotaFacts:
-    """Bearer-free facts admitted only after exact private attestation."""
-
-    request_id: str
-    account_id_hash: str
-    source_id_hash: str
-    main_limit_id: str
-    spark_limit_id: str
-    snapshot_hash: str
-    snapshot_seq: int
-    snapshot: Mapping[str, Any]
+_MAX_HOST_WRITER_ACTIONS: Final = 9
+_MAX_HOST_READER_ACTIONS: Final = 189
 
 
 class HostCapabilityState(StrEnum):
@@ -131,6 +85,38 @@ class HostUnavailableFacts:
     facts: tuple[HostCapabilityFact, ...]
 
 
+# Keep the established HostSession name while the fact remains adapter-private.
+HostTopologyGroupFact = HostSchedulerTopologyFact
+
+
+@dataclass(frozen=True)
+class HostResolvedTopologyGroup:
+    """Auditable, non-dispatching group result without paths or task leases."""
+
+    scheduler_id: str
+    coordinator_lease_id: str
+    worktree_identity: str
+    writer_task_ids: tuple[str, ...]
+    prewarm_task_ids: tuple[str, ...]
+    relay_group_binding_hash: str
+    attested_capacity: int
+    attestation_hash: str
+    group_binding_hash: str
+    authoritative_actions: tuple[HostAuthoritativeActionFact, ...]
+
+
+@dataclass(frozen=True)
+class HostResolvedSchedulerTopology:
+    """Private Host-only resolution of an already parsed Host projection."""
+
+    schema: str
+    relay_plan_hash: str
+    relay_topology_hash: str
+    projection_hash: str
+    groups: tuple[HostResolvedTopologyGroup, ...]
+    audit_binding_hash: str
+
+
 @dataclass(frozen=True)
 class _CapabilityRecord:
     """Process-private binding retained for terminal validation only."""
@@ -139,9 +125,6 @@ class _CapabilityRecord:
     binding: host_envelopes.EnvelopeBinding = field(repr=False)
 
 
-QuotaEvidenceResolver: TypeAlias = Callable[
-    [str, Mapping[str, object]], HostQuotaAttestation | None
-]
 CompilerEvidenceProvider: TypeAlias = Callable[["_CompilerPreparation"], object]
 
 
@@ -167,6 +150,7 @@ class _CompilerInvocationBinding:
 CompilerInvocationResolver: TypeAlias = Callable[
     [str], _CompilerInvocationBinding | None
 ]
+TopologyFactResolver: TypeAlias = Callable[[object], object]
 
 
 @dataclass(frozen=True)
@@ -181,9 +165,6 @@ class _CompilerInvocation:
     verified_lease_scope_bindings: tuple[str, ...]
     issued_at: float
     expires_at: float
-    snapshot_hash: str
-    snapshot_seq: int
-    quota_binding_hash: str
     binding_hash: str
 
 
@@ -200,14 +181,13 @@ class HostSession:
         self,
         *,
         bridge: InheritedHandleHostBridge | None,
-        quota_evidence_resolver: QuotaEvidenceResolver,
         clock: Callable[[], float],
-        quota_expectation: HostQuotaExpectation | None = None,
         compiler_evidence_provider: CompilerEvidenceProvider | None = None,
         compiler_invocation_resolver: CompilerInvocationResolver | None = None,
+        topology_fact_resolver: TopologyFactResolver | None = None,
+        host_action_capacity_resolver: Callable[[], object] | None = None,
     ) -> None:
         self._bridge = bridge
-        self._quota_evidence_resolver = quota_evidence_resolver
         self._compiler_evidence_provider = (
             compiler_evidence_provider if callable(compiler_evidence_provider) else None
         )
@@ -216,31 +196,24 @@ class HostSession:
             if callable(compiler_invocation_resolver)
             else None
         )
+        self._topology_fact_resolver = (
+            topology_fact_resolver if callable(topology_fact_resolver) else None
+        )
+        self._host_action_capacity_resolver = (
+            host_action_capacity_resolver
+            if callable(host_action_capacity_resolver)
+            else None
+        )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
         self._burned_preparation_ids: set[str] = set()
-        self._has_fresh_quota = False
-        self._fresh_quota: HostQuotaFacts | None = None
-        self._fresh_quota_issued_at: float | None = None
-        self._fresh_quota_valid_until: float | None = None
         self._clock = clock
         self._last_trusted_clock: float | None = None
-        try:
-            self._quota_expectation = _normalize_quota_expectation(quota_expectation)
-        except (TypeError, ValueError):
-            self._quota_expectation = None
         self._closed = False
         self._frozen = (
             bridge is None
-            or not callable(quota_evidence_resolver)
             or not callable(clock)
             or not bridge.is_available
-        )
-        self._seen_snapshot_hashes: set[str] = set()
-        self._last_snapshot_seq: int | None = (
-            None
-            if self._quota_expectation is None
-            else self._quota_expectation.snapshot_seq_high_water
         )
         self._attested_capabilities: dict[tuple[str, str], _CapabilityRecord] = {}
         self._consumed_predecessors: set[tuple[str, str, str, str, str]] = set()
@@ -252,9 +225,7 @@ class HostSession:
         *,
         environ: Mapping[str, str] | None,
         platform: str | None,
-        quota_evidence_resolver: QuotaEvidenceResolver,
         clock: Callable[[], float],
-        quota_expectation: HostQuotaExpectation | None = None,
     ) -> HostSession:
         """Accept only the configured inherited bridge selector, never a fallback."""
 
@@ -267,9 +238,7 @@ class HostSession:
             bridge = None
         return cls(
             bridge=bridge,
-            quota_evidence_resolver=quota_evidence_resolver,
             clock=clock,
-            quota_expectation=quota_expectation,
         )
 
     @property
@@ -297,10 +266,6 @@ class HostSession:
                 return
             self._closed = True
             self._frozen = True
-            self._has_fresh_quota = False
-            self._fresh_quota = None
-            self._fresh_quota_issued_at = None
-            self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -325,39 +290,13 @@ class HostSession:
             if preparation_id in self._burned_preparation_ids:
                 return _NO_SAFE_WORK
             self._burned_preparation_ids.add(preparation_id)
-            quota = self._fresh_quota
-            issued_at = self._fresh_quota_issued_at
-            valid_until = self._fresh_quota_valid_until
-            if (
-                not self.is_available
-                or not self._has_fresh_quota
-                or quota is None
-                or issued_at is None
-                or valid_until is None
-            ):
+            if not self.is_available:
                 return _NO_SAFE_WORK
             try:
-                now = self._read_trusted_clock()
+                issued_at = self._read_trusted_clock()
             except (TypeError, ValueError):
                 return _NO_SAFE_WORK
-            self._has_fresh_quota = False
-            self._fresh_quota = None
-            self._fresh_quota_issued_at = None
-            self._fresh_quota_valid_until = None
-            expires_at = min(issued_at + 120, valid_until)
-            if now >= expires_at:
-                return _NO_SAFE_WORK
-            quota_binding_hash = _hash(
-                {
-                    "account_id_hash": quota.account_id_hash,
-                    "main_limit_id": quota.main_limit_id,
-                    "request_id": quota.request_id,
-                    "snapshot_hash": quota.snapshot_hash,
-                    "snapshot_seq": quota.snapshot_seq,
-                    "source_id_hash": quota.source_id_hash,
-                    "spark_limit_id": quota.spark_limit_id,
-                }
-            )
+            expires_at = issued_at + 120
             try:
                 binding = _normalized_compiler_invocation_binding(
                     binding_resolver(preparation_id)
@@ -366,7 +305,7 @@ class HostSession:
                 return _NO_SAFE_WORK
             preparation = _CompilerPreparation()
             material = _CompilerInvocation(
-                schema="2718lab-devkit/compiler-invocation-v1",
+                schema="2718lab-devkit/compiler-invocation-v2",
                 preparation_id=preparation_id,
                 request_hash=binding.request_hash,
                 reasoning_effort=binding.reasoning_effort,
@@ -374,20 +313,15 @@ class HostSession:
                 verified_lease_scope_bindings=binding.verified_lease_scope_bindings,
                 issued_at=issued_at,
                 expires_at=expires_at,
-                snapshot_hash=quota.snapshot_hash,
-                snapshot_seq=quota.snapshot_seq,
-                quota_binding_hash=quota_binding_hash,
                 binding_hash=_hash(
                     {
-                        "expires_at": expires_at,
-                        "issued_at": issued_at,
                         "preparation_id": preparation_id,
-                        "quota_binding_hash": quota_binding_hash,
-                        "reasoning_effort": binding.reasoning_effort,
                         "request_hash": binding.request_hash,
-                        "route_result_hashes": binding.verified_route_result_hashes,
-                        "schema": "2718lab-devkit/compiler-invocation-v1",
-                        "lease_scope_bindings": binding.verified_lease_scope_bindings,
+                        "reasoning_effort": binding.reasoning_effort,
+                        "verified_route_result_hashes": binding.verified_route_result_hashes,
+                        "verified_lease_scope_bindings": binding.verified_lease_scope_bindings,
+                        "issued_at": issued_at,
+                        "expires_at": expires_at,
                     }
                 ),
             )
@@ -435,45 +369,386 @@ class HostSession:
                 return _NO_SAFE_WORK
             return material
 
-    def read_quota(self) -> HostQuotaFacts | str:
-        """Return one fresh, fully bound quota fact set or ``NO_SAFE_WORK``."""
+    def resolve_scheduler_topology(
+        self, topology: object
+    ) -> HostResolvedSchedulerTopology | str:
+        """Resolve one parsed Host topology against the private group facts."""
 
-        if not self.is_available:
-            self._record_unavailable((), _REASON_SESSION_UNAVAILABLE)
-            return _NO_SAFE_WORK
-        if self._quota_expectation is None:
-            self._record_unavailable((), _REASON_QUOTA_EXPECTATION_UNAVAILABLE)
-            return _NO_SAFE_WORK
-        bridge = self._bridge
-        assert bridge is not None
-        request_id = f"quota-{secrets.token_hex(16)}"
-        try:
-            bridge.request_quota_snapshot(request_id=request_id)
-            transport_snapshot = copy.deepcopy(
-                bridge.receive_quota_snapshot(request_id=request_id)
-            )
-            attestation = self._quota_evidence_resolver(
-                request_id, copy.deepcopy(transport_snapshot)
-            )
-            facts = self._verify_quota(
-                request_id=request_id,
-                snapshot=transport_snapshot,
-                attestation=attestation,
-            )
-            issued_at = self._read_trusted_clock()
-            valid_until = _valid_until_timestamp(facts.snapshot)
-        except Exception:
-            self._record_unavailable((), _REASON_QUOTA_UNAVAILABLE)
-            self._freeze()
-            return _NO_SAFE_WORK
+        from .fastlane_host_intent import ParsedHostSchedulerTopologyProjection
+
         with self._compiler_evidence_lock:
-            if self._closed or self._frozen or not self.is_available:
+            resolver = self._topology_fact_resolver
+            if (
+                self._closed
+                or self._frozen
+                or not self.is_available
+                or type(topology) is not ParsedHostSchedulerTopologyProjection
+                or resolver is None
+            ):
                 return _NO_SAFE_WORK
-            self._has_fresh_quota = True
-            self._fresh_quota = facts
-            self._fresh_quota_issued_at = issued_at
-            self._fresh_quota_valid_until = valid_until
-        return facts
+            try:
+                raw_facts = resolver(topology)
+            except Exception:
+                return _NO_SAFE_WORK
+            return self._resolve_host_scheduler_topology(topology, raw_facts)
+
+    def resolve_relay_host_scheduler_slot(
+        self, slot: object
+    ) -> HostResolvedSchedulerTopology | str:
+        """Privately build, parse, and resolve aggregate topology from one slot."""
+
+        from .fastlane_host_intent import (
+            NO_SAFE_WORK,
+            parse_host_scheduler_topology_projection,
+            parse_relay_host_scheduler_slot,
+        )
+
+        with self._compiler_evidence_lock:
+            resolver = self._topology_fact_resolver
+            if (
+                self._closed
+                or self._frozen
+                or not self.is_available
+                or resolver is None
+            ):
+                return _NO_SAFE_WORK
+            parsed_slot = parse_relay_host_scheduler_slot(slot)
+            if parsed_slot == NO_SAFE_WORK:
+                return _NO_SAFE_WORK
+            try:
+                raw_facts = resolver(parsed_slot)
+                host_topology = construct_host_scheduler_topology(
+                    parsed_slot, raw_facts
+                )
+                if host_topology == _NO_SAFE_WORK:
+                    return _NO_SAFE_WORK
+                parsed_topology = parse_host_scheduler_topology_projection(
+                    host_topology
+                )
+                if parsed_topology == NO_SAFE_WORK:
+                    return _NO_SAFE_WORK
+            except Exception:
+                return _NO_SAFE_WORK
+            return self._resolve_host_scheduler_topology(parsed_topology, raw_facts)
+
+    def admit_relay_actions(self, actions: object) -> bool:
+        """Admit only exact Relay actions within live Host physical-slot capacity."""
+
+        from .fastlane_host_intent import (
+            NO_SAFE_WORK,
+            parse_relay_host_scheduler_slot,
+        )
+
+        with self._compiler_evidence_lock:
+            capacity_resolver = self._host_action_capacity_resolver
+            if (
+                self._closed
+                or self._frozen
+                or not self.is_available
+                or capacity_resolver is None
+                or type(actions) is not list
+            ):
+                return False
+            if not actions:
+                return True
+            try:
+                writer_capacity, reader_capacity = _normalized_host_action_capacity(
+                    capacity_resolver()
+                )
+            except Exception:
+                return False
+            if len(actions) > _MAX_HOST_WRITER_ACTIONS + _MAX_HOST_READER_ACTIONS:
+                return False
+            writer_count = 0
+            reader_count = 0
+            seen_task_ids: set[str] = set()
+            resolved_topology: HostResolvedSchedulerTopology | None = None
+            for action in actions:
+                if type(action) is not dict:
+                    return False
+                task_id = action.get("task_id")
+                task_contract = action.get("task_contract")
+                if (
+                    action.get("kind") != "codex.spawn_agent"
+                    or type(task_id) is not str
+                    or _IDENTIFIER.fullmatch(task_id) is None
+                    or task_id in seen_task_ids
+                    or type(task_contract) is not dict
+                    or task_contract.get("task_id") != task_id
+                ):
+                    return False
+                task_kind = task_contract.get("kind")
+                if task_kind not in {"implementation", "prewarm", "design"}:
+                    return False
+                slot = parse_relay_host_scheduler_slot(
+                    action.get("relay_host_scheduler_slot")
+                )
+                if slot == NO_SAFE_WORK:
+                    return False
+                if resolved_topology is None:
+                    resolved = self.resolve_relay_host_scheduler_slot(
+                        action["relay_host_scheduler_slot"]
+                    )
+                    if not isinstance(resolved, HostResolvedSchedulerTopology):
+                        return False
+                    resolved_topology = resolved
+                resolved = resolved_topology
+                if resolved is None:
+                    return False
+                matching_groups = [
+                    group
+                    for group in resolved.groups
+                    if group.scheduler_id == slot.scheduler_id
+                    and group.coordinator_lease_id == slot.coordinator_lease_id
+                    and group.worktree_identity == slot.worktree_identity
+                    and group.relay_group_binding_hash == slot.group_binding_hash
+                ]
+                if (
+                    resolved.relay_plan_hash != slot.plan_hash
+                    or resolved.relay_topology_hash != slot.topology_hash
+                    or len(matching_groups) != 1
+                ):
+                    return False
+                group = matching_groups[0]
+                if task_kind == "implementation":
+                    if (
+                        slot.read_only
+                        or slot.writer_slot is None
+                        or slot.writer_slot > len(group.writer_task_ids)
+                        or group.writer_task_ids[slot.writer_slot - 1] != task_id
+                    ):
+                        return False
+                    writer_count += 1
+                    target = task_id
+                elif task_kind == "prewarm":
+                    target = task_contract.get("prewarm_for_task_id")
+                    if (
+                        not slot.read_only
+                        or slot.writer_slot is not None
+                        or task_id not in group.prewarm_task_ids
+                        or type(target) is not str
+                        or _IDENTIFIER.fullmatch(target) is None
+                        or target not in group.writer_task_ids
+                    ):
+                        return False
+                    reader_count += 1
+                else:
+                    design_target = task_contract.get("design_for_task_id")
+                    if (
+                        not slot.read_only
+                        or slot.writer_slot is not None
+                        or type(design_target) is not str
+                        or _IDENTIFIER.fullmatch(design_target) is None
+                        or design_target not in group.writer_task_ids
+                    ):
+                        return False
+                    target = design_target
+                    reader_count += 1
+                if (
+                    HostAuthoritativeActionFact(
+                        plan_hash=slot.plan_hash,
+                        task_id=task_id,
+                        kind=task_kind,
+                        target=target,
+                        group_binding_hash=slot.group_binding_hash,
+                    )
+                    not in group.authoritative_actions
+                ):
+                    return False
+                seen_task_ids.add(task_id)
+            if resolved_topology is None:
+                return False
+            return (
+                writer_count <= writer_capacity
+                and reader_count <= reader_capacity
+                and writer_count
+                <= sum(group.attested_capacity for group in resolved_topology.groups)
+            )
+
+    def _resolve_host_scheduler_topology(
+        self,
+        topology: object,
+        raw_facts: object,
+    ) -> HostResolvedSchedulerTopology | str:
+        """Strongly compare every Relay hash and group field to private facts."""
+
+        from .fastlane_host_intent import ParsedHostSchedulerTopologyProjection
+
+        if (
+            type(topology) is not ParsedHostSchedulerTopologyProjection
+            or type(raw_facts) is not tuple
+            or len(raw_facts) != len(topology.groups)
+        ):
+            return _NO_SAFE_WORK
+        try:
+            facts_by_scheduler: dict[str, HostTopologyGroupFact] = {}
+            canonical_actions_by_scheduler: dict[
+                str, tuple[HostAuthoritativeActionFact, ...]
+            ] = {}
+            seen_task_ids: set[str] = set()
+            for fact in raw_facts:
+                if (
+                    type(fact) is not HostTopologyGroupFact
+                    or not _is_hash(fact.plan_hash)
+                    or not _is_hash(fact.topology_hash)
+                    or not _is_hash(fact.group_binding_hash)
+                    or _IDENTIFIER.fullmatch(fact.scheduler_id) is None
+                    or _IDENTIFIER.fullmatch(fact.coordinator_lease_id) is None
+                    or _IDENTIFIER.fullmatch(fact.worktree_identity) is None
+                    or type(fact.writer_task_ids) is not tuple
+                    or not 1 <= len(fact.writer_task_ids) <= 3
+                    or any(
+                        _IDENTIFIER.fullmatch(task_id) is None
+                        for task_id in fact.writer_task_ids
+                    )
+                    or type(fact.prewarm_task_ids) is not tuple
+                    or len(fact.prewarm_task_ids) > 16
+                    or any(
+                        _IDENTIFIER.fullmatch(task_id) is None
+                        for task_id in fact.prewarm_task_ids
+                    )
+                    or set(fact.writer_task_ids).intersection(fact.prewarm_task_ids)
+                    or not 1 <= fact.attested_capacity <= 3
+                    or len(fact.writer_task_ids) > fact.attested_capacity
+                    or not _is_hash(fact.attestation_hash)
+                    or type(fact.authoritative_actions) is not tuple
+                    or len(fact.authoritative_actions) > 22
+                    or any(
+                        type(action) is not HostAuthoritativeActionFact
+                        or not _is_hash(action.plan_hash)
+                        or _IDENTIFIER.fullmatch(action.task_id) is None
+                        or action.kind
+                        not in {"implementation", "prewarm", "design"}
+                        or _IDENTIFIER.fullmatch(action.target) is None
+                        or not _is_hash(action.group_binding_hash)
+                        or action.plan_hash != fact.plan_hash
+                        or action.group_binding_hash != fact.group_binding_hash
+                        or (
+                            action.kind == "implementation"
+                            and (
+                                action.task_id not in fact.writer_task_ids
+                                or action.target != action.task_id
+                            )
+                        )
+                        or (
+                            action.kind == "prewarm"
+                            and (
+                                action.task_id not in fact.prewarm_task_ids
+                                or action.target not in fact.writer_task_ids
+                            )
+                        )
+                        or (
+                            action.kind == "design"
+                            and (
+                                action.task_id in fact.writer_task_ids
+                                or action.task_id in fact.prewarm_task_ids
+                                or action.target not in fact.writer_task_ids
+                            )
+                        )
+                        for action in fact.authoritative_actions
+                    )
+                    or len(
+                        {action.task_id for action in fact.authoritative_actions}
+                    )
+                    != len(fact.authoritative_actions)
+                    or fact.scheduler_id in facts_by_scheduler
+                ):
+                    raise ValueError("topology fact is invalid")
+                canonical_actions = _canonical_authoritative_actions(
+                    fact.authoritative_actions
+                )
+                fact_task_ids = {
+                    *fact.writer_task_ids,
+                    *fact.prewarm_task_ids,
+                    *(
+                        action.task_id
+                        for action in canonical_actions
+                        if action.kind == "design"
+                    ),
+                }
+                if seen_task_ids.intersection(fact_task_ids):
+                    raise ValueError("topology task identities are not unique")
+                seen_task_ids.update(fact_task_ids)
+                facts_by_scheduler[fact.scheduler_id] = fact
+                canonical_actions_by_scheduler[fact.scheduler_id] = canonical_actions
+            groups: list[HostResolvedTopologyGroup] = []
+            total_writer_tasks = 0
+            for group in topology.groups:
+                fact = facts_by_scheduler.get(group.scheduler_id)
+                if (
+                    fact is None
+                    or fact.plan_hash != topology.relay_plan_hash
+                    or fact.topology_hash != topology.relay_topology_hash
+                    or fact.group_binding_hash != group.relay_group_binding_hash
+                    or fact.coordinator_lease_id != group.coordinator_lease_id
+                    or fact.worktree_identity != group.worktree_identity
+                    or fact.writer_task_ids != group.writer_task_ids
+                    or fact.prewarm_task_ids != group.prewarm_task_ids
+                    or fact.attested_capacity != group.attested_capacity
+                    or fact.attestation_hash != group.attestation_hash
+                ):
+                    raise ValueError("topology binding is invalid")
+                total_writer_tasks += len(group.writer_task_ids)
+                groups.append(
+                    HostResolvedTopologyGroup(
+                        scheduler_id=group.scheduler_id,
+                        coordinator_lease_id=group.coordinator_lease_id,
+                        worktree_identity=group.worktree_identity,
+                        writer_task_ids=group.writer_task_ids,
+                        prewarm_task_ids=group.prewarm_task_ids,
+                        relay_group_binding_hash=group.relay_group_binding_hash,
+                        attested_capacity=fact.attested_capacity,
+                        attestation_hash=fact.attestation_hash,
+                        group_binding_hash=group.group_binding_hash,
+                        authoritative_actions=canonical_actions_by_scheduler[
+                            group.scheduler_id
+                        ],
+                    )
+                )
+            if total_writer_tasks > 9:
+                raise ValueError("topology exceeds host capacity")
+            audit_binding_hash = _hash(
+                {
+                    "schema": topology.schema,
+                    "relay_plan_hash": topology.relay_plan_hash,
+                    "relay_topology_hash": topology.relay_topology_hash,
+                    "projection_hash": topology.projection_hash,
+                    "groups": [
+                        {
+                            "scheduler_id": group.scheduler_id,
+                            "coordinator_lease_id": group.coordinator_lease_id,
+                            "worktree_identity": group.worktree_identity,
+                            "writer_task_ids": group.writer_task_ids,
+                            "prewarm_task_ids": group.prewarm_task_ids,
+                            "relay_group_binding_hash": group.relay_group_binding_hash,
+                            "attested_capacity": group.attested_capacity,
+                            "attestation_hash": group.attestation_hash,
+                            "group_binding_hash": group.group_binding_hash,
+                            "authoritative_actions": [
+                                {
+                                    "plan_hash": action.plan_hash,
+                                    "task_id": action.task_id,
+                                    "kind": action.kind,
+                                    "target": action.target,
+                                    "group_binding_hash": action.group_binding_hash,
+                                }
+                                for action in group.authoritative_actions
+                            ],
+                        }
+                        for group in groups
+                    ],
+                }
+            )
+        except Exception:
+            return _NO_SAFE_WORK
+        return HostResolvedSchedulerTopology(
+            schema=topology.schema,
+            relay_plan_hash=topology.relay_plan_hash,
+            relay_topology_hash=topology.relay_topology_hash,
+            projection_hash=topology.projection_hash,
+            groups=tuple(groups),
+            audit_binding_hash=audit_binding_hash,
+        )
 
     def declare_routes(
         self, routes: tuple[HostRoute, ...] | list[HostRoute]
@@ -658,77 +933,6 @@ class HostSession:
         )
         return executed
 
-    def _verify_quota(
-        self,
-        *,
-        request_id: str,
-        snapshot: Mapping[str, object],
-        attestation: HostQuotaAttestation | None,
-    ) -> HostQuotaFacts:
-        expectation = self._quota_expectation
-        if expectation is None:
-            raise ValueError("quota expectation is unavailable")
-        if type(attestation) is not HostQuotaAttestation:
-            raise ValueError("quota attestation is unavailable")
-        evidence = attestation.evidence
-        if type(evidence) is not QuotaSnapshotEvidence:
-            raise ValueError("quota evidence is unavailable")
-        if attestation.request_id != request_id or dict(evidence.snapshot) != dict(
-            snapshot
-        ):
-            raise ValueError("quota evidence is not request-bound")
-        evaluation_time = _utc_z(self._read_trusted_clock())
-        verified, _ = _verified_snapshot(
-            snapshot,
-            trusted_key_resolver=evidence.key_resolver,
-            evaluation_time_utc_z=evaluation_time,
-        )
-        source = _mapping(verified["source"])
-        capacity = _mapping(verified["capacity"])
-        snapshot_hash = _required_hash(verified["snapshot_hash"])
-        snapshot_seq = _required_positive_int(verified["snapshot_seq"])
-        if (
-            attestation.source_id_hash != source.get("source_id_hash")
-            or source.get("source_id_hash") != _OFFICIAL_QUOTA_SOURCE_ID_HASH
-            or attestation.source_id_hash != expectation.source_id_hash
-            or evidence.key_id != source.get("key_id")
-            or evidence.key_id != expectation.key_id
-            or not _is_hash(attestation.account_id_hash)
-            or attestation.account_id_hash != evidence.account_id_hash
-            or attestation.account_id_hash != expectation.account_id_hash
-            or attestation.main_limit_id != evidence.main_limit_id
-            or attestation.spark_limit_id != evidence.spark_limit_id
-            or attestation.main_limit_id != "codex"
-            or attestation.main_limit_id != expectation.main_limit_id
-            or not isinstance(attestation.spark_limit_id, str)
-            or not attestation.spark_limit_id
-            or attestation.spark_limit_id != expectation.spark_limit_id
-            or attestation.capacity_hash != _hash(capacity)
-            or _hash(capacity) != expectation.capacity_hash
-            or capacity.get("ledger_epoch") != expectation.ledger_epoch
-            or capacity.get("active_lease_set_hash")
-            != expectation.active_lease_set_hash
-            or attestation.snapshot_seq != snapshot_seq
-        ):
-            raise ValueError("quota evidence binding is invalid")
-        if snapshot_hash in self._seen_snapshot_hashes or (
-            self._last_snapshot_seq is not None
-            and snapshot_seq <= self._last_snapshot_seq
-        ):
-            raise ValueError("quota snapshot was replayed")
-        self._seen_snapshot_hashes.add(snapshot_hash)
-        self._last_snapshot_seq = snapshot_seq
-        return HostQuotaFacts(
-            request_id=request_id,
-            account_id_hash=attestation.account_id_hash,
-            source_id_hash=_required_hash(source["source_id_hash"]),
-            main_limit_id=attestation.main_limit_id,
-            spark_limit_id=attestation.spark_limit_id,
-            snapshot_hash=snapshot_hash,
-            snapshot_seq=snapshot_seq,
-            snapshot=_readonly_mapping(verified),
-        )
-
     def _record_unavailable(
         self,
         routes: tuple[HostRoute, ...] | list[HostRoute],
@@ -755,10 +959,6 @@ class HostSession:
     def _freeze(self) -> None:
         with self._compiler_evidence_lock:
             self._frozen = True
-            self._has_fresh_quota = False
-            self._fresh_quota = None
-            self._fresh_quota_issued_at = None
-            self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -777,7 +977,7 @@ class HostSession:
             return value
 
 
-def _mapping(value: object) -> Mapping[str, Any]:
+def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("expected object")
     return value
@@ -854,43 +1054,7 @@ def _compiler_invocation_state(value: _CompilerInvocation) -> tuple[object, ...]
         value.verified_lease_scope_bindings,
         value.issued_at,
         value.expires_at,
-        value.snapshot_hash,
-        value.snapshot_seq,
-        value.quota_binding_hash,
         value.binding_hash,
-    )
-
-
-def _normalize_quota_expectation(
-    value: HostQuotaExpectation | None,
-) -> HostQuotaExpectation | None:
-    if value is None:
-        return None
-    if type(value) is not HostQuotaExpectation:
-        raise ValueError("quota expectation is invalid")
-    if (
-        not _is_hash(value.account_id_hash)
-        or not _is_hash(value.source_id_hash)
-        or not _is_hash(value.key_id)
-        or value.main_limit_id != "codex"
-        or type(value.spark_limit_id) is not str
-        or _IDENTIFIER.fullmatch(value.spark_limit_id) is None
-        or not _is_hash(value.capacity_hash)
-        or not _is_hash(value.active_lease_set_hash)
-    ):
-        raise ValueError("quota expectation identity is invalid")
-    ledger_epoch = _required_nonnegative_int(value.ledger_epoch)
-    snapshot_seq_high_water = _required_nonnegative_int(value.snapshot_seq_high_water)
-    return HostQuotaExpectation(
-        account_id_hash=value.account_id_hash,
-        source_id_hash=value.source_id_hash,
-        key_id=value.key_id,
-        main_limit_id=value.main_limit_id,
-        spark_limit_id=value.spark_limit_id,
-        capacity_hash=value.capacity_hash,
-        ledger_epoch=ledger_epoch,
-        active_lease_set_hash=value.active_lease_set_hash,
-        snapshot_seq_high_water=snapshot_seq_high_water,
     )
 
 
@@ -899,30 +1063,6 @@ def _trusted_clock(clock: Callable[[], float]) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError("trusted host clock is invalid")
     return value
-
-
-def _valid_until_timestamp(snapshot: Mapping[str, Any]) -> float:
-    value = snapshot.get("valid_until_utc_z")
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise ValueError("signed quota validity is invalid")
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError as error:
-        raise ValueError("signed quota validity is invalid") from error
-    if parsed.tzinfo != UTC:
-        raise ValueError("signed quota validity is invalid")
-    timestamp = parsed.timestamp()
-    if not math.isfinite(timestamp):
-        raise ValueError("signed quota validity is invalid")
-    return timestamp
-
-
-def _utc_z(value: float) -> str:
-    return (
-        datetime.fromtimestamp(value, tz=UTC)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
 
 
 def _hash(value: object) -> str:
@@ -940,22 +1080,36 @@ def _hash(value: object) -> str:
     )
 
 
-_OFFICIAL_QUOTA_SOURCE_ID_HASH: Final = _hash("codex-app-server-account-rate-limits")
+def _canonical_authoritative_actions(
+    actions: tuple[HostAuthoritativeActionFact, ...],
+) -> tuple[HostAuthoritativeActionFact, ...]:
+    return tuple(
+        sorted(
+            actions,
+            key=lambda action: (
+                action.task_id,
+                action.kind,
+                action.target,
+                action.plan_hash,
+                action.group_binding_hash,
+            ),
+        )
+    )
 
 
-def _readonly_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    def freeze(item: object) -> object:
-        if isinstance(item, Mapping):
-            return MappingProxyType(
-                {str(key): freeze(value) for key, value in item.items()}
-            )
-        if isinstance(item, list):
-            return tuple(freeze(child) for child in item)
-        return item
-
-    frozen = freeze(dict(value))
-    assert isinstance(frozen, Mapping)
-    return frozen
+def _normalized_host_action_capacity(value: object) -> tuple[int, int]:
+    if type(value) is not dict or set(value) != {"writer_capacity", "reader_capacity"}:
+        raise ValueError("host action capacity is invalid")
+    writer_capacity = value["writer_capacity"]
+    reader_capacity = value["reader_capacity"]
+    if (
+        type(writer_capacity) is not int
+        or type(reader_capacity) is not int
+        or not 0 <= writer_capacity <= _MAX_HOST_WRITER_ACTIONS
+        or not 0 <= reader_capacity <= _MAX_HOST_READER_ACTIONS
+    ):
+        raise ValueError("host action capacity is invalid")
+    return writer_capacity, reader_capacity
 
 
 def _bounded_routes(value: object) -> tuple[HostRoute, ...]:
@@ -1049,14 +1203,10 @@ def _canonical_json(value: object) -> str:
 
 
 __all__ = [
-    "HostQuotaAttestation",
-    "HostQuotaExpectation",
-    "HostQuotaFacts",
     "HostCapabilityFact",
     "HostCapabilityState",
     "HostRoute",
     "HostSchedulingFacts",
     "HostUnavailableFacts",
     "HostSession",
-    "QuotaEvidenceResolver",
 ]

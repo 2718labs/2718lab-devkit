@@ -1,6 +1,6 @@
 [project]
 name = "2718lab-devkit-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP runtime for the 2718lab DevKit primary plugin."
 requires-python = ">=3.11"
 dependencies = [
@@ -20,6 +20,22 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = false
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "bugkiller",
+    "devkit_atlas",
+    "devkit_continuity",
+    "devkit_fastlane",
+    "devkit_relay",
+    "devkit_runtime",
+    "orchestrator",
+    "project_index",
+]
+exclude = ["*/tests/**"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"server.py" = "server.py"
 
 [tool.ruff]
 line-length = 88

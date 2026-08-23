@@ -3,7 +3,18 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _workflow_job_block(workflow: str, job_name: str) -> str:
+    header = f"  {job_name}:\n"
+    start = workflow.index(header) + len(header)
+    following = workflow[start:]
+    next_job = re.search(r"^  [A-Za-z0-9][A-Za-z0-9-]*:\n", following, re.MULTILINE)
+    return following if next_job is None else following[: next_job.start()]
 
 
 def test_server_card_temp_and_cache_environment_stays_under_task_root() -> None:
@@ -11,12 +22,17 @@ def test_server_card_temp_and_cache_environment_stays_under_task_root() -> None:
 
     assert configured_task_root.is_absolute()
     task_root = configured_task_root.resolve()
-    if os.name == "nt":
-        assert task_root.drive.casefold() == "d:"
-    else:
-        runner_temp = os.environ.get("RUNNER_TEMP")
-        if runner_temp:
-            assert task_root.is_relative_to(Path(runner_temp).resolve())
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    hosted_windows_runner = (
+        os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("RUNNER_OS") == "Windows"
+        and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+        and runner_temp
+    )
+    if hosted_windows_runner:
+        assert task_root.is_relative_to(Path(runner_temp).resolve())
+    elif os.name == "nt":
+        assert task_root.drive.casefold() == "g:"
 
     for name in (
         "CODEX_TASK_TEMP",
@@ -39,3 +55,52 @@ def test_server_does_not_restore_legacy_data_or_temp_ownership() -> None:
     assert "_resolve_data_root" not in source
     assert "tempfile" not in source
     assert "C:\\\\" not in source
+
+
+def test_hosted_workflows_and_fast_lane_docs_preserve_temp_root_boundary() -> None:
+    workflows = {
+        relative_path: (ROOT / relative_path).read_text(encoding="utf-8")
+        for relative_path in (
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+        )
+    }
+
+    for workflow in workflows.values():
+        assert "$env:RUNNER_TEMP" in workflow
+        assert "RUNNER_TEMP is required for hosted task-local storage" in workflow
+
+    for relative_path, workflow in workflows.items():
+        fast_lane = _workflow_job_block(workflow, "fast-lane")
+        assert "runs-on: windows-latest" in fast_lane, relative_path
+        assert "$root = Join-Path $env:RUNNER_TEMP" in fast_lane, relative_path
+        for assignment in (
+            "CODEX_FASTLANE_TASK_ROOT=$root",
+            "CODEX_TASK_TEMP=$root",
+            "TEMP=$(Join-Path $root 'tmp')",
+            "TMP=$(Join-Path $root 'tmp')",
+            "TMPDIR=$(Join-Path $root 'tmp')",
+            "PYTHONPYCACHEPREFIX=$(Join-Path $root 'pycache')",
+            "UV_CACHE_DIR=$(Join-Path $root 'uv-cache')",
+        ):
+            assert assignment in fast_lane, (relative_path, assignment)
+        assert "Verify Fast Lane hosted task root" in fast_lane, relative_path
+        assert "CODEX_FASTLANE_TASK_ROOT must stay below RUNNER_TEMP" in fast_lane
+
+    documents = (
+        (ROOT / "mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md").read_text(
+            encoding="utf-8"
+        ),
+        (
+            ROOT / "mcp-tools/devkit_fastlane/references/efficiency-automation.md"
+        ).read_text(encoding="utf-8"),
+    )
+    for required in (
+        "当前 bootstrap/read-context",
+        "默认 `G:\\2718lab\\_codex\\.codex-task-temp`",
+        "C-drive temporary roots are forbidden",
+        "RUNNER_TEMP",
+        "host-private V2/V3 bootstrap",
+        "external host embedding",
+    ):
+        assert any(required in document for document in documents), required

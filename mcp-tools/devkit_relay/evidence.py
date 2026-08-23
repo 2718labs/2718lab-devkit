@@ -65,6 +65,15 @@ class CapabilitySigner:
         self._secret = secret
         self._lifetime_seconds = lifetime_seconds
 
+    @property
+    def key_id(self) -> str:
+        """Return a one-way key identity suitable for bearer-free persistence."""
+
+        digest = hashlib.sha256(
+            b"2718lab-devkit/relay-capability-key-id-v1\x00" + self._secret
+        ).hexdigest()
+        return f"sha256:{digest}"
+
     def issue(
         self,
         *,

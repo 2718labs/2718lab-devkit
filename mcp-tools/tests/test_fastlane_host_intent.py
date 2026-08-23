@@ -90,19 +90,9 @@ def _intent(
         },
         "route_binding_hash",
     )
-    quota = _with_binding(
-        {
-            "snapshot_hash": _hash("quota-snapshot"),
-            "decision_hash": _hash("quota-decision"),
-            "evidence_hash": _hash("quota-evidence"),
-            "ledger_epoch": 11,
-            "active_lease_set_hash": _hash("active-lease-set"),
-        },
-        "quota_binding_hash",
-    )
     predecessor = _with_binding(
         {
-            "schema": "2718lab-devkit/fastlane-external-lease-predecessor-v1",
+            "schema": "2718lab-devkit/fastlane-external-lease-predecessor-v2",
             "projection_hash": projection_hash,
             "source_plan_hash": source_plan_hash,
             "workflow_hash": workflow_hash,
@@ -111,11 +101,8 @@ def _intent(
             "assignment_id": assignment_id,
             "assignment_token": assignment_token,
             "routing_result_hash": route["routing_result_hash"],
-            "quota_evidence_hash": quota["evidence_hash"],
-            "quota_snapshot_hash": quota["snapshot_hash"],
-            "quota_decision_hash": quota["decision_hash"],
-            "ledger_epoch": quota["ledger_epoch"],
-            "active_lease_set_hash": quota["active_lease_set_hash"],
+            "ledger_epoch": 11,
+            "active_lease_set_hash": _hash("active-lease-set"),
             "lease_epoch": 17,
         },
         "predecessor_hash",
@@ -156,8 +143,8 @@ def _intent(
             "assignment_id": assignment_id,
             "assignment_token": assignment_token,
             "predecessor_hash": predecessor["predecessor_hash"],
-            "ledger_epoch": quota["ledger_epoch"],
-            "active_lease_set_hash": quota["active_lease_set_hash"],
+            "ledger_epoch": predecessor["ledger_epoch"],
+            "active_lease_set_hash": predecessor["active_lease_set_hash"],
         },
         "lease_binding_hash",
     )
@@ -178,14 +165,13 @@ def _intent(
         "create_binding_hash",
     )
     candidate = {
-        "schema": "2718lab-devkit/fastlane-host-execution-intent-v1",
+        "schema": "2718lab-devkit/fastlane-host-execution-intent-v2",
         "projection_hash": projection_hash,
         "source_plan_hash": source_plan_hash,
         "workflow_hash": workflow_hash,
         "assignment": assignment,
         "route": route,
         "capability_facts": [capability_fact],
-        "quota": quota,
         "packets": packets,
         "source": source,
         "create": create,
@@ -218,7 +204,6 @@ def _expectation(module: Any, candidate: dict[str, Any]) -> Any:
     assignment = candidate["assignment"]
     predecessor = assignment["predecessor"]
     route = candidate["route"]
-    quota = candidate["quota"]
     packets = candidate["packets"]
     source = candidate["source"]
     create = candidate["create"]
@@ -250,11 +235,8 @@ def _expectation(module: Any, candidate: dict[str, Any]) -> Any:
         inherit_current_session_model=route["inherit_current_session_model"],
         require_explicit_route=route["require_explicit_route"],
         capability_facts=capability_facts,
-        quota_snapshot_hash=quota["snapshot_hash"],
-        quota_decision_hash=quota["decision_hash"],
-        quota_evidence_hash=quota["evidence_hash"],
-        ledger_epoch=quota["ledger_epoch"],
-        active_lease_set_hash=quota["active_lease_set_hash"],
+        ledger_epoch=predecessor["ledger_epoch"],
+        active_lease_set_hash=predecessor["active_lease_set_hash"],
         task_packet_hash=packets["task_packet_hash"],
         input_packet_hash=packets["input_packet_hash"],
         index_packet_hash=packets["index_packet_hash"],
@@ -307,6 +289,176 @@ def _refresh_predecessor_and_assignment(candidate: dict[str, Any]) -> str:
     assignment = _with_binding(assignment, "assignment_binding_hash")
     candidate["assignment"] = assignment
     return assignment["predecessor"]["predecessor_hash"]
+
+
+def _topology_group(
+    scheduler_id: str,
+    worktree_identity: str,
+    writer_task_ids: list[str],
+    prewarm_task_ids: list[str],
+) -> dict[str, Any]:
+    return _with_binding(
+        {
+            "scheduler_id": scheduler_id,
+            "coordinator_lease_id": f"lease-{scheduler_id}",
+            "worktree_identity": worktree_identity,
+            "writer_task_ids": writer_task_ids,
+            "prewarm_task_ids": prewarm_task_ids,
+        },
+        "group_binding_hash",
+    )
+
+
+def _topology() -> dict[str, Any]:
+    candidate = {
+        "schema": "2718lab-devkit/scheduler-topology-v1",
+        "plan_hash": _hash("topology-plan"),
+        "groups": [
+            _topology_group("scheduler-a", "wt-a", ["writer-a"], ["prewarm-a"]),
+            _topology_group("scheduler-b", "wt-b", ["writer-b"], ["prewarm-b"]),
+        ],
+    }
+    return _with_binding(candidate, "topology_hash")
+
+
+def _relay_host_scheduler_slot() -> dict[str, Any]:
+    return {
+        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+        "plan_hash": _hash("relay-slot-plan"),
+        "topology_hash": _hash("relay-slot-topology"),
+        "group_binding_hash": _hash("relay-slot-group"),
+        "scheduler_id": "scheduler-a",
+        "coordinator_lease_id": "lease-scheduler-a",
+        "worktree_identity": "wt-a",
+        "writer_slot": 1,
+        "read_only": False,
+    }
+
+
+def test_relay_slot_cannot_be_parsed_as_a_host_topology_projection() -> None:
+    module = _module()
+
+    assert (
+        module.parse_host_scheduler_topology_projection(_relay_host_scheduler_slot())
+        is module.NO_SAFE_WORK
+    )
+
+
+def _host_topology() -> dict[str, Any]:
+    relay_topology = _topology()
+    groups = []
+    for relay_group in relay_topology["groups"]:
+        groups.append(
+            _with_binding(
+                {
+                    "scheduler_id": relay_group["scheduler_id"],
+                    "coordinator_lease_id": relay_group["coordinator_lease_id"],
+                    "worktree_identity": relay_group["worktree_identity"],
+                    "writer_task_ids": relay_group["writer_task_ids"],
+                    "prewarm_task_ids": relay_group["prewarm_task_ids"],
+                    "relay_group_binding_hash": relay_group["group_binding_hash"],
+                    "attested_capacity": 3,
+                    "attestation_hash": _hash(
+                        f"host-capacity-{relay_group['scheduler_id']}"
+                    ),
+                },
+                "group_binding_hash",
+            )
+        )
+    return _with_binding(
+        {
+            "schema": "2718lab-devkit/host-scheduler-topology-v1",
+            "relay_plan_hash": relay_topology["plan_hash"],
+            "relay_topology_hash": relay_topology["topology_hash"],
+            "groups": groups,
+        },
+        "projection_hash",
+    )
+
+
+def test_host_topology_projection_keeps_only_opaque_auditable_group_bindings() -> None:
+    module = _module()
+
+    parsed = module.parse_host_scheduler_topology_projection(_host_topology())
+
+    assert parsed.schema == "2718lab-devkit/host-scheduler-topology-v1"
+    assert parsed.groups[0].scheduler_id == "scheduler-a"
+    assert parsed.groups[0].coordinator_lease_id == "lease-scheduler-a"
+    assert parsed.groups[0].worktree_identity == "wt-a"
+    assert parsed.groups[0].writer_task_ids == ("writer-a",)
+    assert parsed.groups[0].prewarm_task_ids == ("prewarm-a",)
+    assert "path" not in repr(parsed).lower()
+    assert "quota" not in repr(parsed).lower()
+    assert "model" not in repr(parsed).lower()
+
+
+def test_host_topology_projection_requires_its_exact_schema_and_rejects_relay_v1() -> None:
+    module = _module()
+    relay_topology = _topology()
+    host_group = _with_binding(
+        {
+            "scheduler_id": "scheduler-a",
+            "coordinator_lease_id": "lease-scheduler-a",
+            "worktree_identity": "wt-a",
+            "writer_task_ids": ["writer-a"],
+            "prewarm_task_ids": ["prewarm-a"],
+            "relay_group_binding_hash": relay_topology["groups"][0]["group_binding_hash"],
+            "attested_capacity": 1,
+            "attestation_hash": _hash("host-capacity-a"),
+        },
+        "group_binding_hash",
+    )
+    host_projection = _with_binding(
+        {
+            "schema": "2718lab-devkit/host-scheduler-topology-v1",
+            "relay_plan_hash": relay_topology["plan_hash"],
+            "relay_topology_hash": relay_topology["topology_hash"],
+            "groups": [host_group],
+        },
+        "projection_hash",
+    )
+
+    parsed = module.parse_host_scheduler_topology_projection(host_projection)
+
+    assert isinstance(parsed, module.ParsedHostSchedulerTopologyProjection)
+    assert parsed.schema == "2718lab-devkit/host-scheduler-topology-v1"
+    assert parsed.relay_plan_hash == relay_topology["plan_hash"]
+    assert parsed.groups[0].relay_group_binding_hash == relay_topology["groups"][0]["group_binding_hash"]
+    assert module.parse_host_scheduler_topology_projection(relay_topology) is module.NO_SAFE_WORK
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda topology: topology["groups"][0].__setitem__(
+            "writer_task_ids", ["writer-a", "writer-a-2", "writer-a-3", "writer-a-4"]
+        ),
+        lambda topology: topology["groups"].append(
+            _topology_group("scheduler-c", "wt-c", ["writer-a"], [])
+        ),
+        lambda topology: topology["groups"][0].__setitem__(
+            "prewarm_task_ids", ["writer-a"]
+        ),
+        lambda topology: topology["groups"][0].__setitem__(
+            "worktree_identity", "G:/raw/worktree/path"
+        ),
+    ],
+)
+def test_topology_v1_rejects_writer_conflicts_and_nonopaque_worktree_data(
+    mutate: Any,
+) -> None:
+    module = _module()
+    topology = _host_topology()
+    mutate(topology)
+    topology["groups"] = [
+        _with_binding(group, "group_binding_hash") for group in topology["groups"]
+    ]
+    topology = _with_binding(topology, "projection_hash")
+
+    assert (
+        module.parse_host_scheduler_topology_projection(topology)
+        is module.NO_SAFE_WORK
+    )
 
 
 def test_public_validation_is_hard_gated_for_every_public_expectation() -> None:
@@ -371,14 +523,14 @@ def test_parse_and_fieldwise_match_are_immutable_but_non_authorizing() -> None:
             ),
         ),
         (
-            "quota_evidence_mismatch",
-            lambda intent: intent["quota"].__setitem__(
-                "evidence_hash", _hash("other-evidence")
-            ),
+            "removed_quota_object",
+            lambda intent: intent.__setitem__("quota", {"used": 1}),
         ),
         (
             "ledger_epoch_mismatch",
-            lambda intent: intent["quota"].__setitem__("ledger_epoch", 12),
+            lambda intent: intent["assignment"]["predecessor"].__setitem__(
+                "ledger_epoch", 12
+            ),
         ),
         (
             "lease_fencing_mismatch",
@@ -466,12 +618,10 @@ def test_parser_accepts_but_matcher_differentiates_a_rebound_assignment_token() 
     _assert_hard_gate(candidate, _expectation(module, baseline))
 
 
-def test_parser_accepts_but_matcher_differentiates_a_rebound_quota_ledger() -> None:
+def test_parser_accepts_but_matcher_differentiates_a_rebound_lease_ledger() -> None:
     module = _module()
     baseline = _intent()
     candidate = copy.deepcopy(baseline)
-    candidate["quota"]["ledger_epoch"] = 12
-    candidate["quota"] = _with_binding(candidate["quota"], "quota_binding_hash")
     candidate["assignment"]["predecessor"]["ledger_epoch"] = 12
     predecessor_hash = _refresh_predecessor_and_assignment(candidate)
     candidate["lease"]["ledger_epoch"] = 12

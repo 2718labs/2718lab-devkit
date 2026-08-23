@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import atexit
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Literal, Protocol, TypeVar, cast
 
@@ -175,6 +175,16 @@ class _TaskLeaseAuthority(Protocol):
     def record_query_receipt(
         self, task_lease: TaskLeaseRef, *, workspace_id: str, result: object
     ) -> None: ...
+
+
+def _compile_host_relay_request_from_runtime(
+    request: Mapping[str, object],
+    *,
+    clock: Callable[[], float],
+) -> dict[str, object]:
+    """Delegate every V2/V3 bootstrap to the fixed RuntimeRoot composition."""
+
+    return _runtime_root().host_relay_bootstrap().compile(request, clock=clock)
 
 
 class _RequestError(ValueError):
@@ -788,7 +798,7 @@ def fastlane_compile(
 ) -> dict[str, object]:
     """Compile inert Fast Lane descriptors without receiving host-private evidence.
 
-    The host remains responsible for quota attestations, worktree/lease fencing,
+    The host remains responsible for capability attestations, worktree/lease fencing,
     model dispatch, terminal receipts, and execution.  This MCP boundary only
     validates and renders the deterministic local scheduling plan.
     """

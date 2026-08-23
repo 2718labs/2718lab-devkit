@@ -6,6 +6,19 @@ when its exact host-attested route justifies architecture, a hard cross-boundary
 diagnosis, or independent terminal review. Execute in parallel only when cards
 have disjoint write scopes; same-path work queues behind the active owner.
 
+## Scheduler topology V1
+
+`2718lab-devkit/scheduler-topology-v1` defines A/B/C as the main conversation,
+scheduler, and writer groups. The main conversation alone reviews and
+integrates; each scheduler has at most a `1:3` writer set. Plan, lease, and
+G-drive worktree bindings are auditable opaque identity values. Design and
+prewarm are read-only rather than writers, yet remain limited by actual host
+slots, host capability, lease, and safety gates. Cross scope requires a
+`declared-child` split that strictly reduces conflict; otherwise it is
+`UNSPLITTABLE_SCOPE_CONFLICT`. This does not restore account-usage quota,
+D-drive temporary roots, or a parent model ceiling, nor weaken host capability,
+lease, worktree, or safety gates.
+
 ## Current host policy
 
 - Terra High (`gpt-5.6-terra`, `high`) handles routine, bounded coding,
@@ -48,10 +61,10 @@ its input/output query at lifecycle boundaries and the worker only consumes the
 packet, with no index polling or hand-written query choreography.
 The host archives only after coordinator acceptance and final evidence binding.
 Fast Lane task roots derive from trusted `CODEX_FASTLANE_TASK_ROOT`, or the
-compatible `D:\bun\tmp\codex` default. Worker/read worktrees and temporary
+local `G:\2718lab\_codex\.codex-task-temp` default. Worker/read worktrees and temporary
 targets stay strictly below their declared project root; standalone read
 contexts carry the same bounded project identity and canonical task-root hash.
-The quota sample cache remains a separately user-configurable path, and C-drive
+Runtime caches remain separately configured below the approved task root, and C-drive
 temporary roots remain forbidden.
 
 No execution worker merges another task, changes a sibling scope, or accepts
