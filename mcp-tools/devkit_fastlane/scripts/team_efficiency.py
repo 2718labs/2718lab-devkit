@@ -175,7 +175,10 @@ _PROJECT_FENCE_FIELDS = frozenset(
 )
 _PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
 _WORK_PACKAGE_V2_SCHEMA = "team-efficiency/work-package-v2"
-_PROJECT_BINDING_SCHEMA = "project-binding-v1"
+_PROJECT_BINDING_SCHEMA = "2718lab-devkit/project-binding-v1"
+_BOOTSTRAP_ATTESTATION_SCHEMA = (
+    "2718lab-devkit/new-project-bootstrap-attestation-v1"
+)
 _PROJECT_BINDING_FIELDS = frozenset(
     {
         "schema",
@@ -184,13 +187,27 @@ _PROJECT_BINDING_FIELDS = frozenset(
         "workspace_id",
         "repository_id",
         "project_id",
-        "root_id",
+        "bootstrap_root_identity",
+        "attestation",
+        "binding_hash",
+    }
+)
+_BOOTSTRAP_ATTESTATION_FIELDS = frozenset(
+    {
+        "schema",
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
         "initial_manifest_hash",
-        "entry_count",
+        "initial_entry_count",
+        "state",
         "capability_epoch",
-        "snapshot_id",
-        "issued_at_utc_z",
-        "expires_at_utc_z",
+        "capability_hash",
+        "attested_input_snapshot_id",
+        "issued_at",
+        "expires_at",
         "attestation_hash",
     }
 )
@@ -203,12 +220,17 @@ _BOOTSTRAP_INDEX_DESCRIPTOR_FIELDS = frozenset(
         "workspace_id",
         "repository_id",
         "project_id",
-        "root_id",
+        "bootstrap_root_identity",
         "initial_manifest_hash",
         "capability_epoch",
-        "snapshot_id",
+        "capability_hash",
+        "attested_input_snapshot_id",
         "attestation_hash",
+        "binding_hash",
     }
+)
+_BOOTSTRAP_INDEX_PLAN_FIELDS = frozenset(
+    {"schema", "status", "decision_code", "bootstrap_queue", "plan_hash"}
 )
 _FAST_LANE_EXECUTION_CONTEXT_FIELDS = frozenset(
     {"task_id", "bootstrap_plan", "workspace_input_snapshot_id"}
@@ -870,6 +892,19 @@ def _hash(value: object, field: str) -> str:
     return text.lower()
 
 
+class _BootstrapAttestationTimestampError(ValueError):
+    """Classify a syntactically exact bootstrap binding with invalid freshness."""
+
+
+def _bootstrap_attestation_timestamp(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _BootstrapAttestationTimestampError(f"{field} is invalid")
+    result = float(value)
+    if result != result or result in {float("inf"), float("-inf")}:
+        raise _BootstrapAttestationTimestampError(f"{field} is invalid")
+    return result
+
+
 def _project_fence_digest(value: object, field: str) -> str:
     text = _text(value, field, maximum=80)
     if _PROJECT_FENCE_SHA256.fullmatch(text) is None:
@@ -942,7 +977,7 @@ def _validated_work_package_v2(value: object) -> dict[str, Any]:
 
 
 def _validated_project_binding(value: object) -> dict[str, Any]:
-    """Validate an opaque host bootstrap attestation without resolving it."""
+    """Validate Task 2's exact opaque project-binding-v1 wrapper locally."""
 
     source = _mapping(value, "project binding")
     _exact_keys(source, _PROJECT_BINDING_FIELDS, "project binding")
@@ -951,41 +986,110 @@ def _validated_project_binding(value: object) -> dict[str, Any]:
     mode = _text(source["mode"], "project binding.mode", maximum=32)
     if mode not in {"indexed", "new_empty_bootstrap"}:
         raise ValueError("project binding mode is unknown")
-    if type(source["entry_count"]) is not int or not 0 <= source["entry_count"] <= MAX_MANIFEST_UNITS:
-        raise ValueError("project binding.entry_count is invalid")
-    if type(source["capability_epoch"]) is not int or not 1 <= source["capability_epoch"] <= 2**63 - 1:
-        raise ValueError("project binding.capability_epoch is invalid")
+    attestation_source = _mapping(source["attestation"], "project binding.attestation")
+    _exact_keys(
+        attestation_source,
+        _BOOTSTRAP_ATTESTATION_FIELDS,
+        "project binding.attestation",
+    )
+    if attestation_source["schema"] != _BOOTSTRAP_ATTESTATION_SCHEMA:
+        raise ValueError("project binding attestation schema is unknown")
+    if (
+        type(attestation_source["initial_entry_count"]) is not int
+        or not 0 <= attestation_source["initial_entry_count"] <= MAX_MANIFEST_UNITS
+    ):
+        raise ValueError("project binding initial entry count is invalid")
+    if (
+        type(attestation_source["capability_epoch"]) is not int
+        or not 1 <= attestation_source["capability_epoch"] <= 2**63 - 1
+    ):
+        raise ValueError("project binding capability epoch is invalid")
+    attestation = {
+        "schema": _BOOTSTRAP_ATTESTATION_SCHEMA,
+        "workflow_id": _text(
+            attestation_source["workflow_id"],
+            "project binding attestation.workflow_id",
+            maximum=256,
+        ),
+        "workspace_id": _hash(
+            attestation_source["workspace_id"],
+            "project binding attestation.workspace_id",
+        ),
+        "repository_id": _hash(
+            attestation_source["repository_id"],
+            "project binding attestation.repository_id",
+        ),
+        "project_id": _hash(
+            attestation_source["project_id"],
+            "project binding attestation.project_id",
+        ),
+        "bootstrap_root_identity": _hash(
+            attestation_source["bootstrap_root_identity"],
+            "project binding attestation.bootstrap_root_identity",
+        ),
+        "initial_manifest_hash": _hash(
+            attestation_source["initial_manifest_hash"],
+            "project binding attestation.initial_manifest_hash",
+        ),
+        "initial_entry_count": attestation_source["initial_entry_count"],
+        "state": _text(
+            attestation_source["state"], "project binding attestation.state", maximum=32
+        ),
+        "capability_epoch": attestation_source["capability_epoch"],
+        "capability_hash": _hash(
+            attestation_source["capability_hash"],
+            "project binding attestation.capability_hash",
+        ),
+        "attested_input_snapshot_id": _hash(
+            attestation_source["attested_input_snapshot_id"],
+            "project binding attestation.attested_input_snapshot_id",
+        ),
+        "issued_at": attestation_source["issued_at"],
+        "expires_at": attestation_source["expires_at"],
+    }
+    _bootstrap_attestation_timestamp(
+        attestation["issued_at"], "project binding attestation.issued_at"
+    )
+    _bootstrap_attestation_timestamp(
+        attestation["expires_at"], "project binding attestation.expires_at"
+    )
+    attestation_hash = _hash(
+        attestation_source["attestation_hash"],
+        "project binding attestation.attestation_hash",
+    )
+    if not hmac.compare_digest(attestation_hash, _sha256_json(attestation)):
+        raise ValueError("project binding attestation hash is unknown")
+    attestation = {**attestation, "attestation_hash": attestation_hash}
     normalized = {
         "schema": _PROJECT_BINDING_SCHEMA,
         "mode": mode,
-        "workflow_id": _hash(source["workflow_id"], "project binding.workflow_id"),
+        "workflow_id": _text(
+            source["workflow_id"], "project binding.workflow_id", maximum=256
+        ),
         "workspace_id": _hash(source["workspace_id"], "project binding.workspace_id"),
-        "repository_id": _hash(source["repository_id"], "project binding.repository_id"),
-        "project_id": _project_fence_project_id(
-            source["project_id"], "project binding.project_id"
+        "repository_id": _hash(
+            source["repository_id"], "project binding.repository_id"
         ),
-        "root_id": _hash(source["root_id"], "project binding.root_id"),
-        "initial_manifest_hash": _hash(
-            source["initial_manifest_hash"], "project binding.initial_manifest_hash"
+        "project_id": _hash(source["project_id"], "project binding.project_id"),
+        "bootstrap_root_identity": _hash(
+            source["bootstrap_root_identity"],
+            "project binding.bootstrap_root_identity",
         ),
-        "entry_count": source["entry_count"],
-        "capability_epoch": source["capability_epoch"],
-        "snapshot_id": _hash(source["snapshot_id"], "project binding.snapshot_id"),
-        "issued_at_utc_z": _text(
-            source["issued_at_utc_z"], "project binding.issued_at_utc_z", maximum=32
-        ),
-        "expires_at_utc_z": _text(
-            source["expires_at_utc_z"], "project binding.expires_at_utc_z", maximum=32
-        ),
+        "attestation": attestation,
     }
-    _fast_lane_utc_z(normalized["issued_at_utc_z"], "project binding.issued_at_utc_z")
-    _fast_lane_utc_z(normalized["expires_at_utc_z"], "project binding.expires_at_utc_z")
-    attestation_hash = _hash(
-        source["attestation_hash"], "project binding.attestation_hash"
-    )
-    if not hmac.compare_digest(attestation_hash, _sha256_json(normalized)):
-        raise ValueError("project binding attestation hash is unknown")
-    return {**normalized, "attestation_hash": attestation_hash}
+    for field in (
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+    ):
+        if normalized[field] != attestation[field]:
+            raise ValueError("project binding identities do not match attestation")
+    binding_hash = _hash(source["binding_hash"], "project binding.binding_hash")
+    if not hmac.compare_digest(binding_hash, _sha256_json(normalized)):
+        raise ValueError("project binding hash is unknown")
+    return {**normalized, "binding_hash": binding_hash}
 
 
 def _project_execution_block_details(
@@ -1036,30 +1140,37 @@ def _project_execution_block_details(
             return "PROJECT_BINDING_INVALID", None
         try:
             binding = _validated_project_binding(raw_request["project_binding"])
+        except _BootstrapAttestationTimestampError:
+            return "BOOTSTRAP_ATTESTATION_STALE", None
         except (TypeError, ValueError):
             return "BOOTSTRAP_ATTESTATION_UNKNOWN", None
         if (
             binding["workspace_id"] != v2["project_authority"]["workspace_id"]
-            or binding["project_id"] != v2["project_authority"]["project_id"]
-            or binding["snapshot_id"] != v2["project_authority"]["input_snapshot_id"]
+            or binding["project_id"]
+            != f"sha256:{v2['project_authority']['project_id']}"
+            or binding["attestation"]["attested_input_snapshot_id"]
+            != v2["project_authority"]["input_snapshot_id"]
         ):
             return "BOOTSTRAP_ATTESTATION_MISMATCH", None
         if binding["mode"] == "new_empty_bootstrap":
-            if binding["entry_count"] != 0:
-                return "BOOTSTRAP_PROJECT_NOT_EMPTY", None
-            issued = _fast_lane_utc_z(
-                binding["issued_at_utc_z"], "project binding.issued_at_utc_z"
-            )
-            expires = _fast_lane_utc_z(
-                binding["expires_at_utc_z"], "project binding.expires_at_utc_z"
-            )
-            now = datetime.now(UTC)
+            attestation = binding["attestation"]
             if (
-                expires < now
+                attestation["state"] != "new_empty"
+                or attestation["initial_entry_count"] != 0
+            ):
+                return "BOOTSTRAP_PROJECT_NOT_EMPTY", None
+            issued = _bootstrap_attestation_timestamp(
+                attestation["issued_at"], "project binding attestation.issued_at"
+            )
+            expires = _bootstrap_attestation_timestamp(
+                attestation["expires_at"], "project binding attestation.expires_at"
+            )
+            now = datetime.now(UTC).timestamp()
+            if (
+                now >= expires
                 or issued > now
                 or expires <= issued
-                or (expires - issued).total_seconds()
-                > MAX_BOOTSTRAP_ATTESTATION_TTL_SECONDS
+                or expires - issued > MAX_BOOTSTRAP_ATTESTATION_TTL_SECONDS
             ):
                 return "BOOTSTRAP_ATTESTATION_STALE", None
             return (
@@ -1069,8 +1180,6 @@ def _project_execution_block_details(
                     "binding": binding,
                 },
             )
-        if binding["entry_count"] == 0:
-            return "PROJECT_BINDING_INVALID", None
         return (
             "PROJECT_AUTHORITY_UNAVAILABLE",
             {
@@ -8169,13 +8278,13 @@ def _fast_lane_project_fence_blocked_plan(
 
 
 def _fast_lane_bootstrap_index_ready_plan(
-    activation: Mapping[str, Any],
     *,
     source_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Emit the sole safe descriptor for an attested empty project."""
+    """Emit only the read-only descriptor for an attested empty project."""
 
     binding = _mapping(source_identity["binding"], "new-empty bootstrap binding")
+    attestation = _mapping(binding["attestation"], "new-empty bootstrap attestation")
     descriptor = {
         "schema": "team-efficiency/bootstrap-index-descriptor-v1",
         "kind": "bootstrap_index",
@@ -8184,48 +8293,23 @@ def _fast_lane_bootstrap_index_ready_plan(
         "workspace_id": binding["workspace_id"],
         "repository_id": binding["repository_id"],
         "project_id": binding["project_id"],
-        "root_id": binding["root_id"],
-        "initial_manifest_hash": binding["initial_manifest_hash"],
-        "capability_epoch": binding["capability_epoch"],
-        "snapshot_id": binding["snapshot_id"],
-        "attestation_hash": binding["attestation_hash"],
+        "bootstrap_root_identity": binding["bootstrap_root_identity"],
+        "initial_manifest_hash": attestation["initial_manifest_hash"],
+        "capability_epoch": attestation["capability_epoch"],
+        "capability_hash": attestation["capability_hash"],
+        "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "attestation_hash": attestation["attestation_hash"],
+        "binding_hash": binding["binding_hash"],
     }
     _exact_keys(descriptor, _BOOTSTRAP_INDEX_DESCRIPTOR_FIELDS, "bootstrap index")
-    source_plan_hash = _sha256_json(
-        {
-            "schema": "team-efficiency/new-empty-bootstrap-plan-v1",
-            "source_identity": dict(source_identity),
-        }
-    )
     result: dict[str, Any] = {
-        "schema": "team-efficiency/fast-lane-plan-v1",
+        "schema": "team-efficiency/bootstrap-index-plan-v1",
         "status": "bootstrap",
         "decision_code": "BOOTSTRAP_INDEX_READY",
-        "activation": dict(activation),
-        "source_plan_hash": source_plan_hash,
-        "phase": "execution",
-        "main_lane": _fast_lane_main_lane(activation, next_action="bootstrap_index"),
-        "subagent_capacity": len(FAST_LANE_SLOT_IDS),
-        "assignments": [],
         "bootstrap_queue": [descriptor],
-        "ready_queue": [],
-        "review_queue": [],
-        "prewarm_queue": [],
-        "design_queue": [],
-        "invalidated_evidence_task_ids": [],
-        "idle_slots": _fast_lane_idle_slots("BOOTSTRAP_INDEX_READY"),
-        "refill_plan": _fast_lane_refill_plan(),
-        "terminal_protocol": _fast_lane_terminal_protocol({"units": []}),
-        "workflow_policy": _fast_lane_workflow_policy(),
-        "cross_session_dispatch_projection": _fast_lane_cross_session_projection(
-            {"source_plan_hash": source_plan_hash},
-            reference_result={},
-            host_status=None,
-            occupancy=None,
-        ),
     }
     result["plan_hash"] = _sha256_json(result)
-    _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
+    _exact_keys(result, _BOOTSTRAP_INDEX_PLAN_FIELDS, "bootstrap index plan")
     return result
 
 
@@ -8865,7 +8949,6 @@ def compile_fast_lane(
     reason_code, source_identity = _project_execution_block_details(request)
     if reason_code == "BOOTSTRAP_INDEX_READY" and source_identity is not None:
         return _fast_lane_bootstrap_index_ready_plan(
-            activation,
             source_identity=source_identity,
         )
     return _fast_lane_project_fence_blocked_plan(

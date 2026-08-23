@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -642,22 +642,16 @@ class TeamEfficiencyTests(unittest.TestCase):
                 }
             )
 
-        project_binding: dict[str, object] = {
-            "schema": "project-binding-v1",
-            "mode": "indexed",
-            "workflow_id": helper._sha256_json({"workflow": "indexed"}),
-            "workspace_id": authority["workspace_id"],
-            "repository_id": helper._sha256_json({"repository": "indexed"}),
-            "project_id": authority["project_id"],
-            "root_id": helper._sha256_json({"root": "indexed"}),
-            "initial_manifest_hash": helper._sha256_json({"manifest": "indexed"}),
-            "entry_count": 1,
-            "capability_epoch": 1,
-            "snapshot_id": authority["input_snapshot_id"],
-            "issued_at_utc_z": "2026-08-23T00:00:00Z",
-            "expires_at_utc_z": "2026-08-23T00:02:00Z",
-        }
-        project_binding["attestation_hash"] = helper._sha256_json(project_binding)
+        now = int(datetime.now(UTC).timestamp())
+        project_binding = self.task2_project_binding(
+            helper,
+            authority=authority,
+            mode="indexed",
+            state="indexed",
+            initial_entry_count=1,
+            issued_at=now - 1,
+            expires_at=now + 60,
+        )
         return {
             "schema": "team-efficiency/fast-lane-request-v1",
             "work_package": work_package,
@@ -724,35 +718,76 @@ class TeamEfficiencyTests(unittest.TestCase):
         helper,
         request: dict[str, object],
         *,
-        issued_at_utc_z: str,
-        expires_at_utc_z: str,
-        entry_count: int = 0,
+        issued_at: int,
+        expires_at: int,
+        initial_entry_count: int = 0,
         snapshot_id: str | None = None,
     ) -> dict[str, object]:
         package = request["work_package"]
         self.assertIsInstance(package, dict)
         project_fence = package["project_fence"]
         self.assertIsInstance(project_fence, dict)
-        binding: dict[str, object] = {
-            "schema": "project-binding-v1",
-            "mode": "new_empty_bootstrap",
-            "workflow_id": helper._sha256_json({"workflow": "bootstrap"}),
-            "workspace_id": package["workspace_id"],
-            "repository_id": helper._sha256_json({"repository": "bootstrap"}),
+        authority = {
             "project_id": project_fence["project_id"],
-            "root_id": helper._sha256_json({"root": "bootstrap"}),
-            "initial_manifest_hash": helper._sha256_json({"manifest": "empty"}),
-            "entry_count": entry_count,
-            "capability_epoch": 1,
-            "snapshot_id": (
+            "workspace_id": package["workspace_id"],
+            "input_snapshot_id": (
                 package["input_snapshot_id"]
                 if snapshot_id is None
                 else snapshot_id
             ),
-            "issued_at_utc_z": issued_at_utc_z,
-            "expires_at_utc_z": expires_at_utc_z,
         }
-        return {**binding, "attestation_hash": helper._sha256_json(binding)}
+        return self.task2_project_binding(
+            helper,
+            authority=authority,
+            mode="new_empty_bootstrap",
+            state="new_empty",
+            initial_entry_count=initial_entry_count,
+            issued_at=issued_at,
+            expires_at=expires_at,
+        )
+
+    def task2_project_binding(
+        self,
+        helper,
+        *,
+        authority: dict[str, object],
+        mode: str,
+        state: str,
+        initial_entry_count: int,
+        issued_at: int,
+        expires_at: int,
+    ) -> dict[str, object]:
+        """Build the exact wrapper emitted by Task 2's private bootstrap test."""
+
+        attestation: dict[str, object] = {
+            "schema": "2718lab-devkit/new-project-bootstrap-attestation-v1",
+            "workflow_id": "workflow-new-project",
+            "workspace_id": authority["workspace_id"],
+            "repository_id": helper._sha256_json({"repository": "bootstrap"}),
+            "project_id": f"sha256:{authority['project_id']}",
+            "bootstrap_root_identity": helper._sha256_json({"root": "bootstrap"}),
+            "initial_manifest_hash": helper._sha256_json({"manifest": "empty"}),
+            "initial_entry_count": initial_entry_count,
+            "state": state,
+            "capability_epoch": 7,
+            "capability_hash": helper._sha256_json({"capability": "bootstrap"}),
+            "attested_input_snapshot_id": authority["input_snapshot_id"],
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+        }
+        attestation["attestation_hash"] = helper._sha256_json(attestation)
+        binding: dict[str, object] = {
+            "schema": "2718lab-devkit/project-binding-v1",
+            "mode": mode,
+            "workflow_id": attestation["workflow_id"],
+            "workspace_id": attestation["workspace_id"],
+            "repository_id": attestation["repository_id"],
+            "project_id": attestation["project_id"],
+            "bootstrap_root_identity": attestation["bootstrap_root_identity"],
+            "attestation": attestation,
+        }
+        binding["binding_hash"] = helper._sha256_json(binding)
+        return binding
 
     def project_bound_work_package(
         self,
@@ -2146,6 +2181,11 @@ class TeamEfficiencyTests(unittest.TestCase):
     ) -> None:
         helper = load_efficiency()
 
+        parser = helper._parser()
+        fast_lane_action = next(
+            action for action in parser._actions if action.dest == "command"
+        )
+        fast_lane_parser = fast_lane_action.choices["fast-lane"]
         self.assertFalse(
             {
                 "quota_request",
@@ -2158,35 +2198,37 @@ class TeamEfficiencyTests(unittest.TestCase):
         )
         option_strings = {
             option
-            for action in helper._parser()._actions
+            for action in fast_lane_parser._actions
             for option in action.option_strings
         }
-        self.assertFalse(
-            {
-                "--quota-input",
-                "--quota-evaluation-time",
-                "--live-quota",
-                "--quota-state-path",
-                "--quota-timeout",
-            }
-            & option_strings
-        )
+        removed = {
+            "--quota-input",
+            "--quota-evaluation-time",
+            "--live-quota",
+            "--quota-state-path",
+            "--quota-timeout",
+        }
+        self.assertFalse(removed & option_strings)
+        for option in sorted(removed):
+            with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()):
+                arguments = ["fast-lane", "--input", "legacy.json", option]
+                if option != "--live-quota":
+                    arguments.append("legacy-value")
+                with self.assertRaises(SystemExit) as rejected:
+                    parser.parse_args(arguments)
+                self.assertEqual(2, rejected.exception.code)
 
-    def test_new_empty_project_emits_read_only_bootstrap_index_descriptor(
+    def test_task2_shaped_new_empty_project_emits_descriptor_only_plan(
         self,
     ) -> None:
         helper = load_efficiency()
         request = self.fast_lane_schedule_request(helper)
-        now = datetime.now(UTC).replace(microsecond=0)
+        now = int(datetime.now(UTC).timestamp())
         request["project_binding"] = self.new_empty_project_binding(
             helper,
             request,
-            issued_at_utc_z=(now - timedelta(seconds=10)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            expires_at_utc_z=(now + timedelta(seconds=110)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
+            issued_at=now - 10,
+            expires_at=now + 110,
         )
 
         result = helper.compile_fast_lane(
@@ -2201,27 +2243,34 @@ class TeamEfficiencyTests(unittest.TestCase):
         descriptor = result["bootstrap_queue"][0]
         self.assertEqual("bootstrap_index", descriptor["kind"])
         self.assertEqual("read_only", descriptor["access"])
-        self.assertNotIn("start", descriptor)
-        self.assertNotIn("lease", descriptor)
-        self.assertNotIn("write_scope", descriptor)
-        self.assertNotIn("model", descriptor)
-        self.assertEqual([], result["assignments"])
-        self.assertEqual([], result["ready_queue"])
-        self.assertNotIn(str(self.repo), json.dumps(result, sort_keys=True))
+        serialized = json.dumps(result, sort_keys=True).casefold()
+        for forbidden in (
+            "model",
+            "parallel_design",
+            "route",
+            "scope",
+            "assignment",
+            "lease",
+            "writer",
+            "start",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, serialized)
+        self.assertNotIn(str(self.repo).casefold(), serialized)
 
     def test_unattested_or_invalid_new_empty_project_stays_fenced(self) -> None:
         helper = load_efficiency()
-        now = datetime.now(UTC).replace(microsecond=0)
-        issued_at = (now - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        expires_at = (now + timedelta(seconds=110)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = int(datetime.now(UTC).timestamp())
+        issued_at = now - 10
+        expires_at = now + 110
 
         def bootstrap_request() -> dict[str, object]:
             request = self.fast_lane_schedule_request(helper)
             request["project_binding"] = self.new_empty_project_binding(
                 helper,
                 request,
-                issued_at_utc_z=issued_at,
-                expires_at_utc_z=expires_at,
+                issued_at=issued_at,
+                expires_at=expires_at,
             )
             return request
 
@@ -2231,34 +2280,30 @@ class TeamEfficiencyTests(unittest.TestCase):
         stale["project_binding"] = self.new_empty_project_binding(
             helper,
             stale,
-            issued_at_utc_z=(now - timedelta(seconds=130)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            expires_at_utc_z=(now - timedelta(seconds=10)).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
+            issued_at=now - 130,
+            expires_at=now - 10,
         )
         nonempty = bootstrap_request()
         nonempty["project_binding"] = self.new_empty_project_binding(
             helper,
             nonempty,
-            issued_at_utc_z=issued_at,
-            expires_at_utc_z=expires_at,
-            entry_count=1,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            initial_entry_count=1,
         )
         mismatch = bootstrap_request()
         mismatch["project_binding"] = self.new_empty_project_binding(
             helper,
             mismatch,
-            issued_at_utc_z=issued_at,
-            expires_at_utc_z=expires_at,
+            issued_at=issued_at,
+            expires_at=expires_at,
             snapshot_id=helper._sha256_json({"snapshot": "mismatched"}),
         )
         unknown = bootstrap_request()
         binding = dict(unknown["project_binding"])
-        binding["schema"] = "project-binding-v0"
-        binding["attestation_hash"] = helper._sha256_json(
-            {key: value for key, value in binding.items() if key != "attestation_hash"}
+        binding["mode"] = "unknown"
+        binding["binding_hash"] = helper._sha256_json(
+            {key: value for key, value in binding.items() if key != "binding_hash"}
         )
         unknown["project_binding"] = binding
 
@@ -2279,6 +2324,89 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertEqual("NO_SAFE_WORK", result["decision_code"])
                 self.assertEqual(expected_reason, result["idle_slots"][0]["reason_code"])
                 self.assertEqual([], result["assignments"])
+
+    def test_malformed_task2_project_binding_stays_fenced(self) -> None:
+        helper = load_efficiency()
+        now = int(datetime.now(UTC).timestamp())
+
+        def request_with_binding() -> dict[str, object]:
+            request = self.fast_lane_schedule_request(helper)
+            request["project_binding"] = self.new_empty_project_binding(
+                helper,
+                request,
+                issued_at=now - 1,
+                expires_at=now + 60,
+            )
+            return request
+
+        def rebuild_hashes(binding: dict[str, object]) -> None:
+            attestation = binding.get("attestation")
+            if isinstance(attestation, dict) and "attestation_hash" in attestation:
+                attestation["attestation_hash"] = helper._sha256_json(
+                    {
+                        key: value
+                        for key, value in attestation.items()
+                        if key != "attestation_hash"
+                    }
+                )
+            if "binding_hash" in binding:
+                binding["binding_hash"] = helper._sha256_json(
+                    {
+                        key: value
+                        for key, value in binding.items()
+                        if key != "binding_hash"
+                    }
+                )
+
+        extra = request_with_binding()
+        extra["project_binding"]["unexpected"] = True
+
+        missing = request_with_binding()
+        del missing["project_binding"]["binding_hash"]
+
+        bad_hash = request_with_binding()
+        bad_hash["project_binding"]["binding_hash"] = "sha256:" + "0" * 64
+
+        raw_path = request_with_binding()
+        raw_attestation = raw_path["project_binding"]["attestation"]
+        raw_attestation["raw_path"] = "G:/host-private/raw-root"
+        rebuild_hashes(raw_path["project_binding"])
+
+        malformed_time = request_with_binding()
+        malformed_time["project_binding"]["attestation"]["issued_at"] = "not-a-time"
+        rebuild_hashes(malformed_time["project_binding"])
+
+        expired = request_with_binding()
+        expired["project_binding"] = self.new_empty_project_binding(
+            helper,
+            expired,
+            issued_at=now - 121,
+            expires_at=now - 1,
+        )
+
+        unknown_mode = request_with_binding()
+        unknown_mode["project_binding"]["mode"] = "unknown"
+        rebuild_hashes(unknown_mode["project_binding"])
+
+        cases = {
+            "extra": (extra, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
+            "missing": (missing, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
+            "bad_hash": (bad_hash, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
+            "raw_path": (raw_path, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
+            "malformed_time": (malformed_time, "BOOTSTRAP_ATTESTATION_STALE"),
+            "expired": (expired, "BOOTSTRAP_ATTESTATION_STALE"),
+            "unknown_mode": (unknown_mode, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
+        }
+        for name, (request, expected_reason) in cases.items():
+            with self.subTest(name=name):
+                result = helper.compile_fast_lane(
+                    request,
+                    reasoning_effort="ultra",
+                    enable=True,
+                )
+                self.assertEqual("NO_SAFE_WORK", result["decision_code"])
+                self.assertEqual(expected_reason, result["idle_slots"][0]["reason_code"])
+                self.assertEqual([], result["bootstrap_queue"])
 
     def test_default_fastlane_task_root_is_g_drive_task_root(self) -> None:
         helper = load_efficiency()
@@ -2379,23 +2507,22 @@ class TeamEfficiencyTests(unittest.TestCase):
         first_request = self.fast_lane_schedule_request(helper)
         original_package = first_request["work_package"]["package"]
         second_request = copy.deepcopy(first_request)
+        second_authority = self.project_binding(helper, project_id="other-project")
         second_request["work_package"] = self.project_bound_work_package(
             helper,
             original_package,
-            authority=self.project_binding(helper, project_id="other-project"),
+            authority=second_authority,
         )
-        second_binding = dict(second_request["project_binding"])
-        second_binding["project_id"] = second_request["work_package"][
-            "project_fence"
-        ]["project_id"]
-        second_binding["attestation_hash"] = helper._sha256_json(
-            {
-                key: value
-                for key, value in second_binding.items()
-                if key != "attestation_hash"
-            }
+        now = int(datetime.now(UTC).timestamp())
+        second_request["project_binding"] = self.task2_project_binding(
+            helper,
+            authority=second_authority,
+            mode="indexed",
+            state="indexed",
+            initial_entry_count=1,
+            issued_at=now - 1,
+            expires_at=now + 60,
         )
-        second_request["project_binding"] = second_binding
 
         first = helper.compile_fast_lane(first_request, reasoning_effort="ultra")
         second = helper.compile_fast_lane(second_request, reasoning_effort="ultra")
@@ -6191,8 +6318,8 @@ class TeamEfficiencyTests(unittest.TestCase):
             "当前 bootstrap/read-context",
             "CODEX_FASTLANE_TASK_ROOT",
             "task_root_hash",
-            "--quota-state-path",
-            "默认 `D:\\bun\\tmp\\codex`",
+            "FASTLANE_SCHEMA_UPGRADE_REQUIRED",
+            "默认 `G:\\2718lab\\_codex\\.codex-task-temp`",
             "不得为卷根",
         ):
             with self.subTest(expected=expected):
@@ -6241,7 +6368,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "bootstrap/read-context boundary",
             "CODEX_FASTLANE_TASK_ROOT",
             "task_root_hash",
-            "--quota-state-path",
+            "FASTLANE_SCHEMA_UPGRADE_REQUIRED",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, document)
@@ -7924,7 +8051,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         worktree_add_calls: list[list[str]] = []
         observed_error: ValueError | None = None
 
-        with tempfile.TemporaryDirectory(dir=r"D:\bun\tmp\codex") as temporary_root:
+        with tempfile.TemporaryDirectory(
+            dir=r"G:\2718lab\_codex\.codex-task-temp"
+        ) as temporary_root:
             configured_root = Path(temporary_root)
             project = "direct-apply-project"
             project_root = configured_root / project
