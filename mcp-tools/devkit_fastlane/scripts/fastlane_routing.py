@@ -41,9 +41,7 @@ POLICY_SCHEMA_V5: Final = "2718lab-devkit/fastlane-routing-policy-v5"
 RESULT_SCHEMA_V5: Final = "2718lab-devkit/fastlane-routing-result-v5"
 FINGERPRINT_SCHEMA_V5: Final = "2718lab-devkit/task-route-fingerprint-v5"
 REQUEST_BINDING_SCHEMA_V5: Final = "2718lab-devkit/child-route-request-binding-v1"
-CHILD_ROUTE_ATTESTATION_SCHEMA: Final = (
-    "2718lab-devkit/host-child-route-attestation-v1"
-)
+CHILD_ROUTE_ATTESTATION_SCHEMA: Final = "2718lab-devkit/host-child-route-attestation-v1"
 POLICY_PATH: Final = (
     Path(__file__).resolve().parents[1] / "assets" / "fastlane-routing-policy-v3.json"
 )
@@ -762,10 +760,14 @@ def _validate_policy_v4(policy: object) -> dict[str, Any]:
         4,
     )
     if set(allowed_efforts) != {"low", "medium", "high", "xhigh"}:
-        raise RoutingError("invalid_schema", "policy spark alternate efforts are invalid")
+        raise RoutingError(
+            "invalid_schema", "policy spark alternate efforts are invalid"
+        )
     raw_bands = alternate["effort_bands"]
     if type(raw_bands) is not list or len(raw_bands) != 4:
-        raise RoutingError("invalid_bounds", "policy spark alternate effort bands are invalid")
+        raise RoutingError(
+            "invalid_bounds", "policy spark alternate effort bands are invalid"
+        )
     expected_minimum = 0
     for index, raw_band in enumerate(raw_bands):
         band = _mapping(raw_band, f"policy spark alternate effort band[{index}]")
@@ -1368,9 +1370,7 @@ def _v4_request_as_v3(
         converted_task = dict(task)
         converted_task["schema"] = TASK_SCHEMA
         converted["task"] = converted_task
-    converted["host_capabilities"] = _v4_host_for_v3(
-        request.get("host_capabilities")
-    )
+    converted["host_capabilities"] = _v4_host_for_v3(request.get("host_capabilities"))
     return converted
 
 
@@ -1396,9 +1396,7 @@ def _normalise_request_v4(value: object, policy: Mapping[str, Any]) -> dict[str,
         "schema": REQUEST_SCHEMA_V4,
         "policy_hash": request["policy_hash"],
         "task": task,
-        "host_capabilities": _normalise_host_v4(
-            request["host_capabilities"], policy
-        ),
+        "host_capabilities": _normalise_host_v4(request["host_capabilities"], policy),
     }
 
 
@@ -2150,8 +2148,7 @@ def _spark_alternate_reason(
         or not 1
         <= int(task["write_scope_count"])
         <= int(alternate["maximum_write_scope_count"])
-        or task["write_scope_breadth"]
-        != alternate["required_write_scope_breadth"]
+        or task["write_scope_breadth"] != alternate["required_write_scope_breadth"]
     ):
         return "spark_alternate_scope_not_bounded"
     if task["verification_cost"] not in alternate["allowed_verification_costs"]:
@@ -2159,10 +2156,9 @@ def _spark_alternate_reason(
     if host["model_slot_limits"]["spark"] != alternate["required_local_slot_count"]:
         return "spark_alternate_slot_unavailable"
     pair = _spark_alternate_pair(policy, score, floor_rank)
-    if (
-        alternate["required_entitlement"] not in host["entitlements"]
-        or not _host_reports_exact(host, pair)
-    ):
+    if alternate["required_entitlement"] not in host[
+        "entitlements"
+    ] or not _host_reports_exact(host, pair):
         return "spark_alternate_capability_unavailable"
     return None
 
@@ -2490,7 +2486,9 @@ def _normalise_host_v5(value: object, policy: Mapping[str, Any]) -> dict[str, An
         for lane in sorted(expected_lanes)
     }
     raw_models = host["models"]
-    if type(raw_models) is not list or len(raw_models) > int(limits["maximum_host_models"]):
+    if type(raw_models) is not list or len(raw_models) > int(
+        limits["maximum_host_models"]
+    ):
         raise RoutingError("invalid_bounds", "host models are out of bounds")
     models: list[dict[str, Any]] = []
     seen_models: set[str] = set()
@@ -2645,19 +2643,32 @@ def _normalise_child_route_attestation_v5(
             frozenset({"attested", "refused"}),
             "child route status",
         )
-        if _hash(
-            attestation["request_binding_hash"], "child route request binding"
-        ) != binding_hash:
+        if (
+            _hash(attestation["request_binding_hash"], "child route request binding")
+            != binding_hash
+        ):
             raise RoutingError("contradictory_profile", "child route binding is stale")
-        if _hash(attestation["host_id_hash"], "child route host id") != host["host_id_hash"]:
+        if (
+            _hash(attestation["host_id_hash"], "child route host id")
+            != host["host_id_hash"]
+        ):
             raise RoutingError("contradictory_profile", "child route host is stale")
-        if _integer(
-            attestation["capability_epoch"], "child route capability epoch", 0, MAX_31
-        ) != host["capability_epoch"]:
-            raise RoutingError("contradictory_profile", "child route capability is stale")
-        if _integer(
-            attestation["lease_epoch"], "child route lease epoch", 0, MAX_31
-        ) != scheduler["lease_epoch"]:
+        if (
+            _integer(
+                attestation["capability_epoch"],
+                "child route capability epoch",
+                0,
+                MAX_31,
+            )
+            != host["capability_epoch"]
+        ):
+            raise RoutingError(
+                "contradictory_profile", "child route capability is stale"
+            )
+        if (
+            _integer(attestation["lease_epoch"], "child route lease epoch", 0, MAX_31)
+            != scheduler["lease_epoch"]
+        ):
             raise RoutingError("contradictory_profile", "child route lease is stale")
         issued = _integer(
             attestation["issued_event_seq"], "child route issued event", 0, MAX_63
@@ -2698,7 +2709,9 @@ def _normalise_child_route_attestation_v5(
             "attestation_hash": supplied_hash,
         }
     except RoutingError as error:
-        raise RoutingError("capability_unavailable", "child route attestation unavailable") from error
+        raise RoutingError(
+            "capability_unavailable", "child route attestation unavailable"
+        ) from error
 
 
 def _task_fingerprint_v5(
@@ -2745,7 +2758,10 @@ def _spark_reason_v5(
     task = _mapping(request["task"], "task")
     scheduler = _mapping(request["scheduler_facts"], "scheduler_facts")
     host = _mapping(request["host_capabilities"], "host_capabilities")
-    if effective_role not in {"execution", "recovery"} or effective_access != "workspace_write":
+    if (
+        effective_role not in {"execution", "recovery"}
+        or effective_access != "workspace_write"
+    ):
         return "spark_role_excluded"
     if task["blocker_severity"] != "severe":
         return "spark_not_severe"
@@ -2803,7 +2819,9 @@ def _terminal_result_v5(
     else:
         raw_task = raw_request.get("task") if isinstance(raw_request, Mapping) else None
         task_id = raw_task.get("task_id") if isinstance(raw_task, Mapping) else ""
-        policy_hash = raw_request.get("policy_hash") if isinstance(raw_request, Mapping) else ""
+        policy_hash = (
+            raw_request.get("policy_hash") if isinstance(raw_request, Mapping) else ""
+        )
         if not isinstance(task_id, str):
             task_id = ""
         if not isinstance(policy_hash, str):

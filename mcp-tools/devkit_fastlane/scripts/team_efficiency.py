@@ -178,9 +178,7 @@ _PROJECT_FENCE_FIELDS = frozenset(
 _PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
 _WORK_PACKAGE_V2_SCHEMA = "team-efficiency/work-package-v2"
 _PROJECT_BINDING_SCHEMA = "2718lab-devkit/project-binding-v1"
-_BOOTSTRAP_ATTESTATION_SCHEMA = (
-    "2718lab-devkit/new-project-bootstrap-attestation-v1"
-)
+_BOOTSTRAP_ATTESTATION_SCHEMA = "2718lab-devkit/new-project-bootstrap-attestation-v1"
 _PROJECT_BINDING_FIELDS = frozenset(
     {
         "schema",
@@ -4017,7 +4015,9 @@ def _fast_lane_scheduler_topology(
         missing = set(_FAST_LANE_TOPOLOGY_GROUP_FIELDS) - set(group)
         if unknown or missing:
             raise ValueError("topology group schema is invalid")
-        group_id = _text(group["group_id"], f"topology.groups[{index}].group_id", maximum=1)
+        group_id = _text(
+            group["group_id"], f"topology.groups[{index}].group_id", maximum=1
+        )
         if group_id != chr(ord("A") + index):
             raise ValueError("topology groups must be ordered A/B/C")
         writers = _normalised_list(
@@ -4040,11 +4040,15 @@ def _fast_lane_scheduler_topology(
         claims_value = group.get("writer_scope_claims")
         scopes: dict[str, list[str]] = {}
         if claims_value is not None:
-            claims = _mapping(claims_value, f"topology.groups[{index}].writer_scope_claims")
+            claims = _mapping(
+                claims_value, f"topology.groups[{index}].writer_scope_claims"
+            )
             if set(claims) != set(writers):
                 raise ValueError("topology writer scope claims must match writers")
             scopes = {
-                task_id: _normalised_scopes(claims[task_id], f"topology scope {task_id}")
+                task_id: _normalised_scopes(
+                    claims[task_id], f"topology scope {task_id}"
+                )
                 for task_id in writers
             }
             if any(
@@ -4058,7 +4062,9 @@ def _fast_lane_scheduler_topology(
                 raise ValueError("UNSPLITTABLE")
         if "declared_child_splits" in group:
             splits = group["declared_child_splits"]
-            if not isinstance(splits, Sequence) or isinstance(splits, (str, bytes, bytearray)):
+            if not isinstance(splits, Sequence) or isinstance(
+                splits, (str, bytes, bytearray)
+            ):
                 raise ValueError("topology.declared_child_splits must be a list")
             if len(splits) > len(writers) or (splits and not scopes):
                 raise ValueError("UNSPLITTABLE")
@@ -4080,7 +4086,9 @@ def _fast_lane_scheduler_topology(
                     ),
                     "declared child split",
                 )
-                child_task_id = _task_id(split["child_task_id"], "declared child split.child_task_id")
+                child_task_id = _task_id(
+                    split["child_task_id"], "declared child split.child_task_id"
+                )
                 _task_id(split["parent_task_id"], "declared child split.parent_task_id")
                 parent_scope = _normalised_scopes(
                     split["parent_scope"], "declared child split.parent_scope"
@@ -4110,8 +4118,12 @@ def _fast_lane_scheduler_topology(
             {
                 "group_id": group_id,
                 "scheduler_id": _hash(group["scheduler_id"], "topology.scheduler_id"),
-                "coordinator_lease_id": _hash(group["coordinator_lease_id"], "topology.coordinator_lease_id"),
-                "worktree_identity": _hash(group["worktree_identity"], "topology.worktree_identity"),
+                "coordinator_lease_id": _hash(
+                    group["coordinator_lease_id"], "topology.coordinator_lease_id"
+                ),
+                "worktree_identity": _hash(
+                    group["worktree_identity"], "topology.worktree_identity"
+                ),
                 "writer_task_ids": writers,
                 "prewarm_task_ids": prewarms,
             }
@@ -4119,7 +4131,10 @@ def _fast_lane_scheduler_topology(
         writer_ids.update(writers)
         participant_ids.update(writers)
         participant_ids.update(prewarms)
-    if len(writer_ids) > MAX_FAST_LANE_TOTAL_WRITERS or len(participant_ids) > host_capacity:
+    if (
+        len(writer_ids) > MAX_FAST_LANE_TOTAL_WRITERS
+        or len(participant_ids) > host_capacity
+    ):
         raise ValueError("topology exceeds host capacity")
 
     topology: dict[str, Any] = {
@@ -8494,9 +8509,7 @@ def _render_fast_lane_status(
             host_status=None,
             occupancy=None,
         ),
-        "scheduler_topology": _fast_lane_plan_topology(
-            validated, running_assignments
-        ),
+        "scheduler_topology": _fast_lane_plan_topology(validated, running_assignments),
     }
     result["plan_hash"] = _sha256_json(result)
     _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")

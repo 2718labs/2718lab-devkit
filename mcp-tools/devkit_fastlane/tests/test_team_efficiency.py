@@ -731,9 +731,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "project_id": project_fence["project_id"],
             "workspace_id": package["workspace_id"],
             "input_snapshot_id": (
-                package["input_snapshot_id"]
-                if snapshot_id is None
-                else snapshot_id
+                package["input_snapshot_id"] if snapshot_id is None else snapshot_id
             ),
         }
         return self.task2_project_binding(
@@ -2322,7 +2320,9 @@ class TeamEfficiencyTests(unittest.TestCase):
                     enable=True,
                 )
                 self.assertEqual("NO_SAFE_WORK", result["decision_code"])
-                self.assertEqual(expected_reason, result["idle_slots"][0]["reason_code"])
+                self.assertEqual(
+                    expected_reason, result["idle_slots"][0]["reason_code"]
+                )
                 self.assertEqual([], result["assignments"])
 
     def test_malformed_task2_project_binding_stays_fenced(self) -> None:
@@ -2405,7 +2405,9 @@ class TeamEfficiencyTests(unittest.TestCase):
                     enable=True,
                 )
                 self.assertEqual("NO_SAFE_WORK", result["decision_code"])
-                self.assertEqual(expected_reason, result["idle_slots"][0]["reason_code"])
+                self.assertEqual(
+                    expected_reason, result["idle_slots"][0]["reason_code"]
+                )
                 self.assertEqual([], result["bootstrap_queue"])
 
     def test_default_fastlane_task_root_is_g_drive_task_root(self) -> None:
@@ -6821,9 +6823,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def test_bootstrap_is_portable_to_any_compliant_codex_project_root(self) -> None:
         helper = load_efficiency()
-        codex_root = Path(r"G:\2718lab\_codex\.codex-task-temp").resolve(
-            strict=False
-        )
+        codex_root = Path(r"G:\2718lab\_codex\.codex-task-temp").resolve(strict=False)
         project_root = self.fast_lane_task_root / "portable-project" / "nested-root"
         project = project_root.resolve(strict=False).relative_to(codex_root).as_posix()
         worktree = project_root / "worktrees" / "portable-atlas"
@@ -8369,7 +8369,9 @@ class TeamEfficiencyTests(unittest.TestCase):
             reasoning_effort="ultra",
             host_status=host_status,
         )
-        local_starts = [item for item in local["assignments"] if item["action"] == "start"]
+        local_starts = [
+            item for item in local["assignments"] if item["action"] == "start"
+        ]
         self.assertEqual(3, len(local_starts))
         result = self.compile_fast_lane(
             helper, request, reasoning_effort="ultra", host_status=host_status
@@ -8594,6 +8596,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         def identity(name: str) -> str:
             return helper._sha256_json({"opaque": name})
+
         common = {
             "group_id": "A",
             "scheduler_id": identity("scheduler-a"),
@@ -8621,7 +8624,9 @@ class TeamEfficiencyTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(["FAST-LANE-MODERATE"], topology["groups"][0]["writer_task_ids"])
+        self.assertEqual(
+            ["FAST-LANE-MODERATE"], topology["groups"][0]["writer_task_ids"]
+        )
 
         with self.assertRaisesRegex(ValueError, "UNSPLITTABLE"):
             helper._fast_lane_scheduler_topology(

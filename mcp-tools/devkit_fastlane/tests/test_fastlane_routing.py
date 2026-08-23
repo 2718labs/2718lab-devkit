@@ -734,7 +734,9 @@ def test_v4_normal_alternate_fails_closed_for_capability_sol_and_high_risk() -> 
     unavailable_result = core.route_v4(unavailable)
     assert unavailable_result["route"]["lane"] == "luna"
     assert unavailable_result["spark_alternate"] is None
-    assert "spark_alternate_capability_unavailable" in unavailable_result["reason_codes"]
+    assert (
+        "spark_alternate_capability_unavailable" in unavailable_result["reason_codes"]
+    )
 
     sol_floor = _normal_spark_alternate_request_v4()
     sol_task = sol_floor["task"]
