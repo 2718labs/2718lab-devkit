@@ -320,6 +320,26 @@ class ProductionRegistryResolver:
         result["binding_hash"] = _canonical_hash(result)
         return result
 
+    def validate_bootstrap_recompile(
+        self,
+        *,
+        project_binding: Mapping[str, object],
+        receipt: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Validate the complete bootstrap lineage before a later indexed request.
+
+        This method does not register, synchronize, or promote an index. A caller
+        must still issue a normal indexed recompile, whose ``resolve`` call keeps
+        the existing current Project Index and Atlas checks.
+        """
+
+        registry_binding = self.resolve_new_empty_bootstrap(project_binding)
+        return validate_project_index_bootstrap_receipt(
+            registry_binding,
+            receipt,
+            clock=self._clock,
+        )
+
 
 class ProjectIndexBootstrapTransport:
     """Run exactly register then sync for a verified bootstrap-only binding."""

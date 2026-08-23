@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from devkit_relay.compiler import RelayPlanError
 from devkit_runtime.relay_runtime import (
     ProductionRegistryResolver,
     ProjectIndexBootstrapTransport,
@@ -193,6 +194,90 @@ def test_bootstrap_transport_runs_only_register_then_sync_and_binds_receipt() ->
     ) == receipt
     assert "lease" not in repr(receipt).lower()
     assert "path" not in repr(receipt).lower()
+
+
+def test_resolver_validates_full_binding_and_receipt_for_indexed_recompile() -> None:
+    project_binding = _binding()
+    resolver = _resolver()
+    registry_binding = resolver.resolve_new_empty_bootstrap(project_binding)
+    host = _HostOperations()
+    receipt = ProjectIndexBootstrapTransport(host, clock=lambda: _NOW).execute(
+        registry_binding
+    )
+    host.calls.clear()
+
+    validated = resolver.validate_bootstrap_recompile(
+        project_binding=project_binding,
+        receipt=receipt,
+    )
+
+    assert validated == receipt
+    assert host.calls == []
+    with pytest.raises(RelayPlanError) as still_unavailable:
+        resolver.resolve(
+            workflow_id="workflow-new-project",
+            workspace_id=str(registry_binding["workspace_id"]),
+            input_snapshot_id=str(receipt["index_snapshot_id"]),
+            atlas_packet_ids=(),
+        )
+    assert still_unavailable.value.code == "registry_binding_unavailable"
+
+
+def test_recompile_validation_rejects_hash_only_mismatched_stale_or_unknown_inputs() -> None:
+    project_binding = _binding()
+    resolver = _resolver()
+    registry_binding = resolver.resolve_new_empty_bootstrap(project_binding)
+    receipt = ProjectIndexBootstrapTransport(
+        _HostOperations(), clock=lambda: _NOW
+    ).execute(registry_binding)
+
+    with pytest.raises(RelayRuntimeError) as hash_only_binding:
+        resolver.validate_bootstrap_recompile(
+            project_binding={"binding_hash": project_binding["binding_hash"]},
+            receipt=receipt,
+        )
+    assert hash_only_binding.value.code == "BOOTSTRAP_ATTESTATION_INVALID"
+
+    with pytest.raises(RelayRuntimeError) as hash_only_receipt:
+        resolver.validate_bootstrap_recompile(
+            project_binding=project_binding,
+            receipt={"receipt_hash": receipt["receipt_hash"]},
+        )
+    assert hash_only_receipt.value.code == "BOOTSTRAP_RECEIPT_INVALID"
+
+    mismatched = dict(receipt)
+    mismatched["workspace_id"] = "sha256:" + "f" * 64
+    mismatched["receipt_hash"] = _canonical_hash(
+        {key: value for key, value in mismatched.items() if key != "receipt_hash"}
+    )
+    with pytest.raises(RelayRuntimeError) as mismatch:
+        resolver.validate_bootstrap_recompile(
+            project_binding=project_binding,
+            receipt=mismatched,
+        )
+    assert mismatch.value.code == "BOOTSTRAP_RECEIPT_INVALID"
+
+    stale = dict(receipt)
+    stale["issued_at"] = _NOW - 121
+    stale["expires_at"] = _NOW - 1
+    stale["receipt_hash"] = _canonical_hash(
+        {key: value for key, value in stale.items() if key != "receipt_hash"}
+    )
+    with pytest.raises(RelayRuntimeError) as stale_receipt:
+        resolver.validate_bootstrap_recompile(
+            project_binding=project_binding,
+            receipt=stale,
+        )
+    assert stale_receipt.value.code == "BOOTSTRAP_RECEIPT_STALE"
+
+    unknown = dict(receipt)
+    unknown["extra"] = "not-accepted"
+    with pytest.raises(RelayRuntimeError) as unknown_receipt:
+        resolver.validate_bootstrap_recompile(
+            project_binding=project_binding,
+            receipt=unknown,
+        )
+    assert unknown_receipt.value.code == "BOOTSTRAP_RECEIPT_INVALID"
 
 
 def test_server_bootstrap_transport_resolves_one_root_and_uses_existing_operations() -> None:
