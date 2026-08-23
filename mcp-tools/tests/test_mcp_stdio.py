@@ -114,6 +114,7 @@ def test_stdio_initialize_lists_exact_tools_and_returns_a_v1_result(tmp_path) ->
     )
     for inherited in (
         "CODEX_HOME",
+        "CODEX_DEVKIT_DATA_ROOT",
         "CODEX_PROJECT_ROOT",
         "CODEX_WORKSPACE_ROOT",
         "CODEX_PROJECT_ID",
@@ -177,6 +178,7 @@ def test_extracted_primary_artifact_starts_without_source_checkout_dependency(
     child_environment = os.environ.copy()
     for inherited in (
         "CODEX_HOME",
+        "CODEX_DEVKIT_DATA_ROOT",
         "PYTHONHOME",
         "UV_PROJECT_ENVIRONMENT",
         "VIRTUAL_ENV",

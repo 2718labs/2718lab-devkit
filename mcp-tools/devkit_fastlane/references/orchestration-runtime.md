@@ -82,12 +82,12 @@ of reinterpreting it using a later scheduler event or lease. `ultra` activates
 lane 0; no worker may receive `ultra`. Prewarm stays read-only. Archive is a
 host action only after coordinator-lane acceptance and final evidence binding.
 Fast Lane task roots derive from trusted `CODEX_FASTLANE_TASK_ROOT`, falling
-back to `D:\bun\tmp\codex` only when it is unset. Worker/read worktrees and
+back to `G:\2718lab\_codex\.codex-task-temp` only when it is unset. Worker/read worktrees and
 temporary targets must stay strictly below their declared derived project root;
 read-only contexts carry that project identity plus a canonical task-root hash
 and align with execution contexts when present. Invalid, changed, non-local,
 reparse-point, Win32-normalized alias, volume-root, or C-drive configuration
-fails closed. This does not constrain the separately user-configurable quota
+fails closed. This does not constrain separately configured runtime data
 sample cache path.
 
 ## 恢复

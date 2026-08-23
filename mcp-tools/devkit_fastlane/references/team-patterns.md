@@ -48,10 +48,10 @@ its input/output query at lifecycle boundaries and the worker only consumes the
 packet, with no index polling or hand-written query choreography.
 The host archives only after coordinator acceptance and final evidence binding.
 Fast Lane task roots derive from trusted `CODEX_FASTLANE_TASK_ROOT`, or the
-compatible `D:\bun\tmp\codex` default. Worker/read worktrees and temporary
+local `G:\2718lab\_codex\.codex-task-temp` default. Worker/read worktrees and temporary
 targets stay strictly below their declared project root; standalone read
 contexts carry the same bounded project identity and canonical task-root hash.
-The quota sample cache remains a separately user-configurable path, and C-drive
+Runtime caches remain separately configured below the approved task root, and C-drive
 temporary roots remain forbidden.
 
 No execution worker merges another task, changes a sibling scope, or accepts

@@ -12,7 +12,7 @@ def test_server_card_temp_and_cache_environment_stays_under_task_root() -> None:
     assert configured_task_root.is_absolute()
     task_root = configured_task_root.resolve()
     if os.name == "nt":
-        assert task_root.drive.casefold() == "d:"
+        assert task_root.drive.casefold() == "g:"
     else:
         runner_temp = os.environ.get("RUNNER_TEMP")
         if runner_temp:

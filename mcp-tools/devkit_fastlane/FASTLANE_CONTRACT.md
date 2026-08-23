@@ -101,8 +101,8 @@ live authority。公开 `compile_fast_lane` 与 `fast-lane` CLI 对 structurally
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`，零本地 assignment、零队列、零外部派发；V2
 envelope/hash 无效、其内层 canonical v1 `package` 不能完成纯诊断解析，或 fast-lane request
 壳的 schema/key/字节边界无效时，必须是 `PROJECT_BINDING_INVALID`；v1 保持
-`LEGACY_PROJECT_UNBOUND`。这些结构预检不读取 host、quota 或 index 输入，也不触及 scheduler。
-公开 MCP request 若试图携带明确的 host-private 字段（如 `host_status`、quota 或 index
+`LEGACY_PROJECT_UNBOUND`。这些结构预检不读取 host、账号用量或 index 输入，也不触及 scheduler。
+公开 MCP request 若试图携带明确的 host-private 字段（如 `host_status`、账号用量或 index
 evidence），则是适配器输入违规，必须在编译前以 `FASTLANE_REQUEST_INVALID` 拒绝，而不是把
 该值当作可诊断的计划输入。
 增加
@@ -134,7 +134,7 @@ host-authorized worktree path：没有 module-private capability、runner、Git 
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
-`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。当前仓库的公开 `fast-lane` CLI/API 不消费 host-status、quota 或 index 输入来激活该合同：在外部 Desktop authority bridge 实现并验收前，它始终输出 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 的零 assignment/队列预览。下文的 descriptor、route、quota 与 host dispatch 约束只定义未来 bridge 的接入要求，不是本仓库存在的执行通路。`fast-lane` 本身不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。当前仓库的公开 `fast-lane` CLI/API 不消费 host-status、额度或 index 输入来激活该合同：在外部 Desktop authority bridge 实现并验收前，它始终输出 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 的零 assignment/队列预览。下文的 descriptor、route 与 host dispatch 约束只定义未来 bridge 的接入要求，不是本仓库存在的执行通路。`fast-lane` 本身不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
 
 host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
 `routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整
@@ -165,7 +165,9 @@ skill 不直接调用 host dispatch 工具。
 每个 assignment 还必须消费 `host_dispatch`。其中的 `model` 和
 `reasoning_effort` 是本次调用的显式参数，`inherit_current_session_model=false`、
 `require_explicit_route=true`；host 调用 `collaboration.spawn_agent` 时必须原样传入
-这两个值，缺失或改写就拒绝派发，不能让宿主从当前会话（例如 Luna）继承模型。
+这两个值，缺失或改写就拒绝派发，不能让宿主从当前会话（例如 Luna）继承模型。可信
+host-attested child route 是独立路由权威，不受 DevKit parent-session rank ceiling 限制；
+没有该 attestation 时必须拒绝而非提升或猜测。
 
 索引由 host 在边界一次性准备：assignment 的 `index_context` 是有界的
 `team-efficiency/fast-lane-index-context-v1`，包含输入/输出 snapshot、写/读 scope、
@@ -175,33 +177,15 @@ terminal boundary 做一次 output query；worker 只消费 packet，不调用
 不匹配时停止该 assignment。这样索引安全约束仍在，但不会把低价值的索引仪式交给
 LLM 自己编排。
 
-未来 bridge 的额度遥测优先由 host-private inherited-handle bridge 传递：先发送
-`kind="quota_snapshot_request"`（`host-quota-snapshot-request-v1`），再接收绑定同一
-`request_id` 的 `kind="quota_snapshot"`（`host-quota-snapshot-response-v1`）。响应内层必须是
-`host-quota-snapshot-v1`，并由 `fastlane_quota_balance` 继续验证快照哈希、签名、租约世代与
-120 秒 freshness。未来 host 需要在同一进程内接入
-`scripts/codex_account_quota.py` 的 `CodexQuotaProvider`：它只调用官方
-`codex app-server --stdio` 的 JSONL `initialize`、`account/read`（`refreshToken=false`）和
-`account/rateLimits/read`，严格按 `limitId="codex"` 与
-`limitName="GPT-5.3-Codex-Spark"` 取主池/Spark 池，HMAC key 只留内存；不读
-`auth.json`、cookie、环境变量邮箱或私有 HTTP 接口。它不是当前公开 CLI 的可执行入口；未来 bridge
-可按下列形状接入：
-
-```text
-python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --quota-input <quota-request.json> --live-quota --reasoning-effort ultra
-```
-
-`--live-quota` 要求 `--quota-input` 已携带 host 绑定的 `snapshot.capacity`，额度采集模块会替换快照并
-重算 request hash；`--quota-state-path`（默认 `CODEX_TASK_TEMP` 下的缓存）只保存最近样本的
-非敏感百分比/周期 hash，用于计算 300 秒斜率。首个样本没有前值时斜率为 0，下一次采样才计算
-增量；周期 reset 或缓存失效会清零增量。命令、JSONL、响应大小、超时和字段均有边界，来源异常、
-缺少任一池、错 Spark 标签或 bridge 缺失/错绑时保持 `usage_unknown`，不得猜测当前账户百分比，
-也不得启动新任务。
+Fast Lane 不包含额度协调器，也不读取、缓存、推断或以额度作路由输入。任何未来额度
+能力须作为外部宿主独立产品建立新合同；本发行版的 host route 与子会话派发不引用该能力。
 
 若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。独立会话必须在获准任务根下创建并绑定自己的隔离 Git worktree；不得把协调器的脏集成工作树当作 worker 工作区，缺失或无法验证 worktree 时 fail-closed。
 
 归档不是 adapter 操作：只能在协调器 lane 已完成 acceptance、最终证据已绑定之后由 host 执行。
-Fast Lane 的宿主任务根由 `CODEX_FASTLANE_TASK_ROOT` 配置；未设置时保持兼容默认 `D:\bun\tmp\codex`。
+X 轮回滚均未恢复时，系统仅产生候选清理资格；默认不自动删除任何 worktree、证据、缓存或用户数据。
+Fast Lane 的宿主任务根由 `CODEX_FASTLANE_TASK_ROOT` 配置；本机默认
+`G:\2718lab\_codex\.codex-task-temp`，显式根也必须位于 G:。
 配置值必须是现存的、本地绝对、非 C 盘、不得为卷根且不含 reparse-point
 的目录，编译器只在其下派生受限 `project` 的任务根，并在规范化前按词法路径拒绝 project
 子路径中的 reparse-point。bootstrap 和 read-context 的 worktree、scratch、普通 cache 与测试
@@ -213,9 +197,10 @@ fail-closed；Windows apply 在目录创建和 Git 调用期间持有只共享 r
 叶目录已存在就停止。默认 bootstrap 保持 v1；非默认根使用只携带规范根 hash 的
 bootstrap-v2，在 apply 前重算该 hash。该变量是宿主配置，不是 request 或 bootstrap
 plan 可自报的根字段。
-额度样本缓存 `--quota-state-path` 仍是独立的用户配置项，可使用
-获准的其他盘符。禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C 盘。这仍是当前 bootstrap/read-context
-边界。
+禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C: 或 G: 以外的本机盘符。这仍是当前
+bootstrap/read-context 边界。空项目只能生成 bootstrap-only index：不得据此创建可执行
+assignment，直到可信宿主提供有界项目索引上下文。旧 schema 输入返回
+`FASTLANE_SCHEMA_UPGRADE_REQUIRED`，不得降级猜测或启动工作。
 
 ### 6. 验证与交付
 

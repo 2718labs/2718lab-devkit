@@ -8,6 +8,17 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-23
+
+### Changed
+
+- Documented G-drive local task roots, disjoint multi-writer scopes, and the
+  PR-style independent-review integration boundary.
+- Removed the quota-coordinator contract from the shipped Fast Lane guidance.
+- Clarified host-attested independent child routing, bootstrap-only empty
+  project handling, and candidate-only cleanup eligibility after exhausted
+  rollback rounds.
+
 ### Changed
 
 - Removed the retired AstrBot extension, its dedicated manual, and its

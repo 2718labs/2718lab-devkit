@@ -1,31 +1,30 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — Codex + MCP v1.0.0
+# 2718lab DevKit — Codex + MCP v1.1.0
 
-[![version](https://img.shields.io/badge/version-v1.0.0-blue)](./.codex-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-v1.1.0-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
 runtime for bounded project indexing, Atlas evidence, Relay lifecycle
 coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
-of reference manuals. This repository carries the versioned v1.0.0 package.
+of reference manuals. This repository carries the versioned v1.1.0 package.
 The checked-in manifest and allowlist define the executable runtime surface;
 the manual map, install, build, and verification sections below describe the
 supported workflow.
 
 The current release retains a deliberately fail-closed Fast Lane preview. The public compiler
 and CLI return `NO_SAFE_WORK` with zero assignments: they do not consume host
-status, quota, or live-account inputs, and have no worktree execution path.
-Ultra, live quota, and host consumption are future requirements of an external
-Desktop-host bridge contract; no such bridge is provided by this repository.
+status or live-account inputs, and have no worktree execution path. Host
+execution remains an external Desktop-host bridge requirement.
 
 > [!IMPORTANT]
-> **Workflow reminder:** route from bounded evidence, keep one writer per
-> write scope, claim and bind before execution, refill only after a validated
-> terminal event, integrate and accept before archiving. Prewarm is read-only;
-> `action="retain"` is not a new spawn. Keep task scratch, caches, worktrees,
-> and evidence in an isolated user-owned workspace. Parse-compatible Fast Lane
-> quota inputs do not currently consume quota. Do not commit runtime state or
+> **Workflow reminder:** route from bounded evidence. Parallel A1/A2/A3 work is
+> allowed only with disjoint, exclusively owned write scopes and independent G:
+> task roots. Claim and bind before execution; prewarm is read-only and
+> `action="retain"` is not a new spawn. The coordinator integrates only after
+> PR-style independent review, then accepts before archiving. Fast Lane does not
+> use an account-usage coordinator or account-usage inputs. Do not commit runtime state or
 > credentials.
 
 ## What is shipped
@@ -45,8 +44,8 @@ Desktop-host bridge contract; no such bridge is provided by this repository.
   an executable prompt/agent surface.
 - Fast Lane is a pure MCP runtime compiler. Its public surface is presently
   authority-inert and fail-closed: it emits no assignments and never spawns
-  agents, edits Git, runs commands, or executes worktrees. Host/private quota
-  consumption is reserved for a future external Desktop-host bridge contract.
+  agents, edits Git, runs commands, or executes worktrees. Host execution is
+  reserved for a future external Desktop-host bridge contract.
 
 ## Module overview
 
@@ -58,7 +57,7 @@ Desktop-host bridge contract; no such bridge is provided by this repository.
 | [`mcp-tools/devkit_relay/`](mcp-tools/devkit_relay/) | explicit work-package compilation and lifecycle host actions | [Relay tools](#exact-mcp-surface) |
 | [`mcp-tools/devkit_runtime/`](mcp-tools/devkit_runtime/) | runtime paths, checkpoints, durable boundaries, and the private host bridge | [runtime and recovery](#runtime-data-and-recovery) |
 | [`mcp-tools/orchestrator/`](mcp-tools/orchestrator/) | durable workflow, task, lease, and lifecycle state | [workflow lifecycle](mcp-tools/devkit_fastlane/references/efficiency-automation.md#workflow-lifecycle-plan) |
-| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | deterministic routing/Fast Lane compiler, future quota-bridge reference, contracts, and tests | [Fast Lane contract](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
+| [`mcp-tools/devkit_fastlane/`](mcp-tools/devkit_fastlane/) | deterministic routing/Fast Lane compiler, contracts, and tests | [Fast Lane contract](mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md) |
 | [`.codex-plugin/`](.codex-plugin/) | plugin manifest, artifact allowlist, and reproducible package builder | [artifact build](#build-the-primary-artifact) |
 
 ## Overall workflow
@@ -121,8 +120,8 @@ re-reading the whole repository:
 
 For the current implementation entry point, see
 [the Fast Lane compiler](mcp-tools/devkit_fastlane/scripts/team_efficiency.py).
-The quota producer is retained as a reference module for the future external
-Desktop-host bridge contract; the public compiler and CLI do not invoke it.
+Fast Lane has no account-usage coordinator contract; the public compiler and
+CLI do not read, coordinate, or infer account usage.
 
 ## Exact MCP surface
 
@@ -173,15 +172,14 @@ handles or falls back to an unrelated local start.
 The allowlisted builder creates a deterministic ZIP outside the plugin source
 tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.0.0.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.0.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
 .codex-plugin/main-artifact-allowlist.json. Its executable runtime surface is
 the MCP server; the ZIP also carries the Fast Lane contract, required references
 and policy assets, the `team_efficiency.py` compatibility entry point, its
-routing and quota-balance modules, and the host-only official-account quota
-producer. It deliberately excludes the optional Skill manual bundle, command
+routing modules. It deliberately excludes the optional Skill manual bundle, command
 helpers, hooks, CI files, host-private state, prompts, static agents, and
 arbitrary repository files.
 
@@ -190,11 +188,9 @@ result:
 
     python mcp-tools/devkit_fastlane/scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --reasoning-effort ultra
 
-The legacy `--host-status`, quota, and live-quota switches remain
-parse-compatible only. The current public CLI does not read or consume them,
-does not collect a quota sample, and cannot activate work. Live quota and
-quota-cache handling belong to the future external Desktop-host bridge
-contract, not this release.
+Legacy host-only switches remain parse-compatible only. The current public CLI
+does not read or consume them and cannot activate work. It has no account-usage
+coordinator or cache contract.
 
 `CODEX_FASTLANE_TASK_ROOT` and worktree/cache placement are likewise reserved
 for a future host-owned execution bridge. The current public compiler neither
@@ -227,11 +223,11 @@ receipts into another project. A command-line invocation with no scope keeps
 the unsuffixed root for backwards compatibility; the host integration should
 always provide a project or thread scope.
 
-Scratch paths use CODEX_TASK_TEMP, TMPDIR, TEMP, or TMP when explicitly
-provided, otherwise a sibling .2718lab-devkit-scratch directory. A configured
-scratch base receives the same scope suffix as durable data. The runtime
-rejects unsafe, overlapping, missing, or reparse-point roots and does not write
-fallback state into the repository.
+For local DevKit work, set CODEX_TASK_TEMP and its TMPDIR/TEMP/TMP/
+PYTHONPYCACHEPREFIX children under an isolated G: task root. A configured
+scratch base receives the same scope suffix as durable data. The runtime rejects
+unsafe, overlapping, missing, or reparse-point roots and does not write fallback
+state into the repository.
 
 After a host interruption, resume from the durable workflow lease, endpoint,
 artifact references, snapshots, and bounded receipts. Rebind a valid current
@@ -249,23 +245,18 @@ mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The public MCP entry is
 
 - `ultra` and `--enable` only select the shape of the blocked result; they do
   not activate scheduling.
-- The public compiler/CLI does not consume host status, quota requests, live
-  quota, index evidence, or a worktree root.
+- The public compiler/CLI does not consume host status, account usage, index
+  evidence, or a worktree root.
 - It never dispatches a session, creates a worktree, refills a slot, or runs a
   command. No in-repository execution path exists for those actions.
-- An external Desktop-host bridge may later provide attested project authority,
-  host/quota consumption, and execution. That is a future contract, not a
+- An external Desktop-host bridge may later provide attested project authority
+  and execution. That is a future contract, not a
   shipped implementation or a claim that any Desktop host source exists.
 
-### Live account quota boundary
+### Account-usage boundary
 
-Live account quota is not a current public Fast Lane capability. Passing
-`--live-quota`, `--quota-input`, or `--quota-state-path` to this release does
-not read an account source, consume quota evidence, or alter its zero-assignment
-result. The existing
-[codex_account_quota.py](mcp-tools/devkit_fastlane/scripts/codex_account_quota.py)
-is reference material for the future external Desktop-host bridge contract;
-this repository does not supply or invoke that bridge.
+Account usage is not a Fast Lane input or routing mechanism. This release has
+no account-usage coordinator, cache, or external collector contract.
 
 ## Safety and scope boundaries
 
@@ -299,7 +290,7 @@ freeze a transient regression count.
 
 ## Version
 
-This repository represents the versioned v1.0.0 package. Release notes are
+This repository represents the versioned v1.1.0 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
 artifact allowlist, and locked dependency set. A maintainer dispatches Release
 from current `main`; it validates all declared gates, creates the annotated tag,
