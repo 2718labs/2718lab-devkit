@@ -195,7 +195,12 @@ Fast Lane 不包含额度协调器，也不读取、缓存、推断或以额度�
 若 `host_spawn_exact_route` 必须先取得 `host_target`，它只能是 `parked endpoint bootstrap`：claim（及条件 endpoint bind）成功前 worker 保持 inert，禁止下发任务或访问 worktree、gate、写入、checkpoint、sync/query、receipt、candidate、terminal；这不是 prewarm，也不新增 compiler operation。独立会话必须在获准任务根下创建并绑定自己的隔离 Git worktree；不得把协调器的脏集成工作树当作 worker 工作区，缺失或无法验证 worktree 时 fail-closed。
 
 归档不是 adapter 操作：只能在协调器 lane 已完成 acceptance、最终证据已绑定之后由 host 执行。
-X 轮回滚均未恢复时，系统仅产生候选清理资格；默认不自动删除任何 worktree、证据、缓存或用户数据。
+合并之后，只有在明确的留存策略规定的连续 `x` 轮后续 integration 均由协调器明确接受、
+这些轮次没有 rollback、完成新的 host 重检查，并且持久化证据同时绑定 candidate、base、
+integration commit 以及 review、verification、integration evidence 时，host 才能记录
+`cleanup_candidate`。仅观察到、pending、推断或其他未经验证的结果都不算已接受轮次。
+`cleanup_candidate` 只是候选资格证据，不是删除授权；adapter 和 host 都绝不自动删除
+worktree、证据、缓存或用户数据。没有留存策略，或任一门槛/证据缺失时，相关材料永久保留。
 Fast Lane 的宿主任务根由 `CODEX_FASTLANE_TASK_ROOT` 配置；本机默认
 `G:\2718lab\_codex\.codex-task-temp`，显式根也必须位于 G:。默认 `G:\2718lab\_codex\.codex-task-temp`
 是本机唯一允许的临时根基线。
@@ -210,7 +215,9 @@ fail-closed；Windows apply 在目录创建和 Git 调用期间持有只共享 r
 叶目录已存在就停止。默认 bootstrap 保持 v1；非默认根使用只携带规范根 hash 的
 bootstrap-v2，在 apply 前重算该 hash。该变量是宿主配置，不是 request 或 bootstrap
 plan 可自报的根字段。
-禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C: 或 G: 以外的本机盘符。C-drive temporary roots are forbidden。
+本地 Windows 的 `C:/` 和 `G:/` 以外的本机盘符都禁止作为 `TEMP`、`TMP`、`TMPDIR`
+或临时根；可信 hosted Windows CI 仅可使用宿主提供的 `RUNNER_TEMP`，并在其下派生
+任务临时与缓存路径。该宿主例外不放宽本地规则，也不是外部宿主 embedding 证据。
 这仍是当前 bootstrap/read-context 边界。空项目只能生成 bootstrap-only index：不得据此创建可执行
 assignment，直到可信宿主提供有界项目索引上下文。旧 schema 输入返回
 `FASTLANE_SCHEMA_UPGRADE_REQUIRED`，不得降级猜测或启动工作。

@@ -14,6 +14,25 @@ the independent-review evidence required before the coordinator integrates. -->
 <!-- Scheduler changes record `2718lab-devkit/scheduler-topology-v1` and
 opaque plan/lease/worktree identities. -->
 
+## Commit and evidence binding
+
+- Candidate commit:
+- Base commit:
+- Integration commit:
+- Review evidence (receipt/link and reviewer):
+- Verification evidence (commands, result, and receipt/link):
+
+## Retention, rollback, and cleanup evidence
+
+- Retention strategy and required `x` consecutive post-merge accepted integration rounds:
+- Evidence that every required round was explicitly accepted by the coordinator:
+- No-rollback evidence for those rounds:
+- Fresh host recheck and its receipt/link:
+- Cleanup eligibility/candidate evidence (if any):
+- [ ] I understand that an unverified or merely observed result is not an accepted round.
+- [ ] I understand that a cleanup candidate is eligibility only, not deletion authorization; no automatic deletion is permitted.
+- [ ] If no retention strategy is declared, the candidate/material remains permanently retained.
+
 ## Validation
 
 - [ ] `uv lock --check` passes for every changed Python project.

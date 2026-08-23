@@ -248,6 +248,23 @@ context before continuing. Do not reconstruct authority from chat history,
 raw logs, or an unrelated new start. Archive a completed independent task only
 after evidence, commit, integration, and acceptance have all succeeded.
 
+### Retention and cleanup boundary
+
+Retention is an explicit host policy, not an inference from a successful or
+unverified run. After merge, a host may record `cleanup_candidate` only when the
+declared policy's `x` consecutive post-merge integration rounds have each been
+explicitly accepted by the coordinator, no rollback occurred in those rounds,
+a fresh host recheck is current, and durable evidence contains the candidate,
+base, and integration commits together with the required review, verification,
+and integration receipts. Pending, observed, inferred, or otherwise
+unverified results are not accepted rounds.
+
+`cleanup_candidate` is eligibility evidence only; it is not deletion
+authorization. No component automatically deletes a worktree, cache, receipt,
+evidence, or user data. If no retention strategy is declared, or if any gate
+or evidence is missing, retain the material permanently until an explicit,
+separately authorized cleanup policy exists.
+
 ## Deterministic Fast Lane
 
 The Fast Lane compiler is in

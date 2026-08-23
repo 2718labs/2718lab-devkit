@@ -505,8 +505,19 @@ local roots are forbidden as well. Hosted Windows CI is the explicit
 workflow must require that root and derive all task-local paths below it. This
 host-provided exception is temporary-path policy, not evidence of an external
 host embedding.
-After X unsuccessful rollback rounds, the host may record only
-candidate cleanup eligibility; it does not delete any path automatically.
+
+### Retention and cleanup boundary
+
+After merge, the host may record `cleanup_candidate` only when the declared
+retention policy requires `x` consecutive post-merge integration rounds and all
+`x` rounds have been explicitly accepted by the coordinator, no rollback
+occurred in those rounds, a fresh host recheck is current, and durable evidence
+binds the candidate, base, and integration commits to the required review,
+verification, and integration evidence. An observed, pending, inferred, or
+otherwise unverified result is not an accepted round. The candidate record is
+eligibility evidence only, never deletion authorization; the adapter and host
+must not delete any path automatically. Without a declared retention strategy,
+or with any missing gate/evidence, the material is retained permanently.
 
 ## CLI
 

@@ -213,6 +213,26 @@ receipt 恢复。继续前先重新绑定有效的当前上下文。不得从聊
 日志或无关的新 start 重建权限。独立任务只有在证据、提交、集成和验收
 全部完成后才可归档。
 
+### 留存与清理边界
+
+留存必须是宿主明确声明的策略，不能从成功结果或未经验证的结果推断。
+合并之后，只有在策略规定的连续 `x` 轮后续 integration 均由协调器明确
+接受、这些轮次没有发生 rollback、完成一次新的且仍然有效的 host 重检查，
+并且持久化证据同时具备 candidate、base、integration commit 以及所需的
+review、verification、integration receipt 时，宿主才可记录
+`cleanup_candidate`。pending、仅观察到、推断得到或其他未经验证的结果，
+都不算已接受的轮次。
+
+`cleanup_candidate` 只是可清理候选资格证据，不是删除授权。任何组件都绝不
+自动删除 worktree、cache、receipt、evidence 或用户数据。没有留存策略，或
+任一门槛/证据缺失时，相关材料必须永久保留，直到另有明确且独立授权的清理
+策略。
+
+本地 Windows 的 `C:/` 和所有非 `G:/` 临时根、worktree、cache、evidence
+路径都禁止使用；可信 hosted Windows CI 仅可把宿主提供的 `RUNNER_TEMP`
+作为明确例外，并在其下派生所有任务临时/缓存路径。该例外不构成外部宿主
+embedding 或本地路径放宽的证据。
+
 ## 确定性 Fast Lane
 
 Fast Lane 编译器位于
