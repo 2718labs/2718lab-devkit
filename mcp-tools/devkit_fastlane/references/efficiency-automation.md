@@ -37,6 +37,12 @@ bootstrap-v1, while a non-default root is bound by a canonical hash in
 bootstrap-v2. A changed configuration fails diagnostic revalidation; this
 repository does not launch Git for bootstrap execution.
 
+For hosted Windows CI, `RUNNER_TEMP` is the explicit host-provided exception:
+the workflow must require it and derive `CODEX_TASK_TEMP`, `TEMP`, `TMP`,
+`TMPDIR`, `PYTHONPYCACHEPREFIX`, and `UV_CACHE_DIR` below that root. This
+exception is not the local default and does not establish an external host
+embedding.
+
 The default output is a canonical dry-run plan. Its canonical worktree vector
 is:
 
@@ -64,6 +70,10 @@ An older bootstrap or routing schema is rejected as
 `FASTLANE_SCHEMA_UPGRADE_REQUIRED`; it is never normalized into an executable
 plan. An empty project may produce bootstrap-only index diagnostics, but cannot
 produce an assignment until trusted host index context is available.
+
+The `RuntimeRoot` host-private V2/V3 bootstrap path is covered with injected
+test doubles only. That coverage does not prove an external host embedding or
+an operational/host-integrated GO.
 
 ## Resume, status, contracts, and cache metadata
 
@@ -489,7 +499,12 @@ The adapter never archives work. The host may archive only after coordinator-lan
 worktrees, ordinary caches, test evidence, and read worktrees must remain below
 the declared project root derived from trusted `CODEX_FASTLANE_TASK_ROOT` (or
 the local `G:\2718lab\_codex\.codex-task-temp` default). This remains the 当前 bootstrap/read-context boundary.
-C-drive temporary roots are forbidden; non-G-drive local temporary roots are forbidden.
+For ordinary local runs, C-drive temporary roots are forbidden; non-G-drive
+local roots are forbidden as well. Hosted Windows CI is the explicit
+`RUNNER_TEMP` exception: its
+workflow must require that root and derive all task-local paths below it. This
+host-provided exception is temporary-path policy, not evidence of an external
+host embedding.
 After X unsuccessful rollback rounds, the host may record only
 candidate cleanup eligibility; it does not delete any path automatically.
 

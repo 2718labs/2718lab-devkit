@@ -53,7 +53,9 @@ execution remains an external Desktop-host bridge requirement.
 - Fast Lane is a pure MCP runtime compiler. Its public surface is presently
   authority-inert and fail-closed: it emits no assignments and never spawns
   agents, edits Git, runs commands, or executes worktrees. Host execution is
-  reserved for a future external Desktop-host bridge contract.
+  reserved for a future external Desktop-host bridge contract. The RuntimeRoot
+  host-private V2/V3 bootstrap path is covered with injected test doubles only;
+  no external host embedding or operational/host-integrated GO is claimed.
 
 ## Module overview
 
@@ -235,7 +237,10 @@ For local DevKit work, set CODEX_TASK_TEMP and its TMPDIR/TEMP/TMP/
 PYTHONPYCACHEPREFIX children under an isolated G: task root. A configured
 scratch base receives the same scope suffix as durable data. The runtime rejects
 unsafe, overlapping, missing, or reparse-point roots and does not write fallback
-state into the repository.
+state into the repository. Hosted Windows CI is the explicit exception: its
+workflow must require RUNNER_TEMP and derive CODEX_TASK_TEMP plus all task-local
+temporary/cache children below it. That host-provided exception does not prove
+an external host embedding.
 
 After a host interruption, resume from the durable workflow lease, endpoint,
 artifact references, snapshots, and bounded receipts. Rebind a valid current

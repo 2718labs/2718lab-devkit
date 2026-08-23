@@ -13,12 +13,11 @@ def test_server_card_temp_and_cache_environment_stays_under_task_root() -> None:
 
     assert configured_task_root.is_absolute()
     task_root = configured_task_root.resolve()
-    if os.name == "nt":
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    if runner_temp:
+        assert task_root.is_relative_to(Path(runner_temp).resolve())
+    elif os.name == "nt":
         assert task_root.drive.casefold() == "g:"
-    else:
-        runner_temp = os.environ.get("RUNNER_TEMP")
-        if runner_temp:
-            assert task_root.is_relative_to(Path(runner_temp).resolve())
 
     for name in (
         "CODEX_TASK_TEMP",
@@ -68,5 +67,8 @@ def test_hosted_workflows_and_fast_lane_docs_preserve_temp_root_boundary() -> No
         "当前 bootstrap/read-context",
         "默认 `G:\\2718lab\\_codex\\.codex-task-temp`",
         "C-drive temporary roots are forbidden",
+        "RUNNER_TEMP",
+        "host-private V2/V3 bootstrap",
+        "external host embedding",
     ):
         assert any(required in document for document in documents), required

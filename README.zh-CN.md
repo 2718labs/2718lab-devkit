@@ -41,6 +41,8 @@ worktree 执行路径。宿主执行属于未来外部 Desktop-host bridge 合�
 - Fast Lane 是 MCP runtime 中的纯本地编译器。其公共面当前没有调度权限并且
   fail-closed：不会产生 assignment，也不会 spawn agent、修改 Git、运行命令或
   执行 worktree。宿主执行预留给未来的外部 Desktop-host bridge 合同。
+  RuntimeRoot 的 host-private V2/V3 bootstrap 仅由注入的测试替身覆盖；
+  没有 external host embedding 实证，也不声称 operational/host-integrated GO。
 
 ## 核心模块速览
 
@@ -201,8 +203,10 @@ CODEX_PROJECT_ID、CODEX_WORKSPACE_ID 或 CODEX_THREAD_ID 会提供非路径的
 
 本机 DevKit 工作必须把 CODEX_TASK_TEMP 以及 TMPDIR/TEMP/TMP/
 PYTHONPYCACHEPREFIX 子路径放在隔离的 G: 盘任务根。已配置的临时根会获得与持久化
-数据相同的范围后缀。运行时会拒绝不安全、重叠、缺失或 reparse-point 根目录，
-不会把回退状态写入仓库。
+数据相同的范围后缀。Hosted Windows CI 是明确例外：工作流必须先要求
+RUNNER_TEMP，再把 CODEX_TASK_TEMP 及所有任务临时/缓存子路径派生到其下。
+该宿主提供的临时根例外不构成 external host embedding 实证。运行时会拒绝
+不安全、重叠、缺失或 reparse-point 根目录，不会把回退状态写入仓库。
 
 宿主中断后，应从持久化工作流租约、端点、artifact 引用、快照和有界
 receipt 恢复。继续前先重新绑定有效的当前上下文。不得从聊天记录、原始

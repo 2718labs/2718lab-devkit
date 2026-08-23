@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_relay.compiler import RelayPlanError
+from devkit_runtime.composition import RuntimeRoot
+from devkit_runtime.config import RuntimeConfig
 from devkit_runtime.relay_runtime import (
     ProductionRegistryResolver,
     ProjectIndexBootstrapTransport,
@@ -67,6 +70,66 @@ def _binding(**attestation_changes: object) -> dict[str, object]:
     }
     binding["binding_hash"] = _canonical_hash(binding)
     return binding
+
+
+def _task(task_id: str, *, scope: str | None = None) -> dict[str, object]:
+    writer = scope is not None
+    return {
+        "task_id": task_id,
+        "kind": "implementation" if writer else "prewarm",
+        "stage": "a1_writer" if writer else "a3_prewarm",
+        "title": task_id,
+        "objective": task_id,
+        "priority": 50,
+        "dependencies": [],
+        "write_scope": [{"path": scope, "kind": "file"}] if scope else [],
+        "route": {
+            "route_class": "terra_high" if writer else "luna_medium",
+            "model": "gpt-5.6-terra" if writer else "gpt-5.6-luna",
+            "reasoning_effort": "high" if writer else "medium",
+        },
+        "constraints": [],
+        "acceptance_criteria": [],
+        "atlas_packet_ids": [],
+        "required_evidence": [],
+        "design_for_task_id": None,
+        "prewarm_for_task_id": "writer-a" if not writer else None,
+        "retry_policy": {"max_attempts": 1, "retryable_codes": []},
+        "split_policy": None,
+        "split_parent_task_id": None,
+        "split_depth": 0,
+        "split_verdict": None,
+    }
+
+
+def _v3_request() -> dict[str, object]:
+    binding = _binding()
+    attestation = binding["attestation"]
+    assert isinstance(attestation, dict)
+    return {
+        "schema": "2718lab-devkit/relay-compile-request-v3",
+        "workflow_id": binding["workflow_id"],
+        "workspace_id": binding["workspace_id"],
+        "input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "base_commit": "a" * 40,
+        "capacity": 1,
+        "project_binding": binding,
+        "scheduler_topology": {
+            "schema": "2718lab-devkit/scheduler-topology-v1",
+            "max_writers_per_scheduler": 3,
+            "max_parallel_writers": 9,
+            "groups": [
+                {
+                    "scheduler_id": "sha256:" + "8" * 64,
+                    "coordinator_lease_id": "sha256:" + "9" * 64,
+                    "worktree_identity": "sha256:" + "b" * 64,
+                    "writer_task_ids": ["writer-a"],
+                    "prewarm_task_ids": ["prewarm-a"],
+                }
+            ],
+        },
+        "tasks": [_task("writer-a", scope="src/a.py"), _task("prewarm-a")],
+    }
 
 
 def _resolver(*, capability_valid: bool = True) -> ProductionRegistryResolver:
@@ -170,6 +233,66 @@ class _HostOperations:
             }
         )
         return result
+
+
+class _RuntimeBootstrapAuthority:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.verified: list[str] = []
+
+    def verify_bootstrap_capability(self, attestation: Mapping[str, object]) -> bool:
+        self.verified.append(str(attestation["attestation_hash"]))
+        return True
+
+    def resolve_bootstrap_root(
+        self, *, bootstrap_root_identity: str, attestation_hash: str
+    ) -> str:
+        self.calls.append((bootstrap_root_identity, attestation_hash))
+        return "G:/host-private/new-project"
+
+
+class _RuntimeProjectIndex:
+    def __init__(self, binding: dict[str, object]) -> None:
+        self.binding = binding
+        attestation = binding["attestation"]
+        assert isinstance(attestation, dict)
+        self.initial_manifest_hash = attestation["initial_manifest_hash"]
+        self.calls: list[tuple[str, str]] = []
+        self.current_snapshot_id: str | None = None
+
+    def project_index_register(self, root: str) -> str:
+        self.calls.append(("project_index_register", root))
+        return str(self.binding["workspace_id"])
+
+    def sync(self, workspace_id: str) -> object:
+        self.calls.append(("project_index_sync", workspace_id))
+        self.current_snapshot_id = "sha256:" + "8" * 64
+        return SimpleNamespace(
+            workspace_id=workspace_id,
+            manifest_hash=self.initial_manifest_hash,
+            file_count=0,
+            snapshot_id=self.current_snapshot_id,
+        )
+
+    def assert_current(self, workspace_id: str, snapshot_id: str) -> None:
+        if (
+            workspace_id != self.binding["workspace_id"]
+            or snapshot_id != self.current_snapshot_id
+        ):
+            raise RuntimeError("index unavailable")
+
+
+class _RuntimeBootstrapUow:
+    def __init__(self, project_index: _RuntimeProjectIndex) -> None:
+        self.project_checkpoint = SimpleNamespace(project_index=project_index)
+        self.atlas_store = SimpleNamespace(get_packet_verified=lambda _packet: None)
+        self.closed = False
+
+    def __enter__(self) -> _RuntimeBootstrapUow:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.closed = True
 
 
 def test_bootstrap_transport_runs_only_register_then_sync_and_binds_receipt() -> None:
@@ -280,55 +403,59 @@ def test_recompile_validation_rejects_hash_only_mismatched_stale_or_unknown_inpu
     assert unknown_receipt.value.code == "BOOTSTRAP_RECEIPT_INVALID"
 
 
-def test_server_bootstrap_transport_resolves_one_root_and_uses_existing_operations() -> None:
-    from server import _run_project_index_bootstrap_transport
+@pytest.mark.parametrize(
+    "schema",
+    (
+        "2718lab-devkit/relay-compile-request-v2",
+        "2718lab-devkit/relay-compile-request-v3",
+    ),
+)
+def test_runtime_root_bootstrap_chain_resolves_one_root_and_recompiles(
+    tmp_path: Path, schema: str
+) -> None:
+    binding = _binding()
+    request = _v3_request()
+    if schema.endswith("-v2"):
+        request["schema"] = schema
+        request.pop("scheduler_topology")
 
-    binding = _resolver().resolve_new_empty_bootstrap(_binding())
-
-    class RootResolver:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
-
-        def resolve_bootstrap_root(
-            self, *, bootstrap_root_identity: str, attestation_hash: str
-        ) -> str:
-            self.calls.append((bootstrap_root_identity, attestation_hash))
-            return "G:/host-private/new-project"
-
-    class ProjectIndex:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
-
-        def project_index_register(self, root: str) -> str:
-            self.calls.append(("project_index_register", root))
-            return str(binding["workspace_id"])
-
-        def sync(self, workspace_id: str) -> object:
-            self.calls.append(("project_index_sync", workspace_id))
-            return SimpleNamespace(
-                workspace_id=workspace_id,
-                manifest_hash=binding["initial_manifest_hash"],
-                file_count=0,
-                snapshot_id="sha256:" + "8" * 64,
-            )
-
-    roots = RootResolver()
-    index = ProjectIndex()
-    receipt = _run_project_index_bootstrap_transport(
-        binding,
-        root_resolver=roots,
-        project_index=index,
-        clock=lambda: _NOW,
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    authority = _RuntimeBootstrapAuthority()
+    project_index = _RuntimeProjectIndex(binding)
+    uow = _RuntimeBootstrapUow(project_index)
+    root = RuntimeRoot(
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "data"),
+                "CODEX_TASK_TEMP": str(scratch),
+            }
+        ),
+        uow_factory=lambda **_kwargs: uow,
+        host_bootstrap_authority=authority,
     )
 
-    assert roots.calls == [
-        (binding["bootstrap_root_identity"], binding["attestation_hash"])
+    plan = root.host_relay_bootstrap().compile(request, clock=lambda: _NOW)
+
+    attestation = binding["attestation"]
+    assert isinstance(attestation, dict)
+    assert authority.calls == [
+        (attestation["bootstrap_root_identity"], attestation["attestation_hash"])
     ]
-    assert index.calls == [
+    assert authority.verified
+    assert project_index.calls == [
         ("project_index_register", "G:/host-private/new-project"),
         ("project_index_sync", binding["workspace_id"]),
     ]
-    assert receipt["workspace_id"] == binding["workspace_id"]
+    assert uow.closed is True
+    assert plan["schema"] == schema.replace("compile-request", "plan")
+    indexed_binding = plan["project_binding"]
+    assert isinstance(indexed_binding, dict)
+    assert indexed_binding["mode"] == "indexed"
+    receipt = indexed_binding["bootstrap_receipt"]
+    assert isinstance(receipt, dict)
+    assert receipt["index_snapshot_id"] == "sha256:" + "8" * 64
+    assert "G:/host-private/new-project" not in repr(plan)
 
 
 @pytest.mark.parametrize("failure", ["register", "sync"])
