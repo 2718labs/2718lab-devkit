@@ -936,10 +936,65 @@ def test_service_starts_disjoint_v2_a1_a2_a3_stages_without_granting_design_a_wr
                     "prewarm_for_task_id": "writer",
                 }
             )
+    binding = compiled["workspace_binding"]
+    assert isinstance(binding, dict)
+    workspace_id = binding["workspace_id"]
+    input_snapshot_id = binding["input_snapshot_id"]
+    attestation: dict[str, object] = {
+        "schema": "2718lab-devkit/new-project-bootstrap-attestation-v1",
+        "workflow_id": compiled["workflow_id"],
+        "workspace_id": workspace_id,
+        "repository_id": "sha256:" + "1" * 64,
+        "project_id": "sha256:" + "2" * 64,
+        "bootstrap_root_identity": "sha256:" + "3" * 64,
+        "initial_manifest_hash": "sha256:" + "4" * 64,
+        "initial_entry_count": 0,
+        "state": "new_empty",
+        "capability_epoch": 1,
+        "capability_hash": "sha256:" + "5" * 64,
+        "attested_input_snapshot_id": "sha256:" + "6" * 64,
+        "issued_at": 1_700_000_000,
+        "expires_at": 1_700_000_060,
+    }
+    attestation["attestation_hash"] = canonical_hash(attestation)
+    bootstrap_binding: dict[str, object] = {
+        "schema": "2718lab-devkit/project-binding-v1",
+        "mode": "new_empty_bootstrap",
+        "workflow_id": compiled["workflow_id"],
+        "workspace_id": workspace_id,
+        "repository_id": attestation["repository_id"],
+        "project_id": attestation["project_id"],
+        "bootstrap_root_identity": attestation["bootstrap_root_identity"],
+        "attestation": attestation,
+    }
+    bootstrap_binding["binding_hash"] = canonical_hash(bootstrap_binding)
+    receipt: dict[str, object] = {
+        "schema": "2718lab-devkit/project-index-bootstrap-receipt-v1",
+        "attestation_hash": attestation["attestation_hash"],
+        "workspace_id": workspace_id,
+        "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "initial_manifest_hash": attestation["initial_manifest_hash"],
+        "index_snapshot_id": input_snapshot_id,
+        "index_identity": canonical_hash(
+            {
+                "workspace_id": workspace_id,
+                "attested_input_snapshot_id": attestation[
+                    "attested_input_snapshot_id"
+                ],
+                "initial_manifest_hash": attestation["initial_manifest_hash"],
+                "index_snapshot_id": input_snapshot_id,
+            }
+        ),
+        "issued_at": 1_700_000_001,
+        "expires_at": 1_700_000_060,
+    }
+    receipt["receipt_hash"] = canonical_hash(receipt)
     compiled["schema"] = "2718lab-devkit/relay-plan-v2"
     compiled["project_binding"] = {
         "schema": "2718lab-devkit/project-binding-v1",
         "mode": "indexed",
+        "bootstrap_binding": bootstrap_binding,
+        "bootstrap_receipt": receipt,
     }
     compiled["queues"] = {
         "writer_ready": ["writer"],

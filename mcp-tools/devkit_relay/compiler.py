@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
+from math import isfinite
 from pathlib import PurePosixPath
 from typing import Any, Protocol
 
@@ -32,6 +33,9 @@ _REQUEST_FIELDS = frozenset(
     }
 )
 _REQUEST_FIELDS_V2 = _REQUEST_FIELDS | frozenset({"project_binding"})
+_REQUEST_FIELDS_V2_RECOMPILE = _REQUEST_FIELDS_V2 | frozenset(
+    {"bootstrap_receipt"}
+)
 _TASK_FIELDS = frozenset(
     {
         "task_id",
@@ -76,25 +80,82 @@ _BINDING_FIELDS = frozenset(
     }
 )
 _PROJECT_BINDING_FIELDS = frozenset({"schema", "mode"})
-_PROJECT_INDEXED_RECEIPT_FIELDS = _PROJECT_BINDING_FIELDS | frozenset(
-    {"bootstrap_receipt"}
+_PROJECT_BOOTSTRAP_BINDING_FIELDS = frozenset(
+    {
+        "schema",
+        "mode",
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+        "attestation",
+        "binding_hash",
+    }
 )
-_SPLIT_POLICY_FIELDS = frozenset({"mode", "max_depth", "child_scopes"})
-_BOOTSTRAP_BINDING_FIELDS = frozenset(
+_BOOTSTRAP_ATTESTATION_FIELDS = frozenset(
     {
         "schema",
         "workflow_id",
         "workspace_id",
-        "input_snapshot_id",
-        "atlas_packet_ids",
-        "current",
-        "root_identity",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
         "initial_manifest_hash",
-        "entry_count",
+        "initial_entry_count",
+        "state",
         "capability_epoch",
+        "capability_hash",
+        "attested_input_snapshot_id",
+        "issued_at",
+        "expires_at",
         "attestation_hash",
     }
 )
+_BOOTSTRAP_REGISTRY_BINDING_FIELDS = frozenset(
+    {
+        "schema",
+        "mode",
+        "bootstrap_only",
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+        "initial_manifest_hash",
+        "initial_entry_count",
+        "capability_epoch",
+        "capability_hash",
+        "attested_input_snapshot_id",
+        "issued_at",
+        "expires_at",
+        "attestation_hash",
+        "binding_hash",
+    }
+)
+_BOOTSTRAP_RECEIPT_FIELDS = frozenset(
+    {
+        "schema",
+        "attestation_hash",
+        "workspace_id",
+        "attested_input_snapshot_id",
+        "initial_manifest_hash",
+        "index_snapshot_id",
+        "index_identity",
+        "issued_at",
+        "expires_at",
+        "receipt_hash",
+    }
+)
+_RECOMPILED_PROJECT_BINDING_FIELDS = frozenset(
+    {
+        "schema",
+        "mode",
+        "bootstrap_binding",
+        "bootstrap_receipt",
+    }
+)
+_SPLIT_POLICY_FIELDS = frozenset({"mode", "max_depth", "child_scopes"})
 
 _ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _HASH = re.compile(r"sha256:[0-9a-f]{64}")
@@ -959,106 +1020,228 @@ def _bootstrap_workspace_binding(
     workflow_id: str,
     workspace_id: str,
     input_snapshot_id: str,
-    atlas_packet_ids: tuple[str, ...],
+    project_binding: object,
 ) -> dict[str, object]:
-    binding = _resolver_value(
-        resolver,
+    binding, attestation = _new_empty_project_binding(
+        project_binding,
         workflow_id=workflow_id,
         workspace_id=workspace_id,
         input_snapshot_id=input_snapshot_id,
-        atlas_packet_ids=atlas_packet_ids,
     )
-    if type(binding) is not dict or set(binding) != _BOOTSTRAP_BINDING_FIELDS:
+    if resolver is None:
         raise RelayPlanError("bootstrap_attestation_required")
+    try:
+        resolve = getattr(resolver, "resolve_new_empty_bootstrap")
+        if not callable(resolve):
+            raise RelayPlanError("bootstrap_attestation_required")
+        registry_binding = resolve(binding)
+    except RelayPlanError:
+        raise
+    except Exception as exc:
+        raise RelayPlanError("bootstrap_attestation_required") from exc
+    return _bootstrap_registry_binding(registry_binding, attestation=attestation)
+
+
+def _new_empty_project_binding(
+    value: object,
+    *,
+    workflow_id: str,
+    workspace_id: str,
+    input_snapshot_id: str | None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Validate the exact Task 2 project-binding-v1 without importing runtime."""
+
+    binding = _exact_fields(
+        value, _PROJECT_BOOTSTRAP_BINDING_FIELDS, "bootstrap_attestation_required"
+    )
     if (
-        binding["schema"]
-        != "2718lab-devkit/new-project-bootstrap-attestation-v1"
-        or binding["current"] is not True
+        binding["schema"] != "2718lab-devkit/project-binding-v1"
+        or binding["mode"] != "new_empty_bootstrap"
         or binding["workflow_id"] != workflow_id
         or binding["workspace_id"] != workspace_id
-        or binding["input_snapshot_id"] != input_snapshot_id
-        or type(binding["entry_count"]) is not int
-        or binding["entry_count"] != 0
-        or type(binding["capability_epoch"]) is not int
-        or binding["capability_epoch"] < 1
+        or not _hash_matches(binding, "binding_hash")
     ):
-        raise RelayPlanError("bootstrap_attestation_stale")
-    try:
-        packets = _hash_list(binding["atlas_packet_ids"], "bootstrap_attestation")
-        root_identity = _hash_identifier(
-            binding["root_identity"], "bootstrap_attestation"
+        raise RelayPlanError("bootstrap_attestation_required")
+    attestation = _exact_fields(
+        binding["attestation"],
+        _BOOTSTRAP_ATTESTATION_FIELDS,
+        "bootstrap_attestation_required",
+    )
+    identity_fields = (
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+    )
+    if (
+        attestation["schema"]
+        != "2718lab-devkit/new-project-bootstrap-attestation-v1"
+        or any(binding[field] != attestation[field] for field in identity_fields)
+        or not _hash_matches(attestation, "attestation_hash")
+        or any(
+            not _is_hash(attestation[field])
+            for field in (
+                "workspace_id",
+                "repository_id",
+                "project_id",
+                "bootstrap_root_identity",
+                "initial_manifest_hash",
+                "capability_hash",
+                "attested_input_snapshot_id",
+            )
         )
-        manifest_hash = _hash_identifier(
-            binding["initial_manifest_hash"], "bootstrap_attestation"
+        or attestation["state"] != "new_empty"
+        or type(attestation["initial_entry_count"]) is not int
+        or attestation["initial_entry_count"] != 0
+        or type(attestation["capability_epoch"]) is not int
+        or attestation["capability_epoch"] < 1
+        or not _finite_timestamp(attestation["issued_at"])
+        or not _finite_timestamp(attestation["expires_at"])
+        or float(attestation["expires_at"]) <= float(attestation["issued_at"])
+        or (
+            input_snapshot_id is not None
+            and attestation["attested_input_snapshot_id"] != input_snapshot_id
         )
-        attestation_hash = _hash_identifier(
-            binding["attestation_hash"], "bootstrap_attestation"
-        )
-    except RelayPlanError as exc:
-        raise RelayPlanError("bootstrap_attestation_required") from exc
-    if not set(atlas_packet_ids) <= set(packets):
-        raise RelayPlanError("bootstrap_attestation_stale")
-    return {
-        "workspace_id": workspace_id,
-        "input_snapshot_id": input_snapshot_id,
-        "atlas_packet_ids": list(atlas_packet_ids),
-        "project_mode": "new_empty_bootstrap",
-        "root_identity": root_identity,
-        "initial_manifest_hash": manifest_hash,
-        "attestation_hash": attestation_hash,
-        "capability_epoch": binding["capability_epoch"],
+    ):
+        raise RelayPlanError("bootstrap_attestation_required")
+    return dict(binding), dict(attestation)
+
+
+def _bootstrap_registry_binding(
+    value: object, *, attestation: Mapping[str, object]
+) -> dict[str, object]:
+    binding = _exact_fields(
+        value, _BOOTSTRAP_REGISTRY_BINDING_FIELDS, "bootstrap_attestation_required"
+    )
+    expected = {
+        "schema": "2718lab-devkit/project-registry-bootstrap-binding-v1",
+        "mode": "new_empty_bootstrap",
+        "bootstrap_only": True,
+        "workflow_id": attestation["workflow_id"],
+        "workspace_id": attestation["workspace_id"],
+        "repository_id": attestation["repository_id"],
+        "project_id": attestation["project_id"],
+        "bootstrap_root_identity": attestation["bootstrap_root_identity"],
+        "initial_manifest_hash": attestation["initial_manifest_hash"],
+        "initial_entry_count": 0,
+        "capability_epoch": attestation["capability_epoch"],
+        "capability_hash": attestation["capability_hash"],
+        "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "issued_at": attestation["issued_at"],
+        "expires_at": attestation["expires_at"],
+        "attestation_hash": attestation["attestation_hash"],
     }
+    if (
+        any(binding[key] != item for key, item in expected.items())
+        or not _hash_matches(binding, "binding_hash")
+    ):
+        raise RelayPlanError("bootstrap_attestation_required")
+    return dict(binding)
 
 
-def _validate_bootstrap_receipt(
+def _validate_bootstrap_recompile(
     resolver: RegistryResolver | RegistryCallback | object | None,
     *,
     workflow_id: str,
     workspace_id: str,
     input_snapshot_id: str,
-    receipt_hash: object,
-) -> str:
+    project_binding: object,
+    receipt: object,
+) -> tuple[dict[str, object], dict[str, object]]:
+    binding, attestation = _new_empty_project_binding(
+        project_binding,
+        workflow_id=workflow_id,
+        workspace_id=workspace_id,
+        input_snapshot_id=None,
+    )
+    requested_receipt = _bootstrap_receipt(receipt)
+    if resolver is None:
+        raise RelayPlanError("bootstrap_receipt_required")
     try:
-        normalized_hash = _hash_identifier(receipt_hash, "bootstrap_receipt_required")
-    except RelayPlanError:
-        raise RelayPlanError("bootstrap_receipt_required") from None
-    try:
-        validate = getattr(resolver, "validate_bootstrap_receipt")
+        validate = getattr(resolver, "validate_bootstrap_recompile")
         if not callable(validate):
             raise RelayPlanError("bootstrap_receipt_required")
-        receipt = validate(
-            workflow_id=workflow_id,
-            workspace_id=workspace_id,
-            input_snapshot_id=input_snapshot_id,
-            receipt_hash=normalized_hash,
+        validated_receipt = validate(
+            project_binding=binding,
+            receipt=requested_receipt,
         )
     except RelayPlanError:
         raise
     except Exception as exc:
         raise RelayPlanError("bootstrap_receipt_required") from exc
-    fields = frozenset(
-        {
-            "schema",
-            "workflow_id",
-            "workspace_id",
-            "input_snapshot_id",
-            "receipt_hash",
-            "current",
-        }
-    )
+    verified_receipt = _bootstrap_receipt(validated_receipt)
     if (
-        type(receipt) is not dict
-        or set(receipt) != fields
-        or receipt["schema"]
-        != "2718lab-devkit/project-index-bootstrap-receipt-v1"
-        or receipt["workflow_id"] != workflow_id
-        or receipt["workspace_id"] != workspace_id
-        or receipt["input_snapshot_id"] != input_snapshot_id
-        or receipt["receipt_hash"] != normalized_hash
-        or receipt["current"] is not True
+        verified_receipt != requested_receipt
+        or verified_receipt["attestation_hash"] != attestation["attestation_hash"]
+        or verified_receipt["workspace_id"] != workspace_id
+        or verified_receipt["attested_input_snapshot_id"]
+        != attestation["attested_input_snapshot_id"]
+        or verified_receipt["initial_manifest_hash"]
+        != attestation["initial_manifest_hash"]
+        or verified_receipt["index_snapshot_id"] != input_snapshot_id
+        or verified_receipt["index_identity"]
+        != canonical_hash(
+            {
+                "workspace_id": verified_receipt["workspace_id"],
+                "attested_input_snapshot_id": verified_receipt[
+                    "attested_input_snapshot_id"
+                ],
+                "initial_manifest_hash": verified_receipt["initial_manifest_hash"],
+                "index_snapshot_id": verified_receipt["index_snapshot_id"],
+            }
+        )
     ):
         raise RelayPlanError("bootstrap_receipt_required")
-    return normalized_hash
+    return binding, verified_receipt
+
+
+def _bootstrap_receipt(value: object) -> dict[str, object]:
+    receipt = _exact_fields(value, _BOOTSTRAP_RECEIPT_FIELDS, "bootstrap_receipt_required")
+    if (
+        receipt["schema"] != "2718lab-devkit/project-index-bootstrap-receipt-v1"
+        or not _hash_matches(receipt, "receipt_hash")
+        or any(
+            not _is_hash(receipt[field])
+            for field in (
+                "attestation_hash",
+                "workspace_id",
+                "attested_input_snapshot_id",
+                "initial_manifest_hash",
+                "index_snapshot_id",
+                "index_identity",
+            )
+        )
+        or not _finite_timestamp(receipt["issued_at"])
+        or not _finite_timestamp(receipt["expires_at"])
+        or float(receipt["expires_at"]) <= float(receipt["issued_at"])
+    ):
+        raise RelayPlanError("bootstrap_receipt_required")
+    return dict(receipt)
+
+
+def _is_hash(value: object) -> bool:
+    return type(value) is str and _HASH.fullmatch(value) is not None
+
+
+def _hash_matches(value: Mapping[str, object], field: str) -> bool:
+    digest = value.get(field)
+    if not _is_hash(digest):
+        return False
+    try:
+        return digest == canonical_hash(
+            {key: item for key, item in value.items() if key != field}
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _finite_timestamp(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and isfinite(float(value))
+    )
 
 
 def _bootstrap_task() -> dict[str, object]:
@@ -1068,7 +1251,6 @@ def _bootstrap_task() -> dict[str, object]:
         "stage": "bootstrap_index",
         "priority": 100,
         "dependencies": [],
-        "write_scope": [],
         "split_parent_task_id": None,
         "split_depth": 0,
         "split_verdict": None,
@@ -1079,7 +1261,12 @@ def _compile_plan_v2(
     request: Mapping[str, Any],
     registry_resolver: RegistryResolver | RegistryCallback | object | None,
 ) -> dict[str, Any]:
-    _exact_fields(request, _REQUEST_FIELDS_V2, "unknown_request_fields")
+    request_fields = (
+        _REQUEST_FIELDS_V2_RECOMPILE
+        if "bootstrap_receipt" in request
+        else _REQUEST_FIELDS_V2
+    )
+    _exact_fields(request, request_fields, "unknown_request_fields")
     workflow_id = _identifier(request["workflow_id"], "invalid_workflow_id")
     workspace_id = _hash_identifier(request["workspace_id"], "invalid_workspace_id")
     input_snapshot_id = _hash_identifier(
@@ -1093,23 +1280,21 @@ def _compile_plan_v2(
         raise RelayPlanError("invalid_tasks")
     if len(request["tasks"]) > _MAX_TASKS:
         raise RelayPlanError("too_many_tasks")
-    project_binding = request["project_binding"]
-    if type(project_binding) is not dict:
+    raw_project_binding = request["project_binding"]
+    if type(raw_project_binding) is not dict:
         raise RelayPlanError("invalid_project_binding")
-    mode = project_binding.get("mode")
-    expected_binding_fields = (
-        _PROJECT_BINDING_FIELDS
-        if mode == "new_empty_bootstrap"
-        else _PROJECT_BINDING_FIELDS
-        if mode == "indexed" and set(project_binding) == _PROJECT_BINDING_FIELDS
-        else _PROJECT_INDEXED_RECEIPT_FIELDS
-    )
-    project_binding = _exact_fields(
-        project_binding, expected_binding_fields, "invalid_project_binding"
-    )
-    if project_binding["schema"] != "2718lab-devkit/project-binding-v1":
+    mode = raw_project_binding.get("mode")
+    if mode == "indexed":
+        project_binding = _exact_fields(
+            raw_project_binding, _PROJECT_BINDING_FIELDS, "invalid_project_binding"
+        )
+        if "bootstrap_receipt" in request:
+            raise RelayPlanError("bootstrap_recompile_binding_required")
+    elif mode == "new_empty_bootstrap":
+        project_binding = raw_project_binding
+    else:
         raise RelayPlanError("invalid_project_binding")
-    if mode not in {"indexed", "new_empty_bootstrap"}:
+    if project_binding.get("schema") != "2718lab-devkit/project-binding-v1":
         raise RelayPlanError("invalid_project_binding")
     tasks = sorted(
         (_normalize_task_v2(item) for item in request["tasks"]),
@@ -1120,16 +1305,7 @@ def _compile_plan_v2(
     atlas_packet_ids = tuple(
         sorted({packet for task in tasks for packet in task["atlas_packet_ids"]})
     )
-    bootstrap_receipt = None
     if mode == "indexed":
-        if "bootstrap_receipt" in project_binding:
-            bootstrap_receipt = _validate_bootstrap_receipt(
-                registry_resolver,
-                workflow_id=workflow_id,
-                workspace_id=workspace_id,
-                input_snapshot_id=input_snapshot_id,
-                receipt_hash=project_binding["bootstrap_receipt"],
-            )
         workspace_binding = _registry_binding(
             registry_resolver,
             workflow_id=workflow_id,
@@ -1139,17 +1315,44 @@ def _compile_plan_v2(
         )
         tasks, conflicts, unsplittable = resolve_write_scope_conflicts(tasks)
         bootstrap = False
+        planned_project_binding: dict[str, object] = dict(project_binding)
     else:
-        workspace_binding = _bootstrap_workspace_binding(
-            registry_resolver,
-            workflow_id=workflow_id,
-            workspace_id=workspace_id,
-            input_snapshot_id=input_snapshot_id,
-            atlas_packet_ids=atlas_packet_ids,
-        )
-        conflicts = []
-        unsplittable = []
-        bootstrap = True
+        if "bootstrap_receipt" in request:
+            bootstrap_binding, bootstrap_receipt = _validate_bootstrap_recompile(
+                registry_resolver,
+                workflow_id=workflow_id,
+                workspace_id=workspace_id,
+                input_snapshot_id=input_snapshot_id,
+                project_binding=project_binding,
+                receipt=request["bootstrap_receipt"],
+            )
+            workspace_binding = _registry_binding(
+                registry_resolver,
+                workflow_id=workflow_id,
+                workspace_id=workspace_id,
+                input_snapshot_id=input_snapshot_id,
+                atlas_packet_ids=atlas_packet_ids,
+            )
+            tasks, conflicts, unsplittable = resolve_write_scope_conflicts(tasks)
+            bootstrap = False
+            planned_project_binding = {
+                "schema": "2718lab-devkit/project-binding-v1",
+                "mode": "indexed",
+                "bootstrap_binding": bootstrap_binding,
+                "bootstrap_receipt": bootstrap_receipt,
+            }
+        else:
+            workspace_binding = _bootstrap_workspace_binding(
+                registry_resolver,
+                workflow_id=workflow_id,
+                workspace_id=workspace_id,
+                input_snapshot_id=input_snapshot_id,
+                project_binding=project_binding,
+            )
+            conflicts = []
+            unsplittable = []
+            bootstrap = True
+            planned_project_binding = dict(project_binding)
     plan_tasks: list[dict[str, Any] | dict[str, object]] = list(tasks)
     if bootstrap:
         plan_tasks.append(_bootstrap_task())
@@ -1157,15 +1360,7 @@ def _compile_plan_v2(
         "schema": _PLAN_SCHEMA_V2,
         "workflow_id": workflow_id,
         "workspace_binding": workspace_binding,
-        "project_binding": {
-            "schema": "2718lab-devkit/project-binding-v1",
-            "mode": mode,
-            **(
-                {"bootstrap_receipt": bootstrap_receipt}
-                if bootstrap_receipt is not None
-                else {}
-            ),
-        },
+        "project_binding": planned_project_binding,
         "base_commit": base_commit,
         "capacity": capacity,
         "runtime_policy_id": _RUNTIME_POLICY_ID,

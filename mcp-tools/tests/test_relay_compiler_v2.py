@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from devkit_relay.canonical import canonical_hash
 from devkit_relay.compiler import RelayPlanError, compile_plan
 
 
@@ -659,41 +660,132 @@ def test_v3_rejects_unbounded_rich_contract_lists(field: str, code: str) -> None
         compile_plan(request, registry_resolver=RegistryResolver())
 
 
+_V2_WORKSPACE_ID = "sha256:" + "d" * 64
+_V2_ATTESTED_SNAPSHOT_ID = "sha256:" + "b" * 64
+_V2_INDEX_SNAPSHOT_ID = "sha256:" + "8" * 64
+
+
+def _new_empty_project_binding(
+    *,
+    attested_snapshot_id: str = _V2_ATTESTED_SNAPSHOT_ID,
+) -> dict[str, object]:
+    """Build Task 2's exact project-binding-v1 with its nested attestation."""
+
+    attestation: dict[str, object] = {
+        "schema": "2718lab-devkit/new-project-bootstrap-attestation-v1",
+        "workflow_id": "relay-v2-stages",
+        "workspace_id": _V2_WORKSPACE_ID,
+        "repository_id": "sha256:" + "e" * 64,
+        "project_id": "sha256:" + "f" * 64,
+        "bootstrap_root_identity": "sha256:" + "1" * 64,
+        "initial_manifest_hash": "sha256:" + "2" * 64,
+        "initial_entry_count": 0,
+        "state": "new_empty",
+        "capability_epoch": 7,
+        "capability_hash": "sha256:" + "3" * 64,
+        "attested_input_snapshot_id": attested_snapshot_id,
+        "issued_at": 1_700_000_000,
+        "expires_at": 1_700_000_060,
+    }
+    attestation["attestation_hash"] = canonical_hash(attestation)
+    binding: dict[str, object] = {
+        "schema": "2718lab-devkit/project-binding-v1",
+        "mode": "new_empty_bootstrap",
+        "workflow_id": attestation["workflow_id"],
+        "workspace_id": attestation["workspace_id"],
+        "repository_id": attestation["repository_id"],
+        "project_id": attestation["project_id"],
+        "bootstrap_root_identity": attestation["bootstrap_root_identity"],
+        "attestation": attestation,
+    }
+    binding["binding_hash"] = canonical_hash(binding)
+    return binding
+
+
+def _bootstrap_registry_binding(project_binding: dict[str, object]) -> dict[str, object]:
+    attestation = project_binding["attestation"]
+    assert isinstance(attestation, dict)
+    binding: dict[str, object] = {
+        "schema": "2718lab-devkit/project-registry-bootstrap-binding-v1",
+        "mode": "new_empty_bootstrap",
+        "bootstrap_only": True,
+        "workflow_id": attestation["workflow_id"],
+        "workspace_id": attestation["workspace_id"],
+        "repository_id": attestation["repository_id"],
+        "project_id": attestation["project_id"],
+        "bootstrap_root_identity": attestation["bootstrap_root_identity"],
+        "initial_manifest_hash": attestation["initial_manifest_hash"],
+        "initial_entry_count": 0,
+        "capability_epoch": attestation["capability_epoch"],
+        "capability_hash": attestation["capability_hash"],
+        "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "issued_at": attestation["issued_at"],
+        "expires_at": attestation["expires_at"],
+        "attestation_hash": attestation["attestation_hash"],
+    }
+    binding["binding_hash"] = canonical_hash(binding)
+    return binding
+
+
+def _bootstrap_receipt(
+    project_binding: dict[str, object],
+    *,
+    index_snapshot_id: str = _V2_INDEX_SNAPSHOT_ID,
+) -> dict[str, object]:
+    attestation = project_binding["attestation"]
+    assert isinstance(attestation, dict)
+    receipt: dict[str, object] = {
+        "schema": "2718lab-devkit/project-index-bootstrap-receipt-v1",
+        "attestation_hash": attestation["attestation_hash"],
+        "workspace_id": attestation["workspace_id"],
+        "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
+        "initial_manifest_hash": attestation["initial_manifest_hash"],
+        "index_snapshot_id": index_snapshot_id,
+        "index_identity": canonical_hash(
+            {
+                "workspace_id": attestation["workspace_id"],
+                "attested_input_snapshot_id": attestation[
+                    "attested_input_snapshot_id"
+                ],
+                "initial_manifest_hash": attestation["initial_manifest_hash"],
+                "index_snapshot_id": index_snapshot_id,
+            }
+        ),
+        "issued_at": 1_700_000_001,
+        "expires_at": 1_700_000_060,
+    }
+    receipt["receipt_hash"] = canonical_hash(receipt)
+    return receipt
+
+
 class V2RegistryResolver(RegistryResolver):
-    """Task 2's narrow resolver double: indexed or bootstrap-only attestations."""
+    """Task 2's resolver shape, including its bootstrap/recompile boundary."""
 
-    def __init__(self, *, bootstrap: bool = False) -> None:
+    def __init__(self, *, missing_index: bool = False) -> None:
         super().__init__()
-        self.bootstrap = bootstrap
+        self.missing_index = missing_index
+        self.bootstrap_calls: list[dict[str, object]] = []
+        self.recompile_calls: list[tuple[dict[str, object], dict[str, object]]] = []
 
-    def resolve(self, **kwargs: object) -> dict[str, object]:
-        binding = super().resolve(**kwargs)
-        if not self.bootstrap:
-            return binding
-        return {
-            "schema": "2718lab-devkit/new-project-bootstrap-attestation-v1",
-            "workflow_id": binding["workflow_id"],
-            "workspace_id": binding["workspace_id"],
-            "input_snapshot_id": binding["input_snapshot_id"],
-            "atlas_packet_ids": binding["atlas_packet_ids"],
-            "current": True,
-            "root_identity": "sha256:" + "e" * 64,
-            "initial_manifest_hash": "sha256:" + "f" * 64,
-            "entry_count": 0,
-            "capability_epoch": 1,
-            "attestation_hash": "sha256:" + "1" * 64,
-        }
+    def resolve(self, **kwargs: object) -> dict[str, object] | None:
+        if self.missing_index:
+            return None
+        return super().resolve(**kwargs)
 
-    def validate_bootstrap_receipt(self, **kwargs: object) -> dict[str, object]:
-        receipt_hash = kwargs["receipt_hash"]
-        return {
-            "schema": "2718lab-devkit/project-index-bootstrap-receipt-v1",
-            "workflow_id": kwargs["workflow_id"],
-            "workspace_id": kwargs["workspace_id"],
-            "input_snapshot_id": kwargs["input_snapshot_id"],
-            "receipt_hash": receipt_hash,
-            "current": True,
-        }
+    def resolve_new_empty_bootstrap(
+        self, project_binding: dict[str, object]
+    ) -> dict[str, object]:
+        self.bootstrap_calls.append(deepcopy(project_binding))
+        return _bootstrap_registry_binding(project_binding)
+
+    def validate_bootstrap_recompile(
+        self,
+        *,
+        project_binding: dict[str, object],
+        receipt: dict[str, object],
+    ) -> dict[str, object]:
+        self.recompile_calls.append((deepcopy(project_binding), deepcopy(receipt)))
+        return dict(receipt)
 
 
 def _v2_task(
@@ -735,18 +827,23 @@ def _v2_task(
 def _v2_request(
     *tasks: dict[str, object],
     project_binding: dict[str, object] | None = None,
+    bootstrap_receipt: dict[str, object] | None = None,
+    input_snapshot_id: str = _V2_ATTESTED_SNAPSHOT_ID,
 ) -> dict[str, object]:
-    return {
+    request: dict[str, object] = {
         "schema": "2718lab-devkit/relay-compile-request-v2",
         "workflow_id": "relay-v2-stages",
-        "workspace_id": "sha256:" + "d" * 64,
-        "input_snapshot_id": "sha256:" + "b" * 64,
+        "workspace_id": _V2_WORKSPACE_ID,
+        "input_snapshot_id": input_snapshot_id,
         "base_commit": "a" * 40,
         "capacity": 3,
         "project_binding": project_binding
         or {"schema": "2718lab-devkit/project-binding-v1", "mode": "indexed"},
         "tasks": list(tasks),
     }
+    if bootstrap_receipt is not None:
+        request["bootstrap_receipt"] = bootstrap_receipt
+    return request
 
 
 def _luna_medium_route() -> dict[str, str]:
@@ -847,60 +944,130 @@ def test_v2_declared_child_split_strictly_reduces_conflicts_or_is_unsplittable()
 
 
 def test_v2_new_empty_bootstrap_is_the_only_executable_phase() -> None:
+    project_binding = _new_empty_project_binding()
+    resolver = V2RegistryResolver()
     plan = compile_plan(
         _v2_request(
             _v2_task(
                 "writer",
                 write_scope=[{"path": "src/writer.py", "kind": "file"}],
             ),
-            project_binding={
-                "schema": "2718lab-devkit/project-binding-v1",
-                "mode": "new_empty_bootstrap",
-            },
+            project_binding=project_binding,
         ),
-        registry_resolver=V2RegistryResolver(bootstrap=True),
+        registry_resolver=resolver,
     )
 
+    registry_binding = _bootstrap_registry_binding(project_binding)
+    assert set(project_binding) == {
+        "schema",
+        "mode",
+        "workflow_id",
+        "workspace_id",
+        "repository_id",
+        "project_id",
+        "bootstrap_root_identity",
+        "attestation",
+        "binding_hash",
+    }
+    assert project_binding["binding_hash"] == canonical_hash(
+        {key: value for key, value in project_binding.items() if key != "binding_hash"}
+    )
+    assert resolver.bootstrap_calls == [project_binding]
+    assert plan["workspace_binding"] == registry_binding
     assert plan["queues"]["bootstrap_index"] == ["bootstrap-index"]
     assert plan["queues"]["writer_ready"] == []
     bootstrap = next(task for task in plan["tasks"] if task["task_id"] == "bootstrap-index")
     assert bootstrap["kind"] == "bootstrap_index"
-    assert bootstrap["write_scope"] == []
-    assert "route" not in bootstrap
+    assert set(bootstrap).isdisjoint(
+        {"route", "model", "scope", "write_scope", "write_lease", "lease"}
+    )
+
+
+def test_v2_bootstrap_rejects_noncanonical_attestation_without_internal_error() -> None:
+    project_binding = _new_empty_project_binding()
+    attestation = project_binding["attestation"]
+    assert isinstance(attestation, dict)
+    attestation["issued_at"] = float("nan")
+
+    with pytest.raises(RelayPlanError, match="bootstrap_attestation_required"):
+        compile_plan(
+            _v2_request(
+                _v2_task(
+                    "writer",
+                    write_scope=[{"path": "src/writer.py", "kind": "file"}],
+                ),
+                project_binding=project_binding,
+            ),
+            registry_resolver=V2RegistryResolver(),
+        )
 
 
 def test_v2_bootstrap_completion_requires_receipt_backed_recompile() -> None:
+    project_binding = _new_empty_project_binding()
+    receipt = _bootstrap_receipt(project_binding)
+    resolver = V2RegistryResolver()
     bootstrap_request = _v2_request(
         _v2_task(
             "writer",
             write_scope=[{"path": "src/writer.py", "kind": "file"}],
         ),
-        project_binding={
-            "schema": "2718lab-devkit/project-binding-v1",
-            "mode": "new_empty_bootstrap",
-        },
+        project_binding=project_binding,
     )
-    bootstrap = compile_plan(
-        bootstrap_request, registry_resolver=V2RegistryResolver(bootstrap=True)
-    )
+    bootstrap = compile_plan(bootstrap_request, registry_resolver=resolver)
     indexed_request = deepcopy(bootstrap_request)
-    indexed_request["project_binding"] = {
-        "schema": "2718lab-devkit/project-binding-v1",
-        "mode": "indexed",
-        "bootstrap_receipt": "sha256:" + "4" * 64,
-    }
+    indexed_request["input_snapshot_id"] = receipt["index_snapshot_id"]
+    indexed_request["bootstrap_receipt"] = receipt
     indexed = compile_plan(
-        indexed_request, registry_resolver=V2RegistryResolver()
+        indexed_request, registry_resolver=resolver
     )
 
     assert indexed["plan_hash"] != bootstrap["plan_hash"]
+    assert resolver.recompile_calls == [(project_binding, receipt)]
+    assert indexed["project_binding"] == {
+        "schema": "2718lab-devkit/project-binding-v1",
+        "mode": "indexed",
+        "bootstrap_binding": project_binding,
+        "bootstrap_receipt": receipt,
+    }
     assert indexed["queues"]["bootstrap_index"] == []
     assert indexed["queues"]["writer_ready"] == ["writer"]
 
-    missing_receipt = deepcopy(indexed_request)
-    missing_receipt["project_binding"]["bootstrap_receipt"] = None
+    missing_receipt = _v2_request(
+        _v2_task(
+            "writer",
+            write_scope=[{"path": "src/writer.py", "kind": "file"}],
+        ),
+        project_binding=project_binding,
+    )
+    missing = compile_plan(missing_receipt, registry_resolver=V2RegistryResolver())
+    assert missing["queues"]["writer_ready"] == []
+    assert missing["queues"]["bootstrap_index"] == ["bootstrap-index"]
+
+    malformed_receipt = deepcopy(indexed_request)
+    malformed = malformed_receipt["bootstrap_receipt"]
+    assert isinstance(malformed, dict)
+    malformed.pop("receipt_hash")
     with pytest.raises(RelayPlanError, match="bootstrap_receipt_required"):
-        compile_plan(missing_receipt, registry_resolver=V2RegistryResolver())
+        compile_plan(malformed_receipt, registry_resolver=V2RegistryResolver())
+
+
+def test_v2_recompile_rejects_receipt_for_an_ordinary_missing_index() -> None:
+    project_binding = _new_empty_project_binding()
+    receipt = _bootstrap_receipt(project_binding)
+
+    with pytest.raises(RelayPlanError, match="registry_binding_unavailable"):
+        compile_plan(
+            _v2_request(
+                _v2_task(
+                    "writer",
+                    write_scope=[{"path": "src/writer.py", "kind": "file"}],
+                ),
+                project_binding=project_binding,
+                bootstrap_receipt=receipt,
+                input_snapshot_id=_V2_INDEX_SNAPSHOT_ID,
+            ),
+            registry_resolver=V2RegistryResolver(missing_index=True),
+        )
 
 
 def test_v2_design_and_prewarm_evidence_are_snapshot_bound() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping
+from math import isfinite
 from typing import Any
 
 from .canonical import canonical_hash
@@ -117,6 +118,55 @@ class RelayService:
             "terminal",
             "unsplittable",
         }
+    )
+    _PROJECT_BOOTSTRAP_BINDING_FIELDS = frozenset(
+        {
+            "schema",
+            "mode",
+            "workflow_id",
+            "workspace_id",
+            "repository_id",
+            "project_id",
+            "bootstrap_root_identity",
+            "attestation",
+            "binding_hash",
+        }
+    )
+    _BOOTSTRAP_ATTESTATION_FIELDS = frozenset(
+        {
+            "schema",
+            "workflow_id",
+            "workspace_id",
+            "repository_id",
+            "project_id",
+            "bootstrap_root_identity",
+            "initial_manifest_hash",
+            "initial_entry_count",
+            "state",
+            "capability_epoch",
+            "capability_hash",
+            "attested_input_snapshot_id",
+            "issued_at",
+            "expires_at",
+            "attestation_hash",
+        }
+    )
+    _BOOTSTRAP_RECEIPT_FIELDS = frozenset(
+        {
+            "schema",
+            "attestation_hash",
+            "workspace_id",
+            "attested_input_snapshot_id",
+            "initial_manifest_hash",
+            "index_snapshot_id",
+            "index_identity",
+            "issued_at",
+            "expires_at",
+            "receipt_hash",
+        }
+    )
+    _RECOMPILED_PROJECT_BINDING_FIELDS = frozenset(
+        {"schema", "mode", "bootstrap_binding", "bootstrap_receipt"}
     )
     _ROUTES = {
         "terra_high": ("gpt-5.6-terra", "high"),
@@ -578,20 +628,33 @@ class RelayService:
         if set(value) != self._PLAN_FIELDS_V2:
             raise RelayError("RELAY_PLAN_INVALID")
         project_binding = value["project_binding"]
-        if type(project_binding) is not dict or set(project_binding) not in (
-            {"schema", "mode"},
-            {"schema", "mode", "bootstrap_receipt"},
-        ):
+        if type(project_binding) is not dict:
             raise RelayError("RELAY_PLAN_INVALID")
         if (
-            project_binding["schema"] != "2718lab-devkit/project-binding-v1"
-            or project_binding["mode"] != "indexed"
+            project_binding.get("schema")
+            != "2718lab-devkit/project-binding-v1"
+            or project_binding.get("mode") != "indexed"
         ):
             raise RelayError("RELAY_BOOTSTRAP_REQUIRED")
-        if "bootstrap_receipt" in project_binding:
-            self._digest(project_binding["bootstrap_receipt"], plan=True)
+        if set(project_binding) == {"schema", "mode"}:
+            bootstrap_recompile = None
+        elif set(project_binding) == self._RECOMPILED_PROJECT_BINDING_FIELDS:
+            bootstrap_recompile = project_binding
+        else:
+            raise RelayError("RELAY_PLAN_INVALID")
         workflow_id = self._identifier(value["workflow_id"], plan=True)
         binding = self._validated_binding(value["workspace_binding"])
+        bound_workspace_id = self._workspace_id(binding["workspace_id"], plan=True)
+        bound_input_snapshot_id = self._digest(
+            binding["input_snapshot_id"], plan=True
+        )
+        if bootstrap_recompile is not None:
+            self._validated_bootstrap_recompile_binding(
+                bootstrap_recompile,
+                workflow_id=workflow_id,
+                workspace_id=bound_workspace_id,
+                input_snapshot_id=bound_input_snapshot_id,
+            )
         base_commit = self._commit(value["base_commit"], plan=True)
         capacity = value["capacity"]
         if type(capacity) is not int or not 1 <= capacity <= 3:
@@ -658,6 +721,123 @@ class RelayService:
             "tasks": tasks,
             "plan_hash": value["plan_hash"],
         }
+
+    def _validated_bootstrap_recompile_binding(
+        self,
+        value: Mapping[str, object],
+        *,
+        workflow_id: str,
+        workspace_id: str,
+        input_snapshot_id: str,
+    ) -> None:
+        """Reject altered Task 2 bootstrap evidence before a writer can start."""
+
+        bootstrap = value["bootstrap_binding"]
+        receipt = value["bootstrap_receipt"]
+        if (
+            type(bootstrap) is not dict
+            or set(bootstrap) != self._PROJECT_BOOTSTRAP_BINDING_FIELDS
+            or type(receipt) is not dict
+            or set(receipt) != self._BOOTSTRAP_RECEIPT_FIELDS
+            or bootstrap["schema"] != "2718lab-devkit/project-binding-v1"
+            or bootstrap["mode"] != "new_empty_bootstrap"
+            or bootstrap["workflow_id"] != workflow_id
+            or bootstrap["workspace_id"] != workspace_id
+            or not self._canonical_digest_matches(bootstrap, "binding_hash")
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        attestation = bootstrap["attestation"]
+        if (
+            type(attestation) is not dict
+            or set(attestation) != self._BOOTSTRAP_ATTESTATION_FIELDS
+            or attestation["schema"]
+            != "2718lab-devkit/new-project-bootstrap-attestation-v1"
+            or any(
+                bootstrap[field] != attestation[field]
+                for field in (
+                    "workflow_id",
+                    "workspace_id",
+                    "repository_id",
+                    "project_id",
+                    "bootstrap_root_identity",
+                )
+            )
+            or attestation["state"] != "new_empty"
+            or type(attestation["initial_entry_count"]) is not int
+            or attestation["initial_entry_count"] != 0
+            or type(attestation["capability_epoch"]) is not int
+            or attestation["capability_epoch"] < 1
+            or not self._finite_timestamp(attestation["issued_at"])
+            or not self._finite_timestamp(attestation["expires_at"])
+            or float(attestation["expires_at"]) <= float(attestation["issued_at"])
+            or not self._canonical_digest_matches(attestation, "attestation_hash")
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        for field in (
+            "workspace_id",
+            "repository_id",
+            "project_id",
+            "bootstrap_root_identity",
+            "initial_manifest_hash",
+            "capability_hash",
+            "attested_input_snapshot_id",
+            "attestation_hash",
+        ):
+            self._digest(attestation[field], plan=True)
+        if (
+            receipt["schema"]
+            != "2718lab-devkit/project-index-bootstrap-receipt-v1"
+            or receipt["attestation_hash"] != attestation["attestation_hash"]
+            or receipt["workspace_id"] != workspace_id
+            or receipt["attested_input_snapshot_id"]
+            != attestation["attested_input_snapshot_id"]
+            or receipt["initial_manifest_hash"]
+            != attestation["initial_manifest_hash"]
+            or receipt["index_snapshot_id"] != input_snapshot_id
+            or not self._finite_timestamp(receipt["issued_at"])
+            or not self._finite_timestamp(receipt["expires_at"])
+            or float(receipt["expires_at"]) <= float(receipt["issued_at"])
+            or not self._canonical_digest_matches(receipt, "receipt_hash")
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        for field in (
+            "attestation_hash",
+            "workspace_id",
+            "attested_input_snapshot_id",
+            "initial_manifest_hash",
+            "index_snapshot_id",
+            "index_identity",
+        ):
+            self._digest(receipt[field], plan=True)
+        if receipt["index_identity"] != canonical_hash(
+            {
+                "workspace_id": receipt["workspace_id"],
+                "attested_input_snapshot_id": receipt["attested_input_snapshot_id"],
+                "initial_manifest_hash": receipt["initial_manifest_hash"],
+                "index_snapshot_id": receipt["index_snapshot_id"],
+            }
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+
+    @staticmethod
+    def _canonical_digest_matches(value: Mapping[str, object], field: str) -> bool:
+        digest = value.get(field)
+        if type(digest) is not str:
+            return False
+        try:
+            return digest == canonical_hash(
+                {key: item for key, item in value.items() if key != field}
+            )
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _finite_timestamp(value: object) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and isfinite(float(value))
+        )
 
     def _validated_task_v2(self, value: object) -> dict[str, Any]:
         if type(value) is not dict or set(value) != self._TASK_FIELDS_V2:
