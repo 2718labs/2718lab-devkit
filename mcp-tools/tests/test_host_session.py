@@ -89,6 +89,7 @@ def _compiler_session(
     provider: object,
     resolver: object | None = None,
     topology_resolver: object | None = None,
+    host_action_capacity_resolver: object | None = None,
     clock: object | None = None,
 ) -> tuple[host_session.HostSession, InheritedHandleHostBridge, InheritedHandleHostBridge]:
     child, host = _pipe_pair()
@@ -102,6 +103,7 @@ def _compiler_session(
             else resolver
         ),
         topology_fact_resolver=topology_resolver,
+        host_action_capacity_resolver=host_action_capacity_resolver,
     )
     return session, child, host
 
@@ -300,17 +302,68 @@ def test_host_session_resolves_relay_slot_through_private_aggregate_adapter() ->
             coordinator_lease_id="lease-a",
             worktree_identity="wt-a",
             writer_task_ids=("writer-a",),
-            prewarm_task_ids=("prewarm-a",),
+            prewarm_task_ids=(),
             attested_capacity=1,
             attestation_hash=_hash("attestation-a"),
         ),
     )
+    available_slots = {"value": 2}
     session, child, host = _compiler_session(
         provider=lambda preparation: preparation,
         topology_resolver=lambda _slot: facts,
+        host_action_capacity_resolver=lambda: available_slots["value"],
     )
     try:
         resolved = session.resolve_relay_host_scheduler_slot(slot)
+        design_slot = {**slot, "writer_slot": None, "read_only": True}
+        actions = [
+            {
+                "kind": "codex.spawn_agent",
+                "task_id": "writer-a",
+                "task_contract": {
+                    "task_id": "writer-a",
+                    "kind": "implementation",
+                },
+                "relay_host_scheduler_slot": slot,
+            },
+            {
+                "kind": "codex.spawn_agent",
+                "task_id": "design-a",
+                "task_contract": {
+                    "task_id": "design-a",
+                    "kind": "design",
+                    "design_for_task_id": "writer-a",
+                },
+                "relay_host_scheduler_slot": design_slot,
+            },
+        ]
+        invalid_slot = {**slot, "writer_slot": 2}
+        task_swap = {
+            **actions[0],
+            "task_contract": {"task_id": "prewarm-a", "kind": "prewarm"},
+        }
+        kind_swap = {
+            **actions[0],
+            "task_contract": {"task_id": "writer-a", "kind": "prewarm"},
+        }
+        assert session.admit_relay_actions(actions) is True
+        assert (
+            session.admit_relay_actions(
+                [{**actions[0], "relay_host_scheduler_slot": invalid_slot}]
+            )
+            is False
+        )
+        assert session.admit_relay_actions([task_swap]) is False
+        assert session.admit_relay_actions([kind_swap]) is False
+        for field in ("plan_hash", "topology_hash", "group_binding_hash"):
+            assert (
+                session.admit_relay_actions(
+                    [{**actions[0], "relay_host_scheduler_slot": {**slot, field: _hash(field)}}]
+                )
+                is False
+            )
+        available_slots["value"] = 1
+        assert session.admit_relay_actions(actions) is False
     finally:
         child.close()
         host.close()

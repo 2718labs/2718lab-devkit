@@ -16,13 +16,7 @@ from devkit_relay.compiler import compile_plan
 from devkit_relay.service import RelayService
 from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
-from devkit_runtime.relay_runtime import (
-    ProductionRegistryResolver,
-    ProjectIndexBootstrapTransport,
-    RelayRuntime,
-    RelayRuntimeError,
-    project_index_bootstrap_index_identity,
-)
+from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
 from devkit_runtime.tool_result import (
     TOOL_ANNOTATIONS,
     ResultContractError,
@@ -183,164 +177,14 @@ class _TaskLeaseAuthority(Protocol):
     ) -> None: ...
 
 
-class _BootstrapRootResolver(Protocol):
-    """Private host authority mapping one opaque bootstrap identity to its root."""
-
-    def resolve_bootstrap_root(
-        self, *, bootstrap_root_identity: str, attestation_hash: str
-    ) -> str: ...
-
-
-class _BootstrapTransportAuthority(_BootstrapRootResolver, Protocol):
-    """Host-private authority for the only bootstrap transport path."""
-
-    def verify_bootstrap_capability(
-        self, attestation: Mapping[str, object]
-    ) -> bool: ...
-
-
-class _ServerProjectIndexBootstrapHost:
-    """Adapt the two existing Project Index operations to private bootstrap IO."""
-
-    def __init__(
-        self,
-        *,
-        registry_binding: dict[str, object],
-        root_resolver: _BootstrapRootResolver,
-        project_index: object,
-    ) -> None:
-        self._binding = dict(registry_binding)
-        self._root_resolver = root_resolver
-        self._project_index = project_index
-
-    def project_index_register(
-        self, *, bootstrap_root_identity: str, attestation_hash: str
-    ) -> dict[str, object]:
-        root = self._root_resolver.resolve_bootstrap_root(
-            bootstrap_root_identity=bootstrap_root_identity,
-            attestation_hash=attestation_hash,
-        )
-        register = getattr(self._project_index, "project_index_register", None)
-        if type(root) is not str or not root or not callable(register):
-            raise RelayRuntimeError("BOOTSTRAP_HOST_OPERATION_FAILED")
-        return {"workspace_id": register(root)}
-
-    def project_index_sync(
-        self, *, workspace_id: str, attestation_hash: str
-    ) -> dict[str, object]:
-        if attestation_hash != self._binding.get("attestation_hash"):
-            raise RelayRuntimeError("BOOTSTRAP_IDENTITY_MISMATCH")
-        sync = getattr(self._project_index, "sync", None)
-        if not callable(sync):
-            raise RelayRuntimeError("BOOTSTRAP_HOST_OPERATION_FAILED")
-        snapshot = sync(workspace_id)
-        result: dict[str, object] = {
-            "workspace_id": getattr(snapshot, "workspace_id", None),
-            "attested_input_snapshot_id": self._binding.get(
-                "attested_input_snapshot_id"
-            ),
-            "initial_manifest_hash": getattr(snapshot, "manifest_hash", None),
-            "initial_entry_count": getattr(snapshot, "file_count", None),
-            "index_snapshot_id": getattr(snapshot, "snapshot_id", None),
-        }
-        result["index_identity"] = project_index_bootstrap_index_identity(result)
-        return result
-
-
-def _run_project_index_bootstrap_transport(
-    registry_binding: dict[str, object],
-    *,
-    root_resolver: _BootstrapRootResolver,
-    project_index: object,
-    clock: Callable[[], float],
-) -> dict[str, object]:
-    """Explicitly run bootstrap; normal startup and Relay compilation never call it."""
-
-    host = _ServerProjectIndexBootstrapHost(
-        registry_binding=registry_binding,
-        root_resolver=root_resolver,
-        project_index=project_index,
-    )
-    return ProjectIndexBootstrapTransport(host, clock=clock).execute(registry_binding)
-
-
-def _compile_host_relay_request(
-    request: Mapping[str, object],
-    *,
-    bootstrap_authority: _BootstrapTransportAuthority,
-    project_index: object,
-    atlas_store: object,
-    clock: Callable[[], float],
-) -> dict[str, object]:
-    """Close a host-authorized V2/V3 bootstrap without widening MCP input.
-
-    The public ``relay_compile`` MCP tool remains V1-only.  A host that owns a
-    real capability verifier may use this private seam to compile an exact
-    V2/V3 descriptor, run the isolated register/sync transport, and then
-    recompile against its receipt.  No root is ever accepted from ``request``.
-    """
-
-    verify = getattr(bootstrap_authority, "verify_bootstrap_capability", None)
-    resolve_root = getattr(bootstrap_authority, "resolve_bootstrap_root", None)
-    if not callable(verify) or not callable(resolve_root):
-        raise RelayRuntimeError("BOOTSTRAP_HOST_AUTHORITY_UNAVAILABLE")
-    registry = ProductionRegistryResolver(
-        project_index,
-        atlas_store,
-        clock=clock,
-        bootstrap_capability_verifier=lambda attestation: verify(attestation) is True,
-    )
-
-    schema = request.get("schema")
-    descriptor = cast(dict[str, object], compile_plan(request, registry_resolver=registry))
-    if schema not in {
-        "2718lab-devkit/relay-compile-request-v2",
-        "2718lab-devkit/relay-compile-request-v3",
-    }:
-        return descriptor
-    if "bootstrap_receipt" in request:
-        return descriptor
-
-    project_binding = request.get("project_binding")
-    if type(project_binding) is not dict or project_binding.get("mode") != "new_empty_bootstrap":
-        return descriptor
-
-    registry_binding = registry.resolve_new_empty_bootstrap(project_binding)
-    receipt = _run_project_index_bootstrap_transport(
-        registry_binding,
-        root_resolver=bootstrap_authority,
-        project_index=project_index,
-        clock=clock,
-    )
-    recompile = dict(request)
-    recompile["input_snapshot_id"] = receipt["index_snapshot_id"]
-    recompile["bootstrap_receipt"] = receipt
-    return cast(dict[str, object], compile_plan(recompile, registry_resolver=registry))
-
-
 def _compile_host_relay_request_from_runtime(
     request: Mapping[str, object],
     *,
-    bootstrap_authority: _BootstrapTransportAuthority | None,
     clock: Callable[[], float],
 ) -> dict[str, object]:
-    """Host-private production composition for the V2/V3 bootstrap chain."""
+    """Delegate every V2/V3 bootstrap to the fixed RuntimeRoot composition."""
 
-    if bootstrap_authority is None:
-        raise RelayRuntimeError("BOOTSTRAP_HOST_AUTHORITY_UNAVAILABLE")
-    if request.get("schema") not in {
-        "2718lab-devkit/relay-compile-request-v2",
-        "2718lab-devkit/relay-compile-request-v3",
-    }:
-        raise RelayRuntimeError("BOOTSTRAP_HOST_REQUEST_INVALID")
-    with _runtime_root().open_uow(read_only=False) as uow:
-        return _compile_host_relay_request(
-            request,
-            bootstrap_authority=bootstrap_authority,
-            project_index=uow.project_checkpoint.project_index,
-            atlas_store=uow.atlas_store,
-            clock=clock,
-        )
+    return _runtime_root().host_relay_bootstrap().compile(request, clock=clock)
 
 
 class _RequestError(ValueError):

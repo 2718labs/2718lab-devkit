@@ -166,7 +166,7 @@ def _slot_is_admissible(
     target: HostSchedulerTopologyFact,
 ) -> bool:
     if slot.read_only:
-        return slot.writer_slot is None and bool(target.prewarm_task_ids)
+        return slot.writer_slot is None
     return (
         type(slot.writer_slot) is int
         and 1 <= slot.writer_slot <= len(target.writer_task_ids)

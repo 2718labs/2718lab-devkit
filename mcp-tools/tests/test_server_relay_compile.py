@@ -19,7 +19,7 @@ from devkit_relay.compiler import RelayPlanError
 from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig
 from devkit_runtime.relay_runtime import RelayRuntimeError
-from server import RelayCompileRequest, _compile_host_relay_request
+from server import RelayCompileRequest
 
 _NOW = 1_700_000_000
 
@@ -180,6 +180,18 @@ class _AtlasStore:
         raise AssertionError(f"unexpected Atlas lookup: {packet_id}")
 
 
+class _BootstrapUow:
+    def __init__(self, project_index: _ProjectIndex) -> None:
+        self.project_checkpoint = SimpleNamespace(project_index=project_index)
+        self.atlas_store = _AtlasStore()
+
+    def __enter__(self) -> _BootstrapUow:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
 class _BootstrapAuthority:
     def __init__(self, *, capability_valid: bool = True) -> None:
         self.calls: list[tuple[str, str]] = []
@@ -197,11 +209,69 @@ class _BootstrapAuthority:
         return "G:/host-private/bootstrap-root"
 
 
+def _bootstrap_root(
+    tmp_path: Path,
+    *,
+    project_index: _ProjectIndex,
+    authority: _BootstrapAuthority,
+) -> RuntimeRoot:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(exist_ok=True)
+    return RuntimeRoot(
+        RuntimeConfig.load(
+            environ={
+                "PLUGIN_DATA": str(tmp_path / "data"),
+                "CODEX_TASK_TEMP": str(scratch),
+            }
+        ),
+        uow_factory=lambda **_kwargs: _BootstrapUow(project_index),
+        host_bootstrap_authority=authority,
+    )
+
+
 def test_public_relay_compile_model_rejects_v2_v3_authority_fields() -> None:
     request = _v3_request()
 
     with pytest.raises(ValidationError):
         RelayCompileRequest.model_validate(request)
+
+
+def test_host_runtime_bootstrap_factory_fixes_authority_and_rejects_v1_pre_uow(
+    tmp_path: Path,
+) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    opened: list[object] = []
+
+    def unexpected_uow(**_kwargs: object) -> object:
+        opened.append(object())
+        return opened[-1]
+
+    config = RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "data"),
+            "CODEX_TASK_TEMP": str(scratch),
+        }
+    )
+    root = RuntimeRoot(
+        config,
+        uow_factory=unexpected_uow,
+        host_bootstrap_authority=_BootstrapAuthority(),
+    )
+
+    bootstrap = root.host_relay_bootstrap()
+    with pytest.raises(RelayRuntimeError) as rejected:
+        bootstrap.compile(_v1_request(), clock=lambda: _NOW)
+
+    assert rejected.value.code == "BOOTSTRAP_HOST_REQUEST_INVALID"
+    assert opened == []
+
+    unavailable_root = RuntimeRoot(config, uow_factory=unexpected_uow)
+    with pytest.raises(RelayRuntimeError) as unavailable:
+        unavailable_root.host_relay_bootstrap()
+
+    assert unavailable.value.code == "BOOTSTRAP_HOST_AUTHORITY_UNAVAILABLE"
+    assert opened == []
 
 
 def test_host_private_production_composition_requires_injected_authority(
@@ -228,20 +298,23 @@ def test_host_private_production_composition_requires_injected_authority(
 
     with pytest.raises(RelayRuntimeError) as rejected:
         server._compile_host_relay_request_from_runtime(
-            _v3_request(), bootstrap_authority=None, clock=lambda: _NOW
+            _v3_request(), clock=lambda: _NOW
         )
 
     assert rejected.value.code == "BOOTSTRAP_HOST_AUTHORITY_UNAVAILABLE"
     assert opened == []
 
 
-def test_host_private_production_composition_rejects_non_bootstrap_schema() -> None:
+def test_host_private_production_composition_rejects_non_bootstrap_schema(
+    tmp_path: Path,
+) -> None:
+    root = _bootstrap_root(
+        tmp_path,
+        project_index=_ProjectIndex(),
+        authority=_BootstrapAuthority(),
+    )
     with pytest.raises(RelayRuntimeError) as rejected:
-        server._compile_host_relay_request_from_runtime(
-            _v1_request(),
-            bootstrap_authority=_BootstrapAuthority(),
-            clock=lambda: _NOW,
-        )
+        root.host_relay_bootstrap().compile(_v1_request(), clock=lambda: _NOW)
 
     assert rejected.value.code == "BOOTSTRAP_HOST_REQUEST_INVALID"
 
@@ -288,6 +361,7 @@ def test_host_private_production_composition_runs_bootstrap_receipt_chain(
             }
         ),
         uow_factory=open_bootstrap_uow,
+        host_bootstrap_authority=_BootstrapAuthority(),
     )
     monkeypatch.setattr("server._RUNTIME_ROOT", root)
     request = _v3_request()
@@ -297,7 +371,6 @@ def test_host_private_production_composition_runs_bootstrap_receipt_chain(
 
     plan = server._compile_host_relay_request_from_runtime(
         request,
-        bootstrap_authority=_BootstrapAuthority(),
         clock=lambda: _NOW,
     )
 
@@ -312,17 +385,17 @@ def test_host_private_production_composition_runs_bootstrap_receipt_chain(
     assert "G:/host-private/bootstrap-root" not in repr(plan)
 
 
-def test_host_v3_bootstrap_compiles_descriptor_then_recompiles_from_receipt() -> None:
+def test_host_v3_bootstrap_compiles_descriptor_then_recompiles_from_receipt(
+    tmp_path: Path,
+) -> None:
     project_index = _ProjectIndex()
     authority = _BootstrapAuthority()
 
-    plan = _compile_host_relay_request(
-        _v3_request(),
-        bootstrap_authority=authority,
+    plan = _bootstrap_root(
+        tmp_path,
         project_index=project_index,
-        atlas_store=_AtlasStore(),
-        clock=lambda: _NOW,
-    )
+        authority=authority,
+    ).host_relay_bootstrap().compile(_v3_request(), clock=lambda: _NOW)
 
     attestation = _bootstrap_binding()["attestation"]
     assert isinstance(attestation, dict)
@@ -342,58 +415,52 @@ def test_host_v3_bootstrap_compiles_descriptor_then_recompiles_from_receipt() ->
     assert "G:/host-private/bootstrap-root" not in repr(plan)
 
 
-def test_host_private_compile_accepts_exact_v1_and_v2_requests() -> None:
+def test_host_private_factory_rejects_v1_and_accepts_v2_requests(
+    tmp_path: Path,
+) -> None:
     indexed = _ProjectIndex()
-    indexed.current_snapshot_id = "sha256:" + "c" * 64
     authority = _BootstrapAuthority()
-
-    v1_plan = _compile_host_relay_request(
-        _v1_request(),
-        bootstrap_authority=authority,
+    bootstrap = _bootstrap_root(
+        tmp_path,
         project_index=indexed,
-        atlas_store=_AtlasStore(),
-        clock=lambda: _NOW,
-    )
+        authority=authority,
+    ).host_relay_bootstrap()
+
+    with pytest.raises(RelayRuntimeError) as v1_rejected:
+        bootstrap.compile(_v1_request(), clock=lambda: _NOW)
+
     v2_request = _v3_request()
     v2_request["schema"] = "2718lab-devkit/relay-compile-request-v2"
     v2_request.pop("scheduler_topology")
-    v2_plan = _compile_host_relay_request(
-        v2_request,
-        bootstrap_authority=authority,
-        project_index=_ProjectIndex(),
-        atlas_store=_AtlasStore(),
-        clock=lambda: _NOW,
-    )
+    v2_plan = bootstrap.compile(v2_request, clock=lambda: _NOW)
 
-    assert v1_plan["schema"] == "2718lab-devkit/relay-plan-v1"
+    assert v1_rejected.value.code == "BOOTSTRAP_HOST_REQUEST_INVALID"
     assert v2_plan["schema"] == "2718lab-devkit/relay-plan-v2"
     assert authority.calls == [("sha256:" + "4" * 64, authority.verified[1])]
 
 
-def test_host_private_compile_rejects_host_topology_envelope() -> None:
+def test_host_private_compile_rejects_host_topology_envelope(tmp_path: Path) -> None:
     request = _v3_request()
     topology = request["scheduler_topology"]
     assert isinstance(topology, dict)
     topology["schema"] = "2718lab-devkit/host-scheduler-topology-v1"
 
     with pytest.raises(RelayPlanError, match="invalid_scheduler_topology"):
-        _compile_host_relay_request(
-            request,
-            bootstrap_authority=_BootstrapAuthority(),
+        _bootstrap_root(
+            tmp_path,
             project_index=_ProjectIndex(),
-            atlas_store=_AtlasStore(),
-            clock=lambda: _NOW,
-        )
+            authority=_BootstrapAuthority(),
+        ).host_relay_bootstrap().compile(request, clock=lambda: _NOW)
 
 
-def test_host_bootstrap_fails_closed_when_injected_authority_cannot_verify() -> None:
+def test_host_bootstrap_fails_closed_when_injected_authority_cannot_verify(
+    tmp_path: Path,
+) -> None:
     project_index = _ProjectIndex()
 
     with pytest.raises(Exception, match="bootstrap_attestation_required"):
-        _compile_host_relay_request(
-            _v3_request(),
-            bootstrap_authority=_BootstrapAuthority(capability_valid=False),
+        _bootstrap_root(
+            tmp_path,
             project_index=project_index,
-            atlas_store=_AtlasStore(),
-            clock=lambda: _NOW,
-        )
+            authority=_BootstrapAuthority(capability_valid=False),
+        ).host_relay_bootstrap().compile(_v3_request(), clock=lambda: _NOW)

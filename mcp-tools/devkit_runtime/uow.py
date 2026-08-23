@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from devkit_runtime.project_checkpoint import ProjectCheckpointRuntime
     from devkit_runtime.relay_runtime import (
         CapabilityBroker,
+        HostActionAdmission,
         RelayReadRuntime,
         RelayRuntime,
     )
@@ -115,6 +116,7 @@ class RuntimeUnitOfWork:
         factories: RuntimeAdapterFactories,
         capability_broker: object | None,
         integration_attestor: object | None,
+        host_session: object | None,
         tool_results: ToolResultAdapter,
     ) -> None:
         self._config = config
@@ -122,6 +124,7 @@ class RuntimeUnitOfWork:
         self._factories = factories
         self._capability_broker = capability_broker
         self._integration_attestor = integration_attestor
+        self._host_session = host_session
         self._tool_results = tool_results
         self._opened: list[object] = []
         self._project_checkpoint: object = _UNSET
@@ -344,6 +347,7 @@ class RuntimeUnitOfWork:
                     read_only=self._read_only,
                     capability_broker=self._capability_broker,
                     integration_attestor=self._integration_attestor,
+                    host_session=self._host_session,
                 )
             )
         return cast("RelayReadRuntime | RelayRuntime", self._relay)
@@ -759,6 +763,7 @@ def open_runtime_uow(
     read_only: bool,
     capability_broker: object | None = None,
     integration_attestor: object | None = None,
+    host_session: object | None = None,
     factories: RuntimeAdapterFactories | None = None,
     tool_results: ToolResultAdapter | None = None,
 ) -> RuntimeUnitOfWork:
@@ -770,6 +775,7 @@ def open_runtime_uow(
         factories=factories or DEFAULT_RUNTIME_ADAPTER_FACTORIES,
         capability_broker=capability_broker,
         integration_attestor=integration_attestor,
+        host_session=host_session,
         tool_results=tool_results or ToolResultAdapter(),
     )
 
@@ -948,6 +954,7 @@ def _open_relay(
     read_only: bool,
     capability_broker: object | None,
     integration_attestor: object | None,
+    host_session: object | None,
 ) -> object:
     from .relay_runtime import (
         RelayCapabilitySecretProvider,
@@ -965,6 +972,7 @@ def _open_relay(
                 config.relay_capability_key
             ),
             capability_broker=cast("CapabilityBroker | None", capability_broker),
+            host_session=cast("HostActionAdmission | None", host_session),
             integration_proof_resolver=cast(
                 "IntegrationProofResolver | None", integration_attestor
             ),

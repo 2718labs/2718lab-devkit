@@ -181,6 +181,7 @@ class HostSession:
         compiler_evidence_provider: CompilerEvidenceProvider | None = None,
         compiler_invocation_resolver: CompilerInvocationResolver | None = None,
         topology_fact_resolver: TopologyFactResolver | None = None,
+        host_action_capacity_resolver: Callable[[], object] | None = None,
     ) -> None:
         self._bridge = bridge
         self._compiler_evidence_provider = (
@@ -193,6 +194,11 @@ class HostSession:
         )
         self._topology_fact_resolver = (
             topology_fact_resolver if callable(topology_fact_resolver) else None
+        )
+        self._host_action_capacity_resolver = (
+            host_action_capacity_resolver
+            if callable(host_action_capacity_resolver)
+            else None
         )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
@@ -420,6 +426,124 @@ class HostSession:
             except Exception:
                 return _NO_SAFE_WORK
             return self._resolve_host_scheduler_topology(parsed_topology, raw_facts)
+
+    def admit_relay_actions(self, actions: object) -> bool:
+        """Admit only exact Relay actions within live Host physical-slot capacity."""
+
+        from .fastlane_host_intent import (
+            NO_SAFE_WORK,
+            parse_relay_host_scheduler_slot,
+        )
+
+        with self._compiler_evidence_lock:
+            capacity_resolver = self._host_action_capacity_resolver
+            if (
+                self._closed
+                or self._frozen
+                or not self.is_available
+                or capacity_resolver is None
+                or type(actions) is not list
+            ):
+                return False
+            if not actions:
+                return True
+            try:
+                available_slots = capacity_resolver()
+            except Exception:
+                return False
+            if (
+                type(available_slots) is not int
+                or not 1 <= available_slots <= 9
+                or len(actions) > available_slots
+            ):
+                return False
+            writer_count = 0
+            seen_task_ids: set[str] = set()
+            resolved_topology: HostResolvedSchedulerTopology | None = None
+            for action in actions:
+                if type(action) is not dict:
+                    return False
+                task_id = action.get("task_id")
+                task_contract = action.get("task_contract")
+                if (
+                    action.get("kind") != "codex.spawn_agent"
+                    or type(task_id) is not str
+                    or _IDENTIFIER.fullmatch(task_id) is None
+                    or task_id in seen_task_ids
+                    or type(task_contract) is not dict
+                    or task_contract.get("task_id") != task_id
+                ):
+                    return False
+                task_kind = task_contract.get("kind")
+                if task_kind not in {"implementation", "prewarm", "design"}:
+                    return False
+                slot = parse_relay_host_scheduler_slot(
+                    action.get("relay_host_scheduler_slot")
+                )
+                if slot == NO_SAFE_WORK:
+                    return False
+                resolved = self.resolve_relay_host_scheduler_slot(
+                    action["relay_host_scheduler_slot"]
+                )
+                if not isinstance(resolved, HostResolvedSchedulerTopology):
+                    return False
+                if resolved_topology is None:
+                    resolved_topology = resolved
+                elif (
+                    resolved.relay_plan_hash != resolved_topology.relay_plan_hash
+                    or resolved.relay_topology_hash
+                    != resolved_topology.relay_topology_hash
+                    or resolved.audit_binding_hash
+                    != resolved_topology.audit_binding_hash
+                ):
+                    return False
+                matching_groups = [
+                    group
+                    for group in resolved.groups
+                    if group.scheduler_id == slot.scheduler_id
+                    and group.coordinator_lease_id == slot.coordinator_lease_id
+                    and group.worktree_identity == slot.worktree_identity
+                    and group.relay_group_binding_hash == slot.group_binding_hash
+                ]
+                if (
+                    resolved.relay_plan_hash != slot.plan_hash
+                    or resolved.relay_topology_hash != slot.topology_hash
+                    or len(matching_groups) != 1
+                ):
+                    return False
+                group = matching_groups[0]
+                if task_kind == "implementation":
+                    if (
+                        slot.read_only
+                        or slot.writer_slot is None
+                        or slot.writer_slot > len(group.writer_task_ids)
+                        or group.writer_task_ids[slot.writer_slot - 1] != task_id
+                    ):
+                        return False
+                    writer_count += 1
+                elif task_kind == "prewarm":
+                    if (
+                        not slot.read_only
+                        or slot.writer_slot is not None
+                        or task_id not in group.prewarm_task_ids
+                    ):
+                        return False
+                else:
+                    design_target = task_contract.get("design_for_task_id")
+                    if (
+                        not slot.read_only
+                        or slot.writer_slot is not None
+                        or type(design_target) is not str
+                        or _IDENTIFIER.fullmatch(design_target) is None
+                        or design_target not in group.writer_task_ids
+                    ):
+                        return False
+                seen_task_ids.add(task_id)
+            if resolved_topology is None:
+                return False
+            return writer_count <= sum(
+                group.attested_capacity for group in resolved_topology.groups
+            )
 
     def _resolve_host_scheduler_topology(
         self,

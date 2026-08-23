@@ -136,6 +136,15 @@ class CapabilityBroker(Protocol):
     ) -> object: ...
 
 
+class HostActionAdmission(Protocol):
+    """Host-private action gate with its own live physical-slot authority."""
+
+    @property
+    def is_available(self) -> bool: ...
+
+    def admit_relay_actions(self, actions: object) -> bool: ...
+
+
 class ProjectIndexBootstrapHostOperations(Protocol):
     """Private host operations used only after a bootstrap binding is verified."""
 
@@ -656,10 +665,15 @@ class RelayRuntime:
     """Start Relay only after a private broker can receive capability bearers."""
 
     def __init__(
-        self, relay_service: RelayService, *, capability_broker: CapabilityBroker | None
+        self,
+        relay_service: RelayService,
+        *,
+        capability_broker: CapabilityBroker | None,
+        host_session: HostActionAdmission | None = None,
     ) -> None:
         self._relay_service = relay_service
         self._capability_broker = capability_broker
+        self._host_session = host_session
 
     @classmethod
     def from_secret_provider(
@@ -668,6 +682,7 @@ class RelayRuntime:
         *,
         capability_secret_provider: RelayCapabilitySecretProvider,
         capability_broker: CapabilityBroker | None,
+        host_session: HostActionAdmission | None = None,
         integration_proof_resolver: IntegrationProofResolver | None = None,
     ) -> RelayRuntime:
         """Construct a Relay service from a pre-existing capability key only."""
@@ -679,6 +694,7 @@ class RelayRuntime:
                 integration_proof_resolver=integration_proof_resolver,
             ),
             capability_broker=capability_broker,
+            host_session=host_session,
         )
 
     def compile(
@@ -702,6 +718,11 @@ class RelayRuntime:
             actions = result["host_actions"]
             if type(actions) is not list:
                 raise TypeError
+            if any(
+                type(action) is dict and "relay_host_scheduler_slot" in action
+                for action in actions
+            ):
+                self._admit_host_actions(actions)
             for action in actions:
                 self._deliver_worker_capabilities(broker, action)
         except RelayError:
@@ -725,6 +746,32 @@ class RelayRuntime:
             return broker if broker.is_available is True else None
         except Exception:
             return None
+
+    def _admit_host_actions(self, actions: list[object]) -> None:
+        """Require live Host slot admission before issuing any bearer capability."""
+
+        host_session = self._available_host_session()
+        if host_session is None:
+            raise RelayError("RELAY_HOST_SESSION_UNAVAILABLE")
+        try:
+            admitted = host_session.admit_relay_actions(actions)
+        except Exception:
+            admitted = False
+        if admitted is not True:
+            raise RelayError("RELAY_HOST_ACTION_REJECTED")
+
+    def _available_host_session(self) -> HostActionAdmission | None:
+        host_session = self._host_session
+        if host_session is None:
+            return None
+        try:
+            if host_session.is_available is True and callable(
+                getattr(host_session, "admit_relay_actions", None)
+            ):
+                return host_session
+        except Exception:
+            return None
+        return None
 
     def _deliver_worker_capabilities(
         self, broker: CapabilityBroker, action: object
