@@ -8380,7 +8380,9 @@ class TeamEfficiencyTests(unittest.TestCase):
     ) -> None:
         helper = load_efficiency()
         plan_hash = helper._sha256_json({"plan": "topology-v1"})
-        identity = lambda name: helper._sha256_json({"opaque": name})
+
+        def identity(name: str) -> str:
+            return helper._sha256_json({"opaque": name})
 
         topology = helper._fast_lane_scheduler_topology(
             plan_binding_hash=plan_hash,
@@ -8422,7 +8424,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        identity = lambda name: helper._sha256_json({"opaque": name})
+
+        def identity(name: str) -> str:
+            return helper._sha256_json({"opaque": name})
 
         with self.assertRaisesRegex(ValueError, "UNSPLITTABLE"):
             helper._fast_lane_scheduler_topology(
@@ -8452,7 +8456,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        identity = lambda name: helper._sha256_json({"opaque": name})
+
+        def identity(name: str) -> str:
+            return helper._sha256_json({"opaque": name})
         common = {
             "group_id": "A",
             "scheduler_id": identity("scheduler-a"),
