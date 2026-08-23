@@ -488,9 +488,9 @@ external receipt bodies.
 The adapter never archives work. The host may archive only after coordinator-lane acceptance and final evidence binding have completed. Fast Lane scratch files,
 worktrees, ordinary caches, test evidence, and read worktrees must remain below
 the declared project root derived from trusted `CODEX_FASTLANE_TASK_ROOT` (or
-the local `G:\2718lab\_codex\.codex-task-temp` default). This remains the 当前 bootstrap/read-context
-boundary. C-drive temporary roots are forbidden; non-G-drive local temporary roots are
-forbidden. After X unsuccessful rollback rounds, the host may record only
+the local `G:\2718lab\_codex\.codex-task-temp` default). This remains the 当前 bootstrap/read-context boundary.
+C-drive temporary roots are forbidden; non-G-drive local temporary roots are forbidden.
+After X unsuccessful rollback rounds, the host may record only
 candidate cleanup eligibility; it does not delete any path automatically.
 
 ## CLI
