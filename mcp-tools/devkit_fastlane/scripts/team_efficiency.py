@@ -1355,6 +1355,58 @@ def _reject_reparse_points_below(path: Path, root: Path, field: str) -> None:
             raise ValueError(f"{field} must not use reparse points")
 
 
+def _trusted_hosted_runner_temp() -> Path | None:
+    if (
+        os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("RUNNER_OS") != "Windows"
+        or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        return None
+    configured = os.environ.get("RUNNER_TEMP")
+    if not configured or configured != configured.strip():
+        return None
+    normalized = configured.replace("/", "\\")
+    if normalized.startswith("\\\\"):
+        return None
+    candidate = Path(configured)
+    if (
+        not candidate.is_absolute()
+        or candidate == Path(candidate.anchor)
+        or any(part == ".." for part in candidate.parts)
+        or any(part.rstrip(" .") != part for part in candidate.parts[1:])
+        or not candidate.is_dir()
+    ):
+        return None
+    current = candidate
+    while True:
+        if _path_has_reparse_point(current):
+            return None
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    resolved = candidate.resolve(strict=True)
+    if (
+        not resolved.is_absolute()
+        or resolved == Path(resolved.anchor)
+        or any(part.rstrip(" .") != part for part in resolved.parts[1:])
+    ):
+        return None
+    return resolved
+
+
+def _is_approved_fastlane_task_root(
+    candidate: Path, hosted_runner_temp: Path | None
+) -> bool:
+    if hosted_runner_temp is not None:
+        try:
+            relative = candidate.relative_to(hosted_runner_temp)
+        except ValueError:
+            return False
+        return bool(relative.parts)
+    return candidate.drive.casefold() == "g:" and candidate != Path(candidate.anchor)
+
+
 def _configured_fastlane_task_root() -> Path:
     configured = os.environ.get(_FASTLANE_TASK_ROOT_ENV)
     if configured is None:
@@ -1374,7 +1426,8 @@ def _configured_fastlane_task_root() -> Path:
         or any(part.rstrip(" .") != part for part in candidate.parts[1:])
     ):
         raise ValueError("configured fast-lane task root must be absolute")
-    if candidate.drive.casefold() != "g:" or candidate == Path(candidate.anchor):
+    hosted_runner_temp = _trusted_hosted_runner_temp()
+    if not _is_approved_fastlane_task_root(candidate, hosted_runner_temp):
         raise ValueError("configured fast-lane task root is not approved")
     if not candidate.is_dir():
         raise ValueError("configured fast-lane task root must be an existing directory")
@@ -1389,10 +1442,8 @@ def _configured_fastlane_task_root() -> Path:
             break
         current = parent
     resolved = candidate.resolve(strict=True)
-    if (
-        resolved.drive.casefold() != "g:"
-        or resolved == Path(resolved.anchor)
-        or any(part.rstrip(" .") != part for part in resolved.parts[1:])
+    if not _is_approved_fastlane_task_root(resolved, hosted_runner_temp) or any(
+        part.rstrip(" .") != part for part in resolved.parts[1:]
     ):
         raise ValueError("configured fast-lane task root is not approved")
     return resolved

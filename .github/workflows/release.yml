@@ -232,15 +232,39 @@ jobs:
         run: |
           if (-not $env:RUNNER_TEMP) { throw 'RUNNER_TEMP is required for hosted task-local storage' }
           $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-release\fast-lane'
-          New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'pip-cache') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'uv-cache'), (Join-Path $root 'pip-cache') | Out-Null
           @(
+            "CODEX_FASTLANE_TASK_ROOT=$root"
             "CODEX_TASK_TEMP=$root"
             "TEMP=$(Join-Path $root 'tmp')"
             "TMP=$(Join-Path $root 'tmp')"
             "TMPDIR=$(Join-Path $root 'tmp')"
             "PYTHONPYCACHEPREFIX=$(Join-Path $root 'pycache')"
+            "UV_CACHE_DIR=$(Join-Path $root 'uv-cache')"
             "PIP_CACHE_DIR=$(Join-Path $root 'pip-cache')"
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify Fast Lane hosted task root
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          if (-not $env:RUNNER_TEMP) { throw 'RUNNER_TEMP is required for hosted task-local storage' }
+          if (-not $env:CODEX_FASTLANE_TASK_ROOT) { throw 'CODEX_FASTLANE_TASK_ROOT is required' }
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\', '/')
+          $taskRoot = [IO.Path]::GetFullPath($env:CODEX_FASTLANE_TASK_ROOT)
+          $runnerPrefix = $runnerTemp + [IO.Path]::DirectorySeparatorChar
+          if (-not $taskRoot.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'CODEX_FASTLANE_TASK_ROOT must stay below RUNNER_TEMP'
+          }
+          $taskRootPrefix = $taskRoot + [IO.Path]::DirectorySeparatorChar
+          foreach ($name in @('CODEX_FASTLANE_TASK_ROOT', 'CODEX_TASK_TEMP', 'TEMP', 'TMP', 'TMPDIR', 'PYTHONPYCACHEPREFIX', 'UV_CACHE_DIR')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not $value) { throw "$name is required" }
+            $candidate = [IO.Path]::GetFullPath($value)
+            if ($candidate -ne $taskRoot -and -not $candidate.StartsWith($taskRootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "$name must stay below CODEX_FASTLANE_TASK_ROOT"
+            }
+          }
 
       - name: Install Fast Lane test tools
         run: python -m pip install --disable-pip-version-check pytest==9.1.1 ruff==0.16.1

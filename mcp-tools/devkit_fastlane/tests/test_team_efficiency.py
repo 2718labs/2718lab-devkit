@@ -6603,6 +6603,82 @@ class TeamEfficiencyTests(unittest.TestCase):
                         ):
                             helper._configured_fastlane_task_root()
 
+    def test_configured_fastlane_task_root_allows_only_trusted_hosted_runner_temp(
+        self,
+    ) -> None:
+        """Hosted Windows may use only the runner-owned temporary root."""
+
+        helper = load_efficiency()
+        runner_temp = Path(r"D:\\hosted-runner-temp")
+        hosted_root = runner_temp / "2718lab-devkit-task" / "fast-lane"
+        outside_runner_temp = Path(r"D:\\outside-runner-temp") / "fast-lane"
+        with (
+            mock.patch.object(helper.Path, "is_dir", return_value=True),
+            mock.patch.object(
+                helper.Path,
+                "resolve",
+                autospec=True,
+                side_effect=lambda path, strict=False: path,
+            ),
+            mock.patch.object(helper, "_path_has_reparse_point", return_value=False),
+        ):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_FASTLANE_TASK_ROOT": str(hosted_root),
+                    "GITHUB_ACTIONS": "true",
+                    "RUNNER_OS": "Windows",
+                    "RUNNER_ENVIRONMENT": "github-hosted",
+                    "RUNNER_TEMP": str(runner_temp),
+                },
+            ):
+                self.assertEqual(hosted_root, helper._configured_fastlane_task_root())
+
+            for configured_root, environment in (
+                (
+                    hosted_root,
+                    {
+                        "GITHUB_ACTIONS": "false",
+                        "RUNNER_OS": "Windows",
+                        "RUNNER_ENVIRONMENT": "github-hosted",
+                        "RUNNER_TEMP": str(runner_temp),
+                    },
+                ),
+                (
+                    hosted_root,
+                    {
+                        "GITHUB_ACTIONS": "true",
+                        "RUNNER_OS": "Windows",
+                        "RUNNER_ENVIRONMENT": "self-hosted",
+                        "RUNNER_TEMP": str(runner_temp),
+                    },
+                ),
+                (
+                    outside_runner_temp,
+                    {
+                        "GITHUB_ACTIONS": "true",
+                        "RUNNER_OS": "Windows",
+                        "RUNNER_ENVIRONMENT": "github-hosted",
+                        "RUNNER_TEMP": str(runner_temp),
+                    },
+                ),
+            ):
+                with self.subTest(
+                    configured_root=configured_root, environment=environment
+                ):
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            "CODEX_FASTLANE_TASK_ROOT": str(configured_root),
+                            **environment,
+                        },
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "configured fast-lane task root is not approved",
+                        ):
+                            helper._configured_fastlane_task_root()
+
     def test_configured_fastlane_task_root_rejects_non_g_canonical_root(
         self,
     ) -> None:
@@ -8565,7 +8641,6 @@ class TeamEfficiencyTests(unittest.TestCase):
                     }
                 ],
             )
-
 
 
 if __name__ == "__main__":
