@@ -928,7 +928,7 @@ class RelayStore:
         attempt_id: str,
         facts: Sequence[Mapping[str, object]],
     ) -> dict[str, object]:
-        """Atomically freeze bearer-free action facts and admit one attempt."""
+        """Atomically freeze facts for a prepared or exact legacy recovery attempt."""
 
         self._validate_start_attempt_id(attempt_id)
         normalized = self._validated_start_delivery_facts(facts)
@@ -939,7 +939,21 @@ class RelayStore:
                     "SELECT * FROM relay_v3_start_attempts WHERE attempt_id = ?",
                     (attempt_id,),
                 ).fetchone()
-                if attempt is None or str(attempt["state"]) != "prepared":
+                if attempt is None:
+                    raise RelayStateStale()
+                state = str(attempt["state"])
+                legacy_recovery = (
+                    state == "admitted"
+                    and int(attempt["attempt_version"]) == 1
+                    and str(attempt["compensation_json"]) == "[]"
+                    and cursor.execute(
+                        "SELECT COUNT(*) FROM relay_v3_start_delivery_journal "
+                        "WHERE attempt_id = ?",
+                        (attempt_id,),
+                    ).fetchone()[0]
+                    == 0
+                )
+                if state != "prepared" and not legacy_recovery:
                     raise RelayStateStale()
                 action_ids = _decode_string_list(str(attempt["action_ids_json"]))
                 if [fact["action_id"] for fact in normalized] != action_ids:
@@ -989,10 +1003,9 @@ class RelayStore:
                     UPDATE relay_v3_start_attempts
                     SET state = 'admitted', attempt_version = attempt_version + 1,
                         updated_at = ?
-                    WHERE attempt_id = ? AND state = 'prepared'
-                      AND attempt_version = ?
+                    WHERE attempt_id = ? AND state = ? AND attempt_version = ?
                     """,
-                    (now, attempt_id, int(attempt["attempt_version"])),
+                    (now, attempt_id, state, int(attempt["attempt_version"])),
                 )
                 if cursor.rowcount != 1:
                     raise RelayStateStale()
@@ -5497,6 +5510,8 @@ class RelayStore:
 
     @staticmethod
     def _backfill_historical_start_attempts(connection: sqlite3.Connection) -> None:
+        """Represent receipt-free legacy starts as delivery-uncertain, never delivered."""
+
         rows = connection.execute(
             """
             SELECT i.idempotency_key, i.payload_hash, i.result_json, i.created_at
@@ -5547,7 +5562,7 @@ class RelayStore:
                     (attempt_id, idempotency_key, run_id, action_ids_json,
                      compensation_json, state, error_code, receipt_json,
                      attempt_version, created_at, updated_at)
-                VALUES (?, ?, ?, ?, '[]', 'delivered', NULL, NULL, 1, ?, ?)
+                VALUES (?, ?, ?, ?, '[]', 'admitted', NULL, NULL, 1, ?, ?)
                 """,
                 (
                     attempt_id,

@@ -12,22 +12,47 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_relay.canonical import canonical_hash
-from devkit_relay.service import RelayService
+from devkit_relay.service import RelayError, RelayService
 from devkit_relay.store import RelayStore, RelayStoreError
 from devkit_runtime.relay_runtime import RelayRuntime
 
 
-class _NoDeliveryBroker:
-    def __init__(self) -> None:
-        self.calls = 0
+class _HistoricalDeliveryBroker:
+    def __init__(self, *, existing: dict[str, tuple[str, str]] | None = None) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.deliveries = {} if existing is None else dict(existing)
 
     @property
     def is_available(self) -> bool:
         return True
 
-    def prepare_capability(self, **_kwargs: object) -> object:
-        self.calls += 1
-        raise AssertionError("migrated historical replay must not redeliver")
+    def prepare_capability(
+        self,
+        *,
+        action_id: str,
+        endpoint: str,
+        capabilities: dict[str, str],
+    ) -> object:
+        bundle_hash = canonical_hash(dict(sorted(capabilities.items())))
+        self.calls.append((action_id, endpoint, bundle_hash))
+        current = self.deliveries.get(action_id)
+        if current is not None and current != (endpoint, bundle_hash):
+            raise RuntimeError("historical broker delivery conflict")
+        self.deliveries[action_id] = (endpoint, bundle_hash)
+        return {
+            "action_id": action_id,
+            "endpoint": endpoint,
+            "bundle_hash": bundle_hash,
+        }
+
+
+class _AcceptingHostAdmission:
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def admit_relay_actions(self, _actions: list[object]) -> bool:
+        return True
 
 
 def _task(task_id: str) -> dict[str, object]:
@@ -591,7 +616,17 @@ def test_real_legacy_schema_versions_migrate_atomically_to_ten_in_rw_factory(
     seeded = RelayStore(database)
     seeded.start_create(_plan(), idempotency_key=f"legacy-{old_version}-seed")
     seeded.close()
-    if old_version != "9":
+    if old_version == "9":
+        connection = sqlite3.connect(database)
+        connection.execute("DROP TABLE relay_v3_start_delivery_journal")
+        connection.execute("DELETE FROM relay_v3_start_attempts")
+        connection.execute(
+            "UPDATE relay_v3_schema_metadata SET value = '9' "
+            "WHERE key = 'schema_version'"
+        )
+        connection.commit()
+        connection.close()
+    else:
         _downgrade_to_legacy(database, old_version)
 
     store = RelayStore.open_readwrite(database)
@@ -611,10 +646,11 @@ def test_real_legacy_schema_versions_migrate_atomically_to_ten_in_rw_factory(
         .fetchone()[0]
         == 1
     )
+    assert store.start_attempt(f"legacy-{old_version}-seed")["state"] == "admitted"
     store.close()
 
 
-def test_real_v8_historical_idempotency_key_replays_after_v10_migration(
+def test_real_v8_historical_idempotency_reconciles_delivery_after_v10_migration(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "relay-v8-replay.sqlite3"
@@ -632,15 +668,70 @@ def test_real_v8_historical_idempotency_key_replays_after_v10_migration(
     _downgrade_to_legacy(database, "8")
 
     migrated = RelayStore.open_readwrite(database)
-    broker = _NoDeliveryBroker()
+    assert migrated.start_attempt("historical-v8-replay")["state"] == "admitted"
+    broker = _HistoricalDeliveryBroker()
     replayed = RelayRuntime(
         RelayService(migrated, capability_secret=b"historical-replay-secret"),
         capability_broker=broker,
+        host_session=_AcceptingHostAdmission(),
     ).start(request)
 
     assert replayed == expected
-    assert broker.calls == 0
+    assert [call[0] for call in broker.calls] == [
+        action["action_id"] for action in expected["host_actions"]
+    ]
     assert migrated.start_attempt("historical-v8-replay")["state"] == "delivered"
+    assert migrated._require_connection().execute(
+        "SELECT COUNT(*) FROM relay_v3_start_delivery_journal "
+        "WHERE receipt_hash IS NOT NULL"
+    ).fetchone()[0] == len(expected["host_actions"])
+
+
+def test_real_v8_historical_delivery_conflict_fails_closed_with_stable_bundle(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay-v8-conflict.sqlite3"
+    request = {
+        "mode": "create",
+        "plan": _plan(),
+        "idempotency_key": "historical-v8-conflict",
+    }
+    seeded_store = RelayStore(database)
+    seeded_relay = RelayService(
+        seeded_store, capability_secret=b"historical-conflict-secret"
+    )
+    expected = seeded_relay.start(request)
+    seeded_store.close()
+    _downgrade_to_legacy(database, "8")
+    migrated = RelayStore.open_readwrite(database)
+    first_action_id = str(expected["host_actions"][0]["action_id"])
+    endpoint = f"bridge/{first_action_id}"
+    broker = _HistoricalDeliveryBroker(
+        existing={first_action_id: (endpoint, "sha256:" + "0" * 64)}
+    )
+    runtime = RelayRuntime(
+        RelayService(migrated, capability_secret=b"historical-conflict-secret"),
+        capability_broker=broker,
+        host_session=_AcceptingHostAdmission(),
+    )
+
+    for _ in range(2):
+        with pytest.raises(RelayError) as raised:
+            runtime.start(request)
+        assert raised.value.code == "RELAY_CAPABILITY_BROKER_UNAVAILABLE"
+
+    assert migrated.start_attempt("historical-v8-conflict")["state"] == "admitted"
+    assert len(broker.calls) == 2
+    assert broker.calls[0] == broker.calls[1]
+    assert (
+        migrated._require_connection()
+        .execute(
+            "SELECT COUNT(*) FROM relay_v3_start_delivery_journal "
+            "WHERE receipt_hash IS NOT NULL"
+        )
+        .fetchone()[0]
+        == 0
+    )
 
 
 @pytest.mark.parametrize("claimed_version", ["5", "6", "7", "8", "9", "10"])

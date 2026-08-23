@@ -836,9 +836,24 @@ class RelayRuntime:
             try:
                 delivery = service.start_delivery(attempt_id)
             except RelayError as error:
-                if error.code == "RELAY_STATE_STALE":
-                    raise RelayError("RELAY_CAPABILITY_INVALID") from None
-                raise
+                if error.code != "RELAY_STATE_STALE" or attempt_state != "admitted":
+                    raise
+                if admitted_actions:
+                    self._admit_host_actions(admitted_actions)
+                issued_at = self._capability_now()
+                facts, prepared_bundles = self._start_delivery_facts(
+                    service,
+                    actions,
+                    issued_at=issued_at,
+                    expires_at=issued_at + _WORKER_CAPABILITY_LIFETIME_SECONDS,
+                )
+                try:
+                    service.initialize_start_delivery(attempt_id, facts)
+                    delivery = service.start_delivery(attempt_id)
+                except RelayError as recovery_error:
+                    if recovery_error.code == "RELAY_STATE_STALE":
+                        raise RelayError("RELAY_CAPABILITY_INVALID") from None
+                    raise
             delivery_actions = delivery.get("actions")
             if type(delivery_actions) is not list:
                 raise TypeError
