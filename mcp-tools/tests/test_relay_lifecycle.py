@@ -1176,17 +1176,96 @@ def test_service_starts_disjoint_v2_a1_a2_a3_stages_without_granting_design_a_wr
     ]
 
 
+def _canonical_v5_fixture(database: Path) -> None:
+    """Create the exact physical V5 authority accepted before migration DDL."""
+
+    original = RelayStore(database)
+    original.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            DROP INDEX relay_v3_cleanup_by_run_state;
+            DROP INDEX relay_v3_scheduler_slots_by_group;
+            DROP TABLE relay_v3_start_attempts;
+            DROP TABLE relay_v3_scheduler_writer_slots;
+            DROP TABLE relay_v3_scheduler_groups;
+            DROP TABLE relay_v3_cleanup_ledger;
+            DROP TABLE relay_v3_finalization_outcomes;
+            DROP TABLE relay_v3_finalization_journal;
+            DROP TABLE relay_v3_runs;
+
+            CREATE TABLE relay_v3_runs (
+                run_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL UNIQUE,
+                plan_hash TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                input_snapshot_id TEXT NOT NULL,
+                base_commit TEXT NOT NULL,
+                integration_head TEXT NOT NULL,
+                integration_version INTEGER NOT NULL
+                    CHECK (integration_version >= 0),
+                capacity INTEGER NOT NULL
+                    CHECK (typeof(capacity) = 'integer')
+                    CHECK (capacity BETWEEN 1 AND 3),
+                schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE relay_v3_finalization_journal (
+                finalization_id TEXT PRIMARY KEY,
+                reservation_epoch INTEGER NOT NULL
+                    CHECK (reservation_epoch >= 1),
+                integration_proof_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL
+                    CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                base_oid TEXT NOT NULL,
+                final_oid TEXT NOT NULL,
+                fence_hash TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL
+                    CHECK (state IN ('prepared', 'committed', 'aborted')),
+                result_hash TEXT,
+                journal_version INTEGER NOT NULL CHECK (journal_version >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (state = 'committed' AND result_hash IS NOT NULL)
+                    OR (state IN ('prepared', 'aborted') AND result_hash IS NULL)
+                ),
+                UNIQUE (integration_proof_id, reservation_epoch)
+            );
+            CREATE TABLE relay_v3_finalization_outcomes (
+                finalization_id TEXT PRIMARY KEY,
+                fence_hash TEXT NOT NULL UNIQUE,
+                integration_proof_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL
+                    CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                result_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX relay_v3_finalizations_by_proof
+                ON relay_v3_finalization_journal(
+                    integration_proof_id, expectation_hash, state
+                );
+            UPDATE relay_v3_schema_metadata
+            SET value = '5'
+            WHERE key = 'schema_version';
+            """
+        )
+
+
 def test_cleanup_ledger_migrates_only_known_v5_metadata_and_rejects_unknown_schema(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "relay-migration.sqlite3"
-    original = RelayStore(database)
-    original.close()
-    with sqlite3.connect(database) as connection:
-        connection.execute("DROP TABLE relay_v3_cleanup_ledger")
-        connection.execute(
-            "UPDATE relay_v3_schema_metadata SET value = '5' WHERE key = 'schema_version'"
-        )
+    _canonical_v5_fixture(database)
 
     migrated = RelayStore(database)
     connection = migrated._require_connection()
