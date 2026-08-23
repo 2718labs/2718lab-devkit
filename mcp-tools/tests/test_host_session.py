@@ -305,6 +305,22 @@ def test_host_session_resolves_relay_slot_through_private_aggregate_adapter() ->
             prewarm_task_ids=(),
             attested_capacity=1,
             attestation_hash=_hash("attestation-a"),
+            authoritative_actions=(
+                host_session.HostAuthoritativeActionFact(
+                    plan_hash=_hash("plan"),
+                    task_id="writer-a",
+                    kind="implementation",
+                    target="writer-a",
+                    group_binding_hash=_hash("group-a"),
+                ),
+                host_session.HostAuthoritativeActionFact(
+                    plan_hash=_hash("plan"),
+                    task_id="design-a",
+                    kind="design",
+                    target="writer-a",
+                    group_binding_hash=_hash("group-a"),
+                ),
+            ),
         ),
     )
     available_slots = {"value": 2}
@@ -373,6 +389,106 @@ def test_host_session_resolves_relay_slot_through_private_aggregate_adapter() ->
     assert resolved.relay_topology_hash == _hash("topology")
     assert resolved.groups[0].relay_group_binding_hash == _hash("group-a")
     assert resolved.groups[0].attested_capacity == 1
+
+
+def test_host_session_rejects_paired_design_id_swap_against_authoritative_actions() -> None:
+    slot = {
+        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+        "plan_hash": _hash("plan"),
+        "topology_hash": _hash("topology"),
+        "group_binding_hash": _hash("group-a"),
+        "scheduler_id": "scheduler-a",
+        "coordinator_lease_id": "lease-a",
+        "worktree_identity": "wt-a",
+        "writer_slot": None,
+        "read_only": True,
+    }
+    facts = (
+        host_session.HostTopologyGroupFact(
+            plan_hash=_hash("plan"),
+            topology_hash=_hash("topology"),
+            group_binding_hash=_hash("group-a"),
+            scheduler_id="scheduler-a",
+            coordinator_lease_id="lease-a",
+            worktree_identity="wt-a",
+            writer_task_ids=("writer-a", "writer-b"),
+            prewarm_task_ids=(),
+            attested_capacity=2,
+            attestation_hash=_hash("attestation-a"),
+            authoritative_actions=(
+                host_session.HostAuthoritativeActionFact(
+                    plan_hash=_hash("plan"),
+                    task_id="design-a",
+                    kind="design",
+                    target="writer-a",
+                    group_binding_hash=_hash("group-a"),
+                ),
+                host_session.HostAuthoritativeActionFact(
+                    plan_hash=_hash("plan"),
+                    task_id="design-b",
+                    kind="design",
+                    target="writer-b",
+                    group_binding_hash=_hash("group-a"),
+                ),
+            ),
+        ),
+    )
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        topology_resolver=lambda _slot: facts,
+        host_action_capacity_resolver=lambda: 2,
+    )
+    try:
+        authoritative_designs = [
+            {
+                "kind": "codex.spawn_agent",
+                "task_id": "design-a",
+                "task_contract": {
+                    "task_id": "design-a",
+                    "kind": "design",
+                    "design_for_task_id": "writer-a",
+                },
+                "relay_host_scheduler_slot": slot,
+            },
+            {
+                "kind": "codex.spawn_agent",
+                "task_id": "design-b",
+                "task_contract": {
+                    "task_id": "design-b",
+                    "kind": "design",
+                    "design_for_task_id": "writer-b",
+                },
+                "relay_host_scheduler_slot": slot,
+            },
+        ]
+        swapped_designs = [
+            {
+                "kind": "codex.spawn_agent",
+                "task_id": "design-a",
+                "task_contract": {
+                    "task_id": "design-a",
+                    "kind": "design",
+                    "design_for_task_id": "writer-b",
+                },
+                "relay_host_scheduler_slot": slot,
+            },
+            {
+                "kind": "codex.spawn_agent",
+                "task_id": "design-b",
+                "task_contract": {
+                    "task_id": "design-b",
+                    "kind": "design",
+                    "design_for_task_id": "writer-a",
+                },
+                "relay_host_scheduler_slot": slot,
+            },
+        ]
+
+        assert session.admit_relay_actions(authoritative_designs) is True
+        assert session.admit_relay_actions(swapped_designs) is False
+    finally:
+        child.close()
+        host.close()
 
 
 @pytest.mark.parametrize("field", ["plan_hash", "topology_hash", "group_binding_hash"])

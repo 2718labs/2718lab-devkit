@@ -25,7 +25,13 @@ class _RelayService:
                 "task_id": "writer-a",
                 "lease": {"epoch": 1},
                 "relay_host_scheduler_slot": {},
-            }
+            },
+            {
+                "action_id": "action-b",
+                "workflow_id": "workflow-a",
+                "task_id": "reader-a",
+                "lease": {"epoch": 1},
+            },
         ]
 
     def start(self, _request: object) -> dict[str, object]:
@@ -95,7 +101,7 @@ def test_runtime_host_admission_precedes_all_capability_delivery() -> None:
         rejected_runtime.start({"mode": "create"})
 
     assert rejected.value.code == "RELAY_HOST_ACTION_REJECTED"
-    assert rejected_host.actions == rejected_relay.host_actions
+    assert rejected_host.actions == [rejected_relay.host_actions[0]]
     assert rejected_relay.capability_issues == []
     assert rejected_broker.deliveries == []
 
@@ -108,6 +114,6 @@ def test_runtime_host_admission_precedes_all_capability_delivery() -> None:
         host_session=admitted_host,
     ).start({"mode": "create"})
 
-    assert admitted_host.actions == result["host_actions"]
-    assert len(admitted_relay.capability_issues) == 5
-    assert len(admitted_broker.deliveries) == 1
+    assert admitted_host.actions == [result["host_actions"][0]]
+    assert len(admitted_relay.capability_issues) == 10
+    assert len(admitted_broker.deliveries) == 2

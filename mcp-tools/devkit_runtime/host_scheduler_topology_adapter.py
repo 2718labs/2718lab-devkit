@@ -23,6 +23,17 @@ _OPAQUE_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
 @dataclass(frozen=True)
+class HostAuthoritativeActionFact:
+    """One Host-owned action identity, kept outside the Relay slot contract."""
+
+    plan_hash: str
+    task_id: str
+    kind: str
+    target: str
+    group_binding_hash: str
+
+
+@dataclass(frozen=True)
 class HostSchedulerTopologyFact:
     """Complete private Host fact for one Relay scheduler group."""
 
@@ -36,6 +47,7 @@ class HostSchedulerTopologyFact:
     prewarm_task_ids: tuple[str, ...]
     attested_capacity: int
     attestation_hash: str
+    authoritative_actions: tuple[HostAuthoritativeActionFact, ...] = ()
 
 
 def construct_host_scheduler_topology(
@@ -116,6 +128,7 @@ def _slot_is_valid(slot: ParsedRelayHostSchedulerSlot) -> bool:
 def _fact_is_valid(fact: HostSchedulerTopologyFact) -> bool:
     writer_ids = fact.writer_task_ids
     prewarm_ids = fact.prewarm_task_ids
+    action_facts = fact.authoritative_actions
     return (
         _is_hash(fact.plan_hash)
         and _is_hash(fact.topology_hash)
@@ -136,6 +149,44 @@ def _fact_is_valid(fact: HostSchedulerTopologyFact) -> bool:
         and 1 <= fact.attested_capacity <= 3
         and len(writer_ids) <= fact.attested_capacity
         and _is_hash(fact.attestation_hash)
+        and type(action_facts) is tuple
+        and len(action_facts) <= 22
+        and all(_action_fact_is_valid(action) for action in action_facts)
+        and len({action.task_id for action in action_facts}) == len(action_facts)
+        and all(
+            action.plan_hash == fact.plan_hash
+            and action.group_binding_hash == fact.group_binding_hash
+            and (
+                (
+                    action.kind == "implementation"
+                    and action.task_id in writer_ids
+                    and action.target == action.task_id
+                )
+                or (
+                    action.kind == "prewarm"
+                    and action.task_id in prewarm_ids
+                    and action.target in writer_ids
+                )
+                or (
+                    action.kind == "design"
+                    and action.task_id not in writer_ids
+                    and action.task_id not in prewarm_ids
+                    and action.target in writer_ids
+                )
+            )
+            for action in action_facts
+        )
+    )
+
+
+def _action_fact_is_valid(action: object) -> bool:
+    return (
+        type(action) is HostAuthoritativeActionFact
+        and _is_hash(action.plan_hash)
+        and _is_identifier(action.task_id)
+        and action.kind in {"implementation", "prewarm", "design"}
+        and _is_identifier(action.target)
+        and _is_hash(action.group_binding_hash)
     )
 
 

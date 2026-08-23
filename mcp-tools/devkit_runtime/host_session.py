@@ -24,6 +24,7 @@ from .host_bridge import (
     OperationReceipt,
 )
 from .host_scheduler_topology_adapter import (
+    HostAuthoritativeActionFact,
     HostSchedulerTopologyFact,
     construct_host_scheduler_topology,
 )
@@ -99,6 +100,7 @@ class HostResolvedTopologyGroup:
     attested_capacity: int
     attestation_hash: str
     group_binding_hash: str
+    authoritative_actions: tuple[HostAuthoritativeActionFact, ...]
 
 
 @dataclass(frozen=True)
@@ -521,11 +523,16 @@ class HostSession:
                     ):
                         return False
                     writer_count += 1
+                    target = task_id
                 elif task_kind == "prewarm":
+                    target = task_contract.get("prewarm_for_task_id")
                     if (
                         not slot.read_only
                         or slot.writer_slot is not None
                         or task_id not in group.prewarm_task_ids
+                        or type(target) is not str
+                        or _IDENTIFIER.fullmatch(target) is None
+                        or target not in group.writer_task_ids
                     ):
                         return False
                 else:
@@ -538,6 +545,18 @@ class HostSession:
                         or design_target not in group.writer_task_ids
                     ):
                         return False
+                    target = design_target
+                if (
+                    HostAuthoritativeActionFact(
+                        plan_hash=slot.plan_hash,
+                        task_id=task_id,
+                        kind=task_kind,
+                        target=target,
+                        group_binding_hash=slot.group_binding_hash,
+                    )
+                    not in group.authoritative_actions
+                ):
+                    return False
                 seen_task_ids.add(task_id)
             if resolved_topology is None:
                 return False
@@ -587,6 +606,46 @@ class HostSession:
                     or not 1 <= fact.attested_capacity <= 3
                     or len(fact.writer_task_ids) > fact.attested_capacity
                     or not _is_hash(fact.attestation_hash)
+                    or type(fact.authoritative_actions) is not tuple
+                    or len(fact.authoritative_actions) > 22
+                    or any(
+                        type(action) is not HostAuthoritativeActionFact
+                        or not _is_hash(action.plan_hash)
+                        or _IDENTIFIER.fullmatch(action.task_id) is None
+                        or action.kind
+                        not in {"implementation", "prewarm", "design"}
+                        or _IDENTIFIER.fullmatch(action.target) is None
+                        or not _is_hash(action.group_binding_hash)
+                        or action.plan_hash != fact.plan_hash
+                        or action.group_binding_hash != fact.group_binding_hash
+                        or (
+                            action.kind == "implementation"
+                            and (
+                                action.task_id not in fact.writer_task_ids
+                                or action.target != action.task_id
+                            )
+                        )
+                        or (
+                            action.kind == "prewarm"
+                            and (
+                                action.task_id not in fact.prewarm_task_ids
+                                or action.target not in fact.writer_task_ids
+                            )
+                        )
+                        or (
+                            action.kind == "design"
+                            and (
+                                action.task_id in fact.writer_task_ids
+                                or action.task_id in fact.prewarm_task_ids
+                                or action.target not in fact.writer_task_ids
+                            )
+                        )
+                        for action in fact.authoritative_actions
+                    )
+                    or len(
+                        {action.task_id for action in fact.authoritative_actions}
+                    )
+                    != len(fact.authoritative_actions)
                     or fact.scheduler_id in facts_by_scheduler
                 ):
                     raise ValueError("topology fact is invalid")
@@ -620,6 +679,7 @@ class HostSession:
                         attested_capacity=fact.attested_capacity,
                         attestation_hash=fact.attestation_hash,
                         group_binding_hash=group.group_binding_hash,
+                        authoritative_actions=fact.authoritative_actions,
                     )
                 )
             if total_writer_tasks > 9:

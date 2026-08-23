@@ -718,11 +718,13 @@ class RelayRuntime:
             actions = result["host_actions"]
             if type(actions) is not list:
                 raise TypeError
-            if any(
-                type(action) is dict and "relay_host_scheduler_slot" in action
+            admitted_actions: list[object] = [
+                action
                 for action in actions
-            ):
-                self._admit_host_actions(actions)
+                if type(action) is dict and "relay_host_scheduler_slot" in action
+            ]
+            if admitted_actions:
+                self._admit_host_actions(admitted_actions)
             for action in actions:
                 self._deliver_worker_capabilities(broker, action)
         except RelayError:
