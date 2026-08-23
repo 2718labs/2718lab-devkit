@@ -6,6 +6,19 @@ when its exact host-attested route justifies architecture, a hard cross-boundary
 diagnosis, or independent terminal review. Execute in parallel only when cards
 have disjoint write scopes; same-path work queues behind the active owner.
 
+## Scheduler topology V1
+
+`2718lab-devkit/scheduler-topology-v1` defines A/B/C as the main conversation,
+scheduler, and writer groups. The main conversation alone reviews and
+integrates; each scheduler has at most a `1:3` writer set. Plan, lease, and
+G-drive worktree bindings are auditable opaque identity values. Design and
+prewarm are read-only rather than writers, yet remain limited by actual host
+slots, host capability, lease, and safety gates. Cross scope requires a
+`declared-child` split that strictly reduces conflict; otherwise it is
+`UNSPLITTABLE_SCOPE_CONFLICT`. This does not restore account-usage quota,
+D-drive temporary roots, or a parent model ceiling, nor weaken host capability,
+lease, worktree, or safety gates.
+
 ## Current host policy
 
 - Terra High (`gpt-5.6-terra`, `high`) handles routine, bounded coding,

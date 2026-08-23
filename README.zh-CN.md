@@ -21,6 +21,12 @@ worktree 执行路径。宿主执行属于未来外部 Desktop-host bridge 合�
 > 只读，`action="retain"` 不是新 spawn。主对话须经 PR-style 独立审查后再集成，
 > 最后验收和归档。Fast Lane 不使用额度协调器或额度输入。不要把运行时状态或凭据提交到仓库。
 
+> **调度拓扑 V1：** `2718lab-devkit/scheduler-topology-v1` 以 opaque identity
+> 绑定计划、lease 和 G 盘 worktree。A/B/C 分别是主对话审查合并、scheduler 和
+> writer；每个 scheduler 最多 1:3 writers。design/prewarm 只读且仍受实际 host
+> slot、host capability 和 safety gates 约束。跨 scope 只能 declared-child split，
+> 且必须严格降低冲突，否则为 UNSPLITTABLE。
+
 ## 已交付内容
 
 - Project Index 提供不透明工作区注册、受限快照、状态和图查询。

@@ -11,6 +11,9 @@
 <!-- State the exclusive write scope, task/lease identity, G: task root, and
 the independent-review evidence required before the coordinator integrates. -->
 
+<!-- Scheduler changes record `2718lab-devkit/scheduler-topology-v1` and
+opaque plan/lease/worktree identities. -->
+
 ## Validation
 
 - [ ] `uv lock --check` passes for every changed Python project.
@@ -26,5 +29,7 @@ the independent-review evidence required before the coordinator integrates. -->
 - [ ] CHANGELOG/README/docs are updated when public behavior changes.
 - [ ] No runtime state, caches, credentials, or unrelated files are committed.
 - [ ] Parallel A1/A2/A3 work used disjoint write scopes and independent G: task roots.
+- [ ] Scheduler topology V1 used A/B/C, a maximum 1:3 scheduler-to-writer ratio, and host-slot-gated read-only design/prewarm work.
+- [ ] Any cross-scope change used a declared-child split that strictly reduced conflict, or was recorded as UNSPLITTABLE.
 - [ ] The coordinator integrated this change only after PR-style independent review.
 - [ ] I have reviewed the repository's [contributing guidance](../CONTRIBUTING.md) when present.

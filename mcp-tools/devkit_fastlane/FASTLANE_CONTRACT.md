@@ -79,6 +79,18 @@ Bug 不可能被一次性根除。修复工作的目标是消除已复现、会�
 
 严格索引任务在 `workflow_register_task` 时标记 `strict_index=true`：先 `project_index_sync`，再 `project_index_query` 取得 `trace_id`，创建 `worktree_checkpoint_create`，写入后以 `project_index_sync(bind_as="output")` 和再次查询确认输出；最后登记 `workflow_artifact_register(kind="verification", snapshot_id=...)`，才可 `workflow_complete`。旧任务保持 `strict_index=false`。
 
+## Scheduler topology V1
+
+`2718lab-devkit/scheduler-topology-v1` binds auditable opaque identity values
+for the plan, lease, and G-drive worktree. A/B/C are main conversation,
+scheduler, and writer; A alone reviews and integrates, and each scheduler has
+at most a `1:3` writer set. Design and prewarm are read-only and do not count
+as writers, but remain gated by actual host slots, host capability, lease, and
+safety gates. A cross-scope `declared-child` split must strictly reduce conflict
+or return `UNSPLITTABLE_SCOPE_CONFLICT`. This contract does not restore
+account-usage quota, D-drive temporary roots, or a parent model ceiling, and
+does not weaken host capability, lease, worktree, review, or safety gates.
+
 如果 MCP 不可用，允许按 `references/work-packages.md` 使用文件降级，但必须标记 `DEGRADED_SKILL_ONLY`，关闭并发写入和崩溃恢复承诺，并向用户说明这不等价于完整插件。
 
 ### 3.1 工作包项目隔离（V2）

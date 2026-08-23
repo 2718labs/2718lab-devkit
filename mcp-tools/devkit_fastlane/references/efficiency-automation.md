@@ -5,6 +5,18 @@ coordination data. It validates JSON and emits plans, packets, checks, cache
 metadata, and Markdown. Inputs are data only: the helper never evaluates an
 input as code and has no model or remote-service interface.
 
+## Scheduler topology V1
+
+`2718lab-devkit/scheduler-topology-v1` records auditable opaque identity
+bindings for the plan, lease, and G-drive worktree. A/B/C means the main
+conversation (which reviews and integrates), scheduler, and writer. One
+scheduler has at most a `1:3` writer set. Design and prewarm are read-only,
+not writers, but are limited by actual host slots, host capability, lease, and
+safety gates. Only a `declared-child` split that strictly reduces conflict may
+cross scope; otherwise emit `UNSPLITTABLE_SCOPE_CONFLICT`. It does not restore
+account-usage quota, D-drive temporary roots, or a parent model ceiling, and
+does not weaken host capability, lease, worktree, or safety gates.
+
 ## Bootstrap
 
 `bootstrap` requires a task id, full base commit, safe branch, bounded relative

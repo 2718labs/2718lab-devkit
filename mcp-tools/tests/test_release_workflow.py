@@ -172,3 +172,65 @@ def test_fast_lane_workflows_use_current_routing_contract_without_quota_paths() 
     assert "gh release create" in workflows[1]
     assert "$env:RUNNER_TEMP" in workflows[0]
     assert "$env:RUNNER_TEMP" in workflows[1]
+
+
+def test_scheduler_topology_v1_documentation_preserves_host_owned_gates() -> None:
+    documents = {
+        "design": (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-23-devkit-1.1.0-scheduling-design.md"
+        ).read_text(encoding="utf-8"),
+        "plan": (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-08-23-devkit-1.1.0-scheduling.md"
+        ).read_text(encoding="utf-8"),
+        "contract": (ROOT / "mcp-tools" / "devkit_fastlane" / "FASTLANE_CONTRACT.md").read_text(
+            encoding="utf-8"
+        ),
+        "automation": (
+            ROOT
+            / "mcp-tools"
+            / "devkit_fastlane"
+            / "references"
+            / "efficiency-automation.md"
+        ).read_text(encoding="utf-8"),
+        "patterns": (
+            ROOT
+            / "mcp-tools"
+            / "devkit_fastlane"
+            / "references"
+            / "team-patterns.md"
+        ).read_text(encoding="utf-8"),
+        "readme": (ROOT / "README.md").read_text(encoding="utf-8"),
+        "readme_zh": (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
+        "pr_template": (ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(
+            encoding="utf-8"
+        ),
+    }
+
+    for name in ("design", "plan", "contract", "automation", "patterns"):
+        text = documents[name]
+        assert "2718lab-devkit/scheduler-topology-v1" in text
+        assert "A/B/C" in text
+        assert "1:3" in text
+        assert "UNSPLITTABLE" in text
+        assert "declared-child" in text
+        assert "opaque identity" in text
+        assert "host capability" in text
+        assert "lease" in text
+
+    for name in ("readme", "readme_zh", "pr_template"):
+        assert "2718lab-devkit/scheduler-topology-v1" in documents[name]
+
+    for required in (
+        "does not restore account-usage quota",
+        "does not restore D-drive temporary roots",
+        "does not restore a parent model ceiling",
+    ):
+        assert required in documents["design"]

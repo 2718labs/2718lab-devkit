@@ -27,6 +27,14 @@ execution remains an external Desktop-host bridge requirement.
 > use an account-usage coordinator or account-usage inputs. Do not commit runtime state or
 > credentials.
 
+> **Scheduler topology V1:** `2718lab-devkit/scheduler-topology-v1` binds the
+> plan, lease, and G-drive worktree as auditable opaque identities. A/B/C means
+> main-conversation review/integration, scheduler, and writer; each scheduler
+> has at most a 1:3 writer relationship. Design/prewarm are read-only and stay
+> subject to actual host slots, host capability, and safety gates. Cross-scope
+> work requires a declared-child split that strictly reduces conflict, or is
+> UNSPLITTABLE.
+
 ## What is shipped
 
 - Project Index exposes opaque workspace registration, bounded snapshots,
