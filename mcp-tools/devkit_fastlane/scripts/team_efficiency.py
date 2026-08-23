@@ -1374,7 +1374,7 @@ def _configured_fastlane_task_root() -> Path:
         or any(part.rstrip(" .") != part for part in candidate.parts[1:])
     ):
         raise ValueError("configured fast-lane task root must be absolute")
-    if candidate.drive.casefold() == "c:" or candidate == Path(candidate.anchor):
+    if candidate.drive.casefold() != "g:" or candidate == Path(candidate.anchor):
         raise ValueError("configured fast-lane task root is not approved")
     if not candidate.is_dir():
         raise ValueError("configured fast-lane task root must be an existing directory")
@@ -1390,7 +1390,7 @@ def _configured_fastlane_task_root() -> Path:
         current = parent
     resolved = candidate.resolve(strict=True)
     if (
-        resolved.drive.casefold() == "c:"
+        resolved.drive.casefold() != "g:"
         or resolved == Path(resolved.anchor)
         or any(part.rstrip(" .") != part for part in resolved.parts[1:])
     ):

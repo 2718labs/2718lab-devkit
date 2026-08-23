@@ -6571,6 +6571,65 @@ class TeamEfficiencyTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         helper.build_bootstrap_plan(**self.bootstrap_kwargs())
 
+    def test_configured_fastlane_task_root_rejects_non_g_volume_roots(
+        self,
+    ) -> None:
+        """The task-root fence is G:-only before host filesystem inspection."""
+
+        helper = load_efficiency()
+        with (
+            mock.patch.object(helper.Path, "is_dir", return_value=True),
+            mock.patch.object(
+                helper.Path,
+                "resolve",
+                autospec=True,
+                side_effect=lambda path, strict=False: path,
+            ),
+            mock.patch.object(helper, "_path_has_reparse_point", return_value=False),
+        ):
+            for configured_root in (
+                r"C:\\fastlane-root",
+                r"D:\\fastlane-root",
+                r"E:\\fastlane-root",
+            ):
+                with self.subTest(configured_root=configured_root):
+                    with mock.patch.dict(
+                        os.environ,
+                        {"CODEX_FASTLANE_TASK_ROOT": configured_root},
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "configured fast-lane task root is not approved",
+                        ):
+                            helper._configured_fastlane_task_root()
+
+    def test_configured_fastlane_task_root_rejects_non_g_canonical_root(
+        self,
+    ) -> None:
+        """A G: spelling cannot canonicalize into an unapproved volume."""
+
+        helper = load_efficiency()
+        canonical_root = Path(r"D:\\canonical-fastlane-root")
+        with (
+            mock.patch.object(helper.Path, "is_dir", return_value=True),
+            mock.patch.object(
+                helper.Path,
+                "resolve",
+                autospec=True,
+                side_effect=lambda _path, strict=False: canonical_root,
+            ),
+            mock.patch.object(helper, "_path_has_reparse_point", return_value=False),
+            mock.patch.dict(
+                os.environ,
+                {"CODEX_FASTLANE_TASK_ROOT": r"G:\\fastlane-root"},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "configured fast-lane task root is not approved",
+            ):
+                helper._configured_fastlane_task_root()
+
     def test_bootstrap_rejects_win32_normalization_aliases_in_root_bound_paths(
         self,
     ) -> None:
