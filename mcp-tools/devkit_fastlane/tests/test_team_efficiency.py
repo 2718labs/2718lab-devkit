@@ -212,16 +212,13 @@ class TeamEfficiencyTests(unittest.TestCase):
         if not task_temp.is_absolute():
             raise AssertionError("CODEX_TASK_TEMP must be an absolute path")
         task_temp.mkdir(parents=True, exist_ok=True)
+        os.environ["CODEX_FASTLANE_TASK_ROOT"] = str(task_temp)
         self._temporary_directory = tempfile.TemporaryDirectory(dir=task_temp)
         self.temp = Path(self._temporary_directory.name)
         self.safe_root = task_temp
-        self.fast_lane_task_root = (
-            Path(r"G:\2718lab\_codex\.codex-task-temp") / self.temp.name
-        ).resolve(strict=False)
+        self.fast_lane_task_root = (task_temp / self.temp.name).resolve(strict=False)
         self.fast_lane_task_root.mkdir(parents=True, exist_ok=True)
-        self.project = self.fast_lane_task_root.relative_to(
-            r"G:\2718lab\_codex\.codex-task-temp"
-        ).as_posix()
+        self.project = self.fast_lane_task_root.relative_to(task_temp).as_posix()
         self.repo = self.fast_lane_task_root / "fixture-repository"
         self.repo.mkdir()
         self._stores: list[SQLiteStore] = []
@@ -238,6 +235,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         self._temporary_directory.cleanup()
         if self._fastlane_task_root is not None:
             os.environ["CODEX_FASTLANE_TASK_ROOT"] = self._fastlane_task_root
+        else:
+            os.environ.pop("CODEX_FASTLANE_TASK_ROOT", None)
 
     def test_fast_lane_fixture_repository_is_task_local_and_existing(self) -> None:
         self.assertEqual(self.fast_lane_task_root / "fixture-repository", self.repo)
@@ -2413,10 +2412,15 @@ class TeamEfficiencyTests(unittest.TestCase):
     def test_default_fastlane_task_root_is_g_drive_task_root(self) -> None:
         helper = load_efficiency()
 
-        self.assertEqual(
-            Path(r"G:\2718lab\_codex\.codex-task-temp").resolve(strict=False),
-            helper._configured_fastlane_task_root(),
-        )
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CODEX_FASTLANE_TASK_ROOT", None)
+            self.assertEqual(
+                Path(r"G:\2718lab\_codex\.codex-task-temp").resolve(strict=False),
+                helper._configured_fastlane_task_root(),
+            )
+
+    def test_fixture_task_root_stays_below_configured_task_temp(self) -> None:
+        self.assertEqual(self.safe_root, self.fast_lane_task_root.parent)
 
     def test_fast_lane_v2_forged_provider_cannot_activate_execution(self) -> None:
         """A same-process module override is not an external host bridge."""
@@ -6383,9 +6387,16 @@ class TeamEfficiencyTests(unittest.TestCase):
 
         expected_target = str(self.bootstrap_kwargs()["worktree"])
         self.assertEqual("dry_run", plan["mode"])
-        self.assertEqual("team-efficiency/bootstrap-v1", plan["schema"])
         self.assertNotIn("task_root", plan)
-        self.assertNotIn("task_root_hash", plan)
+        if helper._is_default_fastlane_task_root(self.safe_root):
+            self.assertEqual("team-efficiency/bootstrap-v1", plan["schema"])
+            self.assertNotIn("task_root_hash", plan)
+        else:
+            self.assertEqual("team-efficiency/bootstrap-v2", plan["schema"])
+            self.assertEqual(
+                helper._fastlane_task_root_hash(self.safe_root),
+                plan["task_root_hash"],
+            )
         self.assertEqual(
             [
                 "git",
@@ -6823,7 +6834,7 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def test_bootstrap_is_portable_to_any_compliant_codex_project_root(self) -> None:
         helper = load_efficiency()
-        codex_root = Path(r"G:\2718lab\_codex\.codex-task-temp").resolve(strict=False)
+        codex_root = self.safe_root
         project_root = self.fast_lane_task_root / "portable-project" / "nested-root"
         project = project_root.resolve(strict=False).relative_to(codex_root).as_posix()
         worktree = project_root / "worktrees" / "portable-atlas"
@@ -6843,7 +6854,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual(project, plan["project"])
         self.assertEqual(str(worktree.resolve(strict=False)), plan["worktree"])
         self.assertEqual(
-            Path(r"G:\2718lab\_codex\.codex-task-temp") / "t",
+            self.safe_root / "t",
             Path(plan["temp_target"]).parent,
         )
 
@@ -8187,9 +8198,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         worktree_add_calls: list[list[str]] = []
         observed_error: ValueError | None = None
 
-        with tempfile.TemporaryDirectory(
-            dir=r"G:\2718lab\_codex\.codex-task-temp"
-        ) as temporary_root:
+        with tempfile.TemporaryDirectory(dir=self.safe_root) as temporary_root:
             configured_root = Path(temporary_root)
             project = "direct-apply-project"
             project_root = configured_root / project
