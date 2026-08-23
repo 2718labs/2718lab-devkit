@@ -93,11 +93,20 @@ def _normalized_facts(
         for fact in facts
     }
     writer_ids = [writer for fact in facts for writer in fact.writer_task_ids]
+    reader_ids = [reader for fact in facts for reader in fact.prewarm_task_ids]
+    reader_ids.extend(
+        action.task_id
+        for fact in facts
+        for action in fact.authoritative_actions
+        if action.kind == "design"
+    )
     if (
         len(plan_hashes) != 1
         or len(topology_hashes) != 1
         or len(group_identities) != len(facts)
         or len(set(writer_ids)) != len(writer_ids)
+        or len(set(reader_ids)) != len(reader_ids)
+        or set(writer_ids).intersection(reader_ids)
         or len(writer_ids) > 9
     ):
         return None

@@ -35,6 +35,8 @@ _IDENTIFIER: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _REASON_SESSION_UNAVAILABLE: Final = "HOST_SESSION_UNAVAILABLE"
 _REASON_CAPABILITY_UNAVAILABLE: Final = "HOST_CAPABILITY_UNAVAILABLE"
 _REASON_EXECUTION_EVIDENCE_UNAVAILABLE: Final = "HOST_EXECUTION_EVIDENCE_UNAVAILABLE"
+_MAX_HOST_WRITER_ACTIONS: Final = 9
+_MAX_HOST_READER_ACTIONS: Final = 189
 
 
 class HostCapabilityState(StrEnum):
@@ -450,16 +452,15 @@ class HostSession:
             if not actions:
                 return True
             try:
-                available_slots = capacity_resolver()
+                writer_capacity, reader_capacity = _normalized_host_action_capacity(
+                    capacity_resolver()
+                )
             except Exception:
                 return False
-            if (
-                type(available_slots) is not int
-                or not 1 <= available_slots <= 9
-                or len(actions) > available_slots
-            ):
+            if len(actions) > _MAX_HOST_WRITER_ACTIONS + _MAX_HOST_READER_ACTIONS:
                 return False
             writer_count = 0
+            reader_count = 0
             seen_task_ids: set[str] = set()
             resolved_topology: HostResolvedSchedulerTopology | None = None
             for action in actions:
@@ -484,20 +485,15 @@ class HostSession:
                 )
                 if slot == NO_SAFE_WORK:
                     return False
-                resolved = self.resolve_relay_host_scheduler_slot(
-                    action["relay_host_scheduler_slot"]
-                )
-                if not isinstance(resolved, HostResolvedSchedulerTopology):
-                    return False
                 if resolved_topology is None:
+                    resolved = self.resolve_relay_host_scheduler_slot(
+                        action["relay_host_scheduler_slot"]
+                    )
+                    if not isinstance(resolved, HostResolvedSchedulerTopology):
+                        return False
                     resolved_topology = resolved
-                elif (
-                    resolved.relay_plan_hash != resolved_topology.relay_plan_hash
-                    or resolved.relay_topology_hash
-                    != resolved_topology.relay_topology_hash
-                    or resolved.audit_binding_hash
-                    != resolved_topology.audit_binding_hash
-                ):
+                resolved = resolved_topology
+                if resolved is None:
                     return False
                 matching_groups = [
                     group
@@ -535,6 +531,7 @@ class HostSession:
                         or target not in group.writer_task_ids
                     ):
                         return False
+                    reader_count += 1
                 else:
                     design_target = task_contract.get("design_for_task_id")
                     if (
@@ -546,6 +543,7 @@ class HostSession:
                     ):
                         return False
                     target = design_target
+                    reader_count += 1
                 if (
                     HostAuthoritativeActionFact(
                         plan_hash=slot.plan_hash,
@@ -560,8 +558,11 @@ class HostSession:
                 seen_task_ids.add(task_id)
             if resolved_topology is None:
                 return False
-            return writer_count <= sum(
-                group.attested_capacity for group in resolved_topology.groups
+            return (
+                writer_count <= writer_capacity
+                and reader_count <= reader_capacity
+                and writer_count
+                <= sum(group.attested_capacity for group in resolved_topology.groups)
             )
 
     def _resolve_host_scheduler_topology(
@@ -581,6 +582,10 @@ class HostSession:
             return _NO_SAFE_WORK
         try:
             facts_by_scheduler: dict[str, HostTopologyGroupFact] = {}
+            canonical_actions_by_scheduler: dict[
+                str, tuple[HostAuthoritativeActionFact, ...]
+            ] = {}
+            seen_task_ids: set[str] = set()
             for fact in raw_facts:
                 if (
                     type(fact) is not HostTopologyGroupFact
@@ -649,7 +654,23 @@ class HostSession:
                     or fact.scheduler_id in facts_by_scheduler
                 ):
                     raise ValueError("topology fact is invalid")
+                canonical_actions = _canonical_authoritative_actions(
+                    fact.authoritative_actions
+                )
+                fact_task_ids = {
+                    *fact.writer_task_ids,
+                    *fact.prewarm_task_ids,
+                    *(
+                        action.task_id
+                        for action in canonical_actions
+                        if action.kind == "design"
+                    ),
+                }
+                if seen_task_ids.intersection(fact_task_ids):
+                    raise ValueError("topology task identities are not unique")
+                seen_task_ids.update(fact_task_ids)
                 facts_by_scheduler[fact.scheduler_id] = fact
+                canonical_actions_by_scheduler[fact.scheduler_id] = canonical_actions
             groups: list[HostResolvedTopologyGroup] = []
             total_writer_tasks = 0
             for group in topology.groups:
@@ -679,7 +700,9 @@ class HostSession:
                         attested_capacity=fact.attested_capacity,
                         attestation_hash=fact.attestation_hash,
                         group_binding_hash=group.group_binding_hash,
-                        authoritative_actions=fact.authoritative_actions,
+                        authoritative_actions=canonical_actions_by_scheduler[
+                            group.scheduler_id
+                        ],
                     )
                 )
             if total_writer_tasks > 9:
@@ -701,6 +724,16 @@ class HostSession:
                             "attested_capacity": group.attested_capacity,
                             "attestation_hash": group.attestation_hash,
                             "group_binding_hash": group.group_binding_hash,
+                            "authoritative_actions": [
+                                {
+                                    "plan_hash": action.plan_hash,
+                                    "task_id": action.task_id,
+                                    "kind": action.kind,
+                                    "target": action.target,
+                                    "group_binding_hash": action.group_binding_hash,
+                                }
+                                for action in group.authoritative_actions
+                            ],
                         }
                         for group in groups
                     ],
@@ -1045,6 +1078,38 @@ def _hash(value: object) -> str:
             ).encode("utf-8")
         ).hexdigest()
     )
+
+
+def _canonical_authoritative_actions(
+    actions: tuple[HostAuthoritativeActionFact, ...],
+) -> tuple[HostAuthoritativeActionFact, ...]:
+    return tuple(
+        sorted(
+            actions,
+            key=lambda action: (
+                action.task_id,
+                action.kind,
+                action.target,
+                action.plan_hash,
+                action.group_binding_hash,
+            ),
+        )
+    )
+
+
+def _normalized_host_action_capacity(value: object) -> tuple[int, int]:
+    if type(value) is not dict or set(value) != {"writer_capacity", "reader_capacity"}:
+        raise ValueError("host action capacity is invalid")
+    writer_capacity = value["writer_capacity"]
+    reader_capacity = value["reader_capacity"]
+    if (
+        type(writer_capacity) is not int
+        or type(reader_capacity) is not int
+        or not 0 <= writer_capacity <= _MAX_HOST_WRITER_ACTIONS
+        or not 0 <= reader_capacity <= _MAX_HOST_READER_ACTIONS
+    ):
+        raise ValueError("host action capacity is invalid")
+    return writer_capacity, reader_capacity
 
 
 def _bounded_routes(value: object) -> tuple[HostRoute, ...]:

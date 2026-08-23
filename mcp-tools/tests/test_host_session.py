@@ -323,11 +323,11 @@ def test_host_session_resolves_relay_slot_through_private_aggregate_adapter() ->
             ),
         ),
     )
-    available_slots = {"value": 2}
+    capacity = {"writer_capacity": 1, "reader_capacity": 1}
     session, child, host = _compiler_session(
         provider=lambda preparation: preparation,
         topology_resolver=lambda _slot: facts,
-        host_action_capacity_resolver=lambda: available_slots["value"],
+        host_action_capacity_resolver=lambda: capacity,
     )
     try:
         resolved = session.resolve_relay_host_scheduler_slot(slot)
@@ -378,7 +378,7 @@ def test_host_session_resolves_relay_slot_through_private_aggregate_adapter() ->
                 )
                 is False
             )
-        available_slots["value"] = 1
+        capacity["writer_capacity"] = 0
         assert session.admit_relay_actions(actions) is False
     finally:
         child.close()
@@ -436,7 +436,10 @@ def test_host_session_rejects_paired_design_id_swap_against_authoritative_action
     session, child, host = _compiler_session(
         provider=lambda preparation: preparation,
         topology_resolver=lambda _slot: facts,
-        host_action_capacity_resolver=lambda: 2,
+        host_action_capacity_resolver=lambda: {
+            "writer_capacity": 0,
+            "reader_capacity": 2,
+        },
     )
     try:
         authoritative_designs = [
@@ -486,6 +489,269 @@ def test_host_session_rejects_paired_design_id_swap_against_authoritative_action
 
         assert session.admit_relay_actions(authoritative_designs) is True
         assert session.admit_relay_actions(swapped_designs) is False
+    finally:
+        child.close()
+        host.close()
+
+
+def test_host_session_resolves_changing_authoritative_facts_once_per_batch() -> None:
+    slot = {
+        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+        "plan_hash": _hash("plan"),
+        "topology_hash": _hash("topology"),
+        "group_binding_hash": _hash("group-a"),
+        "scheduler_id": "scheduler-a",
+        "coordinator_lease_id": "lease-a",
+        "worktree_identity": "wt-a",
+        "writer_slot": None,
+        "read_only": True,
+    }
+
+    def facts(
+        *, design_a_target: str, design_b_target: str
+    ) -> tuple[host_session.HostTopologyGroupFact, ...]:
+        return (
+            host_session.HostTopologyGroupFact(
+                plan_hash=_hash("plan"),
+                topology_hash=_hash("topology"),
+                group_binding_hash=_hash("group-a"),
+                scheduler_id="scheduler-a",
+                coordinator_lease_id="lease-a",
+                worktree_identity="wt-a",
+                writer_task_ids=("writer-a", "writer-b"),
+                prewarm_task_ids=(),
+                attested_capacity=2,
+                attestation_hash=_hash("attestation-a"),
+                authoritative_actions=(
+                    host_session.HostAuthoritativeActionFact(
+                        plan_hash=_hash("plan"),
+                        task_id="design-a",
+                        kind="design",
+                        target=design_a_target,
+                        group_binding_hash=_hash("group-a"),
+                    ),
+                    host_session.HostAuthoritativeActionFact(
+                        plan_hash=_hash("plan"),
+                        task_id="design-b",
+                        kind="design",
+                        target=design_b_target,
+                        group_binding_hash=_hash("group-a"),
+                    ),
+                ),
+            ),
+        )
+
+    calls = 0
+
+    def resolver(_slot: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return facts(design_a_target="writer-a", design_b_target="writer-a")
+        return facts(design_a_target="writer-b", design_b_target="writer-b")
+
+    actions = [
+        {
+            "kind": "codex.spawn_agent",
+            "task_id": "design-a",
+            "task_contract": {
+                "task_id": "design-a",
+                "kind": "design",
+                "design_for_task_id": "writer-a",
+            },
+            "relay_host_scheduler_slot": slot,
+        },
+        {
+            "kind": "codex.spawn_agent",
+            "task_id": "design-b",
+            "task_contract": {
+                "task_id": "design-b",
+                "kind": "design",
+                "design_for_task_id": "writer-b",
+            },
+            "relay_host_scheduler_slot": slot,
+        },
+    ]
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        topology_resolver=resolver,
+        host_action_capacity_resolver=lambda: {
+            "writer_capacity": 0,
+            "reader_capacity": 2,
+        },
+    )
+    try:
+        assert session.admit_relay_actions(actions) is False
+        assert calls == 1
+    finally:
+        child.close()
+        host.close()
+
+
+def test_host_session_binds_canonical_authoritative_actions_to_private_audit() -> None:
+    slot = {
+        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+        "plan_hash": _hash("plan"),
+        "topology_hash": _hash("topology"),
+        "group_binding_hash": _hash("group-a"),
+        "scheduler_id": "scheduler-a",
+        "coordinator_lease_id": "lease-a",
+        "worktree_identity": "wt-a",
+        "writer_slot": None,
+        "read_only": True,
+    }
+
+    def resolve_audit(
+        action_facts: tuple[host_session.HostAuthoritativeActionFact, ...],
+    ) -> str:
+        facts = (
+            host_session.HostTopologyGroupFact(
+                plan_hash=_hash("plan"),
+                topology_hash=_hash("topology"),
+                group_binding_hash=_hash("group-a"),
+                scheduler_id="scheduler-a",
+                coordinator_lease_id="lease-a",
+                worktree_identity="wt-a",
+                writer_task_ids=("writer-a", "writer-b"),
+                prewarm_task_ids=(),
+                attested_capacity=2,
+                attestation_hash=_hash("attestation-a"),
+                authoritative_actions=action_facts,
+            ),
+        )
+        session, child, host = _compiler_session(
+            provider=lambda preparation: preparation,
+            topology_resolver=lambda _slot: facts,
+        )
+        try:
+            resolved = session.resolve_relay_host_scheduler_slot(slot)
+        finally:
+            child.close()
+            host.close()
+        assert isinstance(resolved, host_session.HostResolvedSchedulerTopology)
+        return resolved.audit_binding_hash
+
+    action_a = host_session.HostAuthoritativeActionFact(
+        plan_hash=_hash("plan"),
+        task_id="design-a",
+        kind="design",
+        target="writer-a",
+        group_binding_hash=_hash("group-a"),
+    )
+    action_b = host_session.HostAuthoritativeActionFact(
+        plan_hash=_hash("plan"),
+        task_id="design-b",
+        kind="design",
+        target="writer-b",
+        group_binding_hash=_hash("group-a"),
+    )
+    changed_action_b = replace(action_b, target="writer-a")
+
+    canonical_audit = resolve_audit((action_a, action_b))
+    reordered_audit = resolve_audit((action_b, action_a))
+    changed_audit = resolve_audit((action_a, changed_action_b))
+
+    assert canonical_audit == reordered_audit
+    assert canonical_audit != changed_audit
+
+
+def test_host_session_applies_independent_writer_and_reader_capacity() -> None:
+    plan_hash = _hash("capacity-plan")
+    topology_hash = _hash("capacity-topology")
+    facts: list[host_session.HostTopologyGroupFact] = []
+    actions: list[dict[str, object]] = []
+    for scheduler_id in ("scheduler-a", "scheduler-b", "scheduler-c"):
+        group_hash = _hash(f"capacity-{scheduler_id}")
+        writers = tuple(f"{scheduler_id}-writer-{index}" for index in range(1, 4))
+        action_facts = [
+            host_session.HostAuthoritativeActionFact(
+                plan_hash=plan_hash,
+                task_id=writer,
+                kind="implementation",
+                target=writer,
+                group_binding_hash=group_hash,
+            )
+            for writer in writers
+        ]
+        if scheduler_id == "scheduler-a":
+            action_facts.append(
+                host_session.HostAuthoritativeActionFact(
+                    plan_hash=plan_hash,
+                    task_id="reader-a",
+                    kind="design",
+                    target=writers[0],
+                    group_binding_hash=group_hash,
+                )
+            )
+        facts.append(
+            host_session.HostTopologyGroupFact(
+                plan_hash=plan_hash,
+                topology_hash=topology_hash,
+                group_binding_hash=group_hash,
+                scheduler_id=scheduler_id,
+                coordinator_lease_id=f"lease-{scheduler_id}",
+                worktree_identity=f"wt-{scheduler_id}",
+                writer_task_ids=writers,
+                prewarm_task_ids=(),
+                attested_capacity=3,
+                attestation_hash=_hash(f"attestation-{scheduler_id}"),
+                authoritative_actions=tuple(action_facts),
+            )
+        )
+        for writer_slot, writer in enumerate(writers, start=1):
+            actions.append(
+                {
+                    "kind": "codex.spawn_agent",
+                    "task_id": writer,
+                    "task_contract": {
+                        "task_id": writer,
+                        "kind": "implementation",
+                    },
+                    "relay_host_scheduler_slot": {
+                        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+                        "plan_hash": plan_hash,
+                        "topology_hash": topology_hash,
+                        "group_binding_hash": group_hash,
+                        "scheduler_id": scheduler_id,
+                        "coordinator_lease_id": f"lease-{scheduler_id}",
+                        "worktree_identity": f"wt-{scheduler_id}",
+                        "writer_slot": writer_slot,
+                        "read_only": False,
+                    },
+                }
+            )
+    actions.append(
+        {
+            "kind": "codex.spawn_agent",
+            "task_id": "reader-a",
+            "task_contract": {
+                "task_id": "reader-a",
+                "kind": "design",
+                "design_for_task_id": "scheduler-a-writer-1",
+            },
+            "relay_host_scheduler_slot": {
+                "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+                "plan_hash": plan_hash,
+                "topology_hash": topology_hash,
+                "group_binding_hash": _hash("capacity-scheduler-a"),
+                "scheduler_id": "scheduler-a",
+                "coordinator_lease_id": "lease-scheduler-a",
+                "worktree_identity": "wt-scheduler-a",
+                "writer_slot": None,
+                "read_only": True,
+            },
+        }
+    )
+    capacity: dict[str, int] = {"writer_capacity": 9, "reader_capacity": 0}
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        topology_resolver=lambda _slot: tuple(facts),
+        host_action_capacity_resolver=lambda: capacity,
+    )
+    try:
+        assert session.admit_relay_actions(actions) is False
+        capacity["reader_capacity"] = 1
+        assert session.admit_relay_actions(actions) is True
     finally:
         child.close()
         host.close()
