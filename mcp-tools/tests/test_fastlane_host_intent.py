@@ -291,6 +291,83 @@ def _refresh_predecessor_and_assignment(candidate: dict[str, Any]) -> str:
     return assignment["predecessor"]["predecessor_hash"]
 
 
+def _topology_group(
+    scheduler_id: str,
+    worktree_identity: str,
+    writer_task_ids: list[str],
+    prewarm_task_ids: list[str],
+) -> dict[str, Any]:
+    return _with_binding(
+        {
+            "scheduler_id": scheduler_id,
+            "coordinator_lease_id": f"lease-{scheduler_id}",
+            "worktree_identity": worktree_identity,
+            "writer_task_ids": writer_task_ids,
+            "prewarm_task_ids": prewarm_task_ids,
+        },
+        "group_binding_hash",
+    )
+
+
+def _topology() -> dict[str, Any]:
+    candidate = {
+        "schema": "2718lab-devkit/scheduler-topology-v1",
+        "plan_hash": _hash("topology-plan"),
+        "groups": [
+            _topology_group("scheduler-a", "wt-a", ["writer-a"], ["prewarm-a"]),
+            _topology_group("scheduler-b", "wt-b", ["writer-b"], ["prewarm-b"]),
+        ],
+    }
+    return _with_binding(candidate, "topology_hash")
+
+
+def test_topology_v1_parser_keeps_only_opaque_auditable_group_bindings() -> None:
+    module = _module()
+
+    parsed = module.parse_scheduler_topology_intent(_topology())
+
+    assert parsed.schema == "2718lab-devkit/scheduler-topology-v1"
+    assert parsed.groups[0].scheduler_id == "scheduler-a"
+    assert parsed.groups[0].coordinator_lease_id == "lease-scheduler-a"
+    assert parsed.groups[0].worktree_identity == "wt-a"
+    assert parsed.groups[0].writer_task_ids == ("writer-a",)
+    assert parsed.groups[0].prewarm_task_ids == ("prewarm-a",)
+    assert "path" not in repr(parsed).lower()
+    assert "quota" not in repr(parsed).lower()
+    assert "model" not in repr(parsed).lower()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda topology: topology["groups"][0].__setitem__(
+            "writer_task_ids", ["writer-a", "writer-a-2", "writer-a-3", "writer-a-4"]
+        ),
+        lambda topology: topology["groups"].append(
+            _topology_group("scheduler-c", "wt-c", ["writer-a"], [])
+        ),
+        lambda topology: topology["groups"][0].__setitem__(
+            "prewarm_task_ids", ["writer-a"]
+        ),
+        lambda topology: topology["groups"][0].__setitem__(
+            "worktree_identity", "G:/raw/worktree/path"
+        ),
+    ],
+)
+def test_topology_v1_rejects_writer_conflicts_and_nonopaque_worktree_data(
+    mutate: Any,
+) -> None:
+    module = _module()
+    topology = _topology()
+    mutate(topology)
+    topology["groups"] = [
+        _with_binding(group, "group_binding_hash") for group in topology["groups"]
+    ]
+    topology = _with_binding(topology, "topology_hash")
+
+    assert module.parse_scheduler_topology_intent(topology) is module.NO_SAFE_WORK
+
+
 def test_public_validation_is_hard_gated_for_every_public_expectation() -> None:
     module = _module()
     candidate = _intent()

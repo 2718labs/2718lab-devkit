@@ -79,6 +79,40 @@ class HostUnavailableFacts:
 
 
 @dataclass(frozen=True)
+class HostTopologyGroupFact:
+    """Host-attested capacity for one opaque scheduler/worktree identity."""
+
+    scheduler_id: str
+    worktree_identity: str
+    attested_capacity: int
+    attestation_hash: str
+
+
+@dataclass(frozen=True)
+class HostResolvedTopologyGroup:
+    """Auditable, non-dispatching group result without paths or task leases."""
+
+    scheduler_id: str
+    coordinator_lease_id: str
+    worktree_identity: str
+    writer_task_ids: tuple[str, ...]
+    prewarm_task_ids: tuple[str, ...]
+    attested_capacity: int
+    attestation_hash: str
+
+
+@dataclass(frozen=True)
+class HostResolvedSchedulerTopology:
+    """Private host resolution of an already parsed Topology V1 plan."""
+
+    schema: str
+    plan_hash: str
+    topology_hash: str
+    groups: tuple[HostResolvedTopologyGroup, ...]
+    audit_binding_hash: str
+
+
+@dataclass(frozen=True)
 class _CapabilityRecord:
     """Process-private binding retained for terminal validation only."""
 
@@ -111,6 +145,7 @@ class _CompilerInvocationBinding:
 CompilerInvocationResolver: TypeAlias = Callable[
     [str], _CompilerInvocationBinding | None
 ]
+TopologyFactResolver: TypeAlias = Callable[[object], object]
 
 
 @dataclass(frozen=True)
@@ -144,6 +179,7 @@ class HostSession:
         clock: Callable[[], float],
         compiler_evidence_provider: CompilerEvidenceProvider | None = None,
         compiler_invocation_resolver: CompilerInvocationResolver | None = None,
+        topology_fact_resolver: TopologyFactResolver | None = None,
     ) -> None:
         self._bridge = bridge
         self._compiler_evidence_provider = (
@@ -153,6 +189,9 @@ class HostSession:
             compiler_invocation_resolver
             if callable(compiler_invocation_resolver)
             else None
+        )
+        self._topology_fact_resolver = (
+            topology_fact_resolver if callable(topology_fact_resolver) else None
         )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
@@ -318,6 +357,96 @@ class HostSession:
             if now >= material.expires_at:
                 return _NO_SAFE_WORK
             return material
+
+    def resolve_scheduler_topology(
+        self, topology: object
+    ) -> HostResolvedSchedulerTopology | str:
+        """Bind an opaque V1 plan to host-attested capacity, never dispatching it."""
+
+        from .fastlane_host_intent import ParsedSchedulerTopologyIntent
+
+        with self._compiler_evidence_lock:
+            resolver = self._topology_fact_resolver
+            if (
+                self._closed
+                or self._frozen
+                or not self.is_available
+                or type(topology) is not ParsedSchedulerTopologyIntent
+                or resolver is None
+            ):
+                return _NO_SAFE_WORK
+            try:
+                raw_facts = resolver(topology)
+                if type(raw_facts) is not tuple or len(raw_facts) != len(topology.groups):
+                    raise ValueError("topology facts are invalid")
+                facts_by_scheduler: dict[str, HostTopologyGroupFact] = {}
+                for fact in raw_facts:
+                    if (
+                        type(fact) is not HostTopologyGroupFact
+                        or _IDENTIFIER.fullmatch(fact.scheduler_id) is None
+                        or _IDENTIFIER.fullmatch(fact.worktree_identity) is None
+                        or not _is_hash(fact.attestation_hash)
+                        or not 1 <= fact.attested_capacity <= 9
+                        or fact.scheduler_id in facts_by_scheduler
+                    ):
+                        raise ValueError("topology fact is invalid")
+                    facts_by_scheduler[fact.scheduler_id] = fact
+                groups: list[HostResolvedTopologyGroup] = []
+                total_active_tasks = 0
+                for group in topology.groups:
+                    fact = facts_by_scheduler.get(group.scheduler_id)
+                    active_tasks = len(group.writer_task_ids) + len(
+                        group.prewarm_task_ids
+                    )
+                    if (
+                        fact is None
+                        or fact.worktree_identity != group.worktree_identity
+                        or len(group.writer_task_ids) > 3
+                        or active_tasks > fact.attested_capacity
+                    ):
+                        raise ValueError("topology capacity is invalid")
+                    total_active_tasks += active_tasks
+                    groups.append(
+                        HostResolvedTopologyGroup(
+                            scheduler_id=group.scheduler_id,
+                            coordinator_lease_id=group.coordinator_lease_id,
+                            worktree_identity=group.worktree_identity,
+                            writer_task_ids=group.writer_task_ids,
+                            prewarm_task_ids=group.prewarm_task_ids,
+                            attested_capacity=fact.attested_capacity,
+                            attestation_hash=fact.attestation_hash,
+                        )
+                    )
+                if total_active_tasks > 9:
+                    raise ValueError("topology exceeds host capacity")
+                audit_binding_hash = _hash(
+                    {
+                        "schema": topology.schema,
+                        "plan_hash": topology.plan_hash,
+                        "topology_hash": topology.topology_hash,
+                        "groups": [
+                            {
+                                "scheduler_id": group.scheduler_id,
+                                "coordinator_lease_id": group.coordinator_lease_id,
+                                "worktree_identity": group.worktree_identity,
+                                "writer_task_ids": group.writer_task_ids,
+                                "prewarm_task_ids": group.prewarm_task_ids,
+                                "attested_capacity": group.attested_capacity,
+                                "attestation_hash": group.attestation_hash,
+                            }
+                            for group in groups
+                        ],
+                    }
+                )
+            except Exception:
+                return _NO_SAFE_WORK
+            return HostResolvedSchedulerTopology(
+                schema=topology.schema,
+                plan_hash=topology.plan_hash,
+                topology_hash=topology.topology_hash,
+                groups=tuple(groups),
+                audit_binding_hash=audit_binding_hash,
+            )
 
     def declare_routes(
         self, routes: tuple[HostRoute, ...] | list[HostRoute]

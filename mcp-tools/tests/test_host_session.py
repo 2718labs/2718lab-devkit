@@ -88,6 +88,7 @@ def _compiler_session(
     *,
     provider: object,
     resolver: object | None = None,
+    topology_resolver: object | None = None,
     clock: object | None = None,
 ) -> tuple[host_session.HostSession, InheritedHandleHostBridge, InheritedHandleHostBridge]:
     child, host = _pipe_pair()
@@ -100,8 +101,114 @@ def _compiler_session(
             if resolver is None
             else resolver
         ),
+        topology_fact_resolver=topology_resolver,
     )
     return session, child, host
+
+
+def _with_binding(value: dict[str, object], field: str) -> dict[str, object]:
+    bound = dict(value)
+    bound.pop(field, None)
+    bound[field] = _hash(bound)
+    return bound
+
+
+def _topology() -> object:
+    groups = []
+    for scheduler_id, worktree_identity, writers, prewarm in (
+        ("scheduler-a", "wt-a", ["writer-a"], ["prewarm-a"]),
+        ("scheduler-b", "wt-b", ["writer-b"], []),
+    ):
+        groups.append(
+            _with_binding(
+                {
+                    "scheduler_id": scheduler_id,
+                    "coordinator_lease_id": f"lease-{scheduler_id}",
+                    "worktree_identity": worktree_identity,
+                    "writer_task_ids": writers,
+                    "prewarm_task_ids": prewarm,
+                },
+                "group_binding_hash",
+            )
+        )
+    from devkit_runtime.fastlane_host_intent import parse_scheduler_topology_intent
+
+    return parse_scheduler_topology_intent(
+        _with_binding(
+            {
+                "schema": "2718lab-devkit/scheduler-topology-v1",
+                "plan_hash": _hash({"plan": "topology"}),
+                "groups": groups,
+            },
+            "topology_hash",
+        )
+    )
+
+
+def test_topology_resolution_only_returns_attested_opaque_worktree_capacity() -> None:
+    topology = _topology()
+
+    def resolver(_topology: object) -> object:
+        return (
+            host_session.HostTopologyGroupFact(
+                scheduler_id="scheduler-a",
+                worktree_identity="wt-a",
+                attested_capacity=2,
+                attestation_hash=_hash({"attestation": "a"}),
+            ),
+            host_session.HostTopologyGroupFact(
+                scheduler_id="scheduler-b",
+                worktree_identity="wt-b",
+                attested_capacity=1,
+                attestation_hash=_hash({"attestation": "b"}),
+            ),
+        )
+
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        topology_resolver=resolver,
+    )
+    try:
+        resolved = session.resolve_scheduler_topology(topology)
+    finally:
+        child.close()
+        host.close()
+
+    assert isinstance(resolved, host_session.HostResolvedSchedulerTopology)
+    assert resolved.groups[0].worktree_identity == "wt-a"
+    assert resolved.groups[0].attested_capacity == 2
+    assert resolved.groups[0].writer_task_ids == ("writer-a",)
+    assert resolved.groups[0].prewarm_task_ids == ("prewarm-a",)
+    assert resolved.audit_binding_hash.startswith(_HASH_PREFIX)
+    assert "path" not in repr(resolved).lower()
+    assert "quota" not in repr(resolved).lower()
+    assert "model" not in repr(resolved).lower()
+
+
+def test_topology_resolution_rejects_prewarm_when_it_exceeds_host_capacity() -> None:
+    topology = _topology()
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        topology_resolver=lambda _topology: (
+        host_session.HostTopologyGroupFact(
+            scheduler_id="scheduler-a",
+            worktree_identity="wt-a",
+            attested_capacity=1,
+            attestation_hash=_hash({"attestation": "a"}),
+        ),
+        host_session.HostTopologyGroupFact(
+            scheduler_id="scheduler-b",
+            worktree_identity="wt-b",
+            attested_capacity=1,
+            attestation_hash=_hash({"attestation": "b"}),
+        ),
+        ),
+    )
+    try:
+        assert session.resolve_scheduler_topology(topology) == "NO_SAFE_WORK"
+    finally:
+        child.close()
+        host.close()
 
 
 def test_host_session_missing_or_invalid_inherited_bridge_stays_unavailable(
