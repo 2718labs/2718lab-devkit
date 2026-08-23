@@ -203,6 +203,9 @@ class RelayService:
         {"review", "rebase", "reject", "integrate", "approve_readonly"}
     )
     _RECOVERY_ACTIONS = frozenset({"stale_recovery", "interruption_recovery"})
+    _START_ABORT_CODES = frozenset(
+        {"RELAY_HOST_SESSION_UNAVAILABLE", "RELAY_HOST_ACTION_REJECTED"}
+    )
     _MAX_TASKS = 64
     _MAX_DEPENDENCY_EDGES = 1_520
     _MAX_CONFLICT_EDGES = 2_016
@@ -330,6 +333,40 @@ class RelayService:
             directive,
             expected_schedule_version=expected_schedule_version,
             idempotency_key=idempotency_key,
+        )
+
+    def start_attempt(self, idempotency_key: object) -> dict[str, object]:
+        """Read private start-attempt state without widening the public result."""
+
+        if type(idempotency_key) is not str:
+            raise RelayError("RELAY_REQUEST_INVALID")
+        return self._call(self._store.start_attempt, idempotency_key)
+
+    def mark_start_admitted(self, attempt_id: object) -> dict[str, object]:
+        """Map one private prepared-to-admitted Store CAS."""
+
+        return self._call(
+            self._store.mark_start_admitted, self._identifier(attempt_id)
+        )
+
+    def mark_start_delivered(self, attempt_id: object) -> dict[str, object]:
+        """Map one private admitted-to-delivered Store CAS."""
+
+        return self._call(
+            self._store.mark_start_delivered, self._identifier(attempt_id)
+        )
+
+    def abort_start_attempt(
+        self, attempt_id: object, *, error_code: object
+    ) -> dict[str, object]:
+        """Map one private prepared-only Store compensation."""
+
+        if type(error_code) is not str or error_code not in self._START_ABORT_CODES:
+            raise RelayError("RELAY_REQUEST_INVALID")
+        return self._call(
+            self._store.abort_start_attempt,
+            self._identifier(attempt_id),
+            error_code=error_code,
         )
 
     def recover(self, request: Mapping[str, Any]) -> dict[str, object]:
@@ -510,8 +547,13 @@ class RelayService:
             receipt = reservation.receipt
             validate_integration_proof(proof_id, expectation, receipt)
             prepared = self._finalization_call(
-                self._store.prepare_finalization,
+                self._store.prepare_integration_finalization,
+                candidate_id=candidate_id,
+                proof_id=proof_id,
+                expectation=expectation,
+                receipt=receipt,
                 fence=reservation.fence,
+                **sol_fields,
             )
             if prepared.state != "prepared":
                 raise RelayError("RELAY_FINALIZATION_PENDING")

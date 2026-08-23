@@ -328,6 +328,23 @@ class _RecordingCapabilityBroker:
         return object()
 
 
+class _RecordingHostAdmission:
+    def __init__(self, *, admitted: bool) -> None:
+        self._admitted = admitted
+        self.actions: list[dict[str, object]] = []
+        self.calls = 0
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def admit_relay_actions(self, actions: object) -> bool:
+        assert isinstance(actions, list)
+        self.calls += 1
+        self.actions = [dict(action) for action in actions]
+        return self._admitted
+
+
 class ProofRegistry:
     """Host-ledger double used by lifecycle and proof-boundary tests."""
 
@@ -662,6 +679,127 @@ def _capacity_plan(capacity: int) -> dict[str, object]:
         ),
         capacity=capacity,
     )
+
+
+def _host_bound_plan() -> dict[str, object]:
+    writer = task(
+        "writer-host-bound",
+        write_scope=[{"path": "mcp-tools/host-bound.py", "kind": "file"}],
+    )
+    writer.update(
+        {
+            "stage": "a1_writer",
+            "design_for_task_id": None,
+            "split_policy": None,
+            "split_parent_task_id": None,
+            "split_depth": 0,
+            "split_verdict": None,
+        }
+    )
+    submitted = plan(writer, capacity=1)
+    submitted.update(
+        {
+            "schema": "2718lab-devkit/relay-plan-v3",
+            "project_binding": {
+                "schema": "2718lab-devkit/project-binding-v1",
+                "mode": "indexed",
+            },
+            "queues": {
+                "writer_ready": ["writer-host-bound"],
+                "design_ready": [],
+                "prewarm_ready": [],
+                "bootstrap_index": [],
+                "review_integration": [],
+                "terminal": [],
+                "unsplittable": [],
+            },
+            "scheduler_topology": {
+                "schema": "2718lab-devkit/scheduler-topology-v1",
+                "max_writers_per_scheduler": 3,
+                "max_parallel_writers": 9,
+                "groups": [
+                    {
+                        "scheduler_id": "scheduler-host-bound",
+                        "coordinator_lease_id": "lease-host-bound",
+                        "worktree_identity": "worktree-host-bound",
+                        "writer_task_ids": ["writer-host-bound"],
+                        "prewarm_task_ids": [],
+                    }
+                ],
+            },
+        }
+    )
+    return _rehash(submitted)
+
+
+@pytest.mark.parametrize(
+    ("host_session", "error_code"),
+    [
+        (None, "RELAY_HOST_SESSION_UNAVAILABLE"),
+        (_RecordingHostAdmission(admitted=False), "RELAY_HOST_ACTION_REJECTED"),
+    ],
+)
+def test_runtime_aborts_prepared_start_when_host_cannot_admit(
+    tmp_path: Path,
+    host_session: _RecordingHostAdmission | None,
+    error_code: str,
+) -> None:
+    relay, store = service(tmp_path)
+    broker = _RecordingCapabilityBroker()
+    runtime = RelayRuntime(
+        relay,
+        capability_broker=broker,
+        host_session=host_session,
+    )
+
+    with pytest.raises(RelayError) as caught:
+        runtime.start(
+            {
+                "mode": "create",
+                "plan": _host_bound_plan(),
+                "idempotency_key": f"host-abort-{error_code.lower()}",
+            }
+        )
+
+    assert caught.value.code == error_code
+    status = store.status("relay-runtime-v3")
+    assert status["outstanding_action_ids"] == []
+    assert all(lease["state"] != "active" for lease in status["leases"])
+    assert broker.deliveries == []
+
+
+def test_runtime_recovers_a_crashed_prepared_start_and_delivers_once(
+    tmp_path: Path,
+) -> None:
+    request = {
+        "mode": "create",
+        "plan": _host_bound_plan(),
+        "idempotency_key": "crashed-prepared-start",
+    }
+    crashed_relay, crashed_store = service(tmp_path)
+    crashed_relay.start(request)
+    crashed_store.close()
+
+    relay, store = service(tmp_path)
+    broker = _RecordingCapabilityBroker()
+    host = _RecordingHostAdmission(admitted=True)
+    runtime = RelayRuntime(relay, capability_broker=broker, host_session=host)
+
+    result = runtime.start(request)
+    repeated = runtime.start(request)
+
+    assert repeated == result
+    assert set(result) == {
+        "schema",
+        "workflow_id",
+        "run_id",
+        "schedule_version",
+        "host_actions",
+    }
+    assert host.calls == 1
+    assert len(broker.deliveries) == 1
+    attempt = store.start_attempt("crashed-prepared-start")
+    assert attempt["state"] == "delivered"
 
 
 @pytest.mark.parametrize("capacity", [1, 2, 3])

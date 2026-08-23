@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,213 @@ def _plan() -> dict[str, object]:
     return plan
 
 
+def _plan_with_prepared_prewarm() -> dict[str, object]:
+    submitted = deepcopy(_plan())
+    prewarm = _task("prewarm-0")
+    prewarm.update(
+        {
+            "kind": "prewarm",
+            "stage": "a3_prewarm",
+            "write_scope": [],
+            "route": {
+                "route_class": "luna_medium",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "medium",
+            },
+            "prewarm_for_task_id": "writer-0",
+        }
+    )
+    tasks = submitted["tasks"]
+    assert isinstance(tasks, list)
+    tasks.append(prewarm)
+    tasks.sort(key=lambda item: str(item["task_id"]))
+    topology = submitted["scheduler_topology"]
+    assert isinstance(topology, dict)
+    groups = topology["groups"]
+    assert isinstance(groups, list)
+    groups[0]["prewarm_task_ids"] = ["prewarm-0"]
+    submitted["plan_hash"] = canonical_hash(
+        {key: value for key, value in submitted.items() if key != "plan_hash"}
+    )
+    return submitted
+
+
+def test_start_attempt_abort_is_idempotent_and_restores_writer_prewarm_semantics(
+    tmp_path: Path,
+) -> None:
+    store = RelayStore(tmp_path / "relay.sqlite3")
+    created = store.start_create(
+        _plan_with_prepared_prewarm(), idempotency_key="abort-prepared-start"
+    )
+
+    assert set(created) == {
+        "schema",
+        "workflow_id",
+        "run_id",
+        "schedule_version",
+        "host_actions",
+    }
+    assert store.start_create(
+        _plan_with_prepared_prewarm(), idempotency_key="abort-prepared-start"
+    ) == created
+    attempt = store.start_attempt("abort-prepared-start")
+    assert attempt["state"] == "prepared"
+
+    receipt = store.abort_start_attempt(
+        str(attempt["attempt_id"]),
+        error_code="RELAY_HOST_ACTION_REJECTED",
+    )
+    fingerprint = store.database_fingerprint()
+
+    assert (
+        store.abort_start_attempt(
+            str(attempt["attempt_id"]),
+            error_code="RELAY_HOST_ACTION_REJECTED",
+        )
+        == receipt
+    )
+    assert store.database_fingerprint() == fingerprint
+    status = store.status("topology-store-v1")
+    states = {str(task["task_id"]): task["state"] for task in status["tasks"]}
+    assert states["writer-0"] == "ready"
+    assert states["prewarm-0"] == "prepared"
+    assert status["outstanding_action_ids"] == []
+    assert all(lease["state"] != "active" for lease in status["leases"])
+    with pytest.raises(RelayStoreError, match="RELAY_STATE_STALE"):
+        store.mark_start_admitted(str(attempt["attempt_id"]))
+
+
+def test_admitted_and_delivered_start_attempts_cannot_be_aborted(tmp_path: Path) -> None:
+    store = RelayStore(tmp_path / "relay.sqlite3")
+    store.start_create(_plan(), idempotency_key="admitted-start")
+    attempt = store.start_attempt("admitted-start")
+
+    admitted = store.mark_start_admitted(str(attempt["attempt_id"]))
+    assert admitted["state"] == "admitted"
+    with pytest.raises(RelayStoreError, match="RELAY_STATE_STALE"):
+        store.abort_start_attempt(
+            str(attempt["attempt_id"]), error_code="RELAY_HOST_ACTION_REJECTED"
+        )
+
+    delivered = store.mark_start_delivered(str(attempt["attempt_id"]))
+    assert delivered["state"] == "delivered"
+    with pytest.raises(RelayStoreError, match="RELAY_STATE_STALE"):
+        store.abort_start_attempt(
+            str(attempt["attempt_id"]), error_code="RELAY_HOST_ACTION_REJECTED"
+        )
+
+
+def test_schema_eight_migrates_start_attempt_journal_in_one_open(tmp_path: Path) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.start_create(_plan(), idempotency_key="v8-journal-seed")
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE relay_v3_start_attempts")
+    connection.execute(
+        "UPDATE relay_v3_schema_metadata SET value = '8' WHERE key = 'schema_version'"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = RelayStore(database)
+
+    assert migrated.status("topology-store-v1")["workflow_id"] == "topology-store-v1"
+    assert migrated._require_connection().execute(
+        "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
+    ).fetchone()[0] == "9"
+    assert migrated._require_connection().execute(
+        "SELECT COUNT(*) FROM relay_v3_start_attempts"
+    ).fetchone()[0] == 0
+
+
+def test_v8_shape_drift_fails_before_start_attempt_migration_mutates_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE relay_v3_start_attempts")
+    connection.execute("ALTER TABLE relay_v3_actions ADD COLUMN forged TEXT")
+    connection.execute(
+        "UPDATE relay_v3_schema_metadata SET value = '8' WHERE key = 'schema_version'"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RelayStoreError, match="RELAY_SCHEMA_INCOMPATIBLE"):
+        RelayStore(database)
+
+    unchanged = sqlite3.connect(database)
+    assert unchanged.execute(
+        "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
+    ).fetchone()[0] == "8"
+    assert unchanged.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'relay_v3_start_attempts'"
+    ).fetchone()[0] == 0
+    unchanged.close()
+
+
+def test_v9_missing_start_attempt_table_fails_closed_without_repair(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE relay_v3_start_attempts")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RelayStoreError, match="RELAY_SCHEMA_INCOMPATIBLE"):
+        RelayStore(database)
+
+    unchanged = sqlite3.connect(database)
+    assert unchanged.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'relay_v3_start_attempts'"
+    ).fetchone()[0] == 0
+    unchanged.close()
+
+
+def test_v9_start_attempt_constraint_drift_fails_closed(tmp_path: Path) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("DROP TABLE relay_v3_start_attempts")
+    connection.execute(
+        """
+        CREATE TABLE relay_v3_start_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            action_ids_json TEXT NOT NULL,
+            compensation_json TEXT NOT NULL,
+            state TEXT NOT NULL,
+            error_code TEXT,
+            receipt_json TEXT,
+            attempt_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (idempotency_key)
+                REFERENCES relay_v3_idempotency(idempotency_key)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RelayStoreError, match="RELAY_SCHEMA_INCOMPATIBLE"):
+        RelayStore(database)
+
+
 def test_start_create_persists_topology_groups_and_writer_slots(tmp_path: Path) -> None:
     store = RelayStore(tmp_path / "relay.sqlite3")
 
@@ -173,7 +381,7 @@ def test_start_create_rejects_topology_not_bound_into_plan_hash(tmp_path: Path) 
     assert raised.value.code == "RELAY_TOPOLOGY_INVALID"
 
 
-def test_schema_six_migrates_to_eight_but_unknown_version_is_rejected(
+def test_schema_six_migrates_to_nine_but_unknown_version_is_rejected(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "relay.sqlite3"
@@ -194,13 +402,13 @@ def test_schema_six_migrates_to_eight_but_unknown_version_is_rejected(
             "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
         )
         .fetchone()[0]
-        == "8"
+        == "9"
     )
     store.close()
 
     connection = sqlite3.connect(database)
     connection.execute(
-        "UPDATE relay_v3_schema_metadata SET value = '9' WHERE key = 'schema_version'"
+        "UPDATE relay_v3_schema_metadata SET value = '10' WHERE key = 'schema_version'"
     )
     connection.commit()
     connection.close()
@@ -212,9 +420,9 @@ def test_schema_six_migrates_to_eight_but_unknown_version_is_rejected(
 
 
 @pytest.mark.parametrize(
-    ("old_version", "expected_version"), [("5", "8"), ("6", "8"), ("7", "8")]
+    ("old_version", "expected_version"), [("5", "9"), ("6", "9"), ("7", "9")]
 )
-def test_known_legacy_schema_versions_reach_eight_in_one_constructor(
+def test_known_legacy_schema_versions_reach_nine_in_one_constructor(
     tmp_path: Path, old_version: str, expected_version: str
 ) -> None:
     database = tmp_path / f"relay-{old_version}.sqlite3"

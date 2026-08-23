@@ -708,12 +708,27 @@ class RelayRuntime:
             raise RelayError(_relay_plan_error_code(error.code)) from None
 
     def start(self, request: Mapping[str, object]) -> dict[str, object]:
-        """Gate all Relay writes on broker availability, then deliver privately."""
+        """Journal start, admit at Host, then deliver private capabilities."""
 
         broker = self._available_broker()
         if broker is None:
             raise RelayError("RELAY_CAPABILITY_BROKER_UNAVAILABLE")
         result = self._relay_service.start(request)
+        attempt = self._relay_service.start_attempt(request.get("idempotency_key"))
+        attempt_id = attempt.get("attempt_id")
+        attempt_state = attempt.get("state")
+        if type(attempt_id) is not str or type(attempt_state) is not str:
+            raise RelayError("RELAY_CAPABILITY_BROKER_UNAVAILABLE")
+        if attempt_state == "aborted":
+            error_code = attempt.get("error_code")
+            if type(error_code) is not str or error_code not in {
+                "RELAY_HOST_SESSION_UNAVAILABLE",
+                "RELAY_HOST_ACTION_REJECTED",
+            }:
+                raise RelayError("RELAY_CAPABILITY_BROKER_UNAVAILABLE")
+            raise RelayError(str(error_code))
+        if attempt_state == "delivered":
+            return result
         try:
             actions = result["host_actions"]
             if type(actions) is not list:
@@ -723,10 +738,25 @@ class RelayRuntime:
                 for action in actions
                 if type(action) is dict and "relay_host_scheduler_slot" in action
             ]
-            if admitted_actions:
-                self._admit_host_actions(admitted_actions)
+            if attempt_state == "prepared":
+                try:
+                    if admitted_actions:
+                        self._admit_host_actions(admitted_actions)
+                except RelayError as error:
+                    if error.code in {
+                        "RELAY_HOST_SESSION_UNAVAILABLE",
+                        "RELAY_HOST_ACTION_REJECTED",
+                    }:
+                        self._relay_service.abort_start_attempt(
+                            attempt_id, error_code=error.code
+                        )
+                    raise
+                self._relay_service.mark_start_admitted(attempt_id)
+            elif attempt_state != "admitted":
+                raise TypeError
             for action in actions:
                 self._deliver_worker_capabilities(broker, action)
+            self._relay_service.mark_start_delivered(attempt_id)
         except RelayError:
             raise
         except (HostBridgeError, TypeError, ValueError, KeyError):

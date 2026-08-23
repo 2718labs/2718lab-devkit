@@ -1035,7 +1035,7 @@ def test_cleanup_ledger_migrates_only_known_v5_metadata_and_rejects_unknown_sche
     connection = migrated._require_connection()
     assert connection.execute(
         "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
-    ).fetchone()[0] == "8"
+    ).fetchone()[0] == "9"
     assert connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'relay_v3_cleanup_ledger'"
     ).fetchone() is not None

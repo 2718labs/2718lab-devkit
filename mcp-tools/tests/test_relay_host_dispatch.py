@@ -18,6 +18,8 @@ class _RelayService:
 
     def __init__(self) -> None:
         self.capability_issues: list[dict[str, object]] = []
+        self.events: list[str] = []
+        self.attempt_state = "prepared"
         self.host_actions = [
             {
                 "action_id": "action-a",
@@ -35,7 +37,29 @@ class _RelayService:
         ]
 
     def start(self, _request: object) -> dict[str, object]:
+        self.events.append("start")
         return {"host_actions": [dict(action) for action in self.host_actions]}
+
+    def start_attempt(self, _idempotency_key: object) -> dict[str, object]:
+        self.events.append("load_attempt")
+        return {"attempt_id": "attempt-a", "state": self.attempt_state}
+
+    def mark_start_admitted(self, _attempt_id: object) -> dict[str, object]:
+        self.events.append("mark_admitted")
+        self.attempt_state = "admitted"
+        return {"attempt_id": "attempt-a", "state": self.attempt_state}
+
+    def mark_start_delivered(self, _attempt_id: object) -> dict[str, object]:
+        self.events.append("mark_delivered")
+        self.attempt_state = "delivered"
+        return {"attempt_id": "attempt-a", "state": self.attempt_state}
+
+    def abort_start_attempt(
+        self, _attempt_id: object, *, error_code: object
+    ) -> dict[str, object]:
+        self.events.append(f"abort:{error_code}")
+        self.attempt_state = "aborted"
+        return {"attempt_id": "attempt-a", "state": self.attempt_state}
 
     def issue_worker_capability(
         self,
@@ -59,7 +83,8 @@ class _RelayService:
 
 
 class _Broker:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
         self.deliveries: list[dict[str, object]] = []
 
     @property
@@ -67,12 +92,14 @@ class _Broker:
         return True
 
     def prepare_capability(self, **kwargs: object) -> object:
+        self._events.append("broker")
         self.deliveries.append(dict(kwargs))
         return object()
 
 
 class _HostAdmission:
-    def __init__(self, *, admitted: bool) -> None:
+    def __init__(self, events: list[str], *, admitted: bool) -> None:
+        self._events = events
         self._admitted = admitted
         self.actions: list[dict[str, object]] = []
 
@@ -81,6 +108,7 @@ class _HostAdmission:
         return True
 
     def admit_relay_actions(self, actions: object) -> bool:
+        self._events.append("host")
         if type(actions) is not list:
             return False
         self.actions = [dict(action) for action in actions if type(action) is dict]
@@ -89,8 +117,8 @@ class _HostAdmission:
 
 def test_runtime_host_admission_precedes_all_capability_delivery() -> None:
     rejected_relay = _RelayService()
-    rejected_broker = _Broker()
-    rejected_host = _HostAdmission(admitted=False)
+    rejected_broker = _Broker(rejected_relay.events)
+    rejected_host = _HostAdmission(rejected_relay.events, admitted=False)
     rejected_runtime = RelayRuntime(
         rejected_relay,
         capability_broker=rejected_broker,
@@ -98,22 +126,39 @@ def test_runtime_host_admission_precedes_all_capability_delivery() -> None:
     )
 
     with pytest.raises(RelayError) as rejected:
-        rejected_runtime.start({"mode": "create"})
+        rejected_runtime.start(
+            {"mode": "create", "idempotency_key": "rejected-attempt"}
+        )
 
     assert rejected.value.code == "RELAY_HOST_ACTION_REJECTED"
     assert rejected_host.actions == [rejected_relay.host_actions[0]]
     assert rejected_relay.capability_issues == []
     assert rejected_broker.deliveries == []
+    assert rejected_relay.events == [
+        "start",
+        "load_attempt",
+        "host",
+        "abort:RELAY_HOST_ACTION_REJECTED",
+    ]
 
     admitted_relay = _RelayService()
-    admitted_broker = _Broker()
-    admitted_host = _HostAdmission(admitted=True)
+    admitted_broker = _Broker(admitted_relay.events)
+    admitted_host = _HostAdmission(admitted_relay.events, admitted=True)
     result = RelayRuntime(
         admitted_relay,
         capability_broker=admitted_broker,
         host_session=admitted_host,
-    ).start({"mode": "create"})
+    ).start({"mode": "create", "idempotency_key": "admitted-attempt"})
 
     assert admitted_host.actions == [result["host_actions"][0]]
     assert len(admitted_relay.capability_issues) == 10
     assert len(admitted_broker.deliveries) == 2
+    assert admitted_relay.events == [
+        "start",
+        "load_attempt",
+        "host",
+        "mark_admitted",
+        "broker",
+        "broker",
+        "mark_delivered",
+    ]
