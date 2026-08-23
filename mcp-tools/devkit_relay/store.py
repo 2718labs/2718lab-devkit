@@ -109,7 +109,7 @@ class RelayFinalizationConflict(RelayStoreError):
 class RelayStore:
     """Own the atomic durable state behind Relay's five public tools."""
 
-    _SCHEMA_VERSION = 9
+    _SCHEMA_VERSION = 10
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
     _SCHEMA_AUTHORITY_DIGESTS = {
         "5": "22119850baf3f16e2ca85ae20093bbfa086170c21d22c75ff5ba2e8d59d8536e",
@@ -117,6 +117,7 @@ class RelayStore:
         "7": "a48a1993323a4d4c2dc6178b53d12fb23ad3f27bdb9c7133dff922f10be4885e",
         "8": "b2ba7afeee026f247e8930a729d0c45b59b19baa103327976158b3bd5d1d5d94",
         "9": "2e66fadf0b90a77290c856d1f3e3d3532c1157930ef3dc5cdb149ef103f8f7be",
+        "10": "4a743877dc99e00e6f16e0d6ec7b9d944287ab3f8c6275493b65401bd48f014c",
     }
     _SCHEMA_TABLE_INFO = {
         "relay_v3_actions": (
@@ -295,6 +296,21 @@ class RelayStore:
             ("attempt_version", "INTEGER", 1, 0),
             ("created_at", "TEXT", 1, 0),
             ("updated_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_start_delivery_journal": (
+            ("attempt_id", "TEXT", 1, 1),
+            ("action_id", "TEXT", 1, 2),
+            ("workflow_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("epoch", "INTEGER", 1, 0),
+            ("endpoint", "TEXT", 1, 0),
+            ("issued_at", "INTEGER", 1, 0),
+            ("expires_at", "INTEGER", 1, 0),
+            ("key_id", "TEXT", 1, 0),
+            ("bundle_hash", "TEXT", 1, 0),
+            ("receipt_hash", "TEXT", 0, 0),
+            ("delivered_at", "TEXT", 0, 0),
+            ("delivery_version", "INTEGER", 1, 0),
         ),
         "relay_v3_schema_metadata": (
             ("key", "TEXT", 0, 1),
@@ -525,6 +541,26 @@ class RelayStore:
                 ),
             }
         ),
+        "relay_v3_start_delivery_journal": frozenset(
+            {
+                (
+                    ("action_id",),
+                    "relay_v3_actions",
+                    ("action_id",),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+                (
+                    ("attempt_id",),
+                    "relay_v3_start_attempts",
+                    ("attempt_id",),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
         "relay_v3_tasks": frozenset(
             {
                 (
@@ -576,6 +612,10 @@ class RelayStore:
                 self._connection = sqlite3.connect(self._database, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
         try:
+            if _prepared_connection is not None and (
+                self._connection.execute("PRAGMA query_only").fetchone()[0] != 1
+            ):
+                raise RelaySchemaIncompatible()
             self._assert_schema_compatible()
             if self._schema_is_empty and _require_existing:
                 raise RelaySchemaIncompatible()
@@ -587,7 +627,7 @@ class RelayStore:
             elif self._legacy_schema_version is not None:
                 if not _allow_migration:
                     raise RelaySchemaIncompatible()
-                self._migrate_to_schema_v9()
+                self._migrate_to_schema_v10()
             self._assert_schema_shape()
         except Exception:
             self.close()
@@ -601,7 +641,7 @@ class RelayStore:
         host_writer_capacity: int = 9,
         host_reader_capacity: int = 9,
     ) -> RelayStore:
-        """Open one prepared Relay DB and atomically migrate exact V5-V8 authority."""
+        """Open one prepared Relay DB and atomically migrate exact V5-V9 authority."""
 
         return cls(
             database,
@@ -612,7 +652,7 @@ class RelayStore:
 
     @classmethod
     def from_readonly_connection(cls, connection: sqlite3.Connection) -> RelayStore:
-        """Own one prepared snapshot connection after exact V9 validation."""
+        """Own one query-only snapshot connection after exact V10 validation."""
 
         return cls(
             ":verified-relay-snapshot:",
@@ -649,6 +689,7 @@ class RelayStore:
             "relay_v3_scheduler_groups",
             "relay_v3_scheduler_writer_slots",
             "relay_v3_start_attempts",
+            "relay_v3_start_delivery_journal",
         )
         return canonical_hash(
             {
@@ -879,6 +920,170 @@ class RelayStore:
             if row is None:
                 raise RelayStateStale()
             return self._start_attempt_result(row)
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def initialize_start_delivery(
+        self,
+        attempt_id: str,
+        facts: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        """Atomically freeze bearer-free action facts and admit one attempt."""
+
+        self._validate_start_attempt_id(attempt_id)
+        normalized = self._validated_start_delivery_facts(facts)
+        now = _utc_now()
+        try:
+            with self._transaction() as cursor:
+                attempt = cursor.execute(
+                    "SELECT * FROM relay_v3_start_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if attempt is None or str(attempt["state"]) != "prepared":
+                    raise RelayStateStale()
+                action_ids = _decode_string_list(str(attempt["action_ids_json"]))
+                if [fact["action_id"] for fact in normalized] != action_ids:
+                    raise RelayStateStale()
+                for fact in normalized:
+                    action = cursor.execute(
+                        """
+                        SELECT a.run_id, a.task_id, l.epoch, r.workflow_id
+                        FROM relay_v3_actions AS a
+                        JOIN relay_v3_leases AS l ON l.lease_id = a.lease_id
+                        JOIN relay_v3_runs AS r ON r.run_id = a.run_id
+                        WHERE a.action_id = ?
+                        """,
+                        (fact["action_id"],),
+                    ).fetchone()
+                    if (
+                        action is None
+                        or str(action["run_id"]) != str(attempt["run_id"])
+                        or str(action["workflow_id"]) != fact["workflow_id"]
+                        or str(action["task_id"]) != fact["task_id"]
+                        or int(action["epoch"]) != fact["epoch"]
+                    ):
+                        raise RelayStateStale()
+                    cursor.execute(
+                        """
+                        INSERT INTO relay_v3_start_delivery_journal
+                            (attempt_id, action_id, workflow_id, task_id, epoch,
+                             endpoint, issued_at, expires_at, key_id, bundle_hash,
+                             receipt_hash, delivered_at, delivery_version)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 1)
+                        """,
+                        (
+                            attempt_id,
+                            fact["action_id"],
+                            fact["workflow_id"],
+                            fact["task_id"],
+                            fact["epoch"],
+                            fact["endpoint"],
+                            fact["issued_at"],
+                            fact["expires_at"],
+                            fact["key_id"],
+                            fact["bundle_hash"],
+                        ),
+                    )
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_start_attempts
+                    SET state = 'admitted', attempt_version = attempt_version + 1,
+                        updated_at = ?
+                    WHERE attempt_id = ? AND state = 'prepared'
+                      AND attempt_version = ?
+                    """,
+                    (now, attempt_id, int(attempt["attempt_version"])),
+                )
+                if cursor.rowcount != 1:
+                    raise RelayStateStale()
+                return self._start_delivery_result(cursor, attempt_id)
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def start_delivery(self, attempt_id: str) -> dict[str, object]:
+        """Read the exact bearer-free delivery journal for one admitted attempt."""
+
+        self._validate_start_attempt_id(attempt_id)
+        try:
+            return self._start_delivery_result(self._require_connection(), attempt_id)
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def record_start_action_delivery(
+        self,
+        attempt_id: str,
+        action_id: str,
+        receipt: Mapping[str, object],
+    ) -> dict[str, object]:
+        """CAS one exact broker receipt without ever persisting its bearers."""
+
+        self._validate_start_attempt_id(attempt_id)
+        if (
+            type(action_id) is not str
+            or _IDENTIFIER.fullmatch(action_id) is None
+            or type(receipt) is not dict
+            or set(receipt) != {"action_id", "endpoint", "bundle_hash"}
+            or receipt.get("action_id") != action_id
+            or type(receipt.get("endpoint")) is not str
+            or type(receipt.get("bundle_hash")) is not str
+            or _DIGEST.fullmatch(str(receipt["bundle_hash"])) is None
+        ):
+            raise RelayStateStale()
+        receipt_hash = canonical_hash(dict(receipt))
+        now = _utc_now()
+        try:
+            with self._transaction() as cursor:
+                attempt = cursor.execute(
+                    "SELECT state FROM relay_v3_start_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                row = cursor.execute(
+                    """
+                    SELECT * FROM relay_v3_start_delivery_journal
+                    WHERE attempt_id = ? AND action_id = ?
+                    """,
+                    (attempt_id, action_id),
+                ).fetchone()
+                if (
+                    attempt is None
+                    or str(attempt["state"]) not in {"admitted", "delivered"}
+                    or row is None
+                    or str(row["endpoint"]) != receipt["endpoint"]
+                    or str(row["bundle_hash"]) != receipt["bundle_hash"]
+                ):
+                    raise RelayStateStale()
+                if row["receipt_hash"] is not None:
+                    if str(row["receipt_hash"]) != receipt_hash:
+                        raise RelayStateStale()
+                    return self._start_delivery_row(row)
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_start_delivery_journal
+                    SET receipt_hash = ?, delivered_at = ?,
+                        delivery_version = delivery_version + 1
+                    WHERE attempt_id = ? AND action_id = ?
+                      AND receipt_hash IS NULL AND delivery_version = ?
+                    """,
+                    (
+                        receipt_hash,
+                        now,
+                        attempt_id,
+                        action_id,
+                        int(row["delivery_version"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RelayStateStale()
+                updated = cursor.execute(
+                    """
+                    SELECT * FROM relay_v3_start_delivery_journal
+                    WHERE attempt_id = ? AND action_id = ?
+                    """,
+                    (attempt_id, action_id),
+                ).fetchone()
+                if updated is None:
+                    raise RelayStateStale()
+                return self._start_delivery_row(updated)
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
@@ -3968,6 +4173,18 @@ class RelayStore:
                     return self._start_attempt_result(row)
                 if state != expected_state:
                     raise RelayStateStale()
+                if next_state == "delivered":
+                    action_ids = _decode_string_list(str(row["action_ids_json"]))
+                    delivered = cursor.execute(
+                        """
+                        SELECT action_id FROM relay_v3_start_delivery_journal
+                        WHERE attempt_id = ? AND receipt_hash IS NOT NULL
+                        ORDER BY rowid
+                        """,
+                        (attempt_id,),
+                    ).fetchall()
+                    if [str(item["action_id"]) for item in delivered] != action_ids:
+                        raise RelayStateStale()
                 cursor.execute(
                     """
                     UPDATE relay_v3_start_attempts
@@ -3994,6 +4211,107 @@ class RelayStore:
                 return self._start_attempt_result(updated)
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
+
+    @staticmethod
+    def _validate_start_attempt_id(attempt_id: object) -> None:
+        if type(attempt_id) is not str or _IDENTIFIER.fullmatch(attempt_id) is None:
+            raise RelayStateStale()
+
+    @staticmethod
+    def _validated_start_delivery_facts(
+        facts: Sequence[Mapping[str, object]],
+    ) -> list[dict[str, object]]:
+        if type(facts) not in {list, tuple} or len(facts) > 64:
+            raise RelayStateStale()
+        normalized: list[dict[str, object]] = []
+        for fact in facts:
+            if (
+                type(fact) is not dict
+                or set(fact)
+                != {
+                    "action_id",
+                    "workflow_id",
+                    "task_id",
+                    "epoch",
+                    "endpoint",
+                    "issued_at",
+                    "expires_at",
+                    "key_id",
+                    "bundle_hash",
+                }
+                or any(
+                    type(fact.get(field)) is not str
+                    or _IDENTIFIER.fullmatch(str(fact[field])) is None
+                    for field in ("action_id", "workflow_id", "task_id")
+                )
+                or fact.get("endpoint") != f"bridge/{fact.get('action_id')}"
+                or type(fact.get("epoch")) is not int
+                or int(fact["epoch"]) < 1
+                or type(fact.get("issued_at")) is not int
+                or int(fact["issued_at"]) < 0
+                or type(fact.get("expires_at")) is not int
+                or int(fact["expires_at"]) <= int(fact["issued_at"])
+                or type(fact.get("key_id")) is not str
+                or _DIGEST.fullmatch(str(fact["key_id"])) is None
+                or type(fact.get("bundle_hash")) is not str
+                or _DIGEST.fullmatch(str(fact["bundle_hash"])) is None
+            ):
+                raise RelayStateStale()
+            normalized.append(dict(fact))
+        if len({str(fact["action_id"]) for fact in normalized}) != len(normalized):
+            raise RelayStateStale()
+        return normalized
+
+    @classmethod
+    def _start_delivery_result(
+        cls,
+        connection: sqlite3.Connection | sqlite3.Cursor,
+        attempt_id: str,
+    ) -> dict[str, object]:
+        attempt = connection.execute(
+            "SELECT * FROM relay_v3_start_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None or str(attempt["state"]) not in {"admitted", "delivered"}:
+            raise RelayStateStale()
+        action_ids = _decode_string_list(str(attempt["action_ids_json"]))
+        rows = connection.execute(
+            """
+            SELECT * FROM relay_v3_start_delivery_journal
+            WHERE attempt_id = ? ORDER BY rowid
+            """,
+            (attempt_id,),
+        ).fetchall()
+        if [str(row["action_id"]) for row in rows] != action_ids:
+            raise RelayStateStale()
+        return {
+            "attempt_id": attempt_id,
+            "state": str(attempt["state"]),
+            "actions": [cls._start_delivery_row(row) for row in rows],
+        }
+
+    @staticmethod
+    def _start_delivery_row(row: sqlite3.Row) -> dict[str, object]:
+        result: dict[str, object] = {
+            field: row[field]
+            for field in (
+                "attempt_id",
+                "action_id",
+                "workflow_id",
+                "task_id",
+                "epoch",
+                "endpoint",
+                "issued_at",
+                "expires_at",
+                "key_id",
+                "bundle_hash",
+                "delivery_version",
+            )
+        }
+        result["delivered"] = row["receipt_hash"] is not None
+        if row["receipt_hash"] is not None:
+            result["receipt_hash"] = str(row["receipt_hash"])
+        return result
 
     @staticmethod
     def _start_attempt_result(row: sqlite3.Row) -> dict[str, object]:
@@ -4489,6 +4807,7 @@ class RelayStore:
                     "6",
                     "7",
                     "8",
+                    "9",
                     str(self._SCHEMA_VERSION),
                 }
             ):
@@ -4624,6 +4943,40 @@ class RelayStore:
                         REFERENCES relay_v3_idempotency(idempotency_key)
                         ON DELETE RESTRICT,
                     FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS relay_v3_start_delivery_journal (
+                    attempt_id TEXT NOT NULL,
+                    action_id TEXT NOT NULL,
+                    workflow_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL CHECK (
+                        typeof(epoch) = 'integer' AND epoch >= 1
+                    ),
+                    endpoint TEXT NOT NULL,
+                    issued_at INTEGER NOT NULL CHECK (
+                        typeof(issued_at) = 'integer' AND issued_at >= 0
+                    ),
+                    expires_at INTEGER NOT NULL CHECK (
+                        typeof(expires_at) = 'integer' AND expires_at > issued_at
+                    ),
+                    key_id TEXT NOT NULL,
+                    bundle_hash TEXT NOT NULL,
+                    receipt_hash TEXT,
+                    delivered_at TEXT,
+                    delivery_version INTEGER NOT NULL CHECK (
+                        typeof(delivery_version) = 'integer'
+                        AND delivery_version >= 1
+                    ),
+                    PRIMARY KEY (attempt_id, action_id),
+                    CHECK (
+                        (receipt_hash IS NULL AND delivered_at IS NULL)
+                        OR (receipt_hash IS NOT NULL AND delivered_at IS NOT NULL)
+                    ),
+                    FOREIGN KEY (attempt_id)
+                        REFERENCES relay_v3_start_attempts(attempt_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (action_id) REFERENCES relay_v3_actions(action_id)
                         ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS relay_v3_evidence (
@@ -4852,26 +5205,29 @@ class RelayStore:
         if digest != expected:
             raise RelaySchemaIncompatible()
 
-    def _migrate_to_schema_v9(self) -> None:
-        """Atomically advance one exact V5-V8 authority to exact V9."""
+    def _migrate_to_schema_v10(self) -> None:
+        """Atomically advance one exact V5-V9 authority to exact V10."""
 
         connection = self._require_connection()
         legacy_version = self._legacy_schema_version
-        if legacy_version not in {"5", "6", "7", "8"}:
+        if legacy_version not in {"5", "6", "7", "8", "9"}:
             raise RelaySchemaIncompatible()
         connection.execute("PRAGMA foreign_keys = OFF")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            if legacy_version != "8":
+            if legacy_version in {"5", "6", "7"}:
                 self._migrate_legacy_runs_and_finalization(connection)
             if legacy_version == "5":
                 self._create_cleanup_authority(connection)
             if legacy_version in {"5", "6"}:
                 self._create_scheduler_authority(connection)
-            self._create_start_attempt_authority(connection)
+            if legacy_version in {"5", "6", "7", "8"}:
+                self._create_start_attempt_authority(connection)
+            self._backfill_historical_start_attempts(connection)
+            self._create_start_delivery_authority(connection)
             result = connection.execute(
                 """
-                UPDATE relay_v3_schema_metadata SET value = '9'
+                UPDATE relay_v3_schema_metadata SET value = '10'
                 WHERE key = ? AND value = ?
                 """,
                 ("schema_version", legacy_version),
@@ -5139,8 +5495,113 @@ class RelayStore:
             """
         )
 
+    @staticmethod
+    def _backfill_historical_start_attempts(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """
+            SELECT i.idempotency_key, i.payload_hash, i.result_json, i.created_at
+            FROM relay_v3_idempotency AS i
+            LEFT JOIN relay_v3_start_attempts AS a
+              ON a.idempotency_key = i.idempotency_key
+            WHERE a.attempt_id IS NULL
+            ORDER BY i.idempotency_key
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                result = json.loads(str(row["result_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise RelaySchemaIncompatible() from error
+            if (
+                type(result) is not dict
+                or set(result)
+                != {
+                    "schema",
+                    "workflow_id",
+                    "run_id",
+                    "schedule_version",
+                    "host_actions",
+                }
+                or result.get("schema") != "2718lab-devkit/relay-start-result-v1"
+                or type(result.get("run_id")) is not str
+                or type(result.get("host_actions")) is not list
+            ):
+                raise RelaySchemaIncompatible()
+            action_ids: list[str] = []
+            for action in result["host_actions"]:
+                if type(action) is not dict or type(action.get("action_id")) is not str:
+                    raise RelaySchemaIncompatible()
+                action_ids.append(action["action_id"])
+            if len(action_ids) != len(set(action_ids)):
+                raise RelaySchemaIncompatible()
+            idempotency_key = str(row["idempotency_key"])
+            payload_hash = str(row["payload_hash"])
+            attempt_id = _stable_id(
+                "start-attempt",
+                {"idempotency_key": idempotency_key, "payload_hash": payload_hash},
+            )
+            created_at = str(row["created_at"])
+            connection.execute(
+                """
+                INSERT INTO relay_v3_start_attempts
+                    (attempt_id, idempotency_key, run_id, action_ids_json,
+                     compensation_json, state, error_code, receipt_json,
+                     attempt_version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, '[]', 'delivered', NULL, NULL, 1, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    idempotency_key,
+                    result["run_id"],
+                    _encode_json(action_ids),
+                    created_at,
+                    created_at,
+                ),
+            )
+
+    @staticmethod
+    def _create_start_delivery_authority(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_start_delivery_journal (
+                attempt_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL CHECK (
+                    typeof(epoch) = 'integer' AND epoch >= 1
+                ),
+                endpoint TEXT NOT NULL,
+                issued_at INTEGER NOT NULL CHECK (
+                    typeof(issued_at) = 'integer' AND issued_at >= 0
+                ),
+                expires_at INTEGER NOT NULL CHECK (
+                    typeof(expires_at) = 'integer' AND expires_at > issued_at
+                ),
+                key_id TEXT NOT NULL,
+                bundle_hash TEXT NOT NULL,
+                receipt_hash TEXT,
+                delivered_at TEXT,
+                delivery_version INTEGER NOT NULL CHECK (
+                    typeof(delivery_version) = 'integer'
+                    AND delivery_version >= 1
+                ),
+                PRIMARY KEY (attempt_id, action_id),
+                CHECK (
+                    (receipt_hash IS NULL AND delivered_at IS NULL)
+                    OR (receipt_hash IS NOT NULL AND delivered_at IS NOT NULL)
+                ),
+                FOREIGN KEY (attempt_id)
+                    REFERENCES relay_v3_start_attempts(attempt_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (action_id) REFERENCES relay_v3_actions(action_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
     def _assert_legacy_v8_shape(self) -> None:
-        """Reject V8 drift before the V9 migration performs any DDL."""
+        """Reject V8 drift before the V10 migration performs any DDL."""
 
         connection = self._require_connection()
         try:

@@ -93,6 +93,7 @@ class CapabilityDeliveryReceipt:
 
     action_id: str
     endpoint: str
+    bundle_hash: str
     state: str
 
 
@@ -140,7 +141,10 @@ class _CapabilityDelivery:
 
     def receipt(self, action_id: str) -> CapabilityDeliveryReceipt:
         return CapabilityDeliveryReceipt(
-            action_id=action_id, endpoint=self.endpoint, state=self.state
+            action_id=action_id,
+            endpoint=self.endpoint,
+            bundle_hash=_private_payload_hash(self.capabilities),
+            state=self.state,
         )
 
 

@@ -14,6 +14,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from devkit_relay.canonical import canonical_hash
 from devkit_relay.service import RelayService
 from devkit_relay.store import RelayStore, RelayStoreError
+from devkit_runtime.relay_runtime import RelayRuntime
+
+
+class _NoDeliveryBroker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def prepare_capability(self, **_kwargs: object) -> object:
+        self.calls += 1
+        raise AssertionError("migrated historical replay must not redeliver")
 
 
 def _task(task_id: str) -> dict[str, object]:
@@ -105,6 +119,7 @@ def _downgrade_to_legacy(database: Path, version: str) -> None:
         raise AssertionError("unsupported legacy fixture")
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("DROP TABLE IF EXISTS relay_v3_start_delivery_journal")
     connection.execute("DROP TABLE relay_v3_start_attempts")
     if version != "8":
         connection.execute(
@@ -296,16 +311,46 @@ def test_admitted_and_delivered_start_attempts_cannot_be_aborted(
     tmp_path: Path,
 ) -> None:
     store = RelayStore(tmp_path / "relay.sqlite3")
-    store.start_create(_plan(), idempotency_key="admitted-start")
+    created = store.start_create(_plan(), idempotency_key="admitted-start")
     attempt = store.start_attempt("admitted-start")
+    actions = created["host_actions"]
+    assert isinstance(actions, list)
+    facts = []
+    for action in actions:
+        assert isinstance(action, dict)
+        lease = action["lease"]
+        assert isinstance(lease, dict)
+        facts.append(
+            {
+                "action_id": action["action_id"],
+                "workflow_id": action["workflow_id"],
+                "task_id": action["task_id"],
+                "epoch": lease["epoch"],
+                "endpoint": f"bridge/{action['action_id']}",
+                "issued_at": 2_000_000_000,
+                "expires_at": 2_000_003_600,
+                "key_id": "sha256:" + "8" * 64,
+                "bundle_hash": "sha256:" + "9" * 64,
+            }
+        )
 
-    admitted = store.mark_start_admitted(str(attempt["attempt_id"]))
+    admitted = store.initialize_start_delivery(str(attempt["attempt_id"]), facts)
     assert admitted["state"] == "admitted"
     with pytest.raises(RelayStoreError, match="RELAY_STATE_STALE"):
         store.abort_start_attempt(
             str(attempt["attempt_id"]), error_code="RELAY_HOST_ACTION_REJECTED"
         )
 
+    for fact in facts:
+        store.record_start_action_delivery(
+            str(attempt["attempt_id"]),
+            str(fact["action_id"]),
+            {
+                "action_id": fact["action_id"],
+                "endpoint": fact["endpoint"],
+                "bundle_hash": fact["bundle_hash"],
+            },
+        )
     delivered = store.mark_start_delivered(str(attempt["attempt_id"]))
     assert delivered["state"] == "delivered"
     with pytest.raises(RelayStoreError, match="RELAY_STATE_STALE"):
@@ -322,6 +367,7 @@ def test_schema_eight_migrates_start_attempt_journal_in_one_open(
     seeded.start_create(_plan(), idempotency_key="v8-journal-seed")
     seeded.close()
     connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE IF EXISTS relay_v3_start_delivery_journal")
     connection.execute("DROP TABLE relay_v3_start_attempts")
     connection.execute(
         "UPDATE relay_v3_schema_metadata SET value = '8' WHERE key = 'schema_version'"
@@ -338,13 +384,13 @@ def test_schema_eight_migrates_start_attempt_journal_in_one_open(
             "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
         )
         .fetchone()[0]
-        == "9"
+        == "10"
     )
     assert (
         migrated._require_connection()
         .execute("SELECT COUNT(*) FROM relay_v3_start_attempts")
         .fetchone()[0]
-        == 0
+        == 1
     )
 
 
@@ -355,6 +401,7 @@ def test_v8_shape_drift_fails_before_start_attempt_migration_mutates_database(
     seeded = RelayStore(database)
     seeded.close()
     connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE relay_v3_start_delivery_journal")
     connection.execute("DROP TABLE relay_v3_start_attempts")
     connection.execute("ALTER TABLE relay_v3_actions ADD COLUMN forged TEXT")
     connection.execute(
@@ -383,7 +430,7 @@ def test_v8_shape_drift_fails_before_start_attempt_migration_mutates_database(
     unchanged.close()
 
 
-def test_v9_missing_start_attempt_table_fails_closed_without_repair(
+def test_v10_missing_start_attempt_table_fails_closed_without_repair(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "relay.sqlite3"
@@ -408,7 +455,7 @@ def test_v9_missing_start_attempt_table_fails_closed_without_repair(
     unchanged.close()
 
 
-def test_v9_start_attempt_constraint_drift_fails_closed(tmp_path: Path) -> None:
+def test_v10_start_attempt_constraint_drift_fails_closed(tmp_path: Path) -> None:
     database = tmp_path / "relay.sqlite3"
     seeded = RelayStore(database)
     seeded.close()
@@ -525,7 +572,7 @@ def test_unknown_schema_version_is_rejected(tmp_path: Path) -> None:
     seeded.close()
     connection = sqlite3.connect(database)
     connection.execute(
-        "UPDATE relay_v3_schema_metadata SET value = '10' WHERE key = 'schema_version'"
+        "UPDATE relay_v3_schema_metadata SET value = '11' WHERE key = 'schema_version'"
     )
     connection.commit()
     connection.close()
@@ -536,15 +583,16 @@ def test_unknown_schema_version_is_rejected(tmp_path: Path) -> None:
     assert raised.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
 
 
-@pytest.mark.parametrize("old_version", ["5", "6", "7", "8"])
-def test_real_legacy_schema_versions_migrate_atomically_to_nine_in_rw_factory(
+@pytest.mark.parametrize("old_version", ["5", "6", "7", "8", "9"])
+def test_real_legacy_schema_versions_migrate_atomically_to_ten_in_rw_factory(
     tmp_path: Path, old_version: str
 ) -> None:
     database = tmp_path / f"relay-{old_version}.sqlite3"
     seeded = RelayStore(database)
     seeded.start_create(_plan(), idempotency_key=f"legacy-{old_version}-seed")
     seeded.close()
-    _downgrade_to_legacy(database, old_version)
+    if old_version != "9":
+        _downgrade_to_legacy(database, old_version)
 
     store = RelayStore.open_readwrite(database)
 
@@ -555,18 +603,47 @@ def test_real_legacy_schema_versions_migrate_atomically_to_nine_in_rw_factory(
             "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
         )
         .fetchone()[0]
-        == "9"
+        == "10"
     )
     assert (
         store._require_connection()
         .execute("SELECT COUNT(*) FROM relay_v3_start_attempts")
         .fetchone()[0]
-        == 0
+        == 1
     )
     store.close()
 
 
-@pytest.mark.parametrize("claimed_version", ["5", "6", "7", "8", "9"])
+def test_real_v8_historical_idempotency_key_replays_after_v10_migration(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay-v8-replay.sqlite3"
+    request = {
+        "mode": "create",
+        "plan": _plan(),
+        "idempotency_key": "historical-v8-replay",
+    }
+    seeded_store = RelayStore(database)
+    seeded_relay = RelayService(
+        seeded_store, capability_secret=b"historical-replay-secret"
+    )
+    expected = seeded_relay.start(request)
+    seeded_store.close()
+    _downgrade_to_legacy(database, "8")
+
+    migrated = RelayStore.open_readwrite(database)
+    broker = _NoDeliveryBroker()
+    replayed = RelayRuntime(
+        RelayService(migrated, capability_secret=b"historical-replay-secret"),
+        capability_broker=broker,
+    ).start(request)
+
+    assert replayed == expected
+    assert broker.calls == 0
+    assert migrated.start_attempt("historical-v8-replay")["state"] == "delivered"
+
+
+@pytest.mark.parametrize("claimed_version", ["5", "6", "7", "8", "9", "10"])
 def test_metadata_only_claims_fail_closed_without_creating_authority_objects(
     tmp_path: Path, claimed_version: str
 ) -> None:
@@ -589,15 +666,24 @@ def test_metadata_only_claims_fail_closed_without_creating_authority_objects(
     assert _schema_rows(database) == before
 
 
-@pytest.mark.parametrize("claimed_version", ["5", "6", "7", "8", "9"])
+@pytest.mark.parametrize("claimed_version", ["5", "6", "7", "8", "9", "10"])
 def test_each_schema_version_rejects_extra_authority_before_migration_ddl(
     tmp_path: Path, claimed_version: str
 ) -> None:
     database = tmp_path / f"extra-authority-{claimed_version}.sqlite3"
     seeded = RelayStore(database)
     seeded.close()
-    if claimed_version != "9":
+    if claimed_version not in {"9", "10"}:
         _downgrade_to_legacy(database, claimed_version)
+    elif claimed_version == "9":
+        connection = sqlite3.connect(database)
+        connection.execute("DROP TABLE IF EXISTS relay_v3_start_delivery_journal")
+        connection.execute(
+            "UPDATE relay_v3_schema_metadata SET value = '9' "
+            "WHERE key = 'schema_version'"
+        )
+        connection.commit()
+        connection.close()
     connection = sqlite3.connect(database)
     connection.execute(
         "CREATE VIEW relay_v3_forged_authority AS SELECT run_id FROM relay_v3_runs"

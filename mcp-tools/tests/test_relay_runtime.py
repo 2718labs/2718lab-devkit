@@ -329,7 +329,78 @@ class _RecordingCapabilityBroker:
                 "capabilities": dict(capabilities),
             }
         )
-        return object()
+        return {
+            "action_id": action_id,
+            "endpoint": endpoint,
+            "bundle_hash": canonical_hash(dict(sorted(capabilities.items()))),
+        }
+
+
+class _IdempotentCapabilityBroker:
+    """Host-side idempotency contract keyed by action, endpoint, and bundle hash."""
+
+    def __init__(
+        self,
+        *,
+        fail_action_once: str | None = None,
+        fail_call_once: int | None = None,
+        forged_receipt: dict[str, str] | None = None,
+    ) -> None:
+        self.calls: list[str] = []
+        self.deliveries: dict[str, tuple[str, str]] = {}
+        self._fail_action_once = fail_action_once
+        self._fail_call_once = fail_call_once
+        self._forged_receipt = forged_receipt
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def prepare_capability(
+        self,
+        *,
+        action_id: str,
+        endpoint: str,
+        capabilities: Mapping[str, str],
+    ) -> dict[str, str]:
+        self.calls.append(action_id)
+        bundle_hash = canonical_hash(dict(sorted(capabilities.items())))
+        current = self.deliveries.get(action_id)
+        if current is not None and current != (endpoint, bundle_hash):
+            raise RuntimeError("host delivery conflict")
+        if self._fail_action_once == action_id or self._fail_call_once == len(
+            self.calls
+        ):
+            self._fail_action_once = None
+            self._fail_call_once = None
+            raise RuntimeError("simulated broker interruption")
+        self.deliveries[action_id] = (endpoint, bundle_hash)
+        if self._forged_receipt is not None:
+            return dict(self._forged_receipt)
+        return {
+            "action_id": action_id,
+            "endpoint": endpoint,
+            "bundle_hash": bundle_hash,
+        }
+
+
+class _FailOnceDeliveryStore(RelayStore):
+    """Crash window after broker success but before one local receipt commit."""
+
+    def __init__(self, database: Path) -> None:
+        super().__init__(database)
+        self.fail_delivery_once = True
+
+    def record_start_action_delivery(
+        self,
+        attempt_id: str,
+        action_id: str,
+        receipt: Mapping[str, object],
+    ) -> dict[str, object]:
+        if self.fail_delivery_once:
+            self.fail_delivery_once = False
+            raise RuntimeError("simulated local receipt persistence failure")
+        return super().record_start_action_delivery(attempt_id, action_id, receipt)
 
 
 class _RecordingHostAdmission:
@@ -791,6 +862,7 @@ def test_runtime_root_rw_migrates_real_v8_then_runs_create_and_refill(
     config = _runtime_config(tmp_path)
     RuntimeBootstrap.run(config)
     connection = sqlite3.connect(config.relay_database)
+    connection.execute("DROP TABLE relay_v3_start_delivery_journal")
     connection.execute("DROP TABLE relay_v3_start_attempts")
     connection.execute(
         "UPDATE relay_v3_schema_metadata SET value = '8' WHERE key = 'schema_version'"
@@ -859,7 +931,7 @@ def test_runtime_root_rw_migrates_real_v8_then_runs_create_and_refill(
             verified.execute(
                 "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "9"
+            == "10"
         )
         assert (
             verified.execute("SELECT COUNT(*) FROM relay_v3_start_attempts").fetchone()[
@@ -939,6 +1011,213 @@ def test_runtime_recovers_a_crashed_prepared_start_and_delivers_once(
     assert len(broker.deliveries) == 1
     attempt = store.start_attempt("crashed-prepared-start")
     assert attempt["state"] == "delivered"
+
+
+def test_admitted_retry_reuses_identical_bundle_after_receipt_persist_crash(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay.sqlite3"
+    request = {
+        "mode": "create",
+        "plan": plan(
+            task("writer-a", write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}])
+        ),
+        "idempotency_key": "crash-after-broker-success",
+    }
+    now = [2_000_000_000]
+    broker = _IdempotentCapabilityBroker()
+    crashed_store = _FailOnceDeliveryStore(database)
+    crashed_relay = RelayService(
+        crashed_store, capability_secret=b"stable-relay-capability-secret"
+    )
+    crashed_runtime = RelayRuntime(
+        crashed_relay, capability_broker=broker, clock=lambda: now[0]
+    )
+
+    with pytest.raises(RelayError) as crashed:
+        crashed_runtime.start(request)
+    assert crashed.value.code == "RELAY_CAPABILITY_BROKER_UNAVAILABLE"
+    assert len(broker.deliveries) == 1
+    original_delivery = dict(broker.deliveries)
+    crashed_store.close()
+
+    now[0] += 120
+    recovered_store = RelayStore.open_readwrite(database)
+    recovered_runtime = RelayRuntime(
+        RelayService(
+            recovered_store, capability_secret=b"stable-relay-capability-secret"
+        ),
+        capability_broker=broker,
+        clock=lambda: now[0],
+    )
+    result = recovered_runtime.start(request)
+
+    assert result["workflow_id"] == "relay-runtime-v3"
+    assert broker.deliveries == original_delivery
+    assert len(broker.calls) == 2
+    assert recovered_store.start_attempt("crash-after-broker-success")["state"] == (
+        "delivered"
+    )
+    connection = recovered_store._require_connection()
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM relay_v3_start_delivery_journal "
+            "WHERE receipt_hash IS NOT NULL"
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_admitted_retry_skips_receipted_actions_in_partial_batch(
+    tmp_path: Path,
+) -> None:
+    relay, store = service(tmp_path)
+    request = {
+        "mode": "create",
+        "plan": plan(
+            task("writer-a", write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}]),
+            task("writer-b", write_scope=[{"path": "mcp-tools/b.py", "kind": "file"}]),
+        ),
+        "idempotency_key": "partial-batch-retry",
+    }
+    broker = _IdempotentCapabilityBroker(fail_call_once=2)
+    runtime = RelayRuntime(relay, capability_broker=broker, clock=lambda: 2_000_000_000)
+
+    with pytest.raises(RelayError) as partial:
+        runtime.start(request)
+    assert partial.value.code == "RELAY_CAPABILITY_BROKER_UNAVAILABLE"
+    first_action, failed_action = broker.calls
+
+    result = runtime.start(request)
+
+    assert result["workflow_id"] == "relay-runtime-v3"
+    assert broker.calls == [first_action, failed_action, failed_action]
+    assert set(broker.deliveries) == {first_action, failed_action}
+    assert store.start_attempt("partial-batch-retry")["state"] == "delivered"
+
+
+def test_admitted_retry_fails_closed_after_fixed_capability_expiry(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay.sqlite3"
+    request = {
+        "mode": "create",
+        "plan": plan(
+            task("writer-a", write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}])
+        ),
+        "idempotency_key": "expired-admitted-retry",
+    }
+    now = [2_000_000_000]
+    broker = _IdempotentCapabilityBroker()
+    crashed_store = _FailOnceDeliveryStore(database)
+    runtime = RelayRuntime(
+        RelayService(crashed_store, capability_secret=b"expiry-stable-secret-value"),
+        capability_broker=broker,
+        clock=lambda: now[0],
+    )
+    with pytest.raises(RelayError):
+        runtime.start(request)
+    calls_before_expiry = list(broker.calls)
+    crashed_store.close()
+
+    now[0] += 3_600
+    store = RelayStore.open_readwrite(database)
+    expired = RelayRuntime(
+        RelayService(store, capability_secret=b"expiry-stable-secret-value"),
+        capability_broker=broker,
+        clock=lambda: now[0],
+    )
+    with pytest.raises(RelayError) as caught:
+        expired.start(request)
+
+    assert caught.value.code == "RELAY_CAPABILITY_EXPIRED"
+    assert broker.calls == calls_before_expiry
+    assert store.start_attempt("expired-admitted-retry")["state"] == "admitted"
+
+
+def test_admitted_retry_fails_closed_after_capability_secret_rotation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "relay.sqlite3"
+    request = {
+        "mode": "create",
+        "plan": plan(
+            task("writer-a", write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}])
+        ),
+        "idempotency_key": "secret-rotated-retry",
+    }
+    broker = _IdempotentCapabilityBroker()
+    crashed_store = _FailOnceDeliveryStore(database)
+    first = RelayRuntime(
+        RelayService(crashed_store, capability_secret=b"original-capability-secret"),
+        capability_broker=broker,
+        clock=lambda: 2_000_000_000,
+    )
+    with pytest.raises(RelayError):
+        first.start(request)
+    calls_before_rotation = list(broker.calls)
+    crashed_store.close()
+
+    store = RelayStore.open_readwrite(database)
+    rotated = RelayRuntime(
+        RelayService(store, capability_secret=b"rotated-capability-secret!"),
+        capability_broker=broker,
+        clock=lambda: 2_000_000_120,
+    )
+    with pytest.raises(RelayError) as caught:
+        rotated.start(request)
+
+    assert caught.value.code == "RELAY_CAPABILITY_INVALID"
+    assert broker.calls == calls_before_rotation
+
+
+@pytest.mark.parametrize(
+    "forged_receipt",
+    [
+        {
+            "action_id": "wrong-action",
+            "endpoint": "bridge/wrong-action",
+            "bundle_hash": "sha256:" + "a" * 64,
+        },
+        {
+            "action_id": "action-placeholder",
+            "endpoint": "bridge/wrong-endpoint",
+            "bundle_hash": "sha256:" + "b" * 64,
+        },
+    ],
+)
+def test_broker_receipt_bundle_or_endpoint_mismatch_fails_closed(
+    tmp_path: Path, forged_receipt: dict[str, str]
+) -> None:
+    relay, store = service(tmp_path)
+    broker = _IdempotentCapabilityBroker(forged_receipt=forged_receipt)
+    runtime = RelayRuntime(relay, capability_broker=broker, clock=lambda: 2_000_000_000)
+
+    with pytest.raises(RelayError) as caught:
+        runtime.start(
+            {
+                "mode": "create",
+                "plan": plan(
+                    task(
+                        "writer-a",
+                        write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+                    )
+                ),
+                "idempotency_key": "forged-broker-receipt",
+            }
+        )
+
+    assert caught.value.code == "RELAY_CAPABILITY_BROKER_UNAVAILABLE"
+    assert store.start_attempt("forged-broker-receipt")["state"] == "admitted"
+    assert (
+        store._require_connection()
+        .execute(
+            "SELECT COUNT(*) FROM relay_v3_start_delivery_journal "
+            "WHERE receipt_hash IS NOT NULL"
+        )
+        .fetchone()[0]
+        == 0
+    )
 
 
 @pytest.mark.parametrize("capacity", [1, 2, 3])

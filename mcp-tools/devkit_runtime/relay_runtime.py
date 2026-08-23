@@ -33,6 +33,7 @@ _WORKER_CAPABILITY_ACTIONS = (
     "terminal",
     "candidate_handoff",
 )
+_WORKER_CAPABILITY_LIFETIME_SECONDS = 3_600
 _HASH_PREFIX = "sha256:"
 _BOOTSTRAP_ATTESTATION_SCHEMA = "2718lab-devkit/new-project-bootstrap-attestation-v1"
 _PROJECT_BINDING_SCHEMA = "2718lab-devkit/project-binding-v1"
@@ -664,6 +665,7 @@ class RelayRuntime:
         _store_factory: Callable[[], RelayStore] | None = None,
         _capability_secret_provider: RelayCapabilitySecretProvider | None = None,
         _integration_proof_resolver: IntegrationProofResolver | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if relay_service is None and (
             _store_factory is None or _capability_secret_provider is None
@@ -675,6 +677,7 @@ class RelayRuntime:
         self._store_factory = _store_factory
         self._capability_secret_provider = _capability_secret_provider
         self._integration_proof_resolver = _integration_proof_resolver
+        self._clock = clock
         self._owned_store: RelayStore | None = None
         self._closed = False
 
@@ -687,6 +690,7 @@ class RelayRuntime:
         capability_broker: CapabilityBroker | None,
         host_session: HostActionAdmission | None = None,
         integration_proof_resolver: IntegrationProofResolver | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> RelayRuntime:
         """Construct a Relay service from a pre-existing capability key only."""
 
@@ -698,6 +702,7 @@ class RelayRuntime:
             ),
             capability_broker=capability_broker,
             host_session=host_session,
+            clock=clock,
         )
 
     @classmethod
@@ -709,6 +714,7 @@ class RelayRuntime:
         capability_broker: CapabilityBroker | None,
         host_session: HostActionAdmission | None = None,
         integration_proof_resolver: IntegrationProofResolver | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> RelayRuntime:
         """Defer every Relay DB open until an operation actually needs storage."""
 
@@ -719,6 +725,7 @@ class RelayRuntime:
             _store_factory=store_factory,
             _capability_secret_provider=capability_secret_provider,
             _integration_proof_resolver=integration_proof_resolver,
+            clock=clock,
         )
 
     @property
@@ -795,6 +802,7 @@ class RelayRuntime:
             raise RelayError(str(error_code))
         if attempt_state == "delivered":
             return result
+        prepared_bundles: dict[str, dict[str, str]] = {}
         try:
             actions = result["host_actions"]
             if type(actions) is not list:
@@ -815,11 +823,54 @@ class RelayRuntime:
                     }:
                         service.abort_start_attempt(attempt_id, error_code=error.code)
                     raise
-                service.mark_start_admitted(attempt_id)
+                issued_at = self._capability_now()
+                facts, prepared_bundles = self._start_delivery_facts(
+                    service,
+                    actions,
+                    issued_at=issued_at,
+                    expires_at=issued_at + _WORKER_CAPABILITY_LIFETIME_SECONDS,
+                )
+                service.initialize_start_delivery(attempt_id, facts)
             elif attempt_state != "admitted":
                 raise TypeError
-            for action in actions:
-                self._deliver_worker_capabilities(broker, action)
+            try:
+                delivery = service.start_delivery(attempt_id)
+            except RelayError as error:
+                if error.code == "RELAY_STATE_STALE":
+                    raise RelayError("RELAY_CAPABILITY_INVALID") from None
+                raise
+            delivery_actions = delivery.get("actions")
+            if type(delivery_actions) is not list:
+                raise TypeError
+            action_by_id = self._actions_by_id(actions)
+            for fact in delivery_actions:
+                if type(fact) is not dict:
+                    raise TypeError
+                action_id = fact.get("action_id")
+                if type(action_id) is not str or action_id not in action_by_id:
+                    raise RelayError("RELAY_CAPABILITY_INVALID")
+                bundle = self._rebuild_capability_bundle(
+                    service,
+                    action_by_id[action_id],
+                    fact,
+                    prepared_bundle=prepared_bundles.get(action_id),
+                )
+                if fact.get("delivered") is True:
+                    continue
+                receipt = self._broker_delivery_receipt(
+                    broker.prepare_capability(
+                        action_id=action_id,
+                        endpoint=str(fact["endpoint"]),
+                        capabilities=bundle,
+                    )
+                )
+                if (
+                    receipt["action_id"] != action_id
+                    or receipt["endpoint"] != fact["endpoint"]
+                    or receipt["bundle_hash"] != fact["bundle_hash"]
+                ):
+                    raise RelayError("RELAY_CAPABILITY_BROKER_UNAVAILABLE")
+                service.record_start_action_delivery(attempt_id, action_id, receipt)
             service.mark_start_delivered(attempt_id)
         except RelayError:
             raise
@@ -869,9 +920,59 @@ class RelayRuntime:
             return None
         return None
 
-    def _deliver_worker_capabilities(
-        self, broker: CapabilityBroker, action: object
-    ) -> None:
+    def _start_delivery_facts(
+        self,
+        service: RelayService,
+        actions: list[object],
+        *,
+        issued_at: int,
+        expires_at: int,
+    ) -> tuple[list[dict[str, object]], dict[str, dict[str, str]]]:
+        facts: list[dict[str, object]] = []
+        bundles: dict[str, dict[str, str]] = {}
+        key_id = service.capability_key_id()
+        for action in actions:
+            claims = self._action_claims(action)
+            bundle = self._capability_bundle(service, claims, expires_at=expires_at)
+            bundles[str(claims["action_id"])] = bundle
+            facts.append(
+                {
+                    **claims,
+                    "issued_at": issued_at,
+                    "expires_at": expires_at,
+                    "key_id": key_id,
+                    "bundle_hash": _canonical_hash(bundle),
+                }
+            )
+        return facts, bundles
+
+    def _rebuild_capability_bundle(
+        self,
+        service: RelayService,
+        action: object,
+        fact: Mapping[str, object],
+        *,
+        prepared_bundle: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        claims = self._action_claims(action)
+        if any(fact.get(field) != value for field, value in claims.items()):
+            raise RelayError("RELAY_CAPABILITY_INVALID")
+        expires_at = fact.get("expires_at")
+        if type(expires_at) is not int or self._capability_now() >= expires_at:
+            raise RelayError("RELAY_CAPABILITY_EXPIRED")
+        if fact.get("key_id") != service.capability_key_id():
+            raise RelayError("RELAY_CAPABILITY_INVALID")
+        bundle = (
+            prepared_bundle
+            if prepared_bundle is not None
+            else self._capability_bundle(service, claims, expires_at=expires_at)
+        )
+        if fact.get("bundle_hash") != _canonical_hash(bundle):
+            raise RelayError("RELAY_CAPABILITY_INVALID")
+        return bundle
+
+    @staticmethod
+    def _action_claims(action: object) -> dict[str, object]:
         if type(action) is not dict:
             raise TypeError
         action_id = action.get("action_id")
@@ -887,19 +988,82 @@ class RelayRuntime:
         ):
             raise TypeError
         endpoint = f"bridge/{action_id}"
-        capabilities = {
-            lifecycle_action: self._relay_service.issue_worker_capability(
-                workflow_id=workflow_id,
-                task_id=task_id,
+        return {
+            "action_id": action_id,
+            "workflow_id": workflow_id,
+            "task_id": task_id,
+            "epoch": lease["epoch"],
+            "endpoint": endpoint,
+        }
+
+    @staticmethod
+    def _capability_bundle(
+        service: RelayService,
+        claims: Mapping[str, object],
+        *,
+        expires_at: int,
+    ) -> dict[str, str]:
+        epoch = claims.get("epoch")
+        if type(epoch) is not int:
+            raise TypeError
+        return {
+            lifecycle_action: service.issue_worker_capability(
+                workflow_id=str(claims["workflow_id"]),
+                task_id=str(claims["task_id"]),
                 action=lifecycle_action,
-                epoch=lease["epoch"],
-                endpoint=endpoint,
+                epoch=epoch,
+                endpoint=str(claims["endpoint"]),
+                expires_at=expires_at,
             )
             for lifecycle_action in _WORKER_CAPABILITY_ACTIONS
         }
-        broker.prepare_capability(
-            action_id=action_id, endpoint=endpoint, capabilities=capabilities
-        )
+
+    @staticmethod
+    def _actions_by_id(actions: list[object]) -> dict[str, dict[str, object]]:
+        result: dict[str, dict[str, object]] = {}
+        for action in actions:
+            if type(action) is not dict or type(action.get("action_id")) is not str:
+                raise TypeError
+            action_id = str(action["action_id"])
+            if action_id in result:
+                raise TypeError
+            result[action_id] = action
+        return result
+
+    @staticmethod
+    def _broker_delivery_receipt(value: object) -> dict[str, object]:
+        if type(value) is dict:
+            result = dict(value)
+        else:
+            result = {
+                "action_id": getattr(value, "action_id", None),
+                "endpoint": getattr(value, "endpoint", None),
+                "bundle_hash": getattr(value, "bundle_hash", None),
+            }
+        action_id = result.get("action_id")
+        endpoint = result.get("endpoint")
+        bundle_hash = result.get("bundle_hash")
+        if (
+            set(result) != {"action_id", "endpoint", "bundle_hash"}
+            or type(action_id) is not str
+            or type(endpoint) is not str
+            or not _is_hash(bundle_hash)
+        ):
+            raise RelayError("RELAY_CAPABILITY_BROKER_UNAVAILABLE")
+        return {
+            "action_id": action_id,
+            "endpoint": endpoint,
+            "bundle_hash": bundle_hash,
+        }
+
+    def _capability_now(self) -> int:
+        try:
+            value = float(self._clock())
+        except Exception:
+            raise RelayError("RELAY_CAPABILITY_INVALID") from None
+        if value <= 0 or value != value or value in {float("inf"), float("-inf")}:
+            raise RelayError("RELAY_CAPABILITY_INVALID")
+        return int(value)
 
 
 def _relay_plan_error_code(code: str) -> str:

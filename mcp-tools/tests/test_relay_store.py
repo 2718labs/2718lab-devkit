@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devkit_relay.canonical import canonical_hash
 from devkit_relay.store import RelayStore, RelayStoreError
+
+
+def test_readonly_factory_rejects_a_readwrite_connection(tmp_path: Path) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+
+    with pytest.raises(RelayStoreError) as caught:
+        RelayStore.from_readonly_connection(connection)
+
+    assert caught.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
+
+
+def test_readonly_factory_accepts_only_query_only_connection(tmp_path: Path) -> None:
+    database = tmp_path / "relay.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA query_only=ON")
+
+    readonly = RelayStore.from_readonly_connection(connection)
+
+    assert readonly.database_fingerprint().startswith("sha256:")
+    assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+    readonly.close()
+
 
 try:
     from devkit_relay.proofs import ProofFinalizationFence

@@ -230,6 +230,7 @@ class RelayService:
         action: str,
         epoch: int,
         endpoint: str,
+        expires_at: int | None = None,
     ) -> str:
         """Issue a host-delivered worker token; it is never stored or returned by status."""
 
@@ -241,9 +242,15 @@ class RelayService:
                 epoch=epoch,
                 endpoint=endpoint,
                 scope="worker",
+                expires_at=expires_at,
             )
         except ValueError as error:
             raise RelayError("RELAY_REQUEST_INVALID") from error
+
+    def capability_key_id(self) -> str:
+        """Expose only the one-way identity of the current signing key."""
+
+        return self._capabilities.key_id
 
     def issue_sol_capability(
         self,
@@ -347,6 +354,38 @@ class RelayService:
 
         return self._call(
             self._store.mark_start_admitted, self._identifier(attempt_id)
+        )
+
+    def initialize_start_delivery(
+        self, attempt_id: object, facts: object
+    ) -> dict[str, object]:
+        """Persist one bearer-free fixed delivery plan and admit atomically."""
+
+        if type(facts) is not list:
+            raise RelayError("RELAY_REQUEST_INVALID")
+        return self._call(
+            self._store.initialize_start_delivery,
+            self._identifier(attempt_id),
+            facts,
+        )
+
+    def start_delivery(self, attempt_id: object) -> dict[str, object]:
+        """Read one private bearer-free action delivery journal."""
+
+        return self._call(self._store.start_delivery, self._identifier(attempt_id))
+
+    def record_start_action_delivery(
+        self, attempt_id: object, action_id: object, receipt: object
+    ) -> dict[str, object]:
+        """Persist one exact broker receipt by CAS."""
+
+        if type(receipt) is not dict:
+            raise RelayError("RELAY_REQUEST_INVALID")
+        return self._call(
+            self._store.record_start_action_delivery,
+            self._identifier(attempt_id),
+            self._identifier(action_id),
+            receipt,
         )
 
     def mark_start_delivered(self, attempt_id: object) -> dict[str, object]:

@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from devkit_relay.canonical import canonical_hash
 from devkit_relay.service import RelayError
 from devkit_runtime.relay_runtime import RelayRuntime
 
@@ -20,6 +21,7 @@ class _RelayService:
         self.capability_issues: list[dict[str, object]] = []
         self.events: list[str] = []
         self.attempt_state = "prepared"
+        self.delivery_actions: list[dict[str, object]] = []
         self.host_actions = [
             {
                 "action_id": "action-a",
@@ -49,6 +51,38 @@ class _RelayService:
         self.attempt_state = "admitted"
         return {"attempt_id": "attempt-a", "state": self.attempt_state}
 
+    def capability_key_id(self) -> str:
+        return "sha256:" + "9" * 64
+
+    def initialize_start_delivery(
+        self, _attempt_id: object, facts: object
+    ) -> dict[str, object]:
+        assert type(facts) is list
+        self.events.append("mark_admitted")
+        self.attempt_state = "admitted"
+        self.delivery_actions = [{**fact, "delivered": False} for fact in facts]
+        return {
+            "attempt_id": "attempt-a",
+            "state": self.attempt_state,
+            "actions": [dict(fact) for fact in self.delivery_actions],
+        }
+
+    def start_delivery(self, _attempt_id: object) -> dict[str, object]:
+        return {
+            "attempt_id": "attempt-a",
+            "state": self.attempt_state,
+            "actions": [dict(fact) for fact in self.delivery_actions],
+        }
+
+    def record_start_action_delivery(
+        self, _attempt_id: object, action_id: object, _receipt: object
+    ) -> dict[str, object]:
+        for fact in self.delivery_actions:
+            if fact["action_id"] == action_id:
+                fact["delivered"] = True
+                return dict(fact)
+        raise AssertionError("unknown action")
+
     def mark_start_delivered(self, _attempt_id: object) -> dict[str, object]:
         self.events.append("mark_delivered")
         self.attempt_state = "delivered"
@@ -69,6 +103,7 @@ class _RelayService:
         action: str,
         epoch: int,
         endpoint: str,
+        expires_at: int | None = None,
     ) -> str:
         self.capability_issues.append(
             {
@@ -77,6 +112,7 @@ class _RelayService:
                 "action": action,
                 "epoch": epoch,
                 "endpoint": endpoint,
+                "expires_at": expires_at,
             }
         )
         return f"capability:{action}"
@@ -94,7 +130,13 @@ class _Broker:
     def prepare_capability(self, **kwargs: object) -> object:
         self._events.append("broker")
         self.deliveries.append(dict(kwargs))
-        return object()
+        capabilities = kwargs["capabilities"]
+        assert isinstance(capabilities, dict)
+        return {
+            "action_id": kwargs["action_id"],
+            "endpoint": kwargs["endpoint"],
+            "bundle_hash": canonical_hash(dict(sorted(capabilities.items()))),
+        }
 
 
 class _HostAdmission:

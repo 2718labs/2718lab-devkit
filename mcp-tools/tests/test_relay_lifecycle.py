@@ -1187,6 +1187,7 @@ def _canonical_v5_fixture(database: Path) -> None:
             """
             DROP INDEX relay_v3_cleanup_by_run_state;
             DROP INDEX relay_v3_scheduler_slots_by_group;
+            DROP TABLE relay_v3_start_delivery_journal;
             DROP TABLE relay_v3_start_attempts;
             DROP TABLE relay_v3_scheduler_writer_slots;
             DROP TABLE relay_v3_scheduler_groups;
@@ -1271,7 +1272,7 @@ def test_cleanup_ledger_migrates_only_known_v5_metadata_and_rejects_unknown_sche
     connection = migrated._require_connection()
     assert connection.execute(
         "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
-    ).fetchone()[0] == "9"
+    ).fetchone()[0] == "10"
     assert connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'relay_v3_cleanup_ledger'"
     ).fetchone() is not None
