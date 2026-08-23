@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import atexit
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Literal, Protocol, TypeVar, cast
 
@@ -17,6 +17,7 @@ from devkit_relay.service import RelayService
 from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.relay_runtime import (
+    ProductionRegistryResolver,
     ProjectIndexBootstrapTransport,
     RelayRuntime,
     RelayRuntimeError,
@@ -190,6 +191,14 @@ class _BootstrapRootResolver(Protocol):
     ) -> str: ...
 
 
+class _BootstrapTransportAuthority(_BootstrapRootResolver, Protocol):
+    """Host-private authority for the only bootstrap transport path."""
+
+    def verify_bootstrap_capability(
+        self, attestation: Mapping[str, object]
+    ) -> bool: ...
+
+
 class _ServerProjectIndexBootstrapHost:
     """Adapt the two existing Project Index operations to private bootstrap IO."""
 
@@ -253,6 +262,60 @@ def _run_project_index_bootstrap_transport(
         project_index=project_index,
     )
     return ProjectIndexBootstrapTransport(host, clock=clock).execute(registry_binding)
+
+
+def _compile_host_relay_request(
+    request: Mapping[str, object],
+    *,
+    bootstrap_authority: _BootstrapTransportAuthority,
+    project_index: object,
+    atlas_store: object,
+    clock: Callable[[], float],
+) -> dict[str, object]:
+    """Close a host-authorized V2/V3 bootstrap without widening MCP input.
+
+    The public ``relay_compile`` MCP tool remains V1-only.  A host that owns a
+    real capability verifier may use this private seam to compile an exact
+    V2/V3 descriptor, run the isolated register/sync transport, and then
+    recompile against its receipt.  No root is ever accepted from ``request``.
+    """
+
+    verify = getattr(bootstrap_authority, "verify_bootstrap_capability", None)
+    resolve_root = getattr(bootstrap_authority, "resolve_bootstrap_root", None)
+    if not callable(verify) or not callable(resolve_root):
+        raise RelayRuntimeError("BOOTSTRAP_HOST_AUTHORITY_UNAVAILABLE")
+    registry = ProductionRegistryResolver(
+        project_index,
+        atlas_store,
+        clock=clock,
+        bootstrap_capability_verifier=lambda attestation: verify(attestation) is True,
+    )
+
+    schema = request.get("schema")
+    descriptor = cast(dict[str, object], compile_plan(request, registry_resolver=registry))
+    if schema not in {
+        "2718lab-devkit/relay-compile-request-v2",
+        "2718lab-devkit/relay-compile-request-v3",
+    }:
+        return descriptor
+    if "bootstrap_receipt" in request:
+        return descriptor
+
+    project_binding = request.get("project_binding")
+    if type(project_binding) is not dict or project_binding.get("mode") != "new_empty_bootstrap":
+        return descriptor
+
+    registry_binding = registry.resolve_new_empty_bootstrap(project_binding)
+    receipt = _run_project_index_bootstrap_transport(
+        registry_binding,
+        root_resolver=bootstrap_authority,
+        project_index=project_index,
+        clock=clock,
+    )
+    recompile = dict(request)
+    recompile["input_snapshot_id"] = receipt["index_snapshot_id"]
+    recompile["bootstrap_receipt"] = receipt
+    return cast(dict[str, object], compile_plan(recompile, registry_resolver=registry))
 
 class _RequestError(ValueError):
     """A bounded, public request failure raised before a persistent operation."""
