@@ -40,23 +40,12 @@ def test_adapter_exposes_no_forgeable_verified_host_facts_marker() -> None:
     assert not hasattr(adapter, "_CONSTRUCTION_CAPABILITY")
 
 
-def test_unverified_quota_values_cannot_bootstrap_verified_host_facts() -> None:
+def test_unverified_capability_values_cannot_bootstrap_verified_host_facts() -> None:
     adapter = _adapter()
-    from devkit_runtime.host_session import HostQuotaFacts, HostSession
+    from devkit_runtime.host_session import HostSession
 
-    quota = HostQuotaFacts(
-        request_id="quota-public",
-        account_id_hash="sha256:" + "a" * 64,
-        source_id_hash="sha256:" + "b" * 64,
-        main_limit_id="codex",
-        spark_limit_id="spark",
-        snapshot_hash="sha256:" + "c" * 64,
-        snapshot_seq=1,
-        snapshot={},
-    )
     unavailable_session = HostSession(
         bridge=None,
-        quota_evidence_resolver=lambda *_arguments: None,
         clock=lambda: 1.0,
     )
 
@@ -64,7 +53,6 @@ def test_unverified_quota_values_cannot_bootstrap_verified_host_facts() -> None:
         adapter.prepare_verified_host_facts(
             unavailable_session,
             capability_facts=(),
-            quota_facts=quota,
         )
         == adapter.NO_SAFE_WORK
     )

@@ -90,19 +90,9 @@ def _intent(
         },
         "route_binding_hash",
     )
-    quota = _with_binding(
-        {
-            "snapshot_hash": _hash("quota-snapshot"),
-            "decision_hash": _hash("quota-decision"),
-            "evidence_hash": _hash("quota-evidence"),
-            "ledger_epoch": 11,
-            "active_lease_set_hash": _hash("active-lease-set"),
-        },
-        "quota_binding_hash",
-    )
     predecessor = _with_binding(
         {
-            "schema": "2718lab-devkit/fastlane-external-lease-predecessor-v1",
+            "schema": "2718lab-devkit/fastlane-external-lease-predecessor-v2",
             "projection_hash": projection_hash,
             "source_plan_hash": source_plan_hash,
             "workflow_hash": workflow_hash,
@@ -111,11 +101,8 @@ def _intent(
             "assignment_id": assignment_id,
             "assignment_token": assignment_token,
             "routing_result_hash": route["routing_result_hash"],
-            "quota_evidence_hash": quota["evidence_hash"],
-            "quota_snapshot_hash": quota["snapshot_hash"],
-            "quota_decision_hash": quota["decision_hash"],
-            "ledger_epoch": quota["ledger_epoch"],
-            "active_lease_set_hash": quota["active_lease_set_hash"],
+            "ledger_epoch": 11,
+            "active_lease_set_hash": _hash("active-lease-set"),
             "lease_epoch": 17,
         },
         "predecessor_hash",
@@ -156,8 +143,8 @@ def _intent(
             "assignment_id": assignment_id,
             "assignment_token": assignment_token,
             "predecessor_hash": predecessor["predecessor_hash"],
-            "ledger_epoch": quota["ledger_epoch"],
-            "active_lease_set_hash": quota["active_lease_set_hash"],
+            "ledger_epoch": predecessor["ledger_epoch"],
+            "active_lease_set_hash": predecessor["active_lease_set_hash"],
         },
         "lease_binding_hash",
     )
@@ -178,14 +165,13 @@ def _intent(
         "create_binding_hash",
     )
     candidate = {
-        "schema": "2718lab-devkit/fastlane-host-execution-intent-v1",
+        "schema": "2718lab-devkit/fastlane-host-execution-intent-v2",
         "projection_hash": projection_hash,
         "source_plan_hash": source_plan_hash,
         "workflow_hash": workflow_hash,
         "assignment": assignment,
         "route": route,
         "capability_facts": [capability_fact],
-        "quota": quota,
         "packets": packets,
         "source": source,
         "create": create,
@@ -218,7 +204,6 @@ def _expectation(module: Any, candidate: dict[str, Any]) -> Any:
     assignment = candidate["assignment"]
     predecessor = assignment["predecessor"]
     route = candidate["route"]
-    quota = candidate["quota"]
     packets = candidate["packets"]
     source = candidate["source"]
     create = candidate["create"]
@@ -250,11 +235,8 @@ def _expectation(module: Any, candidate: dict[str, Any]) -> Any:
         inherit_current_session_model=route["inherit_current_session_model"],
         require_explicit_route=route["require_explicit_route"],
         capability_facts=capability_facts,
-        quota_snapshot_hash=quota["snapshot_hash"],
-        quota_decision_hash=quota["decision_hash"],
-        quota_evidence_hash=quota["evidence_hash"],
-        ledger_epoch=quota["ledger_epoch"],
-        active_lease_set_hash=quota["active_lease_set_hash"],
+        ledger_epoch=predecessor["ledger_epoch"],
+        active_lease_set_hash=predecessor["active_lease_set_hash"],
         task_packet_hash=packets["task_packet_hash"],
         input_packet_hash=packets["input_packet_hash"],
         index_packet_hash=packets["index_packet_hash"],
@@ -371,14 +353,14 @@ def test_parse_and_fieldwise_match_are_immutable_but_non_authorizing() -> None:
             ),
         ),
         (
-            "quota_evidence_mismatch",
-            lambda intent: intent["quota"].__setitem__(
-                "evidence_hash", _hash("other-evidence")
-            ),
+            "removed_quota_object",
+            lambda intent: intent.__setitem__("quota", {"used": 1}),
         ),
         (
             "ledger_epoch_mismatch",
-            lambda intent: intent["quota"].__setitem__("ledger_epoch", 12),
+            lambda intent: intent["assignment"]["predecessor"].__setitem__(
+                "ledger_epoch", 12
+            ),
         ),
         (
             "lease_fencing_mismatch",
@@ -466,12 +448,10 @@ def test_parser_accepts_but_matcher_differentiates_a_rebound_assignment_token() 
     _assert_hard_gate(candidate, _expectation(module, baseline))
 
 
-def test_parser_accepts_but_matcher_differentiates_a_rebound_quota_ledger() -> None:
+def test_parser_accepts_but_matcher_differentiates_a_rebound_lease_ledger() -> None:
     module = _module()
     baseline = _intent()
     candidate = copy.deepcopy(baseline)
-    candidate["quota"]["ledger_epoch"] = 12
-    candidate["quota"] = _with_binding(candidate["quota"], "quota_binding_hash")
     candidate["assignment"]["predecessor"]["ledger_epoch"] = 12
     predecessor_hash = _refresh_predecessor_and_assignment(candidate)
     candidate["lease"]["ledger_epoch"] = 12

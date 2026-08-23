@@ -16,7 +16,12 @@ from devkit_relay.compiler import compile_plan
 from devkit_relay.service import RelayService
 from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
-from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
+from devkit_runtime.relay_runtime import (
+    ProjectIndexBootstrapTransport,
+    RelayRuntime,
+    RelayRuntimeError,
+    project_index_bootstrap_index_identity,
+)
 from devkit_runtime.tool_result import (
     TOOL_ANNOTATIONS,
     ResultContractError,
@@ -176,6 +181,78 @@ class _TaskLeaseAuthority(Protocol):
         self, task_lease: TaskLeaseRef, *, workspace_id: str, result: object
     ) -> None: ...
 
+
+class _BootstrapRootResolver(Protocol):
+    """Private host authority mapping one opaque bootstrap identity to its root."""
+
+    def resolve_bootstrap_root(
+        self, *, bootstrap_root_identity: str, attestation_hash: str
+    ) -> str: ...
+
+
+class _ServerProjectIndexBootstrapHost:
+    """Adapt the two existing Project Index operations to private bootstrap IO."""
+
+    def __init__(
+        self,
+        *,
+        registry_binding: dict[str, object],
+        root_resolver: _BootstrapRootResolver,
+        project_index: object,
+    ) -> None:
+        self._binding = dict(registry_binding)
+        self._root_resolver = root_resolver
+        self._project_index = project_index
+
+    def project_index_register(
+        self, *, bootstrap_root_identity: str, attestation_hash: str
+    ) -> dict[str, object]:
+        root = self._root_resolver.resolve_bootstrap_root(
+            bootstrap_root_identity=bootstrap_root_identity,
+            attestation_hash=attestation_hash,
+        )
+        register = getattr(self._project_index, "project_index_register", None)
+        if type(root) is not str or not root or not callable(register):
+            raise RelayRuntimeError("BOOTSTRAP_HOST_OPERATION_FAILED")
+        return {"workspace_id": register(root)}
+
+    def project_index_sync(
+        self, *, workspace_id: str, attestation_hash: str
+    ) -> dict[str, object]:
+        if attestation_hash != self._binding.get("attestation_hash"):
+            raise RelayRuntimeError("BOOTSTRAP_IDENTITY_MISMATCH")
+        sync = getattr(self._project_index, "sync", None)
+        if not callable(sync):
+            raise RelayRuntimeError("BOOTSTRAP_HOST_OPERATION_FAILED")
+        snapshot = sync(workspace_id)
+        result: dict[str, object] = {
+            "workspace_id": getattr(snapshot, "workspace_id", None),
+            "attested_input_snapshot_id": self._binding.get(
+                "attested_input_snapshot_id"
+            ),
+            "initial_manifest_hash": getattr(snapshot, "manifest_hash", None),
+            "initial_entry_count": getattr(snapshot, "file_count", None),
+            "index_snapshot_id": getattr(snapshot, "snapshot_id", None),
+        }
+        result["index_identity"] = project_index_bootstrap_index_identity(result)
+        return result
+
+
+def _run_project_index_bootstrap_transport(
+    registry_binding: dict[str, object],
+    *,
+    root_resolver: _BootstrapRootResolver,
+    project_index: object,
+    clock: Callable[[], float],
+) -> dict[str, object]:
+    """Explicitly run bootstrap; normal startup and Relay compilation never call it."""
+
+    host = _ServerProjectIndexBootstrapHost(
+        registry_binding=registry_binding,
+        root_resolver=root_resolver,
+        project_index=project_index,
+    )
+    return ProjectIndexBootstrapTransport(host, clock=clock).execute(registry_binding)
 
 class _RequestError(ValueError):
     """A bounded, public request failure raised before a persistent operation."""
@@ -788,7 +865,7 @@ def fastlane_compile(
 ) -> dict[str, object]:
     """Compile inert Fast Lane descriptors without receiving host-private evidence.
 
-    The host remains responsible for quota attestations, worktree/lease fencing,
+    The host remains responsible for capability attestations, worktree/lease fencing,
     model dispatch, terminal receipts, and execution.  This MCP boundary only
     validates and renders the deterministic local scheduling plan.
     """

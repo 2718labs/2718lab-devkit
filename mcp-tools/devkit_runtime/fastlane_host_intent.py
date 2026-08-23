@@ -15,8 +15,8 @@ from typing import Final, Literal, cast
 
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 
-_SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v1"
-_PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v1"
+_SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
+_PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v2"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _GIT_OBJECT_PATTERN: Final = re.compile(r"[0-9a-f]{40}\Z")
 _IDENTIFIER_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
@@ -32,7 +32,6 @@ _ROOT_KEYS: Final = frozenset(
         "assignment",
         "route",
         "capability_facts",
-        "quota",
         "packets",
         "source",
         "create",
@@ -59,9 +58,6 @@ _PREDECESSOR_KEYS: Final = frozenset(
         "assignment_id",
         "assignment_token",
         "routing_result_hash",
-        "quota_evidence_hash",
-        "quota_snapshot_hash",
-        "quota_decision_hash",
         "ledger_epoch",
         "active_lease_set_hash",
         "lease_epoch",
@@ -87,16 +83,6 @@ _CAPABILITY_FACT_KEYS: Final = frozenset(
         "state",
         "attestation_hash",
         "capability_binding_hash",
-    }
-)
-_QUOTA_KEYS: Final = frozenset(
-    {
-        "snapshot_hash",
-        "decision_hash",
-        "evidence_hash",
-        "ledger_epoch",
-        "active_lease_set_hash",
-        "quota_binding_hash",
     }
 )
 _PACKET_KEYS: Final = frozenset(
@@ -195,9 +181,6 @@ class HostExecutionExpectationProjection:
     inherit_current_session_model: bool
     require_explicit_route: bool
     capability_facts: tuple[HostCapabilityExpectation, ...]
-    quota_snapshot_hash: str
-    quota_decision_hash: str
-    quota_evidence_hash: str
     ledger_epoch: int
     active_lease_set_hash: str
     task_packet_hash: str
@@ -241,12 +224,8 @@ class ParsedHostExecutionIntent:
     require_explicit_route: bool
     route_binding_hash: str
     parsed_capability_facts: tuple[ParsedHostCapabilityFact, ...]
-    quota_snapshot_hash: str
-    quota_decision_hash: str
-    quota_evidence_hash: str
     ledger_epoch: int
     active_lease_set_hash: str
-    quota_binding_hash: str
     task_packet_hash: str
     input_packet_hash: str
     index_packet_hash: str
@@ -316,29 +295,26 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         root["assignment"], _ASSIGNMENT_KEYS, "assignment_binding_hash"
     )
     route = _bound_mapping(root["route"], _ROUTE_KEYS, "route_binding_hash")
-    quota = _bound_mapping(root["quota"], _QUOTA_KEYS, "quota_binding_hash")
     packets = _bound_mapping(root["packets"], _PACKET_KEYS, "packet_binding_hash")
     source = _bound_mapping(root["source"], _SOURCE_KEYS, "source_binding_hash")
     create = _bound_mapping(root["create"], _CREATE_KEYS, "create_binding_hash")
     lease = _bound_mapping(root["lease"], _LEASE_KEYS, "lease_binding_hash")
     if any(
         value is None
-        for value in (assignment, route, quota, packets, source, create, lease)
+        for value in (assignment, route, packets, source, create, lease)
     ):
         return None
 
     assert assignment is not None
     assert route is not None
-    assert quota is not None
     assert packets is not None
     assert source is not None
     assert create is not None
     assert lease is not None
 
     validated_route = _validate_route(route)
-    validated_quota = _validate_quota(quota)
     validated_source = _validate_source(source)
-    if validated_route is None or validated_quota is None or validated_source is None:
+    if validated_route is None or validated_source is None:
         return None
     (
         model,
@@ -350,14 +326,6 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         require_explicit_route,
         route_binding_hash,
     ) = validated_route
-    (
-        quota_snapshot_hash,
-        quota_decision_hash,
-        quota_evidence_hash,
-        ledger_epoch,
-        active_lease_set_hash,
-        quota_binding_hash,
-    ) = validated_quota
     (
         project_id,
         registered_project_id,
@@ -392,15 +360,17 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         assignment_id=assignment_id,
         assignment_token=assignment_token,
         routing_result_hash=routing_result_hash,
-        quota_snapshot_hash=quota_snapshot_hash,
-        quota_decision_hash=quota_decision_hash,
-        quota_evidence_hash=quota_evidence_hash,
-        ledger_epoch=ledger_epoch,
-        active_lease_set_hash=active_lease_set_hash,
     )
     if validated_predecessor is None:
         return None
-    task_id, role, predecessor_hash, lease_epoch = validated_predecessor
+    (
+        task_id,
+        role,
+        predecessor_hash,
+        lease_epoch,
+        ledger_epoch,
+        active_lease_set_hash,
+    ) = validated_predecessor
 
     capability_facts = _validate_capability_facts(root["capability_facts"])
     if capability_facts is None or not _has_candidate_capability_claim(
@@ -486,12 +456,8 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         require_explicit_route=require_explicit_route,
         route_binding_hash=route_binding_hash,
         parsed_capability_facts=capability_facts,
-        quota_snapshot_hash=quota_snapshot_hash,
-        quota_decision_hash=quota_decision_hash,
-        quota_evidence_hash=quota_evidence_hash,
         ledger_epoch=ledger_epoch,
         active_lease_set_hash=active_lease_set_hash,
-        quota_binding_hash=quota_binding_hash,
         task_packet_hash=task_packet_hash,
         input_packet_hash=input_packet_hash,
         index_packet_hash=index_packet_hash,
@@ -550,34 +516,6 @@ def _validate_route(
     )
 
 
-def _validate_quota(
-    quota: dict[str, object],
-) -> tuple[str, str, str, int, str, str] | None:
-    snapshot_hash = _valid_hash(quota, "snapshot_hash")
-    decision_hash = _valid_hash(quota, "decision_hash")
-    evidence_hash = _valid_hash(quota, "evidence_hash")
-    ledger_epoch = _positive_int(quota, "ledger_epoch")
-    active_lease_set_hash = _valid_hash(quota, "active_lease_set_hash")
-    quota_binding_hash = _valid_hash(quota, "quota_binding_hash")
-    if (
-        snapshot_hash is None
-        or decision_hash is None
-        or evidence_hash is None
-        or ledger_epoch is None
-        or active_lease_set_hash is None
-        or quota_binding_hash is None
-    ):
-        return None
-    return (
-        snapshot_hash,
-        decision_hash,
-        evidence_hash,
-        ledger_epoch,
-        active_lease_set_hash,
-        quota_binding_hash,
-    )
-
-
 def _validate_source(
     source: dict[str, object],
 ) -> tuple[str, str, str, str, str, str, str, str] | None:
@@ -622,23 +560,22 @@ def _validate_predecessor(
     assignment_id: str,
     assignment_token: str,
     routing_result_hash: str,
-    quota_snapshot_hash: str,
-    quota_decision_hash: str,
-    quota_evidence_hash: str,
-    ledger_epoch: int,
-    active_lease_set_hash: str,
-) -> tuple[str, str, str, int] | None:
+) -> tuple[str, str, str, int, int, str] | None:
     if _text(predecessor, "schema") != _PREDECESSOR_SCHEMA:
         return None
     predecessor_hash = _valid_hash(predecessor, "predecessor_hash")
     task_id = _valid_identifier(predecessor, "task_id")
     role = _valid_identifier(predecessor, "role")
     lease_epoch = _positive_int(predecessor, "lease_epoch")
+    ledger_epoch = _positive_int(predecessor, "ledger_epoch")
+    active_lease_set_hash = _valid_hash(predecessor, "active_lease_set_hash")
     if (
         predecessor_hash is None
         or task_id is None
         or role is None
         or lease_epoch is None
+        or ledger_epoch is None
+        or active_lease_set_hash is None
     ):
         return None
     expected_fields = {
@@ -648,15 +585,17 @@ def _validate_predecessor(
         "assignment_id": assignment_id,
         "assignment_token": assignment_token,
         "routing_result_hash": routing_result_hash,
-        "quota_snapshot_hash": quota_snapshot_hash,
-        "quota_decision_hash": quota_decision_hash,
-        "quota_evidence_hash": quota_evidence_hash,
-        "ledger_epoch": ledger_epoch,
-        "active_lease_set_hash": active_lease_set_hash,
     }
     if any(predecessor[field] != value for field, value in expected_fields.items()):
         return None
-    return task_id, role, predecessor_hash, lease_epoch
+    return (
+        task_id,
+        role,
+        predecessor_hash,
+        lease_epoch,
+        ledger_epoch,
+        active_lease_set_hash,
+    )
 
 
 def _validate_capability_facts(
@@ -764,12 +703,6 @@ def matches_host_execution_expectation(
         and expectation_projection.require_explicit_route
         == parsed_intent.require_explicit_route
         and expectation_projection.capability_facts == expected_capability_facts
-        and expectation_projection.quota_snapshot_hash
-        == parsed_intent.quota_snapshot_hash
-        and expectation_projection.quota_decision_hash
-        == parsed_intent.quota_decision_hash
-        and expectation_projection.quota_evidence_hash
-        == parsed_intent.quota_evidence_hash
         and expectation_projection.ledger_epoch == parsed_intent.ledger_epoch
         and expectation_projection.active_lease_set_hash
         == parsed_intent.active_lease_set_hash
@@ -811,9 +744,6 @@ def _is_expectation_projection(
         expectation.predecessor_hash,
         expectation.routing_context_hash,
         expectation.routing_result_hash,
-        expectation.quota_snapshot_hash,
-        expectation.quota_decision_hash,
-        expectation.quota_evidence_hash,
         expectation.active_lease_set_hash,
         expectation.task_packet_hash,
         expectation.input_packet_hash,

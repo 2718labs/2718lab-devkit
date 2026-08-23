@@ -1,29 +1,21 @@
 """Private fail-closed facts from one inherited host bridge session.
 
-This module deliberately has no dispatch, listener, worktree, or persistence
-operation.  Its only live inputs are a previously authenticated inherited
-bridge and a same-process trusted callback that retains the verifier returned
-by the official Codex quota provider.
+This module deliberately has no dispatch, listener, worktree, persistence, or
+account-usage coordinator. Its live inputs are an authenticated inherited
+bridge plus same-process capability and lease-bound compiler resolvers.
 """
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
 import re
-import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import StrEnum
 from threading import RLock
-from types import MappingProxyType
-from typing import Any, Final, TypeAlias
-
-from devkit_fastlane.scripts.codex_account_quota import QuotaSnapshotEvidence
-from devkit_fastlane.scripts.fastlane_quota_balance import _verified_snapshot
+from typing import Final, TypeAlias
 
 from . import host_envelopes
 from .host_bridge import (
@@ -36,53 +28,8 @@ _NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 _HASH_PREFIX: Final = "sha256:"
 _IDENTIFIER: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _REASON_SESSION_UNAVAILABLE: Final = "HOST_SESSION_UNAVAILABLE"
-_REASON_QUOTA_EXPECTATION_UNAVAILABLE: Final = "HOST_QUOTA_EXPECTATION_UNAVAILABLE"
-_REASON_QUOTA_UNAVAILABLE: Final = "HOST_QUOTA_UNAVAILABLE"
 _REASON_CAPABILITY_UNAVAILABLE: Final = "HOST_CAPABILITY_UNAVAILABLE"
 _REASON_EXECUTION_EVIDENCE_UNAVAILABLE: Final = "HOST_EXECUTION_EVIDENCE_UNAVAILABLE"
-
-
-@dataclass(frozen=True)
-class HostQuotaAttestation:
-    """Private, same-process bindings for one bridge-delivered quota snapshot."""
-
-    request_id: str
-    account_id_hash: str
-    source_id_hash: str
-    main_limit_id: str
-    spark_limit_id: str
-    capacity_hash: str
-    snapshot_seq: int
-    evidence: QuotaSnapshotEvidence = field(repr=False)
-
-
-@dataclass(frozen=True)
-class HostQuotaExpectation:
-    """Trusted constructor-time identities that a quota session cannot rebind."""
-
-    account_id_hash: str
-    source_id_hash: str
-    key_id: str
-    main_limit_id: str
-    spark_limit_id: str
-    capacity_hash: str
-    ledger_epoch: int
-    active_lease_set_hash: str
-    snapshot_seq_high_water: int
-
-
-@dataclass(frozen=True)
-class HostQuotaFacts:
-    """Bearer-free facts admitted only after exact private attestation."""
-
-    request_id: str
-    account_id_hash: str
-    source_id_hash: str
-    main_limit_id: str
-    spark_limit_id: str
-    snapshot_hash: str
-    snapshot_seq: int
-    snapshot: Mapping[str, Any]
 
 
 class HostCapabilityState(StrEnum):
@@ -139,9 +86,6 @@ class _CapabilityRecord:
     binding: host_envelopes.EnvelopeBinding = field(repr=False)
 
 
-QuotaEvidenceResolver: TypeAlias = Callable[
-    [str, Mapping[str, object]], HostQuotaAttestation | None
-]
 CompilerEvidenceProvider: TypeAlias = Callable[["_CompilerPreparation"], object]
 
 
@@ -181,9 +125,6 @@ class _CompilerInvocation:
     verified_lease_scope_bindings: tuple[str, ...]
     issued_at: float
     expires_at: float
-    snapshot_hash: str
-    snapshot_seq: int
-    quota_binding_hash: str
     binding_hash: str
 
 
@@ -200,14 +141,11 @@ class HostSession:
         self,
         *,
         bridge: InheritedHandleHostBridge | None,
-        quota_evidence_resolver: QuotaEvidenceResolver,
         clock: Callable[[], float],
-        quota_expectation: HostQuotaExpectation | None = None,
         compiler_evidence_provider: CompilerEvidenceProvider | None = None,
         compiler_invocation_resolver: CompilerInvocationResolver | None = None,
     ) -> None:
         self._bridge = bridge
-        self._quota_evidence_resolver = quota_evidence_resolver
         self._compiler_evidence_provider = (
             compiler_evidence_provider if callable(compiler_evidence_provider) else None
         )
@@ -219,28 +157,13 @@ class HostSession:
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
         self._burned_preparation_ids: set[str] = set()
-        self._has_fresh_quota = False
-        self._fresh_quota: HostQuotaFacts | None = None
-        self._fresh_quota_issued_at: float | None = None
-        self._fresh_quota_valid_until: float | None = None
         self._clock = clock
         self._last_trusted_clock: float | None = None
-        try:
-            self._quota_expectation = _normalize_quota_expectation(quota_expectation)
-        except (TypeError, ValueError):
-            self._quota_expectation = None
         self._closed = False
         self._frozen = (
             bridge is None
-            or not callable(quota_evidence_resolver)
             or not callable(clock)
             or not bridge.is_available
-        )
-        self._seen_snapshot_hashes: set[str] = set()
-        self._last_snapshot_seq: int | None = (
-            None
-            if self._quota_expectation is None
-            else self._quota_expectation.snapshot_seq_high_water
         )
         self._attested_capabilities: dict[tuple[str, str], _CapabilityRecord] = {}
         self._consumed_predecessors: set[tuple[str, str, str, str, str]] = set()
@@ -252,9 +175,7 @@ class HostSession:
         *,
         environ: Mapping[str, str] | None,
         platform: str | None,
-        quota_evidence_resolver: QuotaEvidenceResolver,
         clock: Callable[[], float],
-        quota_expectation: HostQuotaExpectation | None = None,
     ) -> HostSession:
         """Accept only the configured inherited bridge selector, never a fallback."""
 
@@ -267,9 +188,7 @@ class HostSession:
             bridge = None
         return cls(
             bridge=bridge,
-            quota_evidence_resolver=quota_evidence_resolver,
             clock=clock,
-            quota_expectation=quota_expectation,
         )
 
     @property
@@ -297,10 +216,6 @@ class HostSession:
                 return
             self._closed = True
             self._frozen = True
-            self._has_fresh_quota = False
-            self._fresh_quota = None
-            self._fresh_quota_issued_at = None
-            self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -325,39 +240,13 @@ class HostSession:
             if preparation_id in self._burned_preparation_ids:
                 return _NO_SAFE_WORK
             self._burned_preparation_ids.add(preparation_id)
-            quota = self._fresh_quota
-            issued_at = self._fresh_quota_issued_at
-            valid_until = self._fresh_quota_valid_until
-            if (
-                not self.is_available
-                or not self._has_fresh_quota
-                or quota is None
-                or issued_at is None
-                or valid_until is None
-            ):
+            if not self.is_available:
                 return _NO_SAFE_WORK
             try:
-                now = self._read_trusted_clock()
+                issued_at = self._read_trusted_clock()
             except (TypeError, ValueError):
                 return _NO_SAFE_WORK
-            self._has_fresh_quota = False
-            self._fresh_quota = None
-            self._fresh_quota_issued_at = None
-            self._fresh_quota_valid_until = None
-            expires_at = min(issued_at + 120, valid_until)
-            if now >= expires_at:
-                return _NO_SAFE_WORK
-            quota_binding_hash = _hash(
-                {
-                    "account_id_hash": quota.account_id_hash,
-                    "main_limit_id": quota.main_limit_id,
-                    "request_id": quota.request_id,
-                    "snapshot_hash": quota.snapshot_hash,
-                    "snapshot_seq": quota.snapshot_seq,
-                    "source_id_hash": quota.source_id_hash,
-                    "spark_limit_id": quota.spark_limit_id,
-                }
-            )
+            expires_at = issued_at + 120
             try:
                 binding = _normalized_compiler_invocation_binding(
                     binding_resolver(preparation_id)
@@ -366,7 +255,7 @@ class HostSession:
                 return _NO_SAFE_WORK
             preparation = _CompilerPreparation()
             material = _CompilerInvocation(
-                schema="2718lab-devkit/compiler-invocation-v1",
+                schema="2718lab-devkit/compiler-invocation-v2",
                 preparation_id=preparation_id,
                 request_hash=binding.request_hash,
                 reasoning_effort=binding.reasoning_effort,
@@ -374,20 +263,15 @@ class HostSession:
                 verified_lease_scope_bindings=binding.verified_lease_scope_bindings,
                 issued_at=issued_at,
                 expires_at=expires_at,
-                snapshot_hash=quota.snapshot_hash,
-                snapshot_seq=quota.snapshot_seq,
-                quota_binding_hash=quota_binding_hash,
                 binding_hash=_hash(
                     {
-                        "expires_at": expires_at,
-                        "issued_at": issued_at,
                         "preparation_id": preparation_id,
-                        "quota_binding_hash": quota_binding_hash,
-                        "reasoning_effort": binding.reasoning_effort,
                         "request_hash": binding.request_hash,
-                        "route_result_hashes": binding.verified_route_result_hashes,
-                        "schema": "2718lab-devkit/compiler-invocation-v1",
-                        "lease_scope_bindings": binding.verified_lease_scope_bindings,
+                        "reasoning_effort": binding.reasoning_effort,
+                        "verified_route_result_hashes": binding.verified_route_result_hashes,
+                        "verified_lease_scope_bindings": binding.verified_lease_scope_bindings,
+                        "issued_at": issued_at,
+                        "expires_at": expires_at,
                     }
                 ),
             )
@@ -434,46 +318,6 @@ class HostSession:
             if now >= material.expires_at:
                 return _NO_SAFE_WORK
             return material
-
-    def read_quota(self) -> HostQuotaFacts | str:
-        """Return one fresh, fully bound quota fact set or ``NO_SAFE_WORK``."""
-
-        if not self.is_available:
-            self._record_unavailable((), _REASON_SESSION_UNAVAILABLE)
-            return _NO_SAFE_WORK
-        if self._quota_expectation is None:
-            self._record_unavailable((), _REASON_QUOTA_EXPECTATION_UNAVAILABLE)
-            return _NO_SAFE_WORK
-        bridge = self._bridge
-        assert bridge is not None
-        request_id = f"quota-{secrets.token_hex(16)}"
-        try:
-            bridge.request_quota_snapshot(request_id=request_id)
-            transport_snapshot = copy.deepcopy(
-                bridge.receive_quota_snapshot(request_id=request_id)
-            )
-            attestation = self._quota_evidence_resolver(
-                request_id, copy.deepcopy(transport_snapshot)
-            )
-            facts = self._verify_quota(
-                request_id=request_id,
-                snapshot=transport_snapshot,
-                attestation=attestation,
-            )
-            issued_at = self._read_trusted_clock()
-            valid_until = _valid_until_timestamp(facts.snapshot)
-        except Exception:
-            self._record_unavailable((), _REASON_QUOTA_UNAVAILABLE)
-            self._freeze()
-            return _NO_SAFE_WORK
-        with self._compiler_evidence_lock:
-            if self._closed or self._frozen or not self.is_available:
-                return _NO_SAFE_WORK
-            self._has_fresh_quota = True
-            self._fresh_quota = facts
-            self._fresh_quota_issued_at = issued_at
-            self._fresh_quota_valid_until = valid_until
-        return facts
 
     def declare_routes(
         self, routes: tuple[HostRoute, ...] | list[HostRoute]
@@ -658,77 +502,6 @@ class HostSession:
         )
         return executed
 
-    def _verify_quota(
-        self,
-        *,
-        request_id: str,
-        snapshot: Mapping[str, object],
-        attestation: HostQuotaAttestation | None,
-    ) -> HostQuotaFacts:
-        expectation = self._quota_expectation
-        if expectation is None:
-            raise ValueError("quota expectation is unavailable")
-        if type(attestation) is not HostQuotaAttestation:
-            raise ValueError("quota attestation is unavailable")
-        evidence = attestation.evidence
-        if type(evidence) is not QuotaSnapshotEvidence:
-            raise ValueError("quota evidence is unavailable")
-        if attestation.request_id != request_id or dict(evidence.snapshot) != dict(
-            snapshot
-        ):
-            raise ValueError("quota evidence is not request-bound")
-        evaluation_time = _utc_z(self._read_trusted_clock())
-        verified, _ = _verified_snapshot(
-            snapshot,
-            trusted_key_resolver=evidence.key_resolver,
-            evaluation_time_utc_z=evaluation_time,
-        )
-        source = _mapping(verified["source"])
-        capacity = _mapping(verified["capacity"])
-        snapshot_hash = _required_hash(verified["snapshot_hash"])
-        snapshot_seq = _required_positive_int(verified["snapshot_seq"])
-        if (
-            attestation.source_id_hash != source.get("source_id_hash")
-            or source.get("source_id_hash") != _OFFICIAL_QUOTA_SOURCE_ID_HASH
-            or attestation.source_id_hash != expectation.source_id_hash
-            or evidence.key_id != source.get("key_id")
-            or evidence.key_id != expectation.key_id
-            or not _is_hash(attestation.account_id_hash)
-            or attestation.account_id_hash != evidence.account_id_hash
-            or attestation.account_id_hash != expectation.account_id_hash
-            or attestation.main_limit_id != evidence.main_limit_id
-            or attestation.spark_limit_id != evidence.spark_limit_id
-            or attestation.main_limit_id != "codex"
-            or attestation.main_limit_id != expectation.main_limit_id
-            or not isinstance(attestation.spark_limit_id, str)
-            or not attestation.spark_limit_id
-            or attestation.spark_limit_id != expectation.spark_limit_id
-            or attestation.capacity_hash != _hash(capacity)
-            or _hash(capacity) != expectation.capacity_hash
-            or capacity.get("ledger_epoch") != expectation.ledger_epoch
-            or capacity.get("active_lease_set_hash")
-            != expectation.active_lease_set_hash
-            or attestation.snapshot_seq != snapshot_seq
-        ):
-            raise ValueError("quota evidence binding is invalid")
-        if snapshot_hash in self._seen_snapshot_hashes or (
-            self._last_snapshot_seq is not None
-            and snapshot_seq <= self._last_snapshot_seq
-        ):
-            raise ValueError("quota snapshot was replayed")
-        self._seen_snapshot_hashes.add(snapshot_hash)
-        self._last_snapshot_seq = snapshot_seq
-        return HostQuotaFacts(
-            request_id=request_id,
-            account_id_hash=attestation.account_id_hash,
-            source_id_hash=_required_hash(source["source_id_hash"]),
-            main_limit_id=attestation.main_limit_id,
-            spark_limit_id=attestation.spark_limit_id,
-            snapshot_hash=snapshot_hash,
-            snapshot_seq=snapshot_seq,
-            snapshot=_readonly_mapping(verified),
-        )
-
     def _record_unavailable(
         self,
         routes: tuple[HostRoute, ...] | list[HostRoute],
@@ -755,10 +528,6 @@ class HostSession:
     def _freeze(self) -> None:
         with self._compiler_evidence_lock:
             self._frozen = True
-            self._has_fresh_quota = False
-            self._fresh_quota = None
-            self._fresh_quota_issued_at = None
-            self._fresh_quota_valid_until = None
             self._compiler_evidence.clear()
         if self._bridge is not None:
             self._bridge.close()
@@ -777,7 +546,7 @@ class HostSession:
             return value
 
 
-def _mapping(value: object) -> Mapping[str, Any]:
+def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("expected object")
     return value
@@ -854,43 +623,7 @@ def _compiler_invocation_state(value: _CompilerInvocation) -> tuple[object, ...]
         value.verified_lease_scope_bindings,
         value.issued_at,
         value.expires_at,
-        value.snapshot_hash,
-        value.snapshot_seq,
-        value.quota_binding_hash,
         value.binding_hash,
-    )
-
-
-def _normalize_quota_expectation(
-    value: HostQuotaExpectation | None,
-) -> HostQuotaExpectation | None:
-    if value is None:
-        return None
-    if type(value) is not HostQuotaExpectation:
-        raise ValueError("quota expectation is invalid")
-    if (
-        not _is_hash(value.account_id_hash)
-        or not _is_hash(value.source_id_hash)
-        or not _is_hash(value.key_id)
-        or value.main_limit_id != "codex"
-        or type(value.spark_limit_id) is not str
-        or _IDENTIFIER.fullmatch(value.spark_limit_id) is None
-        or not _is_hash(value.capacity_hash)
-        or not _is_hash(value.active_lease_set_hash)
-    ):
-        raise ValueError("quota expectation identity is invalid")
-    ledger_epoch = _required_nonnegative_int(value.ledger_epoch)
-    snapshot_seq_high_water = _required_nonnegative_int(value.snapshot_seq_high_water)
-    return HostQuotaExpectation(
-        account_id_hash=value.account_id_hash,
-        source_id_hash=value.source_id_hash,
-        key_id=value.key_id,
-        main_limit_id=value.main_limit_id,
-        spark_limit_id=value.spark_limit_id,
-        capacity_hash=value.capacity_hash,
-        ledger_epoch=ledger_epoch,
-        active_lease_set_hash=value.active_lease_set_hash,
-        snapshot_seq_high_water=snapshot_seq_high_water,
     )
 
 
@@ -899,30 +632,6 @@ def _trusted_clock(clock: Callable[[], float]) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError("trusted host clock is invalid")
     return value
-
-
-def _valid_until_timestamp(snapshot: Mapping[str, Any]) -> float:
-    value = snapshot.get("valid_until_utc_z")
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise ValueError("signed quota validity is invalid")
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError as error:
-        raise ValueError("signed quota validity is invalid") from error
-    if parsed.tzinfo != UTC:
-        raise ValueError("signed quota validity is invalid")
-    timestamp = parsed.timestamp()
-    if not math.isfinite(timestamp):
-        raise ValueError("signed quota validity is invalid")
-    return timestamp
-
-
-def _utc_z(value: float) -> str:
-    return (
-        datetime.fromtimestamp(value, tz=UTC)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
 
 
 def _hash(value: object) -> str:
@@ -938,24 +647,6 @@ def _hash(value: object) -> str:
             ).encode("utf-8")
         ).hexdigest()
     )
-
-
-_OFFICIAL_QUOTA_SOURCE_ID_HASH: Final = _hash("codex-app-server-account-rate-limits")
-
-
-def _readonly_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    def freeze(item: object) -> object:
-        if isinstance(item, Mapping):
-            return MappingProxyType(
-                {str(key): freeze(value) for key, value in item.items()}
-            )
-        if isinstance(item, list):
-            return tuple(freeze(child) for child in item)
-        return item
-
-    frozen = freeze(dict(value))
-    assert isinstance(frozen, Mapping)
-    return frozen
 
 
 def _bounded_routes(value: object) -> tuple[HostRoute, ...]:
@@ -1049,14 +740,10 @@ def _canonical_json(value: object) -> str:
 
 
 __all__ = [
-    "HostQuotaAttestation",
-    "HostQuotaExpectation",
-    "HostQuotaFacts",
     "HostCapabilityFact",
     "HostCapabilityState",
     "HostRoute",
     "HostSchedulingFacts",
     "HostUnavailableFacts",
     "HostSession",
-    "QuotaEvidenceResolver",
 ]

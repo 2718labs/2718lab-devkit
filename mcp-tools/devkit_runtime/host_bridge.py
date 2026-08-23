@@ -24,9 +24,6 @@ from typing import Final
 from . import host_envelopes
 
 _FRAME_SCHEMA: Final = "2718lab-devkit/host-bridge-v1"
-_QUOTA_REQUEST_SCHEMA: Final = "2718lab-devkit/host-quota-snapshot-request-v1"
-_QUOTA_RESPONSE_SCHEMA: Final = "2718lab-devkit/host-quota-snapshot-response-v1"
-_QUOTA_SNAPSHOT_SCHEMA: Final = "2718lab-devkit/host-quota-snapshot-v1"
 _CAPABILITY_PROBE_SCHEMA: Final = "2718lab-devkit/host-capability-probe-v1"
 _CAPABILITY_REPORT_SCHEMA: Final = "2718lab-devkit/host-capability-report-v1"
 _OPERATION_REQUEST_SCHEMA: Final = "2718lab-devkit/host-operation-request-v1"
@@ -54,8 +51,6 @@ _MESSAGE_KINDS: Final = frozenset(
         "proof_register",
         "proof_attest",
         "proof_result",
-        "quota_snapshot_request",
-        "quota_snapshot",
         "capability_probe",
         "capability_report",
         "operation_request",
@@ -407,38 +402,6 @@ class InheritedHandleHostBridge:
 
         _validate_action_id(action_id)
         self.send_private(kind="capability_ack", action_id=action_id, payload={})
-
-    def request_quota_snapshot(self, *, request_id: str) -> None:
-        """Request one signed main/Spark usage snapshot from the private host."""
-
-        _validate_action_id(request_id)
-        self.send_private(
-            kind="quota_snapshot_request",
-            action_id=request_id,
-            payload={"schema": _QUOTA_REQUEST_SCHEMA, "request_id": request_id},
-        )
-
-    def receive_quota_snapshot(self, *, request_id: str) -> dict[str, object]:
-        """Receive a snapshot bound to the exact request id, failing closed otherwise."""
-
-        _validate_action_id(request_id)
-        try:
-            message = self.receive()
-            payload = message.payload
-            snapshot = payload.get("snapshot")
-            if (
-                message.kind != "quota_snapshot"
-                or message.action_id != request_id
-                or set(payload) != {"schema", "snapshot"}
-                or payload.get("schema") != _QUOTA_RESPONSE_SCHEMA
-                or not isinstance(snapshot, dict)
-                or snapshot.get("schema") != _QUOTA_SNAPSHOT_SCHEMA
-            ):
-                raise HostBridgeError("HOST_BRIDGE_QUOTA_INVALID")
-            return dict(snapshot)
-        except HostBridgeError:
-            self._poison()
-            raise
 
     def send_capability_probe(
         self,
