@@ -34,6 +34,8 @@ MAX_GATE_TIMEOUT_SECONDS = 3600
 MAX_FAST_LANE_ROUTE_REQUEST_BYTES = 32 * 1024
 MAX_FAST_LANE_HOST_STATUS_BYTES = 3 * 1024 * 1024
 FAST_LANE_SLOT_IDS = ("slot-1", "slot-2", "slot-3")
+MAX_FAST_LANE_WRITERS_PER_SCHEDULER = 3
+MAX_FAST_LANE_TOTAL_WRITERS = 9
 MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS = 9
 MAX_FAST_LANE_INDEX_EVIDENCE_RECORDS = (
     len(FAST_LANE_SLOT_IDS) + MAX_FAST_LANE_EXTERNAL_SESSION_ASSIGNMENTS
@@ -563,6 +565,7 @@ _FAST_LANE_PLAN_FIELDS = frozenset(
         "terminal_protocol",
         "workflow_policy",
         "cross_session_dispatch_projection",
+        "scheduler_topology",
         "plan_hash",
     }
 )
@@ -3901,6 +3904,261 @@ def _conflict_graph(units: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
                 graph[left["task_id"]].append(right["task_id"])
                 graph[right["task_id"]].append(left["task_id"])
     return {task_id: sorted(neighbors) for task_id, neighbors in sorted(graph.items())}
+
+
+_FAST_LANE_TOPOLOGY_FIELDS = frozenset(
+    {
+        "schema",
+        "plan_binding_hash",
+        "host_capacity",
+        "max_writers_per_scheduler",
+        "max_writers_total",
+        "groups",
+        "topology_hash",
+    }
+)
+_FAST_LANE_TOPOLOGY_GROUP_FIELDS = frozenset(
+    {
+        "group_id",
+        "scheduler_id",
+        "coordinator_lease_id",
+        "worktree_identity",
+        "writer_task_ids",
+        "prewarm_task_ids",
+    }
+)
+
+
+def _fast_lane_scheduler_topology(
+    *,
+    plan_binding_hash: object,
+    host_capacity: object,
+    groups: object,
+) -> dict[str, Any]:
+    """Seal an auditable, non-executing scheduler topology.
+
+    The topology deliberately contains hashes rather than scheduler leases or
+    filesystem paths.  It may describe at most three scheduler groups and is
+    admissible only when every proposed participant fits current host capacity.
+    Scope claims are validation-only input and never leave this opaque receipt.
+    """
+
+    binding_hash = _hash(plan_binding_hash, "topology.plan_binding_hash")
+    if not isinstance(host_capacity, int) or isinstance(host_capacity, bool):
+        raise ValueError("topology.host_capacity must be an integer")
+    if not 0 <= host_capacity <= MAX_FAST_LANE_TOTAL_WRITERS:
+        raise ValueError("topology.host_capacity is out of bounds")
+    if not isinstance(groups, Sequence) or isinstance(groups, (str, bytes, bytearray)):
+        raise ValueError("topology.groups must be a list")
+    if len(groups) > MAX_FAST_LANE_TOTAL_WRITERS // MAX_FAST_LANE_WRITERS_PER_SCHEDULER:
+        raise ValueError("topology.groups is out of bounds")
+
+    normalized: list[dict[str, Any]] = []
+    writer_ids: set[str] = set()
+    participant_ids: set[str] = set()
+    for index, raw_group in enumerate(groups):
+        group = _mapping(raw_group, f"topology.groups[{index}]")
+        allowed = set(_FAST_LANE_TOPOLOGY_GROUP_FIELDS) | {
+            "writer_scope_claims",
+            "declared_child_splits",
+        }
+        unknown = set(group) - allowed
+        missing = set(_FAST_LANE_TOPOLOGY_GROUP_FIELDS) - set(group)
+        if unknown or missing:
+            raise ValueError("topology group schema is invalid")
+        group_id = _text(group["group_id"], f"topology.groups[{index}].group_id", maximum=1)
+        if group_id != chr(ord("A") + index):
+            raise ValueError("topology groups must be ordered A/B/C")
+        writers = _normalised_list(
+            group["writer_task_ids"],
+            f"topology.groups[{index}].writer_task_ids",
+            _task_id,
+            maximum=MAX_FAST_LANE_WRITERS_PER_SCHEDULER,
+        )
+        prewarms = _normalised_list(
+            group["prewarm_task_ids"],
+            f"topology.groups[{index}].prewarm_task_ids",
+            _task_id,
+            maximum=MAX_LIST_ITEMS,
+        )
+        if set(writers) & set(prewarms):
+            raise ValueError("topology task cannot be both writer and read-only")
+        if writer_ids & set(writers) or participant_ids & set(prewarms):
+            raise ValueError("topology task appears in multiple groups")
+
+        claims_value = group.get("writer_scope_claims")
+        scopes: dict[str, list[str]] = {}
+        if claims_value is not None:
+            claims = _mapping(claims_value, f"topology.groups[{index}].writer_scope_claims")
+            if set(claims) != set(writers):
+                raise ValueError("topology writer scope claims must match writers")
+            scopes = {
+                task_id: _normalised_scopes(claims[task_id], f"topology scope {task_id}")
+                for task_id in writers
+            }
+            if any(
+                _scope_conflicts(scopes[left], scopes[right])
+                for position, left in enumerate(writers)
+                for right in writers[position + 1 :]
+            ):
+                # Scheduler workers may only receive already-declared,
+                # strictly reduced child scopes.  This compiler does not infer
+                # a split from an overlap, so overlap is an auditable stop.
+                raise ValueError("UNSPLITTABLE")
+        if "declared_child_splits" in group:
+            splits = group["declared_child_splits"]
+            if not isinstance(splits, Sequence) or isinstance(splits, (str, bytes, bytearray)):
+                raise ValueError("topology.declared_child_splits must be a list")
+            if len(splits) > len(writers) or (splits and not scopes):
+                raise ValueError("UNSPLITTABLE")
+            seen_children: set[str] = set()
+            for split_index, raw_split in enumerate(splits):
+                split = _mapping(
+                    raw_split,
+                    f"topology.groups[{index}].declared_child_splits[{split_index}]",
+                )
+                _exact_keys(
+                    split,
+                    frozenset(
+                        {
+                            "parent_task_id",
+                            "child_task_id",
+                            "parent_scope",
+                            "child_scope",
+                        }
+                    ),
+                    "declared child split",
+                )
+                child_task_id = _task_id(split["child_task_id"], "declared child split.child_task_id")
+                _task_id(split["parent_task_id"], "declared child split.parent_task_id")
+                parent_scope = _normalised_scopes(
+                    split["parent_scope"], "declared child split.parent_scope"
+                )
+                child_scope = _normalised_scopes(
+                    split["child_scope"], "declared child split.child_scope"
+                )
+                if (
+                    child_task_id not in writers
+                    or child_task_id in seen_children
+                    or child_scope != scopes[child_task_id]
+                    or child_scope == parent_scope
+                    or not all(
+                        any(
+                            child.split("/")[: len(parent.split("/"))]
+                            == parent.split("/")
+                            and child != parent
+                            for parent in parent_scope
+                        )
+                        for child in child_scope
+                    )
+                ):
+                    raise ValueError("UNSPLITTABLE")
+                seen_children.add(child_task_id)
+
+        normalized.append(
+            {
+                "group_id": group_id,
+                "scheduler_id": _hash(group["scheduler_id"], "topology.scheduler_id"),
+                "coordinator_lease_id": _hash(group["coordinator_lease_id"], "topology.coordinator_lease_id"),
+                "worktree_identity": _hash(group["worktree_identity"], "topology.worktree_identity"),
+                "writer_task_ids": writers,
+                "prewarm_task_ids": prewarms,
+            }
+        )
+        writer_ids.update(writers)
+        participant_ids.update(writers)
+        participant_ids.update(prewarms)
+    if len(writer_ids) > MAX_FAST_LANE_TOTAL_WRITERS or len(participant_ids) > host_capacity:
+        raise ValueError("topology exceeds host capacity")
+
+    topology: dict[str, Any] = {
+        "schema": "2718lab-devkit/scheduler-topology-v1",
+        "plan_binding_hash": binding_hash,
+        "host_capacity": host_capacity,
+        "max_writers_per_scheduler": MAX_FAST_LANE_WRITERS_PER_SCHEDULER,
+        "max_writers_total": MAX_FAST_LANE_TOTAL_WRITERS,
+        "groups": normalized,
+    }
+    topology["topology_hash"] = _sha256_json(topology)
+    _exact_keys(topology, _FAST_LANE_TOPOLOGY_FIELDS, "scheduler topology")
+    return topology
+
+
+def _fast_lane_plan_topology(
+    validated: Mapping[str, Any],
+    assignments: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bind current, actually admissible assignments to Topology V1."""
+
+    source_plan_hash = _hash(validated["source_plan_hash"], "source plan hash")
+    phase = _fast_lane_phase(validated["scheduler_state"])
+    active = [
+        assignment
+        for assignment in assignments
+        if assignment.get("action", "retain") in {"start", "retain"}
+    ]
+    writers = sorted(
+        str(assignment["task_id"])
+        for assignment in active
+        if assignment.get("role") == "execution"
+    )
+    readers = sorted(
+        str(assignment["task_id"])
+        for assignment in active
+        if assignment.get("role") != "execution"
+    )
+    unit_by_task_id = _fast_lane_unit_index(validated["source_plan"])
+    worktree_contexts = sorted(
+        _hash(assignment["context_hash"], "assignment context hash")
+        for assignment in active
+        if assignment.get("role") == "execution"
+    )
+    binding = _sha256_json(
+        {
+            "source_plan_hash": source_plan_hash,
+            "phase": phase,
+            "assignments": [
+                {
+                    "task_id": assignment["task_id"],
+                    "role": assignment["role"],
+                    "assignment_token": assignment["assignment_token"],
+                    "context_hash": assignment["context_hash"],
+                }
+                for assignment in active
+            ],
+        }
+    )
+    if not active:
+        return _fast_lane_scheduler_topology(
+            plan_binding_hash=binding, host_capacity=len(FAST_LANE_SLOT_IDS), groups=[]
+        )
+    return _fast_lane_scheduler_topology(
+        plan_binding_hash=binding,
+        host_capacity=len(FAST_LANE_SLOT_IDS),
+        groups=[
+            {
+                "group_id": "A",
+                "scheduler_id": _sha256_json(
+                    {"source_plan_hash": source_plan_hash, "group_id": "A"}
+                ),
+                "coordinator_lease_id": _sha256_json(
+                    {
+                        "source_plan_hash": source_plan_hash,
+                        "phase": phase,
+                        "slot_epochs": validated["scheduler_state"]["slot_epochs"],
+                    }
+                ),
+                "worktree_identity": _sha256_json(worktree_contexts),
+                "writer_task_ids": writers,
+                "prewarm_task_ids": readers,
+                "writer_scope_claims": {
+                    task_id: unit_by_task_id[task_id]["write_scope"]
+                    for task_id in writers
+                },
+                "declared_child_splits": [],
+            }
+        ],
+    )
 
 
 def _maximal_ready_wave(
@@ -8185,6 +8443,9 @@ def _render_fast_lane_status(
             host_status=None,
             occupancy=None,
         ),
+        "scheduler_topology": _fast_lane_plan_topology(
+            validated, running_assignments
+        ),
     }
     result["plan_hash"] = _sha256_json(result)
     _exact_keys(result, _FAST_LANE_PLAN_FIELDS, "fast-lane plan")
@@ -8270,6 +8531,13 @@ def _fast_lane_project_fence_blocked_plan(
             reference_result={},
             host_status=None,
             occupancy=None,
+        ),
+        "scheduler_topology": _fast_lane_scheduler_topology(
+            plan_binding_hash=_sha256_json(
+                {"source_plan_hash": source_plan_hash, "status": "blocked"}
+            ),
+            host_capacity=0,
+            groups=[],
         ),
     }
     result["plan_hash"] = _sha256_json(result)

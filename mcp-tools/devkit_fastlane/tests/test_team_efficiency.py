@@ -4050,6 +4050,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "terminal_protocol",
             "workflow_policy",
             "cross_session_dispatch_projection",
+            "scheduler_topology",
             "plan_hash",
         }
         needs_design_request = self.fast_lane_contexts_empty_request(helper)
@@ -8373,6 +8374,133 @@ class TeamEfficiencyTests(unittest.TestCase):
         self.assertEqual("blocked", over_bound["status"])
         self.assertEqual(0, over_bound["external_agent_count"])
         self.assertIn("external_assignment_limit_exceeded", over_bound["reason_codes"])
+
+    def test_scheduler_topology_v1_is_opaque_capacity_bounded_and_plan_bound(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        plan_hash = helper._sha256_json({"plan": "topology-v1"})
+        identity = lambda name: helper._sha256_json({"opaque": name})
+
+        topology = helper._fast_lane_scheduler_topology(
+            plan_binding_hash=plan_hash,
+            host_capacity=3,
+            groups=[
+                {
+                    "group_id": "A",
+                    "scheduler_id": identity("scheduler-a"),
+                    "coordinator_lease_id": identity("lease-a"),
+                    "worktree_identity": identity("worktree-a"),
+                    "writer_task_ids": [
+                        "FAST-LANE-ROUTINE",
+                        "FAST-LANE-MODERATE",
+                    ],
+                    "prewarm_task_ids": ["FAST-LANE-FUTURE"],
+                }
+            ],
+        )
+
+        self.assertEqual("2718lab-devkit/scheduler-topology-v1", topology["schema"])
+        self.assertEqual(plan_hash, topology["plan_binding_hash"])
+        self.assertEqual(3, topology["host_capacity"])
+        self.assertEqual(3, topology["max_writers_per_scheduler"])
+        self.assertEqual(9, topology["max_writers_total"])
+        self.assertEqual(
+            {
+                "group_id": "A",
+                "scheduler_id": identity("scheduler-a"),
+                "coordinator_lease_id": identity("lease-a"),
+                "worktree_identity": identity("worktree-a"),
+                "writer_task_ids": ["FAST-LANE-MODERATE", "FAST-LANE-ROUTINE"],
+                "prewarm_task_ids": ["FAST-LANE-FUTURE"],
+            },
+            topology["groups"][0],
+        )
+        self.assertTrue(topology["topology_hash"].startswith("sha256:"))
+
+    def test_scheduler_topology_v1_rejects_conflicts_without_declared_reduction(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        identity = lambda name: helper._sha256_json({"opaque": name})
+
+        with self.assertRaisesRegex(ValueError, "UNSPLITTABLE"):
+            helper._fast_lane_scheduler_topology(
+                plan_binding_hash=helper._sha256_json({"plan": "conflict"}),
+                host_capacity=2,
+                groups=[
+                    {
+                        "group_id": "A",
+                        "scheduler_id": identity("scheduler-a"),
+                        "coordinator_lease_id": identity("lease-a"),
+                        "worktree_identity": identity("worktree-a"),
+                        "writer_task_ids": [
+                            "FAST-LANE-ROUTINE",
+                            "FAST-LANE-MODERATE",
+                        ],
+                        "prewarm_task_ids": [],
+                        "writer_scope_claims": {
+                            "FAST-LANE-ROUTINE": ["src/fast_lane"],
+                            "FAST-LANE-MODERATE": ["src/fast_lane/routes.py"],
+                        },
+                        "declared_child_splits": [],
+                    }
+                ],
+            )
+
+    def test_scheduler_topology_v1_accepts_only_strict_declared_child_scopes(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        identity = lambda name: helper._sha256_json({"opaque": name})
+        common = {
+            "group_id": "A",
+            "scheduler_id": identity("scheduler-a"),
+            "coordinator_lease_id": identity("lease-a"),
+            "worktree_identity": identity("worktree-a"),
+            "writer_task_ids": ["FAST-LANE-MODERATE"],
+            "prewarm_task_ids": [],
+            "writer_scope_claims": {"FAST-LANE-MODERATE": ["src/fast_lane/routes.py"]},
+        }
+
+        topology = helper._fast_lane_scheduler_topology(
+            plan_binding_hash=helper._sha256_json({"plan": "declared-child"}),
+            host_capacity=1,
+            groups=[
+                {
+                    **common,
+                    "declared_child_splits": [
+                        {
+                            "parent_task_id": "FAST-LANE-ROUTINE",
+                            "child_task_id": "FAST-LANE-MODERATE",
+                            "parent_scope": ["src/fast_lane"],
+                            "child_scope": ["src/fast_lane/routes.py"],
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(["FAST-LANE-MODERATE"], topology["groups"][0]["writer_task_ids"])
+
+        with self.assertRaisesRegex(ValueError, "UNSPLITTABLE"):
+            helper._fast_lane_scheduler_topology(
+                plan_binding_hash=helper._sha256_json({"plan": "not-reduced"}),
+                host_capacity=1,
+                groups=[
+                    {
+                        **common,
+                        "declared_child_splits": [
+                            {
+                                "parent_task_id": "FAST-LANE-ROUTINE",
+                                "child_task_id": "FAST-LANE-MODERATE",
+                                "parent_scope": ["src/fast_lane/routes.py"],
+                                "child_scope": ["src/fast_lane/routes.py"],
+                            }
+                        ],
+                    }
+                ],
+            )
+
 
 
 if __name__ == "__main__":
