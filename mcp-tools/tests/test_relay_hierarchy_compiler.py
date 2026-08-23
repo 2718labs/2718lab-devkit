@@ -102,6 +102,18 @@ def test_v3_compiles_exact_opaque_topology_and_hashes_its_identities() -> None:
     assert first["plan_hash"] != second["plan_hash"]
 
 
+@pytest.mark.parametrize("capacity", [1, 9])
+def test_v3_accepts_the_full_one_to_nine_writer_capacity_range(
+    capacity: int,
+) -> None:
+    request = _request()
+    request["capacity"] = capacity
+
+    plan = compile_plan(request, registry_resolver=RegistryResolver())
+
+    assert plan["capacity"] == capacity
+
+
 @pytest.mark.parametrize(
     ("mutate", "code"),
     [
@@ -210,3 +222,24 @@ def test_v3_rebinds_a_cross_group_declared_split_to_its_original_scheduler() -> 
     first_group = plan["scheduler_topology"]["groups"][0]
     assert first_group["scheduler_id"] == "sha256:" + "1" * 64
     assert len(first_group["writer_task_ids"]) == 2
+
+
+def test_v3_unsplittable_writers_are_removed_from_groups_and_ready_dispatch() -> None:
+    request = _request()
+    tasks = request["tasks"]
+    assert isinstance(tasks, list)
+    writer = tasks[0]
+    assert isinstance(writer, dict)
+    writer["write_scope"] = [{"path": "src", "kind": "tree"}]
+    tasks.append(_task("writer-b", scope="src/child.py"))
+    topology = request["scheduler_topology"]
+    assert isinstance(topology, dict)
+    groups = topology["groups"]
+    assert isinstance(groups, list)
+    groups[0]["writer_task_ids"] = ["writer-a", "writer-b"]
+
+    plan = compile_plan(request, registry_resolver=RegistryResolver())
+
+    assert plan["queues"]["writer_ready"] == []
+    assert plan["queues"]["unsplittable"] == ["writer-a", "writer-b"]
+    assert plan["scheduler_topology"]["groups"][0]["writer_task_ids"] == []

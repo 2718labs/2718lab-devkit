@@ -74,7 +74,7 @@ def _task(
     }
 
 
-def _plan(*, groups: list[dict[str, object]], capacity: int = 12) -> dict[str, object]:
+def _plan(*, groups: list[dict[str, object]], capacity: int = 2) -> dict[str, object]:
     tasks = sorted(
         [
             _task(
@@ -161,20 +161,52 @@ def test_v3_topology_preserves_group_isolated_writer_assignments() -> None:
     relay.start_create(submitted, idempotency_key="hierarchy-create")
 
     assert store.plan is not None
-    assert store.plan["capacity"] == 9
+    assert store.plan == submitted
     persisted_topology = store.plan["scheduler_topology"]
     assert persisted_topology == submitted["scheduler_topology"]
-    persisted_tasks = {item["task_id"]: item for item in store.plan["tasks"]}
-    assert persisted_tasks["writer-alpha"]["scheduler_assignment"] == {
-        "scheduler_id": "scheduler-alpha",
-        "coordinator_lease_id": "lease-scheduler-alpha",
-        "worktree_identity": "sha256:" + "a" * 64,
-    }
-    assert (
-        persisted_tasks["writer-beta"]["scheduler_assignment"]["scheduler_id"]
-        == "scheduler-beta"
+
+
+def test_v3_accepts_sha256_opaque_group_identities_without_rewriting_the_plan() -> None:
+    store = CaptureStore()
+    relay = RelayService(store, capability_secret=b"hierarchy-test-secret")
+    alpha = "sha256:" + "1" * 64
+    beta = "sha256:" + "2" * 64
+    submitted = _plan(
+        groups=[
+            {
+                "scheduler_id": alpha,
+                "coordinator_lease_id": "sha256:" + "3" * 64,
+                "worktree_identity": "sha256:" + "4" * 64,
+                "writer_task_ids": ["writer-alpha"],
+                "prewarm_task_ids": ["prewarm-alpha"],
+            },
+            {
+                "scheduler_id": beta,
+                "coordinator_lease_id": "sha256:" + "5" * 64,
+                "worktree_identity": "sha256:" + "6" * 64,
+                "writer_task_ids": ["writer-beta"],
+                "prewarm_task_ids": [],
+            },
+        ]
     )
-    assert "scheduler_assignment" not in persisted_tasks["prewarm-alpha"]
+
+    relay.start_create(submitted, idempotency_key="opaque-topology")
+
+    assert store.plan == submitted
+
+
+def test_v3_rejects_capacity_above_the_nine_writer_relay_limit() -> None:
+    relay = RelayService(CaptureStore(), capability_secret=b"hierarchy-test-secret")
+    submitted = _plan(
+        capacity=10,
+        groups=[
+            _group("scheduler-alpha", ["writer-alpha"], ["prewarm-alpha"]),
+            _group("scheduler-beta", ["writer-beta"], []),
+        ],
+    )
+
+    with pytest.raises(RelayError, match="RELAY_PLAN_INVALID"):
+        relay.start_create(submitted, idempotency_key="capacity-over-nine")
 
 
 def test_v3_topology_rejects_more_than_three_writers_per_scheduler() -> None:

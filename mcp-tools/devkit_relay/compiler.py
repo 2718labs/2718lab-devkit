@@ -992,22 +992,28 @@ def _initial_queues_v2(
             "unsplittable": [],
         }
     withheld = {edge["to_task_id"] for edge in conflicts}
+    blocked_targets = set(unsplittable)
     writers = [
         task
         for task in tasks
         if task["stage"] == "a1_writer"
         and not task["dependencies"]
         and task["task_id"] not in withheld
+        and task["task_id"] not in blocked_targets
     ]
     designs = [
         task
         for task in tasks
-        if task["stage"] == "a2_design" and not task["dependencies"]
+        if task["stage"] == "a2_design"
+        and not task["dependencies"]
+        and task["design_for_task_id"] not in blocked_targets
     ]
     prewarms = [
         task
         for task in tasks
-        if task["stage"] == "a3_prewarm" and not task["dependencies"]
+        if task["stage"] == "a3_prewarm"
+        and not task["dependencies"]
+        and task["prewarm_for_task_id"] not in blocked_targets
     ]
     return {
         "writer_ready": _queue_order_v2(writers),
@@ -1434,11 +1440,17 @@ def _normalize_scheduler_topology(
     ):
         raise RelayPlanError("invalid_scheduler_topology")
 
-    writers = {
+    all_writers = {
         task["task_id"]: task
         for task in tasks
         if task.get("stage") == "a1_writer"
     }
+    writers = {
+        task_id: task
+        for task_id, task in all_writers.items()
+        if task.get("split_verdict") != "UNSPLITTABLE_SCOPE_CONFLICT"
+    }
+    unsplittable_writers = set(all_writers) - set(writers)
     prewarms = {
         task["task_id"]: task
         for task in tasks
@@ -1484,6 +1496,8 @@ def _normalize_scheduler_topology(
         )
         expanded_writer_ids: list[str] = []
         for task_id in writer_ids:
+            if task_id in unsplittable_writers:
+                continue
             members = [task_id] if task_id in writers else split_children.get(task_id, [])
             if not members or any(member in assigned_writers for member in members):
                 raise RelayPlanError("invalid_scheduler_topology")
@@ -1525,12 +1539,18 @@ def _compile_plan_v3(
         else _REQUEST_FIELDS_V3
     )
     _exact_fields(request, request_fields, "unknown_request_fields")
+    capacity = request.get("capacity")
+    if type(capacity) is not int or not 1 <= capacity <= _MAX_PARALLEL_WRITERS:
+        raise RelayPlanError("invalid_capacity")
     v2_request = {
         key: value
         for key, value in request.items()
         if key != "scheduler_topology"
     }
     v2_request["schema"] = _REQUEST_SCHEMA_V2
+    # V2 keeps its legacy three-writer public contract.  V3 validates its
+    # wider bounded capacity before borrowing the shared staged compiler.
+    v2_request["capacity"] = min(capacity, _MAX_WRITERS_PER_SCHEDULER)
     compiled = _compile_plan_v2(v2_request, registry_resolver)
     plan_tasks = compiled["tasks"]
     if type(plan_tasks) is not list:
@@ -1541,6 +1561,7 @@ def _compile_plan_v3(
     plan = {
         **{key: value for key, value in compiled.items() if key != "plan_hash"},
         "schema": _PLAN_SCHEMA_V3,
+        "capacity": capacity,
         "scheduler_topology": topology,
     }
     return {**plan, "plan_hash": canonical_hash(plan)}

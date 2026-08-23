@@ -658,22 +658,10 @@ class RelayService:
             value,
             plan_fields=self._PLAN_FIELDS_V3,
             schema="2718lab-devkit/relay-plan-v3",
-            maximum_capacity=None,
+            maximum_capacity=9,
         )
-        assignments = self._validated_scheduler_assignments(topology, plan["tasks"])
-        plan["capacity"] = min(9, int(plan["capacity"]))
+        self._validated_scheduler_assignments(topology, plan["tasks"])
         plan["scheduler_topology"] = topology
-        plan["tasks"] = [
-            {
-                **task,
-                **(
-                    {"scheduler_assignment": assignments[task["task_id"]]}
-                    if task["task_id"] in assignments
-                    else {}
-                ),
-            }
-            for task in plan["tasks"]
-        ]
         return plan
 
     def _validated_project_plan(
@@ -812,13 +800,13 @@ class RelayService:
                 raise RelayError("RELAY_PLAN_INVALID")
             groups.append(
                 {
-                    "scheduler_id": self._identifier(
+                    "scheduler_id": self._topology_identity(
                         raw_group["scheduler_id"], plan=True
                     ),
-                    "coordinator_lease_id": self._identifier(
+                    "coordinator_lease_id": self._topology_identity(
                         raw_group["coordinator_lease_id"], plan=True
                     ),
-                    "worktree_identity": self._digest(
+                    "worktree_identity": self._topology_identity(
                         raw_group["worktree_identity"], plan=True
                     ),
                     "writer_task_ids": writers,
@@ -1146,6 +1134,11 @@ class RelayService:
         if value["bootstrap_index"] or value["review_integration"] or value["terminal"]:
             raise RelayError("RELAY_PLAN_INVALID")
         withheld = {edge["to_task_id"] for edge in conflicts}
+        unsplittable_targets = {
+            task["task_id"]
+            for task in tasks
+            if task["split_verdict"] == "UNSPLITTABLE_SCOPE_CONFLICT"
+        }
         writer = sorted(
             (
                 task
@@ -1153,6 +1146,7 @@ class RelayService:
                 if task["stage"] == "a1_writer"
                 and not task["dependencies"]
                 and task["task_id"] not in withheld
+                and task["task_id"] not in unsplittable_targets
             ),
             key=lambda task: (-task["priority"], task["task_id"]),
         )
@@ -1160,7 +1154,9 @@ class RelayService:
             (
                 task
                 for task in tasks
-                if task["stage"] == "a2_design" and not task["dependencies"]
+                if task["stage"] == "a2_design"
+                and not task["dependencies"]
+                and task["design_for_task_id"] not in unsplittable_targets
             ),
             key=lambda task: (-task["priority"], task["task_id"]),
         )
@@ -1168,7 +1164,9 @@ class RelayService:
             (
                 task
                 for task in tasks
-                if task["stage"] == "a3_prewarm" and not task["dependencies"]
+                if task["stage"] == "a3_prewarm"
+                and not task["dependencies"]
+                and task["prewarm_for_task_id"] not in unsplittable_targets
             ),
             key=lambda task: (-task["priority"], task["task_id"]),
         )
@@ -1537,6 +1535,13 @@ class RelayService:
         if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
             raise RelayError("RELAY_PLAN_INVALID" if plan else "RELAY_REQUEST_INVALID")
         return value
+
+    def _topology_identity(self, value: object, *, plan: bool) -> str:
+        """Accept Relay's opaque identifiers, including canonical sha256 IDs."""
+
+        if type(value) is str and _DIGEST.fullmatch(value) is not None:
+            return value
+        return self._identifier(value, plan=plan)
 
     def _workspace_id(self, value: object, *, plan: bool = False) -> str:
         if type(value) is not str or _WORKSPACE_ID.fullmatch(value) is None:

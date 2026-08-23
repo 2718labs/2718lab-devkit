@@ -111,8 +111,12 @@ class RelayStore:
     _SCHEMA_VERSION = 7
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, *, host_writer_capacity: int = 9) -> None:
+        if type(host_writer_capacity) is not int or not 1 <= host_writer_capacity <= 9:
+            raise RelayTopologyInvalid()
         self._database = str(database)
+        self._host_writer_capacity = host_writer_capacity
+        self._migrating_v5_to_v6 = False
         self._connection: sqlite3.Connection | None = sqlite3.connect(
             self._database, isolation_level=None
         )
@@ -209,7 +213,7 @@ class RelayStore:
                         str(binding["input_snapshot_id"]),
                         str(plan_data["base_commit"]),
                         str(plan_data["base_commit"]),
-                        int(plan_data["capacity"]),
+                        min(int(plan_data["capacity"]), self._host_writer_capacity),
                         now,
                     ),
                 )
@@ -1957,6 +1961,9 @@ class RelayStore:
             }
         if recovery is not None:
             action["recovery"] = dict(recovery)
+        projection = self._host_scheduler_projection(cursor, run, task)
+        if projection is not None:
+            action["host_scheduler_topology"] = projection
         cursor.execute(
             """
             INSERT INTO relay_v3_actions
@@ -1980,6 +1987,45 @@ class RelayStore:
             "worktree_suffix": f"worktrees/{suffix}",
             "temporary_root_suffix": f"contexts/{suffix}",
         }
+
+    def _host_scheduler_projection(
+        self, cursor: sqlite3.Cursor, run: RelayRun, task: RelayTask
+    ) -> dict[str, object] | None:
+        """Project hashed Relay topology into a host-only action fence."""
+
+        rows = cursor.execute(
+            """
+            SELECT scheduler_id, coordinator_lease_id, worktree_identity,
+                   writer_task_ids_json, prewarm_task_ids_json
+            FROM relay_v3_scheduler_groups WHERE run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        target = task.task_id
+        if task.kind == "design":
+            raw_target = task.contract.get("design_for_task_id")
+            if type(raw_target) is not str:
+                raise RelayStorageFailure()
+            target = raw_target
+        for row in rows:
+            writers = _decode_string_list(str(row["writer_task_ids_json"]))
+            prewarms = _decode_string_list(str(row["prewarm_task_ids_json"]))
+            if target not in writers and task.task_id not in prewarms:
+                continue
+            is_writer = task.kind == "implementation"
+            return {
+                "schema": "2718lab-devkit/host-scheduler-topology-v1",
+                "relay_plan_hash": run.plan_hash,
+                "scheduler_id": str(row["scheduler_id"]),
+                "coordinator_lease_id": str(row["coordinator_lease_id"]),
+                "worktree_identity": str(row["worktree_identity"]),
+                "writer_slot": writers.index(task.task_id) + 1 if is_writer else None,
+                "host_writer_capacity": self._host_writer_capacity,
+                "read_only": not is_writer,
+            }
+        raise RelayStorageFailure()
 
     @staticmethod
     def _lease_bootstrap_base(cursor: sqlite3.Cursor, lease: RelayLease) -> str:
@@ -2149,7 +2195,22 @@ class RelayStore:
             """,
             (run_id, RelayTaskState.READY.value, RelayTaskState.PREPARED.value),
         ).fetchall()
-        return tuple(self._task_from_row(row) for row in rows)
+        tasks = tuple(self._task_from_row(row) for row in rows)
+        task_by_id = {task.task_id: task for task in tasks}
+        return tuple(
+            task
+            for task in tasks
+            if not (
+                task.kind == "prewarm"
+                and isinstance(task.contract.get("prewarm_for_task_id"), str)
+                and task_by_id.get(str(task.contract["prewarm_for_task_id"]))
+                is not None
+                and task_by_id[str(task.contract["prewarm_for_task_id"])].contract.get(
+                    "split_verdict"
+                )
+                == "UNSPLITTABLE_SCOPE_CONFLICT"
+            )
+        )
 
     def _held_writer_scopes(
         self, cursor: sqlite3.Cursor, run_id: str
@@ -2232,10 +2293,18 @@ class RelayStore:
             or payload.get("task_contract") != task.task_contract()
         ):
             raise RelayStorageFailure()
+        projection = self._host_scheduler_projection(cursor, run, task)
+        if projection is None:
+            if "host_scheduler_topology" in payload:
+                raise RelayStorageFailure()
+        elif payload.get("host_scheduler_topology") != projection:
+            raise RelayStorageFailure()
         context: dict[str, object] = {
             "route": _task_route(task),
             "task_contract": task.task_contract(),
         }
+        if projection is not None:
+            context["host_scheduler_topology"] = projection
         if task.kind == "implementation":
             bootstrap = payload.get("worktree_bootstrap")
             if type(bootstrap) is not dict:
@@ -3222,6 +3291,7 @@ class RelayStore:
             str(task["task_id"])
             for task in tasks
             if task.get("kind") == "implementation"
+            and task.get("split_verdict") != "UNSPLITTABLE_SCOPE_CONFLICT"
         }
         prewarm_ids = {
             str(task["task_id"]) for task in tasks if task.get("kind") == "prewarm"
@@ -3308,10 +3378,12 @@ class RelayStore:
                 ("schema_version",),
             ).fetchall()
             if len(rows) != 1 or str(rows[0]["value"]) not in {
+                "5",
                 "6",
                 str(self._SCHEMA_VERSION),
             }:
                 raise RelaySchemaIncompatible()
+            self._migrating_v5_to_v6 = str(rows[0]["value"]) == "5"
         except RelaySchemaIncompatible:
             raise
         except sqlite3.Error as error:
@@ -3589,13 +3661,22 @@ class RelayStore:
                 """,
                 ("schema_version", str(self._SCHEMA_VERSION)),
             )
-            connection.execute(
-                """
-                UPDATE relay_v3_schema_metadata SET value = ?
-                WHERE key = ? AND value = '6'
-                """,
-                (str(self._SCHEMA_VERSION), "schema_version"),
-            )
+            if self._migrating_v5_to_v6:
+                connection.execute(
+                    """
+                    UPDATE relay_v3_schema_metadata SET value = '6'
+                    WHERE key = ? AND value = '5'
+                    """,
+                    ("schema_version",),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE relay_v3_schema_metadata SET value = ?
+                    WHERE key = ? AND value = '6'
+                    """,
+                    (str(self._SCHEMA_VERSION), "schema_version"),
+                )
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
