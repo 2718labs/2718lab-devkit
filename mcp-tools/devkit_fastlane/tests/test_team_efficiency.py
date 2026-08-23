@@ -6418,11 +6418,12 @@ class TeamEfficiencyTests(unittest.TestCase):
 
     def test_bootstrap_plan_binds_the_configured_fastlane_task_root(self) -> None:
         helper = load_efficiency()
-        replacement_root = self.fast_lane_task_root / "replacement-root"
-        replacement_root.mkdir()
-        configured_root = self.fast_lane_task_root
-        project = "custom-root-project"
-        project_root = configured_root / project
+        configured_root = self.safe_root / "c"
+        configured_root.mkdir(exist_ok=True)
+        replacement_root = configured_root / "replacement-root"
+        replacement_root.mkdir(exist_ok=True)
+        project = f"{self.project}/custom-root-project"
+        project_root = configured_root.joinpath(*project.split("/"))
         target = self.bootstrap_kwargs()
         target.update(
             {
@@ -6454,8 +6455,9 @@ class TeamEfficiencyTests(unittest.TestCase):
         self,
     ) -> None:
         helper = load_efficiency()
-        configured_root = self.fast_lane_task_root
-        project = "/".join(["deepsegment"] * 3)
+        configured_root = self.safe_root / "c"
+        configured_root.mkdir(exist_ok=True)
+        project = "/".join([self.project, *("deepsegment" for _ in range(3))])
         project_root = configured_root.joinpath(*project.split("/"))
         target = self.bootstrap_kwargs()
         target.update(
