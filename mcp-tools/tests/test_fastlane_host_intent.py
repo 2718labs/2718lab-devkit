@@ -321,6 +321,29 @@ def _topology() -> dict[str, Any]:
     return _with_binding(candidate, "topology_hash")
 
 
+def _relay_host_scheduler_slot() -> dict[str, Any]:
+    return {
+        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+        "plan_hash": _hash("relay-slot-plan"),
+        "topology_hash": _hash("relay-slot-topology"),
+        "group_binding_hash": _hash("relay-slot-group"),
+        "scheduler_id": "scheduler-a",
+        "coordinator_lease_id": "lease-scheduler-a",
+        "worktree_identity": "wt-a",
+        "writer_slot": 1,
+        "read_only": False,
+    }
+
+
+def test_relay_slot_cannot_be_parsed_as_a_host_topology_projection() -> None:
+    module = _module()
+
+    assert (
+        module.parse_host_scheduler_topology_projection(_relay_host_scheduler_slot())
+        is module.NO_SAFE_WORK
+    )
+
+
 def _host_topology() -> dict[str, Any]:
     relay_topology = _topology()
     groups = []

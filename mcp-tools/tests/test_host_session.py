@@ -181,17 +181,29 @@ def _topology(*, capacities: tuple[int, int] = (2, 1)) -> object:
 def test_topology_resolution_only_returns_attested_opaque_worktree_capacity() -> None:
     topology = _topology()
 
-    def resolver(_topology: object) -> object:
+    def resolver(resolved_topology: object) -> object:
         return (
             host_session.HostTopologyGroupFact(
+                plan_hash=resolved_topology.relay_plan_hash,
+                topology_hash=resolved_topology.relay_topology_hash,
+                group_binding_hash=resolved_topology.groups[0].relay_group_binding_hash,
                 scheduler_id="scheduler-a",
+                coordinator_lease_id="lease-scheduler-a",
                 worktree_identity="wt-a",
+                writer_task_ids=("writer-a",),
+                prewarm_task_ids=("prewarm-a",),
                 attested_capacity=2,
                 attestation_hash=_hash({"attestation": "a"}),
             ),
             host_session.HostTopologyGroupFact(
+                plan_hash=resolved_topology.relay_plan_hash,
+                topology_hash=resolved_topology.relay_topology_hash,
+                group_binding_hash=resolved_topology.groups[1].relay_group_binding_hash,
                 scheduler_id="scheduler-b",
+                coordinator_lease_id="lease-scheduler-b",
                 worktree_identity="wt-b",
+                writer_task_ids=("writer-b",),
+                prewarm_task_ids=(),
                 attested_capacity=1,
                 attestation_hash=_hash({"attestation": "b"}),
             ),
@@ -228,16 +240,28 @@ def test_topology_resolution_does_not_spend_writer_capacity_on_prewarm() -> None
     topology = _topology(capacities=(1, 1))
     session, child, host = _compiler_session(
         provider=lambda preparation: preparation,
-        topology_resolver=lambda _topology: (
+        topology_resolver=lambda resolved_topology: (
         host_session.HostTopologyGroupFact(
+            plan_hash=resolved_topology.relay_plan_hash,
+            topology_hash=resolved_topology.relay_topology_hash,
+            group_binding_hash=resolved_topology.groups[0].relay_group_binding_hash,
             scheduler_id="scheduler-a",
+            coordinator_lease_id="lease-scheduler-a",
             worktree_identity="wt-a",
+            writer_task_ids=("writer-a",),
+            prewarm_task_ids=("prewarm-a",),
             attested_capacity=1,
             attestation_hash=_hash({"attestation": "a"}),
         ),
         host_session.HostTopologyGroupFact(
+            plan_hash=resolved_topology.relay_plan_hash,
+            topology_hash=resolved_topology.relay_topology_hash,
+            group_binding_hash=resolved_topology.groups[1].relay_group_binding_hash,
             scheduler_id="scheduler-b",
+            coordinator_lease_id="lease-scheduler-b",
             worktree_identity="wt-b",
+            writer_task_ids=("writer-b",),
+            prewarm_task_ids=(),
             attested_capacity=1,
             attestation_hash=_hash({"attestation": "b"}),
         ),
@@ -253,6 +277,84 @@ def test_topology_resolution_does_not_spend_writer_capacity_on_prewarm() -> None
     assert resolved.groups[0].attested_capacity == 1
     assert resolved.groups[0].prewarm_task_ids == ("prewarm-a",)
     assert not hasattr(resolved.groups[0], "writer_lease")
+
+
+def test_host_session_resolves_relay_slot_through_private_aggregate_adapter() -> None:
+    slot = {
+        "schema": "2718lab-devkit/relay-host-scheduler-slot-v1",
+        "plan_hash": _hash("plan"),
+        "topology_hash": _hash("topology"),
+        "group_binding_hash": _hash("group-a"),
+        "scheduler_id": "scheduler-a",
+        "coordinator_lease_id": "lease-a",
+        "worktree_identity": "wt-a",
+        "writer_slot": 1,
+        "read_only": False,
+    }
+    facts = (
+        host_session.HostTopologyGroupFact(
+            plan_hash=_hash("plan"),
+            topology_hash=_hash("topology"),
+            group_binding_hash=_hash("group-a"),
+            scheduler_id="scheduler-a",
+            coordinator_lease_id="lease-a",
+            worktree_identity="wt-a",
+            writer_task_ids=("writer-a",),
+            prewarm_task_ids=("prewarm-a",),
+            attested_capacity=1,
+            attestation_hash=_hash("attestation-a"),
+        ),
+    )
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        topology_resolver=lambda _slot: facts,
+    )
+    try:
+        resolved = session.resolve_relay_host_scheduler_slot(slot)
+    finally:
+        child.close()
+        host.close()
+
+    assert isinstance(resolved, host_session.HostResolvedSchedulerTopology)
+    assert resolved.relay_plan_hash == _hash("plan")
+    assert resolved.relay_topology_hash == _hash("topology")
+    assert resolved.groups[0].relay_group_binding_hash == _hash("group-a")
+    assert resolved.groups[0].attested_capacity == 1
+
+
+@pytest.mark.parametrize("field", ["plan_hash", "topology_hash", "group_binding_hash"])
+def test_host_session_rejects_each_private_relay_hash_mismatch(field: str) -> None:
+    topology = _topology()
+
+    def resolver(resolved_topology: object) -> object:
+        facts = tuple(
+            host_session.HostTopologyGroupFact(
+                plan_hash=resolved_topology.relay_plan_hash,
+                topology_hash=resolved_topology.relay_topology_hash,
+                group_binding_hash=group.relay_group_binding_hash,
+                scheduler_id=group.scheduler_id,
+                coordinator_lease_id=group.coordinator_lease_id,
+                worktree_identity=group.worktree_identity,
+                writer_task_ids=group.writer_task_ids,
+                prewarm_task_ids=group.prewarm_task_ids,
+                attested_capacity=group.attested_capacity,
+                attestation_hash=group.attestation_hash,
+            )
+            for group in resolved_topology.groups
+        )
+        return (replace(facts[0], **{field: _hash(f"rebound-{field}")}), *facts[1:])
+
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        topology_resolver=resolver,
+    )
+    try:
+        resolved = session.resolve_scheduler_topology(topology)
+    finally:
+        child.close()
+        host.close()
+
+    assert resolved == "NO_SAFE_WORK"
 
 
 def test_host_session_missing_or_invalid_inherited_bridge_stays_unavailable(

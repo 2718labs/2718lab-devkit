@@ -17,6 +17,9 @@ NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 UNSPLITTABLE: Final = "UNSPLITTABLE"
 
 _SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
+_RELAY_HOST_SCHEDULER_SLOT_SCHEMA: Final = (
+    "2718lab-devkit/relay-host-scheduler-slot-v1"
+)
 _HOST_TOPOLOGY_SCHEMA: Final = "2718lab-devkit/host-scheduler-topology-v1"
 _PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v2"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -138,6 +141,19 @@ _LEASE_KEYS: Final = frozenset(
         "ledger_epoch",
         "active_lease_set_hash",
         "lease_binding_hash",
+    }
+)
+_RELAY_HOST_SCHEDULER_SLOT_KEYS: Final = frozenset(
+    {
+        "schema",
+        "plan_hash",
+        "topology_hash",
+        "group_binding_hash",
+        "scheduler_id",
+        "coordinator_lease_id",
+        "worktree_identity",
+        "writer_slot",
+        "read_only",
     }
 )
 _HOST_TOPOLOGY_KEYS: Final = frozenset(
@@ -298,6 +314,21 @@ class ParsedHostSchedulerTopologyProjection:
     projection_hash: str
 
 
+@dataclass(frozen=True, slots=True)
+class ParsedRelayHostSchedulerSlot:
+    """One untrusted Relay slot; it carries no Host capacity or attestation."""
+
+    schema: str
+    plan_hash: str
+    topology_hash: str
+    group_binding_hash: str
+    scheduler_id: str
+    coordinator_lease_id: str
+    worktree_identity: str
+    writer_slot: int | None
+    read_only: bool
+
+
 def validate_host_execution_intent(
     candidate: object,
     *,
@@ -325,10 +356,22 @@ def parse_host_execution_intent(
     return parsed if parsed is not None else NO_SAFE_WORK
 
 
+def parse_relay_host_scheduler_slot(
+    candidate: object,
+) -> ParsedRelayHostSchedulerSlot | Literal["NO_SAFE_WORK"]:
+    """Parse one Relay slot without treating it as Host authorization."""
+
+    try:
+        parsed = _parse_relay_host_scheduler_slot(candidate)
+    except Exception:
+        return NO_SAFE_WORK
+    return parsed if parsed is not None else NO_SAFE_WORK
+
+
 def parse_host_scheduler_topology_projection(
     candidate: object,
 ) -> ParsedHostSchedulerTopologyProjection | Literal["NO_SAFE_WORK"]:
-    """Parse only the Host projection; Relay envelopes never cross this boundary."""
+    """Parse a Host-owned topology shape; Relay slots cannot satisfy it."""
 
     try:
         parsed = _parse_host_scheduler_topology_projection(candidate)
@@ -636,6 +679,48 @@ def _parse_host_scheduler_topology_projection(
         relay_topology_hash=relay_topology_hash,
         groups=tuple(groups),
         projection_hash=projection_hash,
+    )
+
+
+def _parse_relay_host_scheduler_slot(
+    candidate: object,
+) -> ParsedRelayHostSchedulerSlot | None:
+    root = _exact_mapping(candidate, _RELAY_HOST_SCHEDULER_SLOT_KEYS)
+    if root is None or _text(root, "schema") != _RELAY_HOST_SCHEDULER_SLOT_SCHEMA:
+        return None
+    plan_hash = _valid_hash(root, "plan_hash")
+    topology_hash = _valid_hash(root, "topology_hash")
+    group_binding_hash = _valid_hash(root, "group_binding_hash")
+    scheduler_id = _valid_opaque_identity(root, "scheduler_id")
+    coordinator_lease_id = _valid_opaque_identity(root, "coordinator_lease_id")
+    worktree_identity = _valid_opaque_identity(root, "worktree_identity")
+    writer_slot = root["writer_slot"]
+    read_only = _bool(root, "read_only")
+    if (
+        plan_hash is None
+        or topology_hash is None
+        or group_binding_hash is None
+        or scheduler_id is None
+        or coordinator_lease_id is None
+        or worktree_identity is None
+        or read_only is None
+    ):
+        return None
+    if read_only:
+        if writer_slot is not None:
+            return None
+    elif type(writer_slot) is not int or not 1 <= writer_slot <= 3:
+        return None
+    return ParsedRelayHostSchedulerSlot(
+        schema=_RELAY_HOST_SCHEDULER_SLOT_SCHEMA,
+        plan_hash=plan_hash,
+        topology_hash=topology_hash,
+        group_binding_hash=group_binding_hash,
+        scheduler_id=scheduler_id,
+        coordinator_lease_id=coordinator_lease_id,
+        worktree_identity=worktree_identity,
+        writer_slot=writer_slot,
+        read_only=read_only,
     )
 
 
