@@ -657,3 +657,291 @@ def test_v3_rejects_unbounded_rich_contract_lists(field: str, code: str) -> None
 
     with pytest.raises(RelayPlanError, match=code):
         compile_plan(request, registry_resolver=RegistryResolver())
+
+
+class V2RegistryResolver(RegistryResolver):
+    """Task 2's narrow resolver double: indexed or bootstrap-only attestations."""
+
+    def __init__(self, *, bootstrap: bool = False) -> None:
+        super().__init__()
+        self.bootstrap = bootstrap
+
+    def resolve(self, **kwargs: object) -> dict[str, object]:
+        binding = super().resolve(**kwargs)
+        if not self.bootstrap:
+            return binding
+        return {
+            "schema": "2718lab-devkit/new-project-bootstrap-attestation-v1",
+            "workflow_id": binding["workflow_id"],
+            "workspace_id": binding["workspace_id"],
+            "input_snapshot_id": binding["input_snapshot_id"],
+            "atlas_packet_ids": binding["atlas_packet_ids"],
+            "current": True,
+            "root_identity": "sha256:" + "e" * 64,
+            "initial_manifest_hash": "sha256:" + "f" * 64,
+            "entry_count": 0,
+            "capability_epoch": 1,
+            "attestation_hash": "sha256:" + "1" * 64,
+        }
+
+    def validate_bootstrap_receipt(self, **kwargs: object) -> dict[str, object]:
+        receipt_hash = kwargs["receipt_hash"]
+        return {
+            "schema": "2718lab-devkit/project-index-bootstrap-receipt-v1",
+            "workflow_id": kwargs["workflow_id"],
+            "workspace_id": kwargs["workspace_id"],
+            "input_snapshot_id": kwargs["input_snapshot_id"],
+            "receipt_hash": receipt_hash,
+            "current": True,
+        }
+
+
+def _v2_task(
+    task_id: str,
+    *,
+    kind: str = "implementation",
+    stage: str = "a1_writer",
+    priority: int = 50,
+    dependencies: list[str] | None = None,
+    write_scope: list[dict[str, str]] | None = None,
+    route: dict[str, str] | None = None,
+    design_for_task_id: str | None = None,
+    prewarm_for_task_id: str | None = None,
+    split_policy: dict[str, object] | None = None,
+) -> dict[str, object]:
+    value = _task(
+        task_id,
+        kind=kind,
+        priority=priority,
+        dependencies=dependencies,
+        write_scope=write_scope,
+        prewarm_for_task_id=prewarm_for_task_id,
+    )
+    value.update(
+        {
+            "stage": stage,
+            "design_for_task_id": design_for_task_id,
+            "split_policy": split_policy,
+            "split_parent_task_id": None,
+            "split_depth": 0,
+            "split_verdict": None,
+        }
+    )
+    if route is not None:
+        value["route"] = route
+    return value
+
+
+def _v2_request(
+    *tasks: dict[str, object],
+    project_binding: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema": "2718lab-devkit/relay-compile-request-v2",
+        "workflow_id": "relay-v2-stages",
+        "workspace_id": "sha256:" + "d" * 64,
+        "input_snapshot_id": "sha256:" + "b" * 64,
+        "base_commit": "a" * 40,
+        "capacity": 3,
+        "project_binding": project_binding
+        or {"schema": "2718lab-devkit/project-binding-v1", "mode": "indexed"},
+        "tasks": list(tasks),
+    }
+
+
+def _luna_medium_route() -> dict[str, str]:
+    return {
+        "route_class": "luna_medium",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium",
+    }
+
+
+def test_v2_compiles_parallel_a1_writer_a2_design_and_luna_a3_prewarm() -> None:
+    plan = compile_plan(
+        _v2_request(
+            _v2_task(
+                "writer",
+                priority=90,
+                write_scope=[{"path": "src/writer.py", "kind": "file"}],
+            ),
+            _v2_task(
+                "design",
+                kind="design",
+                stage="a2_design",
+                design_for_task_id="writer",
+            ),
+            _v2_task(
+                "prewarm",
+                kind="prewarm",
+                stage="a3_prewarm",
+                prewarm_for_task_id="writer",
+                route=_luna_medium_route(),
+            ),
+        ),
+        registry_resolver=V2RegistryResolver(),
+    )
+
+    assert plan["schema"] == "2718lab-devkit/relay-plan-v2"
+    assert plan["queues"]["writer_ready"] == ["writer"]
+    assert plan["queues"]["design_ready"] == ["design"]
+    assert plan["queues"]["prewarm_ready"] == ["prewarm"]
+
+
+def test_v2_declared_child_split_strictly_reduces_conflicts_or_is_unsplittable() -> None:
+    split_policy = {
+        "mode": "declared_children",
+        "max_depth": 2,
+        "child_scopes": [
+            [{"path": "src/alpha.py", "kind": "file"}],
+            [{"path": "src/beta.py", "kind": "file"}],
+        ],
+    }
+    plan = compile_plan(
+        _v2_request(
+            _v2_task(
+                "writer",
+                priority=90,
+                write_scope=[{"path": "src", "kind": "tree"}],
+                split_policy=split_policy,
+            ),
+            _v2_task(
+                "peer",
+                priority=80,
+                write_scope=[{"path": "src/gamma.py", "kind": "file"}],
+            ),
+        ),
+        registry_resolver=V2RegistryResolver(),
+    )
+
+    assert plan["conflicts"] == []
+    children = [task for task in plan["tasks"] if task["split_parent_task_id"] == "writer"]
+    assert {child["write_scope"][0]["path"] for child in children} == {
+        "src/alpha.py",
+        "src/beta.py",
+    }
+
+    unchanged = compile_plan(
+        _v2_request(
+            _v2_task(
+                "writer",
+                priority=90,
+                write_scope=[{"path": "src", "kind": "tree"}],
+                split_policy={
+                    "mode": "declared_children",
+                    "max_depth": 1,
+                    "child_scopes": [[{"path": "src", "kind": "tree"}]],
+                },
+            ),
+            _v2_task(
+                "peer",
+                priority=80,
+                write_scope=[{"path": "src/gamma.py", "kind": "file"}],
+            ),
+        ),
+        registry_resolver=V2RegistryResolver(),
+    )
+    writer = next(task for task in unchanged["tasks"] if task["task_id"] == "writer")
+    assert writer["split_verdict"] == "UNSPLITTABLE_SCOPE_CONFLICT"
+    assert "writer" in unchanged["queues"]["unsplittable"]
+
+
+def test_v2_new_empty_bootstrap_is_the_only_executable_phase() -> None:
+    plan = compile_plan(
+        _v2_request(
+            _v2_task(
+                "writer",
+                write_scope=[{"path": "src/writer.py", "kind": "file"}],
+            ),
+            project_binding={
+                "schema": "2718lab-devkit/project-binding-v1",
+                "mode": "new_empty_bootstrap",
+            },
+        ),
+        registry_resolver=V2RegistryResolver(bootstrap=True),
+    )
+
+    assert plan["queues"]["bootstrap_index"] == ["bootstrap-index"]
+    assert plan["queues"]["writer_ready"] == []
+    bootstrap = next(task for task in plan["tasks"] if task["task_id"] == "bootstrap-index")
+    assert bootstrap["kind"] == "bootstrap_index"
+    assert bootstrap["write_scope"] == []
+    assert "route" not in bootstrap
+
+
+def test_v2_bootstrap_completion_requires_receipt_backed_recompile() -> None:
+    bootstrap_request = _v2_request(
+        _v2_task(
+            "writer",
+            write_scope=[{"path": "src/writer.py", "kind": "file"}],
+        ),
+        project_binding={
+            "schema": "2718lab-devkit/project-binding-v1",
+            "mode": "new_empty_bootstrap",
+        },
+    )
+    bootstrap = compile_plan(
+        bootstrap_request, registry_resolver=V2RegistryResolver(bootstrap=True)
+    )
+    indexed_request = deepcopy(bootstrap_request)
+    indexed_request["project_binding"] = {
+        "schema": "2718lab-devkit/project-binding-v1",
+        "mode": "indexed",
+        "bootstrap_receipt": "sha256:" + "4" * 64,
+    }
+    indexed = compile_plan(
+        indexed_request, registry_resolver=V2RegistryResolver()
+    )
+
+    assert indexed["plan_hash"] != bootstrap["plan_hash"]
+    assert indexed["queues"]["bootstrap_index"] == []
+    assert indexed["queues"]["writer_ready"] == ["writer"]
+
+    missing_receipt = deepcopy(indexed_request)
+    missing_receipt["project_binding"]["bootstrap_receipt"] = None
+    with pytest.raises(RelayPlanError, match="bootstrap_receipt_required"):
+        compile_plan(missing_receipt, registry_resolver=V2RegistryResolver())
+
+
+def test_v2_design_and_prewarm_evidence_are_snapshot_bound() -> None:
+    plan = compile_plan(
+        _v2_request(
+            _v2_task(
+                "writer",
+                write_scope=[{"path": "src/writer.py", "kind": "file"}],
+            ),
+            _v2_task(
+                "design",
+                kind="design",
+                stage="a2_design",
+                design_for_task_id="writer",
+            ),
+            _v2_task(
+                "prewarm",
+                kind="prewarm",
+                stage="a3_prewarm",
+                prewarm_for_task_id="writer",
+                route=_luna_medium_route(),
+            ),
+        ),
+        registry_resolver=V2RegistryResolver(),
+    )
+    design = next(task for task in plan["tasks"] if task["task_id"] == "design")
+    evidence = {
+        "task_id": "design",
+        "stage": "a2_design",
+        "input_snapshot_id": "sha256:" + "b" * 64,
+        "context_hash": "sha256:" + "4" * 64,
+        "artifact_hash": "sha256:" + "5" * 64,
+    }
+    from devkit_relay.compiler import validate_stage_evidence
+
+    assert validate_stage_evidence(
+        design, input_snapshot_id="sha256:" + "b" * 64, evidence=evidence
+    ) == evidence
+    stale = deepcopy(evidence)
+    stale["input_snapshot_id"] = "sha256:" + "6" * 64
+    with pytest.raises(RelayPlanError, match="DESIGN_EVIDENCE_STALE"):
+        validate_stage_evidence(
+            design, input_snapshot_id="sha256:" + "b" * 64, evidence=stale
+        )

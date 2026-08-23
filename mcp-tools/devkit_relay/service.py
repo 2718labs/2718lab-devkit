@@ -58,6 +58,7 @@ class RelayService:
             "plan_hash",
         }
     )
+    _PLAN_FIELDS_V2 = _PLAN_FIELDS | frozenset({"project_binding"})
     _BINDING_FIELDS = frozenset(
         {"workspace_id", "input_snapshot_id", "atlas_packet_ids"}
     )
@@ -79,6 +80,16 @@ class RelayService:
             "retry_policy",
         }
     )
+    _TASK_FIELDS_V2 = _TASK_FIELDS | frozenset(
+        {
+            "stage",
+            "design_for_task_id",
+            "split_policy",
+            "split_parent_task_id",
+            "split_depth",
+            "split_verdict",
+        }
+    )
     _ROUTE_FIELDS = frozenset({"route_class", "model", "reasoning_effort"})
     _SCOPE_FIELDS = frozenset({"path", "kind"})
     _CONSTRAINT_FIELDS = frozenset({"code", "detail"})
@@ -96,13 +107,27 @@ class RelayService:
             "terminal",
         }
     )
+    _QUEUE_FIELDS_V2 = frozenset(
+        {
+            "writer_ready",
+            "design_ready",
+            "prewarm_ready",
+            "bootstrap_index",
+            "review_integration",
+            "terminal",
+            "unsplittable",
+        }
+    )
     _ROUTES = {
         "terra_high": ("gpt-5.6-terra", "high"),
         "terra_max": ("gpt-5.6-terra", "max"),
         "sol_high": ("gpt-5.6-sol", "high"),
         "sol_ultra": ("gpt-5.6-sol", "ultra"),
+        "luna_medium": ("gpt-5.6-luna", "medium"),
     }
-    _KINDS = frozenset({"implementation", "verification", "review", "prewarm"})
+    _KINDS = frozenset(
+        {"implementation", "verification", "review", "prewarm", "design"}
+    )
     _WORKER_ACTIONS = frozenset(
         {"bind_endpoint", "heartbeat", "evidence", "terminal", "candidate_handoff"}
     )
@@ -485,7 +510,11 @@ class RelayService:
             raise RelayError("RELAY_REQUEST_INVALID") from error
 
     def _validated_plan(self, value: object) -> dict[str, Any]:
-        if type(value) is not dict or set(value) != self._PLAN_FIELDS:
+        if type(value) is not dict:
+            raise RelayError("RELAY_PLAN_INVALID")
+        if value.get("schema") == "2718lab-devkit/relay-plan-v2":
+            return self._validated_plan_v2(value)
+        if set(value) != self._PLAN_FIELDS:
             raise RelayError("RELAY_PLAN_INVALID")
         if value["schema"] != "2718lab-devkit/relay-plan-v1":
             raise RelayError("RELAY_PLAN_INVALID")
@@ -544,6 +573,239 @@ class RelayService:
             "tasks": tasks,
             "plan_hash": value["plan_hash"],
         }
+
+    def _validated_plan_v2(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        if set(value) != self._PLAN_FIELDS_V2:
+            raise RelayError("RELAY_PLAN_INVALID")
+        project_binding = value["project_binding"]
+        if type(project_binding) is not dict or set(project_binding) not in (
+            {"schema", "mode"},
+            {"schema", "mode", "bootstrap_receipt"},
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        if (
+            project_binding["schema"] != "2718lab-devkit/project-binding-v1"
+            or project_binding["mode"] != "indexed"
+        ):
+            raise RelayError("RELAY_BOOTSTRAP_REQUIRED")
+        if "bootstrap_receipt" in project_binding:
+            self._digest(project_binding["bootstrap_receipt"], plan=True)
+        workflow_id = self._identifier(value["workflow_id"], plan=True)
+        binding = self._validated_binding(value["workspace_binding"])
+        base_commit = self._commit(value["base_commit"], plan=True)
+        capacity = value["capacity"]
+        if type(capacity) is not int or not 1 <= capacity <= 3:
+            raise RelayError("RELAY_PLAN_INVALID")
+        if value["runtime_policy_id"] != "2718lab-devkit/relay-runtime-policy-v1":
+            raise RelayError("RELAY_PLAN_INVALID")
+        raw_tasks = value["tasks"]
+        if type(raw_tasks) is not list or not 1 <= len(raw_tasks) <= self._MAX_TASKS:
+            raise RelayError("RELAY_PLAN_INVALID")
+        tasks = [self._validated_task_v2(item) for item in raw_tasks]
+        task_ids = [task["task_id"] for task in tasks]
+        if task_ids != sorted(task_ids) or len(task_ids) != len(set(task_ids)):
+            raise RelayError("RELAY_PLAN_INVALID")
+        task_by_id = {task["task_id"]: task for task in tasks}
+        for task in tasks:
+            if task["stage"] == "a2_design":
+                target = task["design_for_task_id"]
+                if target not in task_by_id or task_by_id[target]["stage"] != "a1_writer":
+                    raise RelayError("RELAY_PLAN_INVALID")
+            if task["stage"] == "a3_prewarm":
+                target = task["prewarm_for_task_id"]
+                if target not in task_by_id or task_by_id[target]["stage"] != "a1_writer":
+                    raise RelayError("RELAY_PLAN_INVALID")
+        self._validate_task_relations(tasks)
+        dependencies = self._validated_edges(
+            value["dependencies"],
+            task_ids,
+            "depends_on",
+            maximum=self._MAX_DEPENDENCY_EDGES,
+        )
+        expected_dependencies = [
+            {
+                "from_task_id": task["task_id"],
+                "kind": "depends_on",
+                "to_task_id": dependency,
+            }
+            for task in tasks
+            for dependency in task["dependencies"]
+        ]
+        if dependencies != expected_dependencies:
+            raise RelayError("RELAY_PLAN_INVALID")
+        conflicts = self._validated_edges(
+            value["conflicts"],
+            task_ids,
+            "write_scope_conflict",
+            maximum=self._MAX_CONFLICT_EDGES,
+        )
+        expected_conflicts = self._compiler_conflicts(tasks)
+        if conflicts != expected_conflicts:
+            raise RelayError("RELAY_PLAN_INVALID")
+        if binding["atlas_packet_ids"] != sorted(
+            {packet for task in tasks for packet in task["atlas_packet_ids"]}
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        self._validated_queues_v2(value["queues"], tasks, expected_conflicts)
+        body = {key: value[key] for key in self._PLAN_FIELDS_V2 if key != "plan_hash"}
+        if value["plan_hash"] != canonical_hash(body):
+            raise RelayError("RELAY_PLAN_INVALID")
+        return {
+            **body,
+            "workflow_id": workflow_id,
+            "workspace_binding": binding,
+            "base_commit": base_commit,
+            "tasks": tasks,
+            "plan_hash": value["plan_hash"],
+        }
+
+    def _validated_task_v2(self, value: object) -> dict[str, Any]:
+        if type(value) is not dict or set(value) != self._TASK_FIELDS_V2:
+            raise RelayError("RELAY_PLAN_INVALID")
+        base = self._validated_task(
+            {key: value[key] for key in self._TASK_FIELDS}
+        )
+        stage = value["stage"]
+        split_parent = value["split_parent_task_id"]
+        split_depth = value["split_depth"]
+        split_verdict = value["split_verdict"]
+        split_policy = value["split_policy"]
+        design_target = value["design_for_task_id"]
+        if (
+            stage not in {"a1_writer", "a2_design", "a3_prewarm"}
+            or type(split_depth) is not int
+            or not 0 <= split_depth <= 8
+            or split_verdict not in {
+                None,
+                "SPLIT_APPLIED",
+                "UNSPLITTABLE_SCOPE_CONFLICT",
+            }
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        if split_parent is None:
+            if split_depth != 0 or split_verdict == "SPLIT_APPLIED":
+                raise RelayError("RELAY_PLAN_INVALID")
+        else:
+            self._identifier(split_parent, plan=True)
+            if split_depth < 1 or split_verdict != "SPLIT_APPLIED":
+                raise RelayError("RELAY_PLAN_INVALID")
+        if split_policy is not None:
+            if (
+                type(split_policy) is not dict
+                or set(split_policy) != {"mode", "max_depth", "child_scopes"}
+                or split_policy["mode"] != "declared_children"
+                or type(split_policy["max_depth"]) is not int
+                or not 1 <= split_policy["max_depth"] <= 8
+                or type(split_policy["child_scopes"]) is not list
+                or not 1 <= len(split_policy["child_scopes"]) <= 32
+            ):
+                raise RelayError("RELAY_PLAN_INVALID")
+            for child in split_policy["child_scopes"]:
+                if not self._validated_scopes(child):
+                    raise RelayError("RELAY_PLAN_INVALID")
+        if stage == "a1_writer":
+            if (
+                base["kind"] != "implementation"
+                or not base["write_scope"]
+                or design_target is not None
+                or base["prewarm_for_task_id"] is not None
+            ):
+                raise RelayError("RELAY_PLAN_INVALID")
+        elif stage == "a2_design":
+            if (
+                base["kind"] != "design"
+                or base["write_scope"]
+                or base["dependencies"]
+                or base["prewarm_for_task_id"] is not None
+            ):
+                raise RelayError("RELAY_PLAN_INVALID")
+            design_target = self._identifier(design_target, plan=True)
+        else:
+            if (
+                base["kind"] != "prewarm"
+                or base["write_scope"]
+                or base["dependencies"]
+                or design_target is not None
+                or base["route"]
+                != {
+                    "route_class": "luna_medium",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "medium",
+                }
+            ):
+                raise RelayError("RELAY_PLAN_INVALID")
+        if stage != "a1_writer" and split_policy is not None:
+            raise RelayError("RELAY_PLAN_INVALID")
+        return {
+            **base,
+            "stage": stage,
+            "design_for_task_id": design_target,
+            "split_policy": split_policy,
+            "split_parent_task_id": split_parent,
+            "split_depth": split_depth,
+            "split_verdict": split_verdict,
+        }
+
+    def _validated_queues_v2(
+        self,
+        value: object,
+        tasks: list[dict[str, Any]],
+        conflicts: list[dict[str, str]],
+    ) -> None:
+        if type(value) is not dict or set(value) != self._QUEUE_FIELDS_V2:
+            raise RelayError("RELAY_PLAN_INVALID")
+        for name in self._QUEUE_FIELDS_V2:
+            queue = value[name]
+            if type(queue) is not list or any(type(item) is not str for item in queue):
+                raise RelayError("RELAY_PLAN_INVALID")
+        if (
+            value["bootstrap_index"]
+            or value["review_integration"]
+            or value["terminal"]
+        ):
+            raise RelayError("RELAY_PLAN_INVALID")
+        withheld = {edge["to_task_id"] for edge in conflicts}
+        writer = sorted(
+            (
+                task
+                for task in tasks
+                if task["stage"] == "a1_writer"
+                and not task["dependencies"]
+                and task["task_id"] not in withheld
+            ),
+            key=lambda task: (-task["priority"], task["task_id"]),
+        )
+        design = sorted(
+            (
+                task
+                for task in tasks
+                if task["stage"] == "a2_design" and not task["dependencies"]
+            ),
+            key=lambda task: (-task["priority"], task["task_id"]),
+        )
+        prewarm = sorted(
+            (
+                task
+                for task in tasks
+                if task["stage"] == "a3_prewarm" and not task["dependencies"]
+            ),
+            key=lambda task: (-task["priority"], task["task_id"]),
+        )
+        unsplittable = sorted(
+            task["task_id"]
+            for task in tasks
+            if task["split_verdict"] == "UNSPLITTABLE_SCOPE_CONFLICT"
+        )
+        if value != {
+            "writer_ready": [task["task_id"] for task in writer],
+            "design_ready": [task["task_id"] for task in design],
+            "prewarm_ready": [task["task_id"] for task in prewarm],
+            "bootstrap_index": [],
+            "review_integration": [],
+            "terminal": [],
+            "unsplittable": unsplittable,
+        }:
+            raise RelayError("RELAY_PLAN_INVALID")
 
     def _validated_binding(self, value: object) -> dict[str, object]:
         if type(value) is not dict or set(value) != self._BINDING_FIELDS:

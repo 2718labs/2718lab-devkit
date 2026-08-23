@@ -104,7 +104,7 @@ class RelayFinalizationConflict(RelayStoreError):
 class RelayStore:
     """Own the atomic durable state behind Relay's five public tools."""
 
-    _SCHEMA_VERSION = 5
+    _SCHEMA_VERSION = 6
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
     def __init__(self, database: str | Path) -> None:
@@ -148,6 +148,7 @@ class RelayStore:
             "relay_v3_integration_proofs",
             "relay_v3_finalization_journal",
             "relay_v3_finalization_outcomes",
+            "relay_v3_cleanup_ledger",
         )
         return canonical_hash(
             {
@@ -205,7 +206,12 @@ class RelayStore:
                         now,
                     ),
                 )
-                ready_ids = {str(item) for item in plan_data["queues"]["ready"]}
+                queues = plan_data["queues"]
+                ready_ids = {
+                    str(item)
+                    for name in ("ready", "writer_ready", "design_ready", "prewarm_ready")
+                    for item in queues.get(name, [])
+                }
                 for ordinal, task in enumerate(plan_data["tasks"]):
                     task_id = str(task["task_id"])
                     cursor.execute(
@@ -652,6 +658,35 @@ class RelayStore:
                         now,
                     ),
                 )
+                cleanup_policy = cast(
+                    dict[str, object] | None, candidate_data["cleanup_policy"]
+                )
+                if cleanup_policy is not None:
+                    cursor.execute(
+                        """
+                        INSERT INTO relay_v3_cleanup_ledger
+                            (candidate_id, run_id, retention_rounds, branch_identity,
+                             worktree_identity, delete_merged_branch,
+                             remove_disposable_worktree, integration_proof_id,
+                             integration_commit, merged_integration_version,
+                             eligible_after_integration_version, state,
+                             rollback_receipt_hash, cleanup_receipt_hash,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
+                                'CLEANUP_PENDING', NULL, NULL, ?, ?)
+                        """,
+                        (
+                            candidate_data["candidate_id"],
+                            run.run_id,
+                            cleanup_policy["retention_rounds"],
+                            cleanup_policy["branch_identity"],
+                            cleanup_policy["worktree_identity"],
+                            1,
+                            1,
+                            now,
+                            now,
+                        ),
+                    )
                 self._release_lease(cursor, lease, now=now)
                 cursor.execute(
                     """
@@ -1248,6 +1283,36 @@ class RelayStore:
                         candidate_id,
                     ),
                 )
+                merged_version = run.integration_version + 1
+                cleanup = cursor.execute(
+                    """
+                    SELECT retention_rounds FROM relay_v3_cleanup_ledger
+                    WHERE candidate_id = ? AND run_id = ?
+                      AND state = 'CLEANUP_PENDING'
+                      AND integration_proof_id IS NULL
+                    """,
+                    (candidate_id, run.run_id),
+                ).fetchone()
+                if cleanup is not None:
+                    cursor.execute(
+                        """
+                        UPDATE relay_v3_cleanup_ledger
+                        SET integration_proof_id = ?, integration_commit = ?,
+                            merged_integration_version = ?,
+                            eligible_after_integration_version = ?,
+                            updated_at = ?
+                        WHERE candidate_id = ? AND run_id = ?
+                        """,
+                        (
+                            proof_id,
+                            receipt.final_commit,
+                            merged_version,
+                            merged_version + int(cleanup["retention_rounds"]),
+                            now,
+                            candidate_id,
+                            run.run_id,
+                        ),
+                    )
                 cursor.execute(
                     """
                     UPDATE relay_v3_tasks
@@ -1273,6 +1338,16 @@ class RelayStore:
                 )
                 if cursor.rowcount != 1:
                     raise RelayIntegrationHeadStale()
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_cleanup_ledger
+                    SET state = 'CLEANUP_ELIGIBLE', updated_at = ?
+                    WHERE run_id = ? AND state = 'CLEANUP_PENDING'
+                      AND integration_proof_id IS NOT NULL
+                      AND eligible_after_integration_version <= ?
+                    """,
+                    (now, run.run_id, merged_version),
+                )
                 self._promote_dependency_safe_tasks(cursor, run.run_id)
                 run = self._increment_schedule_version(cursor, run.run_id)
                 self._refresh_directives(cursor, run, now=now)
@@ -1366,6 +1441,314 @@ class RelayStore:
                 return self._mutation_result(cursor, run, task.task_id)
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
+
+    def cleanup_ledger(
+        self, workflow_id: str, candidate_id: str
+    ) -> dict[str, object]:
+        """Read one candidate-bound cleanup ledger without changing its state."""
+
+        connection = self._require_connection()
+        try:
+            run = self._run_row_for_workflow(connection, workflow_id)
+            if run is None or _IDENTIFIER.fullmatch(candidate_id) is None:
+                raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+            row = connection.execute(
+                """
+                SELECT * FROM relay_v3_cleanup_ledger
+                WHERE run_id = ? AND candidate_id = ?
+                """,
+                (str(run["run_id"]), candidate_id),
+            ).fetchone()
+            if row is None:
+                raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+            return self._cleanup_ledger_public(row)
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def prepare_cleanup_operation(
+        self,
+        workflow_id: str,
+        candidate_id: str,
+        *,
+        host_recheck: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Return a host-only cleanup descriptor after a fresh, non-destructive check."""
+
+        connection = self._require_connection()
+        try:
+            run_row = self._run_row_for_workflow(connection, workflow_id)
+            if run_row is None or _IDENTIFIER.fullmatch(candidate_id) is None:
+                raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+            row = connection.execute(
+                """
+                SELECT ledger.*, candidates.branch, candidates.head_commit
+                FROM relay_v3_cleanup_ledger AS ledger
+                JOIN relay_v3_candidates AS candidates
+                  ON candidates.candidate_id = ledger.candidate_id
+                WHERE ledger.run_id = ? AND ledger.candidate_id = ?
+                """,
+                (str(run_row["run_id"]), candidate_id),
+            ).fetchone()
+            if row is None or str(row["state"]) == "CLEANUP_PENDING":
+                raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+            if str(row["state"]) == "CLEANUP_ROLLBACK_OBSERVED":
+                raise RelayStoreError("CLEANUP_ROLLBACK_OBSERVED")
+            if str(row["state"]) != "CLEANUP_ELIGIBLE":
+                raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+            self._validate_cleanup_recheck(row, run_row, host_recheck)
+            body = {
+                "schema": "2718lab-devkit/cleanup-operation-v1",
+                "candidate_id": candidate_id,
+                "integration_proof_id": str(row["integration_proof_id"]),
+                "integration_version": int(row["merged_integration_version"]),
+                "branch_identity": str(row["branch_identity"]),
+                "worktree_identity": str(row["worktree_identity"]),
+                "delete_merged_branch": bool(row["delete_merged_branch"]),
+                "remove_disposable_worktree": bool(row["remove_disposable_worktree"]),
+                "host_recheck_hash": canonical_hash(host_recheck),
+            }
+            return {**body, "operation_hash": canonical_hash(body)}
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def record_rollback_receipt(
+        self,
+        workflow_id: str,
+        candidate_id: str,
+        *,
+        receipt: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Permanently block cleanup only for a canonical candidate rollback receipt."""
+
+        expected = {
+            "schema",
+            "candidate_id",
+            "integration_proof_id",
+            "pre_rollback_integration_version",
+            "receipt_hash",
+        }
+        if type(receipt) is not dict or set(receipt) != expected:
+            raise RelayStoreError("CLEANUP_HOST_RECHECK_FAILED")
+        try:
+            receipt_hash = receipt["receipt_hash"]
+            if (
+                receipt["schema"] != "2718lab-devkit/rollback-receipt-v1"
+                or receipt["candidate_id"] != candidate_id
+                or type(receipt_hash) is not str
+                or _DIGEST.fullmatch(receipt_hash) is None
+                or type(receipt["pre_rollback_integration_version"]) is not int
+            ):
+                raise RelayStoreError("CLEANUP_HOST_RECHECK_FAILED")
+            with self._transaction() as cursor:
+                run = self._run_for_workflow(cursor, workflow_id)
+                row = cursor.execute(
+                    """
+                    SELECT * FROM relay_v3_cleanup_ledger
+                    WHERE run_id = ? AND candidate_id = ?
+                    """,
+                    (run.run_id, candidate_id),
+                ).fetchone()
+                if row is None:
+                    raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+                merged_version = row["merged_integration_version"]
+                if (
+                    receipt["integration_proof_id"] != row["integration_proof_id"]
+                    or merged_version is None
+                    or not int(merged_version)
+                    <= receipt["pre_rollback_integration_version"]
+                    <= run.integration_version
+                ):
+                    raise RelayStoreError("CLEANUP_HOST_RECHECK_FAILED")
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_cleanup_ledger
+                    SET state = 'CLEANUP_ROLLBACK_OBSERVED',
+                        rollback_receipt_hash = ?, updated_at = ?
+                    WHERE candidate_id = ? AND run_id = ?
+                      AND state != 'CLEANED'
+                    """,
+                    (receipt_hash, _utc_now(), candidate_id, run.run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+                updated = cursor.execute(
+                    """
+                    SELECT * FROM relay_v3_cleanup_ledger WHERE candidate_id = ?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                if updated is None:
+                    raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+                return self._cleanup_ledger_public(updated)
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    def record_cleanup_receipt(
+        self,
+        workflow_id: str,
+        candidate_id: str,
+        *,
+        operation: Mapping[str, object],
+        receipt: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Record only a successful terminal host cleanup receipt; never perform cleanup."""
+
+        operation_hash = self._validate_cleanup_operation(operation, candidate_id)
+        expected = {"schema", "candidate_id", "operation_hash", "status", "receipt_hash"}
+        if type(receipt) is not dict or set(receipt) != expected:
+            raise RelayStoreError("CLEANUP_HOST_FAILED")
+        if (
+            receipt["schema"] != "2718lab-devkit/cleanup-receipt-v1"
+            or receipt["candidate_id"] != candidate_id
+            or receipt["operation_hash"] != operation_hash
+            or type(receipt["receipt_hash"]) is not str
+            or _DIGEST.fullmatch(receipt["receipt_hash"]) is None
+        ):
+            raise RelayStoreError("CLEANUP_HOST_FAILED")
+        if receipt["status"] != "completed":
+            raise RelayStoreError("CLEANUP_HOST_FAILED")
+        try:
+            with self._transaction() as cursor:
+                run = self._run_for_workflow(cursor, workflow_id)
+                row = cursor.execute(
+                    """
+                    SELECT * FROM relay_v3_cleanup_ledger
+                    WHERE candidate_id = ? AND run_id = ?
+                    """,
+                    (candidate_id, run.run_id),
+                ).fetchone()
+                if row is None or str(row["state"]) != "CLEANUP_ELIGIBLE":
+                    raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+                if (
+                    operation["integration_proof_id"] != row["integration_proof_id"]
+                    or operation["integration_version"]
+                    != row["merged_integration_version"]
+                    or operation["branch_identity"] != row["branch_identity"]
+                    or operation["worktree_identity"] != row["worktree_identity"]
+                    or operation["delete_merged_branch"] is not True
+                    or operation["remove_disposable_worktree"] is not True
+                ):
+                    raise RelayStoreError("CLEANUP_HOST_FAILED")
+                cursor.execute(
+                    """
+                    UPDATE relay_v3_cleanup_ledger
+                    SET state = 'CLEANED', cleanup_receipt_hash = ?, updated_at = ?
+                    WHERE candidate_id = ? AND run_id = ?
+                      AND state = 'CLEANUP_ELIGIBLE'
+                    """,
+                    (receipt["receipt_hash"], _utc_now(), candidate_id, run.run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+                updated = cursor.execute(
+                    """
+                    SELECT * FROM relay_v3_cleanup_ledger WHERE candidate_id = ?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                if updated is None:
+                    raise RelayStoreError("CLEANUP_NOT_ELIGIBLE")
+                return self._cleanup_ledger_public(updated)
+        except sqlite3.Error as error:
+            raise RelayStorageFailure() from error
+
+    @staticmethod
+    def _cleanup_ledger_public(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "candidate_id": str(row["candidate_id"]),
+            "retention_rounds": int(row["retention_rounds"]),
+            "branch_identity": str(row["branch_identity"]),
+            "worktree_identity": str(row["worktree_identity"]),
+            "integration_proof_id": (
+                None if row["integration_proof_id"] is None else str(row["integration_proof_id"])
+            ),
+            "integration_commit": (
+                None if row["integration_commit"] is None else str(row["integration_commit"])
+            ),
+            "merged_integration_version": row["merged_integration_version"],
+            "eligible_after_integration_version": row[
+                "eligible_after_integration_version"
+            ],
+            "state": str(row["state"]),
+            "rollback_receipt_hash": (
+                None if row["rollback_receipt_hash"] is None else str(row["rollback_receipt_hash"])
+            ),
+            "cleanup_receipt_hash": (
+                None if row["cleanup_receipt_hash"] is None else str(row["cleanup_receipt_hash"])
+            ),
+        }
+
+    @staticmethod
+    def _validate_cleanup_operation(
+        operation: Mapping[str, object], candidate_id: str
+    ) -> str:
+        fields = {
+            "schema",
+            "candidate_id",
+            "integration_proof_id",
+            "integration_version",
+            "branch_identity",
+            "worktree_identity",
+            "delete_merged_branch",
+            "remove_disposable_worktree",
+            "host_recheck_hash",
+            "operation_hash",
+        }
+        if type(operation) is not dict or set(operation) != fields:
+            raise RelayStoreError("CLEANUP_HOST_FAILED")
+        body = {key: value for key, value in operation.items() if key != "operation_hash"}
+        if (
+            operation["schema"] != "2718lab-devkit/cleanup-operation-v1"
+            or operation["candidate_id"] != candidate_id
+            or operation["operation_hash"] != canonical_hash(body)
+        ):
+            raise RelayStoreError("CLEANUP_HOST_FAILED")
+        return str(operation["operation_hash"])
+
+    @staticmethod
+    def _validate_cleanup_recheck(
+        row: sqlite3.Row, run_row: sqlite3.Row, value: Mapping[str, object]
+    ) -> None:
+        fields = {
+            "schema",
+            "candidate_id",
+            "integration_proof_id",
+            "integration_version",
+            "integration_head",
+            "contains_candidate_integration_commit",
+            "branch_identity",
+            "worktree_identity",
+            "branch_is_protected",
+            "branch_is_current",
+            "active_lease",
+            "pending_review",
+            "approved_g_task_root",
+            "worktree_disposable",
+            "rollback_receipt_hash",
+            "attestation_hash",
+        }
+        if type(value) is not dict or set(value) != fields:
+            raise RelayStoreError("CLEANUP_HOST_RECHECK_FAILED")
+        if (
+            value["schema"] != "2718lab-devkit/host-cleanup-recheck-v1"
+            or value["candidate_id"] != row["candidate_id"]
+            or value["integration_proof_id"] != row["integration_proof_id"]
+            or value["integration_version"] != run_row["integration_version"]
+            or value["integration_head"] != run_row["integration_head"]
+            or value["contains_candidate_integration_commit"] is not True
+            or value["branch_identity"] != row["branch_identity"]
+            or value["worktree_identity"] != row["worktree_identity"]
+            or value["branch_is_protected"] is not False
+            or value["branch_is_current"] is not False
+            or value["active_lease"] is not False
+            or value["pending_review"] is not False
+            or value["approved_g_task_root"] is not True
+            or value["worktree_disposable"] is not True
+            or value["rollback_receipt_hash"] is not None
+            or type(value["attestation_hash"]) is not str
+            or _DIGEST.fullmatch(value["attestation_hash"]) is None
+        ):
+            raise RelayStoreError("CLEANUP_HOST_RECHECK_FAILED")
 
     def status(self, workflow_id: str) -> dict[str, object]:
         """Read durable state only; status never allocates or releases anything."""
@@ -2343,7 +2726,10 @@ class RelayStore:
             "evidence_hashes",
             "pr_reference",
         }
-        if type(value) is not dict or set(value) != expected:
+        optional = {"cleanup_policy"}
+        if type(value) is not dict or (
+            set(value) != expected and set(value) != expected | optional
+        ):
             raise RelayCandidateError()
         candidate_id = value["candidate_id"]
         branch = value["branch"]
@@ -2352,6 +2738,13 @@ class RelayStore:
         diff_hash = value["diff_hash"]
         evidence_hashes = value["evidence_hashes"]
         pr_reference = value["pr_reference"]
+        cleanup_policy = (
+            self._normalize_cleanup_policy(
+                value["cleanup_policy"], branch=branch, head_commit=head_commit
+            )
+            if "cleanup_policy" in value
+            else None
+        )
         if (
             type(candidate_id) is not str
             or _IDENTIFIER.fullmatch(candidate_id) is None
@@ -2374,6 +2767,44 @@ class RelayStore:
             "diff_hash": diff_hash,
             "evidence_hashes": sorted(evidence_hashes),
             "pr_reference": pr_reference,
+            "cleanup_policy": cleanup_policy,
+        }
+
+    @staticmethod
+    def _normalize_cleanup_policy(
+        value: object, *, branch: object, head_commit: object
+    ) -> dict[str, object]:
+        expected = {
+            "retention_rounds",
+            "delete_merged_branch",
+            "remove_disposable_worktree",
+            "branch_identity",
+            "worktree_identity",
+        }
+        if type(value) is not dict or set(value) != expected:
+            raise RelayCandidateError()
+        retention_rounds = value["retention_rounds"]
+        branch_identity = value["branch_identity"]
+        worktree_identity = value["worktree_identity"]
+        if (
+            type(retention_rounds) is not int
+            or not 1 <= retention_rounds <= 32
+            or value["delete_merged_branch"] is not True
+            or value["remove_disposable_worktree"] is not True
+            or type(branch) is not str
+            or type(head_commit) is not str
+            or branch_identity
+            != canonical_hash({"branch": branch, "head_commit": head_commit})
+            or type(worktree_identity) is not str
+            or _DIGEST.fullmatch(worktree_identity) is None
+        ):
+            raise RelayCandidateError()
+        return {
+            "retention_rounds": retention_rounds,
+            "delete_merged_branch": True,
+            "remove_disposable_worktree": True,
+            "branch_identity": branch_identity,
+            "worktree_identity": worktree_identity,
         }
 
     def _mutation_result(
@@ -2678,7 +3109,10 @@ class RelayStore:
                 "SELECT value FROM relay_v3_schema_metadata WHERE key = ?",
                 ("schema_version",),
             ).fetchall()
-            if len(rows) != 1 or str(rows[0]["value"]) != str(self._SCHEMA_VERSION):
+            if len(rows) != 1 or str(rows[0]["value"]) not in {
+                "5",
+                str(self._SCHEMA_VERSION),
+            }:
                 raise RelaySchemaIncompatible()
         except RelaySchemaIncompatible:
             raise
@@ -2875,6 +3309,37 @@ class RelayStore:
                     result_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS relay_v3_cleanup_ledger (
+                    candidate_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    retention_rounds INTEGER NOT NULL
+                        CHECK (retention_rounds BETWEEN 1 AND 32),
+                    branch_identity TEXT NOT NULL,
+                    worktree_identity TEXT NOT NULL,
+                    delete_merged_branch INTEGER NOT NULL CHECK (
+                        delete_merged_branch IN (0, 1)
+                    ),
+                    remove_disposable_worktree INTEGER NOT NULL CHECK (
+                        remove_disposable_worktree IN (0, 1)
+                    ),
+                    integration_proof_id TEXT,
+                    integration_commit TEXT,
+                    merged_integration_version INTEGER,
+                    eligible_after_integration_version INTEGER,
+                    state TEXT NOT NULL CHECK (state IN (
+                        'CLEANUP_PENDING', 'CLEANUP_ELIGIBLE',
+                        'CLEANUP_ROLLBACK_OBSERVED', 'CLEANED'
+                    )),
+                    rollback_receipt_hash TEXT,
+                    cleanup_receipt_hash TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (candidate_id)
+                        REFERENCES relay_v3_candidates(candidate_id) ON DELETE RESTRICT,
+                    FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id) ON DELETE CASCADE,
+                    FOREIGN KEY (integration_proof_id)
+                        REFERENCES relay_v3_integration_proofs(proof_id) ON DELETE RESTRICT
+                );
                 CREATE INDEX IF NOT EXISTS relay_v3_tasks_by_state
                     ON relay_v3_tasks(run_id, state, priority DESC, ordinal, task_id);
                 CREATE INDEX IF NOT EXISTS relay_v3_directives_by_state
@@ -2885,6 +3350,10 @@ class RelayStore:
                     ON relay_v3_finalization_journal(
                         integration_proof_id, expectation_hash, state
                     );
+                CREATE INDEX IF NOT EXISTS relay_v3_cleanup_by_run_state
+                    ON relay_v3_cleanup_ledger(
+                        run_id, state, eligible_after_integration_version
+                    );
                 """
             )
             connection.execute(
@@ -2893,6 +3362,13 @@ class RelayStore:
                 VALUES (?, ?)
                 """,
                 ("schema_version", str(self._SCHEMA_VERSION)),
+            )
+            connection.execute(
+                """
+                UPDATE relay_v3_schema_metadata SET value = ?
+                WHERE key = ? AND value = '5'
+                """,
+                (str(self._SCHEMA_VERSION), "schema_version"),
             )
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
@@ -2928,6 +3404,12 @@ class RelayStore:
                 "fence_hash",
                 "result_hash",
                 "result_json",
+            },
+            "relay_v3_cleanup_ledger": {
+                "candidate_id",
+                "integration_proof_id",
+                "eligible_after_integration_version",
+                "state",
             },
         }
         try:

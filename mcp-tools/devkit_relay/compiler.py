@@ -16,6 +16,8 @@ from .canonical import canonical_hash
 
 _REQUEST_SCHEMA = "2718lab-devkit/relay-compile-request-v1"
 _PLAN_SCHEMA = "2718lab-devkit/relay-plan-v1"
+_REQUEST_SCHEMA_V2 = "2718lab-devkit/relay-compile-request-v2"
+_PLAN_SCHEMA_V2 = "2718lab-devkit/relay-plan-v2"
 _RUNTIME_POLICY_ID = "2718lab-devkit/relay-runtime-policy-v1"
 
 _REQUEST_FIELDS = frozenset(
@@ -29,6 +31,7 @@ _REQUEST_FIELDS = frozenset(
         "tasks",
     }
 )
+_REQUEST_FIELDS_V2 = _REQUEST_FIELDS | frozenset({"project_binding"})
 _TASK_FIELDS = frozenset(
     {
         "task_id",
@@ -47,6 +50,16 @@ _TASK_FIELDS = frozenset(
         "retry_policy",
     }
 )
+_TASK_FIELDS_V2 = _TASK_FIELDS | frozenset(
+    {
+        "stage",
+        "design_for_task_id",
+        "split_policy",
+        "split_parent_task_id",
+        "split_depth",
+        "split_verdict",
+    }
+)
 _ROUTE_FIELDS = frozenset({"route_class", "model", "reasoning_effort"})
 _RETRY_POLICY_FIELDS = frozenset({"max_attempts", "retryable_codes"})
 _SCOPE_FIELDS = frozenset({"path", "kind"})
@@ -62,16 +75,39 @@ _BINDING_FIELDS = frozenset(
         "current",
     }
 )
+_PROJECT_BINDING_FIELDS = frozenset({"schema", "mode"})
+_PROJECT_INDEXED_RECEIPT_FIELDS = _PROJECT_BINDING_FIELDS | frozenset(
+    {"bootstrap_receipt"}
+)
+_SPLIT_POLICY_FIELDS = frozenset({"mode", "max_depth", "child_scopes"})
+_BOOTSTRAP_BINDING_FIELDS = frozenset(
+    {
+        "schema",
+        "workflow_id",
+        "workspace_id",
+        "input_snapshot_id",
+        "atlas_packet_ids",
+        "current",
+        "root_identity",
+        "initial_manifest_hash",
+        "entry_count",
+        "capability_epoch",
+        "attestation_hash",
+    }
+)
 
 _ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _HASH = re.compile(r"sha256:[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _KINDS = frozenset({"implementation", "verification", "review", "prewarm"})
+_V2_KINDS = _KINDS | frozenset({"design"})
+_STAGES = frozenset({"a1_writer", "a2_design", "a3_prewarm"})
 _ROUTES = {
     "terra_high": ("gpt-5.6-terra", "high"),
     "terra_max": ("gpt-5.6-terra", "max"),
     "sol_high": ("gpt-5.6-sol", "high"),
     "sol_ultra": ("gpt-5.6-sol", "ultra"),
+    "luna_medium": ("gpt-5.6-luna", "medium"),
 }
 
 _MAX_TASKS = 64
@@ -540,7 +576,7 @@ def _registry_binding(
     }
 
 
-def compile_plan(
+def _compile_plan_v1(
     request: Mapping[str, Any],
     registry_resolver: RegistryResolver | RegistryCallback | object | None = None,
 ) -> dict[str, Any]:
@@ -609,3 +645,594 @@ def compile_plan(
         "queues": _initial_queues(tasks, conflicts),
     }
     return {**plan, "plan_hash": canonical_hash(plan)}
+
+
+def _normalize_split_policy(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    policy = _exact_fields(value, _SPLIT_POLICY_FIELDS, "invalid_split_policy")
+    if policy["mode"] != "declared_children":
+        raise RelayPlanError("invalid_split_policy")
+    max_depth = policy["max_depth"]
+    if type(max_depth) is not int or not 1 <= max_depth <= 8:
+        raise RelayPlanError("invalid_split_policy")
+    raw_children = policy["child_scopes"]
+    if type(raw_children) is not list or not 1 <= len(raw_children) <= _MAX_LIST_ITEMS:
+        raise RelayPlanError("invalid_split_policy")
+    children = [_scope_list(item) for item in raw_children]
+    if any(not child for child in children):
+        raise RelayPlanError("invalid_split_policy")
+    keyed = sorted((canonical_hash(child), child) for child in children)
+    if len({key for key, _ in keyed}) != len(keyed):
+        raise RelayPlanError("invalid_split_policy")
+    return {
+        "mode": "declared_children",
+        "max_depth": max_depth,
+        "child_scopes": [child for _, child in keyed],
+    }
+
+
+def _normalize_task_v2(raw: object) -> dict[str, Any]:
+    task = _exact_fields(raw, _TASK_FIELDS_V2, "unknown_task_fields")
+    task_id = _identifier(task["task_id"], "invalid_task_id")
+    kind = task["kind"]
+    stage = task["stage"]
+    if type(kind) is not str or kind not in _V2_KINDS:
+        raise RelayPlanError("invalid_task_kind")
+    if type(stage) is not str or stage not in _STAGES:
+        raise RelayPlanError("invalid_task_stage")
+    priority = task["priority"]
+    if type(priority) is not int or not 1 <= priority <= 100:
+        raise RelayPlanError("invalid_priority")
+    dependencies = _identifier_list(task["dependencies"], "invalid_dependencies")
+    write_scope = _scope_list(task["write_scope"])
+    design_target = task["design_for_task_id"]
+    prewarm_target = task["prewarm_for_task_id"]
+    split_parent = task["split_parent_task_id"]
+    split_depth = task["split_depth"]
+    split_verdict = task["split_verdict"]
+    if split_parent is not None or type(split_depth) is not int or split_depth != 0:
+        raise RelayPlanError("invalid_split_provenance")
+    if split_verdict is not None:
+        raise RelayPlanError("invalid_split_provenance")
+
+    if stage == "a1_writer":
+        if kind != "implementation" or not write_scope:
+            raise RelayPlanError("a1_writer_requires_implementation_scope")
+        if design_target is not None or prewarm_target is not None:
+            raise RelayPlanError("invalid_stage_target")
+    elif stage == "a2_design":
+        if kind != "design" or write_scope or dependencies or prewarm_target is not None:
+            raise RelayPlanError("a2_design_must_be_readonly")
+        design_target = _identifier(design_target, "invalid_design_target")
+    else:
+        if (
+            kind != "prewarm"
+            or write_scope
+            or dependencies
+            or design_target is not None
+        ):
+            raise RelayPlanError("a3_prewarm_must_be_readonly")
+        prewarm_target = _identifier(prewarm_target, "invalid_prewarm_target")
+
+    route = _normalize_route(task["route"])
+    if stage == "a3_prewarm" and route != {
+        "route_class": "luna_medium",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium",
+    }:
+        raise RelayPlanError("a3_prewarm_requires_luna_medium")
+    split_policy = _normalize_split_policy(task["split_policy"])
+    if stage != "a1_writer" and split_policy is not None:
+        raise RelayPlanError("readonly_task_has_split_policy")
+    return {
+        "task_id": task_id,
+        "kind": kind,
+        "stage": stage,
+        "title": _bounded_text(
+            task["title"], "invalid_task_title", maximum=_MAX_TITLE_LENGTH
+        ),
+        "objective": _bounded_text(task["objective"], "invalid_objective"),
+        "priority": priority,
+        "dependencies": dependencies,
+        "write_scope": write_scope,
+        "route": route,
+        "constraints": _constraint_list(task["constraints"]),
+        "acceptance_criteria": _criterion_list(task["acceptance_criteria"]),
+        "atlas_packet_ids": _hash_list(
+            task["atlas_packet_ids"], "invalid_atlas_packet_ids", maximum=16
+        ),
+        "required_evidence": _evidence_list(task["required_evidence"]),
+        "design_for_task_id": design_target,
+        "prewarm_for_task_id": prewarm_target,
+        "retry_policy": _normalize_retry_policy(task["retry_policy"]),
+        "split_policy": split_policy,
+        "split_parent_task_id": None,
+        "split_depth": 0,
+        "split_verdict": None,
+    }
+
+
+def _validate_task_relations_v2(tasks: list[dict[str, Any]]) -> None:
+    task_by_id = {task["task_id"]: task for task in tasks}
+    if len(task_by_id) != len(tasks):
+        raise RelayPlanError("duplicate_task_id")
+    known_ids = set(task_by_id)
+    for task in tasks:
+        task_id = task["task_id"]
+        dependencies = task["dependencies"]
+        if task_id in dependencies or not set(dependencies) <= known_ids:
+            raise RelayPlanError("invalid_dependencies")
+        if task["stage"] == "a2_design":
+            target = task["design_for_task_id"]
+            if target not in task_by_id or task_by_id[target]["stage"] != "a1_writer":
+                raise RelayPlanError("invalid_design_target")
+        if task["stage"] == "a3_prewarm":
+            target = task["prewarm_for_task_id"]
+            if target not in task_by_id or task_by_id[target]["stage"] != "a1_writer":
+                raise RelayPlanError("invalid_prewarm_target")
+
+
+def _scope_covers(parent: Mapping[str, str], child: Mapping[str, str]) -> bool:
+    if parent["path"] == child["path"]:
+        return parent["kind"] == "tree" or child["kind"] == "file"
+    return parent["kind"] == "tree" and child["path"].startswith(parent["path"] + "/")
+
+
+def _declared_split(
+    tasks: list[dict[str, Any]], parent_id: str
+) -> list[dict[str, Any]] | None:
+    parent = next(task for task in tasks if task["task_id"] == parent_id)
+    policy = parent["split_policy"]
+    if policy is None or parent["split_depth"] >= policy["max_depth"]:
+        return None
+    if any(
+        parent_id in task["dependencies"]
+        or task.get("design_for_task_id") == parent_id
+        or task.get("prewarm_for_task_id") == parent_id
+        for task in tasks
+        if task["task_id"] != parent_id
+    ):
+        return None
+    child_scopes = policy["child_scopes"]
+    if any(
+        not any(_scope_covers(parent_scope, scope) for parent_scope in parent["write_scope"])
+        for child in child_scopes
+        for scope in child
+    ):
+        return None
+    flattened = [scope for child in child_scopes for scope in child]
+    if any(
+        _scopes_overlap(left, right)
+        for index, left in enumerate(flattened)
+        for right in flattened[index + 1 :]
+    ):
+        return None
+    children: list[dict[str, Any]] = []
+    existing_ids = {task["task_id"] for task in tasks} - {parent_id}
+    for child_scope in child_scopes:
+        suffix = canonical_hash(child_scope)[7:19]
+        child_id = f"{parent_id}-{suffix}"
+        if child_id in existing_ids:
+            return None
+        existing_ids.add(child_id)
+        children.append(
+            {
+                **parent,
+                "task_id": child_id,
+                "write_scope": child_scope,
+                "split_policy": None,
+                "split_parent_task_id": parent_id,
+                "split_depth": parent["split_depth"] + 1,
+                "split_verdict": "SPLIT_APPLIED",
+            }
+        )
+    if len(tasks) - 1 + len(children) > _MAX_TASKS:
+        return None
+    replacement = [task for task in tasks if task["task_id"] != parent_id] + children
+    replacement.sort(key=lambda task: task["task_id"])
+    try:
+        _validate_task_relations_v2(replacement)
+        _assert_acyclic(replacement)
+    except RelayPlanError:
+        return None
+    return replacement
+
+
+def resolve_write_scope_conflicts(
+    tasks: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[str]]:
+    """Use declared children only; a split must strictly reduce conflict edges."""
+
+    current = list(tasks)
+    conflicts = _conflict_edges(current)
+    while conflicts:
+        replacement: list[dict[str, Any]] | None = None
+        for edge in conflicts:
+            for task_id in (edge["to_task_id"], edge["from_task_id"]):
+                proposed = _declared_split(current, task_id)
+                if proposed is None:
+                    continue
+                if len(_conflict_edges(proposed)) < len(conflicts):
+                    replacement = proposed
+                    break
+            if replacement is not None:
+                break
+        if replacement is None:
+            unsplittable = sorted(
+                {item for edge in conflicts for item in (edge["from_task_id"], edge["to_task_id"])}
+            )
+            marked = []
+            for task in current:
+                if task["task_id"] in unsplittable:
+                    marked.append({**task, "split_verdict": "UNSPLITTABLE_SCOPE_CONFLICT"})
+                else:
+                    marked.append(task)
+            return marked, conflicts, unsplittable
+        current = replacement
+        conflicts = _conflict_edges(current)
+    return current, [], []
+
+
+def _queue_order_v2(tasks: list[dict[str, Any]]) -> list[str]:
+    return [
+        task["task_id"]
+        for task in sorted(tasks, key=lambda task: (-task["priority"], task["task_id"]))
+    ]
+
+
+def _initial_queues_v2(
+    tasks: list[dict[str, Any]],
+    conflicts: list[dict[str, str]],
+    unsplittable: list[str],
+    *,
+    bootstrap: bool,
+) -> dict[str, list[str]]:
+    if bootstrap:
+        return {
+            "writer_ready": [],
+            "design_ready": [],
+            "prewarm_ready": [],
+            "bootstrap_index": ["bootstrap-index"],
+            "review_integration": [],
+            "terminal": [],
+            "unsplittable": [],
+        }
+    withheld = {edge["to_task_id"] for edge in conflicts}
+    writers = [
+        task
+        for task in tasks
+        if task["stage"] == "a1_writer"
+        and not task["dependencies"]
+        and task["task_id"] not in withheld
+    ]
+    designs = [
+        task
+        for task in tasks
+        if task["stage"] == "a2_design" and not task["dependencies"]
+    ]
+    prewarms = [
+        task
+        for task in tasks
+        if task["stage"] == "a3_prewarm" and not task["dependencies"]
+    ]
+    return {
+        "writer_ready": _queue_order_v2(writers),
+        "design_ready": _queue_order_v2(designs),
+        "prewarm_ready": _queue_order_v2(prewarms),
+        "bootstrap_index": [],
+        "review_integration": [],
+        "terminal": [],
+        "unsplittable": sorted(unsplittable),
+    }
+
+
+def _resolver_value(
+    resolver: RegistryResolver | RegistryCallback | object | None,
+    *,
+    workflow_id: str,
+    workspace_id: str,
+    input_snapshot_id: str,
+    atlas_packet_ids: tuple[str, ...],
+) -> object:
+    if resolver is None:
+        raise RelayPlanError("registry_binding_unavailable")
+    try:
+        resolve = getattr(resolver, "resolve", resolver)
+        if not callable(resolve):
+            raise RelayPlanError("registry_binding_unavailable")
+        return resolve(
+            workflow_id=workflow_id,
+            workspace_id=workspace_id,
+            input_snapshot_id=input_snapshot_id,
+            atlas_packet_ids=atlas_packet_ids,
+        )
+    except RelayPlanError:
+        raise
+    except Exception as exc:
+        raise RelayPlanError("registry_binding_unavailable") from exc
+
+
+def _bootstrap_workspace_binding(
+    resolver: RegistryResolver | RegistryCallback | object | None,
+    *,
+    workflow_id: str,
+    workspace_id: str,
+    input_snapshot_id: str,
+    atlas_packet_ids: tuple[str, ...],
+) -> dict[str, object]:
+    binding = _resolver_value(
+        resolver,
+        workflow_id=workflow_id,
+        workspace_id=workspace_id,
+        input_snapshot_id=input_snapshot_id,
+        atlas_packet_ids=atlas_packet_ids,
+    )
+    if type(binding) is not dict or set(binding) != _BOOTSTRAP_BINDING_FIELDS:
+        raise RelayPlanError("bootstrap_attestation_required")
+    if (
+        binding["schema"]
+        != "2718lab-devkit/new-project-bootstrap-attestation-v1"
+        or binding["current"] is not True
+        or binding["workflow_id"] != workflow_id
+        or binding["workspace_id"] != workspace_id
+        or binding["input_snapshot_id"] != input_snapshot_id
+        or type(binding["entry_count"]) is not int
+        or binding["entry_count"] != 0
+        or type(binding["capability_epoch"]) is not int
+        or binding["capability_epoch"] < 1
+    ):
+        raise RelayPlanError("bootstrap_attestation_stale")
+    try:
+        packets = _hash_list(binding["atlas_packet_ids"], "bootstrap_attestation")
+        root_identity = _hash_identifier(
+            binding["root_identity"], "bootstrap_attestation"
+        )
+        manifest_hash = _hash_identifier(
+            binding["initial_manifest_hash"], "bootstrap_attestation"
+        )
+        attestation_hash = _hash_identifier(
+            binding["attestation_hash"], "bootstrap_attestation"
+        )
+    except RelayPlanError as exc:
+        raise RelayPlanError("bootstrap_attestation_required") from exc
+    if not set(atlas_packet_ids) <= set(packets):
+        raise RelayPlanError("bootstrap_attestation_stale")
+    return {
+        "workspace_id": workspace_id,
+        "input_snapshot_id": input_snapshot_id,
+        "atlas_packet_ids": list(atlas_packet_ids),
+        "project_mode": "new_empty_bootstrap",
+        "root_identity": root_identity,
+        "initial_manifest_hash": manifest_hash,
+        "attestation_hash": attestation_hash,
+        "capability_epoch": binding["capability_epoch"],
+    }
+
+
+def _validate_bootstrap_receipt(
+    resolver: RegistryResolver | RegistryCallback | object | None,
+    *,
+    workflow_id: str,
+    workspace_id: str,
+    input_snapshot_id: str,
+    receipt_hash: object,
+) -> str:
+    try:
+        normalized_hash = _hash_identifier(receipt_hash, "bootstrap_receipt_required")
+    except RelayPlanError:
+        raise RelayPlanError("bootstrap_receipt_required") from None
+    try:
+        validate = getattr(resolver, "validate_bootstrap_receipt")
+        if not callable(validate):
+            raise RelayPlanError("bootstrap_receipt_required")
+        receipt = validate(
+            workflow_id=workflow_id,
+            workspace_id=workspace_id,
+            input_snapshot_id=input_snapshot_id,
+            receipt_hash=normalized_hash,
+        )
+    except RelayPlanError:
+        raise
+    except Exception as exc:
+        raise RelayPlanError("bootstrap_receipt_required") from exc
+    fields = frozenset(
+        {
+            "schema",
+            "workflow_id",
+            "workspace_id",
+            "input_snapshot_id",
+            "receipt_hash",
+            "current",
+        }
+    )
+    if (
+        type(receipt) is not dict
+        or set(receipt) != fields
+        or receipt["schema"]
+        != "2718lab-devkit/project-index-bootstrap-receipt-v1"
+        or receipt["workflow_id"] != workflow_id
+        or receipt["workspace_id"] != workspace_id
+        or receipt["input_snapshot_id"] != input_snapshot_id
+        or receipt["receipt_hash"] != normalized_hash
+        or receipt["current"] is not True
+    ):
+        raise RelayPlanError("bootstrap_receipt_required")
+    return normalized_hash
+
+
+def _bootstrap_task() -> dict[str, object]:
+    return {
+        "task_id": "bootstrap-index",
+        "kind": "bootstrap_index",
+        "stage": "bootstrap_index",
+        "priority": 100,
+        "dependencies": [],
+        "write_scope": [],
+        "split_parent_task_id": None,
+        "split_depth": 0,
+        "split_verdict": None,
+    }
+
+
+def _compile_plan_v2(
+    request: Mapping[str, Any],
+    registry_resolver: RegistryResolver | RegistryCallback | object | None,
+) -> dict[str, Any]:
+    _exact_fields(request, _REQUEST_FIELDS_V2, "unknown_request_fields")
+    workflow_id = _identifier(request["workflow_id"], "invalid_workflow_id")
+    workspace_id = _hash_identifier(request["workspace_id"], "invalid_workspace_id")
+    input_snapshot_id = _hash_identifier(
+        request["input_snapshot_id"], "invalid_snapshot_id"
+    )
+    base_commit = _commit_identifier(request["base_commit"])
+    capacity = request["capacity"]
+    if type(capacity) is not int or not 1 <= capacity <= 3:
+        raise RelayPlanError("invalid_capacity")
+    if type(request["tasks"]) is not list or not request["tasks"]:
+        raise RelayPlanError("invalid_tasks")
+    if len(request["tasks"]) > _MAX_TASKS:
+        raise RelayPlanError("too_many_tasks")
+    project_binding = request["project_binding"]
+    if type(project_binding) is not dict:
+        raise RelayPlanError("invalid_project_binding")
+    mode = project_binding.get("mode")
+    expected_binding_fields = (
+        _PROJECT_BINDING_FIELDS
+        if mode == "new_empty_bootstrap"
+        else _PROJECT_BINDING_FIELDS
+        if mode == "indexed" and set(project_binding) == _PROJECT_BINDING_FIELDS
+        else _PROJECT_INDEXED_RECEIPT_FIELDS
+    )
+    project_binding = _exact_fields(
+        project_binding, expected_binding_fields, "invalid_project_binding"
+    )
+    if project_binding["schema"] != "2718lab-devkit/project-binding-v1":
+        raise RelayPlanError("invalid_project_binding")
+    if mode not in {"indexed", "new_empty_bootstrap"}:
+        raise RelayPlanError("invalid_project_binding")
+    tasks = sorted(
+        (_normalize_task_v2(item) for item in request["tasks"]),
+        key=lambda task: task["task_id"],
+    )
+    _validate_task_relations_v2(tasks)
+    _assert_acyclic(tasks)
+    atlas_packet_ids = tuple(
+        sorted({packet for task in tasks for packet in task["atlas_packet_ids"]})
+    )
+    bootstrap_receipt = None
+    if mode == "indexed":
+        if "bootstrap_receipt" in project_binding:
+            bootstrap_receipt = _validate_bootstrap_receipt(
+                registry_resolver,
+                workflow_id=workflow_id,
+                workspace_id=workspace_id,
+                input_snapshot_id=input_snapshot_id,
+                receipt_hash=project_binding["bootstrap_receipt"],
+            )
+        workspace_binding = _registry_binding(
+            registry_resolver,
+            workflow_id=workflow_id,
+            workspace_id=workspace_id,
+            input_snapshot_id=input_snapshot_id,
+            atlas_packet_ids=atlas_packet_ids,
+        )
+        tasks, conflicts, unsplittable = resolve_write_scope_conflicts(tasks)
+        bootstrap = False
+    else:
+        workspace_binding = _bootstrap_workspace_binding(
+            registry_resolver,
+            workflow_id=workflow_id,
+            workspace_id=workspace_id,
+            input_snapshot_id=input_snapshot_id,
+            atlas_packet_ids=atlas_packet_ids,
+        )
+        conflicts = []
+        unsplittable = []
+        bootstrap = True
+    plan_tasks: list[dict[str, Any] | dict[str, object]] = list(tasks)
+    if bootstrap:
+        plan_tasks.append(_bootstrap_task())
+    plan = {
+        "schema": _PLAN_SCHEMA_V2,
+        "workflow_id": workflow_id,
+        "workspace_binding": workspace_binding,
+        "project_binding": {
+            "schema": "2718lab-devkit/project-binding-v1",
+            "mode": mode,
+            **(
+                {"bootstrap_receipt": bootstrap_receipt}
+                if bootstrap_receipt is not None
+                else {}
+            ),
+        },
+        "base_commit": base_commit,
+        "capacity": capacity,
+        "runtime_policy_id": _RUNTIME_POLICY_ID,
+        "tasks": plan_tasks,
+        "dependencies": [
+            {
+                "from_task_id": task["task_id"],
+                "kind": "depends_on",
+                "to_task_id": dependency,
+            }
+            for task in tasks
+            for dependency in task["dependencies"]
+        ],
+        "conflicts": conflicts,
+        "queues": _initial_queues_v2(
+            tasks, conflicts, unsplittable, bootstrap=bootstrap
+        ),
+    }
+    return {**plan, "plan_hash": canonical_hash(plan)}
+
+
+def validate_stage_evidence(
+    task: Mapping[str, object],
+    *,
+    input_snapshot_id: object,
+    evidence: object,
+) -> dict[str, str]:
+    """Validate immutable A2/A3 evidence without scheduling or side effects."""
+
+    stage = task.get("stage")
+    if stage not in {"a2_design", "a3_prewarm"}:
+        raise RelayPlanError("invalid_stage_evidence")
+    expected = frozenset(
+        {"task_id", "stage", "input_snapshot_id", "context_hash", "artifact_hash"}
+    )
+    value = _exact_fields(evidence, expected, "invalid_stage_evidence")
+    stale_code = (
+        "DESIGN_EVIDENCE_STALE" if stage == "a2_design" else "PREWARM_EVIDENCE_STALE"
+    )
+    if (
+        value["task_id"] != task.get("task_id")
+        or value["stage"] != stage
+        or value["input_snapshot_id"] != input_snapshot_id
+    ):
+        raise RelayPlanError(stale_code)
+    return {
+        "task_id": _identifier(value["task_id"], "invalid_stage_evidence"),
+        "stage": str(stage),
+        "input_snapshot_id": _hash_identifier(
+            value["input_snapshot_id"], "invalid_stage_evidence"
+        ),
+        "context_hash": _hash_identifier(value["context_hash"], "invalid_stage_evidence"),
+        "artifact_hash": _hash_identifier(value["artifact_hash"], "invalid_stage_evidence"),
+    }
+
+
+def compile_plan(
+    request: Mapping[str, Any],
+    registry_resolver: RegistryResolver | RegistryCallback | object | None = None,
+) -> dict[str, Any]:
+    """Compile a legacy v1 or staged v2 Relay plan without host side effects."""
+
+    if type(request) is not dict:
+        raise RelayPlanError("invalid_request")
+    schema = request.get("schema")
+    if schema == _REQUEST_SCHEMA:
+        return _compile_plan_v1(request, registry_resolver=registry_resolver)
+    if schema == _REQUEST_SCHEMA_V2:
+        return _compile_plan_v2(request, registry_resolver=registry_resolver)
+    raise RelayPlanError("invalid_schema")
