@@ -557,6 +557,7 @@ class RelayService:
             )
             if prepared.state != "prepared":
                 raise RelayError("RELAY_FINALIZATION_PENDING")
+            self._apply_prepared_reservation(reservation, prepared)
             result, committed_evidence = self._finalization_call(
                 self._store.integrate_candidate,
                 candidate_id=candidate_id,
@@ -1750,6 +1751,35 @@ class RelayService:
             "already_released",
         }:
             raise RelayError("RELAY_FINALIZATION_CONFLICT")
+
+    @staticmethod
+    def _apply_prepared_reservation(
+        reservation: RelayProofReservation, evidence: ProofFinalizationEvidence
+    ) -> None:
+        """Ask host-only reservations to CAS after Relay persists PREPARED."""
+
+        try:
+            validate_finalization_evidence(evidence)
+        except ValueError as error:
+            raise RelayError("RELAY_FINALIZATION_CONFLICT") from error
+        if (
+            evidence.state != "prepared"
+            or evidence.finalization_id != reservation.fence.finalization_id
+            or evidence.fence_hash != reservation.fence.fence_hash
+            or evidence.result_hash is not None
+        ):
+            raise RelayError("RELAY_FINALIZATION_CONFLICT")
+        operation = getattr(reservation, "apply_prepared", None)
+        if operation is None:
+            return
+        if not callable(operation):
+            raise RelayError("RELAY_FINALIZATION_CONFLICT")
+        try:
+            operation(evidence=evidence)
+        except IntegrationProofError as error:
+            raise RelayError(RelayService._proof_error_code(error)) from None
+        except Exception:
+            raise RelayError("RELAY_FINALIZATION_PENDING") from None
 
     @staticmethod
     def _validate_terminal_evidence(

@@ -118,6 +118,63 @@ class _NoProofProviderStore:
         raise AssertionError("missing proof provider must be rejected before store")
 
 
+class _FinalizationOrderingStore:
+    """Observe the durable Relay transitions while delegating to the real store."""
+
+    def __init__(self, store: RelayStore, events: list[str]) -> None:
+        self._store = store
+        self._events = events
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._store, name)
+
+    def prepare_integration_finalization(
+        self, *args: object, **kwargs: object
+    ) -> object:
+        self._events.append("relay-prepared")
+        return self._store.prepare_integration_finalization(*args, **kwargs)  # type: ignore[arg-type]
+
+    def integrate_candidate(self, *args: object, **kwargs: object) -> object:
+        self._events.append("relay-committed")
+        return self._store.integrate_candidate(*args, **kwargs)  # type: ignore[arg-type]
+
+
+class _PreparedOrderingReservation:
+    """Host reservation with a visible exact-CAS boundary for this test only."""
+
+    def __init__(self, reservation: object, events: list[str]) -> None:
+        self._reservation = reservation
+        self._events = events
+
+    @property
+    def receipt(self) -> object:
+        return self._reservation.receipt  # type: ignore[union-attr]
+
+    @property
+    def fence(self) -> object:
+        return self._reservation.fence  # type: ignore[union-attr]
+
+    def apply_prepared(self, *, evidence: object) -> None:
+        del evidence
+        self._events.append("git-cas")
+
+    def settle(self, *, evidence: object) -> object:
+        return self._reservation.settle(evidence=evidence)  # type: ignore[union-attr]
+
+
+class _PreparedOrderingRegistry(ProofRegistry):
+    """Record host fence persistence separately from the later Git CAS."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    def reserve(self, proof_id: str, expectation: object) -> object:
+        reservation = super().reserve(proof_id, expectation)  # type: ignore[arg-type]
+        self._events.append("host-fence-persisted")
+        return _PreparedOrderingReservation(reservation, self._events)
+
+
 def _missing_proof_request(
     relay: RelayService,
     *,
@@ -201,6 +258,106 @@ def test_missing_proof_provider_preserves_nonintegrate_sol_actions(
 
     assert result == {"action": action}
     assert store.calls == [action]
+
+
+def test_integration_orders_host_fence_prepared_git_cas_and_committed(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    registry = _PreparedOrderingRegistry(events)
+    store = RelayStore(tmp_path / "finalization-order.sqlite3")
+    relay = RelayService(
+        _FinalizationOrderingStore(store, events),  # type: ignore[arg-type]
+        capability_secret=b"relay-v3-test-secret",
+        integration_proof_resolver=registry,
+    )
+    try:
+        created = relay.start_create(
+            plan(
+                task(
+                    "writer-a",
+                    write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+                )
+            ),
+            idempotency_key="finalization-order",
+        )
+        action = created["host_actions"][0]
+        assert isinstance(action, dict)
+        task_version = bind_worker(relay, action)
+        task_version = _record_evidence(relay, action, task_version)
+        handed_off = relay.handoff(
+            worker_request(
+                action,
+                lifecycle_action="candidate_handoff",
+                capability=issue_worker(
+                    relay, action, lifecycle_action="candidate_handoff"
+                ),
+                expected_task_version=task_version,
+                candidate=_candidate([_EVIDENCE_HASH]),
+            )
+        )
+        candidate_task = handed_off["task"]
+        assert isinstance(candidate_task, dict)
+        lease = action["lease"]
+        assert isinstance(lease, dict)
+        relay.integrate(
+            {
+                "workflow_id": "relay-runtime-v3",
+                "task_id": "writer-a",
+                "action": "review",
+                "epoch": lease["epoch"],
+                "endpoint": "sol-main",
+                "expected_task_version": candidate_task["task_version"],
+                "capability": relay.issue_sol_capability(
+                    workflow_id="relay-runtime-v3",
+                    task_id="writer-a",
+                    action="review",
+                    epoch=int(lease["epoch"]),
+                    endpoint="sol-main",
+                ),
+                "candidate_id": "candidate-a",
+                "review_digest": "sha256:" + "1" * 64,
+            }
+        )
+        expectation = store.integration_expectation(
+            "relay-runtime-v3",
+            "writer-a",
+            epoch=int(lease["epoch"]),
+            expected_task_version=int(candidate_task["task_version"]),
+            candidate_id="candidate-a",
+            proof_id="sha256:" + "0" * 64,
+        )
+        proof_id = registry.register(synthetic_integration_receipt(expectation))
+
+        integrated = relay.integrate(
+            {
+                "workflow_id": "relay-runtime-v3",
+                "task_id": "writer-a",
+                "action": "integrate",
+                "epoch": lease["epoch"],
+                "endpoint": "sol-main",
+                "expected_task_version": candidate_task["task_version"],
+                "capability": relay.issue_sol_capability(
+                    workflow_id="relay-runtime-v3",
+                    task_id="writer-a",
+                    action="integrate",
+                    epoch=int(lease["epoch"]),
+                    endpoint="sol-main",
+                ),
+                "candidate_id": "candidate-a",
+                "integration_proof_id": proof_id,
+            }
+        )
+
+        assert integrated["task"]["state"] == "integrated"
+        assert events == [
+            "host-fence-persisted",
+            "relay-prepared",
+            "git-cas",
+            "relay-committed",
+        ]
+    finally:
+        store.close()
 
 
 def test_candidate_handoff_releases_worker_slot_and_sol_integration_unblocks_dependency(
