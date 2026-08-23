@@ -1703,7 +1703,6 @@ def _normalise_override(value: object) -> dict[str, Any]:
     if reason not in {
         "capability_exact_route_unavailable",
         "host_incident",
-        "quota_exhausted",
     }:
         raise RoutingError("invalid_schema", "override reason is invalid")
     if override["attester_role"] != "coordinator":

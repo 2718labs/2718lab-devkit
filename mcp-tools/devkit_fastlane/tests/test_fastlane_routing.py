@@ -920,6 +920,40 @@ def test_only_a_trusted_upward_override_can_raise_a_route() -> None:
     assert "host_override_upward" in elevated["reason_codes"]
 
 
+def test_quota_specific_override_reason_is_rejected() -> None:
+    core = _load_core()
+    request = _request()
+    request["host_capabilities"] = _all_capabilities()
+    base = core.route(request)
+    receipt = {
+        "schema": "2718lab-devkit/host-route-override-v1",
+        "task_fingerprint": base["task_fingerprint"],
+        "policy_hash": request["policy_hash"],
+        "lease_epoch": 0,
+        "issued_event_seq": 1,
+        "expires_event_seq": 2,
+        "requested_model": "gpt-5.6-terra",
+        "requested_effort": "max",
+        "reason": "quota_exhausted",
+        "evidence_hash": HASH_B,
+        "attester_role": "coordinator",
+        "attester_endpoint_hash": HASH_A,
+    }
+    receipt["receipt_hash"] = _canonical_hash(receipt)
+    request["override_receipt"] = receipt
+
+    result = core.route(
+        request,
+        trusted_override_receipt_hashes=[receipt["receipt_hash"]],
+        trusted_evidence_hashes=[HASH_B],
+        coordinator_endpoint_hash=HASH_A,
+    )
+
+    assert result["status"] == "rejected"
+    assert result["route"] is None
+    assert result["reason_codes"] == ["invalid_schema"]
+
+
 def test_gate_evidence_identity_is_canonical_and_strict_utc_z() -> None:
     core = _load_core()
     identity = {
