@@ -224,7 +224,7 @@ def test_v3_rebinds_a_cross_group_declared_split_to_its_original_scheduler() -> 
     assert len(first_group["writer_task_ids"]) == 2
 
 
-def test_v3_unsplittable_writer_removes_its_prewarm_from_the_group() -> None:
+def test_v3_unsplittable_writers_keep_a_nonempty_serial_group_and_withhold_prewarm() -> None:
     request = _request()
     tasks = request["tasks"]
     assert isinstance(tasks, list)
@@ -240,7 +240,10 @@ def test_v3_unsplittable_writer_removes_its_prewarm_from_the_group() -> None:
 
     plan = compile_plan(request, registry_resolver=RegistryResolver())
 
-    assert plan["queues"]["writer_ready"] == []
+    assert plan["queues"]["writer_ready"] == ["writer-a", "writer-b"]
     assert plan["queues"]["unsplittable"] == ["writer-a", "writer-b"]
-    assert plan["scheduler_topology"]["groups"][0]["writer_task_ids"] == []
+    assert plan["scheduler_topology"]["groups"][0]["writer_task_ids"] == [
+        "writer-a",
+        "writer-b",
+    ]
     assert plan["scheduler_topology"]["groups"][0]["prewarm_task_ids"] == []

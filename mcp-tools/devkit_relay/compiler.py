@@ -991,15 +991,19 @@ def _initial_queues_v2(
             "terminal": [],
             "unsplittable": [],
         }
-    withheld = {edge["to_task_id"] for edge in conflicts}
     blocked_targets = set(unsplittable)
+    withheld = {
+        edge["to_task_id"]
+        for edge in conflicts
+        if edge["from_task_id"] not in blocked_targets
+        and edge["to_task_id"] not in blocked_targets
+    }
     writers = [
         task
         for task in tasks
         if task["stage"] == "a1_writer"
         and not task["dependencies"]
         and task["task_id"] not in withheld
-        and task["task_id"] not in blocked_targets
     ]
     designs = [
         task
@@ -1441,18 +1445,18 @@ def _normalize_scheduler_topology(
         raise RelayPlanError("invalid_scheduler_topology")
 
     all_writers = {
-        task["task_id"]: task
+        str(task["task_id"]): task
         for task in tasks
         if task.get("stage") == "a1_writer"
     }
-    writers = {
-        task_id: task
+    writers = all_writers
+    unsplittable_writers = {
+        task_id
         for task_id, task in all_writers.items()
-        if task.get("split_verdict") != "UNSPLITTABLE_SCOPE_CONFLICT"
+        if task.get("split_verdict") == "UNSPLITTABLE_SCOPE_CONFLICT"
     }
-    unsplittable_writers = set(all_writers) - set(writers)
     all_prewarms = {
-        task["task_id"]: task
+        str(task["task_id"]): task
         for task in tasks
         if task.get("stage") == "a3_prewarm"
     }
@@ -1471,7 +1475,7 @@ def _normalize_scheduler_topology(
             if type(target) is str
             else set()
         )
-        if members:
+        if members and not members & unsplittable_writers:
             prewarm_targets[task_id] = members
     prewarms = {
         task_id: task for task_id, task in all_prewarms.items() if task_id in prewarm_targets
@@ -1511,8 +1515,6 @@ def _normalize_scheduler_topology(
         )
         expanded_writer_ids: list[str] = []
         for task_id in writer_ids:
-            if task_id in unsplittable_writers:
-                continue
             members = [task_id] if task_id in writers else split_children.get(task_id, [])
             if not members or any(member in assigned_writers for member in members):
                 raise RelayPlanError("invalid_scheduler_topology")

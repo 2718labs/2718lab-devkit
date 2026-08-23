@@ -835,7 +835,12 @@ class RelayService:
             task["task_id"]
             for task in tasks
             if task["stage"] == "a1_writer"
-            and task["split_verdict"] != "UNSPLITTABLE_SCOPE_CONFLICT"
+        }
+        unsplittable_writer_ids = {
+            task["task_id"]
+            for task in tasks
+            if task["stage"] == "a1_writer"
+            and task["split_verdict"] == "UNSPLITTABLE_SCOPE_CONFLICT"
         }
         split_children: dict[str, set[str]] = {}
         for task_id in writer_ids:
@@ -852,7 +857,7 @@ class RelayService:
                 if target in writer_ids
                 else set(split_children.get(target, set()))
             )
-            if members:
+            if members and not members & unsplittable_writer_ids:
                 prewarm_targets[task["task_id"]] = members
         prewarm_ids = set(prewarm_targets)
         assigned_writers: dict[str, dict[str, str]] = {}
@@ -1152,11 +1157,16 @@ class RelayService:
                 raise RelayError("RELAY_PLAN_INVALID")
         if value["bootstrap_index"] or value["review_integration"] or value["terminal"]:
             raise RelayError("RELAY_PLAN_INVALID")
-        withheld = {edge["to_task_id"] for edge in conflicts}
         unsplittable_targets = {
             task["task_id"]
             for task in tasks
             if task["split_verdict"] == "UNSPLITTABLE_SCOPE_CONFLICT"
+        }
+        withheld = {
+            edge["to_task_id"]
+            for edge in conflicts
+            if edge["from_task_id"] not in unsplittable_targets
+            and edge["to_task_id"] not in unsplittable_targets
         }
         writer = sorted(
             (
@@ -1165,7 +1175,6 @@ class RelayService:
                 if task["stage"] == "a1_writer"
                 and not task["dependencies"]
                 and task["task_id"] not in withheld
-                and task["task_id"] not in unsplittable_targets
             ),
             key=lambda task: (-task["priority"], task["task_id"]),
         )

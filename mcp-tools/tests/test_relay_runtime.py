@@ -819,7 +819,7 @@ def test_start_rejects_self_hashed_one_over_maximum_graph_before_persistence(
     assert store.database_fingerprint() == before
 
 
-@pytest.mark.parametrize("invalid_capacity", [0, 4, 1.5, "invalid"])
+@pytest.mark.parametrize("invalid_capacity", [0, 10, 1.5, "invalid"])
 def test_store_schema_rejects_noninteger_or_out_of_range_capacity(
     tmp_path: Path, invalid_capacity: object
 ) -> None:
@@ -843,7 +843,7 @@ def test_store_schema_rejects_noninteger_or_out_of_range_capacity(
     assert store.database_fingerprint() == before
 
 
-@pytest.mark.parametrize("invalid_capacity", [0, 4, 1.5, "invalid"])
+@pytest.mark.parametrize("invalid_capacity", [0, 10, 1.5, "invalid"])
 def test_status_rejects_invalid_stored_capacity_as_storage_error(
     tmp_path: Path, invalid_capacity: object
 ) -> None:

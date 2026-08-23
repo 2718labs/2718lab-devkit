@@ -111,14 +111,24 @@ class RelayStore:
     _SCHEMA_VERSION = 8
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
-    def __init__(self, database: str | Path, *, host_writer_capacity: int = 9) -> None:
-        if type(host_writer_capacity) is not int or not 1 <= host_writer_capacity <= 9:
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        host_writer_capacity: int = 9,
+        host_reader_capacity: int = 9,
+    ) -> None:
+        if (
+            type(host_writer_capacity) is not int
+            or not 1 <= host_writer_capacity <= 9
+            or type(host_reader_capacity) is not int
+            or not 1 <= host_reader_capacity <= 9
+        ):
             raise RelayTopologyInvalid()
         self._database = str(database)
         self._host_writer_capacity = host_writer_capacity
-        self._migrating_v5_to_v6 = False
-        self._migrating_v6_to_v7 = False
-        self._migrating_v7_to_v8 = False
+        self._host_reader_capacity = host_reader_capacity
+        self._legacy_schema_version: str | None = None
         self._connection: sqlite3.Connection | None = sqlite3.connect(
             self._database, isolation_level=None
         )
@@ -2206,11 +2216,11 @@ class RelayStore:
     def _select_eligible_tasks(
         self, cursor: sqlite3.Cursor, run: RelayRun
     ) -> tuple[RelayTask, ...]:
-        active_count = int(
+        active_writers = int(
             cursor.execute(
                 """
                 SELECT COUNT(*) AS count FROM relay_v3_tasks
-                WHERE run_id = ? AND state IN (?, ?)
+                WHERE run_id = ? AND kind = 'implementation' AND state IN (?, ?)
                 """,
                 (
                     run.run_id,
@@ -2219,20 +2229,41 @@ class RelayStore:
                 ),
             ).fetchone()["count"]
         )
-        remaining = max(0, run.capacity - active_count)
-        if remaining == 0:
+        active_readers = int(
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count FROM relay_v3_tasks
+                WHERE run_id = ? AND kind != 'implementation' AND state IN (?, ?)
+                """,
+                (
+                    run.run_id,
+                    RelayTaskState.LEASED.value,
+                    RelayTaskState.RUNNING.value,
+                ),
+            ).fetchone()["count"]
+        )
+        writer_remaining = max(0, run.capacity - active_writers)
+        reader_remaining = max(0, self._host_reader_capacity - active_readers)
+        if writer_remaining == 0 and reader_remaining == 0:
             return ()
         held_scopes = self._held_writer_scopes(cursor, run.run_id)
         selected: list[RelayTask] = []
         selected_scopes: list[dict[str, str]] = []
         for task in self._dispatchable_tasks(cursor, run.run_id):
             if task.kind == "implementation":
+                if writer_remaining == 0:
+                    continue
                 scopes = _task_scopes(task)
                 if _scopes_conflict(scopes, [*held_scopes, *selected_scopes]):
                     continue
                 selected_scopes.extend(scopes)
+                writer_remaining -= 1
+            else:
+                if reader_remaining == 0:
+                    continue
+                reader_remaining -= 1
             selected.append(task)
-            if len(selected) == remaining:
+            if writer_remaining == 0 and reader_remaining == 0:
                 break
         return tuple(selected)
 
@@ -3265,7 +3296,12 @@ class RelayStore:
             str(task["task_id"])
             for task in tasks
             if task.get("kind") == "implementation"
-            and task.get("split_verdict") != "UNSPLITTABLE_SCOPE_CONFLICT"
+        }
+        unsplittable_implementation_ids = {
+            str(task["task_id"])
+            for task in tasks
+            if task.get("kind") == "implementation"
+            and task.get("split_verdict") == "UNSPLITTABLE_SCOPE_CONFLICT"
         }
         split_children: dict[str, set[str]] = {}
         for task_id in implementation_ids:
@@ -3284,7 +3320,7 @@ class RelayStore:
                 if type(target) is str
                 else set()
             )
-            if members:
+            if members and not members & unsplittable_implementation_ids:
                 prewarm_targets[str(task["task_id"])] = members
         prewarm_ids = set(prewarm_targets)
 
@@ -3421,7 +3457,10 @@ class RelayStore:
                     _encode_json(group["prewarm_task_ids"]),
                 ),
             )
-            for slot, task_id in enumerate(group["writer_task_ids"], start=1):
+            writer_task_ids = group["writer_task_ids"]
+            if type(writer_task_ids) is not list:
+                raise RelayTopologyInvalid()
+            for slot, task_id in enumerate(writer_task_ids, start=1):
                 cursor.execute(
                     """
                     INSERT INTO relay_v3_scheduler_writer_slots
@@ -3459,9 +3498,10 @@ class RelayStore:
                 str(self._SCHEMA_VERSION),
             }:
                 raise RelaySchemaIncompatible()
-            self._migrating_v5_to_v6 = str(rows[0]["value"]) == "5"
-            self._migrating_v6_to_v7 = str(rows[0]["value"]) == "6"
-            self._migrating_v7_to_v8 = str(rows[0]["value"]) == "7"
+            version = str(rows[0]["value"])
+            self._legacy_schema_version = (
+                version if version != str(self._SCHEMA_VERSION) else None
+            )
         except RelaySchemaIncompatible:
             raise
         except sqlite3.Error as error:
@@ -3739,75 +3779,75 @@ class RelayStore:
                 """,
                 ("schema_version", str(self._SCHEMA_VERSION)),
             )
-            if self._migrating_v7_to_v8:
-                self._migrate_runs_capacity_to_v8()
-                connection.execute(
-                    """
-                    UPDATE relay_v3_schema_metadata SET value = '8'
-                    WHERE key = ? AND value = '7'
-                    """,
-                    ("schema_version",),
-                )
-            elif self._migrating_v6_to_v7:
-                connection.execute(
-                    """
-                    UPDATE relay_v3_schema_metadata SET value = '7'
-                    WHERE key = ? AND value = '6'
-                    """,
-                    ("schema_version",),
-                )
-            elif self._migrating_v5_to_v6:
-                connection.execute(
-                    """
-                    UPDATE relay_v3_schema_metadata SET value = '6'
-                    WHERE key = ? AND value = '5'
-                    """,
-                    ("schema_version",),
-                )
+            if self._legacy_schema_version is not None:
+                self._migrate_to_schema_v8()
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
-    def _migrate_runs_capacity_to_v8(self) -> None:
-        """Upgrade the durable run-capacity check without weakening foreign keys."""
+    def _migrate_to_schema_v8(self) -> None:
+        """Advance every known legacy Relay schema to V8 in this open operation."""
 
         connection = self._require_connection()
-        row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-            ("relay_v3_runs",),
-        ).fetchone()
-        if row is None or "capacity BETWEEN 1 AND 9" in str(row["sql"]):
-            return
+        legacy_version = self._legacy_schema_version
+        if legacy_version not in {"5", "6", "7"}:
+            raise RelaySchemaIncompatible()
         connection.execute("PRAGMA foreign_keys = OFF")
         try:
-            connection.executescript(
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("relay_v3_runs",),
+            ).fetchone()
+            if row is None:
+                raise RelaySchemaIncompatible()
+            if "capacity BETWEEN 1 AND 9" not in str(row["sql"]):
+                connection.execute(
+                    """
+                    CREATE TABLE relay_v3_runs_v8 (
+                        run_id TEXT PRIMARY KEY,
+                        workflow_id TEXT NOT NULL UNIQUE,
+                        plan_hash TEXT NOT NULL,
+                        plan_json TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL,
+                        input_snapshot_id TEXT NOT NULL,
+                        base_commit TEXT NOT NULL,
+                        integration_head TEXT NOT NULL,
+                        integration_version INTEGER NOT NULL
+                            CHECK (integration_version >= 0),
+                        capacity INTEGER NOT NULL
+                            CHECK (typeof(capacity) = 'integer')
+                            CHECK (capacity BETWEEN 1 AND 9),
+                        schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO relay_v3_runs_v8 SELECT * FROM relay_v3_runs"
+                )
+                connection.execute("DROP TABLE relay_v3_runs")
+                connection.execute("ALTER TABLE relay_v3_runs_v8 RENAME TO relay_v3_runs")
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RelaySchemaIncompatible()
+            result = connection.execute(
                 """
-                CREATE TABLE relay_v3_runs_v8 (
-                    run_id TEXT PRIMARY KEY,
-                    workflow_id TEXT NOT NULL UNIQUE,
-                    plan_hash TEXT NOT NULL,
-                    plan_json TEXT NOT NULL,
-                    workspace_id TEXT NOT NULL,
-                    input_snapshot_id TEXT NOT NULL,
-                    base_commit TEXT NOT NULL,
-                    integration_head TEXT NOT NULL,
-                    integration_version INTEGER NOT NULL
-                        CHECK (integration_version >= 0),
-                    capacity INTEGER NOT NULL
-                        CHECK (typeof(capacity) = 'integer')
-                        CHECK (capacity BETWEEN 1 AND 9),
-                    schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
-                    created_at TEXT NOT NULL
-                );
-                INSERT INTO relay_v3_runs_v8
-                SELECT * FROM relay_v3_runs;
-                DROP TABLE relay_v3_runs;
-                ALTER TABLE relay_v3_runs_v8 RENAME TO relay_v3_runs;
-                """
+                UPDATE relay_v3_schema_metadata SET value = '8'
+                WHERE key = ? AND value = ?
+                """,
+                ("schema_version", legacy_version),
             )
+            if result.rowcount != 1:
+                raise RelaySchemaIncompatible()
+            connection.commit()
+            self._legacy_schema_version = None
+        except RelaySchemaIncompatible:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise RelaySchemaIncompatible() from error
         finally:
             connection.execute("PRAGMA foreign_keys = ON")
-        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise RelaySchemaIncompatible()
 
     def _assert_schema_shape(self) -> None:
         connection = self._require_connection()
@@ -3868,6 +3908,16 @@ class RelayStore:
                 }
                 if not columns <= actual:
                     raise RelaySchemaIncompatible()
+            runs_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("relay_v3_runs",),
+            ).fetchone()
+            if (
+                runs_sql is None
+                or "capacity BETWEEN 1 AND 9" not in str(runs_sql["sql"])
+                or connection.execute("PRAGMA foreign_key_check").fetchone() is not None
+            ):
+                raise RelaySchemaIncompatible()
         except RelaySchemaIncompatible:
             raise
         except sqlite3.Error as error:
