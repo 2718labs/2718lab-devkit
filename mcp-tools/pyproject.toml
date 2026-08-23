@@ -21,6 +21,22 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = false
 
+[tool.hatch.build.targets.wheel]
+packages = [
+    "bugkiller",
+    "devkit_atlas",
+    "devkit_continuity",
+    "devkit_fastlane",
+    "devkit_relay",
+    "devkit_runtime",
+    "orchestrator",
+    "project_index",
+]
+exclude = ["*/tests/**"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"server.py" = "server.py"
+
 [tool.ruff]
 line-length = 88
 target-version = "py311"
