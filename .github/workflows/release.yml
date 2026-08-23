@@ -143,6 +143,7 @@ jobs:
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
+          if (-not $env:RUNNER_TEMP) { throw 'RUNNER_TEMP is required for hosted task-local storage' }
           $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-release\mcp-runtime'
           New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'uv-cache') | Out-Null
           @(
@@ -229,6 +230,7 @@ jobs:
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
+          if (-not $env:RUNNER_TEMP) { throw 'RUNNER_TEMP is required for hosted task-local storage' }
           $root = Join-Path $env:RUNNER_TEMP '2718lab-devkit-release\fast-lane'
           New-Item -ItemType Directory -Force -Path (Join-Path $root 'tmp'), (Join-Path $root 'pycache'), (Join-Path $root 'pip-cache') | Out-Null
           @(

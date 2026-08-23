@@ -197,7 +197,8 @@ Fast Lane 不包含额度协调器，也不读取、缓存、推断或以额度�
 归档不是 adapter 操作：只能在协调器 lane 已完成 acceptance、最终证据已绑定之后由 host 执行。
 X 轮回滚均未恢复时，系统仅产生候选清理资格；默认不自动删除任何 worktree、证据、缓存或用户数据。
 Fast Lane 的宿主任务根由 `CODEX_FASTLANE_TASK_ROOT` 配置；本机默认
-`G:\2718lab\_codex\.codex-task-temp`，显式根也必须位于 G:。
+`G:\2718lab\_codex\.codex-task-temp`，显式根也必须位于 G:。默认 `G:\2718lab\_codex\.codex-task-temp`
+是本机唯一允许的临时根基线。
 配置值必须是现存的、本地绝对、非 C 盘、不得为卷根且不含 reparse-point
 的目录，编译器只在其下派生受限 `project` 的任务根，并在规范化前按词法路径拒绝 project
 子路径中的 reparse-point。bootstrap 和 read-context 的 worktree、scratch、普通 cache 与测试
@@ -209,8 +210,8 @@ fail-closed；Windows apply 在目录创建和 Git 调用期间持有只共享 r
 叶目录已存在就停止。默认 bootstrap 保持 v1；非默认根使用只携带规范根 hash 的
 bootstrap-v2，在 apply 前重算该 hash。该变量是宿主配置，不是 request 或 bootstrap
 plan 可自报的根字段。
-禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C: 或 G: 以外的本机盘符。这仍是当前
-bootstrap/read-context 边界。空项目只能生成 bootstrap-only index：不得据此创建可执行
+禁止把 `TEMP`、`TMP`、`TMPDIR` 或临时根指向 C: 或 G: 以外的本机盘符。C-drive temporary roots are forbidden。
+这仍是当前 bootstrap/read-context 边界。空项目只能生成 bootstrap-only index：不得据此创建可执行
 assignment，直到可信宿主提供有界项目索引上下文。旧 schema 输入返回
 `FASTLANE_SCHEMA_UPGRADE_REQUIRED`，不得降级猜测或启动工作。
 

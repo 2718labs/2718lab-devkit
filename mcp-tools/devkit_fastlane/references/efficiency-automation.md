@@ -22,7 +22,8 @@ does not weaken host capability, lease, worktree, or safety gates.
 `bootstrap` requires a task id, full base commit, safe branch, bounded relative
 write scope, existing repository, project identifier, worktree target, and temp
 target. Its host-configured base root is `CODEX_FASTLANE_TASK_ROOT`, or the
-local default `G:\2718lab\_codex\.codex-task-temp` when unset. A configured root
+local default `G:\2718lab\_codex\.codex-task-temp` when unset. 默认 `G:\2718lab\_codex\.codex-task-temp`
+is the local temporary-root baseline. A configured root
 must be an existing local absolute G: non-volume-root directory without reparse points;
 project components and root-bound target components cannot be reparse points;
 the lexical path is checked before canonicalization. Both bootstrap targets and every
@@ -487,9 +488,9 @@ external receipt bodies.
 The adapter never archives work. The host may archive only after coordinator-lane acceptance and final evidence binding have completed. Fast Lane scratch files,
 worktrees, ordinary caches, test evidence, and read worktrees must remain below
 the declared project root derived from trusted `CODEX_FASTLANE_TASK_ROOT` (or
-the local `G:\2718lab\_codex\.codex-task-temp` default). This remains the
-bootstrap/read-context boundary. C-drive and non-G-drive local temporary roots
-are forbidden. After X unsuccessful rollback rounds, the host may record only
+the local `G:\2718lab\_codex\.codex-task-temp` default). This remains the 当前 bootstrap/read-context
+boundary. C-drive temporary roots are forbidden; non-G-drive local temporary roots are
+forbidden. After X unsuccessful rollback rounds, the host may record only
 candidate cleanup eligibility; it does not delete any path automatically.
 
 ## CLI
