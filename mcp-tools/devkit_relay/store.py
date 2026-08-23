@@ -81,6 +81,10 @@ class RelaySchemaIncompatible(RelayStoreError):
     code = "RELAY_SCHEMA_INCOMPATIBLE"
 
 
+class RelayTopologyInvalid(RelayStoreError):
+    code = "RELAY_TOPOLOGY_INVALID"
+
+
 class RelayIntegrationProofCorrupt(RelayStoreError):
     code = "RELAY_INTEGRATION_PROOF_CORRUPT"
 
@@ -104,7 +108,7 @@ class RelayFinalizationConflict(RelayStoreError):
 class RelayStore:
     """Own the atomic durable state behind Relay's five public tools."""
 
-    _SCHEMA_VERSION = 6
+    _SCHEMA_VERSION = 7
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
     def __init__(self, database: str | Path) -> None:
@@ -149,6 +153,8 @@ class RelayStore:
             "relay_v3_finalization_journal",
             "relay_v3_finalization_outcomes",
             "relay_v3_cleanup_ledger",
+            "relay_v3_scheduler_groups",
+            "relay_v3_scheduler_writer_slots",
         )
         return canonical_hash(
             {
@@ -169,6 +175,7 @@ class RelayStore:
 
         self._validate_idempotency_key(idempotency_key)
         plan_data = _clone_json(plan)
+        topology = self._validate_scheduler_topology(plan_data)
         payload_hash = canonical_hash({"mode": "create", "plan": plan_data})
         workflow_id = str(plan_data["workflow_id"])
         now = _utc_now()
@@ -238,6 +245,9 @@ class RelayStore:
                             ),
                         ),
                     )
+
+                if topology is not None:
+                    self._record_scheduler_topology(cursor, run_id, topology)
 
                 run = self._run_from_row(self._run_row(cursor, run_id))
                 actions = [
@@ -3088,6 +3098,194 @@ class RelayStore:
         ):
             raise RelayIdempotencyConflict()
 
+    @staticmethod
+    def _validate_scheduler_topology(
+        plan: Mapping[str, Any],
+    ) -> tuple[dict[str, object], ...] | None:
+        """Fail closed for supplied Scheduler Topology V1 authority."""
+
+        value = plan.get("scheduler_topology")
+        if value is None:
+            return None
+        if plan.get("plan_hash") != canonical_hash(
+            {key: item for key, item in plan.items() if key != "plan_hash"}
+        ):
+            raise RelayTopologyInvalid()
+        expected = {
+            "schema",
+            "max_writers_per_scheduler",
+            "max_parallel_writers",
+            "groups",
+        }
+        if (
+            type(value) is not dict
+            or set(value) != expected
+            or value["schema"] != "2718lab-devkit/scheduler-topology-v1"
+            or type(value["max_writers_per_scheduler"]) is not int
+            or value["max_writers_per_scheduler"] != 3
+            or type(value["max_parallel_writers"]) is not int
+            or value["max_parallel_writers"] != 9
+            or type(value["groups"]) is not list
+            or not value["groups"]
+        ):
+            raise RelayTopologyInvalid()
+        tasks = plan.get("tasks")
+        if type(tasks) is not list or any(type(task) is not dict for task in tasks):
+            raise RelayTopologyInvalid()
+        task_index = {str(task.get("task_id")): task for task in tasks}
+        if len(task_index) != len(tasks) or any(
+            not _opaque_topology_value(task.get("task_id")) for task in tasks
+        ):
+            raise RelayTopologyInvalid()
+
+        groups: list[dict[str, object]] = []
+        scheduler_ids: set[str] = set()
+        coordinator_leases: set[str] = set()
+        worktrees: set[str] = set()
+        writer_owner: dict[str, str] = {}
+        prewarm_owner: dict[str, str] = {}
+        for group in value["groups"]:
+            expected_group = {
+                "scheduler_id",
+                "coordinator_lease_id",
+                "worktree_identity",
+                "writer_task_ids",
+                "prewarm_task_ids",
+            }
+            if type(group) is not dict or set(group) != expected_group:
+                raise RelayTopologyInvalid()
+            scheduler_id = group["scheduler_id"]
+            coordinator_lease_id = group["coordinator_lease_id"]
+            worktree_identity = group["worktree_identity"]
+            writer_task_ids = group["writer_task_ids"]
+            prewarm_task_ids = group["prewarm_task_ids"]
+            if (
+                not _opaque_topology_value(scheduler_id)
+                or not _opaque_topology_value(coordinator_lease_id)
+                or not _opaque_topology_value(worktree_identity)
+                or type(writer_task_ids) is not list
+                or type(prewarm_task_ids) is not list
+                or len(writer_task_ids) > 3
+                or any(
+                    not _opaque_topology_value(task_id) for task_id in writer_task_ids
+                )
+                or any(
+                    not _opaque_topology_value(task_id) for task_id in prewarm_task_ids
+                )
+            ):
+                raise RelayTopologyInvalid()
+            scheduler = str(scheduler_id)
+            coordinator = str(coordinator_lease_id)
+            worktree = str(worktree_identity)
+            writers = [str(task_id) for task_id in writer_task_ids]
+            prewarms = [str(task_id) for task_id in prewarm_task_ids]
+            if (
+                scheduler in scheduler_ids
+                or coordinator in coordinator_leases
+                or worktree in worktrees
+                or len(set(writers)) != len(writers)
+                or len(set(prewarms)) != len(prewarms)
+            ):
+                raise RelayTopologyInvalid()
+            scheduler_ids.add(scheduler)
+            coordinator_leases.add(coordinator)
+            worktrees.add(worktree)
+            for task_id in writers:
+                if (
+                    task_id not in task_index
+                    or task_index[task_id].get("kind") != "implementation"
+                ):
+                    raise RelayTopologyInvalid()
+                if task_id in writer_owner:
+                    raise RelayTopologyInvalid()
+                writer_owner[task_id] = scheduler
+            for task_id in prewarms:
+                if (
+                    task_id not in task_index
+                    or task_index[task_id].get("kind") != "prewarm"
+                ):
+                    raise RelayTopologyInvalid()
+                if task_id in prewarm_owner:
+                    raise RelayTopologyInvalid()
+                prewarm_owner[task_id] = scheduler
+            groups.append(
+                {
+                    "scheduler_id": scheduler,
+                    "coordinator_lease_id": coordinator,
+                    "worktree_identity": worktree,
+                    "writer_task_ids": writers,
+                    "prewarm_task_ids": prewarms,
+                }
+            )
+
+        implementation_ids = {
+            str(task["task_id"])
+            for task in tasks
+            if task.get("kind") == "implementation"
+        }
+        prewarm_ids = {
+            str(task["task_id"]) for task in tasks if task.get("kind") == "prewarm"
+        }
+        if (
+            set(writer_owner) != implementation_ids
+            or set(prewarm_owner) != prewarm_ids
+            or len(writer_owner) > 9
+        ):
+            raise RelayTopologyInvalid()
+        for left_id, left_scheduler in writer_owner.items():
+            for right_id, right_scheduler in writer_owner.items():
+                if left_id >= right_id or left_scheduler == right_scheduler:
+                    continue
+                left = task_index[left_id]
+                right = task_index[right_id]
+                if not _scopes_conflict(
+                    _topology_task_scopes(left), _topology_task_scopes(right)
+                ) and not (
+                    _declared_child_split(left, right)
+                    or _declared_child_split(right, left)
+                ):
+                    continue
+                if not (
+                    _declared_child_split(left, right)
+                    or _declared_child_split(right, left)
+                ):
+                    raise RelayTopologyInvalid()
+        return tuple(groups)
+
+    @staticmethod
+    def _record_scheduler_topology(
+        cursor: sqlite3.Cursor,
+        run_id: str,
+        groups: Sequence[Mapping[str, object]],
+    ) -> None:
+        for group in groups:
+            scheduler_id = str(group["scheduler_id"])
+            cursor.execute(
+                """
+                INSERT INTO relay_v3_scheduler_groups
+                    (run_id, scheduler_id, coordinator_lease_id, worktree_identity,
+                     writer_task_ids_json, prewarm_task_ids_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    scheduler_id,
+                    str(group["coordinator_lease_id"]),
+                    str(group["worktree_identity"]),
+                    _encode_json(group["writer_task_ids"]),
+                    _encode_json(group["prewarm_task_ids"]),
+                ),
+            )
+            for slot, task_id in enumerate(group["writer_task_ids"], start=1):
+                cursor.execute(
+                    """
+                    INSERT INTO relay_v3_scheduler_writer_slots
+                        (run_id, scheduler_id, task_id, slot)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (run_id, scheduler_id, str(task_id), slot),
+                )
+
     def _assert_schema_compatible(self) -> None:
         """Inspect existing Relay metadata before any WAL or DDL mutation."""
 
@@ -3110,7 +3308,7 @@ class RelayStore:
                 ("schema_version",),
             ).fetchall()
             if len(rows) != 1 or str(rows[0]["value"]) not in {
-                "5",
+                "6",
                 str(self._SCHEMA_VERSION),
             }:
                 raise RelaySchemaIncompatible()
@@ -3340,6 +3538,32 @@ class RelayStore:
                     FOREIGN KEY (integration_proof_id)
                         REFERENCES relay_v3_integration_proofs(proof_id) ON DELETE RESTRICT
                 );
+                CREATE TABLE IF NOT EXISTS relay_v3_scheduler_groups (
+                    run_id TEXT NOT NULL,
+                    scheduler_id TEXT NOT NULL,
+                    coordinator_lease_id TEXT NOT NULL,
+                    worktree_identity TEXT NOT NULL,
+                    writer_task_ids_json TEXT NOT NULL,
+                    prewarm_task_ids_json TEXT NOT NULL,
+                    PRIMARY KEY (run_id, scheduler_id),
+                    UNIQUE (run_id, coordinator_lease_id),
+                    UNIQUE (run_id, worktree_identity),
+                    FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS relay_v3_scheduler_writer_slots (
+                    run_id TEXT NOT NULL,
+                    scheduler_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    slot INTEGER NOT NULL CHECK (slot BETWEEN 1 AND 3),
+                    PRIMARY KEY (run_id, task_id),
+                    UNIQUE (run_id, scheduler_id, slot),
+                    FOREIGN KEY (run_id, scheduler_id)
+                        REFERENCES relay_v3_scheduler_groups(run_id, scheduler_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (run_id, task_id)
+                        REFERENCES relay_v3_tasks(run_id, task_id) ON DELETE CASCADE
+                );
                 CREATE INDEX IF NOT EXISTS relay_v3_tasks_by_state
                     ON relay_v3_tasks(run_id, state, priority DESC, ordinal, task_id);
                 CREATE INDEX IF NOT EXISTS relay_v3_directives_by_state
@@ -3354,6 +3578,8 @@ class RelayStore:
                     ON relay_v3_cleanup_ledger(
                         run_id, state, eligible_after_integration_version
                     );
+                CREATE INDEX IF NOT EXISTS relay_v3_scheduler_slots_by_group
+                    ON relay_v3_scheduler_writer_slots(run_id, scheduler_id, slot);
                 """
             )
             connection.execute(
@@ -3366,7 +3592,7 @@ class RelayStore:
             connection.execute(
                 """
                 UPDATE relay_v3_schema_metadata SET value = ?
-                WHERE key = ? AND value = '5'
+                WHERE key = ? AND value = '6'
                 """,
                 (str(self._SCHEMA_VERSION), "schema_version"),
             )
@@ -3410,6 +3636,18 @@ class RelayStore:
                 "integration_proof_id",
                 "eligible_after_integration_version",
                 "state",
+            },
+            "relay_v3_scheduler_groups": {
+                "scheduler_id",
+                "coordinator_lease_id",
+                "worktree_identity",
+                "writer_task_ids_json",
+                "prewarm_task_ids_json",
+            },
+            "relay_v3_scheduler_writer_slots": {
+                "scheduler_id",
+                "task_id",
+                "slot",
             },
         }
         try:
@@ -3514,6 +3752,58 @@ def _decode_scope_list(value: str) -> list[dict[str, str]]:
     ):
         raise RelayStorageFailure()
     return [{"path": item["path"], "kind": item["kind"]} for item in decoded]
+
+
+def _opaque_topology_value(value: object) -> bool:
+    """Permit opaque IDs while rejecting raw path-shaped values."""
+
+    if type(value) is not str or not value.strip() or len(value) > 256:
+        return False
+    if "\x00" in value or "/" in value or "\\" in value:
+        return False
+    return value not in {".", ".."} and re.match(r"^[A-Za-z]:", value) is None
+
+
+def _topology_task_scopes(task: Mapping[str, object]) -> list[dict[str, str]]:
+    try:
+        return _decode_scope_list(_encode_json(task["write_scope"]))
+    except (KeyError, RelayStorageFailure, TypeError, ValueError):
+        raise RelayTopologyInvalid() from None
+
+
+def _scope_contains(parent: Mapping[str, str], child: Mapping[str, str]) -> bool:
+    if parent["path"] == child["path"]:
+        return True
+    return parent["kind"] == "tree" and child["path"].startswith(parent["path"] + "/")
+
+
+def _declared_child_split(
+    parent: Mapping[str, object], child: Mapping[str, object]
+) -> bool:
+    """Allow only a direct child whose scope is a strict subset of its parent."""
+
+    dependencies = child.get("dependencies")
+    if type(dependencies) is not list or parent.get("task_id") not in dependencies:
+        return False
+    parent_scopes = _topology_task_scopes(parent)
+    child_scopes = _topology_task_scopes(child)
+    return (
+        bool(child_scopes)
+        and all(
+            any(
+                _scope_contains(parent_scope, child_scope)
+                for parent_scope in parent_scopes
+            )
+            for child_scope in child_scopes
+        )
+        and not all(
+            any(
+                _scope_contains(child_scope, parent_scope)
+                for child_scope in child_scopes
+            )
+            for parent_scope in parent_scopes
+        )
+    )
 
 
 def _task_scopes(task: RelayTask) -> list[dict[str, str]]:
