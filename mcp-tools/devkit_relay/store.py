@@ -110,6 +110,393 @@ class RelayStore:
 
     _SCHEMA_VERSION = 8
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
+    _SCHEMA_TABLE_INFO = {
+        "relay_v3_actions": (
+            ("action_id", "TEXT", 0, 1),
+            ("run_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("lease_id", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("payload_json", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_candidates": (
+            ("candidate_id", "TEXT", 0, 1),
+            ("run_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("originating_epoch", "INTEGER", 1, 0),
+            ("branch", "TEXT", 1, 0),
+            ("base_commit", "TEXT", 1, 0),
+            ("head_commit", "TEXT", 1, 0),
+            ("diff_hash", "TEXT", 1, 0),
+            ("evidence_hashes_json", "TEXT", 1, 0),
+            ("pr_reference", "TEXT", 0, 0),
+            ("status", "TEXT", 1, 0),
+            ("review_digest", "TEXT", 0, 0),
+            ("integration_commit", "TEXT", 0, 0),
+            ("integration_tree", "TEXT", 0, 0),
+            ("integration_proof_id", "TEXT", 0, 0),
+            ("created_at", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_cleanup_ledger": (
+            ("candidate_id", "TEXT", 0, 1),
+            ("run_id", "TEXT", 1, 0),
+            ("retention_rounds", "INTEGER", 1, 0),
+            ("branch_identity", "TEXT", 1, 0),
+            ("worktree_identity", "TEXT", 1, 0),
+            ("delete_merged_branch", "INTEGER", 1, 0),
+            ("remove_disposable_worktree", "INTEGER", 1, 0),
+            ("integration_proof_id", "TEXT", 0, 0),
+            ("integration_commit", "TEXT", 0, 0),
+            ("merged_integration_version", "INTEGER", 0, 0),
+            ("eligible_after_integration_version", "INTEGER", 0, 0),
+            ("state", "TEXT", 1, 0),
+            ("rollback_receipt_hash", "TEXT", 0, 0),
+            ("cleanup_receipt_hash", "TEXT", 0, 0),
+            ("created_at", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_directives": (
+            ("directive_id", "TEXT", 0, 1),
+            ("run_id", "TEXT", 1, 0),
+            ("workflow_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("expected_schedule_version", "INTEGER", 1, 0),
+            ("route_json", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("consumed_idempotency_key", "TEXT", 0, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_evidence": (
+            ("evidence_id", "TEXT", 0, 1),
+            ("run_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("lease_id", "TEXT", 1, 0),
+            ("epoch", "INTEGER", 1, 0),
+            ("kind", "TEXT", 1, 0),
+            ("selector", "TEXT", 1, 0),
+            ("digest", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_finalization_journal": (
+            ("finalization_id", "TEXT", 0, 1),
+            ("reservation_epoch", "INTEGER", 1, 0),
+            ("integration_proof_id", "TEXT", 1, 0),
+            ("workspace_id", "TEXT", 1, 0),
+            ("expectation_key", "TEXT", 1, 0),
+            ("expectation_version", "INTEGER", 1, 0),
+            ("expectation_hash", "TEXT", 1, 0),
+            ("target_ref", "TEXT", 1, 0),
+            ("base_oid", "TEXT", 1, 0),
+            ("final_oid", "TEXT", 1, 0),
+            ("fence_hash", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("result_hash", "TEXT", 0, 0),
+            ("journal_version", "INTEGER", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_finalization_outcomes": (
+            ("finalization_id", "TEXT", 0, 1),
+            ("fence_hash", "TEXT", 1, 0),
+            ("integration_proof_id", "TEXT", 1, 0),
+            ("expectation_key", "TEXT", 1, 0),
+            ("expectation_version", "INTEGER", 1, 0),
+            ("expectation_hash", "TEXT", 1, 0),
+            ("result_hash", "TEXT", 1, 0),
+            ("result_json", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_idempotency": (
+            ("idempotency_key", "TEXT", 0, 1),
+            ("payload_hash", "TEXT", 1, 0),
+            ("result_json", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_integration_proofs": (
+            ("proof_id", "TEXT", 0, 1),
+            ("run_id", "TEXT", 1, 0),
+            ("workflow_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("candidate_id", "TEXT", 1, 0),
+            ("integration_version", "INTEGER", 1, 0),
+            ("expectation_hash", "TEXT", 1, 0),
+            ("expectation_json", "TEXT", 1, 0),
+            ("receipt_json", "TEXT", 1, 0),
+            ("repository_id", "TEXT", 1, 0),
+            ("integration_ref", "TEXT", 1, 0),
+            ("predecessor_commit", "TEXT", 1, 0),
+            ("final_commit", "TEXT", 1, 0),
+            ("final_tree", "TEXT", 1, 0),
+            ("attestor_id", "TEXT", 1, 0),
+            ("attestor_version", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_leases": (
+            ("lease_id", "TEXT", 0, 1),
+            ("run_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("action_id", "TEXT", 1, 0),
+            ("epoch", "INTEGER", 1, 0),
+            ("task_version", "INTEGER", 1, 0),
+            ("lease_kind", "TEXT", 1, 0),
+            ("endpoint", "TEXT", 0, 0),
+            ("state", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+            ("released_at", "TEXT", 0, 0),
+            ("last_heartbeat_at", "TEXT", 0, 0),
+        ),
+        "relay_v3_runs": (
+            ("run_id", "TEXT", 0, 1),
+            ("workflow_id", "TEXT", 1, 0),
+            ("plan_hash", "TEXT", 1, 0),
+            ("plan_json", "TEXT", 1, 0),
+            ("workspace_id", "TEXT", 1, 0),
+            ("input_snapshot_id", "TEXT", 1, 0),
+            ("base_commit", "TEXT", 1, 0),
+            ("integration_head", "TEXT", 1, 0),
+            ("integration_version", "INTEGER", 1, 0),
+            ("capacity", "INTEGER", 1, 0),
+            ("schedule_version", "INTEGER", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "relay_v3_scheduler_groups": (
+            ("run_id", "TEXT", 1, 1),
+            ("scheduler_id", "TEXT", 1, 2),
+            ("coordinator_lease_id", "TEXT", 1, 0),
+            ("worktree_identity", "TEXT", 1, 0),
+            ("writer_task_ids_json", "TEXT", 1, 0),
+            ("prewarm_task_ids_json", "TEXT", 1, 0),
+        ),
+        "relay_v3_scheduler_writer_slots": (
+            ("run_id", "TEXT", 1, 1),
+            ("scheduler_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 2),
+            ("slot", "INTEGER", 1, 0),
+        ),
+        "relay_v3_schema_metadata": (
+            ("key", "TEXT", 0, 1),
+            ("value", "TEXT", 1, 0),
+        ),
+        "relay_v3_tasks": (
+            ("run_id", "TEXT", 1, 1),
+            ("task_id", "TEXT", 1, 2),
+            ("ordinal", "INTEGER", 1, 0),
+            ("kind", "TEXT", 1, 0),
+            ("priority", "INTEGER", 1, 0),
+            ("task_json", "TEXT", 1, 0),
+            ("dependencies_json", "TEXT", 1, 0),
+            ("write_scope_json", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("task_version", "INTEGER", 1, 0),
+            ("scope_owner", "TEXT", 0, 0),
+            ("candidate_id", "TEXT", 0, 0),
+            ("last_lease_epoch", "INTEGER", 1, 0),
+        ),
+    }
+    _SCHEMA_FOREIGN_KEYS = {
+        "relay_v3_actions": frozenset(
+            {
+                (
+                    ("lease_id",),
+                    "relay_v3_leases",
+                    ("lease_id",),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+                (
+                    ("run_id", "task_id"),
+                    "relay_v3_tasks",
+                    ("run_id", "task_id"),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_candidates": frozenset(
+            {
+                (
+                    ("run_id", "task_id"),
+                    "relay_v3_tasks",
+                    ("run_id", "task_id"),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_cleanup_ledger": frozenset(
+            {
+                (
+                    ("candidate_id",),
+                    "relay_v3_candidates",
+                    ("candidate_id",),
+                    "NO ACTION",
+                    "RESTRICT",
+                    "NONE",
+                ),
+                (
+                    ("run_id",),
+                    "relay_v3_runs",
+                    ("run_id",),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+                (
+                    ("integration_proof_id",),
+                    "relay_v3_integration_proofs",
+                    ("proof_id",),
+                    "NO ACTION",
+                    "RESTRICT",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_directives": frozenset(
+            {
+                (
+                    ("run_id", "task_id"),
+                    "relay_v3_tasks",
+                    ("run_id", "task_id"),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_evidence": frozenset(
+            {
+                (
+                    ("lease_id",),
+                    "relay_v3_leases",
+                    ("lease_id",),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+                (
+                    ("run_id", "task_id"),
+                    "relay_v3_tasks",
+                    ("run_id", "task_id"),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_finalization_journal": frozenset(
+            {
+                (
+                    ("integration_proof_id",),
+                    "relay_v3_integration_proofs",
+                    ("proof_id",),
+                    "NO ACTION",
+                    "RESTRICT",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_finalization_outcomes": frozenset(
+            {
+                (
+                    ("finalization_id",),
+                    "relay_v3_finalization_journal",
+                    ("finalization_id",),
+                    "NO ACTION",
+                    "RESTRICT",
+                    "NONE",
+                ),
+                (
+                    ("integration_proof_id",),
+                    "relay_v3_integration_proofs",
+                    ("proof_id",),
+                    "NO ACTION",
+                    "RESTRICT",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_integration_proofs": frozenset(
+            {
+                (
+                    ("candidate_id",),
+                    "relay_v3_candidates",
+                    ("candidate_id",),
+                    "NO ACTION",
+                    "RESTRICT",
+                    "NONE",
+                ),
+                (
+                    ("run_id", "task_id"),
+                    "relay_v3_tasks",
+                    ("run_id", "task_id"),
+                    "NO ACTION",
+                    "RESTRICT",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_leases": frozenset(
+            {
+                (
+                    ("run_id", "task_id"),
+                    "relay_v3_tasks",
+                    ("run_id", "task_id"),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_scheduler_groups": frozenset(
+            {
+                (
+                    ("run_id",),
+                    "relay_v3_runs",
+                    ("run_id",),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_scheduler_writer_slots": frozenset(
+            {
+                (
+                    ("run_id", "scheduler_id"),
+                    "relay_v3_scheduler_groups",
+                    ("run_id", "scheduler_id"),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+                (
+                    ("run_id", "task_id"),
+                    "relay_v3_tasks",
+                    ("run_id", "task_id"),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+        "relay_v3_tasks": frozenset(
+            {
+                (
+                    ("run_id",),
+                    "relay_v3_runs",
+                    ("run_id",),
+                    "NO ACTION",
+                    "CASCADE",
+                    "NONE",
+                ),
+            }
+        ),
+    }
 
     def __init__(
         self,
@@ -3683,7 +4070,10 @@ class RelayStore:
                         (state = 'committed' AND result_hash IS NOT NULL)
                         OR (state IN ('prepared', 'aborted') AND result_hash IS NULL)
                     ),
-                    UNIQUE (integration_proof_id, reservation_epoch)
+                    UNIQUE (integration_proof_id, reservation_epoch),
+                    FOREIGN KEY (integration_proof_id)
+                        REFERENCES relay_v3_integration_proofs(proof_id)
+                        ON DELETE RESTRICT
                 );
                 CREATE TABLE IF NOT EXISTS relay_v3_finalization_outcomes (
                     finalization_id TEXT PRIMARY KEY,
@@ -3695,7 +4085,13 @@ class RelayStore:
                     expectation_hash TEXT NOT NULL,
                     result_hash TEXT NOT NULL,
                     result_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (finalization_id)
+                        REFERENCES relay_v3_finalization_journal(finalization_id)
+                        ON DELETE RESTRICT,
+                    FOREIGN KEY (integration_proof_id)
+                        REFERENCES relay_v3_integration_proofs(proof_id)
+                        ON DELETE RESTRICT
                 );
                 CREATE TABLE IF NOT EXISTS relay_v3_cleanup_ledger (
                     candidate_id TEXT PRIMARY KEY,
@@ -3794,13 +4190,7 @@ class RelayStore:
         connection.execute("PRAGMA foreign_keys = OFF")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                ("relay_v3_runs",),
-            ).fetchone()
-            if row is None:
-                raise RelaySchemaIncompatible()
-            if "capacity BETWEEN 1 AND 9" not in str(row["sql"]):
+            if not self._runs_capacity_is_v8(connection):
                 connection.execute(
                     """
                     CREATE TABLE relay_v3_runs_v8 (
@@ -3851,70 +4241,29 @@ class RelayStore:
 
     def _assert_schema_shape(self) -> None:
         connection = self._require_connection()
-        required = {
-            "relay_v3_runs": {
-                "integration_head",
-                "integration_version",
-                "schedule_version",
-            },
-            "relay_v3_candidates": {
-                "integration_commit",
-                "integration_tree",
-                "integration_proof_id",
-            },
-            "relay_v3_integration_proofs": {
-                "proof_id",
-                "integration_version",
-                "expectation_json",
-                "receipt_json",
-            },
-            "relay_v3_finalization_journal": {
-                "finalization_id",
-                "fence_hash",
-                "state",
-                "result_hash",
-                "journal_version",
-            },
-            "relay_v3_finalization_outcomes": {
-                "finalization_id",
-                "fence_hash",
-                "result_hash",
-                "result_json",
-            },
-            "relay_v3_cleanup_ledger": {
-                "candidate_id",
-                "integration_proof_id",
-                "eligible_after_integration_version",
-                "state",
-            },
-            "relay_v3_scheduler_groups": {
-                "scheduler_id",
-                "coordinator_lease_id",
-                "worktree_identity",
-                "writer_task_ids_json",
-                "prewarm_task_ids_json",
-            },
-            "relay_v3_scheduler_writer_slots": {
-                "scheduler_id",
-                "task_id",
-                "slot",
-            },
-        }
         try:
-            for table, columns in required.items():
-                actual = {
-                    str(row["name"])
+            for table, expected_columns in self._SCHEMA_TABLE_INFO.items():
+                table_info = tuple(
+                    (
+                        str(row["name"]),
+                        str(row["type"]),
+                        int(row["notnull"]),
+                        int(row["pk"]),
+                    )
                     for row in connection.execute(f"PRAGMA table_info({table})")
-                }
-                if not columns <= actual:
+                )
+                if (
+                    table_info != expected_columns
+                    or any(
+                        row["dflt_value"] is not None
+                        for row in connection.execute(f"PRAGMA table_info({table})")
+                    )
+                    or self._foreign_key_constraints(connection, table)
+                    != self._SCHEMA_FOREIGN_KEYS.get(table, frozenset())
+                ):
                     raise RelaySchemaIncompatible()
-            runs_sql = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                ("relay_v3_runs",),
-            ).fetchone()
             if (
-                runs_sql is None
-                or "capacity BETWEEN 1 AND 9" not in str(runs_sql["sql"])
+                not self._runs_capacity_is_v8(connection)
                 or connection.execute("PRAGMA foreign_key_check").fetchone() is not None
             ):
                 raise RelaySchemaIncompatible()
@@ -3922,6 +4271,63 @@ class RelayStore:
             raise
         except sqlite3.Error as error:
             raise RelaySchemaIncompatible() from error
+
+    @staticmethod
+    def _foreign_key_constraints(
+        connection: sqlite3.Connection, table: str
+    ) -> frozenset[tuple[tuple[str, ...], str, tuple[str, ...], str, str, str]]:
+        constraints: dict[int, list[sqlite3.Row]] = {}
+        for row in connection.execute(f"PRAGMA foreign_key_list({table})"):
+            constraints.setdefault(int(row["id"]), []).append(row)
+        return frozenset(
+            (
+                tuple(str(row["from"]) for row in rows),
+                str(rows[0]["table"]),
+                tuple(str(row["to"]) for row in rows),
+                str(rows[0]["on_update"]),
+                str(rows[0]["on_delete"]),
+                str(rows[0]["match"]),
+            )
+            for rows in (
+                sorted(group, key=lambda row: int(row["seq"]))
+                for group in constraints.values()
+            )
+        )
+
+    @staticmethod
+    def _runs_capacity_is_v8(connection: sqlite3.Connection) -> bool:
+        connection.execute("SAVEPOINT relay_v3_schema_capacity_probe")
+        try:
+            for index, (capacity, accepted) in enumerate(
+                ((0, False), (10, False), (0.5, False), (1, True), (9, True))
+            ):
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO relay_v3_runs
+                            (run_id, workflow_id, plan_hash, plan_json, workspace_id,
+                             input_snapshot_id, base_commit, integration_head,
+                             integration_version, capacity, schedule_version, created_at)
+                        VALUES (?, ?, 'schema-probe', '{}', 'schema-probe',
+                                'schema-probe', 'schema-probe', 'schema-probe',
+                                0, ?, 0, 'schema-probe')
+                        """,
+                        (
+                            f"relay-v3-schema-capacity-run-{index}",
+                            f"relay-v3-schema-capacity-workflow-{index}",
+                            capacity,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    if accepted:
+                        return False
+                else:
+                    if not accepted:
+                        return False
+            return True
+        finally:
+            connection.execute("ROLLBACK TO relay_v3_schema_capacity_probe")
+            connection.execute("RELEASE relay_v3_schema_capacity_probe")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:

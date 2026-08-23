@@ -282,6 +282,114 @@ def test_pretend_v8_with_legacy_capacity_check_fails_closed(tmp_path: Path) -> N
     assert raised.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
 
 
+def test_v8_capacity_check_comment_cannot_forge_schema_compatibility(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "comment-forged-capacity.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        """
+        CREATE TABLE relay_v3_runs_forged (
+            run_id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL UNIQUE,
+            plan_hash TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            input_snapshot_id TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            integration_head TEXT NOT NULL,
+            integration_version INTEGER NOT NULL CHECK (integration_version >= 0),
+            capacity INTEGER NOT NULL CHECK (typeof(capacity) = 'integer')
+                /* CHECK (capacity BETWEEN 1 AND 9) */,
+            schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute("INSERT INTO relay_v3_runs_forged SELECT * FROM relay_v3_runs")
+    connection.execute("DROP TABLE relay_v3_runs")
+    connection.execute("ALTER TABLE relay_v3_runs_forged RENAME TO relay_v3_runs")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RelayStoreError) as raised:
+        RelayStore(database)
+
+    assert raised.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
+
+
+@pytest.mark.parametrize(
+    ("table", "schema"),
+    [
+        pytest.param(
+            "relay_v3_finalization_journal",
+            """
+            finalization_id TEXT PRIMARY KEY,
+            reservation_epoch INTEGER NOT NULL CHECK (reservation_epoch >= 1),
+            integration_proof_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            expectation_key TEXT NOT NULL,
+            expectation_version INTEGER NOT NULL CHECK (expectation_version >= 1),
+            expectation_hash TEXT NOT NULL,
+            target_ref TEXT NOT NULL,
+            base_oid TEXT NOT NULL,
+            final_oid TEXT NOT NULL,
+            fence_hash TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL CHECK (state IN ('prepared', 'committed', 'aborted')),
+            result_hash TEXT,
+            journal_version INTEGER NOT NULL CHECK (journal_version >= 1),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (state = 'committed' AND result_hash IS NOT NULL)
+                OR (state IN ('prepared', 'aborted') AND result_hash IS NULL)
+            ),
+            UNIQUE (integration_proof_id, reservation_epoch)
+            """,
+            id="journal",
+        ),
+        pytest.param(
+            "relay_v3_finalization_outcomes",
+            """
+            finalization_id TEXT PRIMARY KEY,
+            fence_hash TEXT NOT NULL UNIQUE,
+            integration_proof_id TEXT NOT NULL,
+            expectation_key TEXT NOT NULL,
+            expectation_version INTEGER NOT NULL CHECK (expectation_version >= 1),
+            expectation_hash TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+            """,
+            id="outcomes",
+        ),
+    ],
+)
+def test_v8_missing_finalization_foreign_key_fails_closed(
+    tmp_path: Path, table: str, schema: str
+) -> None:
+    database = tmp_path / f"missing-foreign-key-{table}.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    forged_table = f"{table}_forged"
+    connection.execute(f"CREATE TABLE {forged_table} ({schema})")
+    connection.execute(f"INSERT INTO {forged_table} SELECT * FROM {table}")
+    connection.execute(f"DROP TABLE {table}")
+    connection.execute(f"ALTER TABLE {forged_table} RENAME TO {table}")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RelayStoreError) as raised:
+        RelayStore(database)
+
+    assert raised.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
+
+
 def test_v8_foreign_key_violation_fails_closed_during_constructor(tmp_path: Path) -> None:
     database = tmp_path / "foreign-key-v8.sqlite3"
     store = RelayStore(database)
@@ -351,15 +459,6 @@ def test_schema_seven_migrates_capacity_check_before_real_service_store_create(
     relay.start_create(plan, idempotency_key="migrated-capacity-four")
 
     assert store.status("topology-store-v1-capacity-four")["run"]["capacity"] == 4
-    assert "capacity BETWEEN 1 AND 9" in str(
-        store._require_connection()
-        .execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_v3_runs'"
-        )
-        .fetchone()[0]
-    )
-
-
 def test_real_service_to_store_never_dispatches_a_prewarm_for_unsplittable_writer(
     tmp_path: Path,
 ) -> None:
