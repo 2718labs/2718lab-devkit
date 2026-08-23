@@ -56,7 +56,8 @@ def _plan() -> dict[str, object]:
             "atlas_packet_ids": [],
         },
         "project_binding": {
-            "schema": "2718lab-devkit/project-binding-v1", "mode": "indexed"
+            "schema": "2718lab-devkit/project-binding-v1",
+            "mode": "indexed",
         },
         "base_commit": "d" * 40,
         "capacity": 3,
@@ -97,6 +98,119 @@ def _plan() -> dict[str, object]:
     }
     plan["plan_hash"] = canonical_hash(plan)
     return plan
+
+
+def _downgrade_to_legacy(database: Path, version: str) -> None:
+    if version not in {"5", "6", "7", "8"}:
+        raise AssertionError("unsupported legacy fixture")
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("DROP TABLE relay_v3_start_attempts")
+    if version != "8":
+        connection.execute(
+            "CREATE TEMP TABLE relay_v3_runs_migration AS SELECT * FROM relay_v3_runs"
+        )
+        connection.execute("DROP TABLE relay_v3_runs")
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_runs (
+                run_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL UNIQUE,
+                plan_hash TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                input_snapshot_id TEXT NOT NULL,
+                base_commit TEXT NOT NULL,
+                integration_head TEXT NOT NULL,
+                integration_version INTEGER NOT NULL CHECK (integration_version >= 0),
+                capacity INTEGER NOT NULL CHECK (typeof(capacity) = 'integer')
+                    CHECK (capacity BETWEEN 1 AND 3),
+                schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO relay_v3_runs SELECT * FROM relay_v3_runs_migration"
+        )
+        connection.execute("DROP TABLE relay_v3_runs_migration")
+        connection.execute("DROP TABLE relay_v3_finalization_outcomes")
+        connection.execute("DROP TABLE relay_v3_finalization_journal")
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_finalization_journal (
+                finalization_id TEXT PRIMARY KEY,
+                reservation_epoch INTEGER NOT NULL CHECK (reservation_epoch >= 1),
+                integration_proof_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                base_oid TEXT NOT NULL,
+                final_oid TEXT NOT NULL,
+                fence_hash TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN ('prepared', 'committed', 'aborted')),
+                result_hash TEXT,
+                journal_version INTEGER NOT NULL CHECK (journal_version >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (state = 'committed' AND result_hash IS NOT NULL)
+                    OR (state IN ('prepared', 'aborted') AND result_hash IS NULL)
+                ),
+                UNIQUE (integration_proof_id, reservation_epoch)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_finalization_outcomes (
+                finalization_id TEXT PRIMARY KEY,
+                fence_hash TEXT NOT NULL UNIQUE,
+                integration_proof_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                result_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX relay_v3_finalizations_by_proof
+            ON relay_v3_finalization_journal(
+                integration_proof_id, expectation_hash, state
+            )
+            """
+        )
+    if version in {"5", "6"}:
+        connection.execute("DROP INDEX relay_v3_scheduler_slots_by_group")
+        connection.execute("DROP TABLE relay_v3_scheduler_writer_slots")
+        connection.execute("DROP TABLE relay_v3_scheduler_groups")
+    if version == "5":
+        connection.execute("DROP INDEX relay_v3_cleanup_by_run_state")
+        connection.execute("DROP TABLE relay_v3_cleanup_ledger")
+    connection.execute(
+        "UPDATE relay_v3_schema_metadata SET value = ? WHERE key = 'schema_version'",
+        (version,),
+    )
+    connection.commit()
+    connection.close()
+
+
+def _schema_rows(database: Path) -> list[tuple[object, ...]]:
+    connection = sqlite3.connect(database)
+    try:
+        return list(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+        )
+    finally:
+        connection.close()
 
 
 def _plan_with_prepared_prewarm() -> dict[str, object]:
@@ -145,9 +259,12 @@ def test_start_attempt_abort_is_idempotent_and_restores_writer_prewarm_semantics
         "schedule_version",
         "host_actions",
     }
-    assert store.start_create(
-        _plan_with_prepared_prewarm(), idempotency_key="abort-prepared-start"
-    ) == created
+    assert (
+        store.start_create(
+            _plan_with_prepared_prewarm(), idempotency_key="abort-prepared-start"
+        )
+        == created
+    )
     attempt = store.start_attempt("abort-prepared-start")
     assert attempt["state"] == "prepared"
 
@@ -175,7 +292,9 @@ def test_start_attempt_abort_is_idempotent_and_restores_writer_prewarm_semantics
         store.mark_start_admitted(str(attempt["attempt_id"]))
 
 
-def test_admitted_and_delivered_start_attempts_cannot_be_aborted(tmp_path: Path) -> None:
+def test_admitted_and_delivered_start_attempts_cannot_be_aborted(
+    tmp_path: Path,
+) -> None:
     store = RelayStore(tmp_path / "relay.sqlite3")
     store.start_create(_plan(), idempotency_key="admitted-start")
     attempt = store.start_attempt("admitted-start")
@@ -195,7 +314,9 @@ def test_admitted_and_delivered_start_attempts_cannot_be_aborted(tmp_path: Path)
         )
 
 
-def test_schema_eight_migrates_start_attempt_journal_in_one_open(tmp_path: Path) -> None:
+def test_schema_eight_migrates_start_attempt_journal_in_one_open(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "relay.sqlite3"
     seeded = RelayStore(database)
     seeded.start_create(_plan(), idempotency_key="v8-journal-seed")
@@ -211,12 +332,20 @@ def test_schema_eight_migrates_start_attempt_journal_in_one_open(tmp_path: Path)
     migrated = RelayStore(database)
 
     assert migrated.status("topology-store-v1")["workflow_id"] == "topology-store-v1"
-    assert migrated._require_connection().execute(
-        "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
-    ).fetchone()[0] == "9"
-    assert migrated._require_connection().execute(
-        "SELECT COUNT(*) FROM relay_v3_start_attempts"
-    ).fetchone()[0] == 0
+    assert (
+        migrated._require_connection()
+        .execute(
+            "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
+        )
+        .fetchone()[0]
+        == "9"
+    )
+    assert (
+        migrated._require_connection()
+        .execute("SELECT COUNT(*) FROM relay_v3_start_attempts")
+        .fetchone()[0]
+        == 0
+    )
 
 
 def test_v8_shape_drift_fails_before_start_attempt_migration_mutates_database(
@@ -238,13 +367,19 @@ def test_v8_shape_drift_fails_before_start_attempt_migration_mutates_database(
         RelayStore(database)
 
     unchanged = sqlite3.connect(database)
-    assert unchanged.execute(
-        "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
-    ).fetchone()[0] == "8"
-    assert unchanged.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'relay_v3_start_attempts'"
-    ).fetchone()[0] == 0
+    assert (
+        unchanged.execute(
+            "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        == "8"
+    )
+    assert (
+        unchanged.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'relay_v3_start_attempts'"
+        ).fetchone()[0]
+        == 0
+    )
     unchanged.close()
 
 
@@ -263,10 +398,13 @@ def test_v9_missing_start_attempt_table_fails_closed_without_repair(
         RelayStore(database)
 
     unchanged = sqlite3.connect(database)
-    assert unchanged.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'relay_v3_start_attempts'"
-    ).fetchone()[0] == 0
+    assert (
+        unchanged.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'relay_v3_start_attempts'"
+        ).fetchone()[0]
+        == 0
+    )
     unchanged.close()
 
 
@@ -381,31 +519,10 @@ def test_start_create_rejects_topology_not_bound_into_plan_hash(tmp_path: Path) 
     assert raised.value.code == "RELAY_TOPOLOGY_INVALID"
 
 
-def test_schema_six_migrates_to_nine_but_unknown_version_is_rejected(
-    tmp_path: Path,
-) -> None:
+def test_unknown_schema_version_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "relay.sqlite3"
-    connection = sqlite3.connect(database)
-    connection.execute(
-        "CREATE TABLE relay_v3_schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    )
-    connection.execute(
-        "INSERT INTO relay_v3_schema_metadata (key, value) VALUES ('schema_version', '6')"
-    )
-    connection.commit()
-    connection.close()
-
-    store = RelayStore(database)
-    assert (
-        store._require_connection()
-        .execute(
-            "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
-        )
-        .fetchone()[0]
-        == "9"
-    )
-    store.close()
-
+    seeded = RelayStore(database)
+    seeded.close()
     connection = sqlite3.connect(database)
     connection.execute(
         "UPDATE relay_v3_schema_metadata SET value = '10' WHERE key = 'schema_version'"
@@ -414,40 +531,128 @@ def test_schema_six_migrates_to_nine_but_unknown_version_is_rejected(
     connection.close()
 
     with pytest.raises(RelayStoreError) as raised:
-        RelayStore(database)
+        RelayStore.open_readwrite(database)
 
     assert raised.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
 
 
-@pytest.mark.parametrize(
-    ("old_version", "expected_version"), [("5", "9"), ("6", "9"), ("7", "9")]
-)
-def test_known_legacy_schema_versions_reach_nine_in_one_constructor(
-    tmp_path: Path, old_version: str, expected_version: str
+@pytest.mark.parametrize("old_version", ["5", "6", "7", "8"])
+def test_real_legacy_schema_versions_migrate_atomically_to_nine_in_rw_factory(
+    tmp_path: Path, old_version: str
 ) -> None:
     database = tmp_path / f"relay-{old_version}.sqlite3"
-    connection = sqlite3.connect(database)
-    connection.execute(
-        "CREATE TABLE relay_v3_schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    )
-    connection.execute(
-        "INSERT INTO relay_v3_schema_metadata (key, value) VALUES ('schema_version', ?)",
-        (old_version,),
-    )
-    connection.commit()
-    connection.close()
+    seeded = RelayStore(database)
+    seeded.start_create(_plan(), idempotency_key=f"legacy-{old_version}-seed")
+    seeded.close()
+    _downgrade_to_legacy(database, old_version)
 
-    store = RelayStore(database)
+    store = RelayStore.open_readwrite(database)
 
+    assert store.status("topology-store-v1")["workflow_id"] == "topology-store-v1"
     assert (
         store._require_connection()
         .execute(
             "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
         )
         .fetchone()[0]
-        == expected_version
+        == "9"
+    )
+    assert (
+        store._require_connection()
+        .execute("SELECT COUNT(*) FROM relay_v3_start_attempts")
+        .fetchone()[0]
+        == 0
     )
     store.close()
+
+
+@pytest.mark.parametrize("claimed_version", ["5", "6", "7", "8", "9"])
+def test_metadata_only_claims_fail_closed_without_creating_authority_objects(
+    tmp_path: Path, claimed_version: str
+) -> None:
+    database = tmp_path / f"metadata-only-{claimed_version}.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE relay_v3_schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO relay_v3_schema_metadata (key, value) VALUES ('schema_version', ?)",
+        (claimed_version,),
+    )
+    connection.commit()
+    connection.close()
+    before = _schema_rows(database)
+
+    with pytest.raises(RelayStoreError, match="RELAY_SCHEMA_INCOMPATIBLE"):
+        RelayStore.open_readwrite(database)
+
+    assert _schema_rows(database) == before
+
+
+@pytest.mark.parametrize("claimed_version", ["5", "6", "7", "8", "9"])
+def test_each_schema_version_rejects_extra_authority_before_migration_ddl(
+    tmp_path: Path, claimed_version: str
+) -> None:
+    database = tmp_path / f"extra-authority-{claimed_version}.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    if claimed_version != "9":
+        _downgrade_to_legacy(database, claimed_version)
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE VIEW relay_v3_forged_authority AS SELECT run_id FROM relay_v3_runs"
+    )
+    connection.commit()
+    connection.close()
+    before = _schema_rows(database)
+
+    with pytest.raises(RelayStoreError, match="RELAY_SCHEMA_INCOMPATIBLE"):
+        RelayStore.open_readwrite(database)
+
+    assert _schema_rows(database) == before
+
+
+@pytest.mark.parametrize(
+    "extra_ddl",
+    [
+        "CREATE INDEX relay_v3_forged_index ON relay_v3_runs(workflow_id)",
+        "CREATE VIEW relay_v3_forged_view AS SELECT run_id FROM relay_v3_runs",
+        """
+        CREATE TRIGGER relay_v3_forged_trigger AFTER INSERT ON relay_v3_runs
+        BEGIN SELECT 1; END
+        """,
+    ],
+)
+def test_v9_rejects_extra_index_view_or_trigger(tmp_path: Path, extra_ddl: str) -> None:
+    database = tmp_path / "extra-v9-authority.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute(extra_ddl)
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RelayStoreError, match="RELAY_SCHEMA_INCOMPATIBLE"):
+        RelayStore.open_readwrite(database)
+
+
+def test_v9_rejects_index_ddl_drift_and_extra_metadata(tmp_path: Path) -> None:
+    database = tmp_path / "v9-index-drift.sqlite3"
+    seeded = RelayStore(database)
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP INDEX relay_v3_tasks_by_state")
+    connection.execute(
+        "CREATE INDEX relay_v3_tasks_by_state ON relay_v3_tasks(run_id, state)"
+    )
+    connection.execute(
+        "INSERT INTO relay_v3_schema_metadata (key, value) VALUES ('forged', '9')"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RelayStoreError, match="RELAY_SCHEMA_INCOMPATIBLE"):
+        RelayStore.open_readwrite(database)
 
 
 def test_pretend_v8_with_legacy_capacity_check_fails_closed(tmp_path: Path) -> None:
@@ -598,7 +803,9 @@ def test_v8_missing_finalization_foreign_key_fails_closed(
     assert raised.value.code == "RELAY_SCHEMA_INCOMPATIBLE"
 
 
-def test_v8_foreign_key_violation_fails_closed_during_constructor(tmp_path: Path) -> None:
+def test_v8_foreign_key_violation_fails_closed_during_constructor(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "foreign-key-v8.sqlite3"
     store = RelayStore(database)
     relay = RelayService(store, capability_secret=b"hierarchy-test-secret")
@@ -624,37 +831,9 @@ def test_schema_seven_migrates_capacity_check_before_real_service_store_create(
     seeded_relay = RelayService(seeded, capability_secret=b"hierarchy-test-secret")
     seeded_relay.start_create(_plan(), idempotency_key="seeded-v7-capacity-three")
     seeded.close()
-    connection = sqlite3.connect(database)
-    connection.execute("PRAGMA foreign_keys = OFF")
-    connection.execute(
-        """
-        CREATE TABLE relay_v3_runs_v7 (
-            run_id TEXT PRIMARY KEY,
-            workflow_id TEXT NOT NULL UNIQUE,
-            plan_hash TEXT NOT NULL,
-            plan_json TEXT NOT NULL,
-            workspace_id TEXT NOT NULL,
-            input_snapshot_id TEXT NOT NULL,
-            base_commit TEXT NOT NULL,
-            integration_head TEXT NOT NULL,
-            integration_version INTEGER NOT NULL CHECK (integration_version >= 0),
-            capacity INTEGER NOT NULL CHECK (typeof(capacity) = 'integer')
-                CHECK (capacity BETWEEN 1 AND 3),
-            schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute("INSERT INTO relay_v3_runs_v7 SELECT * FROM relay_v3_runs")
-    connection.execute("DROP TABLE relay_v3_runs")
-    connection.execute("ALTER TABLE relay_v3_runs_v7 RENAME TO relay_v3_runs")
-    connection.execute(
-        "UPDATE relay_v3_schema_metadata SET value = '7' WHERE key = 'schema_version'"
-    )
-    connection.commit()
-    connection.close()
+    _downgrade_to_legacy(database, "7")
 
-    store = RelayStore(database)
+    store = RelayStore.open_readwrite(database)
     relay = RelayService(store, capability_secret=b"hierarchy-test-secret")
     assert store.status("topology-store-v1")["run"]["capacity"] == 3
     plan = _plan()
@@ -667,6 +846,8 @@ def test_schema_seven_migrates_capacity_check_before_real_service_store_create(
     relay.start_create(plan, idempotency_key="migrated-capacity-four")
 
     assert store.status("topology-store-v1-capacity-four")["run"]["capacity"] == 4
+
+
 def test_real_service_to_store_never_dispatches_a_prewarm_for_unsplittable_writer(
     tmp_path: Path,
 ) -> None:
@@ -784,7 +965,9 @@ def test_unsplittable_writers_keep_slots_and_are_serialized_by_scope(
     assert slots == [("writer-0", 1), ("writer-1", 2), ("writer-2", 3)]
 
 
-def test_writer_budget_does_not_consume_the_bounded_reader_budget(tmp_path: Path) -> None:
+def test_writer_budget_does_not_consume_the_bounded_reader_budget(
+    tmp_path: Path,
+) -> None:
     store = RelayStore(
         tmp_path / "relay.sqlite3", host_writer_capacity=1, host_reader_capacity=1
     )

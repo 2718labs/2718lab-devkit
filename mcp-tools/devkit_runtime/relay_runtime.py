@@ -34,9 +34,7 @@ _WORKER_CAPABILITY_ACTIONS = (
     "candidate_handoff",
 )
 _HASH_PREFIX = "sha256:"
-_BOOTSTRAP_ATTESTATION_SCHEMA = (
-    "2718lab-devkit/new-project-bootstrap-attestation-v1"
-)
+_BOOTSTRAP_ATTESTATION_SCHEMA = "2718lab-devkit/new-project-bootstrap-attestation-v1"
 _PROJECT_BINDING_SCHEMA = "2718lab-devkit/project-binding-v1"
 _BOOTSTRAP_REGISTRY_BINDING_SCHEMA = (
     "2718lab-devkit/project-registry-bootstrap-binding-v1"
@@ -319,9 +317,7 @@ class ProductionRegistryResolver:
             "initial_entry_count": 0,
             "capability_epoch": attestation["capability_epoch"],
             "capability_hash": attestation["capability_hash"],
-            "attested_input_snapshot_id": attestation[
-                "attested_input_snapshot_id"
-            ],
+            "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
             "issued_at": issued_at,
             "expires_at": expires_at,
             "attestation_hash": attestation["attestation_hash"],
@@ -408,8 +404,7 @@ class ProjectIndexBootstrapTransport:
             synchronized["workspace_id"] != binding["workspace_id"]
             or synchronized["attested_input_snapshot_id"]
             != binding["attested_input_snapshot_id"]
-            or synchronized["initial_manifest_hash"]
-            != binding["initial_manifest_hash"]
+            or synchronized["initial_manifest_hash"] != binding["initial_manifest_hash"]
             or synchronized["initial_entry_count"] != 0
             or not _is_hash(synchronized["index_snapshot_id"])
             or synchronized["index_identity"] != expected_index_identity
@@ -453,15 +448,14 @@ def validate_project_index_bootstrap_receipt(
     if (
         value["schema"] != _BOOTSTRAP_RECEIPT_SCHEMA
         or not _is_hash(value["receipt_hash"])
-        or value["receipt_hash"] != _canonical_hash(_without_hash(value, "receipt_hash"))
+        or value["receipt_hash"]
+        != _canonical_hash(_without_hash(value, "receipt_hash"))
         or value["attestation_hash"] != binding["attestation_hash"]
         or value["workspace_id"] != binding["workspace_id"]
-        or value["attested_input_snapshot_id"]
-        != binding["attested_input_snapshot_id"]
+        or value["attested_input_snapshot_id"] != binding["attested_input_snapshot_id"]
         or value["initial_manifest_hash"] != binding["initial_manifest_hash"]
         or not _is_hash(value["index_snapshot_id"])
-        or value["index_identity"]
-        != project_index_bootstrap_index_identity(value)
+        or value["index_identity"] != project_index_bootstrap_index_identity(value)
     ):
         raise RelayRuntimeError("BOOTSTRAP_RECEIPT_INVALID")
     now = _trusted_time(clock)
@@ -489,9 +483,7 @@ def _validated_bootstrap_registry_binding(
         code="BOOTSTRAP_ATTESTATION_INVALID",
     )
     now = _trusted_time(clock)
-    expires_at = _timestamp(
-        binding["expires_at"], code="BOOTSTRAP_ATTESTATION_INVALID"
-    )
+    expires_at = _timestamp(binding["expires_at"], code="BOOTSTRAP_ATTESTATION_INVALID")
     if (
         binding["schema"] != _BOOTSTRAP_REGISTRY_BINDING_SCHEMA
         or binding["mode"] != "new_empty_bootstrap"
@@ -522,15 +514,18 @@ def _without_hash(value: Mapping[str, object], field: str) -> dict[str, object]:
 
 
 def _canonical_hash(value: object) -> str:
-    return _HASH_PREFIX + hashlib.sha256(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    return (
+        _HASH_PREFIX
+        + hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 def _is_hash(value: object) -> bool:
@@ -639,11 +634,7 @@ def open_relay_ro(
             database_path, scratch_root=scratch_root
         )
         connection = snapshot.connect()
-        connection.row_factory = sqlite3.Row
-        store = RelayStore.__new__(RelayStore)
-        store._connection = connection
-        store._assert_schema_compatible()
-        store._assert_schema_shape()
+        store = RelayStore.from_readonly_connection(connection)
         return RelayReadRuntime(_store=store, _snapshot=snapshot)
     except (SqliteSnapshotError, RelayStoreError, sqlite3.Error, OSError) as error:
         if store is not None:
@@ -666,14 +657,26 @@ class RelayRuntime:
 
     def __init__(
         self,
-        relay_service: RelayService,
+        relay_service: RelayService | None,
         *,
         capability_broker: CapabilityBroker | None,
         host_session: HostActionAdmission | None = None,
+        _store_factory: Callable[[], RelayStore] | None = None,
+        _capability_secret_provider: RelayCapabilitySecretProvider | None = None,
+        _integration_proof_resolver: IntegrationProofResolver | None = None,
     ) -> None:
-        self._relay_service = relay_service
+        if relay_service is None and (
+            _store_factory is None or _capability_secret_provider is None
+        ):
+            raise TypeError("lazy Relay runtime requires store and secret providers")
+        self._relay_service_value = relay_service
         self._capability_broker = capability_broker
         self._host_session = host_session
+        self._store_factory = _store_factory
+        self._capability_secret_provider = _capability_secret_provider
+        self._integration_proof_resolver = _integration_proof_resolver
+        self._owned_store: RelayStore | None = None
+        self._closed = False
 
     @classmethod
     def from_secret_provider(
@@ -697,6 +700,68 @@ class RelayRuntime:
             host_session=host_session,
         )
 
+    @classmethod
+    def from_store_factory(
+        cls,
+        store_factory: Callable[[], RelayStore],
+        *,
+        capability_secret_provider: RelayCapabilitySecretProvider,
+        capability_broker: CapabilityBroker | None,
+        host_session: HostActionAdmission | None = None,
+        integration_proof_resolver: IntegrationProofResolver | None = None,
+    ) -> RelayRuntime:
+        """Defer every Relay DB open until an operation actually needs storage."""
+
+        return cls(
+            None,
+            capability_broker=capability_broker,
+            host_session=host_session,
+            _store_factory=store_factory,
+            _capability_secret_provider=capability_secret_provider,
+            _integration_proof_resolver=integration_proof_resolver,
+        )
+
+    @property
+    def _relay_service(self) -> RelayService:
+        return self._require_relay_service()
+
+    def _require_relay_service(self) -> RelayService:
+        service = self._relay_service_value
+        if service is not None:
+            return service
+        if self._closed:
+            raise RelayRuntimeError("RELAY_STORAGE_ERROR")
+        store_factory = self._store_factory
+        secret_provider = self._capability_secret_provider
+        if store_factory is None or secret_provider is None:
+            raise RelayRuntimeError("RELAY_STORAGE_ERROR")
+        secret = secret_provider.load()
+        store: RelayStore | None = None
+        try:
+            store = store_factory()
+            service = RelayService(
+                store,
+                capability_secret=secret,
+                integration_proof_resolver=self._integration_proof_resolver,
+            )
+        except Exception:
+            if store is not None:
+                store.close()
+            raise
+        self._owned_store = store
+        self._relay_service_value = service
+        return service
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        store = self._owned_store
+        self._owned_store = None
+        self._relay_service_value = None
+        if store is not None:
+            store.close()
+
     def compile(
         self, request: Mapping[str, object], *, registry: ProductionRegistryResolver
     ) -> dict[str, object]:
@@ -713,8 +778,9 @@ class RelayRuntime:
         broker = self._available_broker()
         if broker is None:
             raise RelayError("RELAY_CAPABILITY_BROKER_UNAVAILABLE")
-        result = self._relay_service.start(request)
-        attempt = self._relay_service.start_attempt(request.get("idempotency_key"))
+        service = self._require_relay_service()
+        result = service.start(request)
+        attempt = service.start_attempt(request.get("idempotency_key"))
         attempt_id = attempt.get("attempt_id")
         attempt_state = attempt.get("state")
         if type(attempt_id) is not str or type(attempt_state) is not str:
@@ -747,16 +813,14 @@ class RelayRuntime:
                         "RELAY_HOST_SESSION_UNAVAILABLE",
                         "RELAY_HOST_ACTION_REJECTED",
                     }:
-                        self._relay_service.abort_start_attempt(
-                            attempt_id, error_code=error.code
-                        )
+                        service.abort_start_attempt(attempt_id, error_code=error.code)
                     raise
-                self._relay_service.mark_start_admitted(attempt_id)
+                service.mark_start_admitted(attempt_id)
             elif attempt_state != "admitted":
                 raise TypeError
             for action in actions:
                 self._deliver_worker_capabilities(broker, action)
-            self._relay_service.mark_start_delivered(attempt_id)
+            service.mark_start_delivered(attempt_id)
         except RelayError:
             raise
         except (HostBridgeError, TypeError, ValueError, KeyError):

@@ -6,6 +6,7 @@ their lifecycle evidence, while the host itself performs any agent spawn.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -110,6 +111,13 @@ class RelayStore:
 
     _SCHEMA_VERSION = 9
     _MAX_IDEMPOTENCY_KEY_LENGTH = 256
+    _SCHEMA_AUTHORITY_DIGESTS = {
+        "5": "22119850baf3f16e2ca85ae20093bbfa086170c21d22c75ff5ba2e8d59d8536e",
+        "6": "4c252652a26a6332f6ea381cf136b9e58443bc20ff9c5800d3b236e2da204256",
+        "7": "a48a1993323a4d4c2dc6178b53d12fb23ad3f27bdb9c7133dff922f10be4885e",
+        "8": "b2ba7afeee026f247e8930a729d0c45b59b19baa103327976158b3bd5d1d5d94",
+        "9": "2e66fadf0b90a77290c856d1f3e3d3532c1157930ef3dc5cdb149ef103f8f7be",
+    }
     _SCHEMA_TABLE_INFO = {
         "relay_v3_actions": (
             ("action_id", "TEXT", 0, 1),
@@ -537,6 +545,9 @@ class RelayStore:
         *,
         host_writer_capacity: int = 9,
         host_reader_capacity: int = 9,
+        _require_existing: bool = False,
+        _prepared_connection: sqlite3.Connection | None = None,
+        _allow_migration: bool = True,
     ) -> None:
         if (
             type(host_writer_capacity) is not int
@@ -545,24 +556,70 @@ class RelayStore:
             or not 1 <= host_reader_capacity <= 9
         ):
             raise RelayTopologyInvalid()
-        self._database = str(database)
+        if _prepared_connection is not None and not _require_existing:
+            raise RelaySchemaIncompatible()
+        database_path = Path(database).absolute()
+        self._database = str(database_path)
         self._host_writer_capacity = host_writer_capacity
         self._host_reader_capacity = host_reader_capacity
         self._legacy_schema_version: str | None = None
-        self._connection: sqlite3.Connection | None = sqlite3.connect(
-            self._database, isolation_level=None
-        )
+        self._schema_is_empty = False
+        self._connection: sqlite3.Connection | None = _prepared_connection
+        if self._connection is None:
+            if _require_existing:
+                self._connection = sqlite3.connect(
+                    database_path.as_uri() + "?mode=rw",
+                    uri=True,
+                    isolation_level=None,
+                )
+            else:
+                self._connection = sqlite3.connect(self._database, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
         try:
             self._assert_schema_compatible()
+            if self._schema_is_empty and _require_existing:
+                raise RelaySchemaIncompatible()
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA busy_timeout = 5000")
-            self._connection.execute("PRAGMA journal_mode = WAL")
-            self._create_schema()
+            if self._schema_is_empty:
+                self._connection.execute("PRAGMA journal_mode = WAL")
+                self._create_schema()
+            elif self._legacy_schema_version is not None:
+                if not _allow_migration:
+                    raise RelaySchemaIncompatible()
+                self._migrate_to_schema_v9()
             self._assert_schema_shape()
         except Exception:
             self.close()
             raise
+
+    @classmethod
+    def open_readwrite(
+        cls,
+        database: str | Path,
+        *,
+        host_writer_capacity: int = 9,
+        host_reader_capacity: int = 9,
+    ) -> RelayStore:
+        """Open one prepared Relay DB and atomically migrate exact V5-V8 authority."""
+
+        return cls(
+            database,
+            host_writer_capacity=host_writer_capacity,
+            host_reader_capacity=host_reader_capacity,
+            _require_existing=True,
+        )
+
+    @classmethod
+    def from_readonly_connection(cls, connection: sqlite3.Connection) -> RelayStore:
+        """Own one prepared snapshot connection after exact V9 validation."""
+
+        return cls(
+            ":verified-relay-snapshot:",
+            _require_existing=True,
+            _prepared_connection=connection,
+            _allow_migration=False,
+        )
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -653,7 +710,12 @@ class RelayStore:
                 queues = plan_data["queues"]
                 ready_ids = {
                     str(item)
-                    for name in ("ready", "writer_ready", "design_ready", "prewarm_ready")
+                    for name in (
+                        "ready",
+                        "writer_ready",
+                        "design_ready",
+                        "prewarm_ready",
+                    )
                     for item in queues.get(name, [])
                 }
                 for ordinal, task in enumerate(plan_data["tasks"]):
@@ -804,12 +866,16 @@ class RelayStore:
 
         self._validate_idempotency_key(idempotency_key)
         try:
-            row = self._require_connection().execute(
-                """
+            row = (
+                self._require_connection()
+                .execute(
+                    """
                 SELECT * FROM relay_v3_start_attempts WHERE idempotency_key = ?
                 """,
-                (idempotency_key,),
-            ).fetchone()
+                    (idempotency_key,),
+                )
+                .fetchone()
+            )
             if row is None:
                 raise RelayStateStale()
             return self._start_attempt_result(row)
@@ -853,7 +919,10 @@ class RelayStore:
                     raise RelayStateStale()
                 state = str(row["state"])
                 if state == "aborted":
-                    if str(row["error_code"]) != error_code or row["receipt_json"] is None:
+                    if (
+                        str(row["error_code"]) != error_code
+                        or row["receipt_json"] is None
+                    ):
                         raise RelayStateStale()
                     return _decode_json_object(str(row["receipt_json"]))
                 if state != "prepared":
@@ -1551,9 +1620,7 @@ class RelayStore:
             current = self._integration_expectation(run, task, candidate)
             if proof_row is None:
                 return current
-            persisted = self._validated_proof_row(
-                connection, proof_row, prepared=True
-            )
+            persisted = self._validated_proof_row(connection, proof_row, prepared=True)
             journal = connection.execute(
                 """
                 SELECT state FROM relay_v3_finalization_journal
@@ -1662,9 +1729,7 @@ class RelayStore:
                     )
                     proof = self._integration_proof(cursor, proof_id)
                 else:
-                    persisted = self._validated_proof_row(
-                        cursor, proof, prepared=True
-                    )
+                    persisted = self._validated_proof_row(cursor, proof, prepared=True)
                     if (
                         str(proof["candidate_id"]) != candidate_id
                         or persisted != receipt
@@ -1705,7 +1770,9 @@ class RelayStore:
                     self._require_current_finalization_expectation(cursor, fence)
                     return evidence
                 if evidence.state == "committed":
-                    self._require_committed_finalization(cursor, fence, journal, outcome)
+                    self._require_committed_finalization(
+                        cursor, fence, journal, outcome
+                    )
                     return evidence
                 if outcome is not None:
                     raise RelayFinalizationConflict()
@@ -1737,7 +1804,9 @@ class RelayStore:
                 self._require_matching_finalization_fence(journal, fence)
                 evidence = self._evidence_from_journal(journal)
                 if evidence.state == "committed":
-                    self._require_committed_finalization(cursor, fence, journal, outcome)
+                    self._require_committed_finalization(
+                        cursor, fence, journal, outcome
+                    )
                     return evidence
                 if evidence.state == "aborted":
                     if (
@@ -1779,9 +1848,10 @@ class RelayStore:
     ) -> ProofFinalizationEvidence | None:
         """Find one exact committed journal decision without exposing its outcome."""
 
-        if _DIGEST.fullmatch(integration_proof_id) is None or _DIGEST.fullmatch(
-            expectation_hash
-        ) is None:
+        if (
+            _DIGEST.fullmatch(integration_proof_id) is None
+            or _DIGEST.fullmatch(expectation_hash) is None
+        ):
             raise RelayFinalizationConflict()
         connection = self._require_connection()
         try:
@@ -2157,9 +2227,7 @@ class RelayStore:
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
-    def cleanup_ledger(
-        self, workflow_id: str, candidate_id: str
-    ) -> dict[str, object]:
+    def cleanup_ledger(self, workflow_id: str, candidate_id: str) -> dict[str, object]:
         """Read one candidate-bound cleanup ledger without changing its state."""
 
         connection = self._require_connection()
@@ -2309,7 +2377,13 @@ class RelayStore:
         """Record only a successful terminal host cleanup receipt; never perform cleanup."""
 
         operation_hash = self._validate_cleanup_operation(operation, candidate_id)
-        expected = {"schema", "candidate_id", "operation_hash", "status", "receipt_hash"}
+        expected = {
+            "schema",
+            "candidate_id",
+            "operation_hash",
+            "status",
+            "receipt_hash",
+        }
         if type(receipt) is not dict or set(receipt) != expected:
             raise RelayStoreError("CLEANUP_HOST_FAILED")
         if (
@@ -2375,10 +2449,14 @@ class RelayStore:
             "branch_identity": str(row["branch_identity"]),
             "worktree_identity": str(row["worktree_identity"]),
             "integration_proof_id": (
-                None if row["integration_proof_id"] is None else str(row["integration_proof_id"])
+                None
+                if row["integration_proof_id"] is None
+                else str(row["integration_proof_id"])
             ),
             "integration_commit": (
-                None if row["integration_commit"] is None else str(row["integration_commit"])
+                None
+                if row["integration_commit"] is None
+                else str(row["integration_commit"])
             ),
             "merged_integration_version": row["merged_integration_version"],
             "eligible_after_integration_version": row[
@@ -2386,10 +2464,14 @@ class RelayStore:
             ],
             "state": str(row["state"]),
             "rollback_receipt_hash": (
-                None if row["rollback_receipt_hash"] is None else str(row["rollback_receipt_hash"])
+                None
+                if row["rollback_receipt_hash"] is None
+                else str(row["rollback_receipt_hash"])
             ),
             "cleanup_receipt_hash": (
-                None if row["cleanup_receipt_hash"] is None else str(row["cleanup_receipt_hash"])
+                None
+                if row["cleanup_receipt_hash"] is None
+                else str(row["cleanup_receipt_hash"])
             ),
         }
 
@@ -2411,7 +2493,9 @@ class RelayStore:
         }
         if type(operation) is not dict or set(operation) != fields:
             raise RelayStoreError("CLEANUP_HOST_FAILED")
-        body = {key: value for key, value in operation.items() if key != "operation_hash"}
+        body = {
+            key: value for key, value in operation.items() if key != "operation_hash"
+        }
         if (
             operation["schema"] != "2718lab-devkit/cleanup-operation-v1"
             or operation["candidate_id"] != candidate_id
@@ -2968,18 +3052,14 @@ class RelayStore:
             (run_id, RelayTaskState.READY.value, RelayTaskState.PREPARED.value),
         ).fetchall()
         tasks = tuple(self._task_from_row(row) for row in rows)
-        all_tasks = {
-            task.task_id: task
-            for task in self._tasks_for_run(cursor, run_id)
-        }
+        all_tasks = {task.task_id: task for task in self._tasks_for_run(cursor, run_id)}
         return tuple(
             task
             for task in tasks
             if not (
                 task.kind == "prewarm"
                 and isinstance(task.contract.get("prewarm_for_task_id"), str)
-                and all_tasks.get(str(task.contract["prewarm_for_task_id"]))
-                is not None
+                and all_tasks.get(str(task.contract["prewarm_for_task_id"])) is not None
                 and all_tasks[str(task.contract["prewarm_for_task_id"])].contract.get(
                     "split_verdict"
                 )
@@ -3315,9 +3395,7 @@ class RelayStore:
         return evidence
 
     @classmethod
-    def _evidence_from_journal(
-        cls, row: sqlite3.Row
-    ) -> ProofFinalizationEvidence:
+    def _evidence_from_journal(cls, row: sqlite3.Row) -> ProofFinalizationEvidence:
         fence = cls._fence_from_journal(row)
         state_value = row["state"]
         result_hash = row["result_hash"]
@@ -3516,7 +3594,8 @@ class RelayStore:
                     or candidate["integration_commit"] is not None
                     or candidate["integration_tree"] is not None
                     or candidate["integration_proof_id"] is not None
-                    or self._integration_expectation(run, task, candidate) != expectation
+                    or self._integration_expectation(run, task, candidate)
+                    != expectation
                 ):
                     raise ValueError("prepared task proof binding mismatch")
                 return receipt
@@ -4378,42 +4457,51 @@ class RelayStore:
                 )
 
     def _assert_schema_compatible(self) -> None:
-        """Inspect existing Relay metadata before any WAL or DDL mutation."""
+        """Verify the complete claimed authority before any WAL or DDL mutation."""
 
         connection = self._require_connection()
         try:
-            tables = {
-                str(row["name"])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-            }
             metadata = "relay_v3_schema_metadata"
-            relay_tables = {name for name in tables if name.startswith("relay_v3_")}
-            if metadata not in tables:
-                if relay_tables:
+            authority_objects = connection.execute(
+                """
+                SELECT type, name, tbl_name, sql
+                FROM sqlite_master
+                ORDER BY type, name
+                """
+            ).fetchall()
+            if not any(
+                row["type"] == "table" and row["name"] == metadata
+                for row in authority_objects
+            ):
+                if authority_objects:
                     raise RelaySchemaIncompatible()
+                self._schema_is_empty = True
                 return
             rows = connection.execute(
-                "SELECT value FROM relay_v3_schema_metadata WHERE key = ?",
-                ("schema_version",),
+                "SELECT key, value FROM relay_v3_schema_metadata ORDER BY key"
             ).fetchall()
-            if len(rows) != 1 or str(rows[0]["value"]) not in {
-                "5",
-                "6",
-                "7",
-                "8",
-                str(self._SCHEMA_VERSION),
-            }:
+            if (
+                len(rows) != 1
+                or str(rows[0]["key"]) != "schema_version"
+                or str(rows[0]["value"])
+                not in {
+                    "5",
+                    "6",
+                    "7",
+                    "8",
+                    str(self._SCHEMA_VERSION),
+                }
+            ):
                 raise RelaySchemaIncompatible()
             version = str(rows[0]["value"])
+            self._assert_schema_authority(version)
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RelaySchemaIncompatible()
+            self._schema_is_empty = False
             if version == str(self._SCHEMA_VERSION):
                 self._legacy_schema_version = None
-                self._assert_schema_shape()
                 return
-            self._legacy_schema_version = (
-                version if version != str(self._SCHEMA_VERSION) else None
-            )
+            self._legacy_schema_version = version
         except RelaySchemaIncompatible:
             raise
         except sqlite3.Error as error:
@@ -4422,9 +4510,6 @@ class RelayStore:
     def _create_schema(self) -> None:
         connection = self._require_connection()
         try:
-            if self._legacy_schema_version == "8":
-                self._assert_legacy_v8_shape()
-                self._migrate_to_schema_v9()
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS relay_v3_schema_metadata (
@@ -4726,18 +4811,49 @@ class RelayStore:
             )
             connection.execute(
                 """
-                INSERT OR IGNORE INTO relay_v3_schema_metadata (key, value)
+                INSERT INTO relay_v3_schema_metadata (key, value)
                 VALUES (?, ?)
                 """,
                 ("schema_version", str(self._SCHEMA_VERSION)),
             )
-            if self._legacy_schema_version is not None:
-                self._migrate_to_schema_v9()
+            self._schema_is_empty = False
         except sqlite3.Error as error:
             raise RelayStorageFailure() from error
 
+    def _assert_schema_authority(self, version: str) -> None:
+        expected = self._SCHEMA_AUTHORITY_DIGESTS.get(version)
+        if expected is None:
+            raise RelaySchemaIncompatible()
+        rows = self._require_connection().execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            ORDER BY type, name
+            """
+        )
+        authority = [
+            (
+                str(row["type"]),
+                str(row["name"]),
+                str(row["tbl_name"]),
+                (
+                    None
+                    if row["sql"] is None
+                    else re.sub(r"\s+", " ", str(row["sql"]).strip()).casefold()
+                ),
+            )
+            for row in rows
+        ]
+        digest = hashlib.sha256(
+            json.dumps(authority, separators=(",", ":"), ensure_ascii=True).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if digest != expected:
+            raise RelaySchemaIncompatible()
+
     def _migrate_to_schema_v9(self) -> None:
-        """Advance every known legacy Relay schema to V9 in this open operation."""
+        """Atomically advance one exact V5-V8 authority to exact V9."""
 
         connection = self._require_connection()
         legacy_version = self._legacy_schema_version
@@ -4746,67 +4862,13 @@ class RelayStore:
         connection.execute("PRAGMA foreign_keys = OFF")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            if not self._runs_capacity_is_v8(connection):
-                connection.execute(
-                    """
-                    CREATE TABLE relay_v3_runs_v8 (
-                        run_id TEXT PRIMARY KEY,
-                        workflow_id TEXT NOT NULL UNIQUE,
-                        plan_hash TEXT NOT NULL,
-                        plan_json TEXT NOT NULL,
-                        workspace_id TEXT NOT NULL,
-                        input_snapshot_id TEXT NOT NULL,
-                        base_commit TEXT NOT NULL,
-                        integration_head TEXT NOT NULL,
-                        integration_version INTEGER NOT NULL
-                            CHECK (integration_version >= 0),
-                        capacity INTEGER NOT NULL
-                            CHECK (typeof(capacity) = 'integer')
-                            CHECK (capacity BETWEEN 1 AND 9),
-                        schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
-                        created_at TEXT NOT NULL
-                    )
-                    """
-                )
-                connection.execute(
-                    "INSERT INTO relay_v3_runs_v8 SELECT * FROM relay_v3_runs"
-                )
-                connection.execute("DROP TABLE relay_v3_runs")
-                connection.execute("ALTER TABLE relay_v3_runs_v8 RENAME TO relay_v3_runs")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS relay_v3_start_attempts (
-                    attempt_id TEXT PRIMARY KEY,
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    run_id TEXT NOT NULL,
-                    action_ids_json TEXT NOT NULL,
-                    compensation_json TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (
-                        state IN ('prepared', 'admitted', 'delivered', 'aborted')
-                    ),
-                    error_code TEXT,
-                    receipt_json TEXT,
-                    attempt_version INTEGER NOT NULL CHECK (
-                        typeof(attempt_version) = 'integer' AND attempt_version >= 1
-                    ),
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    CHECK (
-                        (state = 'aborted' AND error_code IS NOT NULL
-                            AND receipt_json IS NOT NULL)
-                        OR (state != 'aborted' AND error_code IS NULL
-                            AND receipt_json IS NULL)
-                    ),
-                    FOREIGN KEY (idempotency_key)
-                        REFERENCES relay_v3_idempotency(idempotency_key)
-                        ON DELETE RESTRICT,
-                    FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                raise RelaySchemaIncompatible()
+            if legacy_version != "8":
+                self._migrate_legacy_runs_and_finalization(connection)
+            if legacy_version == "5":
+                self._create_cleanup_authority(connection)
+            if legacy_version in {"5", "6"}:
+                self._create_scheduler_authority(connection)
+            self._create_start_attempt_authority(connection)
             result = connection.execute(
                 """
                 UPDATE relay_v3_schema_metadata SET value = '9'
@@ -4816,6 +4878,7 @@ class RelayStore:
             )
             if result.rowcount != 1:
                 raise RelaySchemaIncompatible()
+            self._assert_schema_shape()
             connection.commit()
             self._legacy_schema_version = None
         except RelaySchemaIncompatible:
@@ -4827,17 +4890,269 @@ class RelayStore:
         finally:
             connection.execute("PRAGMA foreign_keys = ON")
 
+    @staticmethod
+    def _migrate_legacy_runs_and_finalization(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            "CREATE TEMP TABLE relay_v3_runs_migration AS SELECT * FROM relay_v3_runs"
+        )
+        connection.execute("DROP TABLE relay_v3_runs")
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_runs (
+                run_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL UNIQUE,
+                plan_hash TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                input_snapshot_id TEXT NOT NULL,
+                base_commit TEXT NOT NULL,
+                integration_head TEXT NOT NULL,
+                integration_version INTEGER NOT NULL
+                    CHECK (integration_version >= 0),
+                capacity INTEGER NOT NULL
+                    CHECK (typeof(capacity) = 'integer')
+                    CHECK (capacity BETWEEN 1 AND 9),
+                schedule_version INTEGER NOT NULL CHECK (schedule_version >= 0),
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO relay_v3_runs SELECT * FROM relay_v3_runs_migration"
+        )
+        connection.execute("DROP TABLE relay_v3_runs_migration")
+        connection.execute(
+            """
+            CREATE TEMP TABLE relay_v3_finalization_journal_migration
+            AS SELECT * FROM relay_v3_finalization_journal
+            """
+        )
+        connection.execute(
+            """
+            CREATE TEMP TABLE relay_v3_finalization_outcomes_migration
+            AS SELECT * FROM relay_v3_finalization_outcomes
+            """
+        )
+        connection.execute("DROP TABLE relay_v3_finalization_outcomes")
+        connection.execute("DROP TABLE relay_v3_finalization_journal")
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_finalization_journal (
+                finalization_id TEXT PRIMARY KEY,
+                reservation_epoch INTEGER NOT NULL
+                    CHECK (reservation_epoch >= 1),
+                integration_proof_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL
+                    CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                base_oid TEXT NOT NULL,
+                final_oid TEXT NOT NULL,
+                fence_hash TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL
+                    CHECK (state IN ('prepared', 'committed', 'aborted')),
+                result_hash TEXT,
+                journal_version INTEGER NOT NULL CHECK (journal_version >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (state = 'committed' AND result_hash IS NOT NULL)
+                    OR (state IN ('prepared', 'aborted') AND result_hash IS NULL)
+                ),
+                UNIQUE (integration_proof_id, reservation_epoch),
+                FOREIGN KEY (integration_proof_id)
+                    REFERENCES relay_v3_integration_proofs(proof_id)
+                    ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO relay_v3_finalization_journal
+            SELECT * FROM relay_v3_finalization_journal_migration
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_finalization_outcomes (
+                finalization_id TEXT PRIMARY KEY,
+                fence_hash TEXT NOT NULL UNIQUE,
+                integration_proof_id TEXT NOT NULL,
+                expectation_key TEXT NOT NULL,
+                expectation_version INTEGER NOT NULL
+                    CHECK (expectation_version >= 1),
+                expectation_hash TEXT NOT NULL,
+                result_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (finalization_id)
+                    REFERENCES relay_v3_finalization_journal(finalization_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY (integration_proof_id)
+                    REFERENCES relay_v3_integration_proofs(proof_id)
+                    ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO relay_v3_finalization_outcomes
+            SELECT * FROM relay_v3_finalization_outcomes_migration
+            """
+        )
+        connection.execute("DROP TABLE relay_v3_finalization_outcomes_migration")
+        connection.execute("DROP TABLE relay_v3_finalization_journal_migration")
+        connection.execute(
+            """
+            CREATE INDEX relay_v3_finalizations_by_proof
+            ON relay_v3_finalization_journal(
+                integration_proof_id, expectation_hash, state
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_cleanup_authority(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_cleanup_ledger (
+                candidate_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                retention_rounds INTEGER NOT NULL
+                    CHECK (retention_rounds BETWEEN 1 AND 32),
+                branch_identity TEXT NOT NULL,
+                worktree_identity TEXT NOT NULL,
+                delete_merged_branch INTEGER NOT NULL CHECK (
+                    delete_merged_branch IN (0, 1)
+                ),
+                remove_disposable_worktree INTEGER NOT NULL CHECK (
+                    remove_disposable_worktree IN (0, 1)
+                ),
+                integration_proof_id TEXT,
+                integration_commit TEXT,
+                merged_integration_version INTEGER,
+                eligible_after_integration_version INTEGER,
+                state TEXT NOT NULL CHECK (state IN (
+                    'CLEANUP_PENDING', 'CLEANUP_ELIGIBLE',
+                    'CLEANUP_ROLLBACK_OBSERVED', 'CLEANED'
+                )),
+                rollback_receipt_hash TEXT,
+                cleanup_receipt_hash TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (candidate_id)
+                    REFERENCES relay_v3_candidates(candidate_id) ON DELETE RESTRICT,
+                FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id) ON DELETE CASCADE,
+                FOREIGN KEY (integration_proof_id)
+                    REFERENCES relay_v3_integration_proofs(proof_id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX relay_v3_cleanup_by_run_state
+            ON relay_v3_cleanup_ledger(
+                run_id, state, eligible_after_integration_version
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_scheduler_authority(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_scheduler_groups (
+                run_id TEXT NOT NULL,
+                scheduler_id TEXT NOT NULL,
+                coordinator_lease_id TEXT NOT NULL,
+                worktree_identity TEXT NOT NULL,
+                writer_task_ids_json TEXT NOT NULL,
+                prewarm_task_ids_json TEXT NOT NULL,
+                PRIMARY KEY (run_id, scheduler_id),
+                UNIQUE (run_id, coordinator_lease_id),
+                UNIQUE (run_id, worktree_identity),
+                FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_scheduler_writer_slots (
+                run_id TEXT NOT NULL,
+                scheduler_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                slot INTEGER NOT NULL CHECK (slot BETWEEN 1 AND 3),
+                PRIMARY KEY (run_id, task_id),
+                UNIQUE (run_id, scheduler_id, slot),
+                FOREIGN KEY (run_id, scheduler_id)
+                    REFERENCES relay_v3_scheduler_groups(run_id, scheduler_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (run_id, task_id)
+                    REFERENCES relay_v3_tasks(run_id, task_id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX relay_v3_scheduler_slots_by_group
+            ON relay_v3_scheduler_writer_slots(run_id, scheduler_id, slot)
+            """
+        )
+
+    @staticmethod
+    def _create_start_attempt_authority(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE relay_v3_start_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL,
+                action_ids_json TEXT NOT NULL,
+                compensation_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('prepared', 'admitted', 'delivered', 'aborted')
+                ),
+                error_code TEXT,
+                receipt_json TEXT,
+                attempt_version INTEGER NOT NULL CHECK (
+                    typeof(attempt_version) = 'integer' AND attempt_version >= 1
+                ),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (state = 'aborted' AND error_code IS NOT NULL
+                        AND receipt_json IS NOT NULL)
+                    OR (state != 'aborted' AND error_code IS NULL
+                        AND receipt_json IS NULL)
+                ),
+                FOREIGN KEY (idempotency_key)
+                    REFERENCES relay_v3_idempotency(idempotency_key)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY (run_id) REFERENCES relay_v3_runs(run_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
     def _assert_legacy_v8_shape(self) -> None:
         """Reject V8 drift before the V9 migration performs any DDL."""
 
         connection = self._require_connection()
         try:
-            if connection.execute(
-                """
+            if (
+                connection.execute(
+                    """
                 SELECT COUNT(*) FROM sqlite_master
                 WHERE type = 'table' AND name = 'relay_v3_start_attempts'
                 """
-            ).fetchone()[0] != 0:
+                ).fetchone()[0]
+                != 0
+            ):
                 raise RelaySchemaIncompatible()
             for table, expected_columns in self._SCHEMA_TABLE_INFO.items():
                 if table == "relay_v3_start_attempts":
@@ -4874,6 +5189,16 @@ class RelayStore:
     def _assert_schema_shape(self) -> None:
         connection = self._require_connection()
         try:
+            metadata = connection.execute(
+                "SELECT key, value FROM relay_v3_schema_metadata ORDER BY key"
+            ).fetchall()
+            if (
+                len(metadata) != 1
+                or str(metadata[0]["key"]) != "schema_version"
+                or str(metadata[0]["value"]) != str(self._SCHEMA_VERSION)
+            ):
+                raise RelaySchemaIncompatible()
+            self._assert_schema_authority(str(self._SCHEMA_VERSION))
             for table, expected_columns in self._SCHEMA_TABLE_INFO.items():
                 table_info = tuple(
                     (

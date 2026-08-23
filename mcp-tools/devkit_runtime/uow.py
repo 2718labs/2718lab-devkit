@@ -116,7 +116,7 @@ class RuntimeUnitOfWork:
         factories: RuntimeAdapterFactories,
         capability_broker: object | None,
         integration_attestor: object | None,
-        host_session: object | None,
+        host_session: object | None = None,
         tool_results: ToolResultAdapter,
     ) -> None:
         self._config = config
@@ -341,15 +341,22 @@ class RuntimeUnitOfWork:
     def relay(self) -> RelayReadRuntime | RelayRuntime:
         self._assert_open()
         if self._relay is _UNSET:
-            self._relay = self._remember(
-                self._factories.open_relay(
+            if self._host_session is None:
+                opened = self._factories.open_relay(
+                    config=self._config,
+                    read_only=self._read_only,
+                    capability_broker=self._capability_broker,
+                    integration_attestor=self._integration_attestor,
+                )
+            else:
+                opened = self._factories.open_relay(
                     config=self._config,
                     read_only=self._read_only,
                     capability_broker=self._capability_broker,
                     integration_attestor=self._integration_attestor,
                     host_session=self._host_session,
                 )
-            )
+            self._relay = self._remember(opened)
         return cast("RelayReadRuntime | RelayRuntime", self._relay)
 
     @property
@@ -954,7 +961,7 @@ def _open_relay(
     read_only: bool,
     capability_broker: object | None,
     integration_attestor: object | None,
-    host_session: object | None,
+    host_session: object | None = None,
 ) -> object:
     from .relay_runtime import (
         RelayCapabilitySecretProvider,
@@ -964,60 +971,32 @@ def _open_relay(
 
     if read_only:
         return open_relay_ro(config.relay_database, scratch_root=config.scratch_root)
-    store = _open_relay_store_rw(config)
-    try:
-        runtime = RelayRuntime.from_secret_provider(
-            store,
-            capability_secret_provider=RelayCapabilitySecretProvider(
-                config.relay_capability_key
-            ),
-            capability_broker=cast("CapabilityBroker | None", capability_broker),
-            host_session=cast("HostActionAdmission | None", host_session),
-            integration_proof_resolver=cast(
-                "IntegrationProofResolver | None", integration_attestor
-            ),
-        )
-    except Exception:
-        store.close()
-        raise
-    return _OwnedAdapter(value=runtime, closer=store)
+    return RelayRuntime.from_store_factory(
+        lambda: _open_relay_store_rw(config),
+        capability_secret_provider=RelayCapabilitySecretProvider(
+            config.relay_capability_key
+        ),
+        capability_broker=cast("CapabilityBroker | None", capability_broker),
+        host_session=cast("HostActionAdmission | None", host_session),
+        integration_proof_resolver=cast(
+            "IntegrationProofResolver | None", integration_attestor
+        ),
+    )
 
 
 def _open_relay_store_rw(config: RuntimeConfig) -> RelayStore:
-    """Validate first, then open an existing Relay schema without migration."""
+    """Open exact prepared Relay authority through its migration-owning factory."""
 
-    from devkit_relay.store import RelayStore
+    from devkit_relay.store import RelayStore, RelayStoreError
 
-    from .relay_runtime import RelayRuntimeError, open_relay_ro
+    from .relay_runtime import RelayRuntimeError
 
-    verified = open_relay_ro(config.relay_database, scratch_root=config.scratch_root)
-    verified.close()
-    connection: sqlite3.Connection | None = None
     try:
-        database = Path(config.relay_database).absolute()
-        connection = sqlite3.connect(
-            database.as_uri() + "?mode=rw",
-            uri=True,
-            isolation_level=None,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
-        store = RelayStore.__new__(RelayStore)
-        store._database = str(database)
-        store._connection = connection
-        store._assert_schema_compatible()
-        store._assert_schema_shape()
-        connection = None
-        return store
-    except sqlite3.Error as error:
-        if connection is not None:
-            connection.close()
+        return RelayStore.open_readwrite(config.relay_database)
+    except RelayStoreError as error:
+        raise RelayRuntimeError(error.code) from None
+    except (sqlite3.Error, OSError) as error:
         raise RelayRuntimeError("RELAY_STORAGE_ERROR") from error
-    except Exception:
-        if connection is not None:
-            connection.close()
-        raise
 
 
 DEFAULT_RUNTIME_ADAPTER_FACTORIES = RuntimeAdapterFactories(

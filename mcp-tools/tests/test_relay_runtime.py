@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import sys
@@ -27,6 +28,9 @@ from devkit_relay.proofs import (
 )
 from devkit_relay.service import RelayError, RelayService
 from devkit_relay.store import RelayStore
+from devkit_runtime.bootstrap import RuntimeBootstrap
+from devkit_runtime.composition import RuntimeRoot
+from devkit_runtime.config import RuntimeConfig
 from devkit_runtime.relay_runtime import RelayRuntime
 
 _BASE_COMMIT = "a" * 40
@@ -730,6 +734,141 @@ def _host_bound_plan() -> dict[str, object]:
         }
     )
     return _rehash(submitted)
+
+
+def _runtime_config(tmp_path: Path) -> RuntimeConfig:
+    scratch = tmp_path / "runtime-scratch"
+    scratch.mkdir()
+    return RuntimeConfig.load(
+        environ={
+            "PLUGIN_DATA": str(tmp_path / "runtime-data"),
+            "CODEX_TASK_TEMP": str(scratch),
+        }
+    )
+
+
+def _relay_files_state(database: Path) -> dict[str, tuple[int, int, str]]:
+    return {
+        path.name: (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in database.parent.glob(database.name + "*")
+    }
+
+
+def test_runtime_root_hostless_start_never_opens_or_writes_relay_rw(
+    tmp_path: Path,
+) -> None:
+    config = _runtime_config(tmp_path)
+    RuntimeBootstrap.run(config)
+    before = _relay_files_state(config.relay_database)
+    root = RuntimeRoot(config, capability_broker=_UnavailableCapabilityBroker())
+
+    try:
+        with root.open_uow(read_only=False) as uow:
+            runtime = uow.relay
+            assert isinstance(runtime, RelayRuntime)
+            with pytest.raises(RelayError) as caught:
+                runtime.start(
+                    {
+                        "mode": "create",
+                        "plan": _host_bound_plan(),
+                        "idempotency_key": "runtime-root-hostless",
+                    }
+                )
+    finally:
+        root.shutdown()
+
+    assert caught.value.code == "RELAY_CAPABILITY_BROKER_UNAVAILABLE"
+    assert _relay_files_state(config.relay_database) == before
+
+
+def test_runtime_root_rw_migrates_real_v8_then_runs_create_and_refill(
+    tmp_path: Path,
+) -> None:
+    config = _runtime_config(tmp_path)
+    RuntimeBootstrap.run(config)
+    connection = sqlite3.connect(config.relay_database)
+    connection.execute("DROP TABLE relay_v3_start_attempts")
+    connection.execute(
+        "UPDATE relay_v3_schema_metadata SET value = '8' WHERE key = 'schema_version'"
+    )
+    connection.commit()
+    connection.close()
+    broker = _RecordingCapabilityBroker()
+    root = RuntimeRoot(config, capability_broker=broker)
+
+    try:
+        with root.open_uow(read_only=False) as uow:
+            runtime = uow.relay
+            assert isinstance(runtime, RelayRuntime)
+            created = runtime.start(
+                {
+                    "mode": "create",
+                    "plan": plan(
+                        task(
+                            "writer-a",
+                            priority=100,
+                            write_scope=[{"path": "mcp-tools/a.py", "kind": "file"}],
+                        ),
+                        task(
+                            "writer-b",
+                            priority=50,
+                            write_scope=[{"path": "mcp-tools/b.py", "kind": "file"}],
+                        ),
+                        capacity=1,
+                    ),
+                    "idempotency_key": "runtime-root-v8-create",
+                }
+            )
+            first = created["host_actions"][0]
+            assert isinstance(first, dict)
+            service = runtime._relay_service
+            version = bind_worker(service, first)
+            service.handoff(
+                worker_request(
+                    first,
+                    lifecycle_action="terminal",
+                    capability=issue_worker(
+                        service, first, lifecycle_action="terminal"
+                    ),
+                    expected_task_version=version,
+                    outcome="blocked",
+                )
+            )
+            directive = service.status("relay-runtime-v3")["refill_directives"][0]
+            refilled = runtime.start(
+                {
+                    "mode": "refill",
+                    "workflow_id": "relay-runtime-v3",
+                    "refill_directive_id": directive["directive_id"],
+                    "expected_schedule_version": directive["expected_schedule_version"],
+                    "idempotency_key": "runtime-root-v8-refill",
+                }
+            )
+    finally:
+        root.shutdown()
+
+    assert [action["task_id"] for action in refilled["host_actions"]] == ["writer-b"]
+    assert len(broker.deliveries) == 2
+    verified = sqlite3.connect(config.relay_database)
+    try:
+        assert (
+            verified.execute(
+                "SELECT value FROM relay_v3_schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "9"
+        )
+        assert (
+            verified.execute("SELECT COUNT(*) FROM relay_v3_start_attempts").fetchone()[
+                0
+            ]
+            == 2
+        )
+    finally:
+        verified.close()
 
 
 @pytest.mark.parametrize(
