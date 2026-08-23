@@ -35,11 +35,23 @@ TASK_SCHEMA_V4: Final = "2718lab-devkit/task-routing-profile-v4"
 POLICY_SCHEMA_V4: Final = "2718lab-devkit/fastlane-routing-policy-v4"
 RESULT_SCHEMA_V4: Final = "2718lab-devkit/fastlane-routing-result-v4"
 FINGERPRINT_SCHEMA_V4: Final = "2718lab-devkit/task-route-fingerprint-v4"
+REQUEST_SCHEMA_V5: Final = "2718lab-devkit/fastlane-routing-request-v5"
+TASK_SCHEMA_V5: Final = "2718lab-devkit/task-routing-profile-v5"
+POLICY_SCHEMA_V5: Final = "2718lab-devkit/fastlane-routing-policy-v5"
+RESULT_SCHEMA_V5: Final = "2718lab-devkit/fastlane-routing-result-v5"
+FINGERPRINT_SCHEMA_V5: Final = "2718lab-devkit/task-route-fingerprint-v5"
+REQUEST_BINDING_SCHEMA_V5: Final = "2718lab-devkit/child-route-request-binding-v1"
+CHILD_ROUTE_ATTESTATION_SCHEMA: Final = (
+    "2718lab-devkit/host-child-route-attestation-v1"
+)
 POLICY_PATH: Final = (
     Path(__file__).resolve().parents[1] / "assets" / "fastlane-routing-policy-v3.json"
 )
 POLICY_PATH_V4: Final = (
     Path(__file__).resolve().parents[1] / "assets" / "fastlane-routing-policy-v4.json"
+)
+POLICY_PATH_V5: Final = (
+    Path(__file__).resolve().parents[1] / "assets" / "fastlane-routing-policy-v5.json"
 )
 
 MAX_31: Final = (2**31) - 1
@@ -206,6 +218,37 @@ HOST_FIELDS: Final = frozenset(
     }
 )
 HOST_MODEL_FIELDS: Final = frozenset({"model_id", "status", "efforts"})
+REQUEST_FIELDS_V5: Final = frozenset(
+    {
+        "schema",
+        "policy_hash",
+        "task",
+        "dependency_state",
+        "scope_state",
+        "scheduler_facts",
+        "host_capabilities",
+        "child_route_attestation",
+        "legacy",
+    }
+)
+CHILD_ROUTE_ATTESTATION_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "status",
+        "request_binding_hash",
+        "host_id_hash",
+        "capability_epoch",
+        "lease_epoch",
+        "issued_event_seq",
+        "expires_event_seq",
+        "route",
+        "inherit_current_session_model",
+        "refusal_code",
+        "attestation_hash",
+    }
+)
+CHILD_ROUTE_FIELDS: Final = frozenset({"lane", "model", "effort", "rank"})
+CHILD_ROUTE_LANES: Final = frozenset({"luna", "terra", "sol", "spark"})
 STRIKE_FIELDS: Final = frozenset(
     {
         "schema",
@@ -1874,6 +1917,16 @@ def route(
 ) -> dict[str, Any]:
     """Resolve one strict v3 routing request, failing closed on any ambiguity."""
 
+    if (
+        isinstance(request, Mapping)
+        and request.get("schema") == REQUEST_SCHEMA
+        and _has_quota_field(request)
+    ):
+        return _terminal_result(
+            request,
+            status="rejected",
+            reason="FASTLANE_SCHEMA_UPGRADE_REQUIRED",
+        )
     try:
         active_policy = (
             _validate_policy(policy) if policy is not None else load_policy()
@@ -2182,6 +2235,16 @@ def route_v4(
 ) -> dict[str, Any]:
     """Compile a v4 Spark alternate without replacing its baseline route."""
 
+    if (
+        isinstance(request, Mapping)
+        and request.get("schema") == REQUEST_SCHEMA_V4
+        and _has_quota_field(request)
+    ):
+        return _terminal_result_v4(
+            request,
+            status="rejected",
+            reason="FASTLANE_SCHEMA_UPGRADE_REQUIRED",
+        )
     parsed: dict[str, Any] | None = None
     fingerprint: str | None = None
     try:
@@ -2280,6 +2343,708 @@ def route_v4(
         )
     except (KeyError, TypeError, ValueError):
         return _terminal_result_v4(
+            request,
+            status="rejected",
+            reason="invalid_schema",
+            parsed=parsed,
+            fingerprint=fingerprint,
+        )
+
+
+def _validate_policy_v5(policy: object) -> dict[str, Any]:
+    """Validate V5 safety floors without maintaining a model registry."""
+
+    value = _policy_mapping(policy, "policy")
+    expected = frozenset(
+        {
+            "schema",
+            "version",
+            "role_floors",
+            "risk_floors",
+            "limits",
+            "spark_gate",
+            "reason_codes",
+        }
+    )
+    _exact_keys(value, expected, "policy")
+    if value.get("schema") != POLICY_SCHEMA_V5 or value.get("version") != 5:
+        raise RoutingError("invalid_schema", "policy schema/version is invalid")
+
+    role_floors = _mapping(value["role_floors"], "policy role floors")
+    if set(role_floors) != ROLES:
+        raise RoutingError("invalid_schema", "policy role floors are incomplete")
+    for role, rank in role_floors.items():
+        _integer(rank, f"policy role floor {role}", 10, 110)
+
+    risk_floors = _mapping(value["risk_floors"], "policy risk floors")
+    expected_risks = frozenset(
+        {
+            "cross_module",
+            "database_work",
+            "migration",
+            "security_execution",
+            "security_review",
+            "destructive_execution",
+            "destructive_review",
+            "destructive_acceptance",
+            "design_conflict",
+            "acceptance",
+        }
+    )
+    _exact_keys(risk_floors, expected_risks, "policy risk floors")
+    for risk, rank in risk_floors.items():
+        _integer(rank, f"policy risk floor {risk}", 10, 110)
+
+    limits = _mapping(value["limits"], "policy limits")
+    expected_limits = frozenset(
+        {
+            "maximum_request_bytes",
+            "maximum_tasks",
+            "maximum_cache_entries",
+            "maximum_gate_reason_codes",
+            "maximum_host_models",
+            "maximum_total_slots",
+            "maximum_scope_items",
+            "maximum_dependency_items",
+        }
+    )
+    _exact_keys(limits, expected_limits, "policy limits")
+    expected_limit_values = {
+        "maximum_request_bytes": 32768,
+        "maximum_tasks": 64,
+        "maximum_cache_entries": 128,
+        "maximum_gate_reason_codes": 16,
+        "maximum_host_models": 8,
+        "maximum_total_slots": 8,
+        "maximum_scope_items": 8,
+        "maximum_dependency_items": 32,
+    }
+    if dict(limits) != expected_limit_values:
+        raise RoutingError("invalid_schema", "policy limits are invalid")
+
+    spark_gate = _mapping(value["spark_gate"], "policy spark gate")
+    _exact_keys(spark_gate, frozenset({"required_entitlement"}), "policy spark gate")
+    if spark_gate["required_entitlement"] != "spark_preview":
+        raise RoutingError("invalid_schema", "policy Spark gate is invalid")
+
+    reason_codes = _normalise_list(
+        value["reason_codes"], "policy reason_codes", _string, 128
+    )
+    if len(reason_codes) != len(value["reason_codes"]):
+        raise RoutingError("invalid_bounds", "policy reason codes are duplicated")
+    required_reasons = {
+        "dependency_not_ready",
+        "scope_conflict_active",
+        "destructive_authorization_missing",
+        "lease_unavailable",
+        "capability_unavailable",
+        "host_model_policy_denied",
+        "host_child_route_below_safety_floor",
+        "spark_not_severe",
+        "spark_entitlement_unavailable",
+        "FASTLANE_SCHEMA_UPGRADE_REQUIRED",
+    }
+    if not required_reasons.issubset(reason_codes):
+        raise RoutingError("invalid_schema", "policy reason registry is incomplete")
+    return dict(value)
+
+
+def load_policy_v5(path: Path | None = None) -> dict[str, Any]:
+    """Load the V5 safety-floor policy without contacting a host."""
+
+    policy_path = path or POLICY_PATH_V5
+    try:
+        raw = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RoutingError("invalid_schema", "policy asset cannot be parsed") from error
+    return _validate_policy_v5(raw)
+
+
+def policy_hash_v5(policy: Mapping[str, Any]) -> str:
+    """Return the canonical hash of a V5 safety-floor policy."""
+
+    _validate_policy_v5(policy)
+    return _hash_json(policy)
+
+
+def _normalise_host_v5(value: object, policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate host availability facts without recognizing only fixed models."""
+
+    host = _mapping(value, "host_capabilities")
+    _exact_keys(host, HOST_FIELDS, "host_capabilities")
+    if host["schema"] != HOST_SCHEMA:
+        raise RoutingError("invalid_schema", "host schema is invalid")
+    limits = _mapping(policy["limits"], "policy limits")
+    total_slots = _integer(
+        host["total_slots"],
+        "host.total_slots",
+        1,
+        int(limits["maximum_total_slots"]),
+    )
+    raw_limits = _mapping(host["model_slot_limits"], "host.model_slot_limits")
+    expected_lanes = frozenset({"luna", "terra", "sol", "spark"})
+    _exact_keys(raw_limits, expected_lanes, "host.model_slot_limits")
+    model_slot_limits = {
+        lane: _integer(
+            raw_limits[lane], f"host.model_slot_limits.{lane}", 0, total_slots
+        )
+        for lane in sorted(expected_lanes)
+    }
+    raw_models = host["models"]
+    if type(raw_models) is not list or len(raw_models) > int(limits["maximum_host_models"]):
+        raise RoutingError("invalid_bounds", "host models are out of bounds")
+    models: list[dict[str, Any]] = []
+    seen_models: set[str] = set()
+    for index, raw_model in enumerate(raw_models):
+        model = _mapping(raw_model, f"host.models[{index}]")
+        _exact_keys(model, HOST_MODEL_FIELDS, "host model")
+        model_id = _string(model["model_id"], "host model id", maximum=64)
+        if model_id in seen_models:
+            raise RoutingError("invalid_bounds", "host models are duplicated")
+        seen_models.add(model_id)
+        raw_efforts = model["efforts"]
+        if type(raw_efforts) is not list or len(raw_efforts) > 8:
+            raise RoutingError("invalid_bounds", "host model efforts are invalid")
+        models.append(
+            {
+                "model_id": model_id,
+                "status": _enum(model["status"], HOST_STATUSES, "host model status"),
+                "efforts": _normalise_list(
+                    raw_efforts, "host model efforts", _string, 8
+                ),
+            }
+        )
+    models.sort(key=lambda item: item["model_id"])
+    entitlements = _normalise_list(
+        host["entitlements"], "host.entitlements", _string, 1
+    )
+    if any(entitlement not in ENTITLEMENTS for entitlement in entitlements):
+        raise RoutingError("invalid_schema", "host entitlement is invalid")
+    return {
+        "schema": HOST_SCHEMA,
+        "host_id_hash": _hash(host["host_id_hash"], "host.host_id_hash"),
+        "capability_epoch": _integer(
+            host["capability_epoch"], "host.capability_epoch", 0, MAX_31
+        ),
+        "total_slots": total_slots,
+        "model_slot_limits": model_slot_limits,
+        "models": models,
+        "entitlements": entitlements,
+    }
+
+
+def _normalise_task_v5(value: object) -> dict[str, Any]:
+    task = dict(_mapping(value, "task"))
+    _exact_keys(task, TASK_FIELDS, "task")
+    if task.get("schema") != TASK_SCHEMA_V5:
+        raise RoutingError("invalid_schema", "task schema is invalid")
+    task["schema"] = TASK_SCHEMA
+    normalised = _normalise_task(task)
+    normalised["schema"] = TASK_SCHEMA_V5
+    return normalised
+
+
+def _normalise_request_v5(value: object, policy: Mapping[str, Any]) -> dict[str, Any]:
+    request = _mapping(value, "request")
+    _exact_keys(request, REQUEST_FIELDS_V5, "request")
+    if request["schema"] != REQUEST_SCHEMA_V5:
+        raise RoutingError("invalid_schema", "request schema is invalid")
+    if len(_canonical_json(request).encode("utf-8")) > int(
+        _mapping(policy["limits"], "policy limits")["maximum_request_bytes"]
+    ):
+        raise RoutingError("invalid_bounds", "request exceeds the 32 KiB bound")
+    if _hash(request["policy_hash"], "request.policy_hash") != policy_hash_v5(policy):
+        raise RoutingError("invalid_policy_hash", "request binds a different policy")
+    limits = _mapping(policy["limits"], "policy limits")
+    task = _normalise_task_v5(request["task"])
+    dependency = _normalise_dependency(
+        request["dependency_state"], int(limits["maximum_dependency_items"])
+    )
+    scope = _normalise_scope(request["scope_state"], int(limits["maximum_scope_items"]))
+    if task["overlap_count"] != len(scope["conflicting_task_ids"]):
+        raise RoutingError("contradictory_profile", "overlap count does not bind scope")
+    if bool(scope["active_writer_task_ids"]) != (task["overlap_risk"] == "active"):
+        raise RoutingError("contradictory_profile", "active overlap facts disagree")
+    if (
+        not scope["active_writer_task_ids"]
+        and task["overlap_count"] == 0
+        and task["overlap_risk"] != "none"
+    ):
+        raise RoutingError("contradictory_profile", "overlap facts disagree")
+    return {
+        "schema": REQUEST_SCHEMA_V5,
+        "policy_hash": request["policy_hash"],
+        "task": task,
+        "dependency_state": dependency,
+        "scope_state": scope,
+        "scheduler_facts": _normalise_scheduler(request["scheduler_facts"]),
+        "host_capabilities": _normalise_host_v5(request["host_capabilities"], policy),
+        "child_route_attestation": request["child_route_attestation"],
+        "legacy": _normalise_legacy(request["legacy"]),
+    }
+
+
+def _v5_request_binding_hash(request: Mapping[str, Any]) -> str:
+    dependency = _mapping(request["dependency_state"], "dependency_state")
+    scope = _mapping(request["scope_state"], "scope_state")
+    scheduler = _mapping(request["scheduler_facts"], "scheduler_facts")
+    host = _mapping(request["host_capabilities"], "host_capabilities")
+    return _hash_json(
+        {
+            "schema": REQUEST_BINDING_SCHEMA_V5,
+            "policy_hash": request["policy_hash"],
+            "task": request["task"],
+            "dependency_state_hash": dependency["dependency_state_hash"],
+            "owned_scope_state_hash": scope["owned_scope_hash"],
+            "scheduler_facts": scheduler,
+            "host_capability_hash": _hash_json(host),
+            "legacy": request["legacy"],
+        }
+    )
+
+
+def v5_request_binding_hash(value: Mapping[str, Any]) -> str:
+    """Return the pre-attestation V5 binding a host must sign before routing."""
+
+    policy = load_policy_v5()
+    return _v5_request_binding_hash(_normalise_request_v5(value, policy))
+
+
+def _normalise_child_route_attestation_v5(
+    value: object,
+    *,
+    binding_hash: str,
+    host: Mapping[str, Any],
+    scheduler: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a host-issued route tuple and its freshness fence.
+
+    All malformed, stale, or unavailable attestations collapse to the public
+    capability-unavailable state.  A syntactically valid explicit host refusal
+    remains distinguishable so callers do not misrepresent it as a dispatch.
+    """
+
+    try:
+        attestation = _mapping(value, "child_route_attestation")
+        _exact_keys(
+            attestation,
+            CHILD_ROUTE_ATTESTATION_FIELDS,
+            "child_route_attestation",
+        )
+        if attestation["schema"] != CHILD_ROUTE_ATTESTATION_SCHEMA:
+            raise RoutingError("invalid_schema", "child route schema is invalid")
+        supplied_hash = _hash(
+            attestation["attestation_hash"], "child route attestation hash"
+        )
+        unhashed = {
+            key: item for key, item in attestation.items() if key != "attestation_hash"
+        }
+        if supplied_hash != _hash_json(unhashed):
+            raise RoutingError("contradictory_profile", "child route hash is invalid")
+        status = _enum(
+            attestation["status"],
+            frozenset({"attested", "refused"}),
+            "child route status",
+        )
+        if _hash(
+            attestation["request_binding_hash"], "child route request binding"
+        ) != binding_hash:
+            raise RoutingError("contradictory_profile", "child route binding is stale")
+        if _hash(attestation["host_id_hash"], "child route host id") != host["host_id_hash"]:
+            raise RoutingError("contradictory_profile", "child route host is stale")
+        if _integer(
+            attestation["capability_epoch"], "child route capability epoch", 0, MAX_31
+        ) != host["capability_epoch"]:
+            raise RoutingError("contradictory_profile", "child route capability is stale")
+        if _integer(
+            attestation["lease_epoch"], "child route lease epoch", 0, MAX_31
+        ) != scheduler["lease_epoch"]:
+            raise RoutingError("contradictory_profile", "child route lease is stale")
+        issued = _integer(
+            attestation["issued_event_seq"], "child route issued event", 0, MAX_63
+        )
+        expires = _integer(
+            attestation["expires_event_seq"], "child route expiry event", issued, MAX_63
+        )
+        if not issued <= scheduler["event_seq"] <= expires:
+            raise RoutingError("contradictory_profile", "child route event is stale")
+        if _boolean(
+            attestation["inherit_current_session_model"],
+            "child route inherits current session model",
+        ):
+            raise RoutingError("contradictory_profile", "child route cannot inherit")
+        if status == "refused":
+            if (
+                attestation["route"] is not None
+                or attestation["refusal_code"] != "host_model_policy_denied"
+            ):
+                raise RoutingError("invalid_schema", "host refusal is invalid")
+            return {
+                "status": status,
+                "route": None,
+                "attestation_hash": supplied_hash,
+            }
+        if attestation["refusal_code"] is not None:
+            raise RoutingError("invalid_schema", "attested route has a refusal")
+        route = _mapping(attestation["route"], "child route")
+        _exact_keys(route, CHILD_ROUTE_FIELDS, "child route")
+        return {
+            "status": status,
+            "route": {
+                "lane": _enum(route["lane"], CHILD_ROUTE_LANES, "child route lane"),
+                "model": _string(route["model"], "child route model", maximum=64),
+                "effort": _string(route["effort"], "child route effort", maximum=16),
+                "rank": _integer(route["rank"], "child route rank", 1, 110),
+            },
+            "attestation_hash": supplied_hash,
+        }
+    except RoutingError as error:
+        raise RoutingError("capability_unavailable", "child route attestation unavailable") from error
+
+
+def _task_fingerprint_v5(
+    request: Mapping[str, Any], attestation: Mapping[str, Any]
+) -> str:
+    return _hash_json(
+        {
+            "schema": FINGERPRINT_SCHEMA_V5,
+            "request_binding_hash": _v5_request_binding_hash(request),
+            "attestation_hash": attestation["attestation_hash"],
+        }
+    )
+
+
+def _floor_v5(
+    task: Mapping[str, Any], effective_role: str, policy: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    role_floors = _mapping(policy["role_floors"], "policy role floors")
+    sources = [("floor_role", int(role_floors[effective_role]))]
+    sources.extend(_risk_floor_sources(task, effective_role, policy))
+    rank = max(source_rank for _, source_rank in sources)
+    reasons = [code for code, source_rank in sources if source_rank == rank]
+    return {"rank": rank}, list(dict.fromkeys(reasons))
+
+
+def _host_reports_exact_v5(host: Mapping[str, Any], route: Mapping[str, Any]) -> bool:
+    if host["model_slot_limits"][route["lane"]] < 1:
+        return False
+    for raw_model in host["models"]:
+        model = _mapping(raw_model, "host model")
+        if model["model_id"] != route["model"]:
+            continue
+        return model["status"] == "available" and route["effort"] in model["efforts"]
+    return False
+
+
+def _spark_reason_v5(
+    request: Mapping[str, Any],
+    effective_role: str,
+    effective_access: str,
+    floor_rank: int,
+    policy: Mapping[str, Any],
+) -> str | None:
+    task = _mapping(request["task"], "task")
+    scheduler = _mapping(request["scheduler_facts"], "scheduler_facts")
+    host = _mapping(request["host_capabilities"], "host_capabilities")
+    if effective_role not in {"execution", "recovery"} or effective_access != "workspace_write":
+        return "spark_role_excluded"
+    if task["blocker_severity"] != "severe":
+        return "spark_not_severe"
+    if not task["critical_path"]:
+        return "spark_not_critical_path"
+    strike = task["strike"]
+    if strike is None or strike["kind"] != "static_acceptance_blocker":
+        return "spark_not_static_acceptance"
+    if not (strike["feature_green"] or strike["single_bounded_acceptance_gate"]):
+        return "spark_candidate_not_green"
+    if not task["narrow_decoupling_eligible"]:
+        return "spark_scope_not_narrow"
+    if not strike["no_live_competing_writer"]:
+        return "spark_competing_writer"
+    if (
+        strike["max_changed_files"] > 4
+        or strike["max_focused_commands"] > 3
+        or strike["max_strike_minutes"] > 15
+    ):
+        return "spark_exit_not_bounded"
+    if strike["prior_spark_attempts"] != 0:
+        return "spark_prior_attempt"
+    if task["verification_cost"] in {"full_regression", "long_regression"}:
+        return "spark_long_regression"
+    if (
+        task["migration"]
+        or task["destructive"]
+        or task["architecture_conflict"]
+        or task["design_ambiguity"]
+        or scheduler["dispatch_cause"] == "default_refill"
+        or floor_rank > 80
+    ):
+        return "spark_architecture_or_migration"
+    spark_gate = _mapping(policy["spark_gate"], "policy spark gate")
+    if spark_gate["required_entitlement"] not in host["entitlements"]:
+        return "spark_entitlement_unavailable"
+    return None
+
+
+def _terminal_result_v5(
+    raw_request: object,
+    *,
+    status: str,
+    reason: str,
+    parsed: Mapping[str, Any] | None = None,
+    fingerprint: str | None = None,
+    safety_floor: Mapping[str, Any] | None = None,
+    effective_role: str | None = None,
+    effective_access: str | None = None,
+    capability_resolution: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if parsed is not None:
+        task_id = _mapping(parsed["task"], "task")["task_id"]
+        policy_hash = parsed["policy_hash"]
+    else:
+        raw_task = raw_request.get("task") if isinstance(raw_request, Mapping) else None
+        task_id = raw_task.get("task_id") if isinstance(raw_task, Mapping) else ""
+        policy_hash = raw_request.get("policy_hash") if isinstance(raw_request, Mapping) else ""
+        if not isinstance(task_id, str):
+            task_id = ""
+        if not isinstance(policy_hash, str):
+            policy_hash = ""
+    result: dict[str, Any] = {
+        "schema": RESULT_SCHEMA_V5,
+        "status": status,
+        "task_id": task_id,
+        "task_fingerprint": fingerprint or _safe_hash(raw_request),
+        "policy_hash": policy_hash,
+        "safety_floor": None if safety_floor is None else dict(safety_floor),
+        "effective_role": effective_role,
+        "access": effective_access,
+        "route": None,
+        "dispatch": {"state": "not_dispatched", "requires_host_execution": True},
+        "capability_resolution": capability_resolution,
+        "reason_codes": [reason],
+    }
+    result["render_hash"] = _hash_json(
+        {key: value for key, value in result.items() if key != "render_hash"}
+    )
+    return result
+
+
+def _result_v5(
+    *,
+    request: Mapping[str, Any],
+    fingerprint: str,
+    floor: Mapping[str, Any],
+    effective_role: str,
+    effective_access: str,
+    route: Mapping[str, Any],
+    floor_reasons: Sequence[str],
+    attestation_hash: str,
+) -> dict[str, Any]:
+    task = _mapping(request["task"], "task")
+    result: dict[str, Any] = {
+        "schema": RESULT_SCHEMA_V5,
+        "status": "resolved",
+        "task_id": task["task_id"],
+        "task_fingerprint": fingerprint,
+        "policy_hash": request["policy_hash"],
+        "safety_floor": dict(floor),
+        "effective_role": effective_role,
+        "access": effective_access,
+        "route": {**dict(route), "inherit_current_session_model": False},
+        "dispatch": {"state": "not_dispatched", "requires_host_execution": True},
+        "capability_resolution": {
+            "state": "host_attested",
+            "attestation_hash": attestation_hash,
+        },
+        "reason_codes": list(dict.fromkeys(floor_reasons)),
+        "_computed_event_seq": _mapping(request["scheduler_facts"], "scheduler")[
+            "event_seq"
+        ],
+    }
+    result["render_hash"] = _hash_json(
+        {
+            key: value
+            for key, value in result.items()
+            if key not in {"render_hash", "_computed_event_seq"}
+        }
+    )
+    return result
+
+
+def _has_quota_field(value: object) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            "quota" in str(key).casefold() or _has_quota_field(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_has_quota_field(item) for item in value)
+    return False
+
+
+def route_v5(
+    request: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any] | None = None,
+    cache: RouteCache | None = None,
+    trusted_authorization_evidence_hashes: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Compile a host-attested V5 child route without dispatching a session."""
+
+    if (
+        isinstance(request, Mapping)
+        and request.get("schema") in {REQUEST_SCHEMA, REQUEST_SCHEMA_V4}
+        and _has_quota_field(request)
+    ):
+        return _terminal_result_v5(
+            request,
+            status="rejected",
+            reason="FASTLANE_SCHEMA_UPGRADE_REQUIRED",
+        )
+    parsed: dict[str, Any] | None = None
+    fingerprint: str | None = None
+    try:
+        active_policy = (
+            _validate_policy_v5(policy) if policy is not None else load_policy_v5()
+        )
+        parsed = _normalise_request_v5(request, active_policy)
+        scheduler = _mapping(parsed["scheduler_facts"], "scheduler_facts")
+        host = _mapping(parsed["host_capabilities"], "host_capabilities")
+        attestation = _normalise_child_route_attestation_v5(
+            parsed["child_route_attestation"],
+            binding_hash=_v5_request_binding_hash(parsed),
+            host=host,
+            scheduler=scheduler,
+        )
+        fingerprint = _task_fingerprint_v5(parsed, attestation)
+        task = _mapping(parsed["task"], "task")
+        if cache is not None:
+            cached = cache.get(task["task_id"], fingerprint)
+            if cached is not None:
+                return _public_result(cached)
+        if attestation["status"] == "refused":
+            return _terminal_result_v5(
+                request,
+                status="rejected",
+                reason="host_model_policy_denied",
+                parsed=parsed,
+                fingerprint=fingerprint,
+            )
+        dependency = _mapping(parsed["dependency_state"], "dependency_state")
+        if not set(dependency["direct_dependency_ids"]).issubset(
+            dependency["completed_dependency_ids"]
+        ):
+            return _terminal_result_v5(
+                request,
+                status="blocked",
+                reason="dependency_not_ready",
+                parsed=parsed,
+                fingerprint=fingerprint,
+            )
+        scope = _mapping(parsed["scope_state"], "scope_state")
+        if scope["active_writer_task_ids"]:
+            return _terminal_result_v5(
+                request,
+                status="blocked",
+                reason="scope_conflict_active",
+                parsed=parsed,
+                fingerprint=fingerprint,
+            )
+        trusted_authorizations = _trusted_hashes(
+            trusted_authorization_evidence_hashes, "trusted authorization", 32
+        )
+        if task["destructive"] and (
+            task["authorization"] != "approved"
+            or task["authorization_evidence_hash"] is None
+            or task["authorization_evidence_hash"] not in trusted_authorizations
+        ):
+            return _terminal_result_v5(
+                request,
+                status="blocked",
+                reason="destructive_authorization_missing",
+                parsed=parsed,
+                fingerprint=fingerprint,
+            )
+        if scheduler["lease_state"] in {"expired", "invalid", "released"}:
+            return _terminal_result_v5(
+                request,
+                status="blocked",
+                reason="lease_unavailable",
+                parsed=parsed,
+                fingerprint=fingerprint,
+            )
+        effective_role, effective_access, projection_reasons = _effective_dispatch(task)
+        floor, floor_reasons = _floor_v5(task, effective_role, active_policy)
+        route = _mapping(attestation["route"], "attested child route")
+        if int(route["rank"]) < int(floor["rank"]):
+            return _terminal_result_v5(
+                request,
+                status="blocked",
+                reason="host_child_route_below_safety_floor",
+                parsed=parsed,
+                fingerprint=fingerprint,
+                safety_floor=floor,
+                effective_role=effective_role,
+                effective_access=effective_access,
+            )
+        if route["lane"] == "spark":
+            spark_reason = _spark_reason_v5(
+                parsed,
+                effective_role,
+                effective_access,
+                int(floor["rank"]),
+                active_policy,
+            )
+            if spark_reason is not None:
+                return _terminal_result_v5(
+                    request,
+                    status="blocked",
+                    reason=spark_reason,
+                    parsed=parsed,
+                    fingerprint=fingerprint,
+                    safety_floor=floor,
+                    effective_role=effective_role,
+                    effective_access=effective_access,
+                )
+        if not _host_reports_exact_v5(host, route):
+            return _terminal_result_v5(
+                request,
+                status="unavailable",
+                reason="capability_unavailable",
+                parsed=parsed,
+                fingerprint=fingerprint,
+                safety_floor=floor,
+                effective_role=effective_role,
+                effective_access=effective_access,
+                capability_resolution={
+                    "state": "capability_unavailable",
+                    "attestation_reason": "host_capability_no_longer_exact",
+                },
+            )
+        result = _result_v5(
+            request=parsed,
+            fingerprint=fingerprint,
+            floor=floor,
+            effective_role=effective_role,
+            effective_access=effective_access,
+            route=route,
+            floor_reasons=[*projection_reasons, *floor_reasons],
+            attestation_hash=attestation["attestation_hash"],
+        )
+        if cache is not None:
+            cache.put(result)
+        return _public_result(result)
+    except RoutingError as error:
+        status = "unavailable" if error.code == "capability_unavailable" else "rejected"
+        return _terminal_result_v5(
+            request,
+            status=status,
+            reason=error.code,
+            parsed=parsed,
+            fingerprint=fingerprint,
+        )
+    except (KeyError, TypeError, ValueError):
+        return _terminal_result_v5(
             request,
             status="rejected",
             reason="invalid_schema",

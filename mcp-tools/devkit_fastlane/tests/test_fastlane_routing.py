@@ -29,6 +29,13 @@ POLICY_V4_PATH = (
     / "assets"
     / "fastlane-routing-policy-v4.json"
 )
+POLICY_V5_PATH = (
+    ROOT
+    / "mcp-tools"
+    / "devkit_fastlane"
+    / "assets"
+    / "fastlane-routing-policy-v5.json"
+)
 HASH_A = "sha256:" + ("a" * 64)
 HASH_B = "sha256:" + ("b" * 64)
 HASH_C = "sha256:" + ("c" * 64)
@@ -60,6 +67,11 @@ def _policy_hash() -> str:
 def _policy_v4_hash() -> str:
     assert POLICY_V4_PATH.exists(), "the v4 routing policy asset is absent"
     return _canonical_hash(json.loads(POLICY_V4_PATH.read_text(encoding="utf-8")))
+
+
+def _policy_v5_hash() -> str:
+    assert POLICY_V5_PATH.exists(), "the v5 routing policy asset is absent"
+    return _canonical_hash(json.loads(POLICY_V5_PATH.read_text(encoding="utf-8")))
 
 
 def _request() -> dict[str, object]:
@@ -159,6 +171,49 @@ def _request_v4() -> dict[str, object]:
     assert isinstance(task, dict)
     task["schema"] = "2718lab-devkit/task-routing-profile-v4"
     return request
+
+
+def _request_v5() -> dict[str, object]:
+    request = _request()
+    request["schema"] = "2718lab-devkit/fastlane-routing-request-v5"
+    request["policy_hash"] = _policy_v5_hash()
+    task = request["task"]
+    assert isinstance(task, dict)
+    task["schema"] = "2718lab-devkit/task-routing-profile-v5"
+    request["host_capabilities"] = _all_capabilities()
+    request["child_route_attestation"] = None
+    request.pop("override_receipt")
+    return request
+
+
+def _attest_child_route_v5(
+    core: Any,
+    request: dict[str, object],
+    *,
+    route: dict[str, object] | None,
+    status: str = "attested",
+    capability_epoch: int = 1,
+    refusal_code: str | None = None,
+) -> None:
+    scheduler = request["scheduler_facts"]
+    host = request["host_capabilities"]
+    assert isinstance(scheduler, dict)
+    assert isinstance(host, dict)
+    attestation: dict[str, object] = {
+        "schema": "2718lab-devkit/host-child-route-attestation-v1",
+        "status": status,
+        "request_binding_hash": core.v5_request_binding_hash(request),
+        "host_id_hash": host["host_id_hash"],
+        "capability_epoch": capability_epoch,
+        "lease_epoch": scheduler["lease_epoch"],
+        "issued_event_seq": scheduler["event_seq"],
+        "expires_event_seq": scheduler["event_seq"],
+        "route": route,
+        "inherit_current_session_model": False,
+        "refusal_code": refusal_code,
+    }
+    attestation["attestation_hash"] = _canonical_hash(attestation)
+    request["child_route_attestation"] = attestation
 
 
 def _all_capabilities() -> dict[str, object]:
@@ -895,6 +950,161 @@ def test_gate_evidence_identity_is_canonical_and_strict_utc_z() -> None:
     with pytest.raises(core.RoutingError) as exc:
         core.gate_evidence_identity(invalid)
     assert exc.value.code == "invalid_bounds"
+
+
+def test_v5_uses_a_fresh_host_attested_child_tuple_above_terra_without_dispatching() -> (
+    None
+):
+    core = _load_core()
+    request = _request_v5()
+    _attest_child_route_v5(
+        core,
+        request,
+        route={
+            "lane": "sol",
+            "model": "gpt-5.6-sol",
+            "effort": "max",
+            "rank": 110,
+        },
+    )
+
+    result = core.route_v5(request)
+
+    assert result["schema"] == "2718lab-devkit/fastlane-routing-result-v5"
+    assert result["status"] == "resolved"
+    assert result["route"] == {
+        "lane": "sol",
+        "model": "gpt-5.6-sol",
+        "effort": "max",
+        "rank": 110,
+        "inherit_current_session_model": False,
+    }
+    assert result["dispatch"] == {
+        "state": "not_dispatched",
+        "requires_host_execution": True,
+    }
+    assert result["capability_resolution"]["state"] == "host_attested"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "status", "reason"),
+    [
+        (
+            lambda core, request: request.__setitem__("child_route_attestation", None),
+            "unavailable",
+            "capability_unavailable",
+        ),
+        (
+            lambda core, request: request.__setitem__(
+                "child_route_attestation", {"schema": "not-an-attestation"}
+            ),
+            "unavailable",
+            "capability_unavailable",
+        ),
+        (
+            lambda core, request: _attest_child_route_v5(
+                core,
+                request,
+                route={
+                    "lane": "terra",
+                    "model": "gpt-5.6-terra",
+                    "effort": "high",
+                    "rank": 60,
+                },
+                capability_epoch=2,
+            ),
+            "unavailable",
+            "capability_unavailable",
+        ),
+        (
+            lambda core, request: _attest_child_route_v5(
+                core,
+                request,
+                route=None,
+                status="refused",
+                refusal_code="host_model_policy_denied",
+            ),
+            "rejected",
+            "host_model_policy_denied",
+        ),
+    ],
+)
+def test_v5_missing_stale_or_refused_host_attestation_fails_closed(
+    mutate: Any, status: str, reason: str
+) -> None:
+    core = _load_core()
+    request = _request_v5()
+    mutate(core, request)
+
+    result = core.route_v5(request)
+
+    assert result["status"] == status
+    assert result["route"] is None
+    assert result["reason_codes"] == [reason]
+
+
+def test_v5_blocks_an_attested_child_below_the_role_or_risk_floor() -> None:
+    core = _load_core()
+    request = _request_v5()
+    task = request["task"]
+    assert isinstance(task, dict)
+    task["security_sensitive"] = True
+    _attest_child_route_v5(
+        core,
+        request,
+        route={
+            "lane": "terra",
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "rank": 60,
+        },
+    )
+
+    result = core.route_v5(request)
+
+    assert result["status"] == "blocked"
+    assert result["route"] is None
+    assert result["reason_codes"] == ["host_child_route_below_safety_floor"]
+
+
+def test_v5_keeps_the_spark_gate_even_when_the_host_attests_a_spark_tuple() -> None:
+    core = _load_core()
+    request = _request_v5()
+    _attest_child_route_v5(
+        core,
+        request,
+        route={
+            "lane": "spark",
+            "model": "gpt-5.3-codex-spark",
+            "effort": "medium",
+            "rank": 110,
+        },
+    )
+
+    result = core.route_v5(request)
+
+    assert result["status"] == "blocked"
+    assert result["reason_codes"] == ["spark_not_severe"]
+
+
+@pytest.mark.parametrize(
+    ("compiler_name", "request_factory"),
+    [("route", _request), ("route_v4", _request_v4), ("route_v5", _request)],
+)
+def test_quota_bearing_v3_or_v4_requests_require_an_explicit_schema_upgrade(
+    compiler_name: str, request_factory: Any
+) -> None:
+    core = _load_core()
+    request = request_factory()
+    scheduler = request["scheduler_facts"]
+    assert isinstance(scheduler, dict)
+    scheduler["quota_remaining"] = 1
+
+    result = getattr(core, compiler_name)(request)
+
+    assert result["status"] == "rejected"
+    assert result["route"] is None
+    assert result["reason_codes"] == ["FASTLANE_SCHEMA_UPGRADE_REQUIRED"]
 
 
 def test_routing_core_ast_has_no_outbound_model_or_spawn_surface() -> None:
