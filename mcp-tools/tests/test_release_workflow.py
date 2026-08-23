@@ -131,9 +131,7 @@ def test_ci_workflow_is_mcp_only_and_uses_runner_local_fast_lane_storage() -> No
 def test_ci_and_release_static_checks_cover_continuity_runtime() -> None:
     workflows = (
         (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
-        (ROOT / ".github" / "workflows" / "release.yml").read_text(
-            encoding="utf-8"
-        ),
+        (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"),
     )
 
     for workflow in workflows:
@@ -150,3 +148,27 @@ def test_workflow_test_tool_versions_are_pinned() -> None:
 
     assert "pytest==9.1.1" in continuous_integration
     assert "pytest==9.1.1" in release
+
+
+def test_fast_lane_workflows_use_current_routing_contract_without_quota_paths() -> None:
+    workflows = (
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
+        (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"),
+    )
+
+    for workflow in workflows:
+        assert "scripts/team_efficiency.py" in workflow
+        assert "scripts/fastlane_routing.py" in workflow
+        assert "tests/test_team_efficiency.py" in workflow
+        assert "tests/test_fastlane_routing.py" in workflow
+        assert "quota" not in workflow.casefold()
+
+    assert "uv lock --check" in workflows[0]
+    assert "uv lock --check" in workflows[1]
+    assert "unzip -t" in workflows[0]
+    assert "sha256sum" in workflows[0]
+    assert "if-no-files-found: error" in workflows[0]
+    assert "persist-credentials: false" in workflows[1]
+    assert "gh release create" in workflows[1]
+    assert "$env:RUNNER_TEMP" in workflows[0]
+    assert "$env:RUNNER_TEMP" in workflows[1]

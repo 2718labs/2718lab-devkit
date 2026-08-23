@@ -34,18 +34,15 @@ EXPECTED_FILES = (
     "mcp-tools/uv.lock",
     "mcp-tools/devkit_fastlane/__init__.py",
     "mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md",
-    "mcp-tools/devkit_fastlane/assets/fastlane-quota-balance-policy-v1.json",
-    "mcp-tools/devkit_fastlane/assets/fastlane-quota-balance-policy-v2.json",
     "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v3.json",
     "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v4.json",
+    "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v5.json",
     "mcp-tools/devkit_fastlane/references/efficiency-automation.md",
     "mcp-tools/devkit_fastlane/references/grounding-discipline.md",
     "mcp-tools/devkit_fastlane/references/orchestration-runtime.md",
     "mcp-tools/devkit_fastlane/references/team-patterns.md",
     "mcp-tools/devkit_fastlane/references/verification-checklist.md",
     "mcp-tools/devkit_fastlane/references/work-packages.md",
-    "mcp-tools/devkit_fastlane/scripts/codex_account_quota.py",
-    "mcp-tools/devkit_fastlane/scripts/fastlane_quota_balance.py",
     "mcp-tools/devkit_fastlane/scripts/fastlane_routing.py",
     "mcp-tools/devkit_fastlane/scripts/team_efficiency.py",
 )
@@ -170,6 +167,8 @@ def test_primary_allowlist_is_explicit_and_runtime_only() -> None:
     assert tuple(allowlist["files"]) == EXPECTED_FILES
     assert tuple(allowlist["trees"]) == EXPECTED_TREES
     serialized = json.dumps(allowlist, ensure_ascii=False).casefold()
+    assert "fastlane-routing-policy-v5.json" in serialized
+    assert "quota" not in serialized
     for excluded in (
         "tests",
         "__pycache__",
@@ -216,14 +215,14 @@ def test_python_project_and_lock_use_pep440_stable_v1_metadata() -> None:
 
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == "1.0.0"
+    assert project["project"]["version"] == "1.1.0"
     assert project["project"]["dependencies"] == ["mcp[cli]>=1,<2"]
     assert "devkit_atlas" in project["tool"]["pyright"]["include"]
     assert "devkit_runtime" in project["tool"]["pyright"]["include"]
     assert "code_atlas" not in project["tool"]["pyright"]["include"]
     lock_text = lock_path.read_text(encoding="utf-8")
     assert 'name = "2718lab-devkit-mcp"' in lock_text
-    assert 'version = "1.0.0"' in lock_text
+    assert 'version = "1.1.0"' in lock_text
 
 
 def test_two_builds_are_byte_identical_with_normalized_zip_metadata(

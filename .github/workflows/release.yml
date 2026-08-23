@@ -247,29 +247,29 @@ jobs:
         run: >-
           python -m ruff check --select E,F --ignore E501
           scripts/team_efficiency.py
-          scripts/fastlane_quota_balance.py
+          scripts/fastlane_routing.py
           tests/test_team_efficiency.py
-          tests/test_fastlane_quota_balance.py
+          tests/test_fastlane_routing.py
 
       - name: Ruff format check
         run: >-
           python -m ruff format --check
           scripts/team_efficiency.py
-          scripts/fastlane_quota_balance.py
+          scripts/fastlane_routing.py
           tests/test_team_efficiency.py
-          tests/test_fastlane_quota_balance.py
+          tests/test_fastlane_routing.py
 
       - name: Syntax check
         run: >-
           python -m py_compile
           scripts/team_efficiency.py
-          scripts/fastlane_quota_balance.py
+          scripts/fastlane_routing.py
 
       - name: Test
         run: >-
           python -m pytest -q
           tests/test_team_efficiency.py
-          tests/test_fastlane_quota_balance.py
+          tests/test_fastlane_routing.py
 
   publish:
     name: Create GitHub Release
