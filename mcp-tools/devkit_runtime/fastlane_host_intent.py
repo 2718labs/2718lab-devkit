@@ -17,7 +17,7 @@ NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 UNSPLITTABLE: Final = "UNSPLITTABLE"
 
 _SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
-_TOPOLOGY_SCHEMA: Final = "2718lab-devkit/scheduler-topology-v1"
+_HOST_TOPOLOGY_SCHEMA: Final = "2718lab-devkit/host-scheduler-topology-v1"
 _PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v2"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _GIT_OBJECT_PATTERN: Final = re.compile(r"[0-9a-f]{40}\Z")
@@ -140,14 +140,25 @@ _LEASE_KEYS: Final = frozenset(
         "lease_binding_hash",
     }
 )
-_TOPOLOGY_KEYS: Final = frozenset({"schema", "plan_hash", "groups", "topology_hash"})
-_TOPOLOGY_GROUP_KEYS: Final = frozenset(
+_HOST_TOPOLOGY_KEYS: Final = frozenset(
+    {
+        "schema",
+        "relay_plan_hash",
+        "relay_topology_hash",
+        "groups",
+        "projection_hash",
+    }
+)
+_HOST_TOPOLOGY_GROUP_KEYS: Final = frozenset(
     {
         "scheduler_id",
         "coordinator_lease_id",
         "worktree_identity",
         "writer_task_ids",
         "prewarm_task_ids",
+        "relay_group_binding_hash",
+        "attested_capacity",
+        "attestation_hash",
         "group_binding_hash",
     }
 )
@@ -262,25 +273,29 @@ class ParsedHostExecutionIntent:
 
 
 @dataclass(frozen=True, slots=True)
-class ParsedSchedulerTopologyGroup:
-    """One hash-bound scheduler group, carrying no path or quota material."""
+class ParsedHostSchedulerTopologyGroup:
+    """One Host projection group, bound to Relay evidence and Host capacity."""
 
     scheduler_id: str
     coordinator_lease_id: str
     worktree_identity: str
     writer_task_ids: tuple[str, ...]
     prewarm_task_ids: tuple[str, ...]
+    relay_group_binding_hash: str
+    attested_capacity: int
+    attestation_hash: str
     group_binding_hash: str
 
 
 @dataclass(frozen=True, slots=True)
-class ParsedSchedulerTopologyIntent:
-    """Non-authorizing Topology V1 projection for private host resolution."""
+class ParsedHostSchedulerTopologyProjection:
+    """Non-authorizing Host-only envelope for private topology resolution."""
 
     schema: str
-    plan_hash: str
-    groups: tuple[ParsedSchedulerTopologyGroup, ...]
-    topology_hash: str
+    relay_plan_hash: str
+    relay_topology_hash: str
+    groups: tuple[ParsedHostSchedulerTopologyGroup, ...]
+    projection_hash: str
 
 
 def validate_host_execution_intent(
@@ -310,22 +325,24 @@ def parse_host_execution_intent(
     return parsed if parsed is not None else NO_SAFE_WORK
 
 
-def parse_scheduler_topology_intent(
+def parse_host_scheduler_topology_projection(
     candidate: object,
-) -> ParsedSchedulerTopologyIntent | Literal["NO_SAFE_WORK"]:
-    """Parse an opaque Topology V1 plan; it cannot create a writer lease."""
+) -> ParsedHostSchedulerTopologyProjection | Literal["NO_SAFE_WORK"]:
+    """Parse only the Host projection; Relay envelopes never cross this boundary."""
 
     try:
-        parsed = _parse_scheduler_topology(candidate)
+        parsed = _parse_host_scheduler_topology_projection(candidate)
     except Exception:
         return NO_SAFE_WORK
     return parsed if parsed is not None else NO_SAFE_WORK
 
 
-def classify_scheduler_topology(candidate: object) -> ParsedSchedulerTopologyIntent | str:
-    """Make scope conflicts explicit without treating public data as authority."""
+def classify_host_scheduler_topology(
+    candidate: object,
+) -> ParsedHostSchedulerTopologyProjection | str:
+    """Classify only a Host projection without treating it as authority."""
 
-    parsed = parse_scheduler_topology_intent(candidate)
+    parsed = parse_host_scheduler_topology_projection(candidate)
     return parsed if parsed != NO_SAFE_WORK else UNSPLITTABLE
 
 
@@ -535,30 +552,39 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
     )
 
 
-def _parse_scheduler_topology(
+def _parse_host_scheduler_topology_projection(
     candidate: object,
-) -> ParsedSchedulerTopologyIntent | None:
-    root = _bound_mapping(candidate, _TOPOLOGY_KEYS, "topology_hash")
-    if root is None or _text(root, "schema") != _TOPOLOGY_SCHEMA:
+) -> ParsedHostSchedulerTopologyProjection | None:
+    root = _bound_mapping(candidate, _HOST_TOPOLOGY_KEYS, "projection_hash")
+    if root is None or _text(root, "schema") != _HOST_TOPOLOGY_SCHEMA:
         return None
-    plan_hash = _valid_hash(root, "plan_hash")
+    relay_plan_hash = _valid_hash(root, "relay_plan_hash")
+    relay_topology_hash = _valid_hash(root, "relay_topology_hash")
     raw_groups = root["groups"]
-    if plan_hash is None or type(raw_groups) is not list or not 1 <= len(raw_groups) <= 9:
+    if (
+        relay_plan_hash is None
+        or relay_topology_hash is None
+        or type(raw_groups) is not list
+        or not 1 <= len(raw_groups) <= 9
+    ):
         return None
-    groups: list[ParsedSchedulerTopologyGroup] = []
+    groups: list[ParsedHostSchedulerTopologyGroup] = []
     scheduler_ids: set[str] = set()
     lease_ids: set[str] = set()
     worktree_ids: set[str] = set()
     writer_ids: set[str] = set()
     for raw_group in raw_groups:
         group = _bound_mapping(
-            raw_group, _TOPOLOGY_GROUP_KEYS, "group_binding_hash"
+            raw_group, _HOST_TOPOLOGY_GROUP_KEYS, "group_binding_hash"
         )
         if group is None:
             return None
         scheduler_id = _valid_identifier(group, "scheduler_id")
         coordinator_lease_id = _valid_opaque_identity(group, "coordinator_lease_id")
         worktree_identity = _valid_opaque_identity(group, "worktree_identity")
+        relay_group_binding_hash = _valid_hash(group, "relay_group_binding_hash")
+        attested_capacity = _positive_int(group, "attested_capacity")
+        attestation_hash = _valid_hash(group, "attestation_hash")
         group_binding_hash = _valid_hash(group, "group_binding_hash")
         writer_task_ids = _identifier_tuple(group["writer_task_ids"], maximum=3)
         prewarm_task_ids = _identifier_tuple(group["prewarm_task_ids"], maximum=16)
@@ -566,10 +592,15 @@ def _parse_scheduler_topology(
             scheduler_id is None
             or coordinator_lease_id is None
             or worktree_identity is None
+            or relay_group_binding_hash is None
+            or attested_capacity is None
+            or not 1 <= attested_capacity <= 3
+            or attestation_hash is None
             or group_binding_hash is None
             or writer_task_ids is None
             or prewarm_task_ids is None
             or not writer_task_ids
+            or len(writer_task_ids) > attested_capacity
             or set(writer_task_ids).intersection(prewarm_task_ids)
             or scheduler_id in scheduler_ids
             or coordinator_lease_id in lease_ids
@@ -582,25 +613,29 @@ def _parse_scheduler_topology(
         worktree_ids.add(worktree_identity)
         writer_ids.update(writer_task_ids)
         groups.append(
-            ParsedSchedulerTopologyGroup(
+            ParsedHostSchedulerTopologyGroup(
                 scheduler_id=scheduler_id,
                 coordinator_lease_id=coordinator_lease_id,
                 worktree_identity=worktree_identity,
                 writer_task_ids=writer_task_ids,
                 prewarm_task_ids=prewarm_task_ids,
+                relay_group_binding_hash=relay_group_binding_hash,
+                attested_capacity=attested_capacity,
+                attestation_hash=attestation_hash,
                 group_binding_hash=group_binding_hash,
             )
         )
     if len(writer_ids) > 9:
         return None
-    topology_hash = _valid_hash(root, "topology_hash")
-    if topology_hash is None:
+    projection_hash = _valid_hash(root, "projection_hash")
+    if projection_hash is None:
         return None
-    return ParsedSchedulerTopologyIntent(
-        schema=_TOPOLOGY_SCHEMA,
-        plan_hash=plan_hash,
+    return ParsedHostSchedulerTopologyProjection(
+        schema=_HOST_TOPOLOGY_SCHEMA,
+        relay_plan_hash=relay_plan_hash,
+        relay_topology_hash=relay_topology_hash,
         groups=tuple(groups),
-        topology_hash=topology_hash,
+        projection_hash=projection_hash,
     )
 
 

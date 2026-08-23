@@ -113,13 +113,13 @@ def _with_binding(value: dict[str, object], field: str) -> dict[str, object]:
     return bound
 
 
-def _topology() -> object:
-    groups = []
+def _topology(*, capacities: tuple[int, int] = (2, 1)) -> object:
+    relay_groups = []
     for scheduler_id, worktree_identity, writers, prewarm in (
         ("scheduler-a", "wt-a", ["writer-a"], ["prewarm-a"]),
         ("scheduler-b", "wt-b", ["writer-b"], []),
     ):
-        groups.append(
+        relay_groups.append(
             _with_binding(
                 {
                     "scheduler_id": scheduler_id,
@@ -131,16 +131,49 @@ def _topology() -> object:
                 "group_binding_hash",
             )
         )
-    from devkit_runtime.fastlane_host_intent import parse_scheduler_topology_intent
+    relay_topology = _with_binding(
+        {
+            "schema": "2718lab-devkit/scheduler-topology-v1",
+            "plan_hash": _hash({"plan": "topology"}),
+            "groups": relay_groups,
+        },
+        "topology_hash",
+    )
+    groups = []
+    for relay_group, capacity, attestation in zip(
+        relay_groups,
+        capacities,
+        (_hash({"attestation": "a"}), _hash({"attestation": "b"})),
+        strict=True,
+    ):
+        groups.append(
+            _with_binding(
+                {
+                    "scheduler_id": relay_group["scheduler_id"],
+                    "coordinator_lease_id": relay_group["coordinator_lease_id"],
+                    "worktree_identity": relay_group["worktree_identity"],
+                    "writer_task_ids": relay_group["writer_task_ids"],
+                    "prewarm_task_ids": relay_group["prewarm_task_ids"],
+                    "relay_group_binding_hash": relay_group["group_binding_hash"],
+                    "attested_capacity": capacity,
+                    "attestation_hash": attestation,
+                },
+                "group_binding_hash",
+            )
+        )
+    from devkit_runtime.fastlane_host_intent import (
+        parse_host_scheduler_topology_projection,
+    )
 
-    return parse_scheduler_topology_intent(
+    return parse_host_scheduler_topology_projection(
         _with_binding(
             {
-                "schema": "2718lab-devkit/scheduler-topology-v1",
-                "plan_hash": _hash({"plan": "topology"}),
+                "schema": "2718lab-devkit/host-scheduler-topology-v1",
+                "relay_plan_hash": relay_topology["plan_hash"],
+                "relay_topology_hash": relay_topology["topology_hash"],
                 "groups": groups,
             },
-            "topology_hash",
+            "projection_hash",
         )
     )
 
@@ -175,18 +208,24 @@ def test_topology_resolution_only_returns_attested_opaque_worktree_capacity() ->
         host.close()
 
     assert isinstance(resolved, host_session.HostResolvedSchedulerTopology)
+    assert resolved.schema == "2718lab-devkit/host-scheduler-topology-v1"
+    assert resolved.relay_plan_hash.startswith(_HASH_PREFIX)
+    assert resolved.relay_topology_hash.startswith(_HASH_PREFIX)
+    assert resolved.projection_hash.startswith(_HASH_PREFIX)
     assert resolved.groups[0].worktree_identity == "wt-a"
     assert resolved.groups[0].attested_capacity == 2
     assert resolved.groups[0].writer_task_ids == ("writer-a",)
     assert resolved.groups[0].prewarm_task_ids == ("prewarm-a",)
+    assert resolved.groups[0].relay_group_binding_hash.startswith(_HASH_PREFIX)
+    assert resolved.groups[0].group_binding_hash.startswith(_HASH_PREFIX)
     assert resolved.audit_binding_hash.startswith(_HASH_PREFIX)
     assert "path" not in repr(resolved).lower()
     assert "quota" not in repr(resolved).lower()
     assert "model" not in repr(resolved).lower()
 
 
-def test_topology_resolution_rejects_prewarm_when_it_exceeds_host_capacity() -> None:
-    topology = _topology()
+def test_topology_resolution_does_not_spend_writer_capacity_on_prewarm() -> None:
+    topology = _topology(capacities=(1, 1))
     session, child, host = _compiler_session(
         provider=lambda preparation: preparation,
         topology_resolver=lambda _topology: (
@@ -205,10 +244,15 @@ def test_topology_resolution_rejects_prewarm_when_it_exceeds_host_capacity() -> 
         ),
     )
     try:
-        assert session.resolve_scheduler_topology(topology) == "NO_SAFE_WORK"
+        resolved = session.resolve_scheduler_topology(topology)
     finally:
         child.close()
         host.close()
+
+    assert isinstance(resolved, host_session.HostResolvedSchedulerTopology)
+    assert resolved.groups[0].attested_capacity == 1
+    assert resolved.groups[0].prewarm_task_ids == ("prewarm-a",)
+    assert not hasattr(resolved.groups[0], "writer_lease")
 
 
 def test_host_session_missing_or_invalid_inherited_bridge_stays_unavailable(

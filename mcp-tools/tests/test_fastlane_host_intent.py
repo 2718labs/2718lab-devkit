@@ -321,12 +321,44 @@ def _topology() -> dict[str, Any]:
     return _with_binding(candidate, "topology_hash")
 
 
-def test_topology_v1_parser_keeps_only_opaque_auditable_group_bindings() -> None:
+def _host_topology() -> dict[str, Any]:
+    relay_topology = _topology()
+    groups = []
+    for relay_group in relay_topology["groups"]:
+        groups.append(
+            _with_binding(
+                {
+                    "scheduler_id": relay_group["scheduler_id"],
+                    "coordinator_lease_id": relay_group["coordinator_lease_id"],
+                    "worktree_identity": relay_group["worktree_identity"],
+                    "writer_task_ids": relay_group["writer_task_ids"],
+                    "prewarm_task_ids": relay_group["prewarm_task_ids"],
+                    "relay_group_binding_hash": relay_group["group_binding_hash"],
+                    "attested_capacity": 3,
+                    "attestation_hash": _hash(
+                        f"host-capacity-{relay_group['scheduler_id']}"
+                    ),
+                },
+                "group_binding_hash",
+            )
+        )
+    return _with_binding(
+        {
+            "schema": "2718lab-devkit/host-scheduler-topology-v1",
+            "relay_plan_hash": relay_topology["plan_hash"],
+            "relay_topology_hash": relay_topology["topology_hash"],
+            "groups": groups,
+        },
+        "projection_hash",
+    )
+
+
+def test_host_topology_projection_keeps_only_opaque_auditable_group_bindings() -> None:
     module = _module()
 
-    parsed = module.parse_scheduler_topology_intent(_topology())
+    parsed = module.parse_host_scheduler_topology_projection(_host_topology())
 
-    assert parsed.schema == "2718lab-devkit/scheduler-topology-v1"
+    assert parsed.schema == "2718lab-devkit/host-scheduler-topology-v1"
     assert parsed.groups[0].scheduler_id == "scheduler-a"
     assert parsed.groups[0].coordinator_lease_id == "lease-scheduler-a"
     assert parsed.groups[0].worktree_identity == "wt-a"
@@ -335,6 +367,41 @@ def test_topology_v1_parser_keeps_only_opaque_auditable_group_bindings() -> None
     assert "path" not in repr(parsed).lower()
     assert "quota" not in repr(parsed).lower()
     assert "model" not in repr(parsed).lower()
+
+
+def test_host_topology_projection_requires_its_exact_schema_and_rejects_relay_v1() -> None:
+    module = _module()
+    relay_topology = _topology()
+    host_group = _with_binding(
+        {
+            "scheduler_id": "scheduler-a",
+            "coordinator_lease_id": "lease-scheduler-a",
+            "worktree_identity": "wt-a",
+            "writer_task_ids": ["writer-a"],
+            "prewarm_task_ids": ["prewarm-a"],
+            "relay_group_binding_hash": relay_topology["groups"][0]["group_binding_hash"],
+            "attested_capacity": 1,
+            "attestation_hash": _hash("host-capacity-a"),
+        },
+        "group_binding_hash",
+    )
+    host_projection = _with_binding(
+        {
+            "schema": "2718lab-devkit/host-scheduler-topology-v1",
+            "relay_plan_hash": relay_topology["plan_hash"],
+            "relay_topology_hash": relay_topology["topology_hash"],
+            "groups": [host_group],
+        },
+        "projection_hash",
+    )
+
+    parsed = module.parse_host_scheduler_topology_projection(host_projection)
+
+    assert isinstance(parsed, module.ParsedHostSchedulerTopologyProjection)
+    assert parsed.schema == "2718lab-devkit/host-scheduler-topology-v1"
+    assert parsed.relay_plan_hash == relay_topology["plan_hash"]
+    assert parsed.groups[0].relay_group_binding_hash == relay_topology["groups"][0]["group_binding_hash"]
+    assert module.parse_host_scheduler_topology_projection(relay_topology) is module.NO_SAFE_WORK
 
 
 @pytest.mark.parametrize(
@@ -358,14 +425,17 @@ def test_topology_v1_rejects_writer_conflicts_and_nonopaque_worktree_data(
     mutate: Any,
 ) -> None:
     module = _module()
-    topology = _topology()
+    topology = _host_topology()
     mutate(topology)
     topology["groups"] = [
         _with_binding(group, "group_binding_hash") for group in topology["groups"]
     ]
-    topology = _with_binding(topology, "topology_hash")
+    topology = _with_binding(topology, "projection_hash")
 
-    assert module.parse_scheduler_topology_intent(topology) is module.NO_SAFE_WORK
+    assert (
+        module.parse_host_scheduler_topology_projection(topology)
+        is module.NO_SAFE_WORK
+    )
 
 
 def test_public_validation_is_hard_gated_for_every_public_expectation() -> None:

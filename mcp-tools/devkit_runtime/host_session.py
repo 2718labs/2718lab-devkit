@@ -97,17 +97,20 @@ class HostResolvedTopologyGroup:
     worktree_identity: str
     writer_task_ids: tuple[str, ...]
     prewarm_task_ids: tuple[str, ...]
+    relay_group_binding_hash: str
     attested_capacity: int
     attestation_hash: str
+    group_binding_hash: str
 
 
 @dataclass(frozen=True)
 class HostResolvedSchedulerTopology:
-    """Private host resolution of an already parsed Topology V1 plan."""
+    """Private Host-only resolution of an already parsed Host projection."""
 
     schema: str
-    plan_hash: str
-    topology_hash: str
+    relay_plan_hash: str
+    relay_topology_hash: str
+    projection_hash: str
     groups: tuple[HostResolvedTopologyGroup, ...]
     audit_binding_hash: str
 
@@ -361,9 +364,9 @@ class HostSession:
     def resolve_scheduler_topology(
         self, topology: object
     ) -> HostResolvedSchedulerTopology | str:
-        """Bind an opaque V1 plan to host-attested capacity, never dispatching it."""
+        """Resolve a Host-only projection against private capacity facts."""
 
-        from .fastlane_host_intent import ParsedSchedulerTopologyIntent
+        from .fastlane_host_intent import ParsedHostSchedulerTopologyProjection
 
         with self._compiler_evidence_lock:
             resolver = self._topology_fact_resolver
@@ -371,7 +374,7 @@ class HostSession:
                 self._closed
                 or self._frozen
                 or not self.is_available
-                or type(topology) is not ParsedSchedulerTopologyIntent
+                or type(topology) is not ParsedHostSchedulerTopologyProjection
                 or resolver is None
             ):
                 return _NO_SAFE_WORK
@@ -392,20 +395,18 @@ class HostSession:
                         raise ValueError("topology fact is invalid")
                     facts_by_scheduler[fact.scheduler_id] = fact
                 groups: list[HostResolvedTopologyGroup] = []
-                total_active_tasks = 0
+                total_writer_tasks = 0
                 for group in topology.groups:
                     fact = facts_by_scheduler.get(group.scheduler_id)
-                    active_tasks = len(group.writer_task_ids) + len(
-                        group.prewarm_task_ids
-                    )
                     if (
                         fact is None
                         or fact.worktree_identity != group.worktree_identity
-                        or len(group.writer_task_ids) > 3
-                        or active_tasks > fact.attested_capacity
+                        or fact.attested_capacity != group.attested_capacity
+                        or fact.attestation_hash != group.attestation_hash
+                        or len(group.writer_task_ids) > group.attested_capacity
                     ):
                         raise ValueError("topology capacity is invalid")
-                    total_active_tasks += active_tasks
+                    total_writer_tasks += len(group.writer_task_ids)
                     groups.append(
                         HostResolvedTopologyGroup(
                             scheduler_id=group.scheduler_id,
@@ -413,17 +414,20 @@ class HostSession:
                             worktree_identity=group.worktree_identity,
                             writer_task_ids=group.writer_task_ids,
                             prewarm_task_ids=group.prewarm_task_ids,
+                            relay_group_binding_hash=group.relay_group_binding_hash,
                             attested_capacity=fact.attested_capacity,
                             attestation_hash=fact.attestation_hash,
+                            group_binding_hash=group.group_binding_hash,
                         )
                     )
-                if total_active_tasks > 9:
+                if total_writer_tasks > 9:
                     raise ValueError("topology exceeds host capacity")
                 audit_binding_hash = _hash(
                     {
                         "schema": topology.schema,
-                        "plan_hash": topology.plan_hash,
-                        "topology_hash": topology.topology_hash,
+                        "relay_plan_hash": topology.relay_plan_hash,
+                        "relay_topology_hash": topology.relay_topology_hash,
+                        "projection_hash": topology.projection_hash,
                         "groups": [
                             {
                                 "scheduler_id": group.scheduler_id,
@@ -431,8 +435,10 @@ class HostSession:
                                 "worktree_identity": group.worktree_identity,
                                 "writer_task_ids": group.writer_task_ids,
                                 "prewarm_task_ids": group.prewarm_task_ids,
+                                "relay_group_binding_hash": group.relay_group_binding_hash,
                                 "attested_capacity": group.attested_capacity,
                                 "attestation_hash": group.attestation_hash,
+                                "group_binding_hash": group.group_binding_hash,
                             }
                             for group in groups
                         ],
@@ -442,8 +448,9 @@ class HostSession:
                 return _NO_SAFE_WORK
             return HostResolvedSchedulerTopology(
                 schema=topology.schema,
-                plan_hash=topology.plan_hash,
-                topology_hash=topology.topology_hash,
+                relay_plan_hash=topology.relay_plan_hash,
+                relay_topology_hash=topology.relay_topology_hash,
+                projection_hash=topology.projection_hash,
                 groups=tuple(groups),
                 audit_binding_hash=audit_binding_hash,
             )
