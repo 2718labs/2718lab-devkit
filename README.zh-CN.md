@@ -1,14 +1,14 @@
 [English](README.md)
 
-# 2718lab DevKit —— Codex + MCP v1.1.0
+# 2718lab DevKit —— Codex + MCP v1.1.1
 
-[![版本](https://img.shields.io/badge/version-v1.1.0-blue)](./.codex-plugin/plugin.json)
+[![版本](https://img.shields.io/badge/version-v1.1.1-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit 是一个 Codex-first 工程工具包：它包含一个本地、仅 stdio
 传输的 MCP 运行时，用于有边界的项目索引、Atlas 证据、Relay 生命周期协调和
 确定性的 Fast Lane 规划；同时还包含一组精简的 Skill 说明书。本仓库承载版本化的
-v1.1.0 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
+v1.1.1 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
 安装、构建和验证章节共同给出支持的工作流。
 
 当前版本保留刻意 fail-closed 的 Fast Lane 预览。公共编译器和 CLI 固定返回
@@ -160,7 +160,7 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.0.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.1.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
@@ -228,6 +228,14 @@ review、verification、integration receipt 时，宿主才可记录
 任一门槛/证据缺失时，相关材料必须永久保留，直到另有明确且独立授权的清理
 策略。
 
+派生的项目索引快照使用独立的两阶段维护命令。先运行
+`uv run python -m devkit_runtime.index_maintenance preview`，检查完整候选集与
+保护集；确认后再把未变化的 identity 传给
+`uv run python -m devkit_runtime.index_maintenance apply --preview-id <id>`。
+Apply 会持有 Orchestrator 写围栏、重新核验跨数据库快照引用、为每个工作区保留
+最新两代，并且每批最多删除 32 个候选。preview 过期、schema 缺失、锁失败或
+引用无效都会零删除并关闭失败。Atlas 数据永远不属于索引清理目标。
+
 本地 Windows 的 `C:/` 和所有非 `G:/` 临时根、worktree、cache、evidence
 路径都禁止使用；可信 hosted Windows CI 仅可把宿主提供的 `RUNNER_TEMP`
 作为明确例外，并在其下派生所有任务临时/缓存路径。该例外不构成外部宿主
@@ -279,7 +287,7 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 ## 版本
 
-本仓库代表版本化的 v1.1.0 包。发布说明见
+本仓库代表版本化的 v1.1.1 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
 和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
 后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。

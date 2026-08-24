@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
@@ -20,6 +21,9 @@ from .models import (
     IndexEdge,
     IndexError,
     IndexNode,
+    IndexRetentionApply,
+    IndexRetentionCandidate,
+    IndexRetentionPreview,
     IndexSnapshot,
     IndexState,
     PackageDescriptor,
@@ -804,6 +808,261 @@ class ProjectIndexStore:
             for row in rows
         )
 
+    def preview_retention(
+        self, protected_snapshot_ids: Sequence[str] = ()
+    ) -> IndexRetentionPreview:
+        """Compute a conservative snapshot-release plan without mutating storage."""
+
+        try:
+            return self._retention_preview(
+                self._connection.cursor(), protected_snapshot_ids
+            )
+        except (sqlite3.DatabaseError, StoreError):
+            return IndexRetentionPreview(
+                preview_id=None,
+                candidates=(),
+                protected_snapshot_ids=(),
+                blocked_reason="RETENTION_REFERENCE_SCHEMA_UNAVAILABLE",
+            )
+
+    def apply_retention(
+        self,
+        preview_id: str | None,
+        protected_snapshot_ids: Sequence[str] = (),
+    ) -> IndexRetentionApply:
+        """Recheck and release only the exact previously previewed candidates."""
+
+        if not isinstance(preview_id, str) or not preview_id:
+            return IndexRetentionApply(
+                preview_id=None,
+                deleted_snapshot_ids=(),
+                deleted_row_count=0,
+                blocked_reason="RETENTION_PREVIEW_ID_INVALID",
+            )
+        try:
+            with self._transaction() as cursor:
+                preview = self._retention_preview(cursor, protected_snapshot_ids)
+                if preview.preview_id != preview_id:
+                    return IndexRetentionApply(
+                        preview_id=preview.preview_id,
+                        deleted_snapshot_ids=(),
+                        deleted_row_count=0,
+                        blocked_reason="RETENTION_PREVIEW_STALE",
+                    )
+                deleted_rows = 0
+                deleted_snapshot_ids = tuple(
+                    candidate.snapshot_id for candidate in preview.candidates
+                )
+                for snapshot_id in deleted_snapshot_ids:
+                    deleted_rows += self._delete_retained_snapshot(cursor, snapshot_id)
+                return IndexRetentionApply(
+                    preview_id=preview_id,
+                    deleted_snapshot_ids=deleted_snapshot_ids,
+                    deleted_row_count=deleted_rows,
+                )
+        except (sqlite3.DatabaseError, StoreError):
+            return IndexRetentionApply(
+                preview_id=None,
+                deleted_snapshot_ids=(),
+                deleted_row_count=0,
+                blocked_reason="RETENTION_REFERENCE_SCHEMA_UNAVAILABLE",
+            )
+
+    @staticmethod
+    def _retention_tables_are_safe(cursor: sqlite3.Cursor) -> None:
+        required_tables = {
+            "project_index_blobs",
+            "project_index_snapshots",
+            "project_index_snapshot_files",
+            "project_index_snapshot_packages",
+            "project_index_parse_cache",
+            "project_index_nodes",
+            "project_index_edges",
+            "project_index_gaps",
+            "project_index_syncs",
+            "project_index_workspaces",
+            "project_index_snapshot_bindings",
+            "project_index_query_receipts",
+        }
+        tables = {
+            str(row["name"])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not required_tables.issubset(tables):
+            raise StoreError("retention reference schema is unavailable")
+
+        snapshot_children: set[str] = set()
+        for table in tables:
+            escaped_table = table.replace('"', '""')
+            for row in cursor.execute(f'PRAGMA foreign_key_list("{escaped_table}")'):
+                if str(row["table"]) == "project_index_snapshots":
+                    snapshot_children.add(table)
+        expected_children = {
+            "project_index_snapshot_files",
+            "project_index_snapshot_packages",
+            "project_index_nodes",
+            "project_index_edges",
+            "project_index_gaps",
+            "project_index_syncs",
+            "project_index_snapshot_bindings",
+            "project_index_query_receipts",
+        }
+        if snapshot_children != expected_children:
+            raise StoreError("retention snapshot ownership is unknown")
+
+    def _retention_preview(
+        self, cursor: sqlite3.Cursor, external_protected_snapshot_ids: Sequence[str]
+    ) -> IndexRetentionPreview:
+        self._retention_tables_are_safe(cursor)
+        retained_by_workspace: dict[str, int] = {}
+        protected_snapshot_ids: set[str] = set()
+        sync_rows = cursor.execute(
+            """
+            SELECT workspace, snapshot_id, MAX(sequence) AS latest_sequence
+            FROM project_index_syncs
+            GROUP BY workspace, snapshot_id
+            ORDER BY workspace, latest_sequence DESC, snapshot_id
+            """
+        ).fetchall()
+        for row in sync_rows:
+            workspace = str(row["workspace"])
+            count = retained_by_workspace.get(workspace, 0)
+            if count < 2:
+                protected_snapshot_ids.add(str(row["snapshot_id"]))
+                retained_by_workspace[workspace] = count + 1
+        receipt_rows = cursor.execute(
+            "SELECT DISTINCT snapshot_id FROM project_index_query_receipts"
+        ).fetchall()
+        protected_snapshot_ids.update(str(row["snapshot_id"]) for row in receipt_rows)
+        protected_snapshot_ids.update(self._external_snapshot_references(cursor))
+        if any(
+            not isinstance(snapshot_id, str) or not snapshot_id
+            for snapshot_id in external_protected_snapshot_ids
+        ):
+            raise StoreError("retention external reference is invalid")
+        protected_snapshot_ids.update(external_protected_snapshot_ids)
+
+        snapshot_rows = cursor.execute(
+            "SELECT snapshot_id FROM project_index_snapshots ORDER BY snapshot_id"
+        ).fetchall()
+        candidates: list[IndexRetentionCandidate] = []
+        row_count_tables = (
+            "project_index_snapshots",
+            "project_index_snapshot_files",
+            "project_index_snapshot_packages",
+            "project_index_nodes",
+            "project_index_edges",
+            "project_index_gaps",
+            "project_index_syncs",
+            "project_index_snapshot_bindings",
+        )
+        for row in snapshot_rows:
+            snapshot_id = str(row["snapshot_id"])
+            if snapshot_id in protected_snapshot_ids:
+                continue
+            estimated_rows = 0
+            for table in row_count_tables:
+                estimated_rows += int(
+                    cursor.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()[0]
+                )
+            estimated_bytes = int(
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(size), 0)
+                    FROM project_index_snapshot_files
+                    WHERE snapshot_id = ?
+                    """,
+                    (snapshot_id,),
+                ).fetchone()[0]
+            )
+            candidates.append(
+                IndexRetentionCandidate(
+                    snapshot_id=snapshot_id,
+                    reasons=(
+                        "outside_newest_two_sync_references",
+                        "no_query_receipt",
+                    ),
+                    estimated_row_count=estimated_rows,
+                    estimated_reclaimable_bytes=estimated_bytes,
+                )
+            )
+        protected = tuple(sorted(protected_snapshot_ids))
+        candidate_tuple = tuple(candidates[:32])
+        return IndexRetentionPreview(
+            _retention_preview_identifier(candidate_tuple, protected),
+            candidate_tuple,
+            protected,
+        )
+
+    @staticmethod
+    def _external_snapshot_references(cursor: sqlite3.Cursor) -> set[str]:
+        """Discover durable cross-module roots stored beside the index schema."""
+
+        index_owned_tables = {
+            "project_index_snapshots",
+            "project_index_snapshot_files",
+            "project_index_snapshot_packages",
+            "project_index_nodes",
+            "project_index_edges",
+            "project_index_gaps",
+            "project_index_syncs",
+            "project_index_snapshot_bindings",
+            "project_index_query_receipts",
+        }
+        tables = tuple(
+            str(row["name"])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+            if str(row["name"]) not in index_owned_tables
+        )
+        protected: set[str] = set()
+        for table in tables:
+            escaped_table = table.replace('"', '""')
+            columns = tuple(
+                str(row["name"])
+                for row in cursor.execute(f'PRAGMA table_info("{escaped_table}")')
+                if str(row["name"]) == "snapshot_id"
+                or str(row["name"]).endswith("_snapshot_id")
+            )
+            for column in columns:
+                escaped_column = column.replace('"', '""')
+                rows = cursor.execute(
+                    f'SELECT DISTINCT "{escaped_column}" AS snapshot_id '
+                    f'FROM "{escaped_table}" '
+                    f'WHERE "{escaped_column}" IS NOT NULL'
+                )
+                protected.update(
+                    str(row["snapshot_id"])
+                    for row in rows
+                    if isinstance(row["snapshot_id"], str) and row["snapshot_id"]
+                )
+        return protected
+
+    @staticmethod
+    def _delete_retained_snapshot(cursor: sqlite3.Cursor, snapshot_id: str) -> int:
+        deleted_rows = 0
+        for table in (
+            "project_index_edges",
+            "project_index_nodes",
+            "project_index_snapshot_files",
+            "project_index_snapshot_packages",
+            "project_index_gaps",
+            "project_index_syncs",
+            "project_index_snapshot_bindings",
+            "project_index_snapshots",
+        ):
+            result = cursor.execute(
+                f"DELETE FROM {table} WHERE snapshot_id = ?", (snapshot_id,)
+            )
+            deleted_rows += max(0, result.rowcount)
+        return deleted_rows
+
     def _create_schema(self) -> None:
         with self._connection:
             self._connection.executescript(
@@ -1275,3 +1534,24 @@ def _historical_root_identity(workspace_root: str) -> str:
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def _retention_preview_identifier(
+    candidates: Sequence[IndexRetentionCandidate], protected_snapshot_ids: Sequence[str]
+) -> str:
+    payload = {
+        "candidates": [
+            {
+                "snapshot_id": candidate.snapshot_id,
+                "reasons": candidate.reasons,
+                "estimated_row_count": candidate.estimated_row_count,
+                "estimated_reclaimable_bytes": candidate.estimated_reclaimable_bytes,
+            }
+            for candidate in candidates
+        ],
+        "protected_snapshot_ids": tuple(protected_snapshot_ids),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"

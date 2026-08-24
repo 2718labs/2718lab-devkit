@@ -1,14 +1,14 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — Codex + MCP v1.1.0
+# 2718lab DevKit — Codex + MCP v1.1.1
 
-[![version](https://img.shields.io/badge/version-v1.1.0-blue)](./.codex-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-v1.1.1-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
 runtime for bounded project indexing, Atlas evidence, Relay lifecycle
 coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
-of reference manuals. This repository carries the versioned v1.1.0 package.
+of reference manuals. This repository carries the versioned v1.1.1 package.
 The checked-in manifest and allowlist define the executable runtime surface;
 the manual map, install, build, and verification sections below describe the
 supported workflow.
@@ -182,7 +182,7 @@ handles or falls back to an unrelated local start.
 The allowlisted builder creates a deterministic ZIP outside the plugin source
 tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.0.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.1.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
@@ -265,6 +265,16 @@ evidence, or user data. If no retention strategy is declared, or if any gate
 or evidence is missing, retain the material permanently until an explicit,
 separately authorized cleanup policy exists.
 
+Derived project-index snapshots use a separate two-step maintenance command.
+Run `uv run python -m devkit_runtime.index_maintenance preview` first, inspect
+the exact candidate and protection sets, then pass its unchanged identity to
+`uv run python -m devkit_runtime.index_maintenance apply --preview-id <id>`.
+Apply holds the Orchestrator writer fence, rechecks cross-database snapshot
+references, keeps the newest two snapshots per workspace, and deletes at most
+32 candidates. Any stale preview, missing schema, lock failure, or invalid
+reference fails closed with zero deletion. Atlas data is never an index cleanup
+target.
+
 ## Deterministic Fast Lane
 
 The Fast Lane compiler is in
@@ -320,7 +330,7 @@ freeze a transient regression count.
 
 ## Version
 
-This repository represents the versioned v1.1.0 package. Release notes are
+This repository represents the versioned v1.1.1 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
 artifact allowlist, and locked dependency set. A maintainer dispatches Release
 from current `main`; it validates all declared gates, creates the annotated tag,

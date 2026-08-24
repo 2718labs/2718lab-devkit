@@ -8,6 +8,17 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-25
+
+### Fixed
+
+- Added conservative local project-index retention with protected-snapshot
+  revalidation so reproducible historical index data can be released safely.
+- Activated fresh local Atlas runtime initialization and repaired the accepted
+  recipe matching loop so durable knowledge can be reused after reopening.
+- Kept project indexes local-only while documenting the future
+  server-authoritative Atlas boundary.
+
 ## [1.1.0] - 2026-08-23
 
 ### Changed

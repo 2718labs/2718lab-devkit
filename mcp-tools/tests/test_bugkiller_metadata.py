@@ -34,7 +34,7 @@ class BugkillerMetadataTests(unittest.TestCase):
         self,
     ) -> None:
         codex = load_json(".codex-plugin/plugin.json")
-        self.assertEqual("1.1.0", codex["version"])
+        self.assertEqual("1.1.1", codex["version"])
         self.assertEqual("./.mcp.json", codex["mcpServers"])
         for legacy_surface in ("skills", "agents", "commands", "hooks"):
             self.assertNotIn(legacy_surface, codex)
