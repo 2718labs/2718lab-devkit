@@ -1191,13 +1191,13 @@ class ProjectIndexStore:
         estimates = {snapshot_id: (0, 0) for snapshot_id in snapshot_ids}
         if not snapshot_ids:
             return estimates, 0
-        values = ",".join("(?, ?)" for _ in snapshot_ids)
-        parameters: list[object] = []
-        for ordinal, snapshot_id in enumerate(snapshot_ids):
-            parameters.extend((snapshot_id, ordinal))
+        encoded_snapshot_ids = _json(tuple(snapshot_ids))
         rows = cursor.execute(
-            f"""
-            WITH candidates(snapshot_id, ordinal) AS (VALUES {values}),
+            """
+            WITH candidates(snapshot_id, ordinal) AS (
+                SELECT CAST(value AS TEXT), CAST(key AS INTEGER)
+                FROM json_each(?)
+            ),
             candidate_refs(content_hash, ordinal) AS (
                 SELECT file.content_hash, candidate.ordinal
                 FROM project_index_snapshot_files AS file
@@ -1250,7 +1250,7 @@ class ProjectIndexStore:
             FROM candidates AS candidate
             ORDER BY candidate.ordinal
             """,
-            tuple(parameters),
+            (encoded_snapshot_ids,),
         ).fetchall()
         planned_hash_count = 0
         for row in rows:
@@ -1283,7 +1283,6 @@ class ProjectIndexStore:
             )
             if str(row["name"]) not in index_owned_tables
         )
-        protected: set[str] = set()
         for table in tables:
             columns = tuple(
                 str(row["name"])
@@ -1293,20 +1292,9 @@ class ProjectIndexStore:
                 if str(row["name"]) == "snapshot_id"
                 or str(row["name"]).endswith("_snapshot_id")
             )
-            for column in columns:
-                escaped_table = table.replace('"', '""')
-                escaped_column = column.replace('"', '""')
-                rows = cursor.execute(
-                    f'SELECT DISTINCT "{escaped_column}" AS snapshot_id '
-                    f'FROM "{escaped_table}" '
-                    f'WHERE "{escaped_column}" IS NOT NULL'
-                )
-                protected.update(
-                    str(row["snapshot_id"])
-                    for row in rows
-                    if isinstance(row["snapshot_id"], str) and row["snapshot_id"]
-                )
-        return protected
+            if columns:
+                raise StoreError("retention external snapshot ownership is unknown")
+        return set()
 
     @staticmethod
     def _delete_retained_snapshot(cursor: sqlite3.Cursor, snapshot_id: str) -> int:
@@ -1341,24 +1329,32 @@ class ProjectIndexStore:
         cursor.execute("DELETE FROM temp.project_index_retention_hash_plan")
         if not snapshot_ids:
             return True
-        placeholders = ",".join("?" for _ in snapshot_ids)
+        encoded_snapshot_ids = _json(tuple(snapshot_ids))
         cursor.execute(
-            f"""
+            """
+            WITH candidates(snapshot_id) AS (
+                SELECT CAST(value AS TEXT)
+                FROM json_each(?)
+            )
             INSERT OR IGNORE INTO temp.project_index_retention_hash_plan(content_hash)
-            SELECT content_hash
-            FROM project_index_snapshot_files
-            WHERE snapshot_id IN ({placeholders})
+            SELECT file.content_hash
+            FROM project_index_snapshot_files AS file
+            JOIN candidates AS candidate USING (snapshot_id)
             """,
-            tuple(snapshot_ids),
+            (encoded_snapshot_ids,),
         )
         cursor.execute(
-            f"""
+            """
+            WITH candidates(snapshot_id) AS (
+                SELECT CAST(value AS TEXT)
+                FROM json_each(?)
+            )
             INSERT OR IGNORE INTO temp.project_index_retention_hash_plan(content_hash)
-            SELECT manifest_hash
-            FROM project_index_snapshot_packages
-            WHERE snapshot_id IN ({placeholders})
+            SELECT package.manifest_hash
+            FROM project_index_snapshot_packages AS package
+            JOIN candidates AS candidate USING (snapshot_id)
             """,
-            tuple(snapshot_ids),
+            (encoded_snapshot_ids,),
         )
         row = cursor.execute(
             "SELECT COUNT(*) FROM temp.project_index_retention_hash_plan"

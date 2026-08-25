@@ -126,7 +126,7 @@ def test_retention_apply_rejects_a_preview_changed_by_a_later_sync(
     service.close()
 
 
-def test_retention_protects_snapshots_referenced_by_external_runtime_tables(
+def test_retention_fails_closed_on_unknown_external_snapshot_reference_columns(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "workspace"
@@ -144,11 +144,10 @@ def test_retention_protects_snapshots_referenced_by_external_runtime_tables(
 
     preview = service.preview_retention()
 
-    assert preview.blocked_reason is None
-    assert snapshots[0] in preview.protected_snapshot_ids
-    assert tuple(candidate.snapshot_id for candidate in preview.candidates) == (
-        snapshots[1],
-    )
+    assert preview.preview_id is None
+    assert preview.candidates == ()
+    assert preview.protected_snapshot_ids == ()
+    assert preview.blocked_reason == "RETENTION_REFERENCE_SCHEMA_UNAVAILABLE"
     service.close()
 
 
