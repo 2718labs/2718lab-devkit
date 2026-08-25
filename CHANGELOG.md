@@ -18,6 +18,9 @@ only after the CI and artifact checks pass.
   recipe matching loop so durable knowledge can be reused after reopening.
 - Kept project indexes local-only while documenting the future
   server-authoritative Atlas boundary.
+- Added a dedicated marketplace artifact boundary that includes the Codex Skill
+  manuals, so remote installs expose documented workflows without widening the
+  runtime-only primary release package.
 
 ## [1.1.0] - 2026-08-23
 

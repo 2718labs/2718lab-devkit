@@ -131,6 +131,25 @@ Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协�
 者路径、Shell 片段、原始源码、凭据、无界命令输出和调用方伪造的验收证据
 都会被拒绝。
 
+## 从 Codex 插件市场安装
+
+首次添加仓库的瘦市场分支，然后安装插件：
+
+    codex plugin marketplace add 2718labs/2718lab-devkit --ref marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+后续版本先刷新远端快照，再从市场重装：
+
+    codex plugin marketplace upgrade 2718lab-marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+安装或更新后请新建 Codex 任务，使新的 skills 和 MCP 服务器被重新载入。
+`marketplace` 分支只是分发快照；源码权威仍是 `main` 和不可变 release tag。
+
+维护者使用专用的 marketplace allowlist 构建该快照：
+
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.1.zip
+
 ## 本地安装与运行
 
 要求：Python 3.11 或更高版本，以及 uv。
@@ -166,8 +185,7 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
 表面是 MCP 服务器；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
 `team_efficiency.py` 兼容入口及其路由模块。它明确不包含可选的 Skill 说明书 bundle、
-命令辅助文件、hooks、CI
-文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
+命令辅助文件、hooks、CI 文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
 
 Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 

@@ -150,6 +150,26 @@ The server has no prompt or resource surface. Tool inputs are structured and
 bounded; absolute worker paths, shell fragments, raw source, credentials,
 unbounded command output, and caller-forged acceptance evidence are rejected.
 
+## Install from the Codex marketplace
+
+Add the repository's slim marketplace branch once, then install the plugin:
+
+    codex plugin marketplace add 2718labs/2718lab-devkit --ref marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+For later releases, refresh the remote snapshot and reinstall from it:
+
+    codex plugin marketplace upgrade 2718lab-marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+Start a new Codex task after installing or updating so the refreshed skills and
+MCP server are loaded. The `marketplace` branch is a distribution snapshot; the
+source of record remains `main` and immutable release tags.
+
+Maintainers build that snapshot with the dedicated marketplace allowlist:
+
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.1.zip
+
 ## Install and run locally
 
 Requirements: Python 3.11 or newer and uv.
@@ -189,9 +209,9 @@ project, and the runtime files selected by
 .codex-plugin/main-artifact-allowlist.json. Its executable runtime surface is
 the MCP server; the ZIP also carries the Fast Lane contract, required references
 and policy assets, the `team_efficiency.py` compatibility entry point, its
-routing modules. It deliberately excludes the optional Skill manual bundle, command
-helpers, hooks, CI files, host-private state, prompts, static agents, and
-arbitrary repository files.
+routing modules. It deliberately excludes the optional Skill manual bundle,
+command helpers, hooks, CI files, host-private state, prompts, static agents,
+and arbitrary repository files.
 
 Run Fast Lane through its executable entry point to inspect its fail-closed
 result:
