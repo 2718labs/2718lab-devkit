@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from .extractors import (
 )
 from .models import (
     CoverageGap,
+    IndexCompactionResult,
     IndexEdge,
     IndexError,
     IndexNode,
@@ -53,6 +55,10 @@ class ProjectIndexStore:
     """Store immutable snapshots and path-neutral parser artifacts."""
 
     _SCHEMA_VERSION = 5
+    _RETENTION_MAX_SNAPSHOTS = 32
+    _RETENTION_MAX_HASHES = 65_536
+    _RETENTION_MAX_ROWS = 1_000_000
+    _RETENTION_MAX_INCREMENTAL_VACUUM_PAGES = 1_024
 
     def __init__(self, database_path: str | Path) -> None:
         """Open an existing prepared store without changing durable state."""
@@ -91,6 +97,8 @@ class ProjectIndexStore:
         store._connection.row_factory = sqlite3.Row
         store._connection.execute("PRAGMA foreign_keys = ON")
         store._connection.execute("PRAGMA busy_timeout = 5000")
+        if int(store._connection.execute("PRAGMA page_count").fetchone()[0]) == 0:
+            store._connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
         store._connection.execute("PRAGMA journal_mode = WAL")
         store._create_schema()
         cls.validate_prepared_connection(store._connection)
@@ -853,8 +861,24 @@ class ProjectIndexStore:
                 deleted_snapshot_ids = tuple(
                     candidate.snapshot_id for candidate in preview.candidates
                 )
+                if not deleted_snapshot_ids:
+                    return IndexRetentionApply(
+                        preview_id=preview_id,
+                        deleted_snapshot_ids=(),
+                        deleted_row_count=0,
+                    )
+                if not self._install_retention_hash_plan(cursor, deleted_snapshot_ids):
+                    return IndexRetentionApply(
+                        preview_id=preview.preview_id,
+                        deleted_snapshot_ids=(),
+                        deleted_row_count=0,
+                        blocked_reason="RETENTION_CANDIDATE_BUDGET_EXCEEDED",
+                    )
                 for snapshot_id in deleted_snapshot_ids:
                     deleted_rows += self._delete_retained_snapshot(cursor, snapshot_id)
+                deleted_rows += self._delete_unreferenced_payloads(cursor)
+                self._release_incremental_pages(cursor)
+                cursor.execute("DROP TABLE temp.project_index_retention_hash_plan")
                 return IndexRetentionApply(
                     preview_id=preview_id,
                     deleted_snapshot_ids=deleted_snapshot_ids,
@@ -867,6 +891,107 @@ class ProjectIndexStore:
                 deleted_row_count=0,
                 blocked_reason="RETENTION_REFERENCE_SCHEMA_UNAVAILABLE",
             )
+
+    def compact_storage(
+        self, *, allow_full_rewrite: bool = False
+    ) -> IndexCompactionResult:
+        """Compact local index pages under an explicit, space-checked request."""
+
+        database_before, wal_before = self._storage_file_sizes()
+        mode = "unknown"
+        try:
+            self._retention_tables_are_safe(self._connection.cursor())
+            checkpoint = self._connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if int(checkpoint[0]) != 0:
+                database_after, wal_after = self._storage_file_sizes()
+                return IndexCompactionResult(
+                    database_before,
+                    database_after,
+                    wal_before,
+                    wal_after,
+                    mode,
+                    "RETENTION_COMPACTION_BUSY",
+                )
+            auto_vacuum = int(
+                self._connection.execute("PRAGMA auto_vacuum").fetchone()[0]
+            )
+            mode = {0: "none", 1: "full", 2: "incremental"}.get(auto_vacuum, "unknown")
+            if auto_vacuum == 0:
+                if not allow_full_rewrite:
+                    database_after, wal_after = self._storage_file_sizes()
+                    return IndexCompactionResult(
+                        database_before,
+                        database_after,
+                        wal_before,
+                        wal_after,
+                        mode,
+                        "RETENTION_FULL_REWRITE_REQUIRED",
+                    )
+                current_database, current_wal = self._storage_file_sizes()
+                required_free = current_database * 2 + current_wal + 64 * 1024 * 1024
+                available_free = shutil.disk_usage(self.database_path.parent).free
+                if available_free < required_free:
+                    return IndexCompactionResult(
+                        database_before,
+                        current_database,
+                        wal_before,
+                        current_wal,
+                        mode,
+                        "RETENTION_COMPACTION_SPACE_INSUFFICIENT",
+                    )
+                self._connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                self._connection.execute("VACUUM")
+                mode = "incremental"
+            free_pages = int(
+                self._connection.execute("PRAGMA freelist_count").fetchone()[0]
+            )
+            for _ in range(
+                min(free_pages, self._RETENTION_MAX_INCREMENTAL_VACUUM_PAGES)
+            ):
+                self._connection.execute("PRAGMA incremental_vacuum(1)")
+            checkpoint = self._connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            database_after, wal_after = self._storage_file_sizes()
+            if int(checkpoint[0]) != 0:
+                return IndexCompactionResult(
+                    database_before,
+                    database_after,
+                    wal_before,
+                    wal_after,
+                    mode,
+                    "RETENTION_COMPACTION_CHECKPOINT_BUSY",
+                )
+            return IndexCompactionResult(
+                database_before,
+                database_after,
+                wal_before,
+                wal_after,
+                mode,
+            )
+        except (OSError, sqlite3.DatabaseError, StoreError):
+            database_after, wal_after = self._storage_file_sizes()
+            return IndexCompactionResult(
+                database_before,
+                database_after,
+                wal_before,
+                wal_after,
+                mode,
+                "RETENTION_COMPACTION_UNAVAILABLE",
+            )
+
+    def _storage_file_sizes(self) -> tuple[int, int]:
+        try:
+            database_bytes = (
+                self.database_path.stat().st_size if self.database_path.is_file() else 0
+            )
+            wal_path = Path(f"{self.database_path}-wal")
+            wal_bytes = wal_path.stat().st_size if wal_path.is_file() else 0
+            return database_bytes, wal_bytes
+        except OSError:
+            return 0, 0
 
     @staticmethod
     def _retention_tables_are_safe(cursor: sqlite3.Cursor) -> None:
@@ -894,11 +1019,15 @@ class ProjectIndexStore:
             raise StoreError("retention reference schema is unavailable")
 
         snapshot_children: set[str] = set()
+        blob_children: set[tuple[str, str]] = set()
         for table in tables:
-            escaped_table = table.replace('"', '""')
-            for row in cursor.execute(f'PRAGMA foreign_key_list("{escaped_table}")'):
+            for row in cursor.execute(
+                "SELECT * FROM pragma_foreign_key_list(?)", (table,)
+            ):
                 if str(row["table"]) == "project_index_snapshots":
                     snapshot_children.add(table)
+                if str(row["table"]) == "project_index_blobs":
+                    blob_children.add((table, str(row["from"])))
         expected_children = {
             "project_index_snapshot_files",
             "project_index_snapshot_packages",
@@ -911,6 +1040,13 @@ class ProjectIndexStore:
         }
         if snapshot_children != expected_children:
             raise StoreError("retention snapshot ownership is unknown")
+        expected_blob_children = {
+            ("project_index_snapshot_files", "content_hash"),
+            ("project_index_snapshot_packages", "manifest_hash"),
+            ("project_index_parse_cache", "content_hash"),
+        }
+        if blob_children != expected_blob_children:
+            raise StoreError("retention blob ownership is unknown")
 
     def _retention_preview(
         self, cursor: sqlite3.Cursor, external_protected_snapshot_ids: Sequence[str]
@@ -945,59 +1081,185 @@ class ProjectIndexStore:
         protected_snapshot_ids.update(external_protected_snapshot_ids)
 
         snapshot_rows = cursor.execute(
-            "SELECT snapshot_id FROM project_index_snapshots ORDER BY snapshot_id"
+            """
+            SELECT snapshot.snapshot_id, COALESCE(MAX(sync.sequence), -1) AS last_sequence
+            FROM project_index_snapshots AS snapshot
+            LEFT JOIN project_index_syncs AS sync
+              ON sync.snapshot_id = snapshot.snapshot_id
+            GROUP BY snapshot.snapshot_id
+            ORDER BY last_sequence, snapshot.snapshot_id
+            """
         ).fetchall()
-        candidates: list[IndexRetentionCandidate] = []
-        row_count_tables = (
-            "project_index_snapshots",
-            "project_index_snapshot_files",
-            "project_index_snapshot_packages",
-            "project_index_nodes",
-            "project_index_edges",
-            "project_index_gaps",
-            "project_index_syncs",
-            "project_index_snapshot_bindings",
+        eligible_ids = tuple(
+            str(row["snapshot_id"])
+            for row in snapshot_rows
+            if str(row["snapshot_id"]) not in protected_snapshot_ids
         )
-        for row in snapshot_rows:
-            snapshot_id = str(row["snapshot_id"])
-            if snapshot_id in protected_snapshot_ids:
-                continue
-            estimated_rows = 0
-            for table in row_count_tables:
-                estimated_rows += int(
-                    cursor.execute(
-                        f"SELECT COUNT(*) FROM {table} WHERE snapshot_id = ?",
-                        (snapshot_id,),
-                    ).fetchone()[0]
-                )
-            estimated_bytes = int(
-                cursor.execute(
-                    """
-                    SELECT COALESCE(SUM(size), 0)
-                    FROM project_index_snapshot_files
-                    WHERE snapshot_id = ?
-                    """,
-                    (snapshot_id,),
-                ).fetchone()[0]
+        row_count_queries = (
+            "SELECT COUNT(*) FROM project_index_snapshots WHERE snapshot_id = ?",
+            "SELECT COUNT(*) FROM project_index_snapshot_files WHERE snapshot_id = ?",
+            "SELECT COUNT(*) FROM project_index_snapshot_packages WHERE snapshot_id = ?",
+            "SELECT COUNT(*) FROM project_index_nodes WHERE snapshot_id = ?",
+            "SELECT COUNT(*) FROM project_index_edges WHERE snapshot_id = ?",
+            "SELECT COUNT(*) FROM project_index_gaps WHERE snapshot_id = ?",
+            "SELECT COUNT(*) FROM project_index_syncs WHERE snapshot_id = ?",
+            "SELECT COUNT(*) FROM project_index_snapshot_bindings WHERE snapshot_id = ?",
+        )
+        candidate_ids: list[str] = []
+        base_row_counts: dict[str, int] = {}
+        planned_hashes: set[str] = set()
+        planned_base_rows = 0
+        for snapshot_id in eligible_ids[: self._RETENTION_MAX_SNAPSHOTS]:
+            base_rows = sum(
+                int(cursor.execute(query, (snapshot_id,)).fetchone()[0])
+                for query in row_count_queries
             )
-            candidates.append(
-                IndexRetentionCandidate(
-                    snapshot_id=snapshot_id,
-                    reasons=(
-                        "outside_newest_two_sync_references",
-                        "no_query_receipt",
-                    ),
-                    estimated_row_count=estimated_rows,
-                    estimated_reclaimable_bytes=estimated_bytes,
-                )
+            hash_rows = cursor.execute(
+                """
+                SELECT content_hash
+                FROM project_index_snapshot_files
+                WHERE snapshot_id = ?
+                UNION
+                SELECT manifest_hash
+                FROM project_index_snapshot_packages
+                WHERE snapshot_id = ?
+                LIMIT ?
+                """,
+                (snapshot_id, snapshot_id, self._RETENTION_MAX_HASHES + 1),
+            ).fetchall()
+            snapshot_hashes = {str(row["content_hash"]) for row in hash_rows}
+            if (
+                planned_base_rows + base_rows > self._RETENTION_MAX_ROWS
+                or len(planned_hashes | snapshot_hashes) > self._RETENTION_MAX_HASHES
+            ):
+                break
+            candidate_ids.append(snapshot_id)
+            base_row_counts[snapshot_id] = base_rows
+            planned_base_rows += base_rows
+            planned_hashes.update(snapshot_hashes)
+        if eligible_ids and not candidate_ids:
+            return IndexRetentionPreview(
+                preview_id=None,
+                candidates=(),
+                protected_snapshot_ids=tuple(sorted(protected_snapshot_ids)),
+                blocked_reason="RETENTION_CANDIDATE_BUDGET_EXCEEDED",
             )
+        payload_estimates, _ = self._batch_payload_estimates(cursor, candidate_ids)
+        while (
+            candidate_ids
+            and sum(
+                base_row_counts[snapshot_id] + payload_estimates[snapshot_id][0]
+                for snapshot_id in candidate_ids
+            )
+            > self._RETENTION_MAX_ROWS
+        ):
+            candidate_ids.pop()
+            payload_estimates, _ = self._batch_payload_estimates(cursor, candidate_ids)
+        if eligible_ids and not candidate_ids:
+            return IndexRetentionPreview(
+                preview_id=None,
+                candidates=(),
+                protected_snapshot_ids=tuple(sorted(protected_snapshot_ids)),
+                blocked_reason="RETENTION_CANDIDATE_BUDGET_EXCEEDED",
+            )
+        candidates = tuple(
+            IndexRetentionCandidate(
+                snapshot_id=snapshot_id,
+                reasons=(
+                    "outside_newest_two_sync_references",
+                    "no_query_receipt",
+                ),
+                estimated_row_count=(
+                    base_row_counts[snapshot_id] + payload_estimates[snapshot_id][0]
+                ),
+                estimated_reclaimable_bytes=payload_estimates[snapshot_id][1],
+            )
+            for snapshot_id in candidate_ids
+        )
         protected = tuple(sorted(protected_snapshot_ids))
-        candidate_tuple = tuple(candidates[:32])
         return IndexRetentionPreview(
-            _retention_preview_identifier(candidate_tuple, protected),
-            candidate_tuple,
+            _retention_preview_identifier(candidates, protected),
+            candidates,
             protected,
         )
+
+    def _batch_payload_estimates(
+        self, cursor: sqlite3.Cursor, snapshot_ids: Sequence[str]
+    ) -> tuple[dict[str, tuple[int, int]], int]:
+        """Assign each batch-orphan payload to its oldest candidate once."""
+
+        estimates = {snapshot_id: (0, 0) for snapshot_id in snapshot_ids}
+        if not snapshot_ids:
+            return estimates, 0
+        values = ",".join("(?, ?)" for _ in snapshot_ids)
+        parameters: list[object] = []
+        for ordinal, snapshot_id in enumerate(snapshot_ids):
+            parameters.extend((snapshot_id, ordinal))
+        rows = cursor.execute(
+            f"""
+            WITH candidates(snapshot_id, ordinal) AS (VALUES {values}),
+            candidate_refs(content_hash, ordinal) AS (
+                SELECT file.content_hash, candidate.ordinal
+                FROM project_index_snapshot_files AS file
+                JOIN candidates AS candidate USING (snapshot_id)
+                UNION ALL
+                SELECT package.manifest_hash, candidate.ordinal
+                FROM project_index_snapshot_packages AS package
+                JOIN candidates AS candidate USING (snapshot_id)
+            ),
+            exclusive_hashes(content_hash, owner_ordinal) AS (
+                SELECT reference.content_hash, MIN(reference.ordinal)
+                FROM candidate_refs AS reference
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM project_index_snapshot_files AS retained_file
+                    WHERE retained_file.content_hash = reference.content_hash
+                      AND NOT EXISTS (
+                          SELECT 1 FROM candidates
+                          WHERE snapshot_id = retained_file.snapshot_id
+                      )
+                )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM project_index_snapshot_packages AS retained_package
+                    WHERE retained_package.manifest_hash = reference.content_hash
+                      AND NOT EXISTS (
+                          SELECT 1 FROM candidates
+                          WHERE snapshot_id = retained_package.snapshot_id
+                      )
+                )
+                GROUP BY reference.content_hash
+            )
+            SELECT
+                candidate.snapshot_id,
+                (SELECT COUNT(*) FROM exclusive_hashes AS exclusive
+                 WHERE exclusive.owner_ordinal = candidate.ordinal)
+                  + (SELECT COUNT(*)
+                     FROM project_index_parse_cache AS cache
+                     JOIN exclusive_hashes AS exclusive
+                       ON exclusive.content_hash = cache.content_hash
+                     WHERE exclusive.owner_ordinal = candidate.ordinal) AS payload_rows,
+                COALESCE((SELECT SUM(length(CAST(cache.payload AS BLOB)))
+                          FROM project_index_parse_cache AS cache
+                          JOIN exclusive_hashes AS exclusive
+                            ON exclusive.content_hash = cache.content_hash
+                          WHERE exclusive.owner_ordinal = candidate.ordinal), 0)
+                    AS payload_bytes,
+                (SELECT COUNT(DISTINCT content_hash) FROM candidate_refs)
+                    AS planned_hash_count
+            FROM candidates AS candidate
+            ORDER BY candidate.ordinal
+            """,
+            tuple(parameters),
+        ).fetchall()
+        planned_hash_count = 0
+        for row in rows:
+            estimates[str(row["snapshot_id"])] = (
+                int(row["payload_rows"]),
+                int(row["payload_bytes"]),
+            )
+            planned_hash_count = int(row["planned_hash_count"])
+        return estimates, planned_hash_count
 
     @staticmethod
     def _external_snapshot_references(cursor: sqlite3.Cursor) -> set[str]:
@@ -1023,14 +1285,16 @@ class ProjectIndexStore:
         )
         protected: set[str] = set()
         for table in tables:
-            escaped_table = table.replace('"', '""')
             columns = tuple(
                 str(row["name"])
-                for row in cursor.execute(f'PRAGMA table_info("{escaped_table}")')
+                for row in cursor.execute(
+                    "SELECT * FROM pragma_table_info(?)", (table,)
+                )
                 if str(row["name"]) == "snapshot_id"
                 or str(row["name"]).endswith("_snapshot_id")
             )
             for column in columns:
+                escaped_table = table.replace('"', '""')
                 escaped_column = column.replace('"', '""')
                 rows = cursor.execute(
                     f'SELECT DISTINCT "{escaped_column}" AS snapshot_id '
@@ -1047,21 +1311,115 @@ class ProjectIndexStore:
     @staticmethod
     def _delete_retained_snapshot(cursor: sqlite3.Cursor, snapshot_id: str) -> int:
         deleted_rows = 0
-        for table in (
-            "project_index_edges",
-            "project_index_nodes",
-            "project_index_snapshot_files",
-            "project_index_snapshot_packages",
-            "project_index_gaps",
-            "project_index_syncs",
-            "project_index_snapshot_bindings",
-            "project_index_snapshots",
-        ):
-            result = cursor.execute(
-                f"DELETE FROM {table} WHERE snapshot_id = ?", (snapshot_id,)
-            )
+        delete_queries = (
+            "DELETE FROM project_index_edges WHERE snapshot_id = ?",
+            "DELETE FROM project_index_nodes WHERE snapshot_id = ?",
+            "DELETE FROM project_index_snapshot_files WHERE snapshot_id = ?",
+            "DELETE FROM project_index_snapshot_packages WHERE snapshot_id = ?",
+            "DELETE FROM project_index_gaps WHERE snapshot_id = ?",
+            "DELETE FROM project_index_syncs WHERE snapshot_id = ?",
+            "DELETE FROM project_index_snapshot_bindings WHERE snapshot_id = ?",
+            "DELETE FROM project_index_snapshots WHERE snapshot_id = ?",
+        )
+        for query in delete_queries:
+            result = cursor.execute(query, (snapshot_id,))
             deleted_rows += max(0, result.rowcount)
         return deleted_rows
+
+    def _install_retention_hash_plan(
+        self, cursor: sqlite3.Cursor, snapshot_ids: Sequence[str]
+    ) -> bool:
+        """Capture the bounded hash set authorized by the current preview."""
+
+        cursor.execute(
+            """
+            CREATE TEMP TABLE IF NOT EXISTS project_index_retention_hash_plan (
+                content_hash TEXT PRIMARY KEY
+            ) WITHOUT ROWID
+            """
+        )
+        cursor.execute("DELETE FROM temp.project_index_retention_hash_plan")
+        if not snapshot_ids:
+            return True
+        placeholders = ",".join("?" for _ in snapshot_ids)
+        cursor.execute(
+            f"""
+            INSERT OR IGNORE INTO temp.project_index_retention_hash_plan(content_hash)
+            SELECT content_hash
+            FROM project_index_snapshot_files
+            WHERE snapshot_id IN ({placeholders})
+            """,
+            tuple(snapshot_ids),
+        )
+        cursor.execute(
+            f"""
+            INSERT OR IGNORE INTO temp.project_index_retention_hash_plan(content_hash)
+            SELECT manifest_hash
+            FROM project_index_snapshot_packages
+            WHERE snapshot_id IN ({placeholders})
+            """,
+            tuple(snapshot_ids),
+        )
+        row = cursor.execute(
+            "SELECT COUNT(*) FROM temp.project_index_retention_hash_plan"
+        ).fetchone()
+        if int(row[0]) <= self._RETENTION_MAX_HASHES:
+            return True
+        cursor.execute("DROP TABLE temp.project_index_retention_hash_plan")
+        return False
+
+    @staticmethod
+    def _delete_unreferenced_payloads(cursor: sqlite3.Cursor) -> int:
+        """Release only preview-planned payload no retained snapshot can reach."""
+
+        deleted_rows = 0
+        for query in (
+            """
+            DELETE FROM project_index_parse_cache
+            WHERE content_hash IN (
+                SELECT content_hash FROM temp.project_index_retention_hash_plan
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM project_index_snapshot_files AS retained_file
+                WHERE retained_file.content_hash = project_index_parse_cache.content_hash
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM project_index_snapshot_packages AS retained_package
+                WHERE retained_package.manifest_hash = project_index_parse_cache.content_hash
+            )
+            """,
+            """
+            DELETE FROM project_index_blobs
+            WHERE content_hash IN (
+                SELECT content_hash FROM temp.project_index_retention_hash_plan
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM project_index_snapshot_files AS retained_file
+                WHERE retained_file.content_hash = project_index_blobs.content_hash
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM project_index_snapshot_packages AS retained_package
+                WHERE retained_package.manifest_hash = project_index_blobs.content_hash
+            )
+            """,
+        ):
+            result = cursor.execute(query)
+            deleted_rows += max(0, result.rowcount)
+        return deleted_rows
+
+    def _release_incremental_pages(self, cursor: sqlite3.Cursor) -> None:
+        """Return a bounded number of pages when the store already supports it."""
+
+        auto_vacuum = int(cursor.execute("PRAGMA auto_vacuum").fetchone()[0])
+        if auto_vacuum != 2:
+            return
+        free_pages = int(cursor.execute("PRAGMA freelist_count").fetchone()[0])
+        for _ in range(min(free_pages, self._RETENTION_MAX_INCREMENTAL_VACUUM_PAGES)):
+            cursor.execute("PRAGMA incremental_vacuum(1)")
 
     def _create_schema(self) -> None:
         with self._connection:
@@ -1112,6 +1470,8 @@ class ProjectIndexStore:
                 );
                 CREATE INDEX IF NOT EXISTS project_index_packages_manifest
                     ON project_index_snapshot_packages(snapshot_id, manifest_path);
+                CREATE INDEX IF NOT EXISTS project_index_packages_manifest_hash
+                    ON project_index_snapshot_packages(manifest_hash);
                 CREATE TABLE IF NOT EXISTS project_index_parse_cache (
                     content_hash TEXT NOT NULL REFERENCES project_index_blobs(content_hash),
                     extractor_id TEXT NOT NULL,
@@ -1178,6 +1538,8 @@ class ProjectIndexStore:
                 );
                 CREATE INDEX IF NOT EXISTS project_index_syncs_workspace
                     ON project_index_syncs(workspace, sequence);
+                CREATE INDEX IF NOT EXISTS project_index_syncs_snapshot
+                    ON project_index_syncs(snapshot_id, sequence);
                 CREATE TABLE IF NOT EXISTS project_index_workspaces (
                     workspace_id TEXT PRIMARY KEY,
                     root_path TEXT NOT NULL,

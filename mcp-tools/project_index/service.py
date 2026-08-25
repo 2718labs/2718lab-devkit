@@ -23,6 +23,7 @@ from . import extractors
 from .extractors import ParsedExtraction, SourceFile
 from .models import (
     CoverageGap,
+    IndexCompactionResult,
     IndexEdge,
     IndexError,
     IndexNode,
@@ -200,6 +201,13 @@ class ProjectIndexService:
         """Apply a previously previewed local-only retention plan."""
 
         return self._store.apply_retention(preview_id, protected_snapshot_ids)
+
+    def compact_storage(
+        self, *, allow_full_rewrite: bool = False
+    ) -> IndexCompactionResult:
+        """Compact released local index pages after explicit authorization."""
+
+        return self._store.compact_storage(allow_full_rewrite=allow_full_rewrite)
 
     def project_index_register(self, workspace_root: str | Path) -> str:
         """Register the sole accepted filesystem-root input for project indexing."""

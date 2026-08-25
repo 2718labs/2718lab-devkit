@@ -291,9 +291,19 @@ the exact candidate and protection sets, then pass its unchanged identity to
 `uv run python -m devkit_runtime.index_maintenance apply --preview-id <id>`.
 Apply holds the Orchestrator writer fence, rechecks cross-database snapshot
 references, keeps the newest two snapshots per workspace, and deletes at most
-32 candidates. Any stale preview, missing schema, lock failure, or invalid
-reference fails closed with zero deletion. Atlas data is never an index cleanup
-target.
+32 oldest candidates within fixed row and content-hash budgets. Parser-cache
+and blob rows are collected only when the approved batch made them unreachable.
+New stores use bounded incremental vacuuming; older stores without incremental
+auto-vacuum reuse freed SQLite pages internally. Run
+`uv run python -m devkit_runtime.index_maintenance compact` to inspect that
+boundary; a legacy store returns `RETENTION_FULL_REWRITE_REQUIRED` until the
+operator explicitly repeats it with `--allow-full-rewrite`. The one-time rewrite
+checks for at least twice the database size plus 64 MiB of free space and stops
+on active readers instead of gambling with a low-space database. Compaction
+reports observed database/WAL bytes before and after. Any stale preview, missing
+schema, budget overflow, lock failure, or
+invalid reference fails closed with zero deletion. Atlas data is never an index
+cleanup target.
 
 ## Deterministic Fast Lane
 

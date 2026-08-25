@@ -251,8 +251,15 @@ review、verification、integration receipt 时，宿主才可记录
 保护集；确认后再把未变化的 identity 传给
 `uv run python -m devkit_runtime.index_maintenance apply --preview-id <id>`。
 Apply 会持有 Orchestrator 写围栏、重新核验跨数据库快照引用、为每个工作区保留
-最新两代，并且每批最多删除 32 个候选。preview 过期、schema 缺失、锁失败或
-引用无效都会零删除并关闭失败。Atlas 数据永远不属于索引清理目标。
+最新两代，并按时间从旧到新处理最多 32 个候选，同时受固定行数与内容哈希预算
+限制。只有本批删除后确实失去引用的 parser cache 和 blob 才会被回收。新建存储
+启用有界 incremental vacuum；旧存储若没有该能力，先只在 SQLite 内部复用空闲页。
+运行 `uv run python -m devkit_runtime.index_maintenance compact` 可检查物理压缩边界；
+旧库会先返回 `RETENTION_FULL_REWRITE_REQUIRED`，只有操作者明确追加
+`--allow-full-rewrite` 才执行一次性转换。转换前必须有不少于数据库两倍加 64 MiB 的
+可用空间，存在活跃读者时停止，并报告数据库/WAL 压缩前后的实测字节数。preview
+过期、schema 缺失、预算溢出、锁失败或引用
+无效都会零删除并关闭失败。Atlas 数据永远不属于索引清理目标。
 
 本地 Windows 的 `C:/` 和所有非 `G:/` 临时根、worktree、cache、evidence
 路径都禁止使用；可信 hosted Windows CI 仅可把宿主提供的 `RUNNER_TEMP`

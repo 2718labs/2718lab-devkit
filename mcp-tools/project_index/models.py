@@ -251,6 +251,18 @@ class IndexRetentionApply:
 
 
 @dataclass(frozen=True)
+class IndexCompactionResult:
+    """Observed file-size outcome of an explicit local index compaction."""
+
+    database_bytes_before: int
+    database_bytes_after: int
+    wal_bytes_before: int
+    wal_bytes_after: int
+    auto_vacuum_mode: str
+    blocked_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class SnapshotDiff:
     from_snapshot_id: str
     to_snapshot_id: str

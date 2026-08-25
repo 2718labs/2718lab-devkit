@@ -13,7 +13,11 @@ only after the CI and artifact checks pass.
 ### Fixed
 
 - Added conservative local project-index retention with protected-snapshot
-  revalidation so reproducible historical index data can be released safely.
+  revalidation, oldest-first bounded batches, and orphan cache/blob collection
+  so reproducible historical index data can be released safely.
+- Added explicit index compaction with observed before/after file sizes; legacy
+  databases require an opt-in, free-space-checked rewrite before incremental
+  vacuuming is enabled.
 - Activated fresh local Atlas runtime initialization and repaired the accepted
   recipe matching loop so durable knowledge can be reused after reopening.
 - Kept project indexes local-only while documenting the future

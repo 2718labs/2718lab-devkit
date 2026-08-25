@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -52,11 +53,32 @@ def test_retention_preview_and_apply_keep_two_latest_and_query_receipts(
     assert preview.candidates[0].estimated_row_count > 0
     assert preview.candidates[0].estimated_reclaimable_bytes > 0
     assert service._store.get_snapshot(snapshots[1]) is not None
+    blob_count_before = service._store.blob_count()
 
     applied = service.apply_retention(preview.preview_id)
 
     assert applied.blocked_reason is None
     assert applied.deleted_snapshot_ids == (snapshots[1],)
+    assert service._store.blob_count() < blob_count_before
+    assert (
+        service._store._connection.execute(
+            """
+        SELECT COUNT(*) FROM project_index_parse_cache AS cache
+        WHERE NOT EXISTS (
+            SELECT 1 FROM project_index_snapshot_files AS file
+            WHERE file.content_hash = cache.content_hash
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM project_index_snapshot_packages AS package
+            WHERE package.manifest_hash = cache.content_hash
+        )
+        """
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        service._store._connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    )
     assert service._store.get_snapshot(snapshots[0]) is not None
     assert service._store.get_snapshot(snapshots[1]) is None
     assert service._store.get_snapshot(snapshots[2]) is not None
@@ -128,3 +150,45 @@ def test_retention_protects_snapshots_referenced_by_external_runtime_tables(
         snapshots[1],
     )
     service.close()
+
+
+def test_retention_uses_the_largest_oldest_prefix_within_hash_budget(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    service = _service(tmp_path)
+    workspace_id = service.project_index_register(root)
+    snapshots: list[str] = []
+    for value in ("one", "two", "three", "four", "five"):
+        (root / "module.py").write_text(f"VALUE = {value!r}\n", encoding="utf-8")
+        snapshots.append(service.sync(workspace_id).snapshot_id)
+    service._store._RETENTION_MAX_HASHES = 1
+
+    preview = service.preview_retention()
+
+    assert preview.blocked_reason is None
+    assert tuple(candidate.snapshot_id for candidate in preview.candidates) == (
+        snapshots[0],
+    )
+    service.close()
+
+
+def test_legacy_store_compaction_requires_explicit_space_checked_rewrite(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "project-index.sqlite3"
+    legacy = sqlite3.connect(database)
+    legacy.execute("CREATE TABLE legacy_marker(value TEXT)")
+    legacy.close()
+    store = ProjectIndexStore.bootstrap(database)
+    assert store._connection.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+
+    blocked = store.compact_storage()
+    compacted = store.compact_storage(allow_full_rewrite=True)
+
+    assert blocked.blocked_reason == "RETENTION_FULL_REWRITE_REQUIRED"
+    assert compacted.blocked_reason is None
+    assert compacted.auto_vacuum_mode == "incremental"
+    assert store._connection.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    store.close()

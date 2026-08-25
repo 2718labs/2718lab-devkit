@@ -18,6 +18,8 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser("preview")
     apply = subcommands.add_parser("apply")
     apply.add_argument("--preview-id", required=True)
+    compact = subcommands.add_parser("compact")
+    compact.add_argument("--allow-full-rewrite", action="store_true")
     return parser
 
 
@@ -30,10 +32,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         index = uow.project_checkpoint.project_index
         if arguments.command == "preview":
             result = index.preview_retention(uow.index_retention_references())
-        else:
+        elif arguments.command == "apply":
             with uow.index_retention_fence() as protected_snapshot_ids:
                 result = index.apply_retention(
                     arguments.preview_id, protected_snapshot_ids
+                )
+        else:
+            with uow.index_retention_fence():
+                result = index.compact_storage(
+                    allow_full_rewrite=arguments.allow_full_rewrite
                 )
     print(json.dumps(asdict(result), ensure_ascii=True, sort_keys=True))
     return 0 if result.blocked_reason is None else 2
