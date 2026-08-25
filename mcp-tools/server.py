@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from devkit_fastlane import compile_fast_lane
 from devkit_relay.compiler import compile_plan
 from devkit_relay.service import RelayService
+from devkit_runtime.bootstrap import RuntimeBootstrap
 from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
@@ -212,9 +213,20 @@ def _tool_annotations(name: str) -> ToolAnnotations:
 
 
 def _default_runtime_root() -> RuntimeRoot:
-    """Create the pure process root; bootstrap is deliberately never implicit."""
+    """Bootstrap durable local stores before exposing the default process root."""
 
-    return RuntimeRoot(RuntimeConfig.load(protected_roots=(PLUGIN_ROOT,)))
+    config = RuntimeConfig.load(protected_roots=(PLUGIN_ROOT,))
+    required_databases = (
+        config.orchestrator_database,
+        config.project_index_database,
+        config.continuity_database,
+        config.atlas_database,
+        config.relay_database,
+        config.relay_proof_registry_database,
+    )
+    if not all(path.is_file() for path in required_databases):
+        RuntimeBootstrap.run(config)
+    return RuntimeRoot(config)
 
 
 def _runtime_root() -> RuntimeRoot:

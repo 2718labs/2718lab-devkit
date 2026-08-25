@@ -221,6 +221,48 @@ class QueryReceipt:
 
 
 @dataclass(frozen=True)
+class IndexRetentionCandidate:
+    """One snapshot eligible for local derived-index release."""
+
+    snapshot_id: str
+    reasons: tuple[str, ...]
+    estimated_row_count: int
+    estimated_reclaimable_bytes: int
+
+
+@dataclass(frozen=True)
+class IndexRetentionPreview:
+    """A deterministic, non-mutating local index retention plan."""
+
+    preview_id: str | None
+    candidates: tuple[IndexRetentionCandidate, ...]
+    protected_snapshot_ids: tuple[str, ...]
+    blocked_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class IndexRetentionApply:
+    """The observed outcome of applying one previously previewed plan."""
+
+    preview_id: str | None
+    deleted_snapshot_ids: tuple[str, ...]
+    deleted_row_count: int
+    blocked_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class IndexCompactionResult:
+    """Observed file-size outcome of an explicit local index compaction."""
+
+    database_bytes_before: int
+    database_bytes_after: int
+    wal_bytes_before: int
+    wal_bytes_after: int
+    auto_vacuum_mode: str
+    blocked_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class SnapshotDiff:
     from_snapshot_id: str
     to_snapshot_id: str

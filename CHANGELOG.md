@@ -8,6 +8,24 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-25
+
+### Fixed
+
+- Added conservative local project-index retention with protected-snapshot
+  revalidation, oldest-first bounded batches, and orphan cache/blob collection
+  so reproducible historical index data can be released safely.
+- Added explicit index compaction with observed before/after file sizes; legacy
+  databases require an opt-in, free-space-checked rewrite before incremental
+  vacuuming is enabled.
+- Activated fresh local Atlas runtime initialization and repaired the accepted
+  recipe matching loop so durable knowledge can be reused after reopening.
+- Kept project indexes local-only while documenting the future
+  server-authoritative Atlas boundary.
+- Added a dedicated marketplace artifact boundary that includes the Codex Skill
+  manuals, so remote installs expose documented workflows without widening the
+  runtime-only primary release package.
+
 ## [1.1.0] - 2026-08-23
 
 ### Changed

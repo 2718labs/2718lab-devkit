@@ -1550,6 +1550,56 @@ class SQLiteStore:
             self._connection.close()
             self._connection = None  # type: ignore[assignment]
 
+    def index_retention_references(self) -> tuple[str, ...]:
+        """Return every durable orchestrator reference to an index snapshot."""
+
+        return self._index_retention_references(self._connection.cursor())
+
+    @contextmanager
+    def index_retention_fence(self) -> Iterator[tuple[str, ...]]:
+        """Fence orchestrator writers while a cross-database release is applied."""
+
+        cursor = self._connection.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._index_retention_references(cursor)
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.rollback()
+
+    @staticmethod
+    def _index_retention_references(cursor: sqlite3.Cursor) -> tuple[str, ...]:
+        references: set[str] = set()
+        tables = tuple(
+            str(row["name"])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+        for table in tables:
+            escaped_table = table.replace('"', '""')
+            columns = tuple(
+                str(row["name"])
+                for row in cursor.execute(f'PRAGMA table_info("{escaped_table}")')
+                if str(row["name"]) == "snapshot_id"
+                or str(row["name"]).endswith("_snapshot_id")
+            )
+            for column in columns:
+                escaped_column = column.replace('"', '""')
+                rows = cursor.execute(
+                    f'SELECT DISTINCT "{escaped_column}" AS snapshot_id '
+                    f'FROM "{escaped_table}" '
+                    f'WHERE "{escaped_column}" IS NOT NULL'
+                )
+                references.update(
+                    str(row["snapshot_id"])
+                    for row in rows
+                    if isinstance(row["snapshot_id"], str) and row["snapshot_id"]
+                )
+        return tuple(sorted(references))
+
     def schema_version(self) -> int:
         row = self._connection.execute(
             "SELECT value FROM schema_metadata WHERE key = ?", ("schema_version",)
@@ -7206,7 +7256,7 @@ class SQLiteStore:
             raise StoreError("orchestrator store is not prepared")
         if _sqlite_schema_tokens(str(row["sql"])) != expected_tokens:
             raise StoreError("orchestrator store is not prepared")
-        cursor.execute(f"DROP TRIGGER {trigger_name}")
+        cursor.execute("DROP TRIGGER atlas_finalizations_require_projected_outbox")
 
     @staticmethod
     def _restore_atlas_finalization_projection_trigger_after_outbox_rebuild(

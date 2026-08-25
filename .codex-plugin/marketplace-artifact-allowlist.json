@@ -1,0 +1,35 @@
+{
+  "schema": "2718lab-devkit/main-artifact-allowlist-v1",
+  "files": [
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    "LICENSE",
+    ".codex-plugin/fastlane_todo_projection.py",
+    "mcp-tools/pyproject.toml",
+    "mcp-tools/server.py",
+    "mcp-tools/uv.lock",
+    "mcp-tools/devkit_fastlane/__init__.py",
+    "mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md",
+    "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v3.json",
+    "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v4.json",
+    "mcp-tools/devkit_fastlane/assets/fastlane-routing-policy-v5.json",
+    "mcp-tools/devkit_fastlane/references/efficiency-automation.md",
+    "mcp-tools/devkit_fastlane/references/grounding-discipline.md",
+    "mcp-tools/devkit_fastlane/references/orchestration-runtime.md",
+    "mcp-tools/devkit_fastlane/references/team-patterns.md",
+    "mcp-tools/devkit_fastlane/references/verification-checklist.md",
+    "mcp-tools/devkit_fastlane/references/work-packages.md",
+    "mcp-tools/devkit_fastlane/scripts/fastlane_routing.py",
+    "mcp-tools/devkit_fastlane/scripts/team_efficiency.py"
+  ],
+  "trees": [
+    "skills",
+    "mcp-tools/bugkiller",
+    "mcp-tools/devkit_atlas",
+    "mcp-tools/devkit_relay",
+    "mcp-tools/devkit_runtime",
+    "mcp-tools/devkit_continuity",
+    "mcp-tools/orchestrator",
+    "mcp-tools/project_index"
+  ]
+}

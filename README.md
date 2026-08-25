@@ -1,14 +1,14 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — Codex + MCP v1.1.0
+# 2718lab DevKit — Codex + MCP v1.1.1
 
-[![version](https://img.shields.io/badge/version-v1.1.0-blue)](./.codex-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-v1.1.1-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
 runtime for bounded project indexing, Atlas evidence, Relay lifecycle
 coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
-of reference manuals. This repository carries the versioned v1.1.0 package.
+of reference manuals. This repository carries the versioned v1.1.1 package.
 The checked-in manifest and allowlist define the executable runtime surface;
 the manual map, install, build, and verification sections below describe the
 supported workflow.
@@ -150,6 +150,26 @@ The server has no prompt or resource surface. Tool inputs are structured and
 bounded; absolute worker paths, shell fragments, raw source, credentials,
 unbounded command output, and caller-forged acceptance evidence are rejected.
 
+## Install from the Codex marketplace
+
+Add the repository's slim marketplace branch once, then install the plugin:
+
+    codex plugin marketplace add 2718labs/2718lab-devkit --ref marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+For later releases, refresh the remote snapshot and reinstall from it:
+
+    codex plugin marketplace upgrade 2718lab-marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+Start a new Codex task after installing or updating so the refreshed skills and
+MCP server are loaded. The `marketplace` branch is a distribution snapshot; the
+source of record remains `main` and immutable release tags.
+
+Maintainers build that snapshot with the dedicated marketplace allowlist:
+
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.1.zip
+
 ## Install and run locally
 
 Requirements: Python 3.11 or newer and uv.
@@ -182,16 +202,16 @@ handles or falls back to an unrelated local start.
 The allowlisted builder creates a deterministic ZIP outside the plugin source
 tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.0.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.1.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
 .codex-plugin/main-artifact-allowlist.json. Its executable runtime surface is
 the MCP server; the ZIP also carries the Fast Lane contract, required references
 and policy assets, the `team_efficiency.py` compatibility entry point, its
-routing modules. It deliberately excludes the optional Skill manual bundle, command
-helpers, hooks, CI files, host-private state, prompts, static agents, and
-arbitrary repository files.
+routing modules. It deliberately excludes the optional Skill manual bundle,
+command helpers, hooks, CI files, host-private state, prompts, static agents,
+and arbitrary repository files.
 
 Run Fast Lane through its executable entry point to inspect its fail-closed
 result:
@@ -265,6 +285,26 @@ evidence, or user data. If no retention strategy is declared, or if any gate
 or evidence is missing, retain the material permanently until an explicit,
 separately authorized cleanup policy exists.
 
+Derived project-index snapshots use a separate two-step maintenance command.
+Run `uv run python -m devkit_runtime.index_maintenance preview` first, inspect
+the exact candidate and protection sets, then pass its unchanged identity to
+`uv run python -m devkit_runtime.index_maintenance apply --preview-id <id>`.
+Apply holds the Orchestrator writer fence, rechecks cross-database snapshot
+references, keeps the newest two snapshots per workspace, and deletes at most
+32 oldest candidates within fixed row and content-hash budgets. Parser-cache
+and blob rows are collected only when the approved batch made them unreachable.
+New stores use bounded incremental vacuuming; older stores without incremental
+auto-vacuum reuse freed SQLite pages internally. Run
+`uv run python -m devkit_runtime.index_maintenance compact` to inspect that
+boundary; a legacy store returns `RETENTION_FULL_REWRITE_REQUIRED` until the
+operator explicitly repeats it with `--allow-full-rewrite`. The one-time rewrite
+checks for at least twice the database size plus 64 MiB of free space and stops
+on active readers instead of gambling with a low-space database. Compaction
+reports observed database/WAL bytes before and after. Any stale preview, missing
+schema, budget overflow, lock failure, or
+invalid reference fails closed with zero deletion. Atlas data is never an index
+cleanup target.
+
 ## Deterministic Fast Lane
 
 The Fast Lane compiler is in
@@ -320,7 +360,7 @@ freeze a transient regression count.
 
 ## Version
 
-This repository represents the versioned v1.1.0 package. Release notes are
+This repository represents the versioned v1.1.1 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
 artifact allowlist, and locked dependency set. A maintainer dispatches Release
 from current `main`; it validates all declared gates, creates the annotated tag,

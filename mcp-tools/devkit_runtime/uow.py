@@ -7,7 +7,8 @@ and keeps every resulting connection or verified snapshot within one UoW.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -498,6 +499,37 @@ class RuntimeUnitOfWork:
                 _open_orchestrator_store_rw(self._config)
             )
         return self._orchestrator_store
+
+    def index_retention_references(self) -> tuple[str, ...]:
+        """Read durable cross-database snapshot roots for a retention preview."""
+
+        store = self._orchestrator_store_for_outbox()
+        read_references = getattr(store, "index_retention_references", None)
+        if not callable(read_references):
+            raise RuntimeConfigError("RUNTIME_PROVIDER_INVALID")
+        references = read_references()
+        if not isinstance(references, tuple) or any(
+            not isinstance(snapshot_id, str) for snapshot_id in references
+        ):
+            raise RuntimeConfigError("RUNTIME_PROVIDER_INVALID")
+        return references
+
+    @contextmanager
+    def index_retention_fence(self) -> Iterator[tuple[str, ...]]:
+        """Hold the orchestrator writer fence across one index release."""
+
+        if self._read_only:
+            raise RuntimeConfigError("RUNTIME_READ_ONLY")
+        store = self._orchestrator_store_for_outbox()
+        open_fence = getattr(store, "index_retention_fence", None)
+        if not callable(open_fence):
+            raise RuntimeConfigError("RUNTIME_PROVIDER_INVALID")
+        with open_fence() as references:
+            if not isinstance(references, tuple) or any(
+                not isinstance(snapshot_id, str) for snapshot_id in references
+            ):
+                raise RuntimeConfigError("RUNTIME_PROVIDER_INVALID")
+            yield references
 
     @staticmethod
     def _continuity_key(

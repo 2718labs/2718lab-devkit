@@ -42,7 +42,6 @@ from .security import (
     validate_slot_value,
 )
 
-
 _GAP_PRIORITY = {
     "SNAPSHOT_MISMATCH": 1,
     "VERIFICATION_FAILED": 2,
@@ -101,6 +100,7 @@ class ExtractionRequest:
     changed_nodes: tuple[IndexNode, ...]
     coverage_gaps: tuple[CoverageGap, ...]
     execution_receipts: tuple[BoundExecutionReceipt, ...]
+    repository_signature: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -1142,9 +1142,13 @@ class PythonRecipeExtractor:
             "intent_id": intent,
             "language": {"name": "python", "extractor_version": self.extractor_version},
             "framework": None,
-            "repository_signature": request.workspace_hash
-            if _is_hash(request.workspace_hash)
-            else _safe_metadata_hash(request.workspace_hash),
+            "repository_signature": request.repository_signature
+            if _is_hash(request.repository_signature)
+            else (
+                request.workspace_hash
+                if _is_hash(request.workspace_hash)
+                else _safe_metadata_hash(request.workspace_hash)
+            ),
             "layer": "local",
             "slots": [slot.to_dict() for slot in slots],
             "constraints": [constraint.to_dict() for constraint in constraints],

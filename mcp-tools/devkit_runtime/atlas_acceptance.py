@@ -12,6 +12,7 @@ from typing import NoReturn
 
 from devkit_atlas.canonical import canonical_hash
 from devkit_atlas.extractors import BoundExecutionReceipt, ExtractionRequest
+from devkit_atlas.matching import structural_repository_signature
 from devkit_atlas.models import AtlasError
 from devkit_atlas.receipts import (
     RawExecutionReceipt,
@@ -342,6 +343,11 @@ class ProductionAcceptanceEvidenceReader:
                 gap for gap in facts.gaps if _within_scope(gap.path, write_scope)
             ),
             execution_receipts=(),
+            repository_signature=structural_repository_signature(
+                facts,
+                language=request.language,
+                framework=request.framework,
+            ),
         )
         input_hash = _extraction_binding_hash(
             kind="atlas-extraction-input-v1",
@@ -383,6 +389,7 @@ class ProductionAcceptanceEvidenceReader:
             changed_nodes=raw.changed_nodes,
             coverage_gaps=raw.coverage_gaps,
             execution_receipts=receipts,
+            repository_signature=raw.repository_signature,
         )
 
     def _receipt_workspace_hash(self, workspace_id: str) -> str:

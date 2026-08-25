@@ -1,14 +1,14 @@
 [English](README.md)
 
-# 2718lab DevKit —— Codex + MCP v1.1.0
+# 2718lab DevKit —— Codex + MCP v1.1.1
 
-[![版本](https://img.shields.io/badge/version-v1.1.0-blue)](./.codex-plugin/plugin.json)
+[![版本](https://img.shields.io/badge/version-v1.1.1-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit 是一个 Codex-first 工程工具包：它包含一个本地、仅 stdio
 传输的 MCP 运行时，用于有边界的项目索引、Atlas 证据、Relay 生命周期协调和
 确定性的 Fast Lane 规划；同时还包含一组精简的 Skill 说明书。本仓库承载版本化的
-v1.1.0 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
+v1.1.1 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
 安装、构建和验证章节共同给出支持的工作流。
 
 当前版本保留刻意 fail-closed 的 Fast Lane 预览。公共编译器和 CLI 固定返回
@@ -131,6 +131,25 @@ Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协�
 者路径、Shell 片段、原始源码、凭据、无界命令输出和调用方伪造的验收证据
 都会被拒绝。
 
+## 从 Codex 插件市场安装
+
+首次添加仓库的瘦市场分支，然后安装插件：
+
+    codex plugin marketplace add 2718labs/2718lab-devkit --ref marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+后续版本先刷新远端快照，再从市场重装：
+
+    codex plugin marketplace upgrade 2718lab-marketplace
+    codex plugin add 2718lab-devkit@2718lab-marketplace
+
+安装或更新后请新建 Codex 任务，使新的 skills 和 MCP 服务器被重新载入。
+`marketplace` 分支只是分发快照；源码权威仍是 `main` 和不可变 release tag。
+
+维护者使用专用的 marketplace allowlist 构建该快照：
+
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.1.zip
+
 ## 本地安装与运行
 
 要求：Python 3.11 或更高版本，以及 uv。
@@ -160,14 +179,13 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.0.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.1.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
 表面是 MCP 服务器；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
 `team_efficiency.py` 兼容入口及其路由模块。它明确不包含可选的 Skill 说明书 bundle、
-命令辅助文件、hooks、CI
-文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
+命令辅助文件、hooks、CI 文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
 
 Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 
@@ -228,6 +246,21 @@ review、verification、integration receipt 时，宿主才可记录
 任一门槛/证据缺失时，相关材料必须永久保留，直到另有明确且独立授权的清理
 策略。
 
+派生的项目索引快照使用独立的两阶段维护命令。先运行
+`uv run python -m devkit_runtime.index_maintenance preview`，检查完整候选集与
+保护集；确认后再把未变化的 identity 传给
+`uv run python -m devkit_runtime.index_maintenance apply --preview-id <id>`。
+Apply 会持有 Orchestrator 写围栏、重新核验跨数据库快照引用、为每个工作区保留
+最新两代，并按时间从旧到新处理最多 32 个候选，同时受固定行数与内容哈希预算
+限制。只有本批删除后确实失去引用的 parser cache 和 blob 才会被回收。新建存储
+启用有界 incremental vacuum；旧存储若没有该能力，先只在 SQLite 内部复用空闲页。
+运行 `uv run python -m devkit_runtime.index_maintenance compact` 可检查物理压缩边界；
+旧库会先返回 `RETENTION_FULL_REWRITE_REQUIRED`，只有操作者明确追加
+`--allow-full-rewrite` 才执行一次性转换。转换前必须有不少于数据库两倍加 64 MiB 的
+可用空间，存在活跃读者时停止，并报告数据库/WAL 压缩前后的实测字节数。preview
+过期、schema 缺失、预算溢出、锁失败或引用
+无效都会零删除并关闭失败。Atlas 数据永远不属于索引清理目标。
+
 本地 Windows 的 `C:/` 和所有非 `G:/` 临时根、worktree、cache、evidence
 路径都禁止使用；可信 hosted Windows CI 仅可把宿主提供的 `RUNNER_TEMP`
 作为明确例外，并在其下派生所有任务临时/缓存路径。该例外不构成外部宿主
@@ -279,7 +312,7 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 ## 版本
 
-本仓库代表版本化的 v1.1.0 包。发布说明见
+本仓库代表版本化的 v1.1.1 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
 和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
 后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。

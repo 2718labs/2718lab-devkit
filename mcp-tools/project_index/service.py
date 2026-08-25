@@ -23,9 +23,12 @@ from . import extractors
 from .extractors import ParsedExtraction, SourceFile
 from .models import (
     CoverageGap,
+    IndexCompactionResult,
     IndexEdge,
     IndexError,
     IndexNode,
+    IndexRetentionApply,
+    IndexRetentionPreview,
     IndexSnapshot,
     IndexState,
     IndexStatus,
@@ -182,6 +185,29 @@ class ProjectIndexService:
 
     def close(self) -> None:
         self._store.close()
+
+    def preview_retention(
+        self, protected_snapshot_ids: Sequence[str] = ()
+    ) -> IndexRetentionPreview:
+        """Return a local-only snapshot retention plan without making changes."""
+
+        return self._store.preview_retention(protected_snapshot_ids)
+
+    def apply_retention(
+        self,
+        preview_id: str | None,
+        protected_snapshot_ids: Sequence[str] = (),
+    ) -> IndexRetentionApply:
+        """Apply a previously previewed local-only retention plan."""
+
+        return self._store.apply_retention(preview_id, protected_snapshot_ids)
+
+    def compact_storage(
+        self, *, allow_full_rewrite: bool = False
+    ) -> IndexCompactionResult:
+        """Compact released local index pages after explicit authorization."""
+
+        return self._store.compact_storage(allow_full_rewrite=allow_full_rewrite)
 
     def project_index_register(self, workspace_root: str | Path) -> str:
         """Register the sole accepted filesystem-root input for project indexing."""
