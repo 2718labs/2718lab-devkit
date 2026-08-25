@@ -7256,7 +7256,7 @@ class SQLiteStore:
             raise StoreError("orchestrator store is not prepared")
         if _sqlite_schema_tokens(str(row["sql"])) != expected_tokens:
             raise StoreError("orchestrator store is not prepared")
-        cursor.execute(f"DROP TRIGGER {trigger_name}")
+        cursor.execute("DROP TRIGGER atlas_finalizations_require_projected_outbox")
 
     @staticmethod
     def _restore_atlas_finalization_projection_trigger_after_outbox_rebuild(
