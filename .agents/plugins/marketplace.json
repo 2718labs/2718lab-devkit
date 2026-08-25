@@ -1,0 +1,20 @@
+{
+  "name": "2718lab-marketplace",
+  "interface": {
+    "displayName": "2718lab Marketplace"
+  },
+  "plugins": [
+    {
+      "name": "2718lab-devkit",
+      "source": {
+        "source": "local",
+        "path": "./plugins/2718lab-devkit"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

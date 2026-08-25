@@ -1,0 +1,30 @@
+{
+  "name": "2718lab-devkit",
+  "version": "1.1.1",
+  "description": "Local MCP server for developer workflow coordination, indexing, and evidence handling.",
+  "author": {
+    "name": "2718lab",
+    "url": "https://github.com/2718labs"
+  },
+  "homepage": "https://github.com/2718labs/2718lab-devkit",
+  "repository": "https://github.com/2718labs/2718lab-devkit",
+  "license": "AGPL-3.0",
+  "keywords": [
+    "mcp",
+    "developer-tools",
+    "local"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "2718lab DevKit",
+    "shortDescription": "Local MCP server for developer workflows",
+    "longDescription": "A local MCP server for workflow coordination, indexing, and evidence handling.",
+    "developerName": "2718lab",
+    "category": "Developer Tools",
+    "capabilities": [
+      "MCP server"
+    ],
+    "websiteURL": "https://github.com/2718labs/2718lab-devkit",
+    "defaultPrompt": []
+  }
+}

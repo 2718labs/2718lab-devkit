@@ -1,0 +1,63 @@
+[project]
+name = "2718lab-devkit-mcp"
+version = "1.1.1"
+description = "MCP runtime for the 2718lab DevKit primary plugin."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1",
+    "pytest>=8.0",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "bugkiller",
+    "devkit_atlas",
+    "devkit_continuity",
+    "devkit_fastlane",
+    "devkit_relay",
+    "devkit_runtime",
+    "orchestrator",
+    "project_index",
+]
+exclude = ["*/tests/**"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"server.py" = "server.py"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
+
+[tool.pyright]
+include = [
+    "bugkiller",
+    "devkit_atlas",
+    "devkit_relay",
+    "devkit_runtime",
+    "devkit_continuity",
+    "devkit_fastlane",
+    "orchestrator",
+    "project_index",
+    "server.py",
+]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "devkit_fastlane/tests"]
