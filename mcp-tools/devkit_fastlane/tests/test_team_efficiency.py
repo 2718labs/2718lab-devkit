@@ -2256,6 +2256,30 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertNotIn(forbidden, serialized)
         self.assertNotIn(str(self.repo).casefold(), serialized)
 
+    def test_unindexed_project_with_more_than_manifest_units_can_bootstrap(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        now = int(datetime.now(UTC).timestamp())
+        request["project_binding"] = self.new_empty_project_binding(
+            helper,
+            request,
+            issued_at=now - 10,
+            expires_at=now + 110,
+            initial_entry_count=helper.MAX_MANIFEST_UNITS + 1,
+        )
+
+        result = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            enable=True,
+        )
+
+        self.assertEqual("BOOTSTRAP_INDEX_READY", result["decision_code"])
+        self.assertEqual("bootstrap", result["status"])
+        self.assertEqual(1, len(result["bootstrap_queue"]))
+
     def test_unattested_or_invalid_new_empty_project_stays_fenced(self) -> None:
         helper = load_efficiency()
         now = int(datetime.now(UTC).timestamp())
