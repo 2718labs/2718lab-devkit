@@ -23,6 +23,7 @@ MAX_MANIFEST_INPUT_BYTES = 4 * MAX_MANIFEST_BYTES
 MAX_WRITE_SCOPES = 32
 MAX_STATUS_TASKS = 64
 MAX_MANIFEST_UNITS = 16
+MAX_BOOTSTRAP_ENTRY_COUNT = 2**63 - 1
 MAX_LIST_ITEMS = 32
 MAX_GRAPH_NODES = 64
 MAX_GRAPH_EDGES = 128
@@ -997,7 +998,9 @@ def _validated_project_binding(value: object) -> dict[str, Any]:
         raise ValueError("project binding attestation schema is unknown")
     if (
         type(attestation_source["initial_entry_count"]) is not int
-        or not 0 <= attestation_source["initial_entry_count"] <= MAX_MANIFEST_UNITS
+        or not 0
+        <= attestation_source["initial_entry_count"]
+        <= MAX_BOOTSTRAP_ENTRY_COUNT
     ):
         raise ValueError("project binding initial entry count is invalid")
     if (
