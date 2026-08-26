@@ -1155,10 +1155,7 @@ def _project_execution_block_details(
             return "BOOTSTRAP_ATTESTATION_MISMATCH", None
         if binding["mode"] == "new_empty_bootstrap":
             attestation = binding["attestation"]
-            if (
-                attestation["state"] != "new_empty"
-                or attestation["initial_entry_count"] != 0
-            ):
+            if attestation["state"] != "new_empty":
                 return "BOOTSTRAP_PROJECT_NOT_EMPTY", None
             issued = _bootstrap_attestation_timestamp(
                 attestation["issued_at"], "project binding attestation.issued_at"
@@ -8613,7 +8610,7 @@ def _fast_lane_bootstrap_index_ready_plan(
     *,
     source_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Emit only the read-only descriptor for an attested empty project."""
+    """Emit the read-only descriptor for an attested unindexed new project."""
 
     binding = _mapping(source_identity["binding"], "new-empty bootstrap binding")
     attestation = _mapping(binding["attestation"], "new-empty bootstrap attestation")

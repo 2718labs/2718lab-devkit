@@ -218,8 +218,9 @@ plan 可自报的根字段。
 本地 Windows 的 `C:/` 和 `G:/` 以外的本机盘符都禁止作为 `TEMP`、`TMP`、`TMPDIR`
 或临时根；可信 hosted Windows CI 仅可使用宿主提供的 `RUNNER_TEMP`，并在其下派生
 任务临时与缓存路径。该宿主例外不放宽本地规则，也不是外部宿主 embedding 证据。
-这仍是当前 bootstrap/read-context 边界。空项目只能生成 bootstrap-only index：不得据此创建可执行
-assignment，直到可信宿主提供有界项目索引上下文。旧 schema 输入返回
+这仍是当前 bootstrap/read-context 边界。尚未建立索引的新项目（无论目录是否已包含
+源码、README 或配置）只能生成 bootstrap-only index：不得据此创建可执行 assignment，
+直到可信宿主完成一次 `register -> sync` 并提供与初始 manifest 精确绑定的有界项目索引上下文。旧 schema 输入返回
 `FASTLANE_SCHEMA_UPGRADE_REQUIRED`，不得降级猜测或启动工作。
 
 ### 6. 验证与交付

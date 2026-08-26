@@ -154,7 +154,7 @@ def test_current_new_empty_attestation_yields_only_bootstrap_registry_binding() 
 @pytest.mark.parametrize(
     ("changes", "code"),
     [
-        ({"initial_entry_count": 1}, "BOOTSTRAP_PROJECT_NOT_EMPTY"),
+        ({"initial_entry_count": -1}, "BOOTSTRAP_PROJECT_NOT_EMPTY"),
         ({"state": "indexed"}, "BOOTSTRAP_PROJECT_NOT_EMPTY"),
         ({"issued_at": _NOW - 121, "expires_at": _NOW - 1}, "BOOTSTRAP_ATTESTATION_STALE"),
     ],
@@ -195,8 +195,11 @@ def test_bootstrap_transport_rejects_raw_path_extra_field_and_forgery() -> None:
 
 
 class _HostOperations:
-    def __init__(self, *, fail: str | None = None) -> None:
+    def __init__(
+        self, *, fail: str | None = None, initial_entry_count: int = 0
+    ) -> None:
         self.fail = fail
+        self.initial_entry_count = initial_entry_count
         self.calls: list[tuple[str, str, str]] = []
 
     def project_index_register(
@@ -219,7 +222,7 @@ class _HostOperations:
             "workspace_id": workspace_id,
             "attested_input_snapshot_id": "sha256:" + "7" * 64,
             "initial_manifest_hash": "sha256:" + "5" * 64,
-            "initial_entry_count": 0,
+            "initial_entry_count": self.initial_entry_count,
             "index_snapshot_id": "sha256:" + "8" * 64,
         }
         result["index_identity"] = _canonical_hash(
@@ -317,6 +320,36 @@ def test_bootstrap_transport_runs_only_register_then_sync_and_binds_receipt() ->
     ) == receipt
     assert "lease" not in repr(receipt).lower()
     assert "path" not in repr(receipt).lower()
+
+
+def test_new_empty_bootstrap_accepts_attested_initial_entries() -> None:
+    registry_binding = _resolver().resolve_new_empty_bootstrap(
+        _binding(initial_entry_count=3)
+    )
+    host = _HostOperations(initial_entry_count=3)
+
+    receipt = ProjectIndexBootstrapTransport(host, clock=lambda: _NOW).execute(
+        registry_binding
+    )
+
+    assert receipt["workspace_id"] == registry_binding["workspace_id"]
+    assert receipt["initial_manifest_hash"] == registry_binding[
+        "initial_manifest_hash"
+    ]
+
+
+def test_bootstrap_transport_rejects_count_that_does_not_match_binding() -> None:
+    registry_binding = _resolver().resolve_new_empty_bootstrap(
+        _binding(initial_entry_count=3)
+    )
+    host = _HostOperations(initial_entry_count=2)
+
+    with pytest.raises(RelayRuntimeError) as rejected:
+        ProjectIndexBootstrapTransport(host, clock=lambda: _NOW).execute(
+            registry_binding
+        )
+
+    assert rejected.value.code == "BOOTSTRAP_IDENTITY_MISMATCH"
 
 
 def test_resolver_validates_full_binding_and_receipt_for_indexed_recompile() -> None:

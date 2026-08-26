@@ -1,6 +1,6 @@
 [project]
 name = "2718lab-devkit-mcp"
-version = "1.1.1"
+version = "1.1.2"
 description = "MCP runtime for the 2718lab DevKit primary plugin."
 requires-python = ">=3.11"
 dependencies = [

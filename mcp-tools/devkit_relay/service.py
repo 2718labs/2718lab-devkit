@@ -26,6 +26,7 @@ _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _WORKSPACE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SCOPE_PATH = re.compile(r"^[A-Za-z]:")
+_MAX_BOOTSTRAP_ENTRY_COUNT = 2**63 - 1
 
 
 class RelayError(RuntimeError):
@@ -1066,7 +1067,7 @@ class RelayService:
             )
             or attestation["state"] != "new_empty"
             or type(attestation["initial_entry_count"]) is not int
-            or attestation["initial_entry_count"] != 0
+            or not 0 <= attestation["initial_entry_count"] <= _MAX_BOOTSTRAP_ENTRY_COUNT
             or type(attestation["capability_epoch"]) is not int
             or attestation["capability_epoch"] < 1
             or not self._finite_timestamp(attestation["issued_at"])

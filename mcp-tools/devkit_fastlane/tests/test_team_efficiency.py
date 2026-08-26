@@ -720,6 +720,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         issued_at: int,
         expires_at: int,
         initial_entry_count: int = 0,
+        state: str = "new_empty",
         snapshot_id: str | None = None,
     ) -> dict[str, object]:
         package = request["work_package"]
@@ -737,7 +738,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper,
             authority=authority,
             mode="new_empty_bootstrap",
-            state="new_empty",
+            state=state,
             initial_entry_count=initial_entry_count,
             issued_at=issued_at,
             expires_at=expires_at,
@@ -2280,13 +2281,22 @@ class TeamEfficiencyTests(unittest.TestCase):
             issued_at=now - 130,
             expires_at=now - 10,
         )
-        nonempty = bootstrap_request()
-        nonempty["project_binding"] = self.new_empty_project_binding(
+        invalid_state = bootstrap_request()
+        invalid_state["project_binding"] = self.new_empty_project_binding(
             helper,
-            nonempty,
+            invalid_state,
             issued_at=issued_at,
             expires_at=expires_at,
             initial_entry_count=1,
+            state="indexed",
+        )
+        negative_count = bootstrap_request()
+        negative_count["project_binding"] = self.new_empty_project_binding(
+            helper,
+            negative_count,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            initial_entry_count=-1,
         )
         mismatch = bootstrap_request()
         mismatch["project_binding"] = self.new_empty_project_binding(
@@ -2307,7 +2317,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         cases = {
             "missing": (missing, "BOOTSTRAP_ATTESTATION_REQUIRED"),
             "stale": (stale, "BOOTSTRAP_ATTESTATION_STALE"),
-            "nonempty": (nonempty, "BOOTSTRAP_PROJECT_NOT_EMPTY"),
+            "invalid_state": (invalid_state, "BOOTSTRAP_PROJECT_NOT_EMPTY"),
+            "negative_count": (negative_count, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
             "mismatch": (mismatch, "BOOTSTRAP_ATTESTATION_MISMATCH"),
             "unknown": (unknown, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
         }

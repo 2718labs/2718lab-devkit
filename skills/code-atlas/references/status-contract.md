@@ -3,6 +3,13 @@
 Treat every Code Atlas status as a bounded next action, never as authority to
 broaden a task or query an external service.
 
+The absence of a workspace id or first snapshot is not a Code Atlas status. In
+a newly opened project, establish the first local snapshot with the bounded
+`project_index_register` -> `project_index_sync` cold-start sequence before
+asking for status or choosing a fallback. Existing project files do not make
+that initialization unsafe. Only tool unavailability or a failed register/sync
+permits the degraded path.
+
 | Status | Action |
 | --- | --- |
 | `READY` | Use the local verified recipe within the assigned scope and verify it. |

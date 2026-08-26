@@ -8,6 +8,19 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-08-27
+
+### Fixed
+
+- Treat a newly opened project without an index as normal cold start: initialize
+  it with one bounded `project_index_register -> project_index_sync` sequence
+  before considering degraded mode, including when README, configuration, or
+  source files already exist.
+- Preserve the host-attested initial entry count through bootstrap and require
+  the synchronized manifest and entry count to match exactly before indexed
+  recompilation; registration, synchronization, identity, or attestation
+  failures remain fail-closed.
+
 ## [1.1.1] - 2026-08-25
 
 ### Fixed
