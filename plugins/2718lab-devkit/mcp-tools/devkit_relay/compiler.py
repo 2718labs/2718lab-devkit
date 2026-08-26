@@ -202,6 +202,7 @@ _MAX_TITLE_LENGTH = 256
 _MAX_RETRY_ATTEMPTS = 3
 _MAX_WRITERS_PER_SCHEDULER = 3
 _MAX_PARALLEL_WRITERS = 9
+_MAX_BOOTSTRAP_ENTRY_COUNT = 2**63 - 1
 
 
 class RelayPlanError(ValueError):
@@ -1135,7 +1136,7 @@ def _new_empty_project_binding(
         )
         or attestation["state"] != "new_empty"
         or type(attestation["initial_entry_count"]) is not int
-        or attestation["initial_entry_count"] != 0
+        or not 0 <= attestation["initial_entry_count"] <= _MAX_BOOTSTRAP_ENTRY_COUNT
         or type(attestation["capability_epoch"]) is not int
         or attestation["capability_epoch"] < 1
         or not _finite_timestamp(attestation["issued_at"])
@@ -1166,7 +1167,7 @@ def _bootstrap_registry_binding(
         "project_id": attestation["project_id"],
         "bootstrap_root_identity": attestation["bootstrap_root_identity"],
         "initial_manifest_hash": attestation["initial_manifest_hash"],
-        "initial_entry_count": 0,
+        "initial_entry_count": attestation["initial_entry_count"],
         "capability_epoch": attestation["capability_epoch"],
         "capability_hash": attestation["capability_hash"],
         "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
