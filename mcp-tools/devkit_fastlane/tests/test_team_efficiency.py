@@ -720,6 +720,7 @@ class TeamEfficiencyTests(unittest.TestCase):
         issued_at: int,
         expires_at: int,
         initial_entry_count: int = 0,
+        state: str = "new_empty",
         snapshot_id: str | None = None,
     ) -> dict[str, object]:
         package = request["work_package"]
@@ -737,7 +738,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             helper,
             authority=authority,
             mode="new_empty_bootstrap",
-            state="new_empty",
+            state=state,
             initial_entry_count=initial_entry_count,
             issued_at=issued_at,
             expires_at=expires_at,
@@ -2255,6 +2256,30 @@ class TeamEfficiencyTests(unittest.TestCase):
                 self.assertNotIn(forbidden, serialized)
         self.assertNotIn(str(self.repo).casefold(), serialized)
 
+    def test_unindexed_project_with_more_than_manifest_units_can_bootstrap(
+        self,
+    ) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_schedule_request(helper)
+        now = int(datetime.now(UTC).timestamp())
+        request["project_binding"] = self.new_empty_project_binding(
+            helper,
+            request,
+            issued_at=now - 10,
+            expires_at=now + 110,
+            initial_entry_count=helper.MAX_MANIFEST_UNITS + 1,
+        )
+
+        result = helper.compile_fast_lane(
+            request,
+            reasoning_effort="ultra",
+            enable=True,
+        )
+
+        self.assertEqual("BOOTSTRAP_INDEX_READY", result["decision_code"])
+        self.assertEqual("bootstrap", result["status"])
+        self.assertEqual(1, len(result["bootstrap_queue"]))
+
     def test_unattested_or_invalid_new_empty_project_stays_fenced(self) -> None:
         helper = load_efficiency()
         now = int(datetime.now(UTC).timestamp())
@@ -2280,13 +2305,22 @@ class TeamEfficiencyTests(unittest.TestCase):
             issued_at=now - 130,
             expires_at=now - 10,
         )
-        nonempty = bootstrap_request()
-        nonempty["project_binding"] = self.new_empty_project_binding(
+        invalid_state = bootstrap_request()
+        invalid_state["project_binding"] = self.new_empty_project_binding(
             helper,
-            nonempty,
+            invalid_state,
             issued_at=issued_at,
             expires_at=expires_at,
             initial_entry_count=1,
+            state="indexed",
+        )
+        negative_count = bootstrap_request()
+        negative_count["project_binding"] = self.new_empty_project_binding(
+            helper,
+            negative_count,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            initial_entry_count=-1,
         )
         mismatch = bootstrap_request()
         mismatch["project_binding"] = self.new_empty_project_binding(
@@ -2307,7 +2341,8 @@ class TeamEfficiencyTests(unittest.TestCase):
         cases = {
             "missing": (missing, "BOOTSTRAP_ATTESTATION_REQUIRED"),
             "stale": (stale, "BOOTSTRAP_ATTESTATION_STALE"),
-            "nonempty": (nonempty, "BOOTSTRAP_PROJECT_NOT_EMPTY"),
+            "invalid_state": (invalid_state, "BOOTSTRAP_PROJECT_NOT_EMPTY"),
+            "negative_count": (negative_count, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
             "mismatch": (mismatch, "BOOTSTRAP_ATTESTATION_MISMATCH"),
             "unknown": (unknown, "BOOTSTRAP_ATTESTATION_UNKNOWN"),
         }

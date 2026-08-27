@@ -68,8 +68,11 @@ apply behavior; neither is implemented or accepted as an input here.
 
 An older bootstrap or routing schema is rejected as
 `FASTLANE_SCHEMA_UPGRADE_REQUIRED`; it is never normalized into an executable
-plan. An empty project may produce bootstrap-only index diagnostics, but cannot
-produce an assignment until trusted host index context is available.
+plan. An unindexed new project, including one that already contains source,
+README, or configuration files, may produce bootstrap-only index diagnostics,
+but cannot produce an assignment until the trusted host completes one
+`register -> sync` and supplies index context bound to the attested initial
+manifest.
 
 The `RuntimeRoot` host-private V2/V3 bootstrap path is covered with injected
 test doubles only. That coverage does not prove an external host embedding or

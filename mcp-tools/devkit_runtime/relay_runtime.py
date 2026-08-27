@@ -41,6 +41,7 @@ _BOOTSTRAP_REGISTRY_BINDING_SCHEMA = (
     "2718lab-devkit/project-registry-bootstrap-binding-v1"
 )
 _BOOTSTRAP_RECEIPT_SCHEMA = "2718lab-devkit/project-index-bootstrap-receipt-v1"
+_MAX_BOOTSTRAP_ENTRY_COUNT = 2**63 - 1
 _PROJECT_BINDING_KEYS = frozenset(
     {
         "schema",
@@ -280,7 +281,7 @@ class ProductionRegistryResolver:
         if (
             attestation["state"] != "new_empty"
             or type(attestation["initial_entry_count"]) is not int
-            or attestation["initial_entry_count"] != 0
+            or not 0 <= attestation["initial_entry_count"] <= _MAX_BOOTSTRAP_ENTRY_COUNT
         ):
             raise RelayRuntimeError("BOOTSTRAP_PROJECT_NOT_EMPTY")
         now = _trusted_time(self._clock)
@@ -315,7 +316,7 @@ class ProductionRegistryResolver:
             "project_id": attestation["project_id"],
             "bootstrap_root_identity": attestation["bootstrap_root_identity"],
             "initial_manifest_hash": attestation["initial_manifest_hash"],
-            "initial_entry_count": 0,
+            "initial_entry_count": attestation["initial_entry_count"],
             "capability_epoch": attestation["capability_epoch"],
             "capability_hash": attestation["capability_hash"],
             "attested_input_snapshot_id": attestation["attested_input_snapshot_id"],
@@ -406,7 +407,8 @@ class ProjectIndexBootstrapTransport:
             or synchronized["attested_input_snapshot_id"]
             != binding["attested_input_snapshot_id"]
             or synchronized["initial_manifest_hash"] != binding["initial_manifest_hash"]
-            or synchronized["initial_entry_count"] != 0
+            or type(synchronized["initial_entry_count"]) is not int
+            or synchronized["initial_entry_count"] != binding["initial_entry_count"]
             or not _is_hash(synchronized["index_snapshot_id"])
             or synchronized["index_identity"] != expected_index_identity
         ):
@@ -489,7 +491,8 @@ def _validated_bootstrap_registry_binding(
         binding["schema"] != _BOOTSTRAP_REGISTRY_BINDING_SCHEMA
         or binding["mode"] != "new_empty_bootstrap"
         or binding["bootstrap_only"] is not True
-        or binding["initial_entry_count"] != 0
+        or type(binding["initial_entry_count"]) is not int
+        or not 0 <= binding["initial_entry_count"] <= _MAX_BOOTSTRAP_ENTRY_COUNT
         or not _is_hash(binding["binding_hash"])
         or binding["binding_hash"]
         != _canonical_hash(_without_hash(binding, "binding_hash"))
