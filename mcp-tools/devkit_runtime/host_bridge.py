@@ -1,9 +1,9 @@
-"""Framed host-private capability traffic over one inherited OS handle.
+"""Framed host-private capability traffic over one private OS transport.
 
 The bridge deliberately has no listener, socket bootstrap, file mailbox, or
-environment-provided secret.  A launcher may pass only its dedicated inherited
-descriptor/handle selector; all capability material stays in authenticated
-frames on that private handle.
+environment-provided secret. A launcher passes either a Unix inherited
+descriptor or a high-entropy local Windows named-pipe selector; all capability
+material stays in authenticated frames on that private transport.
 """
 
 from __future__ import annotations
@@ -41,7 +41,12 @@ _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _ENDPOINT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MAC = re.compile(r"[0-9a-f]{64}\Z")
-_HANDLE_SELECTOR = re.compile(r"[0-9]{1,18}\Z")
+_FD_SELECTOR = re.compile(r"[0-9]{1,18}\Z")
+_WINDOWS_PIPE_SELECTOR = re.compile(
+    r"pipe:(?P<name>codex-devkit-(?P<server_pid>[1-9][0-9]{0,9})-"
+    r"(?P<creation_filetime>[0-9a-f]{16})-(?P<token>[0-9a-f]{32}))\Z"
+)
+_MAX_WINDOWS_PIPE_NAME: Final = 96
 _MESSAGE_KINDS: Final = frozenset(
     {
         "session_open",
@@ -149,12 +154,12 @@ class _CapabilityDelivery:
 
 
 class InheritedHandleHostBridge:
-    """Concrete non-listening bridge backed by a dedicated inherited handle.
+    """Concrete non-listening bridge backed by one private duplex descriptor.
 
-    ``from_environment`` is the launch-path constructor.  It accepts only the
-    numeric inherited handle selector frozen in the design lock.  The direct
-    descriptor constructor exists for an already-established host session and
-    for process-local harnesses; it does not open any listener.
+    ``from_environment`` accepts a Unix inherited descriptor or a strict local
+    Windows named-pipe selector.  The direct descriptor constructor exists for
+    an already-established host session and for process-local harnesses; this
+    module never opens a listener.
     """
 
     def __init__(
@@ -222,7 +227,7 @@ class InheritedHandleHostBridge:
         *,
         platform: str | None = None,
     ) -> InheritedHandleHostBridge | None:
-        """Open only the dedicated inherited handle selected by the launcher.
+        """Open only the dedicated private transport selected by the launcher.
 
         Absence is intentionally non-fatal so read-only Relay operations remain
         available.  An invalid selector is fail-closed and is never reflected
@@ -239,19 +244,34 @@ class InheritedHandleHostBridge:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         if selector is None or selector == "":
             return None
-        if type(selector) is not str or _HANDLE_SELECTOR.fullmatch(selector) is None:
-            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
-        handle = int(selector)
-        if handle in {0, 1, 2}:
-            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         descriptor = -1
+        unavailable = False
         try:
             if target_platform == "nt":
-                _assert_windows_private_duplex_ipc_handle(handle)
                 import msvcrt
 
-                descriptor = msvcrt.open_osfhandle(handle, os.O_BINARY | os.O_RDWR)
+                (
+                    pipe_path,
+                    expected_server_pid,
+                    expected_creation_filetime,
+                ) = _windows_named_pipe_target(selector)
+                descriptor = os.open(pipe_path, os.O_BINARY | os.O_RDWR)
+                windows_handle = msvcrt.get_osfhandle(descriptor)
+                _assert_windows_private_duplex_ipc_handle(windows_handle)
+                _assert_windows_named_pipe_server(
+                    windows_handle,
+                    expected_server_pid=expected_server_pid,
+                    expected_creation_filetime=expected_creation_filetime,
+                )
             else:
+                if (
+                    type(selector) is not str
+                    or _FD_SELECTOR.fullmatch(selector) is None
+                ):
+                    raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+                handle = int(selector)
+                if handle in {0, 1, 2}:
+                    raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
                 descriptor = os.dup(handle)
             _assert_private_duplex_ipc_descriptor(descriptor, platform=target_platform)
             os.set_inheritable(descriptor, False)
@@ -261,15 +281,17 @@ class InheritedHandleHostBridge:
             OSError,
             OverflowError,
             ValueError,
-        ) as error:
+        ):
             if descriptor >= 0:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-            if isinstance(error, HostBridgeError):
-                raise
-            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+            unavailable = True
+        if unavailable:
+            # Raise outside the handler so a path-bearing OSError is not retained
+            # in __cause__, __context__, or formatted traceback state.
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         return cls(
             read_fd=descriptor,
             write_fd=descriptor,
@@ -586,9 +608,7 @@ class InheritedHandleHostBridge:
             normalized_predecessor = _normalize_operation_receipt(predecessor, now=now)
             if normalized_predecessor.kind != "coordinator_assignment":
                 raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
-            _assert_terminal_predecessor(
-                normalized, normalized_predecessor, now=now
-            )
+            _assert_terminal_predecessor(normalized, normalized_predecessor, now=now)
             registered_predecessor = self._received_operations.get(
                 normalized_predecessor.envelope_hash
             )
@@ -732,7 +752,7 @@ class InheritedHandleHostBridge:
     def send_private(
         self, *, kind: str, action_id: str, payload: Mapping[str, object]
     ) -> None:
-        """Write one canonical authenticated frame to the inherited handle."""
+        """Write one canonical authenticated frame to the private transport."""
 
         if kind in _VALIDATED_PRIVATE_KINDS:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
@@ -1009,7 +1029,10 @@ def _normalize_capability_hashes(
     normalized: dict[str, str] = {}
     for name in capability_names:
         capability_hash = value.get(name)
-        if type(capability_hash) is not str or _DIGEST.fullmatch(capability_hash) is None:
+        if (
+            type(capability_hash) is not str
+            or _DIGEST.fullmatch(capability_hash) is None
+        ):
             raise HostBridgeError("HOST_BRIDGE_CAPABILITY_INVALID")
         normalized[name] = capability_hash
     return dict(sorted(normalized.items()))
@@ -1130,9 +1153,7 @@ def _parse_capability_report(
     return normalized
 
 
-def _operation_receipt(
-    envelope: Mapping[str, object], *, now: int
-) -> OperationReceipt:
+def _operation_receipt(envelope: Mapping[str, object], *, now: int) -> OperationReceipt:
     normalized = host_envelopes.validate_envelope(envelope, now=now)
     payload = normalized["payload"]
     assert type(payload) is dict
@@ -1182,14 +1203,19 @@ def _operation_replay_identity_from_key(
     return key[:-1]
 
 
-def _normalize_operation_receipt(value: OperationReceipt, *, now: int) -> OperationReceipt:
+def _normalize_operation_receipt(
+    value: OperationReceipt, *, now: int
+) -> OperationReceipt:
     if type(value) is not OperationReceipt:
         raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
     if value.kind not in {"coordinator_assignment", "peer_evidence_handoff"}:
         raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
     _validate_action_id(value.task_id)
     _validate_action_id(value.correlation_id)
-    if type(value.envelope_hash) is not str or _DIGEST.fullmatch(value.envelope_hash) is None:
+    if (
+        type(value.envelope_hash) is not str
+        or _DIGEST.fullmatch(value.envelope_hash) is None
+    ):
         raise HostBridgeError("HOST_BRIDGE_ENVELOPE_INVALID")
     try:
         binding = _normalize_bridge_binding(value.binding, now=now)
@@ -1380,17 +1406,30 @@ def _assert_private_duplex_ipc_descriptor(descriptor: int, *, platform: str) -> 
         raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
 
 
+def _windows_named_pipe_target(selector: str) -> tuple[str, int, int]:
+    """Map a process-identity-bound selector to the local Windows pipe namespace."""
+
+    if type(selector) is not str:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    matched = _WINDOWS_PIPE_SELECTOR.fullmatch(selector)
+    if matched is None:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    name = matched.group("name")
+    server_pid = int(matched.group("server_pid"))
+    creation_filetime = int(matched.group("creation_filetime"), 16)
+    if len(name) > _MAX_WINDOWS_PIPE_NAME:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    if server_pid > 0xFFFF_FFFF:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    return rf"\\.\pipe\{name}", server_pid, creation_filetime
+
+
 def _assert_windows_private_duplex_ipc_handle(handle: int) -> None:
     """Reject console, disk, and one-way Windows handles before CRT adoption."""
 
     try:
         import _winapi
 
-        for standard_handle in (-10, -11, -12):
-            if not _windows_handles_are_provably_distinct(
-                handle, _winapi.GetStdHandle(standard_handle)
-            ):
-                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         if _winapi.GetFileType(handle) != 3:  # FILE_TYPE_PIPE
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         if not _windows_named_pipe_info_available(handle):
@@ -1411,19 +1450,90 @@ def _assert_windows_private_duplex_ipc_handle(handle: int) -> None:
         raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
 
 
-def _windows_handles_are_provably_distinct(first: int, second: int) -> bool:
-    """Accept only a verified distinct kernel object, never an ambiguous comparison."""
+def _assert_windows_named_pipe_server(
+    handle: int,
+    *,
+    expected_server_pid: int,
+    expected_creation_filetime: int,
+) -> None:
+    """Bind the opened pipe to the selector's exact launcher process identity."""
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_server_pid = kernel32.GetNamedPipeServerProcessId
+        get_server_pid.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        )
+        get_server_pid.restype = ctypes.c_int
+        observed_server_pid = ctypes.c_ulong()
+        if not get_server_pid(handle, ctypes.byref(observed_server_pid)):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if observed_server_pid.value != expected_server_pid:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if (
+            _windows_process_creation_filetime(expected_server_pid)
+            != expected_creation_filetime
+        ):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    except HostBridgeError:
+        raise
+    except (
+        AttributeError,
+        ImportError,
+        OSError,
+        OverflowError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+
+
+def _windows_process_creation_filetime(process_id: int) -> int:
+    """Read one process creation identity without retaining a process handle."""
 
     import ctypes
 
-    kernelbase = ctypes.WinDLL("kernelbase", use_last_error=True)
-    compare_object_handles = kernelbase.CompareObjectHandles
-    compare_object_handles.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-    compare_object_handles.restype = ctypes.c_int
-    ctypes.set_last_error(0)
-    if compare_object_handles(first, second):
-        return False
-    return ctypes.get_last_error() == 1656  # ERROR_NOT_SAME_OBJECT
+    class _FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    open_process.restype = ctypes.c_void_p
+    get_process_times = kernel32.GetProcessTimes
+    get_process_times.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+    )
+    get_process_times.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    process = open_process(0x1000, False, process_id)  # QUERY_LIMITED_INFORMATION
+    if not process:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    try:
+        creation = _FileTime()
+        exit_time = _FileTime()
+        kernel_time = _FileTime()
+        user_time = _FileTime()
+        if not get_process_times(
+            process,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        return (creation.high << 32) | creation.low
+    finally:
+        close_handle(process)
 
 
 def _windows_named_pipe_info_available(handle: int) -> bool:

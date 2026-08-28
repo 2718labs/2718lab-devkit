@@ -7,6 +7,8 @@ import os
 import socket
 import struct
 import sys
+import threading
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 
@@ -89,6 +91,84 @@ def test_inherited_handle_bridge_rejects_missing_or_invalid_selectors() -> None:
 
 
 @pytest.mark.parametrize(
+    "selector",
+    [
+        "1234",
+        "handle:1234",
+        "pipe:",
+        "pipe:other-product-0123456789abcdef0123456789abcdef",
+        "pipe:codex-devkit-not-a-pid-0123456789abcdef-0123456789abcdef0123456789abcdef",
+        "pipe:codex-devkit-0-0123456789abcdef-0123456789abcdef0123456789abcdef",
+        "pipe:codex-devkit-01-0123456789abcdef-0123456789abcdef0123456789abcdef",
+        "pipe:codex-devkit-4294967296-0123456789abcdef-0123456789abcdef0123456789abcdef",
+        "pipe:codex-devkit-42-not-filetime-0123456789abcdef0123456789abcdef",
+        "pipe:codex-devkit-42-0123456789abcdef-0123456789abcdef0123456789abcdeg",
+        "pipe:codex-devkit-42-0123456789abcdef-0123456789abcdef0123456789abcdef/child",
+        r"pipe:codex-devkit-42-0123456789abcdef-0123456789abcdef0123456789abcdef\child",
+        r"pipe:\\server\pipe\codex-devkit-42-0123456789abcdef-0123456789abcdef0123456789abcdef",
+        "pipe:codex-devkit-42-0123456789abcdef-0123456789abcdef0123456789abcdef.",
+        "pipe:codex-devkit-" + "a" * 97,
+    ],
+)
+def test_windows_named_pipe_selector_rejects_untagged_or_unsafe_values(
+    selector: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = False
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> int:
+        nonlocal opened
+        opened = True
+        raise AssertionError("invalid selector reached os.open")
+
+    monkeypatch.setattr(host_bridge_module.os, "open", unexpected_open)
+    with pytest.raises(HostBridgeError) as caught:
+        InheritedHandleHostBridge.from_environment(
+            {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": selector}, platform="nt"
+        )
+
+    assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
+    assert selector not in str(caught.value)
+    assert opened is False
+
+
+def test_windows_named_pipe_selector_maps_only_to_local_namespace() -> None:
+    name = "codex-devkit-42-0123456789abcdef-0123456789abcdef0123456789abcdef"
+
+    assert host_bridge_module._windows_named_pipe_target(f"pipe:{name}") == (
+        rf"\\.\pipe\{name}",
+        42,
+        0x0123456789ABCDEF,
+    )
+
+
+def test_windows_named_pipe_open_failure_drops_sensitive_exception_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "fedcba9876543210fedcba9876543210"
+    selector = f"pipe:codex-devkit-42-0123456789abcdef-{token}"
+
+    def fail_open(path: str, _flags: int) -> int:
+        raise OSError(f"cannot open {path}")
+
+    monkeypatch.setattr(host_bridge_module.os, "open", fail_open)
+    with pytest.raises(HostBridgeError) as caught:
+        InheritedHandleHostBridge.from_environment(
+            {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": selector}, platform="nt"
+        )
+
+    error = caught.value
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert error.code == "HOST_BRIDGE_UNAVAILABLE"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    for sensitive in (selector, token, r"\\.\pipe"):
+        assert sensitive not in str(error)
+        assert sensitive not in rendered
+
+
+@pytest.mark.parametrize(
     ("platform", "selector_name"),
     [
         ("posix", "CODEX_DEVKIT_HOST_BRIDGE_FD"),
@@ -119,169 +199,6 @@ def test_inherited_handle_bridge_rejects_regular_file_selector(tmp_path: Path) -
 
     assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
     assert mailbox.read_bytes() == b""
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle semantics")
-def test_inherited_handle_bridge_rejects_windows_regular_file_handle(
-    tmp_path: Path,
-) -> None:
-    import _winapi
-    import msvcrt
-
-    mailbox = tmp_path / "not-a-private-windows-ipc-handle"
-    descriptor = os.open(mailbox, os.O_RDWR | os.O_CREAT, 0o600)
-    duplicated_handle: int | None = None
-    bridge: InheritedHandleHostBridge | None = None
-    try:
-        duplicated_handle = _winapi.DuplicateHandle(
-            _winapi.GetCurrentProcess(),
-            msvcrt.get_osfhandle(descriptor),
-            _winapi.GetCurrentProcess(),
-            0,
-            False,
-            _winapi.DUPLICATE_SAME_ACCESS,
-        )
-        with pytest.raises(HostBridgeError) as caught:
-            bridge = InheritedHandleHostBridge.from_environment(
-                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(duplicated_handle)},
-                platform="nt",
-            )
-    finally:
-        if bridge is not None:
-            bridge.close()
-        elif duplicated_handle is not None:
-            try:
-                _winapi.CloseHandle(duplicated_handle)
-            except OSError:
-                pass
-        os.close(descriptor)
-
-    assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
-    assert mailbox.read_bytes() == b""
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle semantics")
-@pytest.mark.parametrize("endpoint_name", ["read", "write"])
-def test_inherited_handle_bridge_rejects_windows_one_way_pipe_handle(
-    endpoint_name: str,
-) -> None:
-    import _winapi
-    import msvcrt
-
-    read_fd, write_fd = os.pipe()
-    duplicated_handle: int | None = None
-    bridge: InheritedHandleHostBridge | None = None
-    try:
-        duplicated_handle = _winapi.DuplicateHandle(
-            _winapi.GetCurrentProcess(),
-            msvcrt.get_osfhandle(read_fd if endpoint_name == "read" else write_fd),
-            _winapi.GetCurrentProcess(),
-            0,
-            False,
-            _winapi.DUPLICATE_SAME_ACCESS,
-        )
-        with pytest.raises(HostBridgeError) as caught:
-            bridge = InheritedHandleHostBridge.from_environment(
-                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(duplicated_handle)},
-                platform="nt",
-            )
-    finally:
-        if bridge is not None:
-            bridge.close()
-        elif duplicated_handle is not None:
-            try:
-                _winapi.CloseHandle(duplicated_handle)
-            except OSError:
-                pass
-        os.close(read_fd)
-        os.close(write_fd)
-
-    assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle semantics")
-@pytest.mark.parametrize(
-    "standard_handle", [-10, -11, -12], ids=["stdin", "stdout", "stderr"]
-)
-def test_inherited_handle_bridge_rejects_windows_standard_handle_object_alias(
-    standard_handle: int,
-) -> None:
-    import _winapi
-    import ctypes
-    from multiprocessing import Pipe
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    set_std_handle = kernel32.SetStdHandle
-    set_std_handle.argtypes = (ctypes.c_ulong, ctypes.c_void_p)
-    set_std_handle.restype = ctypes.c_int
-    standard_handle_selector = ctypes.c_ulong(standard_handle).value
-    peer, inherited = Pipe(duplex=True)
-    standard_alias = _winapi.DuplicateHandle(
-        _winapi.GetCurrentProcess(),
-        inherited.fileno(),
-        _winapi.GetCurrentProcess(),
-        0,
-        False,
-        _winapi.DUPLICATE_SAME_ACCESS,
-    )
-    candidate_alias = _winapi.DuplicateHandle(
-        _winapi.GetCurrentProcess(),
-        standard_alias,
-        _winapi.GetCurrentProcess(),
-        0,
-        False,
-        _winapi.DUPLICATE_SAME_ACCESS,
-    )
-    original_standard_handle = _winapi.GetStdHandle(standard_handle)
-    bridge: InheritedHandleHostBridge | None = None
-    standard_handle_replaced = False
-    try:
-        assert candidate_alias != standard_alias
-        if not set_std_handle(
-            standard_handle_selector, ctypes.c_void_p(standard_alias)
-        ):
-            raise OSError(ctypes.get_last_error(), "SetStdHandle failed")
-        standard_handle_replaced = True
-        assert _winapi.GetStdHandle(standard_handle) == standard_alias
-
-        caught: HostBridgeError | None = None
-        try:
-            bridge = InheritedHandleHostBridge.from_environment(
-                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(candidate_alias)},
-                platform="nt",
-            )
-        except HostBridgeError as error:
-            caught = error
-
-        if bridge is not None:
-            bridge.prepare_capability(
-                action_id="standard-alias",
-                endpoint="bridge/standard-alias",
-                capabilities={"heartbeat": "test-private-capability"},
-            )
-        assert bridge is None
-        assert caught is not None
-        assert caught.code == "HOST_BRIDGE_UNAVAILABLE"
-        assert peer.poll(0) is False
-    finally:
-        if standard_handle_replaced:
-            if not set_std_handle(
-                standard_handle_selector, ctypes.c_void_p(original_standard_handle)
-            ):
-                raise OSError(ctypes.get_last_error(), "SetStdHandle restore failed")
-        if bridge is not None:
-            bridge.close()
-        else:
-            try:
-                _winapi.CloseHandle(candidate_alias)
-            except OSError:
-                pass
-        try:
-            _winapi.CloseHandle(standard_alias)
-        except OSError:
-            pass
-        peer.close()
-        inherited.close()
 
 
 @pytest.mark.parametrize(
@@ -363,32 +280,14 @@ def test_bad_bootstrap_closes_owned_transport_before_reaccept(
         os.close(sender_reply_fd)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX socket inheritance")
 def test_inherited_handle_bridge_accepts_only_duplex_inherited_ipc_selector() -> None:
-    closers: list[Callable[[], None]]
-    if os.name == "nt":
-        import _winapi
-        from multiprocessing import Pipe
-
-        peer, inherited = Pipe(duplex=True)
-        handle = _winapi.DuplicateHandle(
-            _winapi.GetCurrentProcess(),
-            inherited.fileno(),
-            _winapi.GetCurrentProcess(),
-            0,
-            False,
-            _winapi.DUPLICATE_SAME_ACCESS,
-        )
-        environ = {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": str(handle)}
-        platform = "nt"
-        closers = [peer.close, inherited.close]
-    else:
-        peer, inherited = socket.socketpair()
-        environ = {"CODEX_DEVKIT_HOST_BRIDGE_FD": str(inherited.fileno())}
-        platform = "posix"
-        closers = [peer.close, inherited.close]
+    peer, inherited = socket.socketpair()
+    environ = {"CODEX_DEVKIT_HOST_BRIDGE_FD": str(inherited.fileno())}
+    closers: list[Callable[[], None]] = [peer.close, inherited.close]
     bridge: InheritedHandleHostBridge | None = None
     try:
-        bridge = InheritedHandleHostBridge.from_environment(environ, platform=platform)
+        bridge = InheritedHandleHostBridge.from_environment(environ, platform="posix")
         assert bridge is not None
         assert bridge.is_available
     finally:
@@ -396,6 +295,319 @@ def test_inherited_handle_bridge_accepts_only_duplex_inherited_ipc_selector() ->
             bridge.close()
         for close in closers:
             close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows named pipes")
+@pytest.mark.parametrize("reply_mode", ["pong", "silent"])
+def test_windows_named_pipe_selector_opens_duplex_and_exchanges_frames(
+    reply_mode: str,
+) -> None:
+    import _winapi
+    import ctypes
+    import msvcrt
+
+    creation_filetime = host_bridge_module._windows_process_creation_filetime(
+        os.getpid()
+    )
+    pipe_name = (
+        f"codex-devkit-{os.getpid()}-{creation_filetime:016x}-{os.urandom(16).hex()}"
+    )
+    selector = f"pipe:{pipe_name}"
+    pipe_path = rf"\\.\pipe\{pipe_name}"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_named_pipe = kernel32.CreateNamedPipeW
+    create_named_pipe.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    )
+    create_named_pipe.restype = ctypes.c_void_p
+    connect_named_pipe = kernel32.ConnectNamedPipe
+    connect_named_pipe.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    connect_named_pipe.restype = ctypes.c_int
+    open_thread = kernel32.OpenThread
+    open_thread.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    open_thread.restype = ctypes.c_void_p
+    cancel_synchronous_io = kernel32.CancelSynchronousIo
+    cancel_synchronous_io.argtypes = (ctypes.c_void_p,)
+    cancel_synchronous_io.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    local_free = kernel32.LocalFree
+    local_free.argtypes = (ctypes.c_void_p,)
+    local_free.restype = ctypes.c_void_p
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    convert_sddl = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert_sddl.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    )
+    convert_sddl.restype = ctypes.c_int
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("nLength", ctypes.c_ulong),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", ctypes.c_int),
+        ]
+
+    security_descriptor = ctypes.c_void_p()
+    if not convert_sddl("D:P(A;;GA;;;OW)", 1, ctypes.byref(security_descriptor), None):
+        raise OSError(ctypes.get_last_error(), "owner-only SDDL conversion failed")
+    security_attributes = SecurityAttributes(
+        ctypes.sizeof(SecurityAttributes), security_descriptor, False
+    )
+    server_handle = create_named_pipe(
+        pipe_path,
+        0x00000003 | 0x00080000,  # PIPE_ACCESS_DUPLEX | FIRST_PIPE_INSTANCE
+        0x00000008,  # byte mode, blocking, and PIPE_REJECT_REMOTE_CLIENTS
+        1,
+        65_536,
+        65_536,
+        0,
+        ctypes.byref(security_attributes),
+    )
+    local_free(security_descriptor)
+    if server_handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "CreateNamedPipeW failed")
+
+    errors: list[BaseException] = []
+    release_silent_server = threading.Event()
+
+    def serve() -> None:
+        nonlocal server_handle
+        descriptor = -1
+        host: InheritedHandleHostBridge | None = None
+        try:
+            if not connect_named_pipe(server_handle, None):
+                error = ctypes.get_last_error()
+                if error != 535:  # ERROR_PIPE_CONNECTED
+                    raise OSError(error, "ConnectNamedPipe failed")
+            descriptor = msvcrt.open_osfhandle(
+                int(server_handle), os.O_BINARY | os.O_RDWR
+            )
+            server_handle = None
+            host = InheritedHandleHostBridge.accept_from_file_descriptors(
+                read_fd=descriptor, write_fd=descriptor
+            )
+            descriptor = -1
+            ping = host.receive()
+            assert (ping.kind, ping.action_id, ping.payload) == (
+                "capability_ack",
+                "pipe-ping",
+                {},
+            )
+            if reply_mode == "pong":
+                host.send_private(
+                    kind="capability_ack", action_id="pipe-pong", payload={}
+                )
+            else:
+                release_silent_server.wait(timeout=4)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            if host is not None:
+                host.close()
+            elif descriptor >= 0:
+                os.close(descriptor)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    child: InheritedHandleHostBridge | None = None
+    client_thread: threading.Thread | None = None
+    client_errors: list[BaseException] = []
+    try:
+        child = InheritedHandleHostBridge.from_environment(
+            {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": selector}, platform="nt"
+        )
+        assert child is not None
+
+        def exchange() -> None:
+            try:
+                assert child is not None
+                child.send_private(
+                    kind="capability_ack", action_id="pipe-ping", payload={}
+                )
+                pong = child.receive()
+                assert (pong.kind, pong.action_id, pong.payload) == (
+                    "capability_ack",
+                    "pipe-pong",
+                    {},
+                )
+            except BaseException as error:
+                client_errors.append(error)
+
+        client_thread = threading.Thread(target=exchange, daemon=True)
+        client_thread.start()
+        client_thread.join(timeout=2)
+        if client_thread.is_alive():
+            assert client_thread.native_id is not None
+            thread_handle = open_thread(0x0001, False, client_thread.native_id)
+            if not thread_handle:
+                raise OSError(ctypes.get_last_error(), "OpenThread failed")
+            try:
+                if not cancel_synchronous_io(thread_handle):
+                    raise OSError(ctypes.get_last_error(), "CancelSynchronousIo failed")
+            finally:
+                close_handle(thread_handle)
+            client_thread.join(timeout=2)
+        release_silent_server.set()
+        if reply_mode == "pong":
+            assert client_errors == []
+        else:
+            assert len(client_errors) == 1
+            assert isinstance(client_errors[0], HostBridgeError)
+            assert child.is_available is False
+            rendered = "".join(
+                traceback.format_exception(
+                    type(client_errors[0]),
+                    client_errors[0],
+                    client_errors[0].__traceback__,
+                )
+            )
+            for sensitive in (selector, pipe_name.rsplit("-", 1)[-1], pipe_path):
+                assert sensitive not in rendered
+        assert not client_thread.is_alive()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert errors == []
+    finally:
+        release_silent_server.set()
+        if child is not None:
+            child.close()
+        if server_handle is not None:
+            if thread.is_alive() and thread.native_id is not None:
+                thread_handle = open_thread(0x0001, False, thread.native_id)
+                if thread_handle:
+                    try:
+                        cancel_synchronous_io(thread_handle)
+                    finally:
+                        close_handle(thread_handle)
+            _winapi.CloseHandle(server_handle)
+        thread.join(timeout=2)
+        if client_thread is not None:
+            client_thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert client_thread is None or not client_thread.is_alive()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows named pipes")
+@pytest.mark.parametrize("mismatch", ["pid", "creation_filetime"])
+def test_windows_named_pipe_rejects_reused_server_identity_before_bootstrap(
+    mismatch: str,
+) -> None:
+    import _winapi
+    import ctypes
+    import msvcrt
+
+    actual_pid = os.getpid()
+    creation_filetime = host_bridge_module._windows_process_creation_filetime(
+        actual_pid
+    )
+    encoded_pid = (
+        actual_pid + 1
+        if mismatch == "pid" and actual_pid < 0xFFFF_FFFF
+        else actual_pid - 1
+        if mismatch == "pid"
+        else actual_pid
+    )
+    encoded_creation = (
+        creation_filetime ^ 1 if mismatch == "creation_filetime" else creation_filetime
+    )
+    pipe_name = (
+        f"codex-devkit-{encoded_pid}-{encoded_creation:016x}-{os.urandom(16).hex()}"
+    )
+    selector = f"pipe:{pipe_name}"
+    pipe_path = rf"\\.\pipe\{pipe_name}"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_named_pipe = kernel32.CreateNamedPipeW
+    create_named_pipe.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    )
+    create_named_pipe.restype = ctypes.c_void_p
+    connect_named_pipe = kernel32.ConnectNamedPipe
+    connect_named_pipe.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    connect_named_pipe.restype = ctypes.c_int
+    open_thread = kernel32.OpenThread
+    open_thread.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    open_thread.restype = ctypes.c_void_p
+    cancel_synchronous_io = kernel32.CancelSynchronousIo
+    cancel_synchronous_io.argtypes = (ctypes.c_void_p,)
+    cancel_synchronous_io.restype = ctypes.c_int
+    server_handle = create_named_pipe(
+        pipe_path,
+        0x00000003 | 0x00080000,
+        0x00000008,
+        1,
+        65_536,
+        65_536,
+        0,
+        None,
+    )
+    if server_handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "CreateNamedPipeW failed")
+
+    observed: list[bytes] = []
+    errors: list[BaseException] = []
+
+    def serve() -> None:
+        nonlocal server_handle
+        descriptor = -1
+        try:
+            if not connect_named_pipe(server_handle, None):
+                error = ctypes.get_last_error()
+                if error != 535:
+                    raise OSError(error, "ConnectNamedPipe failed")
+            descriptor = msvcrt.open_osfhandle(
+                int(server_handle), os.O_BINARY | os.O_RDWR
+            )
+            server_handle = None
+            observed.append(os.read(descriptor, 1))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(HostBridgeError) as caught:
+            InheritedHandleHostBridge.from_environment(
+                {"CODEX_DEVKIT_HOST_BRIDGE_HANDLE": selector}, platform="nt"
+            )
+        assert caught.value.code == "HOST_BRIDGE_UNAVAILABLE"
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert errors == []
+        assert observed == [b""]
+    finally:
+        if server_handle is not None:
+            if thread.is_alive() and thread.native_id is not None:
+                thread_handle = open_thread(0x0001, False, thread.native_id)
+                if thread_handle:
+                    try:
+                        cancel_synchronous_io(thread_handle)
+                    finally:
+                        _winapi.CloseHandle(thread_handle)
+            _winapi.CloseHandle(server_handle)
+        thread.join(timeout=2)
+        assert not thread.is_alive()
 
 
 @pytest.mark.skipif(

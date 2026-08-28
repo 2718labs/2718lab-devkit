@@ -169,7 +169,16 @@ Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协�
 - CODEX_PROJECT_ID、CODEX_WORKSPACE_ID、CODEX_THREAD_ID
 
 这些是 selector 或 identity 名称，不是应该自行编造或塞进任务消息的值。后五项
-会把持久化状态限定在单个项目或线程，避免投影到另一个工作区。需要私有
+会把持久化状态限定在单个项目或线程，避免投影到另一个工作区。
+在 Windows 上，CODEX_DEVKIT_HOST_BRIDGE_HANDLE 为兼容既有环境变量名而保留，
+但值只能是 `pipe:codex-devkit-<宿主PID>-<创建FILETIME>-<128位小写十六进制令牌>`，
+其中创建时间是 16 位小写十六进制 Windows FILETIME。运行时只会把该不透明
+selector 映射到本机 `\\.\pipe\` 命名空间，并在发送 session key 之前证明
+已连接管道的 server PID 与进程创建时间都与 selector 完全相同；数字 HANDLE、
+路径、远程 UNC 名称及未加标签的值都会被拒绝。可信 launcher 负责用 CSPRNG 生成令牌、
+以 first-instance 与拒绝远程客户端模式创建管道，并设置仅 owner 可访问的 ACL。
+Unix 仍只通过 CODEX_DEVKIT_HOST_BRIDGE_FD 接受数字形式的继承描述符。
+需要私有
 宿主 capability broker 或 proof registry 的 Relay 生命周期变更，在宿主
 没有提供可证明能力时会失败关闭，并返回
 RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也不会

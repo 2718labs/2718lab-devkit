@@ -8,6 +8,14 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+### Fixed
+
+- Replaced inherited numeric Windows host-bridge handles with a strict local
+  named-pipe selector bound to the exact launcher PID and process creation
+  FILETIME while preserving the Unix inherited-FD contract. Untagged,
+  path-like, remote, malformed, PID-mismatched, or creation-mismatched selectors
+  now fail closed before any session key is sent.
+
 ## [1.1.2] - 2026-08-27
 
 ### Fixed

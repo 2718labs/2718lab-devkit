@@ -192,6 +192,19 @@ private host-bridge selector names and optional project/thread scope identifiers
 These are selector or identity names, not values to invent or copy into a task
 message. The latter identifiers keep durable state scoped to one project or
 thread instead of leaking it into another workspace.
+On Windows, CODEX_DEVKIT_HOST_BRIDGE_HANDLE is intentionally named for
+compatibility but accepts only
+`pipe:codex-devkit-<launcher-pid>-<creation-filetime>-<high-entropy-token>` (a
+launcher PID, its 16-hex Windows creation FILETIME, and a launcher-generated
+128-bit lowercase hex token). The runtime
+maps that opaque selector only into the local `\\.\pipe\` namespace, verifies
+that the connected pipe server has exactly the encoded launcher PID and process
+creation time before sending the session key, and rejects inherited numeric
+handles, paths, remote UNC names, and untagged values. The launcher remains
+responsible for CSPRNG
+generation, first-instance creation, remote-client rejection, and an owner-only
+ACL. Unix continues to accept only a numeric inherited descriptor through
+CODEX_DEVKIT_HOST_BRIDGE_FD.
 Relay lifecycle mutations that need the private host capability broker or proof
 registry fail closed when the host does not provide an attested capability,
 using RELAY_CAPABILITY_BROKER_UNAVAILABLE. The server never exposes raw
