@@ -5,29 +5,21 @@ from __future__ import annotations
 import atexit
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from devkit_fastlane import compile_fast_lane
-from devkit_relay.compiler import compile_plan
-from devkit_relay.service import RelayService
-from devkit_runtime.bootstrap import RuntimeBootstrap
-from devkit_runtime.composition import RuntimeRoot
-from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
-from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
-from devkit_runtime.tool_result import (
-    TOOL_ANNOTATIONS,
-    ResultContractError,
-    envelope_failure,
-    envelope_success,
-    result_from_exception,
-)
-from devkit_runtime.uow import RuntimeUnitOfWork
-from project_index.checkpoints import WorkspaceOwnership
-from project_index.models import IndexState, IndexStatusResult, IndexSyncResult
+from devkit_runtime.tool_metadata import TOOL_ANNOTATIONS
+
+if TYPE_CHECKING:
+    from devkit_relay.service import RelayService
+    from devkit_runtime.composition import RuntimeRoot
+    from devkit_runtime.config import RuntimeConfigError
+    from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
+    from devkit_runtime.uow import RuntimeUnitOfWork
+    from project_index.checkpoints import WorkspaceOwnership
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 mcp = FastMCP(name="2718lab-devkit")
@@ -215,6 +207,10 @@ def _tool_annotations(name: str) -> ToolAnnotations:
 def _default_runtime_root() -> RuntimeRoot:
     """Bootstrap durable local stores before exposing the default process root."""
 
+    from devkit_runtime.bootstrap import RuntimeBootstrap
+    from devkit_runtime.composition import RuntimeRoot
+    from devkit_runtime.config import RuntimeConfig
+
     config = RuntimeConfig.load(protected_roots=(PLUGIN_ROOT,))
     required_databases = (
         config.orchestrator_database,
@@ -238,6 +234,8 @@ def _runtime_root() -> RuntimeRoot:
 
 def _install_runtime_root_for_host(root: RuntimeRoot) -> None:
     """Private embedding seam for a host-injected broker or proof resolver."""
+
+    from devkit_runtime.composition import RuntimeRoot
 
     if not isinstance(root, RuntimeRoot):
         raise TypeError("root must be a RuntimeRoot")
@@ -265,12 +263,16 @@ atexit.register(_shutdown_runtime)
 
 
 def _failure(code: str) -> dict[str, object]:
+    from devkit_runtime.tool_result import envelope_failure
+
     return envelope_failure(code)
 
 
 def _runtime_failure(
     error: RuntimeConfigError | RelayRuntimeError,
 ) -> dict[str, object]:
+    from devkit_runtime.config import RuntimeConfigError
+
     if isinstance(error, RuntimeConfigError):
         if error.code in {
             "DATA_ROOT_INVALID",
@@ -301,11 +303,18 @@ def _invoke(
             return uow.tool_results.project(tool_name, operation(uow))
     except _RequestError as error:
         return _failure(error.code)
-    except (RuntimeConfigError, RelayRuntimeError) as error:
-        return _runtime_failure(error)
-    except ResultContractError:
-        return _failure("INTERNAL_ERROR")
     except Exception as error:
+        from devkit_runtime.config import RuntimeConfigError
+        from devkit_runtime.relay_runtime import RelayRuntimeError
+        from devkit_runtime.tool_result import (
+            ResultContractError,
+            result_from_exception,
+        )
+
+        if isinstance(error, (RuntimeConfigError, RelayRuntimeError)):
+            return _runtime_failure(error)
+        if isinstance(error, ResultContractError):
+            return _failure("INTERNAL_ERROR")
         return result_from_exception(error, invalid_code=invalid_code)
 
 
@@ -430,6 +439,8 @@ def _require_lease_authority() -> _TaskLeaseAuthority:
 def _workspace_ownership(
     task_lease: TaskLeaseRef, *, workspace_id: str
 ) -> WorkspaceOwnership:
+    from project_index.checkpoints import WorkspaceOwnership
+
     ownership = _require_lease_authority().ownership_for(
         task_lease, workspace_id=workspace_id
     )
@@ -446,6 +457,8 @@ def _workspace_ownership(
 
 
 def _relay_runtime(uow: RuntimeUnitOfWork) -> RelayRuntime:
+    from devkit_runtime.relay_runtime import RelayRuntime
+
     relay = uow.relay
     if not isinstance(relay, RelayRuntime):
         raise _RequestError("RELAY_REQUEST_INVALID")
@@ -454,6 +467,8 @@ def _relay_runtime(uow: RuntimeUnitOfWork) -> RelayRuntime:
 
 def _relay_service(runtime: RelayRuntime) -> RelayService:
     """Use the lifecycle service already owned by the typed Relay runtime."""
+
+    from devkit_relay.service import RelayService
 
     service = runtime._relay_service
     if not isinstance(service, RelayService):
@@ -498,6 +513,8 @@ def project_index_sync(
         return _failure(error.code)
 
     def operation(uow: RuntimeUnitOfWork) -> object:
+        from project_index.models import IndexSyncResult
+
         authority = _require_lease_authority() if lease is not None else None
         snapshot = uow.project_checkpoint.project_index.sync(
             workspace_id, include_paths
@@ -547,6 +564,8 @@ def project_index_status(
         return _failure(error.code)
 
     def operation(uow: RuntimeUnitOfWork) -> object:
+        from project_index.models import IndexState, IndexStatusResult
+
         status = uow.project_checkpoint.project_index.status(
             workspace_id,
             snapshot_id,
@@ -788,6 +807,8 @@ def atlas_accept(
 def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
     """Compile a locked Relay request using only verified read snapshots."""
 
+    from devkit_relay.compiler import compile_plan
+
     try:
         payload = _relay_compile_request(request)
     except _RequestError as error:
@@ -817,6 +838,9 @@ def fastlane_compile(
 
     if type(request) is not dict or type(enable) is not bool:
         return _failure("FASTLANE_REQUEST_INVALID")
+    from devkit_fastlane import compile_fast_lane
+    from devkit_runtime.tool_result import ResultContractError, envelope_success
+
     try:
         plan = compile_fast_lane(
             request,

@@ -207,11 +207,14 @@ tree. Choose an output directory outside the source tree:
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
 .codex-plugin/main-artifact-allowlist.json. Its executable runtime surface is
-the MCP server; the ZIP also carries the Fast Lane contract, required references
+the MCP server. The ZIP also carries the Fast Lane contract, required references
 and policy assets, the `team_efficiency.py` compatibility entry point, its
-routing modules. It deliberately excludes the optional Skill manual bundle,
-command helpers, hooks, CI files, host-private state, prompts, static agents,
-and arbitrary repository files.
+routing modules, and the exact `fast-lane-routing`, `code-atlas`, and
+`workflow-design` Skill directories whose `agents/openai.yaml` files require
+that MCP server. The builder only supports file and directory allowlist roots,
+so those three directories are named individually and archive tests reject any
+other Skill directory. Command helpers, hooks, CI files, host-private state,
+prompts, top-level static agents, and arbitrary repository files remain excluded.
 
 Run Fast Lane through its executable entry point to inspect its fail-closed
 result:

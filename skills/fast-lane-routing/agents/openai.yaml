@@ -1,0 +1,7 @@
+interface:
+  display_name: "Fast Lane Routing"
+  short_description: "Compile verified DevKit routing contracts"
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "2718lab-devkit"

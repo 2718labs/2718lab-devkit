@@ -184,8 +184,11 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
 表面是 MCP 服务器；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
-`team_efficiency.py` 兼容入口及其路由模块。它明确不包含可选的 Skill 说明书 bundle、
-命令辅助文件、hooks、CI 文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
+`team_efficiency.py` 兼容入口、路由模块，以及明确依赖该 MCP 服务器的
+`fast-lane-routing`、`code-atlas`、`workflow-design` 三个 Skill 目录及其
+`agents/openai.yaml`。builder 的 allowlist 只支持文件或目录根，因此这里逐项
+列出三个目录，并由归档测试拒绝其他 Skill 目录。命令辅助文件、hooks、CI 文件、
+宿主私有状态、prompts、顶层静态 agent 和任意仓库文件仍不进入主产物。
 
 Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 

@@ -23,7 +23,14 @@
     "mcp-tools/devkit_fastlane/scripts/team_efficiency.py"
   ],
   "trees": [
-    "skills",
+    "skills/bugkiller",
+    "skills/code-atlas",
+    "skills/devkit-overview",
+    "skills/fast-lane-routing",
+    "skills/mcp-server-dev",
+    "skills/oss-repo-ops",
+    "skills/python-engineering",
+    "skills/workflow-design",
     "mcp-tools/bugkiller",
     "mcp-tools/devkit_atlas",
     "mcp-tools/devkit_relay",
