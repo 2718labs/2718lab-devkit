@@ -145,6 +145,8 @@ class _CompilerInvocationBinding:
     reasoning_effort: str
     verified_route_result_hashes: tuple[str, ...]
     verified_lease_scope_bindings: tuple[str, ...]
+    dispatch_facts: tuple[object, ...] = ()
+    dispatch_binding_hashes: tuple[str, ...] = ()
 
 
 CompilerInvocationResolver: TypeAlias = Callable[
@@ -163,6 +165,8 @@ class _CompilerInvocation:
     reasoning_effort: str
     verified_route_result_hashes: tuple[str, ...]
     verified_lease_scope_bindings: tuple[str, ...]
+    dispatch_facts: tuple[object, ...]
+    dispatch_binding_hashes: tuple[str, ...]
     issued_at: float
     expires_at: float
     binding_hash: str
@@ -304,6 +308,19 @@ class HostSession:
             except Exception:
                 return _NO_SAFE_WORK
             preparation = _CompilerPreparation()
+            invocation_binding = {
+                "preparation_id": preparation_id,
+                "request_hash": binding.request_hash,
+                "reasoning_effort": binding.reasoning_effort,
+                "verified_route_result_hashes": binding.verified_route_result_hashes,
+                "verified_lease_scope_bindings": binding.verified_lease_scope_bindings,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+            }
+            if binding.dispatch_binding_hashes:
+                invocation_binding["dispatch_binding_hashes"] = (
+                    binding.dispatch_binding_hashes
+                )
             material = _CompilerInvocation(
                 schema="2718lab-devkit/compiler-invocation-v2",
                 preparation_id=preparation_id,
@@ -311,19 +328,11 @@ class HostSession:
                 reasoning_effort=binding.reasoning_effort,
                 verified_route_result_hashes=binding.verified_route_result_hashes,
                 verified_lease_scope_bindings=binding.verified_lease_scope_bindings,
+                dispatch_facts=binding.dispatch_facts,
+                dispatch_binding_hashes=binding.dispatch_binding_hashes,
                 issued_at=issued_at,
                 expires_at=expires_at,
-                binding_hash=_hash(
-                    {
-                        "preparation_id": preparation_id,
-                        "request_hash": binding.request_hash,
-                        "reasoning_effort": binding.reasoning_effort,
-                        "verified_route_result_hashes": binding.verified_route_result_hashes,
-                        "verified_lease_scope_bindings": binding.verified_lease_scope_bindings,
-                        "issued_at": issued_at,
-                        "expires_at": expires_at,
-                    }
-                ),
+                binding_hash=_hash(invocation_binding),
             )
             material_state = _compiler_invocation_state(material)
             try:
@@ -1022,6 +1031,15 @@ def _strict_hash_tuple(value: object) -> bool:
     )
 
 
+def _optional_ordered_hash_tuple(value: object) -> bool:
+    return (
+        type(value) is tuple
+        and len(value) <= 16
+        and all(_is_hash(item) for item in value)
+        and len(set(value)) == len(value)
+    )
+
+
 def _normalized_compiler_invocation_binding(
     value: object,
 ) -> _CompilerInvocationBinding:
@@ -1032,6 +1050,10 @@ def _normalized_compiler_invocation_binding(
         or value.reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
         or not _strict_hash_tuple(value.verified_route_result_hashes)
         or not _strict_hash_tuple(value.verified_lease_scope_bindings)
+        or type(value.dispatch_facts) is not tuple
+        or len(value.dispatch_facts) > 16
+        or not _optional_ordered_hash_tuple(value.dispatch_binding_hashes)
+        or len(value.dispatch_facts) != len(value.dispatch_binding_hashes)
     ):
         raise ValueError("compiler invocation binding is invalid")
     return _CompilerInvocationBinding(
@@ -1039,6 +1061,8 @@ def _normalized_compiler_invocation_binding(
         reasoning_effort=value.reasoning_effort,
         verified_route_result_hashes=value.verified_route_result_hashes,
         verified_lease_scope_bindings=value.verified_lease_scope_bindings,
+        dispatch_facts=value.dispatch_facts,
+        dispatch_binding_hashes=value.dispatch_binding_hashes,
     )
 
 
@@ -1052,6 +1076,8 @@ def _compiler_invocation_state(value: _CompilerInvocation) -> tuple[object, ...]
         value.reasoning_effort,
         value.verified_route_result_hashes,
         value.verified_lease_scope_bindings,
+        value.dispatch_facts,
+        value.dispatch_binding_hashes,
         value.issued_at,
         value.expires_at,
         value.binding_hash,

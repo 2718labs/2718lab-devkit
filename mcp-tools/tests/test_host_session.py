@@ -75,12 +75,16 @@ def _compiler_binding(
     reasoning_effort: str = "high",
     route_hashes: tuple[str, ...] = (_HASH_PREFIX + "2" * 64,),
     lease_hashes: tuple[str, ...] = (_HASH_PREFIX + "3" * 64,),
+    dispatch_facts: tuple[object, ...] = (),
+    dispatch_binding_hashes: tuple[str, ...] = (),
 ) -> object:
     return host_session._CompilerInvocationBinding(
         request_hash=request_hash,
         reasoning_effort=reasoning_effort,
         verified_route_result_hashes=route_hashes,
         verified_lease_scope_bindings=lease_hashes,
+        dispatch_facts=dispatch_facts,
+        dispatch_binding_hashes=dispatch_binding_hashes,
     )
 
 
@@ -1048,6 +1052,37 @@ def test_host_session_compiler_evidence_is_capability_and_lease_bound_without_qu
     )
     assert "quota" not in repr(invocation).lower()
     assert session.consume_compiler_evidence(handle) == "NO_SAFE_WORK"
+
+
+def test_compiler_invocation_binding_hash_binds_ordered_dispatch_hashes() -> None:
+    dispatch_hashes = (_HASH_PREFIX + "4" * 64, _HASH_PREFIX + "5" * 64)
+    session, child, host = _compiler_session(
+        provider=lambda preparation: preparation,
+        resolver=lambda _preparation_id: _compiler_binding(
+            dispatch_facts=("fact-a", "fact-b"),
+            dispatch_binding_hashes=dispatch_hashes,
+        ),
+    )
+    try:
+        handle = session.prepare_compiler_evidence(preparation_id="prep-dispatch")
+        invocation = session.consume_compiler_evidence(handle)
+    finally:
+        child.close()
+        host.close()
+
+    assert invocation.dispatch_binding_hashes == dispatch_hashes
+    assert invocation.binding_hash == _hash(
+        {
+            "preparation_id": "prep-dispatch",
+            "request_hash": invocation.request_hash,
+            "reasoning_effort": invocation.reasoning_effort,
+            "verified_route_result_hashes": invocation.verified_route_result_hashes,
+            "verified_lease_scope_bindings": invocation.verified_lease_scope_bindings,
+            "issued_at": invocation.issued_at,
+            "expires_at": invocation.expires_at,
+            "dispatch_binding_hashes": dispatch_hashes,
+        }
+    )
 
 
 def test_compiler_evidence_fails_closed_without_provider_or_binding() -> None:
