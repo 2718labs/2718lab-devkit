@@ -523,6 +523,11 @@ class HostSession:
     def close(self) -> None:
         """Close the owned private transport once; no session can be revived."""
 
+        # Admission owns the business lock across its single-reader round trip.
+        # Wake it first without closing/reusing descriptors while it restores
+        # transport mode; only close fds after that owner releases this lock.
+        if self._bridge is not None:
+            self._bridge.cancel_read()
         with self._compiler_evidence_lock:
             if self._closed:
                 return

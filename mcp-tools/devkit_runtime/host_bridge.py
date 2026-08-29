@@ -20,7 +20,8 @@ import select
 import stat
 import struct
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Event, Lock, RLock
 from typing import Final, cast
@@ -640,7 +641,7 @@ class InheritedHandleHostBridge:
 
     @property
     def is_available(self) -> bool:
-        return not self._closed
+        return not self._closed and not self._cancel_event.is_set()
 
     def prepare_capability(
         self,
@@ -1627,7 +1628,7 @@ class InheritedHandleHostBridge:
         The owning HostSession serializes this round trip with preparation and
         terminal-reader startup. The existing bridge I/O lock owns both frames.
         """
-        with self._io_lock:
+        with self._storage_admission_io(now=now, expires_at=expires_at) as deadline:
             normalized = _normalize_storage_admission_request(request)
             correlation = cast(str, normalized["correlation_id"])
             attestation = cast(str, normalized["profile_attestation_hash"])
@@ -1650,9 +1651,10 @@ class InheritedHandleHostBridge:
             self._storage_admission_correlations.add(correlation)
             try:
                 self._send_validated_private(
-                    kind="storage_admission_request", action_id=correlation, payload=normalized
+                    kind="storage_admission_request", action_id=correlation, payload=normalized,
+                    deadline=deadline,
                 )
-                message = self._receive_private()
+                message = self._receive_private(deadline=deadline)
                 if message.kind != "storage_admission_response" or message.action_id != correlation:
                     raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
                 completed_time = clock()
@@ -1679,6 +1681,27 @@ class InheritedHandleHostBridge:
                 completed_at=completed_at,
             )
             return receipt
+
+    @contextmanager
+    def _storage_admission_io(self, *, now: int, expires_at: int) -> Iterator[float]:
+        if (
+            type(now) is not int or type(expires_at) is not int
+            or not 0 <= now < expires_at <= (1 << 64) - 1
+        ):
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+        # One monotonic deadline covers lock acquisition, bootstrap/request
+        # writes, reply length prefix, and reply payload. Partial progress must
+        # never restart the authority-derived transport budget.
+        deadline = time.monotonic() + (expires_at - now)
+        while not self._io_lock.acquire(
+            timeout=min(0.1, _remaining_io_time(deadline, self._cancel_event))
+        ):
+            pass
+        try:
+            self._ensure_open()
+            yield deadline
+        finally:
+            self._io_lock.release()
 
     def has_completed_storage_profile(self, profile: Mapping[str, object]) -> bool:
         """Lookup transport-completed facts; caller-supplied hashes cannot enroll."""
@@ -1903,16 +1926,18 @@ class InheritedHandleHostBridge:
         self._send_private(kind=kind, action_id=action_id, payload=payload)
 
     def _send_validated_private(
-        self, *, kind: str, action_id: str, payload: Mapping[str, object]
+        self, *, kind: str, action_id: str, payload: Mapping[str, object],
+        deadline: float | None = None,
     ) -> None:
         """Write a packet only after its typed private validator has succeeded."""
 
         if kind not in _VALIDATED_PRIVATE_KINDS:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
-        self._send_private(kind=kind, action_id=action_id, payload=payload)
+        self._send_private(kind=kind, action_id=action_id, payload=payload, deadline=deadline)
 
     def _send_private(
-        self, *, kind: str, action_id: str, payload: Mapping[str, object]
+        self, *, kind: str, action_id: str, payload: Mapping[str, object],
+        deadline: float | None = None,
     ) -> None:
         with self._io_lock:
             if kind not in _MESSAGE_KINDS or kind == "session_open":
@@ -1941,9 +1966,9 @@ class InheritedHandleHostBridge:
                 self._poison()
                 raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from None
             if bootstrap is not None:
-                self._write_complete(bootstrap)
+                self._write_complete(bootstrap, deadline=deadline)
                 self._bootstrap_sent = True
-            self._write_complete(private_frame)
+            self._write_complete(private_frame, deadline=deadline)
             self._next_out += 1
 
     def receive(self) -> PrivateHostMessage:
@@ -1955,7 +1980,7 @@ class InheritedHandleHostBridge:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
         return message
 
-    def _receive_private(self) -> PrivateHostMessage:
+    def _receive_private(self, *, deadline: float | None = None) -> PrivateHostMessage:
         """Read one framed message for a typed private validator."""
 
         with self._io_lock:
@@ -1966,6 +1991,7 @@ class InheritedHandleHostBridge:
                         self._read_fd,
                         cancel_event=self._cancel_event,
                         cancel_fd=self._cancel_read_fd,
+                        deadline=deadline,
                     )
                 )
                 self._verify_frame(frame, expected_sequence=self._next_in)
@@ -1991,6 +2017,20 @@ class InheritedHandleHostBridge:
                 payload=payload,
             )
 
+    def cancel_read(self) -> None:
+        """Cancel blocked I/O without waiting for its lock or closing its fd."""
+        with self._close_lock:
+            self._signal_cancel_locked()
+
+    def _signal_cancel_locked(self) -> None:
+        if self._cancel_event.is_set():
+            return
+        self._cancel_event.set()
+        try:
+            os.write(self._cancel_write_fd, b"\x00")
+        except OSError:
+            pass
+
     def close(self) -> None:
         """Close only the descriptor(s) this bridge owns."""
 
@@ -1998,11 +2038,7 @@ class InheritedHandleHostBridge:
             if self._closed:
                 return
             self._closed = True
-            self._cancel_event.set()
-            try:
-                os.write(self._cancel_write_fd, b"\\x00")
-            except OSError:
-                pass
+            self._signal_cancel_locked()
             cancel_descriptors = {
                 self._cancel_read_fd,
                 self._cancel_write_fd,
@@ -2094,21 +2130,48 @@ class InheritedHandleHostBridge:
         *,
         cancel_event: Event | None = None,
         cancel_fd: int | None = None,
+        deadline: float | None = None,
     ) -> bytes:
         header = _read_exact(
-            descriptor, 4, cancel_event=cancel_event, cancel_fd=cancel_fd
+            descriptor, 4, cancel_event=cancel_event, cancel_fd=cancel_fd,
+            deadline=deadline,
         )
         size = struct.unpack("!I", header)[0]
         if size == 0 or size > _MAX_FRAME_BYTES:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
         return _read_exact(
-            descriptor, size, cancel_event=cancel_event, cancel_fd=cancel_fd
+            descriptor, size, cancel_event=cancel_event, cancel_fd=cancel_fd,
+            deadline=deadline,
         )
 
-    def _write_complete(self, payload: bytes) -> None:
+    def _write_complete(self, payload: bytes, *, deadline: float | None = None) -> None:
         try:
+            if deadline is not None:
+                with _nonblocking_pipe_writer(self._write_fd) as write:
+                    offset = 0
+                    while offset < len(payload):
+                        remaining = _remaining_io_time(deadline, self._cancel_event)
+                        if os.name != "nt":
+                            readable, writable, _ = select.select(
+                                [self._cancel_read_fd], [self._write_fd], [], min(0.1, remaining)
+                            )
+                            if readable:
+                                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+                            if not writable:
+                                continue
+                        try:
+                            written = write(payload[offset:])
+                        except BlockingIOError:
+                            written = 0
+                        if written < 0 or written > len(payload) - offset:
+                            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+                        offset += written
+                        if written == 0:
+                            self._cancel_event.wait(min(0.05, _remaining_io_time(deadline, self._cancel_event)))
+                    _remaining_io_time(deadline, self._cancel_event)
+                return
             written = os.write(self._write_fd, payload)
-        except OSError as error:
+        except (HostBridgeError, OSError, ValueError) as error:
             self._poison()
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
         if written != len(payload):
@@ -2172,7 +2235,7 @@ class InheritedHandleHostBridge:
             del self._terminal_operation_tombstones[key]
 
     def _ensure_open(self) -> None:
-        if self._closed or self._read_fd < 0 or self._write_fd < 0:
+        if self._closed or self._cancel_event.is_set() or self._read_fd < 0 or self._write_fd < 0:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
 
 
@@ -3996,17 +4059,127 @@ def _windows_file_access_mask(handle: int) -> int:
     return access_mask.value
 
 
+def _remaining_io_time(deadline: float, cancel_event: Event | None) -> float:
+    if cancel_event is not None and cancel_event.is_set():
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    return remaining
+
+
+@contextmanager
+def _nonblocking_pipe_writer(descriptor: int) -> Iterator[Callable[[bytes], int]]:
+    """Temporarily use synchronous nonblocking writes; never spawn an I/O worker.
+
+    Windows PIPE_NOWAIT supports our synchronous named and anonymous handles.
+    Query/verify/restore the exact original mode; unsupported handles fail
+    closed, never fall back to a blocking WriteFile. Partial/zero writes are
+    handled by the caller's single absolute deadline loop.
+    """
+    if os.name != "nt":
+        previous = os.get_blocking(descriptor)
+        os.set_blocking(descriptor, False)
+        try:
+            yield lambda payload: os.write(descriptor, payload)
+        finally:
+            os.set_blocking(descriptor, previous)
+        return
+
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = msvcrt.get_osfhandle(descriptor)
+    get_state = kernel32.GetNamedPipeHandleStateW
+    get_state.argtypes = (
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+    )
+    get_state.restype = ctypes.c_int
+    set_state = kernel32.SetNamedPipeHandleState
+    set_state.argtypes = (
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p, ctypes.c_void_p,
+    )
+    set_state.restype = ctypes.c_int
+    write_file = kernel32.WriteFile
+    write_file.argtypes = (
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+    )
+    write_file.restype = ctypes.c_int
+
+    def read_mode() -> int:
+        state = ctypes.c_ulong()
+        if not get_state(handle, ctypes.byref(state), None, None, None, None, 0):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if state.value & ~3:  # only PIPE_NOWAIT | PIPE_READMODE_MESSAGE
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        return state.value
+
+    def set_mode(mode: int) -> None:
+        state = ctypes.c_ulong(mode)
+        if not set_state(handle, ctypes.byref(state), None, None):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if read_mode() != mode:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+
+    def write(payload: bytes) -> int:
+        buffer = ctypes.create_string_buffer(payload)
+        written = ctypes.c_ulong()
+        if not write_file(handle, buffer, len(payload), ctypes.byref(written), None):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        return written.value
+
+    original = read_mode()
+    try:
+        set_mode(original | 1)  # PIPE_NOWAIT; retain the original read mode
+        yield write
+    finally:
+        set_mode(original)
+
+
 def _read_exact(
     descriptor: int,
     size: int,
     *,
     cancel_event: Event | None = None,
     cancel_fd: int | None = None,
+    deadline: float | None = None,
 ) -> bytes:
     chunks: list[bytes] = []
     remaining = size
     while remaining:
-        if cancel_event is not None:
+        read_size = remaining
+        if deadline is not None:
+            timeout = min(0.1, _remaining_io_time(deadline, cancel_event))
+            if os.name == "nt":
+                # Only this receiver can consume these bytes. Never request
+                # more than PeekNamedPipe reported, or read an unknown handle.
+                available = _windows_pipe_available_bytes(descriptor)
+                if not available:
+                    if cancel_event is not None:
+                        cancel_event.wait(min(0.05, timeout))
+                    else:
+                        time.sleep(min(0.05, timeout))
+                    continue
+                read_size = min(remaining, available)
+            else:
+                wait_fds = [descriptor]
+                if cancel_fd is not None and cancel_fd >= 0:
+                    wait_fds.append(cancel_fd)
+                try:
+                    readable, _, _ = select.select(wait_fds, [], [], timeout)
+                except (OSError, ValueError) as error:
+                    raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+                if cancel_fd is not None and cancel_fd in readable:
+                    raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+                if descriptor not in readable:
+                    continue
+            _remaining_io_time(deadline, cancel_event)
+        elif cancel_event is not None:
             if cancel_event.is_set():
                 raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
             # POSIX pipes can be waited on together with the private wake fd.
@@ -4031,14 +4204,37 @@ def _read_exact(
                     time.sleep(0.05)
                     continue
         try:
-            chunk = os.read(descriptor, remaining)
+            chunk = os.read(descriptor, read_size)
         except OSError as error:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
         if not chunk:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         chunks.append(chunk)
         remaining -= len(chunk)
+    if deadline is not None:
+        _remaining_io_time(deadline, cancel_event)
     return b"".join(chunks)
+
+
+def _windows_pipe_available_bytes(descriptor: int) -> int:
+    """A bounded-read prerequisite; unsupported/closed handles fail closed."""
+    try:
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        peek = kernel32.PeekNamedPipe
+        peek.argtypes = (
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+        )
+        peek.restype = ctypes.c_int
+        available = ctypes.c_ulong()
+        if not peek(msvcrt.get_osfhandle(descriptor), None, 0, None, ctypes.byref(available), None):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        return available.value
+    except (AttributeError, ImportError, OSError, OverflowError, ValueError) as error:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
 
 
 def _windows_pipe_readable(descriptor: int) -> bool | None:

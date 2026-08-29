@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -579,6 +580,76 @@ def test_storage_admission_rejects_substitution_and_unknown_fields() -> None:
     finally:
         child.close()
         host.close()
+
+
+def test_storage_admission_deadline_and_close_cancel_blocked_io() -> None:
+    from devkit_runtime import host_bridge, host_session
+    from devkit_runtime.storage_intent import parse_storage_intent
+
+    # Real pipe I/O with a fixed trusted clock: the transport deadline must
+    # still advance monotonically. Peer never returns an admission response.
+    for scenario in ("no_reply", "full_pipe", "close"):
+        child, host = _pipe_pair()
+        profile_request = _storage_profile_request()
+        pending = child.send_storage_profile_request(**{
+            name: getattr(profile_request, name) for name in (
+                "call_intent_hash", "preparation_id", "task_id",
+                "source_plan_hash", "index_attestation_hash",
+            )
+        })
+        peer_request = host.receive_storage_profile_request()
+        host.send_storage_profile_response(request=peer_request, response=_storage_profile_response(peer_request))
+        profile = child.receive_storage_profile_response(request=pending)
+        session = host_session.HostSession(bridge=child, clock=lambda: 1_700_000_000)
+        # This test isolates transport lifecycle after actual profile delivery;
+        # preparation enrollment itself is covered by the round-trip test.
+        session._completed_storage_profiles[_hash("7")] = host_session._CompletedStorageProfile(
+            profile=profile, bridge=child,
+            expires_at=1_700_000_060 if scenario == "close" else 1_700_000_001,
+            requested_bytes=4096, requested_files=8,
+        )
+        intent = parse_storage_intent(_storage_intent(
+            task_id="TASK-V5", plan_binding=_hash("8"), context_hash=_hash("6")
+        ))
+        if scenario == "full_pipe":
+            with host_bridge._nonblocking_pipe_writer(child._write_fd) as write:
+                for _ in range(1024):
+                    try:
+                        if write(b"x" * 4096) == 0:
+                            break
+                    except BlockingIOError:
+                        break
+                else:
+                    raise AssertionError("fixture pipe did not reach bounded capacity")
+        result: list[object] = []
+        worker = threading.Thread(target=lambda: result.append(session.request_storage_admission(
+            intent, profile_attestation_hash=_hash("7")
+        )), daemon=True)
+        closer: threading.Thread | None = None
+        worker.start()
+        try:
+            if scenario != "full_pipe":
+                message = host._receive_private(deadline=time.monotonic() + 2)
+                assert message.kind == "storage_admission_request"
+            if scenario == "close":
+                closer = threading.Thread(target=session.close, daemon=True)
+                closer.start()
+                closer.join(timeout=2)
+                assert not closer.is_alive(), "close waited behind admission's business lock"
+            worker.join(timeout=3)
+            assert not worker.is_alive(), "admission did not terminate at its transport deadline"
+            assert result == ["STORAGE_STAT_UNAVAILABLE"]
+            assert not child._storage_admission_completions
+            assert not child._storage_admission_decisions
+        finally:
+            # Only test-owned descriptors/threads; ensure a failing regression
+            # cannot leave a blocked peer alive in the test process.
+            child.close()
+            host.close()
+            worker.join(timeout=2)
+            if closer is not None:
+                closer.join(timeout=2)
+            session.close()
 
 
 def test_profile_tamper_or_missing_field_fails_closed() -> None:
