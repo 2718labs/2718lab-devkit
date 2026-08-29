@@ -2,551 +2,494 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Persist every admitted generated-storage lease across process restarts and make generated-cache cleanup a bounded preview/recheck/apply transaction owned by the Codex Host.
+**Goal:** Give the existing Host storage service one durable family/member/control accounting authority, then add explicitly authorized, bounded generated-cache cleanup.
 
-**Architecture:** Plan 1 supplies the validated `StorageAdmissionReceipt` and deterministic target root. This plan adds a host-owned JSON ledger with atomic replacement, owner/process fencing, restart recovery, byte/file/free-space accounting, and a fair pressure state; the DevKit only forwards typed status/preview/apply requests over the authenticated bridge. A cleanup candidate is immutable evidence, not permission: only a fresh candidate hash, policy hash, ledger epoch, writer fence, and post-stat match can authorize a bounded generated-cache deletion.
+**Architecture:** Plan 1 supplies strict intents, verified group/member authority, and a single service per runtime. Plan 2 moves kernel state into a root-shared transactional ledger: every Host transaction takes an OS fence, reloads current state, rechecks epoch/owners, transitions and atomically persists. Admission is one transition, not an admission followed by another reservation. Independently owned control allocations keep bootstrap/queue metadata bounded across waves without holding Cargo family leases. Cleanup is a later handle-fenced transaction over proven disposable objects, not a consequence of release, expiry, size, or age.
 
-**Tech Stack:** Rust 2021 (`serde`, `serde_json`, `sha2`, `tokio`, `std::fs`, `std::time`), Python 3.11 (`dataclasses`, `hashlib`, `json`, `pathlib`), FastMCP/Pydantic, and the existing atomic JSON replacement and authenticated inherited-handle transport.
+**Tech Stack:** Existing Rust `serde`/`serde_json`/`sha2`, platform filesystem/process handles, existing durable replacement helpers, and the authenticated bridge; Python is a path-free projection only.
+
+**Revision status (2026-08-30):** This replaces the unpublished flat lease-v1 design with internal snapshot-v2 aligned to Host `937ae14` kernel/service symbols and Plan 1's Task 6 map. It does not claim implementation, migration, cleanup, or activation is complete. Preserve admission-v1 exact5, existing intent/target/profile contracts, SHA-256 admission/family IDs, and the strict `fast_lane_storage` root-plus-eight policy shape. No new artifact kind, public admission field, or user control-budget field is introduced.
+
+The main thread records Host `841fdaf` three-crate compile exit 0 and DevKit
+`b2aff` three selected final tests exit 0 for the existing slices. Retain that
+scope of evidence; it does not prove the new Plan 2 ledger/cleanup exists.
+Production cleanup and the 1.1.3 release remain incomplete.
+
+**Compile first:** Reuse only
+`G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\target`,
+with `CARGO_INCREMENTAL=0` and `--locked -j1`. Retain prior compile evidence;
+compile changed crates before at most the two core boundary probes below.
+Do not create a ledger-specific Cargo target or repeatedly run full suites.
+Commands here are implementation instructions, not commands to run during
+this documentation-only revision. No live cleanup/configuration is authorized.
 
 ---
 
-## Scope and file map
+## Dependency order and bounded file map
 
-Line ranges refer to the Plan 1 baseline (`37029a9` for DevKit and
-`552fe8035d` for Host). Re-read the named symbol before editing because Plan 1
-will add the storage admission types.
+Implement **P2-base** (Tasks 1-3: root guard, unique ledger transaction,
+bootstrap/control allocations and restart protection) before enabling Plan 1
+Task 6's durable refill registration. Plan 1 does not depend on **P2-apply**
+(Tasks 4-5: preview/delete tooling). Conversely P2-apply depends on Plan 1's
+real process/descendant terminal fence and a correct family postcheck.
+Never unblock a circular dependency with free metadata writes or fake proof.
+The next production integration order is P2-base/control, then Plan 1's
+remaining lifecycle/terminal wiring, then P2-apply. The root and eight policy
+values are still awaiting the user's confirmation; this plan requires no
+additional control-budget choice and fills in no values on the user's behalf.
 
-DevKit:
+All Host paths below are relative to
+`G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2`.
+DevKit paths are relative to
+`G:\2718lab\_codex\.codex-task-temp\devkit-1.1.2-recovery`.
+Re-read current symbols before editing; unrelated dirty work stays untouched.
+Bare Host module filenames below resolve within
+`codex-rs/core/src/fast_lane_host_dispatch/`; other paths are explicitly prefixed.
 
-- Create `mcp-tools/devkit_runtime/storage_ledger.py`: typed status, preview,
-  and apply request/receipt projections; it must never inspect or delete a host
-  path.
-- Modify `mcp-tools/devkit_runtime/host_bridge.py:218-264,916-1045` to carry
-  `storage_status`, `storage_preview`, and `storage_apply` request/receipt
-  frames through the authenticated session.
-- Modify `mcp-tools/devkit_runtime/host_session.py:159-335,636-735` with
-  `storage_status()`, `storage_preview()`, and `storage_apply()` methods that
-  return only stable codes, hashes, counts, and opaque receipt identities.
-- Modify `mcp-tools/server.py:179-289,1008-1314` and
-  `mcp-tools/devkit_runtime/tool_metadata.py:1-28` to add the read-only
-  `storage_status`/`storage_preview` tools and the explicitly destructive
-  `storage_apply` tool; the apply model requires candidate/policy/epoch hashes
-  and a finite batch limit.
-- Create `mcp-tools/tests/test_storage_ledger.py` and modify
-  `mcp-tools/tests/test_mcp_contract.py:240-360` for tool annotations and
-  exact request validation.
+| Slice | Files and ownership |
+| --- | --- |
+| Base state/transactions | Create `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs` for typed snapshots, `RootStorageLedger` transactions, bounded commit/recovery and control ownership; its local mutex serializes only this Host's callers, never replaces the cross-process fence/reload; register in `mod.rs`. |
+| Real OS boundary | Create `codex-rs/core/src/fast_lane_host_dispatch/storage_fs.rs` for root/process exclusion, owned directory/file handles, bounded durable replacement and deletion primitives; no permissive path-string fallback. |
+| Existing kernel integration | Modify `storage_firewall.rs` to evaluate transitions against freshly loaded transaction state instead of its own independent `Mutex<State>`; modify `storage_service.rs::HostStorageService` to own one ledger/checker entry point per runtime into the shared root state. |
+| Runtime/base initialization | Modify `codex-rs/core/src/thread_manager.rs` and existing service/session construction only as required to initialize the shared base-Config service once. Registries do not reopen a ledger per session. |
+| Authority/queue lifecycle | Modify `fast_lane_host_dispatch/registry.rs` at initial admission, `consume_batch`, `register_refill_queue`, `consume_refill_queue` and queue persistence; modify `codex_adapter.rs`/`coordinator.rs` only at lifecycle settlement seams. Keep original route/lease hashes unchanged. |
+| Later cleanup | Create `fast_lane_host_dispatch/storage_cleanup.rs` for candidate classification/manifest and apply state machine; reuse `storage_fs.rs` and Plan 1 terminal/postcheck evidence. |
+| Later wire projection | Modify `codex-rs/rmcp-client/src/inherited_host_bridge_protocol.rs` and its `envelope.rs`/`session.rs`/`pump.rs` only for status/preview/apply; keep the single authenticated writer/receiver arrangement. |
+| Later DevKit projection | Create `mcp-tools/devkit_runtime/storage_ledger.py`; modify existing `host_bridge.py`, `host_session.py`, `mcp-tools/server.py` and `devkit_runtime/tool_metadata.py` for typed read-only status/preview and explicitly destructive apply. |
+| Bounded verification | Create `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`; reuse existing firewall tests. Add only the necessary exact Python request/tool-annotation assertion in `mcp-tools/tests/test_storage_ledger.py` / `test_mcp_contract.py`. |
 
-Codex Host:
+No source/session deletion, GitHub reachability, CAS, compression, remote sync,
+new dependency, or live configuration change belongs to this revision.
+Unknown existing directories are protected, not automatically imported.
 
-- Create `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs`: the
-  `LeaseRecord`, ledger snapshot, atomic journal, owner probe, recovery state,
-  quota accounting, candidate manifest, and generated apply transaction.
-- Create `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`.
-- Modify `codex-rs/core/src/fast_lane_host_dispatch/mod.rs:1-49` to register and
-  export the ledger types to the coordinator.
-- Modify `codex-rs/core/src/fast_lane_host_dispatch/storage_firewall.rs` at
-  its admission/release methods to call the ledger rather than maintaining
-  process-local counters.
-- Modify `codex-rs/core/src/fast_lane_host_dispatch/registry.rs:567-2060`
-  and `coordinator.rs:393-580,1218-1260` to recover/open the ledger at host
-  startup, reserve/heartbeat/release records, and block admission in pressure
-  or recovery state.
-- Modify `codex-rs/rmcp-client/src/inherited_host_bridge_protocol.rs:35-240`
-  and `.../envelope.rs:25-220` for exact ledger/preview/apply wire schemas.
-- Modify `codex-rs/rmcp-client/src/inherited_host_bridge_protocol/session.rs:159-240,247-350,412-570`
-  to expose the typed operation queue without creating a second receiver.
+## Internal snapshot-v2: family, group, member, control
 
-No source/session deletion, GitHub reachability, or CAS deduplication belongs
-to this plan; those are Plan 3. No unknown directory can enter this ledger.
+The existing kernel has `Family { lease, observed }`,
+`FamilyLease { owner, lease_id, reserved, allowance }`,
+`Group { authority_subject, sealed, members }` and
+`MemberPhase::{Reserved, Consumed, Released}`. Preserve those semantics;
+do not flatten them into one task per family lease or invent an `Active`
+phase that changes the consume-before-prepare boundary.
 
-## Shared lease schema and public operation contract
+The following are **planned private persistence records**, not wire authority
+types. Decode with exact fields, bounded lengths/counts, checked arithmetic
+and duplicate-key rejection. `Usage` contains `bytes: u64, files: u64`.
 
-This plan consumes Plan 1's `StorageAdmissionReceipt` and uses this exact
-record shape for `schema == "2718lab.storage.lease.v1"`:
+| Record / unique key | Required contents |
+| --- | --- |
+| `LedgerSnapshotV2` / one approved root | `schema = "2718lab.storage.ledger-snapshot.v2"`, root-wide `ledger_epoch`, root identity, policy hash, owner/family/group/member/control collections and one bounded optional pending operation. Restart generations belong to individual owners, not a global takeover generation. |
+| `FamilySnapshot` / `target_key` | Canonical descriptor/root identity, retained `observed: Usage` and optional `FamilyLeaseSnapshot`. Shared Cargo data is observed once per family, not once per member. Every existing artifact kind retains its common `cargo-target` child. |
+| `FamilyLeaseSnapshot` / active `target_family_lease_id` | One `owner_id`, `reserved: Usage` and `allowance: Usage`. One family has at most one active lease/owner; many same-owner members may reference it. IDs remain strict lowercase SHA-256 digests. |
+| `GroupSnapshot` / `owner_id` | Original Host batch/selected-wave authority subject and provenance binding, exact Host-owner reference, optional exact sealed task set, authority deadline/epoch, and recovery disposition. It is not keyed by each task's distinct Sent profile hash. |
+| `MemberSnapshot` / (`owner_id`, `task_id`) | Original intent, exact decision/receipt identity including admission/family IDs, `StorageAssignmentBinding`, derived private path identities, `MemberPhase`, and terminal/postcheck evidence references. Released records retain replay tombstones. |
+| `ControlSnapshot` / `control_id` | Internal purpose (`Bootstrap` or `RefillQueue`, not an artifact kind), verified queue/Host provenance, exact Host-owner reference and independent lifecycle owner, safe control-path identity, bounded payload identity, committed observation, reserved physical footprint/growth and state. No Cargo family lease or fabricated task ID. |
+| `OwnerBinding` / (`host_instance_id`, `owner_epoch`) | Host instance identity, PID plus creation identity, this owner's restart generation and recovery disposition. Mutations require the live root transaction guard and matching owner evidence; serialized fields alone never substitute for process handles. |
+| `PendingOperation` / at most one root transaction | Operation/expected epoch, exact affected identities, before/after state hashes, reserved metadata footprint and stage/cleanup progress. No append-only unbounded journal. |
 
-```rust
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct LeaseRecord {
-    pub(crate) ledger_epoch: u64,
-    pub(crate) schema_version: String,
-    pub(crate) lease_id: String,
-    pub(crate) task_id: String,
-    pub(crate) assignment_id: String,
-    pub(crate) plan_binding: String,
-    pub(crate) project_identity: String,
-    pub(crate) repository_identity: String,
-    pub(crate) worktree_identity: String,
-    pub(crate) artifact_kind: String,
-    pub(crate) target_key: String,
-    pub(crate) path_identity: String,
-    pub(crate) owner_epoch: u64,
-    pub(crate) owner_kind: String,
-    pub(crate) process_id: u32,
-    pub(crate) process_start_time: u64,
-    pub(crate) host_instance_id: String,
-    pub(crate) state: LeaseState,
-    pub(crate) created_at: u64,
-    pub(crate) last_heartbeat: u64,
-    pub(crate) expires_at: u64,
-    pub(crate) restart_generation: u64,
-    pub(crate) reserved_bytes: u64,
-    pub(crate) reserved_files: u64,
-    pub(crate) observed_bytes: u64,
-    pub(crate) observed_files: u64,
-    pub(crate) free_space_before: u64,
-    pub(crate) free_space_after_reserve: u64,
-    pub(crate) free_space_floor: u64,
-    pub(crate) candidate_hash: Option<String>,
-    pub(crate) receipt_hash: Option<String>,
-    pub(crate) release_reason: Option<String>,
-    pub(crate) cleanup_policy_hash: Option<String>,
-}
-```
+`RecoveryDisposition::{Current, RecoveryPending, Quarantined}` is orthogonal
+to member phase. A persisted `Released` tombstone does not become executable
+again after restart. Duplicate member keys and inconsistent family references
+are invalid; repeated references to the **same** family lease from distinct
+members are expected. A different owner cannot reference that active lease.
+Released tombstones retain their historical lease/receipt identities even
+after the family has no lease or a later owner has acquired a new one.
 
-`LeaseState` is exactly `reserved | active | released | recovery_pending |
-quarantined | cleanup_eligible`. The only legal automatic transitions are
-`reserved -> active -> released`; restart evidence can move an active or
-reserved record to `recovery_pending`, and failed verification can move it to
-`quarantined`. `cleanup_eligible` never deletes anything by itself.
-`StorageLedgerError::LeaseConflict` maps exactly to
-`STORAGE_LEASE_CONFLICT`; it is returned for a stale owner proof, duplicate
-activation, heartbeat after release, and release by a different owner.
+Private paths are derived/reopened against the approved root and checked OS
+identities. Deserializing a subject hash must not call
+`StorageAdmissionAuthority::from_verified_batch` as if provenance had been
+verified. Rehydration must pass the service's recovery boundary first.
+Do not persist or deserialize live handle/termination capabilities.
 
-The public status/preview/apply shapes are:
+### Single ownership and arithmetic
 
-```json
-{
-  "schema": "2718lab.storage.preview.v1",
-  "ledger_epoch": 12,
-  "policy_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "candidate_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "candidates": [
-    {
-      "path_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-      "artifact_kind": "cargo-target",
-      "bytes": 1024,
-      "files": 3,
-      "content_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "owner_state": "none",
-      "classification": "generated-disposable",
-      "lease_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-    }
-  ]
-}
-```
+`RootStorageLedger::transact` is the sole state-mutation/commit boundary.
+Every transaction acquires the real cross-process root fence, reloads the
+latest bounded snapshot, rechecks epoch/policy/owners, computes a transition
+and atomically persists before releasing the fence. `HostStorageService`
+remains one entry point per runtime, constructed from its manager's base
+Config and shared across its sessions. Multiple Host processes coordinate
+through this same root transaction protocol, not separate cached counters.
+The kernel evaluates only the current transaction state. An optional cached
+snapshot is non-authoritative for reservation, release, recovery or deletion.
 
-`storage_apply` accepts exactly `candidate_hash`, `policy_hash`,
-`ledger_epoch`, and `batch_limit` (1 through 16). It returns
-`STORAGE_CANDIDATE_STALE`, `STORAGE_PROTECTED_UNKNOWN`,
-`STORAGE_PROTECTED_ACTIVE`, `STORAGE_PROTECTED_DIRTY`, or
-`STORAGE_APPLY_INCOMPLETE` without deleting when any recheck differs.
+Move the current `State` into this durable authority rather than mirroring it. Do not expose a new
+`ledger.reserve(receipt)` after `reserve_member_once`. Receipt delivery/replay,
+group sealing and member attachment do not reserve again. Kernel public
+wrappers must delegate into the same ledger transaction, never recursively
+lock the old firewall while a ledger transaction is held.
 
-## Implementation tasks
+Compute/validate aggregate caches from authoritative records at load and
+commit; never trust a serialized global total independently:
 
-### Task 1: Define ledger and operation RED tests
+- Family reserved = sum of original budgets of its non-Released members.
+- Global reserved = those member budgets plus independently reserved control
+  footprints, each physical control extent counted once.
+- Family observed remains after the lease is removed; private member counts
+  are not added to it again. Observed family bytes already occupy disk and
+  are not newly added to global growth reservation.
+- A new member adds its budget once to family reserved, family allowance and
+  global reserved. Same member/intent replay returns the original grant;
+  changed intent or a Released member cannot reserve again.
+- For unused `Reserved` cancellation, remove that member's budget from the
+  prior allowance before postcheck. For `Consumed` settlement, require the
+  real termination evidence and bounded scan; then retire unused allowance:
+  `next_allowance = min(adjusted_allowance, observed + remaining_reserved)`
+  componentwise with checked arithmetic. Never lend a released allowance to
+  another writer. When no members remain, remove the active family lease but
+  retain observed usage and tombstones.
+- Over-budget postcheck updates conservative known usage without releasing
+  ownership/counters. Preserve Plan 1's all-members-quiet barrier for the
+  final shared-family observation; a mutex is not a filesystem writer fence.
 
-**Files:**
-- Create: `mcp-tools/tests/test_storage_ledger.py`
-- Create: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`
-- Modify: `mcp-tools/tests/test_mcp_contract.py:240-360`
+Capacity uses the existing root-plus-eight policy. Windows physical free-file
+capacity remains `None`, not infinity; enforce logical file budgets from
+owned observations/reservations. Metadata fits under the same global and
+free-space checks. Below emergency pressure, no new positive reservation is
+allowed; already-reserved bounded recovery/settlement space remains usable.
+No pressure state authorizes killing a process or deleting data.
 
-- [ ] **Step 1: Add the Python RED test for exact apply fields and bounded batch.**
+## Real authority and filesystem interfaces
 
-```python
-def test_storage_apply_rejects_path_and_unbounded_batch():
-    from devkit_runtime.storage_ledger import StorageApplyRequest, StorageLedgerError
-
-    try:
-        StorageApplyRequest.from_mapping({
-            "candidate_hash": "sha256:" + "a" * 64,
-            "policy_hash": "sha256:" + "b" * 64,
-            "ledger_epoch": 1,
-            "batch_limit": 17,
-            "path": "G:/source"
-        })
-    except StorageLedgerError as error:
-        assert error.code == "STORAGE_CANDIDATE_STALE"
-    else:
-        raise AssertionError("invalid apply request was accepted")
-```
-
-- [ ] **Step 2: Add the Rust RED test for an invalid transition.**
+Implement these interfaces as private RAII/handle types in `storage_fs.rs`;
+the names describe new implementation work, not an existing capability:
 
 ```rust
-#[test]
-fn released_lease_cannot_receive_a_heartbeat() {
-    let mut ledger = test_ledger();
-    let lease = ledger.reserve(test_admission()).unwrap();
-    ledger.activate(&lease.lease_id, owner()).unwrap();
-    ledger.release(&lease.lease_id, "terminal").unwrap();
-    assert_eq!(
-        ledger.heartbeat(
-            &lease.lease_id,
-            owner(),
-            ObservedStorage { bytes: 100, files: 1 },
-        ),
-        Err(StorageLedgerError::LeaseConflict),
-    );
+trait RootOwnershipProvider {
+    fn acquire(&self, root: &ApprovedRoot) -> Result<RootTransactionGuard, StorageLedgerError>;
+}
+trait OwnedFilesystem {
+    fn open_child_no_follow(
+        &self, parent: &OwnedDirectoryHandle, child: &SingleComponent,
+    ) -> Result<OwnedEntryHandle, StorageLedgerError>;
+    fn begin_mutation(
+        &self, root: &RootTransactionGuard, subject: &OwnedEntryHandle,
+    ) -> Result<NamespaceMutationFence, StorageLedgerError>;
+    fn remove_verified_tree(
+        &self, fence: &NamespaceMutationFence, entry: &OwnedEntryHandle,
+        limit: &RemovalBound,
+    ) -> Result<RemovalObservation, StorageLedgerError>;
 }
 ```
 
-- [ ] **Step 3: Run only the new RED tests.**
+`ApprovedRoot`, `SingleComponent` and handles have private constructors.
+`RootTransactionGuard` retains the opened root identity and actual exclusive
+OS lock for one reload/recheck/transition/persist transaction. Release it
+after commit so another Host can transact against the new epoch; never keep
+one Host's cached state authoritative after releasing it.
+`NamespaceMutationFence` excludes admissions
+and namespace writers for the exact owned subtree until final observation/
+commit. Neither type is serde, a boolean, a deadline, or a caller token.
+
+On Windows, acquire a machine-wide named mutex keyed from the opened local
+volume/file identity before creating lock/ledger files; validate ownership,
+abandonment and collisions. Retain no-follow directory handles and compare
+volume/file IDs; reject reparse points. Child deletion uses verified handles
+and the platform disposition API, not `remove_dir_all` on a reconstructed
+string. Sharing/ACL rules and the process fence must exclude rename/replacement
+by writers during the operation. The guard must also cover every Host process
+using that root, not merely one Rust mutex.
+
+On Unix, use an actual exclusive OS lock on an already-open approved
+directory where supported, and directory-relative no-follow opens plus
+`fstat` identity checks. Relative unlink operations still require a real
+namespace-mutation fence; `openat` or a final string comparison alone does
+not close a leaf-replacement race. If the backend cannot prove that fence,
+apply is unavailable. Do not claim a portable secure delete from a trait
+stub. Remote/shared filesystems without a cross-host locking guarantee are
+unsupported for this local-root implementation.
+
+Keep lock order explicit: OS root transaction guard, then this runtime's
+transaction mutex, then the specific namespace fence. Reload after taking
+the OS guard, not before. Await actual writer shutdown
+**before** the transaction and validate the Host-owned terminal evidence
+nonblockingly inside it, as required by `HostStorageTerminationEvidence`.
+Do not hold the OS/accounting locks while waiting for child exit or call back
+into the firewall from a proof provider. Busy/unavailable/abandoned/unknown
+results fail closed and never trigger takeover by TTL.
+
+## P2-base implementation tasks
+
+### Task 1: Own bootstrap and control writes before opening a ledger
+
+**Files:** `storage_fs.rs`, `storage_ledger.rs`, `storage_service.rs`, `mod.rs`.
+
+- [ ] Open/validate the configured root without writing, obtain its OS
+  transaction guard, reload any current root snapshot, verify the unchanged
+  trusted base policy and measure available capacity. An existing valid
+  ledger is joined transactionally, never overwritten with an empty state.
+  No new user fields are needed or allowed: all policy values remain pending
+  the user's root-plus-eight choice; absent policy is not zero/unlimited.
+- [ ] Calculate an internal bootstrap reservation before the first metadata
+  write. Its bound includes the encoded empty snapshot/header and all files
+  simultaneously alive during creation/replacement: old snapshot, stage,
+  bounded pending journal/receipt, and any on-disk lock representation.
+  Charge directories/files according to the same deterministic counting rule
+  used by observations; do not hide stage/lock overhead.
+- [ ] Use a bounded counting serializer and existing per-record protocol
+  limits to prove the encoded maximum. Account for maximum numeric widths,
+  current collection sizes and the proposed records. Stop encoding/scanning
+  at the remaining admitted bound. Reject overflow or an unprovable bound;
+  do not invent a record count, unlimited log or free bootstrap exception.
+- [ ] Before a ledger exists, the live root transaction guard owns this startup
+  reservation in memory and excludes concurrent root transactions. Write the first durable
+  snapshot containing that same control reservation, then release the guard
+  and publish the service. For an existing ledger reserve only this operation's
+  required delta against the reloaded shared state.
+  This transfers ownership of one reservation; it does not charge twice.
+  A crash leaving only stage/unknown files enters recovery, never fresh-empty
+  initialization over those files.
+- [ ] Before every growth/replacement, calculate peak physical coexistence and
+  reserve the positive delta from existing global bytes/files limits while
+  checking the free-space floor. Only then create/write. Shrink/release a
+  control footprint only after durable commit and verified old/stage removal.
+  Already-accounted file extents are not summed again as parent and child.
+- [ ] The bootstrap allocation belongs to the root lifetime, not the first
+  Host process. Record its last mutator for audit, but do not release it on
+  that Host's exit or reserve it again when another Host opens the ledger.
+- [ ] Provide `reserve_control_once`, `replace_control_payload` and
+  `settle_control` on the same service transaction, taking verified Host
+  queue provenance and bounded encoded payloads, not caller paths/owners.
+  Queue control lives under the private `approved_root/control` namespace,
+  outside `generated/<target>/members` and outside the common Cargo cache.
+- [ ] A queue allocation survives initial member release and all intermediate
+  waves. It settles only after the verified queue is exhausted/cancelled,
+  no queue writer remains and its final payload/postcheck is durable.
+  It never holds a Cargo family lease. Initial and same-key successor groups
+  can therefore settle/reacquire their family without destroying live queue
+  metadata. Queue suballocations transfer reserved extents; they are not a
+  second global charge on top of a parent footprint.
+- [ ] Keep retained control metadata and replay tombstones bounded. If a next
+  snapshot cannot fit, reject the mutation before write. Do not discard
+  tombstones or live queue records to make it fit. Terminal metadata retirement
+  needs its own proven lifecycle/epoch rule; no age-only trimming.
+
+### Task 2: Make kernel transitions one durable transaction
+
+**Files:** `storage_ledger.rs`, `storage_firewall.rs`, `storage_service.rs`;
+later attachment points in `registry.rs`, `codex_adapter.rs`, `coordinator.rs`.
+
+- [ ] Replace the private kernel state mutex with the reloaded ledger transaction state.
+  Preserve `create_group`, `reserve_member_once`, `seal_group`,
+  `consume_member_once`, `revoke_unused_member` and
+  `release_member_after_postcheck` semantics. Internal transition evaluators
+  take transaction state rather than reacquiring a separate lock.
+- [ ] Under a newly acquired root guard/transaction lock: reload the committed
+  snapshot, verify expected epoch, current and other recorded owners/policy,
+  exact authority and namespace identities; compute the
+  next family/group/member/control snapshot and peak metadata reservation.
+  Run all fallible validation/checked arithmetic before granting an action.
+- [ ] Persist one bounded next snapshot with a unique owned stage handle,
+  sync file contents, atomically replace through the held parent handles, and
+  complete the platform durability barrier. Reuse existing
+  `registry.rs::persist_json_file` replacement semantics as a reference, not
+  as proof that its path-based helper already supplies the required fence.
+  On Unix also sync the parent; on Windows use the existing durable replacement
+  behavior plus identity-safe handles.
+- [ ] Return a grant and refresh any read-only cache only after commit.
+  A serialization/write failure before replacement keeps the old state and
+  releases only proven-unused operation space. An uncertain replacement/
+  durability outcome freezes the service in recovery; do not report the old
+  or next epoch as certainly committed. Leftover stage files remain accounted
+  and protected until their recorded identity can be verified.
+- [ ] Persist Reserved admission before returning its decision and persist
+  Consumed before **any** writer preparation/materialization is permitted.
+  Successful transport is not another reservation. `consume_batch` and the
+  native selected-wave path use this same service and original frozen batch
+  hashes; no synthetic bridge exchange is needed.
+- [ ] Only an unconsumed Reserved grant may use `revoke_unused_member`.
+  Consumed prepare failure, cancellation, timeout and terminal ACK require
+  actual never-launched or all-writing-descendants-stopped evidence plus
+  postcheck before settlement. Do not unconditionally release on prepare error.
+  Preserve ownership if an adapter runtime object is removed during recovery.
+- [ ] Heartbeats/observations are bounded state updates, not authority renewal.
+  They cannot reactivate Released members, expand budgets, or erase shared
+  observed usage. A root snapshot contains the exact effect once.
+
+### Task 3: Recover epochs/owners without inventing live authority
+
+**Files:** `storage_ledger.rs`, `storage_fs.rs`, `storage_service.rs` and queue
+recovery seams in `registry.rs`; use Plan 1 process-lifecycle evidence.
+
+- [ ] Acquire the real root transaction guard and reload before advancing state.
+  Validate exact snapshot-v2 structure, checksum/predecessor epoch and pending
+  operation evidence under bounded reads. Unknown/malformed/regressing state
+  is protected; a self-consistent hash alone is not trusted owner authority.
+- [ ] Register the starting Host's real instance/PID/creation identity and
+  owner epoch through a durable transaction before its first grant. A restart
+  generation applies only to the corresponding prior Host instance, never
+  the entire root. Preserve other live Host owners and all their member/
+  control reservations in the shared global totals. Starting this Host does
+  not migrate, reclaim or relabel another active Host's members.
+- [ ] Reconcile a prior owner only using actual process/Job handles and full
+  ownership/path evidence. PID equality, PID absence, heartbeat expiry and
+  OS mutex abandonment do not prove old descendants stopped. Uncertain old
+  owners become RecoveryPending while their reservation/allowance/observation
+  remains charged; live other owners remain live. Do not resume execution
+  solely from stored hashes or reconstruct Sent/native authority from a string.
+- [ ] Await the real owned-process fence outside the transaction; inside it
+  verify the bound terminal evidence and remeasure under the namespace fence.
+  Only a committed recovery settlement can release capacity. Unknown owner,
+  missing evidence, replaced root, failed stat or unreconciled journal keeps
+  admission/apply blocked. Quarantine is a logical protected state, not an
+  automatic move/delete operation. An abandoned guard or unmatched stage
+  triggers bounded pending-operation reconciliation, not automatic deletion
+  or a guess about which Host owned the stage.
+- [ ] Treat legacy flat lease-v1 as read-only recovery input. It cannot
+  reconstruct exact sealed member sets, shared allowance or control ownership
+  unambiguously, so do not auto-migrate it into active snapshot-v2 or duplicate
+  one family lease per task. Unknown versions fail closed. Existing data and
+  raw legacy evidence remain untouched pending an explicit audited recovery.
+  A missing ledger never authorizes adoption/deletion of unknown artifacts.
+- [ ] Report P2-base ready only when the shared ledger, bounded bootstrap/queue
+  allocations and fail-closed restart gate are wired and compiled. This lets
+  Plan 1 Task 6 proceed; it does not enable cleanup apply.
+
+## P2-apply: classification, preview and locked deletion
+
+### Task 4: Classify only proven disposable, unowned generated objects
+
+**Files:** `storage_cleanup.rs`, `storage_fs.rs`, `storage_ledger.rs`.
+
+- [ ] Build candidates from registered family/member generated roots only.
+  Eligibility requires verified producer/classification evidence, released
+  ownership, terminal/postcheck proof, no live group/member/control reference,
+  stable no-follow identity and a bounded content manifest. Unreleased family
+  data, unknown files, dirty output, source/worktree data, sessions, metadata
+  and live queues are protected. Size/age/name may order already-eligible
+  candidates but never make an object eligible.
+- [ ] Shared Cargo cleanup targets the family cache once, never one task's
+  duplicate lease reference. Member scratch/output is a separate bounded
+  object and is not disposable merely because its phase is Released.
+  Non-Cargo output can contain valuable results; require explicit classification
+  and requested cleanup scope. Do not infer disposability from the four
+  artifact-kind names alone.
+- [ ] Preview is read-only and path-free. Under a consistent ledger view,
+  bind root/policy/epoch, exact candidate set, last ownership/evidence,
+  content/identity manifest and finite limits into the candidate hash.
+  Counts and hashes are observations, not deletion capabilities; caller
+  recomputation does not mint Host classification or a handle fence.
+- [ ] Retain the planned bounded public apply payload:
+  `{candidate_hash, policy_hash, ledger_epoch, batch_limit}`, with batch_limit
+  1 through 16 and no path/owner fields, inside the authenticated operation
+  envelope. Explicit user authorization for that destructive scope is still
+  required. Status/preview are read-only; no automatic pressure cleanup.
+
+### Task 5: Acquire fences first, then recheck and journal apply
+
+**Files:** `storage_cleanup.rs`, `storage_fs.rs`, `storage_ledger.rs`;
+only afterward the mapped rmcp-client and DevKit projection files.
+
+- [ ] Resolve the Host-held preview reference, acquire the root transaction
+  lock and real namespace-mutation fence, then freshly reopen/remeasure the
+  exact candidate set through retained no-follow handles. Recheck owner/
+  member/control references, policy, expected epoch, classification, identity,
+  content manifest and finite bounds **inside** that fenced interval.
+  Never compute a new preview first and acquire the writer fence afterward.
+- [ ] Any discrepancy returns `STORAGE_CANDIDATE_STALE` or the precise
+  protected code before deletion. Unknown/active/dirty/recovery/control data
+  remains protected. No path string, TTL, `owner_state = none` label or a
+  successful hash comparison substitutes for this fenced recheck.
+- [ ] Reserve the bounded apply journal/receipt peak before writing it, using
+  the same control accounting. Persist an Applying operation for the exact
+  selected identities/expected epoch before the first delete. The root lock
+  prevents another admission during this transition; retain the namespace
+  fence through deletion, post-stat and final ledger commit.
+- [ ] Delete only via `OwnedFilesystem::remove_verified_tree` with finite
+  bytes/files/depth/time limits, no links/mount traversal, stable opened parent
+  identities and the supported platform's actual mutation exclusion.
+  Reject multiply linked or unowned entries when ownership cannot be proved.
+  No generic `remove_dir_all` fallback or wildcard deletion is permitted.
+- [ ] Postcheck the exact result and update retained family/control observation
+  once before committing the bounded receipt. Deletion does not release an
+  active lease; only already-settled eligible data enters apply. On partial
+  removal or an uncertain final commit, persist/protect the pending operation,
+  return `STORAGE_APPLY_INCOMPLETE`, stop later items and require recovery.
+  Never roll back by claiming removed bytes/files still exist or attempt an
+  unrelated cleanup. Crash recovery does not auto-continue deletion.
+- [ ] Expose only stable codes, hashes, counts and receipt identity through
+  `storage_status`/`storage_preview`/`storage_apply`. Keep absolute paths,
+  owner PID/creation identity and handles private. Stable failures include
+  `STORAGE_CANDIDATE_STALE`, `STORAGE_PROTECTED_UNKNOWN`,
+  `STORAGE_PROTECTED_ACTIVE`, `STORAGE_PROTECTED_DIRTY`,
+  `STORAGE_APPLY_INCOMPLETE` and existing admission/recovery codes.
+  Internal snapshot-v2 is not a change to public admission-v1.
+
+## Compile-first verification and commits
+
+Keep only two new core boundary cases; preserve existing kernel vectors.
+Use temporary, owned fixture roots and injected filesystem/process backends,
+never the configured live generated root.
+
+1. `shared_family_control_transaction_is_single_charge`: two distinct members
+   share one family lease; repeating one intent is not a new reservation.
+   Persist/reopen a protected snapshot with allowance and retained observation
+   intact. Alternate transactions through two runtime service fixtures and
+   verify each reloads the latest epoch and retains the other live owner's
+   reservations. Initial settlement keeps a live independent queue; a same-key
+   successor can reserve without inheriting its predecessor's active lease.
+   Inject commit failure and verify no uncommitted grant is returned and
+   retained control/stage capacity is not silently freed.
+2. `apply_rechecks_identity_under_fence_and_retains_failed_shutdown`: a
+   Consumed member lacking real terminal proof cannot release or become a
+   candidate. Change candidate identity/epoch between preview and fence;
+   apply rejects before the delete primitive. The fixture backend verifies
+   that the successful recheck/deletion interval actually holds both guards.
+
+These are acceptance cases to implement, not claims that the test functions
+already exist. Keep one small Python assertion rejecting paths/unknown fields
+and unbounded apply batches if the bridge projection changes. Do not recreate
+old missing-module RED failures or introduce a broad test matrix.
+
+After a changed slice compiles, run the relevant case once, from Host
+`codex-rs`:
 
 ```powershell
-$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; python -m pytest tests/test_storage_ledger.py::test_storage_apply_rejects_path_and_unbounded_batch -q -o cache_dir=G:\2718lab\_codex\.codex-task-temp\storage-113-ledger-pytest
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs'; $env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\storage-113-ledger-rust-target'; cargo test -p codex-core released_lease_cannot_receive_a_heartbeat --locked -j1; Pop-Location
+$env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\target'
+$env:CARGO_INCREMENTAL='0'
+cargo check -p codex-rmcp-client -p codex-core --lib --locked -j1
+cargo test -p codex-core shared_family_control_transaction_is_single_charge --locked -j1
+cargo test -p codex-core apply_rechecks_identity_under_fence_and_retains_failed_shutdown --locked -j1
 ```
 
-Expected: both commands fail because the ledger types do not exist. The
-failure must occur before any production path or deletion call.
-
-- [ ] **Step 4: Commit only the RED contract.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\devkit-1.1.2-recovery'; git add mcp-tools/tests/test_storage_ledger.py mcp-tools/tests/test_mcp_contract.py; git commit -m 'test: define owned storage ledger contract'; Pop-Location
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs; git commit -m 'test: define owned storage ledger contract'; Pop-Location
-```
-
-### Task 2: Implement atomic ledger snapshots and schema migration
-
-**Files:**
-- Create: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/mod.rs:1-49`
-- Test: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`
-
-- [ ] **Step 1: Define the store and exact snapshot envelope.**
-
-```rust
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct LedgerSnapshot {
-    pub(crate) schema: String,
-    pub(crate) ledger_epoch: u64,
-    pub(crate) restart_generation: u64,
-    pub(crate) host_instance_id: String,
-    pub(crate) policy_hash: String,
-    pub(crate) leases: Vec<LeaseRecord>,
-    pub(crate) journal: Option<LedgerJournal>,
-}
-
-pub(crate) struct StorageLedger {
-    path: PathBuf,
-    snapshot: LedgerSnapshot,
-    owner_probe: Box<dyn OwnerProbe>,
-    capacity: Box<dyn CapacityProvider>,
-}
-```
-
-`open` must reject a symlink/reparse-point ledger file, malformed JSON, a
-non-monotonic epoch, unknown state, duplicate `lease_id`, or a path whose
-canonical parent is outside the approved generated root. An absent file is
-opened as a zero-lease `storage-ledger-v1` snapshot only after the parent root
-has been proved approved; it is not an authorization to write arbitrary roots.
-
-- [ ] **Step 2: Implement atomic replacement with a journal.**
-
-```rust
-fn persist(&mut self, next: LedgerSnapshot) -> Result<(), StorageLedgerError> {
-    validate_snapshot(&next)?;
-    let temporary = self.path.with_extension("json.stage");
-    let bytes = serde_json::to_vec(&next).map_err(|_| StorageLedgerError::StatUnavailable)?;
-    let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)
-        .map_err(|_| StorageLedgerError::StatUnavailable)?;
-    file.write_all(&bytes).map_err(|_| StorageLedgerError::StatUnavailable)?;
-    file.sync_all().map_err(|_| StorageLedgerError::StatUnavailable)?;
-    replace_file_durably(&temporary, &self.path)?;
-    self.snapshot = next;
-    Ok(())
-}
-```
-
-The Windows replace helper must use the same write-through replacement
-semantics already used by `registry.rs:4281-4380`; Unix uses `rename` after
-`sync_all`. A failed replacement leaves the prior snapshot and the stage file
-is removed only when its identity still matches the stage created by this
-operation.
-
-- [ ] **Step 3: Add migration and rollback tests, then turn the RED schema tests green.**
-
-```rust
-#[test]
-fn old_or_missing_ledger_becomes_recovery_pending_without_deletion() {
-    let mut ledger = open_fixture_with_legacy_snapshot();
-    let result = ledger.recover_after_restart(current_owner_set_empty());
-    assert!(result.is_ok());
-    assert!(ledger.records().iter().all(|record| record.state == LeaseState::RecoveryPending));
-    assert!(fixture_generated_file().exists());
-}
-```
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs'; $env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\storage-113-ledger-rust-target'; cargo test -p codex-core storage_ledger --locked -j1; Pop-Location
-```
-
-Expected: the focused ledger tests pass; migration failure returns to the
-previous snapshot and keeps every generated file.
-
-- [ ] **Step 4: Commit the durable ledger core.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs codex-rs/core/src/fast_lane_host_dispatch/mod.rs; git commit -m 'feat: persist storage lease ledger atomically'; Pop-Location
-```
-
-### Task 3: Enforce reserve, heartbeat, release, and pressure gates
-
-**Files:**
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/storage_firewall.rs`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/registry.rs:567-1668`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/coordinator.rs:393-580,1218-1260`
-- Test: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`
-
-- [ ] **Step 1: Add RED accounting tests for all four admission equations.**
-
-```rust
-#[test]
-fn byte_file_global_and_floor_limits_fail_closed() {
-    let cases = [
-        (AdmissionMutation::TaskBytes, "STORAGE_QUOTA_EXCEEDED"),
-        (AdmissionMutation::TaskFiles, "STORAGE_FILE_LIMIT_EXCEEDED"),
-        (AdmissionMutation::GlobalReserved, "STORAGE_QUOTA_EXCEEDED"),
-        (AdmissionMutation::FreeFloor, "STORAGE_FREE_SPACE_FLOOR"),
-    ];
-    for (mutation, code) in cases {
-        let firewall = fixture_firewall(mutation);
-        assert_eq!(firewall.admit(test_intent()).unwrap_err().code(), code);
-        assert!(fixture_target_root().read_dir().unwrap().next().is_none());
-    }
-}
-```
-
-- [ ] **Step 2: Implement lease state methods with owner fencing.**
-
-```rust
-pub(crate) fn reserve(&mut self, admission: StorageAdmissionReceipt, now: u64) -> Result<LeaseRecord, StorageLedgerError>;
-pub(crate) fn activate(&mut self, lease_id: &str, owner: OwnerProof) -> Result<(), StorageLedgerError>;
-pub(crate) fn heartbeat(&mut self, lease_id: &str, owner: OwnerProof, observed: ObservedStorage) -> Result<LeaseRecord, StorageLedgerError>;
-pub(crate) fn release(&mut self, lease_id: &str, owner: OwnerProof, reason: &str) -> Result<ReleaseReceipt, StorageLedgerError>;
-```
-
-`heartbeat` remeasures bytes/files and applies the task, family, global, and
-free-space equations before persisting. If an observation exceeds a limit,
-new reservations return the stable pressure/quota code; the active lease is
-not killed and its directory is not deleted. At or below
-`emergency_floor_bytes`, the ledger enters `pressure=true` and allows only
-release, recovery, and read-only preview operations.
-
-- [ ] **Step 3: Connect `registry.rs` and the coordinator to the ledger.**
-
-```rust
-let admission = storage_firewall.admit(intent)?;
-let lease = storage_ledger.reserve(admission, clock.now()?)?;
-let prepared = adapter.prepare_batch_with_storage(batch, lease.clone()).await?;
-storage_ledger.activate(&lease.lease_id, owner_probe.current()?)?;
-```
-
-Every failed preparation calls `release` with `"prepare_failed"`; every
-terminal/recovery path calls it with its exact reason. Releasing the Fast Lane
-scope lease and releasing storage are separate journal entries bound by the
-same `assignment_id`, `plan_binding`, and receipt hash.
-
-- [ ] **Step 4: Run the focused accounting and core compile gates.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs'; $env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\storage-113-ledger-rust-target'; cargo test -p codex-core byte_file_global_and_floor_limits_fail_closed --locked -j1; cargo check -p codex-core --lib --locked -j1; Pop-Location
-```
-
-Expected: the four cases pass and `cargo check` finishes with zero warnings.
-If disk statistics fail, the result is `STORAGE_STAT_UNAVAILABLE` and no new
-target root is created.
-
-- [ ] **Step 5: Commit the quota and lifecycle wiring.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/core/src/fast_lane_host_dispatch/storage_firewall.rs codex-rs/core/src/fast_lane_host_dispatch/registry.rs codex-rs/core/src/fast_lane_host_dispatch/coordinator.rs codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs; git commit -m 'feat: bind storage leases to quota lifecycle'; Pop-Location
-```
-
-### Task 4: Implement restart owner recovery and fail-closed quarantine
-
-**Files:**
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/registry.rs:3809-4380`
-- Test: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`
-
-- [ ] **Step 1: Add RED tests for PID reuse, changed path, unknown files, and locked-stat recovery.**
-
-```rust
-#[test]
-fn restart_requires_instance_pid_start_and_owner_epoch() {
-    let mut ledger = open_fixture_with_active_lease(owner_with(41, 900, 7));
-    ledger.recover_after_restart(owner_with(41, 901, 7)).unwrap();
-    assert_eq!(ledger.records()[0].state, LeaseState::RecoveryPending);
-    assert_eq!(ledger.records()[0].restart_generation, 2);
-}
-```
-
-- [ ] **Step 2: Implement `OwnerProbe` and recovery validation.**
-
-```rust
-pub(crate) trait OwnerProbe: Send + Sync {
-    fn current(&self) -> Result<OwnerProof, StorageLedgerError>;
-    fn matches(&self, owner: &OwnerProof) -> Result<bool, StorageLedgerError>;
-}
-
-fn recover_record(record: &mut LeaseRecord, owner_probe: &dyn OwnerProbe, root: &Path) -> Result<(), StorageLedgerError> {
-    if record.state != LeaseState::Active && record.state != LeaseState::Reserved {
-        return Ok(());
-    }
-    if !owner_probe.matches(&OwnerProof::from_record(record))?
-        || !verify_target_identity(root, record)?
-        || !manifest_matches(record)?
-    {
-        record.state = LeaseState::Quarantined;
-        return Ok(());
-    }
-    record.state = LeaseState::Active;
-    Ok(())
-}
-```
-
-The host increments `restart_generation` under the ledger lock before examining
-records. Missing receipt, path change, dirty state, unknown file, or a failed
-lock/stat check becomes `quarantined`; an owner that cannot be proved becomes
-`recovery_pending` until a later explicit recovery receipt. `apply` is blocked
-while any recovery remains unresolved.
-
-- [ ] **Step 3: Add a restart recovery receipt and verify no deletion occurred.**
-
-```rust
-assert_eq!(receipt.code(), "STORAGE_RECOVERY_REQUIRED");
-assert_eq!(receipt.restart_generation(), 2);
-assert!(fixture_generated_file().exists());
-```
-
-- [ ] **Step 4: Run the focused recovery probe and compile gate.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs'; $env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\storage-113-ledger-rust-target'; cargo test -p codex-core restart_requires_instance_pid_start_and_owner_epoch --locked -j1; cargo check -p codex-core --lib --locked -j1; Pop-Location
-```
-
-Expected: `1 passed`, then a zero-warning compile.
-
-- [ ] **Step 5: Commit restart recovery.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs codex-rs/core/src/fast_lane_host_dispatch/registry.rs codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs; git commit -m 'feat: recover storage ownership across restarts'; Pop-Location
-```
-
-### Task 5: Add preview hash, recheck fence, and bounded generated apply
-
-**Files:**
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs`
-- Modify: `codex-rs/rmcp-client/src/inherited_host_bridge_protocol.rs:35-240`
-- Modify: `codex-rs/rmcp-client/src/inherited_host_bridge_protocol/envelope.rs:25-220`
-- Modify: `codex-rs/rmcp-client/src/inherited_host_bridge_protocol/session.rs:412-570`
-- Test: `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`
-
-- [ ] **Step 1: Add RED tests for candidate invalidation and protected classifications.**
-
-```rust
-#[test]
-fn preview_hash_invalidates_on_epoch_owner_or_content_change() {
-    let mut ledger = test_ledger_with_disposable_candidate();
-    let preview = ledger.preview().unwrap();
-    ledger.bump_epoch_for_test();
-    let error = ledger.apply(&ApplyRequest::from_preview(&preview, 1)).unwrap_err();
-    assert_eq!(error.code(), "STORAGE_CANDIDATE_STALE");
-    assert!(fixture_candidate_path().exists());
-}
-```
-
-- [ ] **Step 2: Implement canonical candidate manifest and preview hash.**
-
-```rust
-pub(crate) fn preview(&self) -> Result<StoragePreview, StorageLedgerError> {
-    let mut candidates = self.scan_registered_generated_roots()?;
-    candidates.sort_by(|left, right| left.path_identity.cmp(&right.path_identity));
-    let manifest = serde_json::json!({
-        "schema": "2718lab.storage.preview.v1",
-        "ledger_epoch": self.snapshot.ledger_epoch,
-        "policy_hash": self.snapshot.policy_hash,
-        "candidates": candidates,
-    });
-    Ok(StoragePreview { manifest, candidate_hash: canonical_hash(&manifest)? })
-}
-```
-
-The scan follows no reparse point, visits only ledger-registered generated
-roots, and labels active/unknown/dirty/source/session entries as protected.
-It does not select by size, age, or directory name.
-
-- [ ] **Step 3: Implement apply as recheck, journal, delete, postcheck.**
-
-```rust
-pub(crate) fn apply(&mut self, request: ApplyRequest) -> Result<ApplyReceipt, StorageLedgerError> {
-    let preview = self.preview()?;
-    if request.candidate_hash != preview.candidate_hash
-        || request.policy_hash != self.snapshot.policy_hash
-        || request.ledger_epoch != self.snapshot.ledger_epoch
-    {
-        return Err(StorageLedgerError::CandidateStale);
-    }
-    let fence = self.writer_fence()?;
-    let selected = preview.generated_disposable(request.batch_limit)?;
-    for candidate in selected {
-        self.recheck_candidate(&candidate, &fence)?;
-        self.write_journal_started(&candidate)?;
-        self.remove_verified_generated_path(&candidate)?;
-        if candidate.path_exists()? {
-            return Err(StorageLedgerError::PostcheckFailed);
-        }
-        self.mark_released(&candidate.lease_id)?;
-    }
-    self.write_receipt_and_release_fence()
-}
-```
-
-A failed item returns `STORAGE_APPLY_INCOMPLETE` and leaves all later items
-untouched. A changed candidate releases the writer fence without deletion.
-Apply cannot run while the ledger is in pressure recovery or while any
-candidate is active, unknown, dirty, source, or session classified.
-
-- [ ] **Step 4: Add the exact bridge operations and DevKit projections.**
-
-```python
-def storage_apply(self, request: StorageApplyRequest) -> dict[str, object]:
-    if request.batch_limit < 1 or request.batch_limit > 16:
-        return {"code": "STORAGE_CANDIDATE_STALE"}
-    response = _host_session().storage_apply(request.to_wire())
-    return project_storage_receipt(response)
-```
-
-The bridge validator requires exact schemas
-`2718lab.storage.status.v1`, `2718lab.storage.preview.v1`, and
-`2718lab.storage.apply.v1`; `storage_apply` is the only destructive operation.
-The DevKit projection strips absolute paths and owner/process values before
-returning an MCP result.
-
-- [ ] **Step 5: Run preview/apply focused tests and compile-first gates.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs'; $env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\storage-113-ledger-rust-target'; cargo test -p codex-core preview_hash_invalidates_on_epoch_owner_or_content_change --locked -j1; cargo check -p codex-core --lib --locked -j1; Pop-Location
-$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; Push-Location 'G:\2718lab\_codex\.codex-task-temp\devkit-1.1.2-recovery\mcp-tools'; python -m pytest tests/test_storage_ledger.py -q -o cache_dir=G:\2718lab\_codex\.codex-task-temp\storage-113-ledger-pytest; python -m py_compile devkit_runtime/storage_ledger.py devkit_runtime/host_bridge.py devkit_runtime/host_session.py server.py; Pop-Location
-```
-
-Expected: focused Rust and Python tests pass, both compile gates are silent,
-and only the named task-local target/cache roots are touched.
-
-- [ ] **Step 6: Commit preview/apply and bridge integration.**
-
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\devkit-1.1.2-recovery'; git add mcp-tools/devkit_runtime/storage_ledger.py mcp-tools/devkit_runtime/host_bridge.py mcp-tools/devkit_runtime/host_session.py mcp-tools/devkit_runtime/tool_metadata.py mcp-tools/server.py mcp-tools/tests/test_storage_ledger.py mcp-tools/tests/test_mcp_contract.py; git commit -m 'feat: add owned storage preview and apply'; Pop-Location
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs codex-rs/rmcp-client/src/inherited_host_bridge_protocol.rs codex-rs/rmcp-client/src/inherited_host_bridge_protocol/envelope.rs codex-rs/rmcp-client/src/inherited_host_bridge_protocol/session.rs; git commit -m 'feat: add owned storage preview and apply'; Pop-Location
-```
-
-## Plan 2 acceptance gate and handoff
-
-- [ ] Re-read the design sections “Task Storage Lease Ledger”, “重启恢复”, “Preview、候选哈希、复核与 Apply”, and “稳定错误”; map every listed field/code to a task above.
-- [ ] Run `git diff --check` in both worktrees and verify only the mapped files changed.
-- [ ] Run DevKit `py_compile` and Host `cargo check -p codex-core --lib --locked -j1` with the one named task target; zero warnings are required before any package build.
-- [ ] Record receipts for reserve, heartbeat, release, restart recovery, candidate stale, protected candidate, successful one-item generated apply, and partial apply. Each receipt must include ledger epoch and receipt hash.
-- [ ] Verify a missing/legacy ledger migrates to recovery protection, a failed atomic write leaves the previous snapshot, pressure blocks new reservations, and no operation kills another process or scans outside registered generated roots.
-- [ ] Do not implement GitHub source deletion, ordinary/active session deletion, CAS dedupe, compression, or remote synchronization. Plan 3 consumes the ledger's protected classifications and apply fence.
+Stop before probes if compilation fails; no repeated full-suite runs. Compile
+any changed runtime caller separately with the same target/settings rather
+than treating the two-crate gate as coverage of an edited app-server.
+For changed Python modules, run only their `py_compile` and the selected
+exact request assertion after the Rust gate. No package build or live cleanup
+is needed for these document/base slices.
+
+- [ ] Commit P2-base state/control work separately from later cleanup/wire
+  changes. Use explicit named-file staging after `git diff --check`; do not
+  stage other workers' changes or commit an uncompiled layer as accepted.
+- [ ] Record which OS handle/descendant fence has real implementation and
+  verification. An unsupported backend stays unavailable; a mock guard or
+  compile success is not production deletion approval.
+
+## Plan 2 acceptance gates and handoff
+
+- [ ] One service per runtime enters the same cross-process root transaction:
+  OS fence, reload/recheck epoch/owner state, transition, durable commit.
+  Other live Host owners remain active and globally counted; no independent
+  per-Host authoritative counter cache exists. Same-key members share the lease, and no path performs
+  firewall admission followed by independent ledger reservation.
+- [ ] Root-plus-eight trusted configuration remains unchanged and numerically
+  pending the user. Bootstrap/queue/snapshot/stage/journal bytes/files are
+  bounded and charged before writes from the existing global limits;
+  unprovable capacity/bounds fail closed without creating metadata.
+- [ ] P2-base enables Plan 1's durable refill dependency independently of
+  cleanup apply: live queues survive initial member settlement without
+  occupying its Cargo family lease or releasable member paths.
+- [ ] Real cross-process root exclusion, epoch/creation identity, recovery
+  protection and no-follow handle fences exist. TTL/strings/PID equality
+  cannot authorize takeover, release or deletion.
+- [ ] Released tombstones and retained family observations survive restart;
+  legacy/missing/ambiguous state never grants fresh ownership over old data.
+- [ ] Consumed prepare failure and terminal settlement require actual process
+  proof and postcheck. Uncertain commit/shutdown/stat leaves ownership intact.
+- [ ] Cleanup requires explicit scope authorization and fresh locked/fenced
+  eligibility/identity checks, with bounded journal/delete/postcheck.
+  Record a fixture stale-candidate/no-delete result before any separately
+  authorized live apply; this plan edit itself authorizes none.
+- [ ] No generated/source/session/queue data was deleted merely to complete a
+  test, satisfy pressure, or repair a snapshot. Plan 3 receives protected
+  classifications and the real fence, not permission for broader deletion.
