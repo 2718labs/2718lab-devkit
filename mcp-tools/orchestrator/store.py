@@ -7238,6 +7238,7 @@ class SQLiteStore:
                 row["state"] not in {"pending", "projected", "quarantined"}
                 or not 0 <= row["attempt_count"] <= cls._MAX_ATLAS_OUTBOX_ATTEMPTS
                 or row["ingestion_key"] != row["payload_hash"]
+                or row["acceptance_id"] != row["ingestion_key"]
                 or (
                     row["state"] == "projected"
                     and row["last_error_code"] != ""
@@ -7256,6 +7257,19 @@ class SQLiteStore:
                     and row["attempt_count"] == 0
                     and row["last_error_code"] != ""
                 )
+            ):
+                raise StoreError("legacy atlas outbox row is invalid")
+            acceptance = cursor.execute(
+                "SELECT acceptance_id, payload_hash, payload_json "
+                "FROM code_task_acceptances WHERE acceptance_id = ?",
+                (row["acceptance_id"],),
+            ).fetchone()
+            if (
+                acceptance is None
+                or row["acceptance_id"] != acceptance["acceptance_id"]
+                or row["ingestion_key"] != acceptance["payload_hash"]
+                or row["acceptance_id"] != acceptance["payload_hash"]
+                or row["payload_json"] != acceptance["payload_json"]
             ):
                 raise StoreError("legacy atlas outbox row is invalid")
             try:
