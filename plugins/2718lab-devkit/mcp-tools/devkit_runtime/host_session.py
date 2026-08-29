@@ -11,14 +11,15 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from threading import RLock
-from typing import Final, TypeAlias
+from threading import Event, RLock, Thread, current_thread
+from typing import Final, TypeAlias, cast
 
 from . import host_envelopes
 from .host_bridge import (
+    FastLaneRefillRegistryRequest,
     HostBridgeError,
     InheritedHandleHostBridge,
     OperationReceipt,
@@ -145,6 +146,10 @@ class _CompilerInvocationBinding:
     reasoning_effort: str
     verified_route_result_hashes: tuple[str, ...]
     verified_lease_scope_bindings: tuple[str, ...]
+    dispatch_facts: tuple[object, ...] = ()
+    dispatch_binding_hashes: tuple[str, ...] = ()
+    registry_binding_hash: str | None = None
+    evidence_expires_at: int | None = None
 
 
 CompilerInvocationResolver: TypeAlias = Callable[
@@ -163,9 +168,50 @@ class _CompilerInvocation:
     reasoning_effort: str
     verified_route_result_hashes: tuple[str, ...]
     verified_lease_scope_bindings: tuple[str, ...]
+    dispatch_facts: tuple[object, ...]
+    dispatch_binding_hashes: tuple[str, ...]
     issued_at: float
     expires_at: float
     binding_hash: str
+    registry_binding_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class _CompilerRequestContext:
+    call_intent_hash: str
+    request_hash: str
+    reasoning_effort: str
+    requested_routes: tuple[HostRoute, ...]
+    assignment_skeletons: tuple[dict[str, object], ...] = field(repr=False)
+    project_index_attestation_refs: tuple[dict[str, object], ...] = field(repr=False)
+    routing_registry_binding_hash: str
+
+
+@dataclass(frozen=True)
+class _HostCapabilitySnapshotV2:
+    call_intent_hash: str
+    preparation_id: str
+    host_capabilities: dict[str, object] = field(repr=False)
+    scheduler_facts: dict[str, object] = field(repr=False)
+    report_hash: str
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class _RoutingAttestationSnapshot:
+    call_intent_hash: str
+    preparation_id: str
+    routing_requests: tuple[dict[str, object], ...] = field(repr=False)
+    attestations: tuple[dict[str, object], ...] = field(repr=False)
+    routing_request_set_hash: str
+    routing_registry_binding_hash: str
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class _PendingFastLaneTerminal:
+    expected: dict[str, object] = field(repr=False)
+    lease_expires_at: int = field(repr=False)
 
 
 class _CompilerPreparation:
@@ -206,6 +252,30 @@ class HostSession:
         )
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
+        self._compiler_request_contexts: dict[str, _CompilerRequestContext] = {}
+        self._capability_snapshots_v2: dict[
+            tuple[str, str], _HostCapabilitySnapshotV2
+        ] = {}
+        self._preparation_expiry_caps: dict[str, int] = {}
+        self._routing_attestation_snapshots: dict[
+            tuple[str, str], _RoutingAttestationSnapshot
+        ] = {}
+        self._pending_fast_lane_terminals: dict[
+            tuple[str, str], _PendingFastLaneTerminal
+        ] = {}
+        # One reader owns the framed inbound sequence for all active batches;
+        # callbacks are multiplexed by the authenticated batch hash.
+        # Batch identities share one session-level reader; this set is only
+        # bookkeeping for callbacks, never a per-batch receiver registry.
+        self._fast_lane_active_batches: set[str] = set()
+        self._fast_lane_terminal_thread: Thread | None = None
+        self._fast_lane_refill_callbacks: dict[
+            str, Callable[[Mapping[str, object]], object]
+        ] = {}
+        self._fast_lane_terminal_stop = Event()
+        self._fast_lane_refill_receipts: dict[str, object] = {}
+        self._fast_lane_refill_registries: dict[str, object] = {}
+        self._project_index_query_attestations: dict[str, dict[str, object]] = {}
         self._burned_preparation_ids: set[str] = set()
         self._clock = clock
         self._last_trusted_clock: float | None = None
@@ -236,10 +306,16 @@ class HostSession:
             )
         except HostBridgeError:
             bridge = None
-        return cls(
+        session = cls(
             bridge=bridge,
             clock=clock,
         )
+        if bridge is not None:
+            session._compiler_evidence_provider = lambda preparation: preparation
+            session._compiler_invocation_resolver = (
+                session._resolve_bridge_compiler_invocation
+            )
+        return session
 
     @property
     def is_available(self) -> bool:
@@ -258,6 +334,122 @@ class HostSession:
 
         return self._last_unavailable
 
+    @property
+    def has_active_fast_lane_terminal_receiver(self) -> bool:
+        """Whether this session currently owns its multiplexed terminal reader."""
+
+        with self._compiler_evidence_lock:
+            thread = self._fast_lane_terminal_thread
+            return thread is not None and thread.is_alive()
+
+    def resolve_capability_snapshot_v2(
+        self,
+        *,
+        call_intent_hash: str,
+        preparation_id: str,
+        expires_at_ceiling: int | None = None,
+    ) -> _HostCapabilitySnapshotV2 | None:
+        """Resolve and retain one generation-bound V5 Host/scheduler snapshot."""
+
+        bridge = self._bridge
+        if (
+            bridge is None
+            or not self.is_available
+            or type(call_intent_hash) is not str
+            or len(call_intent_hash) != 64
+            or any(character not in "0123456789abcdef" for character in call_intent_hash)
+            or type(preparation_id) is not str
+            or _IDENTIFIER.fullmatch(preparation_id) is None
+            or (
+                expires_at_ceiling is not None
+                and (type(expires_at_ceiling) is not int or expires_at_ceiling <= 0)
+            )
+        ):
+            return None
+        key = (call_intent_hash, preparation_id)
+        if key in self._capability_snapshots_v2:
+            return None
+        try:
+            now = int(self._read_trusted_clock())
+            probe = bridge.send_capability_probe_v2(
+                call_intent_hash=call_intent_hash,
+                preparation_id=preparation_id,
+                now=now,
+            )
+            report = bridge.receive_capability_report_v2(probe=probe, now=now)
+            host = cast(dict[str, object], report["host_capabilities"])
+            scheduler = cast(dict[str, object], report["scheduler_facts"])
+            snapshot_expires_at = probe.expires_at
+            if expires_at_ceiling is not None:
+                if now >= expires_at_ceiling:
+                    return None
+                snapshot_expires_at = min(snapshot_expires_at, expires_at_ceiling)
+            if snapshot_expires_at <= now:
+                return None
+            snapshot = _HostCapabilitySnapshotV2(
+                call_intent_hash=call_intent_hash,
+                preparation_id=preparation_id,
+                host_capabilities=dict(host),
+                scheduler_facts=dict(scheduler),
+                report_hash=_required_hash(report["report_hash"]),
+                expires_at=snapshot_expires_at,
+            )
+        except Exception:
+            return None
+        self._capability_snapshots_v2[key] = snapshot
+        self._preparation_expiry_caps[preparation_id] = snapshot.expires_at
+        return snapshot
+
+    def resolve_routing_attestations(
+        self,
+        *,
+        call_intent_hash: str,
+        preparation_id: str,
+        routing_requests: Sequence[Mapping[str, object]],
+    ) -> _RoutingAttestationSnapshot | None:
+        """Resolve one V5 route set after the same-generation capability report."""
+
+        bridge = self._bridge
+        key = (call_intent_hash, preparation_id)
+        capability_snapshot = self._capability_snapshots_v2.get(key)
+        if (
+            bridge is None
+            or not self.is_available
+            or capability_snapshot is None
+            or key in self._routing_attestation_snapshots
+        ):
+            return None
+        try:
+            now = int(self._read_trusted_clock())
+            if now >= capability_snapshot.expires_at:
+                return None
+            request = bridge.send_routing_attestation_request(
+                call_intent_hash=call_intent_hash,
+                preparation_id=preparation_id,
+                routing_requests=routing_requests,
+                now=now,
+            )
+            response = bridge.receive_routing_attestation_response(
+                request=request, now=now
+            )
+            raw_attestations = response["attestations"]
+            assert type(raw_attestations) is list
+            snapshot = _RoutingAttestationSnapshot(
+                call_intent_hash=call_intent_hash,
+                preparation_id=preparation_id,
+                routing_requests=tuple(dict(item) for item in request.routing_requests),
+                attestations=tuple(dict(item) for item in raw_attestations),
+                routing_request_set_hash=request.routing_request_set_hash,
+                routing_registry_binding_hash=_required_hash(
+                    response["routing_registry_binding_hash"]
+                ),
+                expires_at=request.expires_at,
+            )
+        except Exception:
+            return None
+        self._routing_attestation_snapshots[key] = snapshot
+        return snapshot
+
     def close(self) -> None:
         """Close the owned private transport once; no session can be revived."""
 
@@ -267,8 +459,26 @@ class HostSession:
             self._closed = True
             self._frozen = True
             self._compiler_evidence.clear()
+            self._compiler_request_contexts.clear()
+            self._capability_snapshots_v2.clear()
+            self._preparation_expiry_caps.clear()
+            self._routing_attestation_snapshots.clear()
+            self._pending_fast_lane_terminals.clear()
+            self._fast_lane_refill_callbacks.clear()
+            self._fast_lane_active_batches.clear()
+            self._project_index_query_attestations.clear()
+            self._fast_lane_terminal_stop.set()
+            terminal_thread = self._fast_lane_terminal_thread
         if self._bridge is not None:
+            # Closing the descriptor unblocks the single multiplexed receiver;
+            # join it here so no detached reader can outlive this session.
             self._bridge.close()
+        if (
+            terminal_thread is not None
+            and terminal_thread is not current_thread()
+            and terminal_thread.is_alive()
+        ):
+            terminal_thread.join(timeout=0.25)
 
     def prepare_compiler_evidence(
         self, *, preparation_id: str
@@ -296,14 +506,40 @@ class HostSession:
                 issued_at = self._read_trusted_clock()
             except (TypeError, ValueError):
                 return _NO_SAFE_WORK
-            expires_at = issued_at + 120
             try:
                 binding = _normalized_compiler_invocation_binding(
                     binding_resolver(preparation_id)
                 )
             except Exception:
                 return _NO_SAFE_WORK
+            expires_at = (
+                binding.evidence_expires_at
+                if binding.evidence_expires_at is not None
+                else issued_at + 120
+            )
+            expiry_cap = self._preparation_expiry_caps.pop(preparation_id, None)
+            if not issued_at < expires_at <= issued_at + 120 or (
+                expiry_cap is not None and expires_at > expiry_cap
+            ):
+                return _NO_SAFE_WORK
             preparation = _CompilerPreparation()
+            invocation_binding = {
+                "preparation_id": preparation_id,
+                "request_hash": binding.request_hash,
+                "reasoning_effort": binding.reasoning_effort,
+                "verified_route_result_hashes": binding.verified_route_result_hashes,
+                "verified_lease_scope_bindings": binding.verified_lease_scope_bindings,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+            }
+            if binding.registry_binding_hash is not None:
+                invocation_binding["registry_binding_hash"] = (
+                    binding.registry_binding_hash
+                )
+            if binding.dispatch_binding_hashes:
+                invocation_binding["dispatch_binding_hashes"] = (
+                    binding.dispatch_binding_hashes
+                )
             material = _CompilerInvocation(
                 schema="2718lab-devkit/compiler-invocation-v2",
                 preparation_id=preparation_id,
@@ -311,19 +547,12 @@ class HostSession:
                 reasoning_effort=binding.reasoning_effort,
                 verified_route_result_hashes=binding.verified_route_result_hashes,
                 verified_lease_scope_bindings=binding.verified_lease_scope_bindings,
+                dispatch_facts=binding.dispatch_facts,
+                dispatch_binding_hashes=binding.dispatch_binding_hashes,
                 issued_at=issued_at,
                 expires_at=expires_at,
-                binding_hash=_hash(
-                    {
-                        "preparation_id": preparation_id,
-                        "request_hash": binding.request_hash,
-                        "reasoning_effort": binding.reasoning_effort,
-                        "verified_route_result_hashes": binding.verified_route_result_hashes,
-                        "verified_lease_scope_bindings": binding.verified_lease_scope_bindings,
-                        "issued_at": issued_at,
-                        "expires_at": expires_at,
-                    }
-                ),
+                binding_hash=_hash(invocation_binding),
+                registry_binding_hash=binding.registry_binding_hash,
             )
             material_state = _compiler_invocation_state(material)
             try:
@@ -348,6 +577,153 @@ class HostSession:
             self._compiler_evidence[evidence] = material
             return evidence
 
+    def bind_compiler_request(
+        self,
+        *,
+        preparation_id: str,
+        call_intent_hash: str,
+        request_hash: str,
+        reasoning_effort: str,
+        requested_routes: tuple[HostRoute, ...],
+        assignment_skeletons: tuple[dict[str, object], ...],
+        project_index_attestation_refs: tuple[dict[str, object], ...],
+        routing_registry_binding_hash: str,
+    ) -> bool:
+        """Bind public request identity before a private registry round trip."""
+
+        with self._compiler_evidence_lock:
+            if (
+                self._closed
+                or self._frozen
+                or self._compiler_invocation_resolver
+                != self._resolve_bridge_compiler_invocation
+                or _IDENTIFIER.fullmatch(preparation_id) is None
+                or type(call_intent_hash) is not str
+                or len(call_intent_hash) != 64
+                or any(character not in "0123456789abcdef" for character in call_intent_hash)
+                or not _is_hash(request_hash)
+                or not _is_hash(routing_registry_binding_hash)
+                or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
+            ):
+                return False
+            try:
+                normalized_routes = _normalized_routes(requested_routes)
+                trusted_now = int(self._read_trusted_clock())
+            except (TypeError, ValueError):
+                return False
+            routing_snapshot = self._routing_attestation_snapshots.get(
+                (call_intent_hash, preparation_id)
+            )
+            if (
+                routing_snapshot is None
+                or routing_snapshot.routing_registry_binding_hash
+                != routing_registry_binding_hash
+                or trusted_now >= routing_snapshot.expires_at
+            ):
+                return False
+            if preparation_id in self._compiler_request_contexts:
+                return False
+            self._compiler_request_contexts[preparation_id] = _CompilerRequestContext(
+                call_intent_hash=call_intent_hash,
+                request_hash=request_hash,
+                reasoning_effort=reasoning_effort,
+                requested_routes=normalized_routes,
+                assignment_skeletons=assignment_skeletons,
+                project_index_attestation_refs=project_index_attestation_refs,
+                routing_registry_binding_hash=routing_registry_binding_hash,
+            )
+            return True
+
+    def _resolve_bridge_compiler_invocation(
+        self, preparation_id: str
+    ) -> _CompilerInvocationBinding | None:
+        context = self._compiler_request_contexts.pop(preparation_id, None)
+        bridge = self._bridge
+        if context is None or bridge is None or not self.is_available:
+            return None
+        now = int(self._read_trusted_clock())
+        request = bridge.send_compiler_evidence_request(
+            preparation_id=preparation_id,
+            call_intent_hash=context.call_intent_hash,
+            request_hash=context.request_hash,
+            reasoning_effort=context.reasoning_effort,
+            requested_route_pairs=tuple(
+                {"model": route.model, "effort": route.effort}
+                for route in context.requested_routes
+            ),
+            assignment_skeletons=context.assignment_skeletons,
+            project_index_attestation_refs=context.project_index_attestation_refs,
+            routing_registry_binding_hash=context.routing_registry_binding_hash,
+            now=now,
+        )
+
+        response = bridge.receive_compiler_evidence_response(request=request, now=now)
+        from .fastlane_host_adapter import _dispatch_fact_from_mapping
+
+        facts_value = response["dispatch_facts"]
+        assert type(facts_value) is list
+        route_hashes = cast(list[object], response["verified_route_result_hashes"])
+        lease_hashes = cast(list[object], response["verified_lease_scope_bindings"])
+        dispatch_hashes = cast(list[object], response["dispatch_binding_hashes"])
+        return _CompilerInvocationBinding(
+            request_hash=_required_hash(response["request_hash"]),
+            reasoning_effort=str(response["reasoning_effort"]),
+            verified_route_result_hashes=tuple(
+                _required_hash(value)
+                for value in route_hashes
+            ),
+            verified_lease_scope_bindings=tuple(
+                _required_hash(value)
+                for value in lease_hashes
+            ),
+            dispatch_facts=tuple(
+                _dispatch_fact_from_mapping(value) for value in facts_value
+            ),
+            dispatch_binding_hashes=tuple(
+                _required_hash(value) for value in dispatch_hashes
+            ),
+            registry_binding_hash=_required_hash(response["registry_binding_hash"]),
+            evidence_expires_at=_required_positive_int(response["expires_at"]),
+        )
+
+    def send_project_index_attestation(
+        self, attestation: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        """Emit a persisted index attestation only when this bridge is live."""
+
+        bridge = self._bridge
+        if bridge is None or not self.is_available:
+            return None
+        now = int(self._read_trusted_clock())
+        sent = bridge.send_project_index_attestation(attestation=attestation, now=now)
+        if sent.get("operation") == "query":
+            correlation_id = sent.get("correlation_id")
+            if type(correlation_id) is not str:
+                self._freeze()
+                return None
+            self._project_index_query_attestations[correlation_id] = dict(sent)
+        return sent
+
+    def project_index_query_attestation(
+        self, *, correlation_id: str
+    ) -> dict[str, object] | None:
+        """Resolve a Host-preselected, same-generation query attestation once."""
+
+        try:
+            now = int(self._read_trusted_clock())
+        except (TypeError, ValueError):
+            return None
+        value = self._project_index_query_attestations.pop(correlation_id, None)
+        if (
+            value is None
+            or value.get("operation") != "query"
+            or value.get("correlation_id") != correlation_id
+            or type(value.get("expires_at")) is not int
+            or not now < cast(int, value["expires_at"])
+        ):
+            return None
+        return dict(value)
+
     def consume_compiler_evidence(self, evidence: object) -> object | str:
         """Exchange a session-issued handle once, rejecting public substitutes."""
 
@@ -368,6 +744,334 @@ class HostSession:
             if now >= material.expires_at:
                 return _NO_SAFE_WORK
             return material
+
+    def compiler_evidence_expires_at(self, evidence: object) -> int | None:
+        """Return only the expiry of a still-live opaque session handle."""
+
+        with self._compiler_evidence_lock:
+            if type(evidence) is not _CompilerEvidenceHandle:
+                return None
+            material = self._compiler_evidence.get(evidence)
+            if material is None or not math.isfinite(material.expires_at):
+                return None
+            return int(material.expires_at)
+
+    def send_fast_lane_dispatch_batch(
+        self,
+        *,
+        batch: Mapping[str, object],
+        binding: host_envelopes.EnvelopeBinding,
+        correlation_id: str,
+        now: int,
+        call_intent_hash: str | None = None,
+        preparation_id: str | None = None,
+        refill_callback: Callable[[Mapping[str, object]], object] | None = None,
+    ) -> OperationReceipt | str:
+        """Forward a compiled batch only on this session's authenticated bridge."""
+
+        bridge = self._bridge
+        if not self.is_available or bridge is None:
+            return _NO_SAFE_WORK
+        try:
+            # Validate and publish the whole batch under the session lock.  A
+            # second dispatch may arrive while the receiver is blocked, but it
+            # can never race the pending-map update or the bridge sequence.
+            with self._compiler_evidence_lock:
+                if self._closed or self._frozen:
+                    return _NO_SAFE_WORK
+                if (
+                    type(call_intent_hash) is not str
+                    or len(call_intent_hash) != 64
+                    or any(character not in "0123456789abcdef" for character in call_intent_hash)
+                    or type(preparation_id) is not str
+                    or _IDENTIFIER.fullmatch(preparation_id) is None
+                ):
+                    raise ValueError("missing Fast Lane terminal binding")
+                assignments = batch.get("assignments")
+                batch_hash = batch.get("batch_hash")
+                if (
+                    type(assignments) is not list
+                    or not assignments
+                    or not _is_hash(batch_hash)
+                ):
+                    raise ValueError("invalid Fast Lane terminal binding")
+                pending: list[tuple[tuple[str, str], _PendingFastLaneTerminal]] = []
+                seen_tasks: set[str] = set()
+                for assignment in assignments:
+                    if type(assignment) is not dict:
+                        raise ValueError("invalid Fast Lane terminal binding")
+                    route = assignment.get("route")
+                    if type(route) is not dict:
+                        raise ValueError("invalid Fast Lane terminal binding")
+                    expected = {
+                        "call_intent_hash": call_intent_hash,
+                        "preparation_id": preparation_id,
+                        "batch_hash": batch_hash,
+                        "task_id": assignment.get("task_id"),
+                        "lease_id": assignment.get("lease_id"),
+                        "lease_epoch": assignment.get("lease_epoch"),
+                        "task_version": assignment.get("task_version"),
+                        "assignment_token": assignment.get("assignment_token"),
+                        "dispatch_binding_hash": assignment.get("dispatch_binding_hash"),
+                        "routing_result_hash": route.get("routing_result_hash"),
+                        "worktree_identity": assignment.get("worktree_identity"),
+                        "worktree_base": assignment.get("worktree_base"),
+                        "integration_head": assignment.get("integration_head"),
+                        "predecessor_hash": assignment.get("predecessor_hash"),
+                    }
+                    task_id = assignment.get("task_id")
+                    if type(task_id) is not str or task_id in seen_tasks:
+                        raise ValueError("invalid Fast Lane terminal binding")
+                    seen_tasks.add(task_id)
+                    key = (cast(str, batch_hash), task_id)
+                    if key in self._pending_fast_lane_terminals:
+                        raise ValueError("duplicate Fast Lane terminal binding")
+                    pending.append(
+                        (
+                            key,
+                            _PendingFastLaneTerminal(
+                                expected=expected,
+                                # The envelope binding is host-issued and is
+                                # the only expiry available on the dispatch
+                                # wire.  Terminal receipts cannot extend it.
+                                lease_expires_at=binding.expires_at,
+                            ),
+                        )
+                    )
+                receipt = bridge.send_fast_lane_dispatch_batch(
+                    batch=batch,
+                    binding=binding,
+                    correlation_id=correlation_id,
+                    now=now,
+                )
+                self._pending_fast_lane_terminals.update(pending)
+                if refill_callback is not None and not self.start_fast_lane_terminal_receiver(
+                    batch_hash=cast(str, batch_hash), refill_callback=refill_callback
+                ):
+                    raise ValueError("Fast Lane terminal receiver was not started")
+                return receipt
+        except Exception:
+            self._freeze()
+            return _NO_SAFE_WORK
+
+    def send_fast_lane_refill_registry(
+        self,
+        *,
+        call_intent_hash: str,
+        preparation_id: str,
+        source_plan_hash: str,
+        index_context_hash: str,
+        routing_registry_binding_hash: str,
+        source_plan_task_ids: Sequence[str],
+        initial_skeletons: Sequence[Mapping[str, object]],
+        remaining_skeletons: Sequence[Mapping[str, object]],
+        index_attestation_refs: Sequence[Mapping[str, object]],
+        skeleton_package_hash: str,
+        now: int,
+    ) -> FastLaneRefillRegistryRequest | str:
+        """Publish one host-authenticated queue for successor Fast Lane waves."""
+
+        bridge = self._bridge
+        if bridge is None or not self.is_available:
+            return _NO_SAFE_WORK
+        try:
+            with self._compiler_evidence_lock:
+                if self._closed or self._frozen:
+                    return _NO_SAFE_WORK
+                routing_snapshot = self._routing_attestation_snapshots.get(
+                    (call_intent_hash, preparation_id)
+                )
+                if (
+                    routing_snapshot is None
+                    or routing_snapshot.routing_registry_binding_hash
+                    != routing_registry_binding_hash
+                    or type(now) is not int
+                    or now < 0
+                    or now >= routing_snapshot.expires_at
+                ):
+                    return _NO_SAFE_WORK
+                request = bridge.send_fast_lane_refill_registry_request(
+                    call_intent_hash=call_intent_hash,
+                    preparation_id=preparation_id,
+                    source_plan_hash=source_plan_hash,
+                    index_context_hash=index_context_hash,
+                    routing_registry_binding_hash=routing_registry_binding_hash,
+                    source_plan_task_ids=source_plan_task_ids,
+                    initial_skeletons=initial_skeletons,
+                    remaining_skeletons=remaining_skeletons,
+                    index_attestation_refs=index_attestation_refs,
+                    skeleton_package_hash=skeleton_package_hash,
+                    now=now,
+                )
+                self._fast_lane_refill_registries[request.queue_registry_hash] = request
+                return request
+        except Exception:
+            self._freeze()
+            return _NO_SAFE_WORK
+
+    def receive_fast_lane_worker_terminal(
+        self,
+        *,
+        correlation_id: str,
+        batch_hash: str,
+        task_id: str,
+        accepted_event_seq: int,
+        refill_trigger_hash: str,
+    ) -> dict[str, object] | str:
+        """Consume and acknowledge one stored batch assignment, retaining peers."""
+
+        bridge = self._bridge
+        key = (batch_hash, task_id)
+        try:
+            with self._compiler_evidence_lock:
+                pending = self._pending_fast_lane_terminals.get(key)
+                if (
+                    bridge is None
+                    or not self.is_available
+                    or pending is None
+                    or (
+                        self._fast_lane_terminal_thread is not None
+                        and self._fast_lane_terminal_thread.is_alive()
+                    )
+                ):
+                    return _NO_SAFE_WORK
+                now = int(self._read_trusted_clock())
+                terminal = bridge.receive_fast_lane_worker_terminal_result(
+                    correlation_id=correlation_id,
+                    expected=pending.expected,
+                    expires_at=pending.lease_expires_at,
+                    now=now,
+                )
+                ack = bridge.send_fast_lane_worker_terminal_ack(
+                    terminal_result=terminal,
+                    correlation_id=correlation_id,
+                    accepted_event_seq=accepted_event_seq,
+                    refill_trigger_hash=refill_trigger_hash,
+                )
+        except Exception:
+            self._freeze()
+            return _NO_SAFE_WORK
+        with self._compiler_evidence_lock:
+            self._pending_fast_lane_terminals.pop(key, None)
+        return ack
+
+    def start_fast_lane_terminal_receiver(
+        self,
+        *,
+        batch_hash: str,
+        refill_callback: Callable[[Mapping[str, object]], object],
+    ) -> bool:
+        """Register a batch on the session's shared terminal receiver.
+
+        There is exactly one inbound framed reader per session.  Additional
+        batches attach their callback to that reader instead of competing for
+        the transport sequence.
+        """
+
+        if not _is_hash(batch_hash) or not callable(refill_callback):
+            return False
+        with self._compiler_evidence_lock:
+            if (
+                not self.is_available
+                or not any(key[0] == batch_hash for key in self._pending_fast_lane_terminals)
+                or batch_hash in self._fast_lane_refill_callbacks
+            ):
+                return False
+            self._fast_lane_refill_callbacks[batch_hash] = refill_callback
+            thread = self._fast_lane_terminal_thread
+            if thread is not None and thread.is_alive():
+                self._fast_lane_active_batches.add(batch_hash)
+                return True
+            self._fast_lane_active_batches.clear()
+            thread = Thread(
+                target=self._run_fast_lane_terminal_receiver,
+                name="devkit-fastlane-terminal-multiplex",
+                daemon=False,
+            )
+            self._fast_lane_terminal_thread = thread
+            self._fast_lane_active_batches.add(batch_hash)
+            try:
+                thread.start()
+            except Exception:
+                self._fast_lane_terminal_thread = None
+                self._fast_lane_active_batches.discard(batch_hash)
+                self._fast_lane_refill_callbacks.pop(batch_hash, None)
+                raise
+        return True
+
+    def _run_fast_lane_terminal_receiver(self) -> None:
+        bridge = self._bridge
+        if bridge is None:
+            self._freeze()
+            return
+        try:
+            while not self._fast_lane_terminal_stop.is_set():
+                with self._compiler_evidence_lock:
+                    pending = {
+                        key: dict(value.expected)
+                        for key, value in self._pending_fast_lane_terminals.items()
+                    }
+                    expires_at_by_assignment = {
+                        key: value.lease_expires_at
+                        for key, value in self._pending_fast_lane_terminals.items()
+                    }
+                if not pending:
+                    return
+                now = int(self._read_trusted_clock())
+                correlation_id, terminal = (
+                    bridge.receive_next_fast_lane_worker_terminal_result(
+                        expected_by_assignment=pending,
+                        expires_at_by_assignment=expires_at_by_assignment,
+                        now=now,
+                    )
+                )
+                batch_hash = cast(str, terminal["batch_hash"])
+                task_id = cast(str, terminal["task_id"])
+                event_seq = cast(int, terminal["event_seq"])
+                receipt_hash = cast(str, terminal["terminal_receipt_hash"])
+                remaining = sorted(
+                    key[1]
+                    for key in pending
+                    if key[0] == batch_hash and key != (batch_hash, task_id)
+                )
+                descriptor: dict[str, object] = {
+                    "schema": "team-efficiency/fast-lane-refill-trigger-v1",
+                    "trigger": "slot_terminal_event",
+                    "dispatch_at": "next_host_dispatch_boundary",
+                    "polling": False,
+                    "batch_hash": batch_hash,
+                    "task_id": task_id,
+                    "terminal_receipt_hash": receipt_hash,
+                    "accepted_event_seq": event_seq,
+                    "remaining_task_ids": remaining,
+                }
+                refill_trigger_hash = _hash(descriptor)
+                bridge.send_fast_lane_worker_terminal_ack(
+                    terminal_result=terminal,
+                    correlation_id=correlation_id,
+                    accepted_event_seq=event_seq,
+                    refill_trigger_hash=refill_trigger_hash,
+                )
+                with self._compiler_evidence_lock:
+                    self._pending_fast_lane_terminals.pop((batch_hash, task_id), None)
+                    refill_callback = self._fast_lane_refill_callbacks.get(batch_hash)
+                if refill_callback is not None:
+                    result = refill_callback(
+                        {**descriptor, "refill_trigger_hash": refill_trigger_hash}
+                    )
+                    with self._compiler_evidence_lock:
+                        self._fast_lane_refill_receipts[receipt_hash] = result
+        except Exception:
+            if not self._closed:
+                self._freeze()
+        finally:
+            with self._compiler_evidence_lock:
+                current = self._fast_lane_terminal_thread
+                if current is current_thread():
+                    self._fast_lane_terminal_thread = None
+                    self._fast_lane_active_batches.clear()
+                    if not self._pending_fast_lane_terminals:
+                        self._fast_lane_refill_callbacks.clear()
 
     def resolve_scheduler_topology(
         self, topology: object
@@ -960,6 +1664,7 @@ class HostSession:
         with self._compiler_evidence_lock:
             self._frozen = True
             self._compiler_evidence.clear()
+            self._compiler_request_contexts.clear()
         if self._bridge is not None:
             self._bridge.close()
 
@@ -1022,6 +1727,15 @@ def _strict_hash_tuple(value: object) -> bool:
     )
 
 
+def _optional_ordered_hash_tuple(value: object) -> bool:
+    return (
+        type(value) is tuple
+        and len(value) <= 16
+        and all(_is_hash(item) for item in value)
+        and len(set(value)) == len(value)
+    )
+
+
 def _normalized_compiler_invocation_binding(
     value: object,
 ) -> _CompilerInvocationBinding:
@@ -1032,6 +1746,18 @@ def _normalized_compiler_invocation_binding(
         or value.reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
         or not _strict_hash_tuple(value.verified_route_result_hashes)
         or not _strict_hash_tuple(value.verified_lease_scope_bindings)
+        or type(value.dispatch_facts) is not tuple
+        or len(value.dispatch_facts) > 16
+        or not _optional_ordered_hash_tuple(value.dispatch_binding_hashes)
+        or len(value.dispatch_facts) != len(value.dispatch_binding_hashes)
+        or (
+            value.registry_binding_hash is not None
+            and not _is_hash(value.registry_binding_hash)
+        )
+        or (
+            value.evidence_expires_at is not None
+            and type(value.evidence_expires_at) is not int
+        )
     ):
         raise ValueError("compiler invocation binding is invalid")
     return _CompilerInvocationBinding(
@@ -1039,6 +1765,10 @@ def _normalized_compiler_invocation_binding(
         reasoning_effort=value.reasoning_effort,
         verified_route_result_hashes=value.verified_route_result_hashes,
         verified_lease_scope_bindings=value.verified_lease_scope_bindings,
+        dispatch_facts=value.dispatch_facts,
+        dispatch_binding_hashes=value.dispatch_binding_hashes,
+        registry_binding_hash=value.registry_binding_hash,
+        evidence_expires_at=value.evidence_expires_at,
     )
 
 
@@ -1052,9 +1782,12 @@ def _compiler_invocation_state(value: _CompilerInvocation) -> tuple[object, ...]
         value.reasoning_effort,
         value.verified_route_result_hashes,
         value.verified_lease_scope_bindings,
+        value.dispatch_facts,
+        value.dispatch_binding_hashes,
         value.issued_at,
         value.expires_at,
         value.binding_hash,
+        value.registry_binding_hash,
     )
 
 

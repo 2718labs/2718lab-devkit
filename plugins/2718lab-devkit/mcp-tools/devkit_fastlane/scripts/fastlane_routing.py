@@ -2410,7 +2410,7 @@ def _validate_policy_v5(policy: object) -> dict[str, Any]:
         "maximum_cache_entries": 128,
         "maximum_gate_reason_codes": 16,
         "maximum_host_models": 8,
-        "maximum_total_slots": 8,
+        "maximum_total_slots": 9,
         "maximum_scope_items": 8,
         "maximum_dependency_items": 32,
     }

@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Final, Literal, cast
 
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
@@ -210,7 +211,7 @@ class HostExecutionExpectationProjection:
     source_plan_hash: str
     workflow_hash: str
     assignment_id: str
-    assignment_token: str
+    assignment_token: str = dataclass_field(repr=False)
     predecessor_hash: str
     task_id: str
     role: str
@@ -251,7 +252,7 @@ class ParsedHostExecutionIntent:
     source_plan_hash: str
     workflow_hash: str
     assignment_id: str
-    assignment_token: str
+    assignment_token: str = dataclass_field(repr=False)
     assignment_binding_hash: str
     predecessor_hash: str
     task_id: str

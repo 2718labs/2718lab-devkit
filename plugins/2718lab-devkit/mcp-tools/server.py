@@ -3,34 +3,32 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
+import json
+import os
+import secrets
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from devkit_fastlane import compile_fast_lane
-from devkit_relay.compiler import compile_plan
-from devkit_relay.service import RelayService
-from devkit_runtime.bootstrap import RuntimeBootstrap
-from devkit_runtime.composition import RuntimeRoot
-from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
-from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
-from devkit_runtime.tool_result import (
-    TOOL_ANNOTATIONS,
-    ResultContractError,
-    envelope_failure,
-    envelope_success,
-    result_from_exception,
-)
-from devkit_runtime.uow import RuntimeUnitOfWork
-from project_index.checkpoints import WorkspaceOwnership
-from project_index.models import IndexState, IndexStatusResult, IndexSyncResult
+from devkit_runtime.tool_metadata import TOOL_ANNOTATIONS
+
+if TYPE_CHECKING:
+    from devkit_relay.service import RelayService
+    from devkit_runtime.composition import RuntimeRoot
+    from devkit_runtime.config import RuntimeConfigError
+    from devkit_runtime.relay_runtime import RelayRuntime, RelayRuntimeError
+    from devkit_runtime.uow import RuntimeUnitOfWork
+    from project_index.checkpoints import WorkspaceOwnership
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 mcp = FastMCP(name="2718lab-devkit")
+_FASTLANE_HOST_SESSION: object | None = None
 
 
 class _StrictModel(BaseModel):
@@ -215,6 +213,10 @@ def _tool_annotations(name: str) -> ToolAnnotations:
 def _default_runtime_root() -> RuntimeRoot:
     """Bootstrap durable local stores before exposing the default process root."""
 
+    from devkit_runtime.bootstrap import RuntimeBootstrap
+    from devkit_runtime.composition import RuntimeRoot
+    from devkit_runtime.config import RuntimeConfig
+
     config = RuntimeConfig.load(protected_roots=(PLUGIN_ROOT,))
     required_databases = (
         config.orchestrator_database,
@@ -239,6 +241,8 @@ def _runtime_root() -> RuntimeRoot:
 def _install_runtime_root_for_host(root: RuntimeRoot) -> None:
     """Private embedding seam for a host-injected broker or proof resolver."""
 
+    from devkit_runtime.composition import RuntimeRoot
+
     if not isinstance(root, RuntimeRoot):
         raise TypeError("root must be a RuntimeRoot")
     global _RUNTIME_ROOT
@@ -259,18 +263,165 @@ def _shutdown_runtime() -> None:
     root = _RUNTIME_ROOT
     if root is not None:
         root.shutdown()
+    session = _FASTLANE_HOST_SESSION
+    close = getattr(session, "close", None)
+    if callable(close):
+        close()
 
 
 atexit.register(_shutdown_runtime)
 
 
 def _failure(code: str) -> dict[str, object]:
+    from devkit_runtime.tool_result import envelope_failure
+
     return envelope_failure(code)
+
+
+def _host_session() -> object:
+    global _FASTLANE_HOST_SESSION
+    if _FASTLANE_HOST_SESSION is None:
+        from devkit_runtime.host_session import HostSession
+
+        _FASTLANE_HOST_SESSION = HostSession.from_environment(
+            environ=None, platform=os.name, clock=time.time
+        )
+    return _FASTLANE_HOST_SESSION
+
+
+def _project_index_attestation(
+    uow: RuntimeUnitOfWork,
+    operation: str,
+    *,
+    workspace_id: str,
+    snapshot_id: str | None = None,
+    trace_id: str | None = None,
+) -> dict[str, object] | None:
+    """Send only persisted, path-free Project Index evidence to a live Host."""
+
+    from devkit_runtime.host_bridge import build_project_index_attestation
+    from devkit_runtime.host_session import HostSession
+
+    correlation_id = _current_index_correlation()
+    if correlation_id is None:
+        return None
+    session = _host_session()
+    if type(session) is not HostSession or not session.is_available:
+        return None
+    material = uow.project_checkpoint.project_index.host_attestation_material(
+        workspace_id,
+        snapshot_id=snapshot_id,
+        trace_id=trace_id,
+    )
+    now = int(time.time())
+    attestation = build_project_index_attestation(
+        operation=operation,
+        correlation_id=correlation_id,
+        material=material,
+        now=now,
+    )
+    sent = session.send_project_index_attestation(attestation)
+    if sent is None:
+        return None
+    return {
+        key: value
+        for key, value in sent.items()
+        if key
+        in {
+            "correlation_id",
+            "workspace_id",
+            "workspace_binding_hash",
+            "root_identity_hash",
+            "snapshot_id",
+            "snapshot_attestation_hash",
+            "query_receipt_hash",
+            "index_context_hash",
+            "attestation_hash",
+            "expires_at",
+        }
+    }
+
+
+def _current_index_correlation() -> str | None:
+    """Read the Host reservation from MCP `_meta`, never from public arguments."""
+
+    try:
+        meta = mcp.get_context().request_context.meta
+    except (LookupError, ValueError):
+        return None
+    if meta is None or type(meta.model_extra) is not dict:
+        return None
+    value = meta.model_extra.get("2718lab/host-index-correlation")
+    if (
+        type(value) is not str
+        or len(value) != 70
+        or not value.startswith("index-")
+        or any(character not in "0123456789abcdef" for character in value[6:])
+    ):
+        return None
+    return value
+
+
+def _current_fastlane_intent_hash() -> str | None:
+    """Read the Host call intent from current MCP metadata only."""
+
+    try:
+        meta = mcp.get_context().request_context.meta
+    except (LookupError, ValueError):
+        return None
+    if meta is None or type(meta.model_extra) is not dict:
+        return None
+    value = meta.model_extra.get("2718lab/host-fastlane-intent-hash")
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return None
+    return value
+
+
+def _current_fastlane_index_query_correlation() -> str | None:
+    """Read the Host-selected Fast Lane query receipt from reserved metadata."""
+
+    try:
+        meta = mcp.get_context().request_context.meta
+    except (LookupError, ValueError):
+        return None
+    if meta is None or type(meta.model_extra) is not dict:
+        return None
+    value = meta.model_extra.get("2718lab/host-fastlane-index-query-correlation")
+    if (
+        type(value) is not str
+        or len(value) != 70
+        or not value.startswith("index-")
+        or any(character not in "0123456789abcdef" for character in value[6:])
+    ):
+        return None
+    return value
+
+
+def _sync_result_snapshot_id(value: object) -> str:
+    from project_index.models import IndexSyncResult
+
+    if type(value) is not IndexSyncResult:
+        raise TypeError("invalid sync result")
+    return value.snapshot.snapshot_id
+
+
+def _query_result_trace_id(value: object) -> str:
+    from project_index.models import QueryResult
+
+    if type(value) is not QueryResult:
+        raise TypeError("invalid query result")
+    return value.trace_id
 
 
 def _runtime_failure(
     error: RuntimeConfigError | RelayRuntimeError,
 ) -> dict[str, object]:
+    from devkit_runtime.config import RuntimeConfigError
+
     if isinstance(error, RuntimeConfigError):
         if error.code in {
             "DATA_ROOT_INVALID",
@@ -293,19 +444,37 @@ def _invoke(
     read_only: bool,
     invalid_code: str = "INVALID_REQUEST",
     operation: Callable[[RuntimeUnitOfWork], object],
+    private_success: Callable[[RuntimeUnitOfWork, object], dict[str, object] | None]
+    | None = None,
 ) -> dict[str, object]:
     """Run one operation inside a fresh UoW and project its exact result."""
 
     try:
         with _runtime_root().open_uow(read_only=read_only) as uow:
-            return uow.tool_results.project(tool_name, operation(uow))
+            value = operation(uow)
+            projected = uow.tool_results.project(tool_name, value)
+            if private_success is not None:
+                attestation = private_success(uow, value)
+                if attestation is not None:
+                    data = projected.get("data")
+                    if type(data) is not dict:
+                        raise TypeError("successful result has no data")
+                    data["index_attestation"] = attestation
+            return projected
     except _RequestError as error:
         return _failure(error.code)
-    except (RuntimeConfigError, RelayRuntimeError) as error:
-        return _runtime_failure(error)
-    except ResultContractError:
-        return _failure("INTERNAL_ERROR")
     except Exception as error:
+        from devkit_runtime.config import RuntimeConfigError
+        from devkit_runtime.relay_runtime import RelayRuntimeError
+        from devkit_runtime.tool_result import (
+            ResultContractError,
+            result_from_exception,
+        )
+
+        if isinstance(error, (RuntimeConfigError, RelayRuntimeError)):
+            return _runtime_failure(error)
+        if isinstance(error, ResultContractError):
+            return _failure("INTERNAL_ERROR")
         return result_from_exception(error, invalid_code=invalid_code)
 
 
@@ -430,6 +599,8 @@ def _require_lease_authority() -> _TaskLeaseAuthority:
 def _workspace_ownership(
     task_lease: TaskLeaseRef, *, workspace_id: str
 ) -> WorkspaceOwnership:
+    from project_index.checkpoints import WorkspaceOwnership
+
     ownership = _require_lease_authority().ownership_for(
         task_lease, workspace_id=workspace_id
     )
@@ -446,6 +617,8 @@ def _workspace_ownership(
 
 
 def _relay_runtime(uow: RuntimeUnitOfWork) -> RelayRuntime:
+    from devkit_runtime.relay_runtime import RelayRuntime
+
     relay = uow.relay
     if not isinstance(relay, RelayRuntime):
         raise _RequestError("RELAY_REQUEST_INVALID")
@@ -454,6 +627,8 @@ def _relay_runtime(uow: RuntimeUnitOfWork) -> RelayRuntime:
 
 def _relay_service(runtime: RelayRuntime) -> RelayService:
     """Use the lifecycle service already owned by the typed Relay runtime."""
+
+    from devkit_relay.service import RelayService
 
     service = runtime._relay_service
     if not isinstance(service, RelayService):
@@ -470,6 +645,9 @@ def project_index_register(workspace_root: str) -> dict[str, object]:
         read_only=False,
         operation=lambda uow: (
             uow.project_checkpoint.project_index.project_index_register(workspace_root)
+        ),
+        private_success=lambda uow, value: _project_index_attestation(
+            uow, "register", workspace_id=str(value)
         ),
     )
 
@@ -498,6 +676,8 @@ def project_index_sync(
         return _failure(error.code)
 
     def operation(uow: RuntimeUnitOfWork) -> object:
+        from project_index.models import IndexSyncResult
+
         authority = _require_lease_authority() if lease is not None else None
         snapshot = uow.project_checkpoint.project_index.sync(
             workspace_id, include_paths
@@ -522,7 +702,17 @@ def project_index_sync(
             )
         return result
 
-    return _invoke("project_index_sync", read_only=False, operation=operation)
+    return _invoke(
+        "project_index_sync",
+        read_only=False,
+        operation=operation,
+        private_success=lambda uow, value: _project_index_attestation(
+            uow,
+            "sync",
+            workspace_id=workspace_id,
+            snapshot_id=_sync_result_snapshot_id(value),
+        ),
+    )
 
 
 @mcp.tool(annotations=_tool_annotations("project_index_status"))
@@ -547,6 +737,8 @@ def project_index_status(
         return _failure(error.code)
 
     def operation(uow: RuntimeUnitOfWork) -> object:
+        from project_index.models import IndexState, IndexStatusResult
+
         status = uow.project_checkpoint.project_index.status(
             workspace_id,
             snapshot_id,
@@ -622,7 +814,18 @@ def project_index_query(
             )
         return result
 
-    return _invoke("project_index_query", read_only=False, operation=operation)
+    return _invoke(
+        "project_index_query",
+        read_only=False,
+        operation=operation,
+        private_success=lambda uow, value: _project_index_attestation(
+            uow,
+            "query",
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            trace_id=_query_result_trace_id(value),
+        ),
+    )
 
 
 @mcp.tool(annotations=_tool_annotations("worktree_checkpoint_create"))
@@ -788,6 +991,8 @@ def atlas_accept(
 def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
     """Compile a locked Relay request using only verified read snapshots."""
 
+    from devkit_relay.compiler import compile_plan
+
     try:
         payload = _relay_compile_request(request)
     except _RequestError as error:
@@ -804,8 +1009,8 @@ def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
 def fastlane_compile(
     request: dict[str, object],
     reasoning_effort: Literal[
-        "low", "medium", "high", "xhigh", "max", "ultra"
-    ] = "ultra",
+        "low", "medium", "high", "xhigh", "max"
+    ],
     enable: bool = False,
 ) -> dict[str, object]:
     """Compile inert Fast Lane descriptors without receiving host-private evidence.
@@ -817,6 +1022,23 @@ def fastlane_compile(
 
     if type(request) is not dict or type(enable) is not bool:
         return _failure("FASTLANE_REQUEST_INVALID")
+    session = _host_session()
+    intent_hash = _current_fastlane_intent_hash()
+    index_query_correlation = _current_fastlane_index_query_correlation()
+    from devkit_runtime.host_session import HostSession
+
+    if type(session) is HostSession and session.is_available:
+        if intent_hash is None or index_query_correlation is None or not enable:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        return _fastlane_authenticated_dispatch(
+            request,
+            reasoning_effort,
+            call_intent_hash=intent_hash,
+            index_query_correlation=index_query_correlation,
+        )
+    from devkit_fastlane import compile_fast_lane
+    from devkit_runtime.tool_result import ResultContractError, envelope_success
+
     try:
         plan = compile_fast_lane(
             request,
@@ -828,6 +1050,266 @@ def fastlane_compile(
         return _failure("INTERNAL_ERROR")
     except (TypeError, ValueError):
         return _failure("FASTLANE_REQUEST_INVALID")
+
+
+def _fastlane_authenticated_dispatch(
+    request: dict[str, object],
+    reasoning_effort: str,
+    *,
+    call_intent_hash: str,
+    index_query_correlation: str,
+) -> dict[str, object]:
+    """Use no request-carried authority; the inherited bridge is the only gate."""
+
+    from devkit_runtime.fastlane_host_adapter import (
+        NO_SAFE_WORK,
+        dispatch_fast_lane_with_host_facts,
+        prepare_verified_host_facts,
+    )
+    from devkit_runtime.host_bridge import (
+        FastLaneRefillRegistryRequest,
+        OperationReceipt,
+    )
+    from devkit_runtime.host_session import HostRoute, HostSession
+    from devkit_runtime.tool_result import ResultContractError, envelope_success
+
+    try:
+        if reasoning_effort == "ultra":
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        session = _host_session()
+        if (
+            type(session) is not HostSession
+            or not session.is_available
+        ):
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        index_attestation = session.project_index_query_attestation(
+            correlation_id=index_query_correlation
+        )
+        if index_attestation is None:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        project_binding = request.get("project_binding")
+        work_package = request.get("work_package")
+        if (
+            type(project_binding) is not dict
+            or type(work_package) is not dict
+            or project_binding.get("workspace_id")
+            != index_attestation.get("workspace_id")
+            or work_package.get("input_snapshot_id")
+            != index_attestation.get("snapshot_id")
+        ):
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        preparation_id = f"compiler-{secrets.token_hex(16)}"
+        capability_snapshot = session.resolve_capability_snapshot_v2(
+            call_intent_hash=call_intent_hash,
+            preparation_id=preparation_id,
+            expires_at_ceiling=cast(int, index_attestation["expires_at"]),
+        )
+        if capability_snapshot is None:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        from devkit_fastlane.scripts.team_efficiency import (
+            compile_authenticated_v5_assignment_skeletons,
+            prepare_authenticated_v5_routing_from_request,
+            validate_authenticated_v5_skeleton_package,
+        )
+
+        projected = prepare_authenticated_v5_routing_from_request(
+            request,
+            index_context_hash=index_attestation["index_context_hash"],
+            host_capabilities=capability_snapshot.host_capabilities,
+            scheduler_facts=capability_snapshot.scheduler_facts,
+        )
+        routing_snapshot = session.resolve_routing_attestations(
+            call_intent_hash=call_intent_hash,
+            preparation_id=preparation_id,
+            routing_requests=projected["all_routing_requests"],
+        )
+        if routing_snapshot is None:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        initial_units = projected["units"]
+        remaining_units = projected["remaining_units"]
+        initial_task_ids = {
+            unit["task"]["task_id"] for unit in initial_units
+        }
+        initial_requests = [
+            item
+            for item in routing_snapshot.routing_requests
+            if item["task"]["task_id"] in initial_task_ids
+        ]
+        initial_attestations = [
+            item
+            for item in routing_snapshot.attestations
+            if item["task_id"] in initial_task_ids
+        ]
+        if len(initial_requests) != len(initial_units) or len(
+            initial_attestations
+        ) != len(initial_units):
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        compiled = compile_authenticated_v5_assignment_skeletons(
+            initial_units,
+            source_plan_hash=projected["source_plan_hash"],
+            routing_requests=initial_requests,
+            attestation_items=initial_attestations,
+        )
+        compiled_remaining = (
+            compile_authenticated_v5_assignment_skeletons(
+                remaining_units,
+                source_plan_hash=projected["source_plan_hash"],
+                routing_requests=[
+                    item
+                    for item in routing_snapshot.routing_requests
+                    if item["task"]["task_id"]
+                    not in initial_task_ids
+                ],
+                attestation_items=[
+                    item
+                    for item in routing_snapshot.attestations
+                    if item["task_id"] not in initial_task_ids
+                ],
+            )
+            if remaining_units
+            else {"assignment_skeletons": [], "requested_route_pairs": []}
+        )
+        attestation_ref_fields = (
+            "correlation_id",
+            "workspace_id",
+            "workspace_binding_hash",
+            "root_identity_hash",
+            "snapshot_id",
+            "snapshot_attestation_hash",
+            "query_receipt_hash",
+            "index_context_hash",
+            "attestation_hash",
+        )
+        skeletons = compiled["assignment_skeletons"]
+        skeleton_package_hash = validate_authenticated_v5_skeleton_package(
+            projected["all_units"],
+            skeletons,
+            compiled_remaining["assignment_skeletons"],
+            source_plan_hash=projected["source_plan_hash"],
+        )
+        index_refs = [
+            {
+                "task_id": skeleton["task_id"],
+                **{field: index_attestation[field] for field in attestation_ref_fields},
+            }
+            for skeleton in skeletons
+        ]
+        planner_request = {
+            "schema": "2718lab-devkit/fastlane-host-planner-request-v1",
+            "action": "plan_dispatch",
+            "assignment_skeletons": skeletons,
+            "project_index_attestation_refs": index_refs,
+        }
+        requested_route_pairs: set[tuple[str, str]] = set()
+        for item in routing_snapshot.attestations:
+            route = cast(dict[str, object], item["route"])
+            model = route.get("model")
+            effort = route.get("effort")
+            if type(model) is not str or type(effort) is not str:
+                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+            requested_route_pairs.add((model, effort))
+        requested_routes = tuple(
+            HostRoute(model=model, effort=effort)
+            for model, effort in sorted(requested_route_pairs)
+        )
+        prepared = prepare_verified_host_facts(
+            session,
+            preparation_id=preparation_id,
+            call_intent_hash=call_intent_hash,
+            routing_registry_binding_hash=(
+                routing_snapshot.routing_registry_binding_hash
+            ),
+            request=planner_request,
+            reasoning_effort=reasoning_effort,
+            requested_routes=requested_routes,
+        )
+        if prepared == NO_SAFE_WORK:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        now = int(time.time())
+        correlation_id = f"operation-{secrets.randbelow(999_999_999_999) + 1}"
+
+        queue_registry = None
+        if remaining_units:
+            queue_registry = session.send_fast_lane_refill_registry(
+                call_intent_hash=call_intent_hash,
+                preparation_id=preparation_id,
+                source_plan_hash=projected["source_plan_hash"],
+                index_context_hash=index_attestation["index_context_hash"],
+                routing_registry_binding_hash=(
+                    routing_snapshot.routing_registry_binding_hash
+                ),
+                source_plan_task_ids=[
+                    unit["task"]["task_id"] for unit in projected["all_units"]
+                ],
+                initial_skeletons=skeletons,
+                remaining_skeletons=compiled_remaining["assignment_skeletons"],
+                index_attestation_refs=[
+                    {
+                        "task_id": skeleton["task_id"],
+                        **{
+                            field: index_attestation[field]
+                            for field in attestation_ref_fields
+                        },
+                    }
+                    for skeleton in compiled_remaining["assignment_skeletons"]
+                ],
+                skeleton_package_hash=skeleton_package_hash,
+                now=now,
+            )
+            if type(queue_registry) is not FastLaneRefillRegistryRequest:
+                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+
+        def refill_callback(trigger: Mapping[str, object]) -> dict[str, object]:
+            """Record the real next-boundary result for this fully dispatched plan."""
+
+            request_hash = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    request,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            queued_ids = [
+                skeleton["task_id"]
+                for skeleton in compiled_remaining["assignment_skeletons"]
+            ]
+            return {
+                "schema": "2718lab-devkit/fastlane-refill-receipt-v1",
+                "state": (
+                    "QUEUED_WAVE_PENDING" if queued_ids else "NO_QUEUED_WORK"
+                ),
+                "request_hash": request_hash,
+                "refill_trigger_hash": trigger["refill_trigger_hash"],
+                "queue_registry_hash": (
+                    queue_registry.queue_registry_hash if queue_registry else None
+                ),
+                "queued_task_ids": queued_ids,
+            }
+
+        receipt = dispatch_fast_lane_with_host_facts(
+            planner_request,
+            reasoning_effort=reasoning_effort,
+            verified_host_facts=prepared,
+            correlation_id=correlation_id,
+            now=now,
+            refill_callback=refill_callback,
+        )
+        if type(receipt) is not OperationReceipt:
+            return _failure("FASTLANE_HOST_DISPATCH_REJECTED")
+        return envelope_success(
+            {
+                "state": "DISPATCH_COMMITTED",
+                "task_id": receipt.task_id,
+                "correlation_id": receipt.correlation_id,
+                "dispatch_envelope_hash": receipt.envelope_hash,
+            }
+        )
+    except ResultContractError:
+        return _failure("INTERNAL_ERROR")
+    except Exception:
+        return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
 
 
 def _fastlane_public_value(value: object) -> object:

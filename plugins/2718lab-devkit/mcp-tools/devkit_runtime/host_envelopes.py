@@ -11,13 +11,14 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final, NoReturn
 
 HOST_ENVELOPE_SCHEMA: Final = "2718lab-devkit/host-envelope-v1"
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TASK_ID = re.compile(r"task-[1-9][0-9]{0,11}\Z")
+_FAST_LANE_TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z")
 _CORRELATION_ID_BY_KIND: Final = {
     "coordinator_assignment": re.compile(r"operation-[1-9][0-9]{0,11}\Z"),
     "worker_terminal_result": re.compile(r"operation-[1-9][0-9]{0,11}\Z"),
@@ -26,6 +27,7 @@ _CORRELATION_ID_BY_KIND: Final = {
 _RISK_CODES: Final = frozenset({"none", "bounded", "unverified"})
 _ROLE_BY_KIND: Final = {
     "coordinator_assignment": ("coordinator", "worker"),
+    "fast_lane_dispatch_batch": ("coordinator", "worker"),
     "worker_terminal_result": ("worker", "coordinator"),
     "peer_evidence_handoff": ("peer", "peer"),
 }
@@ -46,6 +48,7 @@ _ENVELOPE_FIELDS: Final = frozenset(
 )
 _MAX_BYTES_BY_KIND: Final = {
     "coordinator_assignment": 32 * 1024,
+    "fast_lane_dispatch_batch": 64 * 1024,
     "worker_terminal_result": 24 * 1024,
     "peer_evidence_handoff": 16 * 1024,
 }
@@ -85,7 +88,7 @@ class EnvelopeBinding:
 
     task_id: str
     lease_epoch: int
-    assignment_token: str
+    assignment_token: str = field(repr=False)
     dispatch_context_hash: str
     route_hash: str
     expires_at: int
@@ -111,7 +114,11 @@ def render_envelope(
     """Render one canonical, role-fixed envelope without performing I/O."""
 
     roles = _roles_for_kind(kind)
-    normalized_binding = _validate_binding(binding, now=now)
+    normalized_binding = _validate_binding(
+        binding,
+        now=now,
+        allow_fast_lane=kind == "fast_lane_dispatch_batch",
+    )
     normalized_payload = _validate_payload(kind, payload)
     envelope = {
         "schema": HOST_ENVELOPE_SCHEMA,
@@ -121,8 +128,38 @@ def render_envelope(
         **normalized_binding,
         "payload": normalized_payload,
     }
+    if kind == "fast_lane_dispatch_batch":
+        _validate_fast_lane_outer_binding(envelope)
     _validate_size(kind, envelope)
     return envelope
+
+
+def build_fast_lane_dispatch_envelope(
+    *,
+    batch: Mapping[str, object],
+    binding: EnvelopeBinding,
+    correlation_id: str,
+    now: int,
+) -> dict[str, object]:
+    """Build the only envelope allowed to carry a compiler-authorized batch."""
+
+    return render_envelope(
+        kind="fast_lane_dispatch_batch",
+        binding=binding,
+        payload={"correlation_id": correlation_id, "batch": batch},
+        now=now,
+    )
+
+
+def validate_fast_lane_dispatch_envelope(
+    envelope: Mapping[str, object], *, now: int
+) -> dict[str, object]:
+    """Validate a complete dispatch batch and its first-assignment outer fence."""
+
+    normalized = validate_envelope(envelope, now=now)
+    if normalized["kind"] != "fast_lane_dispatch_batch":
+        _invalid()
+    return normalized
 
 
 def validate_envelope(
@@ -152,7 +189,11 @@ def validate_envelope(
         route_hash=_required_str(envelope, "route_hash"),
         expires_at=_required_int(envelope, "expires_at"),
     )
-    normalized_binding = _validate_binding(binding, now=now)
+    normalized_binding = _validate_binding(
+        binding,
+        now=now,
+        allow_fast_lane=kind == "fast_lane_dispatch_batch",
+    )
     normalized_payload = _validate_payload(kind, envelope["payload"])
     normalized = {
         "schema": HOST_ENVELOPE_SCHEMA,
@@ -162,6 +203,8 @@ def validate_envelope(
         **normalized_binding,
         "payload": normalized_payload,
     }
+    if kind == "fast_lane_dispatch_batch":
+        _validate_fast_lane_outer_binding(normalized)
     _validate_size(kind, normalized)
     if expected is not None:
         _validate_expectation(normalized, expected, now=now)
@@ -192,14 +235,16 @@ def envelope_hash(
     ).hexdigest()
 
 
-def binding_mapping(binding: EnvelopeBinding, *, now: int) -> dict[str, object]:
+def binding_mapping(
+    binding: EnvelopeBinding, *, now: int, allow_fast_lane: bool = False
+) -> dict[str, object]:
     """Return the normalized binding for private bridge packet validation."""
 
-    return _validate_binding(binding, now=now)
+    return _validate_binding(binding, now=now, allow_fast_lane=allow_fast_lane)
 
 
 def validate_binding_mapping(
-    value: Mapping[str, object], *, now: int
+    value: Mapping[str, object], *, now: int, allow_fast_lane: bool = False
 ) -> EnvelopeBinding:
     """Validate exact binding data received in a private bridge packet."""
 
@@ -220,7 +265,7 @@ def validate_binding_mapping(
         route_hash=_required_str(value, "route_hash"),
         expires_at=_required_int(value, "expires_at"),
     )
-    _validate_binding(binding, now=now)
+    _validate_binding(binding, now=now, allow_fast_lane=allow_fast_lane)
     return binding
 
 
@@ -230,11 +275,16 @@ def _roles_for_kind(kind: str) -> tuple[str, str]:
     return _ROLE_BY_KIND[kind]
 
 
-def _validate_binding(binding: EnvelopeBinding, *, now: int) -> dict[str, object]:
+def _validate_binding(
+    binding: EnvelopeBinding,
+    *,
+    now: int,
+    allow_fast_lane: bool = False,
+) -> dict[str, object]:
     _validate_now(now)
     if type(binding) is not EnvelopeBinding:
         _invalid()
-    _validate_task_id(binding.task_id)
+    _validate_task_id(binding.task_id, allow_fast_lane=allow_fast_lane)
     if (
         type(binding.lease_epoch) is not int
         or binding.lease_epoch < 1
@@ -264,7 +314,11 @@ def _validate_expectation(
     if type(expectation) is not EnvelopeExpectation:
         _invalid()
     expected_roles = _roles_for_kind(expectation.kind)
-    expected_binding = _validate_binding(expectation.binding, now=now)
+    expected_binding = _validate_binding(
+        expectation.binding,
+        now=now,
+        allow_fast_lane=expectation.kind == "fast_lane_dispatch_batch",
+    )
     if (
         envelope["kind"] != expectation.kind
         or envelope["sender_role"] != expected_roles[0]
@@ -307,6 +361,14 @@ def _validate_payload(kind: str, payload: object) -> dict[str, object]:
             "artifact_refs": _required_refs(payload, "artifact_refs", _MAX_ARTIFACT_REFS),
             "digest_refs": _required_refs(payload, "digest_refs", _MAX_DIGEST_REFS),
         }
+    if kind == "fast_lane_dispatch_batch":
+        if set(payload) != {"correlation_id", "batch"}:
+            _invalid()
+        correlation_id = _required_correlation_id(
+            payload, "correlation_id", kind="coordinator_assignment"
+        )
+        batch = _validate_fast_lane_dispatch_batch(payload.get("batch"))
+        return {"correlation_id": correlation_id, "batch": batch}
     if kind == "worker_terminal_result":
         if set(payload) != {
             "correlation_id",
@@ -353,6 +415,158 @@ def _validate_payload(kind: str, payload: object) -> dict[str, object]:
             "digest_refs": _required_refs(payload, "digest_refs", _MAX_DIGEST_REFS),
         }
     _invalid()
+
+
+def _validate_fast_lane_dispatch_batch(value: object) -> dict[str, object]:
+    """Reuse the compiler's closed assignment validator, then bind every hash."""
+
+    if type(value) is not dict or set(value) != {
+        "schema",
+        "action",
+        "selection_authority",
+        "llm_choice",
+        "source_plan_hash",
+        "ledger_epoch",
+        "active_lease_set_hash",
+        "dispatch_binding_hashes",
+        "assignments",
+        "batch_hash",
+    }:
+        _invalid()
+    if (
+        value.get("schema")
+        != "2718lab-devkit/fastlane-host-dispatch-batch-v1"
+        or value.get("action") != "dispatch_all"
+        or value.get("selection_authority") != "host_attested_compiler"
+        or value.get("llm_choice") is not False
+    ):
+        _invalid()
+    assignments = value.get("assignments")
+    if type(assignments) is not list or not assignments or len(assignments) > 16:
+        _invalid()
+    # Lazy import avoids making the pure envelope module part of adapter startup.
+    from .fastlane_host_adapter import _dispatch_request
+
+    try:
+        request = _dispatch_request(
+            {
+                "schema": "2718lab-devkit/fastlane-host-dispatch-request-v1",
+                "action": "dispatch_all",
+                "assignments": assignments,
+            }
+        )
+        normalized_assignments = request["assignments"]
+        assert type(normalized_assignments) is list
+        # Reconstructing trusted facts is intentionally not possible here.  The
+        # request validator still closes every scalar/path field; the following
+        # checks close all batch-level hashes and fences independently.
+        if normalized_assignments != assignments:
+            _invalid()
+        task_ids = [assignment["task_id"] for assignment in assignments]
+        if any(
+            type(task_id) is not str or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+            for task_id in task_ids
+        ) or len(set(task_ids)) != len(task_ids):
+            _invalid()
+        source_plan_hash = value.get("source_plan_hash")
+        active_lease_set_hash = value.get("active_lease_set_hash")
+        ledger_epoch = value.get("ledger_epoch")
+        _validate_digest(source_plan_hash)
+        _validate_digest(active_lease_set_hash)
+        if type(ledger_epoch) is not int or not 0 < ledger_epoch <= 2**63 - 1:
+            _invalid()
+        if any(
+            assignment["source_plan_hash"] != source_plan_hash
+            or assignment["ledger_epoch"] != ledger_epoch
+            or assignment["active_lease_set_hash"] != active_lease_set_hash
+            for assignment in assignments
+        ):
+            _invalid()
+        dispatch_hashes = value.get("dispatch_binding_hashes")
+        expected_hashes = [
+            assignment["dispatch_binding_hash"] for assignment in assignments
+        ]
+        if dispatch_hashes != expected_hashes:
+            _invalid()
+        for assignment in assignments:
+            unsigned = dict(assignment)
+            received = unsigned.pop("dispatch_binding_hash")
+            if received != _digest_mapping(unsigned):
+                _invalid()
+        _validate_dispatch_assignment_fences(assignments)
+        unsigned_batch = dict(value)
+        received_batch_hash = unsigned_batch.pop("batch_hash")
+        if received_batch_hash != _digest_mapping(unsigned_batch):
+            _invalid()
+    except HostEnvelopeError:
+        raise
+    except Exception:
+        _invalid()
+    return dict(value)
+
+
+def _validate_dispatch_assignment_fences(
+    assignments: list[dict[str, object]],
+) -> None:
+    serial_orders: set[int] = set()
+    for assignment in assignments:
+        mode = assignment["concurrency_mode"]
+        order = assignment["dispatch_order"]
+        if mode == "serial":
+            assert type(order) is int
+            if order in serial_orders:
+                _invalid()
+            serial_orders.add(order)
+    for index, left in enumerate(assignments):
+        for right in assignments[index + 1 :]:
+            if not _scopes_overlap(left["write_scope"], right["write_scope"]):
+                continue
+            if left["concurrency_mode"] == right["concurrency_mode"] == "serial":
+                continue
+            if (
+                left["concurrency_mode"]
+                == right["concurrency_mode"]
+                == "isolated_worktree"
+                and left["worktree_identity"] != right["worktree_identity"]
+            ):
+                continue
+            _invalid()
+
+
+def _validate_fast_lane_outer_binding(envelope: Mapping[str, object]) -> None:
+    payload = envelope["payload"]
+    assert type(payload) is dict
+    batch = payload["batch"]
+    assert type(batch) is dict
+    assignments = batch["assignments"]
+    assert type(assignments) is list and assignments
+    first = assignments[0]
+    assert type(first) is dict
+    route = first["route"]
+    assert type(route) is dict
+    if (
+        envelope["task_id"] != first["task_id"]
+        or envelope["lease_epoch"] != first["lease_epoch"]
+        or envelope["assignment_token"] != first["assignment_token"]
+        or envelope["dispatch_context_hash"] != first["dispatch_binding_hash"]
+        or envelope["route_hash"] != route["routing_result_hash"]
+    ):
+        raise HostEnvelopeError("HOST_ENVELOPE_BINDING_INVALID")
+
+
+def _scopes_overlap(left: object, right: object) -> bool:
+    assert type(left) is list and type(right) is list
+    return any(
+        left_item.casefold() == right_item.casefold()
+        or left_item.casefold().startswith(right_item.casefold() + "/")
+        or right_item.casefold().startswith(left_item.casefold() + "/")
+        for left_item in left
+        for right_item in right
+    )
+
+
+def _digest_mapping(value: Mapping[str, object]) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
 def _required_risks(payload: Mapping[str, object]) -> list[dict[str, str]]:
@@ -442,8 +656,10 @@ def _required_int(payload: Mapping[str, object], field: str) -> int:
     return value
 
 
-def _validate_task_id(value: object) -> None:
-    if type(value) is not str or _TASK_ID.fullmatch(value) is None:
+def _validate_task_id(value: object, *, allow_fast_lane: bool = False) -> None:
+    if type(value) is not str or _TASK_ID.fullmatch(value) is None and not (
+        allow_fast_lane and _FAST_LANE_TASK_ID.fullmatch(value) is not None
+    ):
         _invalid()
 
 
