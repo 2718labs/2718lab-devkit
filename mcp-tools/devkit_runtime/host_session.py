@@ -23,12 +23,16 @@ from .host_bridge import (
     HostBridgeError,
     InheritedHandleHostBridge,
     OperationReceipt,
+    StorageAdmissionReceipt,
+    _validate_storage_admission_profile,
+    build_storage_admission_request,
 )
 from .host_scheduler_topology_adapter import (
     HostAuthoritativeActionFact,
     HostSchedulerTopologyFact,
     construct_host_scheduler_topology,
 )
+from .storage_intent import StorageIntent, StorageIntentError, parse_storage_intent
 
 _NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 _HASH_PREFIX: Final = "sha256:"
@@ -268,6 +272,17 @@ class _PendingFastLaneTerminal:
     lease_expires_at: int = field(repr=False)
 
 
+@dataclass(frozen=True)
+class _CompletedStorageProfile:
+    """Local completion tied to a verified preparation and this exact bridge."""
+
+    profile: dict[str, object] = field(repr=False)
+    bridge: InheritedHandleHostBridge = field(repr=False)
+    expires_at: int
+    requested_bytes: int
+    requested_files: int
+
+
 class _CompilerPreparation:
     """A zero-field marker that a provider can only return unchanged."""
 
@@ -307,6 +322,7 @@ class HostSession:
         self._compiler_evidence_lock = RLock()
         self._compiler_evidence: dict[_CompilerEvidenceHandle, _CompilerInvocation] = {}
         self._compiler_request_contexts: dict[str, _CompilerRequestContext] = {}
+        self._completed_storage_profiles: dict[str, _CompletedStorageProfile] = {}
         self._capability_snapshots_v2: dict[
             tuple[str, str], _HostCapabilitySnapshotV2
         ] = {}
@@ -514,6 +530,7 @@ class HostSession:
             self._frozen = True
             self._compiler_evidence.clear()
             self._compiler_request_contexts.clear()
+            self._completed_storage_profiles.clear()
             self._capability_snapshots_v2.clear()
             self._preparation_expiry_caps.clear()
             self._routing_attestation_snapshots.clear()
@@ -617,6 +634,27 @@ class HostSession:
             ):
                 return _NO_SAFE_WORK
             evidence = _CompilerEvidenceHandle()
+            # Only the actual authenticated profile round trip can enroll a
+            # reference; an injected resolver/provider cannot mint authority.
+            bridge = self._bridge
+            if bridge is not None and binding_resolver == self._resolve_bridge_compiler_invocation:
+                budgets = {task: (byte_count, files) for task, byte_count, files
+                           in material.storage_budget_bindings}
+                completed_profiles: dict[str, _CompletedStorageProfile] = {}
+                for profile in material.storage_profiles:
+                    if not bridge.has_completed_storage_profile(profile):
+                        return _NO_SAFE_WORK
+                    attestation = cast(str, profile["attestation_hash"])
+                    byte_count, files = budgets[cast(str, profile["task_id"])]
+                    completed = _CompletedStorageProfile(
+                        profile=dict(profile), bridge=bridge, expires_at=int(expires_at),
+                        requested_bytes=byte_count, requested_files=files,
+                    )
+                    previous = completed_profiles.get(attestation) or self._completed_storage_profiles.get(attestation)
+                    if previous is not None and previous != completed:
+                        return _NO_SAFE_WORK
+                    completed_profiles[attestation] = completed
+                self._completed_storage_profiles.update(completed_profiles)
             self._compiler_evidence[evidence] = material
             return evidence
 
@@ -846,6 +884,63 @@ class HostSession:
         ):
             return None
         return dict(value)
+
+    def request_storage_admission(
+        self, intent: StorageIntent, *, profile_attestation_hash: str
+    ) -> StorageAdmissionReceipt | str:
+        """Ask Host before dispatch; no profile hash or local cache admits work.
+
+        Profile-v1 keeps Host generation/index deadlines opaque. Their final
+        validation belongs to Rust's completed-profile/Sent records. Locally
+        the same bridge, accepted preparation, exact profile and budgets are
+        mandatory, and the Host decision cannot extend preparation authority.
+        """
+        with self._compiler_evidence_lock:
+            bridge = self._bridge
+            if not self.is_available or bridge is None:
+                return "STORAGE_STAT_UNAVAILABLE"
+            terminal_thread = self._fast_lane_terminal_thread
+            if terminal_thread is not None and terminal_thread.is_alive():
+                return "STORAGE_STAT_UNAVAILABLE"
+            if type(profile_attestation_hash) is not str:
+                return "STORAGE_TARGET_KEY_INVALID"
+            completed = self._completed_storage_profiles.get(profile_attestation_hash)
+            if completed is None or completed.bridge is not bridge:
+                return "STORAGE_TARGET_KEY_INVALID"
+            try:
+                now = int(self._read_trusted_clock())
+                if now >= completed.expires_at or not bridge.has_completed_storage_profile(completed.profile):
+                    return "STORAGE_STAT_UNAVAILABLE"
+                if type(intent) is not StorageIntent:
+                    return "STORAGE_TARGET_KEY_INVALID"
+                parsed = parse_storage_intent(intent.to_dict())
+                _validate_storage_admission_profile(parsed, completed.profile)
+                if (parsed.requested_bytes, parsed.requested_files) != (
+                    completed.requested_bytes, completed.requested_files
+                ):
+                    return "STORAGE_LEASE_CONFLICT"
+                request = build_storage_admission_request(
+                    parsed, profile_attestation_hash=profile_attestation_hash
+                )
+                receipt = bridge.request_storage_admission(
+                    request, now=now, expires_at=completed.expires_at,
+                    clock=self._read_trusted_clock,
+                )
+                # Re-read the trusted clock after blocking I/O. A valid frame
+                # received after its deadline must not authorize a writer.
+                if int(self._read_trusted_clock()) >= receipt.expires_at:
+                    return "STORAGE_STAT_UNAVAILABLE"
+                return receipt
+            except StorageIntentError as error:
+                return error.code
+            except HostBridgeError as error:
+                if error.code in {"STORAGE_TARGET_KEY_INVALID", "STORAGE_LEASE_CONFLICT"}:
+                    return error.code
+                self._freeze()
+                return "STORAGE_STAT_UNAVAILABLE"
+            except (TypeError, ValueError):
+                self._freeze()
+                return "STORAGE_STAT_UNAVAILABLE"
 
     def storage_profiles_for_compiler_evidence(
         self, evidence: object
@@ -1895,6 +1990,7 @@ class HostSession:
             self._frozen = True
             self._compiler_evidence.clear()
             self._compiler_request_contexts.clear()
+            self._completed_storage_profiles.clear()
         if self._bridge is not None:
             self._bridge.close()
 
