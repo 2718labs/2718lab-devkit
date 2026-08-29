@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -292,6 +293,61 @@ def test_real_prepare_entry_binds_initial_successor_and_missing_facts_fail_close
                 index_context_hash=helper._sha256_json({"index": "storage-real-entry"}),
                 host_capabilities=host,
                 scheduler_facts=scheduler,
+            )
+    finally:
+        fixture.tearDown()
+        if previous_task_temp is None:
+            os.environ.pop("CODEX_TASK_TEMP", None)
+        else:
+            os.environ["CODEX_TASK_TEMP"] = previous_task_temp
+
+
+def test_attested_routing_rejects_storage_rebind_after_attestation() -> None:
+    fixture, helper, request, host, scheduler, previous_task_temp = _real_storage_request()
+    try:
+        prepared = helper.prepare_authenticated_v5_routing_from_request(
+            request,
+            index_context_hash=helper._sha256_json({"index": "storage-real-entry"}),
+            host_capabilities=host,
+            scheduler_facts=scheduler,
+        )
+        routing_request = prepared["routing_requests"][0]
+        core = sys.modules["fastlane_routing"]
+        request_binding_hash = core.v5_request_binding_hash(routing_request)
+        attestation = {
+            "schema": "2718lab-devkit/host-child-route-attestation-v1",
+            "status": "attested",
+            "request_binding_hash": request_binding_hash,
+            "host_id_hash": host["host_id_hash"],
+            "capability_epoch": 1,
+            "lease_epoch": 0,
+            "issued_event_seq": 1,
+            "expires_event_seq": 1,
+            "route": {"lane": "sol", "model": "gpt-5.6-sol", "effort": "high", "rank": 40},
+            "inherit_current_session_model": False,
+            "refusal_code": None,
+        }
+        attestation["attestation_hash"] = helper._sha256_json(attestation)
+        tampered = copy.deepcopy(prepared["units"][0])
+        budget = {"bytes": tampered["storage_budget"]["bytes"] + 1, "files": tampered["storage_budget"]["files"] + 1}
+        tampered["storage_budget"] = budget
+        intent = tampered["storage_intent"] = copy.deepcopy(tampered["storage_intent"])
+        intent.update({"requested_bytes": budget["bytes"], "requested_files": budget["files"]})
+        intent["storage_intent_hash"] = _canonical_hash(
+            {key: intent[key] for key in ("target_descriptor", "task_id", "plan_binding", "context_hash", "requested_bytes", "requested_files")}
+        )
+        with pytest.raises(ValueError, match="routing profile"):
+            helper.compile_authenticated_v5_assignment_skeletons(
+                [tampered],
+                source_plan_hash=prepared["source_plan_hash"],
+                routing_requests=[routing_request],
+                attestation_items=[
+                    {
+                        "task_id": routing_request["task"]["task_id"],
+                        "request_binding_hash": request_binding_hash,
+                        "attestation": attestation,
+                    }
+                ],
             )
     finally:
         fixture.tearDown()

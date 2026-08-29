@@ -46,6 +46,18 @@ _STORAGE_DESCRIPTOR_FIELDS = (
     "features_hash",
     "build_env_class",
 )
+_PROFILE_EVIDENCE_SCHEMA = "team-efficiency/fast-lane-v5-profile-evidence-v1"
+_PROFILE_UNIT_FIELDS = (
+    "task",
+    "dependency_state",
+    "write_scope",
+    "concurrency_mode",
+    "dispatch_order",
+    "index_context_hash",
+    "workflow_id_hash",
+    "storage_budget",
+    "storage_intent",
+)
 
 
 def _storage_context_for_task(
@@ -271,6 +283,21 @@ def _unit_storage_intent(
         source_unit=unit,
         api=api,
     )
+
+
+def _routing_profile_material(
+    source_plan_hash: str, unit: Mapping[str, Any]
+) -> dict[str, Any]:
+    task = dict(unit["task"])
+    task.pop("profile_evidence_hash", None)
+    return {
+        "schema": _PROFILE_EVIDENCE_SCHEMA,
+        "source_plan_hash": source_plan_hash,
+        "unit": {
+            field: task if field == "task" else unit[field]
+            for field in _PROFILE_UNIT_FIELDS
+        },
+    }
 
 
 def owned_scope_hash(api: Any, task_id: object, write_scope: object) -> str:
@@ -546,6 +573,18 @@ def compile_skeletons(
         attestation = attestation_by_task.get(task_id)
         if request is None or attestation is None:
             raise ValueError("authenticated V5 routing response is incomplete")
+        if request["task"] != unit["task"]:
+            raise ValueError("authenticated V5 routing profile binding is invalid")
+        profile_hash = api._sha256_json(
+            _routing_profile_material(
+                source_hash,
+                {**unit, "storage_intent": storage_intent},
+            )
+        )
+        if not hmac.compare_digest(
+            str(unit["task"].get("profile_evidence_hash")), profile_hash
+        ):
+            raise ValueError("authenticated V5 routing profile binding is invalid")
         attested_request = {**request, "child_route_attestation": attestation}
         try:
             normalized_request = core._normalise_request_v5(attested_request, policy)
