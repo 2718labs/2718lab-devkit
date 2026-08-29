@@ -19,30 +19,142 @@ _STORAGE_DESCRIPTOR_FIELDS = (
     "features_hash",
     "build_env_class",
 )
+_STORAGE_CONTEXT_FIELDS = frozenset(
+    {"execution_context_hash", *_STORAGE_DESCRIPTOR_FIELDS}
+)
+_STORAGE_REQUEST_FIELDS = frozenset({"storage_budgets", "storage_contexts"})
+_STORAGE_CONTEXT_CONTAINERS = ("storage_context", "storage_descriptor")
+
+
+def _storage_record_for_task(
+    value: object, task_id: str, field: str
+) -> Mapping[str, Any] | None:
+    """Return one explicitly keyed storage record without selecting a default."""
+
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        direct = value.get(task_id)
+        if isinstance(direct, Mapping):
+            return direct
+        if value.get("task_id") == task_id:
+            return value
+        if any(key in value for key in _STORAGE_CONTEXT_FIELDS) or field == "budget":
+            raise ValueError(_STORAGE_POLICY_MISSING)
+        return None
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        matches = [
+            item
+            for item in value
+            if isinstance(item, Mapping) and item.get("task_id") == task_id
+        ]
+        if len(matches) > 1:
+            raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+        return matches[0] if matches else None
+    raise ValueError(_STORAGE_POLICY_MISSING)
+
+
+def _storage_context_record(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Collect only explicit context facts and reject conflicting duplicates."""
+
+    records: list[Mapping[str, Any]] = []
+    direct = {key: value[key] for key in _STORAGE_CONTEXT_FIELDS if key in value}
+    if direct:
+        records.append(direct)
+    for name in _STORAGE_CONTEXT_CONTAINERS:
+        nested = value.get(name)
+        if isinstance(nested, Mapping):
+            records.append(
+                {key: nested[key] for key in _STORAGE_CONTEXT_FIELDS if key in nested}
+            )
+    if not records:
+        return None
+    merged: dict[str, Any] = {}
+    for record in records:
+        for key, item in record.items():
+            if key in merged and merged[key] != item:
+                raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+            merged[key] = item
+    return merged
+
+
+def _canonical_storage_context(value: Mapping[str, Any]) -> dict[str, Any]:
+    if set(value) != _STORAGE_CONTEXT_FIELDS:
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    return dict(value)
+
+
+def _merge_storage_contexts(
+    *records: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {}
+    for record in records:
+        if record is None:
+            continue
+        for key, item in record.items():
+            if key in merged and merged[key] != item:
+                raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+            merged[key] = item
+    return merged or None
+
+
+def _storage_context_without_facts(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    cleaned = dict(value)
+    for key in _STORAGE_CONTEXT_FIELDS:
+        cleaned.pop(key, None)
+    for name in _STORAGE_CONTEXT_CONTAINERS:
+        cleaned.pop(name, None)
+    return cleaned
+
+
+def _storage_request_without_extensions(
+    value: Mapping[str, Any], api: Any
+) -> None:
+    base = {
+        key: item for key, item in value.items() if key not in _STORAGE_REQUEST_FIELDS
+    }
+    api._exact_keys(base, api._FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+
+
+def _attach_storage_budget(
+    source_unit: Mapping[str, Any],
+    request: Mapping[str, Any],
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    result = dict(source_unit)
+    source_budget = source_unit.get("storage_budget")
+    request_record = _storage_record_for_task(
+        request.get("storage_budgets"), task_id, "budget"
+    )
+    request_budget: object = request_record
+    if isinstance(request_record, Mapping) and "storage_budget" in request_record:
+        request_budget = request_record["storage_budget"]
+    if source_budget is not None and request_budget is not None:
+        if source_budget != request_budget:
+            raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+    elif source_budget is None:
+        source_budget = request_budget
+    if source_budget is None:
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    result["storage_budget"] = source_budget
+    return result
 
 
 def _storage_context_value(
-    context: Mapping[str, Any], source_unit: Mapping[str, Any], field: str
+    context: Mapping[str, Any], field: str
 ) -> object:
     candidates: list[Mapping[str, Any]] = [context]
-    for container_name in (
-        "storage_descriptor",
-        "target_descriptor",
-        "storage_target",
-        "build_context",
-        "bootstrap_plan",
-        "storage",
-    ):
+    for container_name in _STORAGE_CONTEXT_CONTAINERS:
         container = context.get(container_name)
         if isinstance(container, Mapping):
             candidates.insert(0, container)
     for candidate in candidates:
         if field in candidate:
             return candidate[field]
-    task = source_unit.get("task")
-    if isinstance(task, Mapping) and field in task:
-        return task[field]
-    return source_unit.get(field)
+    return None
 
 
 def _make_storage_intent(
@@ -54,8 +166,6 @@ def _make_storage_intent(
     source_plan_hash: str,
 ) -> dict[str, object]:
     context_hash = context.get("execution_context_hash")
-    if context_hash is None:
-        context_hash = source_unit.get("execution_context_hash")
     try:
         context_hash = api._hash(
             context_hash,
@@ -64,10 +174,6 @@ def _make_storage_intent(
     except Exception as error:
         raise ValueError(_STORAGE_POLICY_MISSING) from error
     budget = source_unit.get("storage_budget")
-    if budget is None:
-        task = source_unit.get("task")
-        if isinstance(task, Mapping):
-            budget = task.get("storage_budget")
     if not isinstance(budget, Mapping):
         raise ValueError(_STORAGE_POLICY_MISSING)
     requested_bytes = budget.get("bytes")
@@ -85,7 +191,7 @@ def _make_storage_intent(
         "schema": _STORAGE_TARGET_SCHEMA,
         "artifact_kind": "fastlane-task",
         **{
-            field: _storage_context_value(context, source_unit, field)
+            field: _storage_context_value(context, field)
             for field in _STORAGE_DESCRIPTOR_FIELDS
         },
     }
@@ -166,7 +272,7 @@ def project_units_with_waves(
     """
 
     candidate = api._mapping(request, "fast-lane request")
-    api._exact_keys(candidate, api._FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+    _storage_request_without_extensions(candidate, api)
     if (
         candidate.get("schema") != "team-efficiency/fast-lane-request-v1"
         or len(api._json_bytes(candidate)) > api.MAX_MANIFEST_INPUT_BYTES
@@ -174,9 +280,26 @@ def project_units_with_waves(
     ):
         raise ValueError("authenticated V5 raw request is unsupported")
     source_plan = api.decompose(candidate["work_package"])
+    raw_context_by_task: dict[str, Mapping[str, Any]] = {}
+    raw_execution_contexts = candidate["execution_contexts"]
+    if isinstance(raw_execution_contexts, Sequence) and not isinstance(
+        raw_execution_contexts, (str, bytes, bytearray)
+    ):
+        for raw_context in raw_execution_contexts:
+            if not isinstance(raw_context, Mapping):
+                continue
+            raw_task_id = raw_context.get("task_id")
+            if not isinstance(raw_task_id, str):
+                continue
+            record = _storage_context_record(raw_context)
+            if record is not None:
+                existing = raw_context_by_task.get(raw_task_id)
+                raw_context_by_task[raw_task_id] = _merge_storage_contexts(
+                    existing, record
+                ) or {}
+    source_plan_hash = api._sha256_json(source_plan)
     if source_plan.get("status") != "planned":
         raise ValueError("authenticated V5 source plan is not schedulable")
-    source_plan_hash = api._sha256_json(source_plan)
     project_binding = api._validated_project_binding(candidate["project_binding"])
     project_authority = api._mapping(
         source_plan.get("project_authority"), "source plan.project_authority"
@@ -197,7 +320,10 @@ def project_units_with_waves(
         candidate["target_gates"], source_plan
     )
     execution_contexts, read_contexts = api._validated_fast_lane_contexts(
-        candidate["execution_contexts"],
+        [
+            _storage_context_without_facts(item)
+            for item in candidate["execution_contexts"]
+        ],
         candidate["read_contexts"],
         source_plan,
         candidate["scheduler_state"],
@@ -215,7 +341,31 @@ def project_units_with_waves(
     if remediation is not None or state["phase"] != "execution":
         raise ValueError("authenticated V5 scheduler phase is unsupported")
 
-    units_by_task = api._fast_lane_unit_index(source_plan)
+    storage_context_by_task: dict[str, dict[str, Any]] = {}
+    for normalized_context in execution_contexts:
+        task_id = str(normalized_context["task_id"])
+        request_context = _storage_record_for_task(
+            candidate.get("storage_contexts"), task_id, "context"
+        )
+        raw_context = raw_context_by_task.get(task_id)
+        merged = _merge_storage_contexts(raw_context, request_context)
+        if merged is None:
+            raise ValueError(_STORAGE_POLICY_MISSING)
+        storage_context_by_task[task_id] = _canonical_storage_context(merged)
+    execution_contexts = [
+        {**context, **storage_context_by_task[str(context["task_id"])]}
+        for context in execution_contexts
+    ]
+
+    raw_units_by_task = api._fast_lane_unit_index(source_plan)
+    units_by_task = {
+        task_id: _attach_storage_budget(
+            source_unit,
+            candidate,
+            task_id=task_id,
+        )
+        for task_id, source_unit in raw_units_by_task.items()
+    }
     if not 1 <= len(units_by_task) <= 16:
         raise ValueError("authenticated V5 source plan exceeds the bounded queue")
     config_capacity = source_plan.get("capacity")
@@ -404,6 +554,7 @@ def project_units_with_waves(
                     "dispatch_order": dispatch_order,
                     "index_context_hash": index_hash,
                     "workflow_id_hash": workflow_hash,
+                    "storage_budget": source_unit["storage_budget"],
                     "storage_intent": storage_intent,
                 }
             )
