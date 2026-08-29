@@ -213,9 +213,9 @@ def _canonical_target(descriptor: Mapping[str, object]) -> dict[str, str]:
 def _bounded_identifier(value: object) -> str:
     if type(value) is not str:
         raise StorageIntentError()
-    if not value or len(value.encode("utf-8")) > _MAX_IDENTIFIER_BYTES:
+    if not value or _IDENTIFIER.fullmatch(value) is None:
         raise StorageIntentError()
-    if _IDENTIFIER.fullmatch(value) is None:
+    if len(value.encode("utf-8")) > _MAX_IDENTIFIER_BYTES:
         raise StorageIntentError()
     return value
 

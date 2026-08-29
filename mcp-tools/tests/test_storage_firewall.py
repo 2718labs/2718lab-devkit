@@ -73,3 +73,20 @@ def test_storage_intent_rejects_plain_unknown_descriptor_key() -> None:
     _assert_storage_intent_rejected(
         _intent_with_unknown_descriptor_key("unexpected", "cache")
     )
+
+
+def test_storage_intent_rejects_isolated_surrogate_with_stable_code() -> None:
+    value = _intent_with_unknown_descriptor_key("unexpected", "cache")
+    descriptor = value["target_descriptor"]
+    assert isinstance(descriptor, dict)
+    descriptor.pop("unexpected")
+    descriptor["target_triple"] = "\ud800"
+
+    from devkit_runtime.storage_intent import StorageIntentError, parse_storage_intent
+
+    try:
+        parse_storage_intent(value)
+    except StorageIntentError as error:
+        assert error.code == "STORAGE_TARGET_KEY_INVALID"
+    else:
+        raise AssertionError("invalid surrogate was accepted")
