@@ -3240,6 +3240,7 @@ def _normalize_storage_admission_response(
         or receipt["target_key"] != _private_payload_hash(dict(intent.target_descriptor))
         or receipt["reserved_bytes"] != intent.requested_bytes
         or receipt["reserved_files"] != intent.requested_files
+        or receipt["free_space_floor"] == 0
         or receipt["free_space_after_reserve"] > receipt["free_space_before"] - receipt["reserved_bytes"]
         or receipt["free_space_after_reserve"] < receipt["free_space_floor"]
         or receipt["receipt_hash"] != _private_payload_hash(
