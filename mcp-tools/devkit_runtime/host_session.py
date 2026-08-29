@@ -33,11 +33,39 @@ from .host_scheduler_topology_adapter import (
 _NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 _HASH_PREFIX: Final = "sha256:"
 _IDENTIFIER: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_FAST_LANE_TASK_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z")
+_RAW_HASH: Final = re.compile(r"[0-9a-f]{64}\Z")
 _REASON_SESSION_UNAVAILABLE: Final = "HOST_SESSION_UNAVAILABLE"
 _REASON_CAPABILITY_UNAVAILABLE: Final = "HOST_CAPABILITY_UNAVAILABLE"
 _REASON_EXECUTION_EVIDENCE_UNAVAILABLE: Final = "HOST_EXECUTION_EVIDENCE_UNAVAILABLE"
 _MAX_HOST_WRITER_ACTIONS: Final = 9
 _MAX_HOST_READER_ACTIONS: Final = 189
+_STORAGE_PROFILE_SCHEMA: Final = "2718lab-devkit/storage-profile-v1"
+_STORAGE_PROFILE_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "call_intent_hash",
+        "preparation_id",
+        "task_id",
+        "source_plan_hash",
+        "index_attestation_hash",
+        "execution_context_hash",
+        "repository_identity",
+        "workspace_manifest_hash",
+        "cargo_lock_hash",
+        "toolchain_digest",
+        "target_triple",
+        "profile",
+        "features_hash",
+        "build_env_class",
+        "profile_hash",
+        "attestation_hash",
+    }
+)
+_STORAGE_PROFILE_BUILD_ENV_CLASSES: Final = frozenset(
+    {"managed_read_only", "managed_workspace", "disabled", "external"}
+)
+_STORAGE_PROFILE_SCALAR: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 
 
 class HostCapabilityState(StrEnum):
@@ -148,6 +176,7 @@ class _CompilerInvocationBinding:
     verified_lease_scope_bindings: tuple[str, ...]
     dispatch_facts: tuple[object, ...] = ()
     dispatch_binding_hashes: tuple[str, ...] = ()
+    storage_profiles: tuple[dict[str, object], ...] = field(default=(), repr=False)
     registry_binding_hash: str | None = None
     evidence_expires_at: int | None = None
 
@@ -174,6 +203,7 @@ class _CompilerInvocation:
     expires_at: float
     binding_hash: str
     registry_binding_hash: str | None = None
+    storage_profiles: tuple[dict[str, object], ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -182,9 +212,10 @@ class _CompilerRequestContext:
     request_hash: str
     reasoning_effort: str
     requested_routes: tuple[HostRoute, ...]
+    routing_registry_binding_hash: str
     assignment_skeletons: tuple[dict[str, object], ...] = field(repr=False)
     project_index_attestation_refs: tuple[dict[str, object], ...] = field(repr=False)
-    routing_registry_binding_hash: str
+    storage_task_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -540,6 +571,8 @@ class HostSession:
                 invocation_binding["dispatch_binding_hashes"] = (
                     binding.dispatch_binding_hashes
                 )
+            if binding.storage_profiles:
+                invocation_binding["storage_profiles"] = binding.storage_profiles
             material = _CompilerInvocation(
                 schema="2718lab-devkit/compiler-invocation-v2",
                 preparation_id=preparation_id,
@@ -553,6 +586,7 @@ class HostSession:
                 expires_at=expires_at,
                 binding_hash=_hash(invocation_binding),
                 registry_binding_hash=binding.registry_binding_hash,
+                storage_profiles=binding.storage_profiles,
             )
             material_state = _compiler_invocation_state(material)
             try:
@@ -588,6 +622,7 @@ class HostSession:
         assignment_skeletons: tuple[dict[str, object], ...],
         project_index_attestation_refs: tuple[dict[str, object], ...],
         routing_registry_binding_hash: str,
+        storage_task_ids: tuple[str, ...] = (),
     ) -> bool:
         """Bind public request identity before a private registry round trip."""
 
@@ -604,12 +639,26 @@ class HostSession:
                 or not _is_hash(request_hash)
                 or not _is_hash(routing_registry_binding_hash)
                 or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
+                or type(storage_task_ids) is not tuple
+                or len(storage_task_ids) > 16
+                or any(
+                    type(task_id) is not str
+                    or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+                    for task_id in storage_task_ids
+                )
+                or len(set(storage_task_ids)) != len(storage_task_ids)
             ):
                 return False
             try:
                 normalized_routes = _normalized_routes(requested_routes)
+                skeleton_task_ids = tuple(
+                    _required_fast_lane_task_id(_mapping(item).get("task_id"))
+                    for item in assignment_skeletons
+                )
                 trusted_now = int(self._read_trusted_clock())
             except (TypeError, ValueError):
+                return False
+            if storage_task_ids and storage_task_ids != skeleton_task_ids:
                 return False
             routing_snapshot = self._routing_attestation_snapshots.get(
                 (call_intent_hash, preparation_id)
@@ -631,6 +680,7 @@ class HostSession:
                 assignment_skeletons=assignment_skeletons,
                 project_index_attestation_refs=project_index_attestation_refs,
                 routing_registry_binding_hash=routing_registry_binding_hash,
+                storage_task_ids=storage_task_ids,
             )
             return True
 
@@ -665,6 +715,53 @@ class HostSession:
         route_hashes = cast(list[object], response["verified_route_result_hashes"])
         lease_hashes = cast(list[object], response["verified_lease_scope_bindings"])
         dispatch_hashes = cast(list[object], response["dispatch_binding_hashes"])
+        dispatch_facts = tuple(
+            _dispatch_fact_from_mapping(value) for value in facts_value
+        )
+        storage_profiles: tuple[dict[str, object], ...] = ()
+        if context.storage_task_ids:
+            skeleton_task_ids = tuple(
+                _required_fast_lane_task_id(_mapping(item).get("task_id"))
+                for item in context.assignment_skeletons
+            )
+            if skeleton_task_ids != context.storage_task_ids:
+                return None
+            profiles: list[dict[str, object]] = []
+            for skeleton, index_ref, fact in zip(
+                context.assignment_skeletons,
+                context.project_index_attestation_refs,
+                dispatch_facts,
+                strict=True,
+            ):
+                skeleton_mapping = _mapping(skeleton)
+                index_mapping = _mapping(index_ref)
+                task_id = _required_fast_lane_task_id(
+                    skeleton_mapping.get("task_id")
+                )
+                source_plan_hash = _required_hash(
+                    skeleton_mapping.get("source_plan_hash")
+                )
+                index_attestation_hash = _required_hash(
+                    index_mapping.get("attestation_hash")
+                )
+                if (
+                    index_mapping.get("task_id") != task_id
+                    or fact.task_id != task_id
+                    or fact.source_plan_hash != source_plan_hash
+                    or fact.index_context_hash != skeleton_mapping.get("index_context_hash")
+                ):
+                    return None
+                profile_request = bridge.send_storage_profile_request(
+                    call_intent_hash=context.call_intent_hash,
+                    preparation_id=preparation_id,
+                    task_id=task_id,
+                    source_plan_hash=source_plan_hash,
+                    index_attestation_hash=index_attestation_hash,
+                )
+                profiles.append(
+                    bridge.receive_storage_profile_response(request=profile_request)
+                )
+            storage_profiles = tuple(profiles)
         return _CompilerInvocationBinding(
             request_hash=_required_hash(response["request_hash"]),
             reasoning_effort=str(response["reasoning_effort"]),
@@ -676,14 +773,13 @@ class HostSession:
                 _required_hash(value)
                 for value in lease_hashes
             ),
-            dispatch_facts=tuple(
-                _dispatch_fact_from_mapping(value) for value in facts_value
-            ),
+            dispatch_facts=dispatch_facts,
             dispatch_binding_hashes=tuple(
                 _required_hash(value) for value in dispatch_hashes
             ),
             registry_binding_hash=_required_hash(response["registry_binding_hash"]),
             evidence_expires_at=_required_positive_int(response["expires_at"]),
+            storage_profiles=storage_profiles,
         )
 
     def send_project_index_attestation(
@@ -1695,6 +1791,12 @@ def _required_hash(value: object) -> str:
     return value
 
 
+def _required_fast_lane_task_id(value: object) -> str:
+    if type(value) is not str or _FAST_LANE_TASK_ID.fullmatch(value) is None:
+        raise ValueError("expected Fast Lane task id")
+    return value
+
+
 def _is_hash(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -1736,6 +1838,68 @@ def _optional_ordered_hash_tuple(value: object) -> bool:
     )
 
 
+def _normalized_storage_profiles(
+    value: object,
+) -> tuple[dict[str, object], ...]:
+    if type(value) is not tuple or len(value) > 16:
+        raise ValueError("compiler storage profiles are invalid")
+    normalized: list[dict[str, object]] = []
+    for profile in value:
+        mapping = dict(_mapping(profile))
+        if set(mapping) != _STORAGE_PROFILE_FIELDS:
+            raise ValueError("compiler storage profile fields are invalid")
+        if mapping.get("schema") != _STORAGE_PROFILE_SCHEMA:
+            raise ValueError("compiler storage profile schema is invalid")
+        call_intent_hash = mapping.get("call_intent_hash")
+        preparation_id = mapping.get("preparation_id")
+        task_id = mapping.get("task_id")
+        if (
+            type(call_intent_hash) is not str
+            or _RAW_HASH.fullmatch(call_intent_hash) is None
+            or type(preparation_id) is not str
+            or _IDENTIFIER.fullmatch(preparation_id) is None
+            or type(task_id) is not str
+            or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+        ):
+            raise ValueError("compiler storage profile binding is invalid")
+        target_triple = mapping.get("target_triple")
+        if (
+            type(target_triple) is not str
+            or _STORAGE_PROFILE_SCALAR.fullmatch(target_triple) is None
+            or mapping.get("profile") != "dev"
+        ):
+            raise ValueError("compiler storage profile scalar is invalid")
+        for field_name in (
+            "source_plan_hash",
+            "index_attestation_hash",
+            "execution_context_hash",
+            "repository_identity",
+            "workspace_manifest_hash",
+            "cargo_lock_hash",
+            "toolchain_digest",
+            "features_hash",
+            "profile_hash",
+            "attestation_hash",
+        ):
+            _required_hash(mapping.get(field_name))
+        if mapping.get("build_env_class") not in _STORAGE_PROFILE_BUILD_ENV_CLASSES:
+            raise ValueError("compiler storage profile build environment is invalid")
+        unsigned = {
+            field_name: mapping[field_name]
+            for field_name in _STORAGE_PROFILE_FIELDS
+            if field_name not in {"profile_hash", "attestation_hash"}
+        }
+        if mapping["profile_hash"] != _hash(unsigned):
+            raise ValueError("compiler storage profile hash is invalid")
+        normalized.append(
+            {field_name: mapping[field_name] for field_name in sorted(_STORAGE_PROFILE_FIELDS)}
+        )
+    task_ids = [cast(str, profile["task_id"]) for profile in normalized]
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("compiler storage profile tasks are duplicated")
+    return tuple(normalized)
+
+
 def _normalized_compiler_invocation_binding(
     value: object,
 ) -> _CompilerInvocationBinding:
@@ -1750,6 +1914,8 @@ def _normalized_compiler_invocation_binding(
         or len(value.dispatch_facts) > 16
         or not _optional_ordered_hash_tuple(value.dispatch_binding_hashes)
         or len(value.dispatch_facts) != len(value.dispatch_binding_hashes)
+        or type(value.storage_profiles) is not tuple
+        or len(value.storage_profiles) > 16
         or (
             value.registry_binding_hash is not None
             and not _is_hash(value.registry_binding_hash)
@@ -1760,6 +1926,7 @@ def _normalized_compiler_invocation_binding(
         )
     ):
         raise ValueError("compiler invocation binding is invalid")
+    storage_profiles = _normalized_storage_profiles(value.storage_profiles)
     return _CompilerInvocationBinding(
         request_hash=value.request_hash,
         reasoning_effort=value.reasoning_effort,
@@ -1767,6 +1934,7 @@ def _normalized_compiler_invocation_binding(
         verified_lease_scope_bindings=value.verified_lease_scope_bindings,
         dispatch_facts=value.dispatch_facts,
         dispatch_binding_hashes=value.dispatch_binding_hashes,
+        storage_profiles=storage_profiles,
         registry_binding_hash=value.registry_binding_hash,
         evidence_expires_at=value.evidence_expires_at,
     )
@@ -1784,6 +1952,7 @@ def _compiler_invocation_state(value: _CompilerInvocation) -> tuple[object, ...]
         value.verified_lease_scope_bindings,
         value.dispatch_facts,
         value.dispatch_binding_hashes,
+        tuple(_hash(profile) for profile in value.storage_profiles),
         value.issued_at,
         value.expires_at,
         value.binding_hash,
