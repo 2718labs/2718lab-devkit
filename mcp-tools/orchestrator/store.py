@@ -7074,6 +7074,125 @@ class SQLiteStore:
                 )
 
     @classmethod
+    def _validate_legacy_atlas_outbox_shape(cls, cursor: sqlite3.Cursor) -> None:
+        """Prove the v6-v10 outbox is the known legacy DDL before rebuilding it."""
+
+        expected_columns = tuple(
+            (
+                name,
+                column_type.casefold(),
+                0 if name == "ingestion_key" else not_null,
+                primary_key,
+                0,
+            )
+            for name, column_type, not_null, primary_key in _ATLAS_OUTBOX_COLUMN_CONTRACT
+        )
+        if _table_column_contract(cursor, "atlas_ingestion_outbox") != expected_columns:
+            raise StoreError("orchestrator store is not prepared")
+
+        def index_columns(index_name: object) -> tuple[str, ...]:
+            if type(index_name) is not str:
+                raise ValueError("index name is invalid")
+            identifier = index_name.replace('"', '""')
+            return tuple(
+                str(row["name"])
+                for row in cursor.execute(f'PRAGMA index_info("{identifier}")').fetchall()
+            )
+
+        unique_indexes: set[tuple[str, ...]] = set()
+        non_unique_indexes: set[tuple[str, ...]] = set()
+        index_rows = cursor.execute(
+            "PRAGMA index_list(atlas_ingestion_outbox)"
+        ).fetchall()
+        for index in index_rows:
+            if int(index["partial"]):
+                raise StoreError("orchestrator store is not prepared")
+            columns = index_columns(index["name"])
+            (unique_indexes if int(index["unique"]) else non_unique_indexes).add(columns)
+        expected_unique_indexes = {
+            ("ingestion_key",),
+            ("acceptance_id",),
+            ("payload_hash",),
+            _ATLAS_OUTBOX_IDENTITY,
+        }
+        expected_non_unique_indexes = {("state", "created_at", "ingestion_key")}
+        if (
+            unique_indexes != expected_unique_indexes
+            or non_unique_indexes != expected_non_unique_indexes
+            or len(index_rows)
+            != len(expected_unique_indexes) + len(expected_non_unique_indexes)
+        ):
+            raise StoreError("orchestrator store is not prepared")
+
+        expected_foreign_keys = frozenset(
+            {
+                (
+                    (
+                        "acceptance_id",
+                        "code_task_acceptances",
+                        "acceptance_id",
+                        "no action",
+                        "no action",
+                        "none",
+                    ),
+                )
+            }
+        )
+        if (
+            _foreign_key_contract(cursor, "atlas_ingestion_outbox")
+            != expected_foreign_keys
+            or _sqlite_check_expressions(
+                _table_sql(cursor, "atlas_ingestion_outbox")
+            )
+            != _ATLAS_OUTBOX_REQUIRED_CHECKS
+        ):
+            raise StoreError("orchestrator store is not prepared")
+
+    @classmethod
+    def _validate_legacy_atlas_outbox_rows(cls, cursor: sqlite3.Cursor) -> None:
+        """Reject null or non-convertible legacy rows before the table swap."""
+
+        text_columns = {
+            "ingestion_key",
+            "acceptance_id",
+            "payload_json",
+            "payload_hash",
+            "state",
+            "last_error_code",
+            "reason_codes_json",
+            "created_at",
+            "updated_at",
+        }
+        rows = cursor.execute("SELECT * FROM atlas_ingestion_outbox").fetchall()
+        for row in rows:
+            if any(row[column] is None for column in _ATLAS_OUTBOX_COLUMNS):
+                raise StoreError("legacy atlas outbox row is invalid")
+            if any(type(row[column]) is not str for column in text_columns):
+                raise StoreError("legacy atlas outbox row is invalid")
+            if type(row["attempt_count"]) is not int:
+                raise StoreError("legacy atlas outbox row is invalid")
+            if (
+                row["state"] not in {"pending", "projected", "quarantined"}
+                or not 0 <= row["attempt_count"] <= cls._MAX_ATLAS_OUTBOX_ATTEMPTS
+                or row["ingestion_key"] != row["payload_hash"]
+            ):
+                raise StoreError("legacy atlas outbox row is invalid")
+            try:
+                cls._safe_acceptance_identifier("ingestion_key", row["ingestion_key"])
+                cls._safe_acceptance_identifier("acceptance_id", row["acceptance_id"])
+                cls._safe_acceptance_identifier("payload_hash", row["payload_hash"])
+                cls._safe_outbox_code(
+                    "last_error_code", row["last_error_code"], allow_empty=True
+                )
+                reason_codes = _decode_outbox_reason_codes(row["reason_codes_json"])
+                if len(reason_codes) > cls._MAX_SAFE_OUTBOX_REASON_COUNT:
+                    raise ValueError("too many outbox reason codes")
+                for reason_code in reason_codes:
+                    cls._safe_outbox_code("reason_code", reason_code)
+            except (StoreError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise StoreError("legacy atlas outbox row is invalid") from error
+
+    @classmethod
     def _migrate_atlas_outbox_ingestion_key_not_null(
         cls, cursor: sqlite3.Cursor
     ) -> None:
@@ -7100,85 +7219,31 @@ class SQLiteStore:
             }
             if set(columns) != required_columns:
                 raise StoreError("orchestrator store is not prepared")
-            ingestion_key = columns["ingestion_key"]
-            if int(ingestion_key["notnull"]):
-                return
             source_version_row = cursor.execute(
                 "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
             ).fetchone()
-            source_version = (
-                None if source_version_row is None else int(source_version_row["value"])
-            )
-
-            def index_columns(index_name: object) -> tuple[str, ...]:
-                if type(index_name) is not str:
-                    raise ValueError("index name is invalid")
-                identifier = index_name.replace('"', '""')
-                return tuple(
-                    str(row["name"])
-                    for row in cursor.execute(f'PRAGMA index_info("{identifier}")')
-                )
-
-            outbox_not_null_columns = {
-                str(row["name"])
-                for row in columns.values()
-                if int(row["notnull"])
-            }
-            outbox_primary_key = tuple(
-                str(row["name"])
-                for row in sorted(
-                    columns.values(), key=lambda row: int(row["pk"])
-                )
-                if int(row["pk"])
-            )
-            outbox_unique_columns = {
-                index_columns(row["name"])
-                for row in cursor.execute(
-                    "PRAGMA index_list(atlas_ingestion_outbox)"
-                ).fetchall()
-                if int(row["unique"]) and not int(row["partial"])
-            }
-            outbox_foreign_keys = {
-                (str(row["from"]), str(row["table"]), str(row["to"]))
-                for row in cursor.execute(
-                    "PRAGMA foreign_key_list(atlas_ingestion_outbox)"
-                )
-            }
-            outbox_row = cursor.execute(
-                """
-                SELECT sql FROM sqlite_master
-                WHERE type = 'table' AND name = 'atlas_ingestion_outbox'
-                """
-            ).fetchone()
-            outbox_checks = (
-                frozenset()
-                if outbox_row is None
-                else _sqlite_check_expressions(outbox_row["sql"])
-            )
-            required_not_null_columns = required_columns - {"ingestion_key"}
-            has_complete_v10_layout = (
-                required_not_null_columns.issubset(outbox_not_null_columns)
-                and outbox_primary_key == ("ingestion_key",)
-                and ("acceptance_id",) in outbox_unique_columns
-                and ("payload_hash",) in outbox_unique_columns
-                and (
-                    "acceptance_id",
-                    "code_task_acceptances",
-                    "acceptance_id",
-                )
-                in outbox_foreign_keys
-                and _ATLAS_OUTBOX_REQUIRED_CHECKS.issubset(outbox_checks)
-            )
-            if source_version != 10 or not has_complete_v10_layout:
+            ingestion_key = columns["ingestion_key"]
+            if source_version_row is None:
+                if int(ingestion_key["notnull"]):
+                    return
                 raise StoreError("orchestrator store is not prepared")
-            if cursor.execute(
-                """
-                SELECT 1 FROM atlas_ingestion_outbox
-                WHERE ingestion_key IS NULL
-                LIMIT 1
-                """
-            ).fetchone() is not None:
-                raise StoreError("legacy atlas outbox row is invalid")
+            source_version_value = source_version_row["value"]
+            if type(source_version_value) is not str:
+                raise StoreError("orchestrator store is not prepared")
+            try:
+                source_version = int(source_version_value)
+            except (TypeError, ValueError) as error:
+                raise StoreError("orchestrator store is not prepared") from error
+            if str(source_version) != source_version_value or not (
+                6 <= source_version <= cls._SCHEMA_VERSION
+            ):
+                raise StoreError("orchestrator store is not prepared")
+            if int(ingestion_key["notnull"]):
+                return
+            if source_version not in range(6, 11):
+                raise StoreError("orchestrator store is not prepared")
+            cls._validate_legacy_atlas_outbox_shape(cursor)
+            cls._validate_legacy_atlas_outbox_rows(cursor)
             cursor.execute(
                 """
                 CREATE TABLE atlas_ingestion_outbox_v11 (
