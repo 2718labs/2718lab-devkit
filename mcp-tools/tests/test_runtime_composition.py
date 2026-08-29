@@ -13,7 +13,7 @@ from devkit_runtime.composition import RuntimeRoot
 from devkit_runtime.config import RuntimeConfig, RuntimeConfigError
 from devkit_runtime.relay_runtime import RelayRuntime
 from devkit_runtime.uow import RuntimeAdapterFactories, RuntimeUnitOfWork
-from orchestrator.store import SQLiteStore, StoreError
+from orchestrator.store import SQLiteStore, StoreError, _payload_hash
 
 
 def test_runtime_config_load_prefers_plugin_data_without_writing(
@@ -1182,7 +1182,21 @@ def _insert_legacy_atlas_acceptance(
     timestamp = "2026-08-09T00:00:00+00:00"
     workflow_id = "legacy-workflow"
     task_id = f"legacy-task-{suffix}"
-    acceptance_id = f"sha256:{suffix * 64}"
+    input_snapshot_id = f"sha256:{'e' * 64}"
+    output_snapshot_id = f"sha256:{'f' * 64}"
+    indexed_diff_hash = f"sha256:{'0' * 64}"
+    payload_json = SQLiteStore._canonical_code_task_acceptance_payload(
+        workflow_id=workflow_id,
+        task_id=task_id,
+        task_version=1,
+        input_snapshot_id=input_snapshot_id,
+        output_snapshot_id=output_snapshot_id,
+        indexed_diff_hash=indexed_diff_hash,
+        intent_id="legacy",
+        language="python",
+        framework="pytest",
+    )
+    acceptance_id = _payload_hash(payload_json)
     connection.execute(
         """
         INSERT INTO workflows (
@@ -1235,13 +1249,13 @@ def _insert_legacy_atlas_acceptance(
             workflow_id,
             task_id,
             1,
-            f"sha256:{'e' * 64}",
-            f"sha256:{'f' * 64}",
-            f"sha256:{'0' * 64}",
+            input_snapshot_id,
+            output_snapshot_id,
+            indexed_diff_hash,
             "legacy",
             "python",
             "pytest",
-            "{}",
+            payload_json,
             acceptance_id,
             timestamp,
         ),
@@ -1262,6 +1276,11 @@ def _legacy_v6_atlas_outbox_database(
         acceptance_id, timestamp = _insert_legacy_atlas_acceptance(
             connection, suffix="a"
         )
+        payload_json = connection.execute(
+            "SELECT payload_json FROM code_task_acceptances WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()[0]
+        outbox_ingestion_key = acceptance_id if ingestion_key is not None else None
         connection.execute(
             "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
             ("schema_version", "6"),
@@ -1274,9 +1293,9 @@ def _legacy_v6_atlas_outbox_database(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                ingestion_key,
+                outbox_ingestion_key,
                 acceptance_id,
-                "{}",
+                payload_json,
                 acceptance_id,
                 "pending",
                 0,
@@ -1304,6 +1323,11 @@ def _legacy_v10_atlas_outbox_database(
         acceptance_id, timestamp = _insert_legacy_atlas_acceptance(
             connection, suffix="a"
         )
+        payload_json = connection.execute(
+            "SELECT payload_json FROM code_task_acceptances WHERE acceptance_id = ?",
+            (acceptance_id,),
+        ).fetchone()[0]
+        outbox_ingestion_key = acceptance_id if ingestion_key is not None else None
         connection.execute("DROP TABLE schema_metadata")
         connection.execute(
             """
@@ -1331,9 +1355,9 @@ def _legacy_v10_atlas_outbox_database(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                ingestion_key,
+                outbox_ingestion_key,
                 acceptance_id,
-                "{}",
+                payload_json,
                 acceptance_id,
                 "pending",
                 0,
@@ -1356,6 +1380,7 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
     database, acceptance_id, timestamp = _legacy_v10_atlas_outbox_database(
         tmp_path, ingestion_key=ingestion_key
     )
+    ingestion_key = acceptance_id
 
     store = SQLiteStore(database)
     try:
@@ -1616,7 +1641,7 @@ def test_sqlite_store_rejects_legacy_atlas_outbox_row_contract_drift(
         connection.close()
 
 
-@pytest.mark.parametrize("binding_drift", ("identity", "payload"))
+@pytest.mark.parametrize("binding_drift", ("identity", "payload-both"))
 def test_sqlite_store_rejects_legacy_outbox_acceptance_binding_drift(
     tmp_path: Path, binding_drift: str
 ) -> None:
@@ -1638,6 +1663,10 @@ def test_sqlite_store_rejects_legacy_outbox_acceptance_binding_drift(
                 "UPDATE code_task_acceptances SET payload_json = ? "
                 "WHERE acceptance_id = ?",
                 ('{"different":true}', acceptance_id),
+            )
+            connection.execute(
+                "UPDATE atlas_ingestion_outbox SET payload_json = ?",
+                ('{"different":true}',),
             )
         connection.commit()
     finally:
@@ -1756,6 +1785,7 @@ def _legacy_v10_incomplete_atlas_outbox_database(
     database, acceptance_id, timestamp = _legacy_v10_atlas_outbox_database(
         tmp_path, ingestion_key=ingestion_key
     )
+    ingestion_key = acceptance_id
     connection = sqlite3.connect(database)
     try:
         connection.execute("DROP TABLE atlas_ingestion_outbox")
@@ -1841,6 +1871,7 @@ def _malformed_v11_nullable_atlas_outbox_database(
     database, acceptance_id, _ = _legacy_v10_atlas_outbox_database(
         tmp_path, ingestion_key=ingestion_key
     )
+    ingestion_key = acceptance_id
     connection = sqlite3.connect(database)
     try:
         connection.execute(
