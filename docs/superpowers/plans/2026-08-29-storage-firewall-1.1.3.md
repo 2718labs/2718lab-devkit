@@ -98,8 +98,8 @@ Codex Host files:
 - Modify `codex-rs/config/src/config_toml.rs` (`ConfigToml`),
   `codex-rs/core/src/config/mod.rs` (`Config::load_config_with_layer_stack`),
   and generated `codex-rs/core/config.schema.json` for the explicit Host
-  storage block. Read existing `config/src/config_layer_source.rs` for trust
-  provenance and `config/src/schema.rs::write_config_schema` for generation.
+  `fast_lane_storage` block. Read existing `config/src/config_layer_source.rs`
+  for trust provenance and `config/src/schema.rs::write_config_schema` for generation.
 - Modify `codex-rs/app-server/src/message_processor.rs`,
   `codex-rs/core/src/thread_manager.rs` (`ThreadManagerState`),
   `codex-rs/core/src/session/mod.rs` (`SessionSpawnArgs`),
@@ -667,13 +667,15 @@ than concurrently editing registry/adapter/process-manager from two slices.
 
 - [ ] **Step 6a: Load explicit trusted configuration and inject one runtime-owned service.**
 
-Add an optional `storage_firewall` block to `ConfigToml`, containing exactly
-nine required fields: `approved_root`, `task_byte_limit`, `task_file_limit`,
+Preserve the implemented optional `fast_lane_storage` block in `ConfigToml`,
+containing exactly nine required fields: `approved_root`, `task_byte_limit`, `task_file_limit`,
 `target_family_byte_limit`, `target_family_file_limit`,
 `global_reserved_byte_limit`, `global_reserved_file_limit`,
 `free_space_floor_bytes`, and `emergency_floor_bytes`. The root must be an
-explicit absolute Host-approved directory; each numeric value must pass the
-kernel's positive/checked policy validation, including emergency <= floor.
+explicit absolute Host-approved directory; all eight numeric fields use
+`NonZeroU64` and must also pass the kernel's checked policy validation,
+including emergency <= floor. Keep the root and all eight values pending the
+operator's explicit choice; do not populate them in this plan revision.
 Do not supply numerical defaults, derive authority from free disk space, or
 create an approved root while loading configuration. Missing block disables
 storage admission with `STORAGE_POLICY_MISSING`; malformed blocks are rejected.
@@ -684,20 +686,38 @@ workspace `Project` configuration cannot set or override it. Treat session
 flags as authority only when the Host startup path explicitly validates an
 operator override, never when copied from worker/caller facts. Reject an
 untrusted storage override instead of silently merging individual fields.
-Generate `core/config.schema.json` through the existing
-`config/src/schema.rs::write_config_schema` path.
+Local configuration rejection uses `STORAGE_CONFIG_SOURCE_NOT_TRUSTED` and
+`STORAGE_CONFIG_RESTART_REQUIRED`, alongside `STORAGE_ROOT_NOT_APPROVED` and
+`STORAGE_POLICY_MISSING` where applicable. These are local configuration
+diagnostics, not new public admission-wire fields or a change to the exact
+request/receipt shape; do not expose private configuration paths in responses.
 
-Construct one service at the process-scoped Host runtime's ThreadManager
-creation in `app-server/src/message_processor.rs`; store the same Arc in
-`ThreadManagerState`, forward through `SessionSpawnArgs`/`SessionServices`,
-and give every `FastLaneHostFactsRegistry` a reference to it. The new
+Generate only `core/config.schema.json` with the lightweight config example;
+do not rebuild a core binary solely to emit schema. The implementation command
+below is documentation, not an instruction to run it during plan-only edits:
+
+```powershell
+Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs'
+$env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\target'
+$env:CARGO_INCREMENTAL='0'
+cargo run --locked -p codex-config --example write_config_schema -j1 -- 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\core\config.schema.json'
+Pop-Location
+```
+
+Construct the sole service Arc from the manager's base `Config` in
+`ThreadManager` initialization, not from per-session or per-turn config.
+The Host runtime caller in `app-server/src/message_processor.rs` supplies
+that base configuration. Store the same Arc in `ThreadManagerState`, forward
+through `SessionSpawnArgs`/`SessionServices`, and give every
+`FastLaneHostFactsRegistry` a reference to it. The new
 `storage_service.rs` facade owns the single kernel accounting state and
 immutable resolved policy/root, not another independent reservation ledger.
 Adapt every constructor/call site; test-only construction may be explicitly
 disabled or use an injected fixture, never a permissive production default.
 Current `session/session.rs` creates registries per Session: keep that facts
 scope but do not create a firewall there. Per-thread config reload must not
-reset global reservations or replace policy/root while grants are retained.
+reset global reservations or replace policy/root; reject a differing storage
+configuration with the local `STORAGE_CONFIG_RESTART_REQUIRED` diagnostic.
 
 This is cross-session sharing inside one Host runtime, not a cross-process
 ledger. An independent Host process must not claim the same active storage
