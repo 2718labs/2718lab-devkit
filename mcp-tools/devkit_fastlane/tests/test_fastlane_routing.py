@@ -1022,6 +1022,30 @@ def test_v5_uses_a_fresh_host_attested_child_tuple_above_terra_without_dispatchi
     assert result["capability_resolution"]["state"] == "host_attested"
 
 
+def test_v5_accepts_nine_host_slots_without_inflating_lane_limits() -> None:
+    core = _load_core()
+    policy = core.load_policy_v5()
+    assert policy["limits"]["maximum_total_slots"] == 9
+
+    request = _request_v5()
+    host = request["host_capabilities"]
+    assert isinstance(host, dict)
+    host["total_slots"] = 9
+    normalized = core._normalise_host_v5(host, policy)
+    assert normalized["total_slots"] == 9
+    assert normalized["model_slot_limits"] == {
+        "luna": 4,
+        "terra": 4,
+        "sol": 4,
+        "spark": 1,
+    }
+
+    host["total_slots"] = 10
+    with pytest.raises(core.RoutingError) as exc:
+        core._normalise_host_v5(host, policy)
+    assert exc.value.code == "invalid_bounds"
+
+
 @pytest.mark.parametrize(
     ("mutate", "status", "reason"),
     [

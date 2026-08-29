@@ -52,6 +52,35 @@ EXPECTED_TOOL_NAMES = frozenset(
     }
 )
 
+
+def test_index_sideband_correlation_is_meta_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server.mcp,
+        "get_context",
+        lambda: SimpleNamespace(
+            request_context=SimpleNamespace(
+                meta=SimpleNamespace(
+                    model_extra={
+                        "2718lab/host-index-correlation": "index-" + "a" * 64
+                    }
+                )
+            )
+        ),
+    )
+    assert server._current_index_correlation() == "index-" + "a" * 64
+    monkeypatch.setattr(
+        server.mcp,
+        "get_context",
+        lambda: SimpleNamespace(
+            request_context=SimpleNamespace(
+                meta=SimpleNamespace(
+                    model_extra={"2718lab/host-index-correlation": "caller-value"}
+                )
+            )
+        ),
+    )
+    assert server._current_index_correlation() is None
+
 EXPECTED_PARAMETERS = {
     "project_index_register": ("workspace_root",),
     "project_index_sync": (
@@ -210,7 +239,7 @@ def test_tool_signatures_and_top_level_input_schemas_are_exact() -> None:
             "ingestion_key",
         },
         "relay_compile": {"request"},
-        "fastlane_compile": {"request"},
+        "fastlane_compile": {"request", "reasoning_effort"},
         "relay_start": {"request"},
         "relay_status": {"workflow_id"},
         "relay_handoff": {"request"},

@@ -327,17 +327,22 @@ The Fast Lane compiler is in
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py and
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The public MCP entry is
 `fastlane_compile`; every current invocation is deliberately blocked with
-`NO_SAFE_WORK` and zero assignments.
+`NO_SAFE_WORK` and zero assignments unless the request is the closed
+`fastlane-host-dispatch-request-v1` shape and this MCP process owns an
+authenticated inherited host bridge. In that private case the host supplies
+one-time registry-bound compiler evidence and receives a typed dispatch batch.
 
-- `ultra` and `--enable` only select the shape of the blocked result; they do
-  not activate scheduling.
+- `reasoning_effort` is required and accepts only `low`, `medium`, `high`,
+  `xhigh`, or `max`; worker dispatch never accepts `ultra`.
 - The public compiler/CLI does not consume host status, account usage, index
   evidence, or a worktree root.
-- It never dispatches a session, creates a worktree, refills a slot, or runs a
-  command. No in-repository execution path exists for those actions.
-- An external Desktop-host bridge may later provide attested project authority
-  and execution. That is a future contract, not a
-  shipped implementation or a claim that any Desktop host source exists.
+- The compiler never creates a worktree, selects a route, or runs a command.
+  The authenticated session ACKs terminal slots and requests refill only at the
+  next host boundary. The compiler can only commit the fully hash-bound batch to the private
+  host bridge; the host remains the execution authority.
+- Missing, stale, mismatched, replayed, or caller-supplied evidence keeps the
+  result at `NO_SAFE_WORK`. Filesystem paths are never accepted as compiler
+  evidence.
 
 ### Account-usage boundary
 

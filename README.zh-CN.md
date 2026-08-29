@@ -284,13 +284,18 @@ Fast Lane 编译器位于
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py 和
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
 `fastlane_compile`；当前每一次调用都会刻意以 `NO_SAFE_WORK` 和零 assignments
-被阻断。
+被阻断；唯一例外是 exact-key 的 `fastlane-host-dispatch-request-v1`，且当前 MCP
+进程确实持有经过认证的 inherited host bridge。此时宿主通过一次性、registry-bound
+的 compiler evidence 回传精确事实，并接收 typed dispatch batch。
 
-- `ultra` 和 `--enable` 只选择被阻断结果的形状，不会激活调度。
+- `reasoning_effort` 必填且只接受 `low`、`medium`、`high`、`xhigh` 或
+  `max`；worker 调度永不接受 `ultra`。
 - 公共编译器/CLI 不消费 host-status、账号用量、index evidence 或 worktree root。
-- 它不会派发会话、创建 worktree、补位或运行命令；仓库内不存在这些动作的执行路径。
-- 外部 Desktop-host bridge 未来可以提供经证明的项目权限和执行能力。
-  这只是未来合同，不是已交付实现，也不是任何 Desktop host 源码已经存在的声明。
+- 编译器不会创建 worktree、选择路由或运行命令；认证 session 只在 terminal ACK
+  后请求下一宿主边界补位。编译器只能把完整 hash-bound batch 提交给私有宿主桥，
+  真正执行权限仍属于宿主。
+- evidence 缺失、过期、错配、重放或来自 caller 自报时仍保持 `NO_SAFE_WORK`；
+  filesystem path 永远不能充当 compiler evidence。
 
 ### 账号用量边界
 

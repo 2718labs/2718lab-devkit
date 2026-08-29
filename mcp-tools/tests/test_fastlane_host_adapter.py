@@ -8,7 +8,8 @@ import json
 import os
 import sys
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -42,6 +43,215 @@ def _canonical_hash(value: object) -> str:
     )
 
 
+def _authenticated_v5_fixture() -> dict[str, object]:
+    from devkit_fastlane.scripts import fastlane_routing, team_efficiency
+
+    hash_a = _canonical_hash({"fixture": "a"})
+    hash_b = _canonical_hash({"fixture": "b"})
+    source_plan_hash = _canonical_hash({"fixture": "plan"})
+    dependency: dict[str, object] = {
+        "schema": "2718lab-devkit/dependency-state-v1",
+        "graph_epoch": 1,
+        "direct_dependency_ids": [],
+        "completed_dependency_ids": [],
+    }
+    dependency["dependency_state_hash"] = _canonical_hash(dependency)
+    scheduler = {
+        "event_seq": 1,
+        "route_epoch": 1,
+        "override_epoch": 0,
+        "recovery_epoch": 0,
+        "ready_event_seq": 1,
+        "dispatch_cause": "task_ready",
+        "transport_state": "connected",
+        "execution_state": "unknown",
+        "lease_state": "unclaimed",
+        "evidence_state": "none",
+        "lease_epoch": 0,
+        "recovery_probe_count_epoch": 0,
+        "fence_count_epoch": 0,
+        "fenced_replacement_count_task": 0,
+    }
+    host = {
+        "schema": "2718lab-devkit/host-capabilities-v1",
+        "host_id_hash": hash_a,
+        "capability_epoch": 1,
+        "total_slots": 4,
+        "model_slot_limits": {"luna": 4, "terra": 0, "sol": 0, "spark": 0},
+        "models": [
+            {
+                "model_id": "gpt-5.6-luna",
+                "status": "available",
+                "efforts": ["max"],
+            }
+        ],
+        "entitlements": [],
+    }
+    unit = {
+        "task": {
+            "schema": "2718lab-devkit/task-routing-profile-v5",
+            "task_id": "TASK-V5",
+            "role": "execution",
+            "access": "workspace_write",
+            "write_scope_count": 1,
+            "write_scope_breadth": "single_file",
+            "read_scope_count": 0,
+            "read_scope_breadth": "none",
+            "overlap_risk": "none",
+            "overlap_count": 0,
+            "dependency_depth": 0,
+            "downstream_critical_count": 0,
+            "critical_path": False,
+            "criticality": "low",
+            "cross_module": False,
+            "database_work": False,
+            "migration": False,
+            "security_sensitive": False,
+            "destructive": False,
+            "external_boundary": False,
+            "architecture_conflict": False,
+            "design_ambiguity": False,
+            "verification_cost": "none",
+            "blocker_severity": "none",
+            "authorization": "not_required",
+            "authorization_evidence_hash": None,
+            "narrow_decoupling_eligible": False,
+            "strike": None,
+            "gate_matrix_hash": hash_a,
+            "profile_evidence_hash": hash_b,
+        },
+        "dependency_state": dependency,
+        "write_scope": ["src/task_v5.py"],
+        "concurrency_mode": "parallel",
+        "dispatch_order": 0,
+        "index_context_hash": hash_a,
+        "predecessor_hash": hash_b,
+    }
+    routing_requests = team_efficiency.prepare_authenticated_v5_routing_requests(
+        [unit],
+        source_plan_hash=source_plan_hash,
+        host_capabilities=host,
+        scheduler_facts=scheduler,
+    )
+    request_binding_hash = fastlane_routing.v5_request_binding_hash(
+        routing_requests[0]
+    )
+    attestation: dict[str, object] = {
+        "schema": "2718lab-devkit/host-child-route-attestation-v1",
+        "status": "attested",
+        "request_binding_hash": request_binding_hash,
+        "host_id_hash": hash_a,
+        "capability_epoch": 1,
+        "lease_epoch": 0,
+        "issued_event_seq": 1,
+        "expires_event_seq": 1,
+        "route": {
+            "lane": "luna",
+            "model": "gpt-5.6-luna",
+            "effort": "max",
+            "rank": 40,
+        },
+        "inherit_current_session_model": False,
+        "refusal_code": None,
+    }
+    attestation["attestation_hash"] = _canonical_hash(attestation)
+    attestation_items = [
+        {
+            "task_id": "TASK-V5",
+            "request_binding_hash": request_binding_hash,
+            "attestation": attestation,
+        }
+    ]
+    compiled = team_efficiency.compile_authenticated_v5_assignment_skeletons(
+        [unit],
+        source_plan_hash=source_plan_hash,
+        routing_requests=routing_requests,
+        attestation_items=attestation_items,
+    )
+    index_query = {
+        "schema": "2718lab-devkit/project-index-attestation-v1",
+        "operation": "query",
+        "correlation_id": "index-" + "c" * 64,
+        "workspace_id": _hash("d"),
+        "workspace_binding_hash": _hash("e"),
+        "root_identity_hash": _hash("f"),
+        "expires_at": 1_700_000_120,
+        "snapshot_id": _hash("0"),
+        "snapshot_attestation_hash": _hash("1"),
+        "head_hash": _hash("2"),
+        "manifest_hash": _hash("3"),
+        "parser_set_hash": _hash("5"),
+        "query_receipt_hash": _hash("6"),
+        "index_context_hash": hash_a,
+    }
+    index_query["attestation_hash"] = _canonical_hash(index_query)
+    index_ref = {
+        key: value
+        for key, value in index_query.items()
+        if key
+        not in {
+            "schema",
+            "operation",
+            "expires_at",
+            "head_hash",
+            "manifest_hash",
+            "parser_set_hash",
+        }
+    }
+    index_ref["task_id"] = "TASK-V5"
+    planner_request = {
+        "schema": "2718lab-devkit/fastlane-host-planner-request-v1",
+        "action": "plan_dispatch",
+        "assignment_skeletons": compiled["assignment_skeletons"],
+        "project_index_attestation_refs": [index_ref],
+    }
+    return {
+        "call_intent_hash": "a" * 64,
+        "preparation_id": "dispatch-v5-1",
+        "host": host,
+        "scheduler": scheduler,
+        "unit": unit,
+        "source_plan_hash": source_plan_hash,
+        "routing_requests": routing_requests,
+        "attestation_items": attestation_items,
+        "compiled": compiled,
+        "index_query": index_query,
+        "index_ref": index_ref,
+        "planner_request": planner_request,
+    }
+
+
+def _v5_dispatch_fact(adapter: object, fixture: dict[str, object]) -> object:
+    skeleton = fixture["compiled"]["assignment_skeletons"][0]
+    proof = skeleton["routing_proof"]
+    result_route = proof["result"]["route"]
+    return adapter._HostDispatchFact(
+        task_id=skeleton["task_id"],
+        route=adapter._HostDispatchRoute(
+            model=result_route["model"],
+            reasoning_effort=result_route["effort"],
+            routing_context_hash=proof["routing_context_hash"],
+            routing_result_hash=proof["routing_result_hash"],
+            require_explicit_route=True,
+        ),
+        lease_id="lease-task-v5",
+        lease_epoch=1,
+        task_version=1,
+        assignment_token=_hash("3"),
+        write_scope=tuple(skeleton["write_scope"]),
+        concurrency_mode=skeleton["concurrency_mode"],
+        dispatch_order=skeleton["dispatch_order"],
+        index_context_hash=skeleton["index_context_hash"],
+        worktree_identity=_hash("5"),
+        worktree_base=_hash("6"),
+        integration_head=_hash("7"),
+        predecessor_hash=skeleton["predecessor_hash"],
+        source_plan_hash=skeleton["source_plan_hash"],
+        ledger_epoch=11,
+        active_lease_set_hash=_hash("b"),
+    )
+
+
 def _pipe_pair() -> tuple[object, object]:
     from devkit_runtime.host_bridge import InheritedHandleHostBridge
 
@@ -65,7 +275,7 @@ def _pipe_pair() -> tuple[object, object]:
     )
 
 
-def _dispatch_fact(adapter: object, *, task: str, scope: str) -> object:
+def _dispatch_fact(adapter: object, *, task: str, scope: str, order: int = 0) -> object:
     task_hash_character = "a" if task.endswith("a") else "b"
     return adapter._HostDispatchFact(
         task_id=task,
@@ -82,7 +292,7 @@ def _dispatch_fact(adapter: object, *, task: str, scope: str) -> object:
         assignment_token=_hash("3"),
         write_scope=(scope,),
         concurrency_mode="parallel",
-        dispatch_order=0,
+        dispatch_order=order,
         index_context_hash=_hash("4"),
         worktree_identity=_hash("5"),
         worktree_base=_hash("6"),
@@ -99,6 +309,50 @@ def _dispatch_request(adapter: object, facts: tuple[object, ...]) -> dict[str, o
         "schema": "2718lab-devkit/fastlane-host-dispatch-request-v1",
         "action": "dispatch_all",
         "assignments": [adapter._dispatch_fact_mapping(fact) for fact in facts],
+    }
+
+
+def _planner_request(adapter: object, facts: tuple[object, ...]) -> dict[str, object]:
+    skeletons = []
+    references = []
+    for fact in facts:
+        mapping = adapter._dispatch_fact_mapping(fact)
+        skeletons.append(
+            {
+                key: mapping[key]
+                for key in (
+                    "task_id",
+                    "route",
+                    "write_scope",
+                    "concurrency_mode",
+                    "dispatch_order",
+                    "index_context_hash",
+                    "predecessor_hash",
+                    "source_plan_hash",
+                    "ledger_epoch",
+                    "active_lease_set_hash",
+                )
+            }
+        )
+        references.append(
+            {
+                "task_id": mapping["task_id"],
+                "correlation_id": "index-" + "c" * 64,
+                "workspace_id": _hash("d"),
+                "workspace_binding_hash": _hash("e"),
+                "root_identity_hash": _hash("f"),
+                "snapshot_id": _hash("0"),
+                "snapshot_attestation_hash": _hash("1"),
+                "query_receipt_hash": _hash("2"),
+                "index_context_hash": mapping["index_context_hash"],
+                "attestation_hash": _hash("3"),
+            }
+        )
+    return {
+        "schema": "2718lab-devkit/fastlane-host-planner-request-v1",
+        "action": "plan_dispatch",
+        "assignment_skeletons": skeletons,
+        "project_index_attestation_refs": references,
     }
 
 
@@ -196,7 +450,7 @@ def test_private_host_facts_form_one_mechanical_dispatch_all_request() -> None:
     adapter = _adapter()
     facts = (
         _dispatch_fact(adapter, task="task-a", scope="src/a.py"),
-        _dispatch_fact(adapter, task="task-b", scope="src/b.py"),
+        _dispatch_fact(adapter, task="task-b", scope="src/b.py", order=1),
     )
     request, prepared, bridges = _prepared_dispatch(adapter, facts)
     try:
@@ -552,6 +806,7 @@ def test_overlapping_parallel_scopes_fail_closed_but_serial_scopes_are_ordered()
     overlapping = replace(
         _dispatch_fact(adapter, task="task-b", scope="src/shared/child.py"),
         concurrency_mode="parallel",
+        dispatch_order=1,
     )
     request, prepared, bridges = _prepared_dispatch(adapter, (first, overlapping))
     try:
@@ -564,12 +819,12 @@ def test_overlapping_parallel_scopes_fail_closed_but_serial_scopes_are_ordered()
     assert rejected == adapter.NO_SAFE_WORK
     with pytest.raises(ValueError, match="parallel write scopes overlap"):
         adapter._validate_batch_fences(
-            (replace(first, concurrency_mode="serial", dispatch_order=1), overlapping)
+            (replace(first, concurrency_mode="serial", dispatch_order=0), overlapping)
         )
 
     serial_facts = (
-        replace(first, concurrency_mode="serial", dispatch_order=1),
-        replace(overlapping, concurrency_mode="serial", dispatch_order=2),
+        replace(first, concurrency_mode="serial", dispatch_order=0),
+        replace(overlapping, concurrency_mode="serial", dispatch_order=1),
     )
     request, prepared, bridges = _prepared_dispatch(adapter, serial_facts)
     try:
@@ -579,7 +834,7 @@ def test_overlapping_parallel_scopes_fail_closed_but_serial_scopes_are_ordered()
     finally:
         for bridge in bridges:
             bridge.close()
-    assert [item["dispatch_order"] for item in accepted["assignments"]] == [1, 2]
+    assert [item["dispatch_order"] for item in accepted["assignments"]] == [0, 1]
 
 
 def test_adapter_exposes_no_forgeable_verified_host_facts_marker() -> None:
@@ -634,6 +889,398 @@ def test_adapter_contains_no_host_execution_calls() -> None:
             "project_index_query",
         }
     )
+
+
+def test_environment_session_round_trips_evidence_and_typed_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter()
+    import devkit_runtime.host_session as host_session
+    from devkit_runtime.host_bridge import InheritedHandleHostBridge, OperationReceipt
+
+    fixture = _authenticated_v5_fixture()
+    child, host = _pipe_pair()
+    fact = _v5_dispatch_fact(adapter, fixture)
+    request = fixture["planner_request"]
+    fact_mapping = adapter._dispatch_fact_mapping(fact)
+    lease_hash = adapter._lease_scope_binding_hash(fact)
+    received: list[OperationReceipt] = []
+
+    def host_reply() -> None:
+        assert host.receive_project_index_attestation(now=1_700_000_000) == fixture[
+            "index_query"
+        ]
+        probe = host.receive_capability_probe_v2(now=1_700_000_000)
+        host.send_capability_report_v2(
+            probe=probe,
+            host_capabilities=fixture["host"],
+            scheduler_facts=fixture["scheduler"],
+            now=1_700_000_000,
+        )
+        routing_request = host.receive_routing_attestation_request(
+            now=1_700_000_000
+        )
+        assert list(routing_request.routing_requests) == fixture["routing_requests"]
+        host.send_routing_attestation_response(
+            request=routing_request,
+            attestations=fixture["attestation_items"],
+            now=1_700_000_000,
+        )
+        evidence_request = host.receive_compiler_evidence_request(now=1_700_000_000)
+        response = {
+            "schema": "2718lab-devkit/compiler-evidence-response-v1",
+            "preparation_id": evidence_request.preparation_id,
+            "request_hash": evidence_request.request_hash,
+            "reasoning_effort": evidence_request.reasoning_effort,
+            "verified_route_result_hashes": [fact.route.routing_result_hash],
+            "verified_lease_scope_bindings": [lease_hash],
+            "dispatch_facts": [fact_mapping],
+            "dispatch_binding_hashes": [fact_mapping["dispatch_binding_hash"]],
+            "nonce": evidence_request.nonce,
+            "expires_at": evidence_request.expires_at,
+        }
+        response["registry_binding_hash"] = _canonical_hash(response)
+        host.send_compiler_evidence_response(
+            request=evidence_request,
+            response=response,
+            now=1_700_000_000,
+        )
+        received.append(host.receive_fast_lane_dispatch_batch(now=1_700_000_000))
+
+    thread = threading.Thread(target=host_reply, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        InheritedHandleHostBridge,
+        "from_environment",
+        classmethod(lambda cls, environ=None, *, platform=None: child),
+    )
+    session = host_session.HostSession.from_environment(
+        environ={}, platform="posix", clock=lambda: 1_700_000_000
+    )
+    assert session.send_project_index_attestation(fixture["index_query"]) == fixture[
+        "index_query"
+    ]
+    capability = session.resolve_capability_snapshot_v2(
+        call_intent_hash=fixture["call_intent_hash"],
+        preparation_id=fixture["preparation_id"],
+    )
+    assert capability is not None
+    routing = session.resolve_routing_attestations(
+        call_intent_hash=fixture["call_intent_hash"],
+        preparation_id=fixture["preparation_id"],
+        routing_requests=fixture["routing_requests"],
+    )
+    assert routing is not None
+    prepared = adapter.prepare_verified_host_facts(
+        session,
+        preparation_id=fixture["preparation_id"],
+        call_intent_hash=fixture["call_intent_hash"],
+        routing_registry_binding_hash=routing.routing_registry_binding_hash,
+        request=request,
+        reasoning_effort="max",
+    )
+    assert type(prepared).__name__ == "_PreparedHostFacts"
+    batch = adapter.compile_fast_lane_with_host_facts(
+        request,
+        reasoning_effort="max",
+        verified_host_facts=prepared,
+    )
+    assert type(batch) is dict
+    first = batch["assignments"][0]
+    route = first["route"]
+    receipt = session.send_fast_lane_dispatch_batch(
+        batch=batch,
+        binding=host_session.host_envelopes.EnvelopeBinding(
+            task_id=first["task_id"],
+            lease_epoch=first["lease_epoch"],
+            assignment_token=first["assignment_token"],
+            dispatch_context_hash=first["dispatch_binding_hash"],
+            route_hash=route["routing_result_hash"],
+            expires_at=1_700_000_120,
+        ),
+        correlation_id="operation-1",
+        now=1_700_000_000,
+        refill_callback=lambda trigger: {"trigger": dict(trigger)},
+        call_intent_hash=fixture["call_intent_hash"],
+        preparation_id=fixture["preparation_id"],
+    )
+    thread.join(timeout=2)
+    try:
+        assert type(receipt) is OperationReceipt
+        assert received == [receipt]
+    finally:
+        host.close()
+        child.close()
+
+
+def test_fast_lane_terminal_ack_removes_only_completed_assignment() -> None:
+    adapter = _adapter()
+    from devkit_runtime import host_bridge, host_envelopes
+    from devkit_runtime.host_session import HostSession
+
+    fixture = _authenticated_v5_fixture()
+    fact_a = _v5_dispatch_fact(adapter, fixture)
+    fact_b = replace(
+        fact_a,
+        task_id="TASK-V5-B",
+        route=replace(
+            fact_a.route,
+            routing_context_hash=_hash("c"),
+            routing_result_hash=_hash("d"),
+        ),
+        lease_id="lease-task-v5-b",
+        assignment_token=_hash("e"),
+        write_scope=("src/task_v5_b.py",),
+        dispatch_order=1,
+    )
+    mappings = [
+        adapter._dispatch_fact_mapping(fact) for fact in (fact_a, fact_b)
+    ]
+    batch: dict[str, object] = {
+        "schema": "2718lab-devkit/fastlane-host-dispatch-batch-v1",
+        "action": "dispatch_all",
+        "selection_authority": "host_attested_compiler",
+        "llm_choice": False,
+        "source_plan_hash": fact_a.source_plan_hash,
+        "ledger_epoch": fact_a.ledger_epoch,
+        "active_lease_set_hash": fact_a.active_lease_set_hash,
+        "dispatch_binding_hashes": [
+            mapping["dispatch_binding_hash"] for mapping in mappings
+        ],
+        "assignments": mappings,
+    }
+    batch["batch_hash"] = _canonical_hash(batch)
+    assert host_envelopes._validate_fast_lane_dispatch_batch(batch) == batch
+    child, host = _pipe_pair()
+    session = HostSession(bridge=child, clock=lambda: 1_700_000_000)
+    first_route = mappings[0]["route"]
+    binding = host_envelopes.EnvelopeBinding(
+        task_id=fact_a.task_id,
+        lease_epoch=fact_a.lease_epoch,
+        assignment_token=fact_a.assignment_token,
+        dispatch_context_hash=mappings[0]["dispatch_binding_hash"],
+        route_hash=first_route["routing_result_hash"],
+        expires_at=1_700_000_120,
+    )
+    received_dispatch: list[host_bridge.OperationReceipt] = []
+    refill_receipts: list[dict[str, object]] = []
+
+    def refill_callback(trigger: Mapping[str, object]) -> dict[str, object]:
+        receipt = {"state": "NO_QUEUED_WORK", **dict(trigger)}
+        refill_receipts.append(receipt)
+        return receipt
+    dispatch_reader = threading.Thread(
+        target=lambda: received_dispatch.append(
+            host.receive_fast_lane_dispatch_batch(now=1_700_000_000)
+        ),
+        daemon=True,
+    )
+    dispatch_reader.start()
+    receipt = session.send_fast_lane_dispatch_batch(
+        batch=batch,
+        binding=binding,
+        correlation_id="operation-2",
+        now=1_700_000_000,
+        call_intent_hash=fixture["call_intent_hash"],
+        preparation_id=fixture["preparation_id"],
+        refill_callback=refill_callback,
+    )
+    assert type(receipt) is host_bridge.OperationReceipt
+    dispatch_reader.join(timeout=2)
+    assert received_dispatch == [receipt]
+    expected = dict(
+        session._pending_fast_lane_terminals[(batch["batch_hash"], fact_a.task_id)].expected
+    )
+    terminal: dict[str, object] = {
+        "schema": "2718lab-devkit/fastlane-worker-terminal-result-v1",
+        **expected,
+        "terminal": "succeeded",
+        "result": ["result.verified"],
+        "risk": [],
+        "artifact_refs": [],
+        "digest_refs": [],
+        "event_seq": 1,
+        "expires_at": 1_700_000_120,
+    }
+    terminal["terminal_receipt_hash"] = _canonical_hash(terminal)
+    assert len(terminal) == 23
+    assert (
+        host_bridge._normalize_fast_lane_worker_terminal_result(
+            terminal,
+            expected=expected,
+            expires_at=1_699_999_999,
+            now=1_700_000_000,
+        )
+        == terminal
+    )
+    expired = {**terminal, "expires_at": 1_700_000_000}
+    expired["terminal_receipt_hash"] = _canonical_hash(
+        {key: value for key, value in expired.items() if key != "terminal_receipt_hash"}
+    )
+    with pytest.raises(
+        host_bridge.HostBridgeError,
+        match="HOST_BRIDGE_FAST_LANE_TERMINAL_INVALID",
+    ):
+        host_bridge._normalize_fast_lane_worker_terminal_result(
+            expired, expected=expected, now=1_700_000_000
+        )
+    invalid = {**terminal, "terminal": "cancelled"}
+    invalid["terminal_receipt_hash"] = _canonical_hash(
+        {key: value for key, value in invalid.items() if key != "terminal_receipt_hash"}
+    )
+    with pytest.raises(
+        host_bridge.HostBridgeError,
+        match="HOST_BRIDGE_FAST_LANE_TERMINAL_INVALID",
+    ):
+        host_bridge._normalize_fast_lane_worker_terminal_result(
+            invalid,
+            expected=expected,
+            expires_at=1_700_000_120,
+            now=1_700_000_000,
+        )
+    correlation_id = "terminal-" + "d" * 64
+    host.send_fast_lane_worker_terminal_result(
+        terminal_result=terminal,
+        correlation_id=correlation_id,
+        expected=expected,
+        expires_at=1_700_000_120,
+        now=1_700_000_000,
+    )
+    ack = host.receive_fast_lane_worker_terminal_ack(
+        terminal_result=terminal, correlation_id=correlation_id
+    )
+    assert type(ack) is dict and len(ack) == 9
+    deadline = time.monotonic() + 2
+    while not refill_receipts and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(refill_receipts) == 1
+    assert ack["refill_trigger_hash"] == refill_receipts[0]["refill_trigger_hash"]
+    assert (batch["batch_hash"], fact_a.task_id) not in session._pending_fast_lane_terminals
+    assert (batch["batch_hash"], fact_b.task_id) in session._pending_fast_lane_terminals
+    close_started = time.monotonic()
+    session.close()
+    assert time.monotonic() - close_started < 0.5
+    host.close()
+
+
+def test_compiler_evidence_cross_language_fixed_vector() -> None:
+    from devkit_runtime import host_bridge
+
+    vector = json.loads(
+        (MCP_TOOLS / "tests" / "compiler_evidence_vector.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    request = host_bridge._normalize_compiler_evidence_request(
+        vector["request"], now=1_700_000_000
+    )
+    assert len(vector["request"]) == 11
+    assert set(vector["request"]["assignment_skeletons"][0]) == {
+        "task_id",
+        "routing_proof",
+        "write_scope",
+        "concurrency_mode",
+        "dispatch_order",
+        "index_context_hash",
+        "predecessor_hash",
+        "source_plan_hash",
+    }
+    assert host_bridge._normalize_compiler_evidence_response(
+        vector["response"], request=request, now=1_700_000_000
+    ) == vector["response"]
+    assert vector["frame"]["canonical_payload_hash"] == _canonical_hash(
+        vector["request"]
+    )
+    for item in vector["project_index_attestations"]:
+        assert host_bridge._normalize_project_index_attestation(
+            item["payload"], now=1_700_000_000
+        ) == item["payload"]
+    read_fd, write_fd = os.pipe()
+    bridge = host_bridge.InheritedHandleHostBridge.from_file_descriptors(
+        read_fd=read_fd,
+        write_fd=write_fd,
+        session_key=bytes.fromhex(vector["frame"]["session_key_hex"]),
+        session_nonce=bytes.fromhex(vector["frame"]["session_nonce_hex"]),
+        owns_descriptors=True,
+    )
+    try:
+        frame = bridge._frame_bytes(
+            kind=vector["frame"]["kind"],
+            action_id=vector["frame"]["action_id"],
+            sequence=vector["frame"]["sequence"],
+            payload=vector["request"],
+        )
+        assert json.loads(frame[4:])["mac"] == vector["frame"]["mac"]
+        for item in vector["project_index_attestations"]:
+            sideband = bridge._frame_bytes(
+                kind="project_index_attestation",
+                action_id=item["payload"]["correlation_id"],
+                sequence=item["sequence"],
+                payload=item["payload"],
+            )
+            assert json.loads(sideband[4:])["mac"] == item["mac"]
+    finally:
+        bridge.close()
+
+
+def test_registry_hash_tamper_never_issues_compiler_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter()
+    import devkit_runtime.host_session as host_session
+    from devkit_runtime.host_bridge import InheritedHandleHostBridge
+
+    child, host = _pipe_pair()
+    fact = _dispatch_fact(adapter, task="task-1", scope="src/a.py")
+    request = _planner_request(adapter, (fact,))
+    fact_mapping = adapter._dispatch_fact_mapping(fact)
+
+    def host_reply() -> None:
+        evidence_request = host.receive_compiler_evidence_request(now=1_700_000_000)
+        host._send_private(
+            kind="compiler_evidence_response",
+            action_id=evidence_request.preparation_id,
+            payload={
+                "schema": "2718lab-devkit/compiler-evidence-response-v1",
+                "preparation_id": evidence_request.preparation_id,
+                "request_hash": evidence_request.request_hash,
+                "reasoning_effort": evidence_request.reasoning_effort,
+                "verified_route_result_hashes": [fact.route.routing_result_hash],
+                "verified_lease_scope_bindings": [
+                    adapter._lease_scope_binding_hash(fact)
+                ],
+                "dispatch_facts": [fact_mapping],
+                "dispatch_binding_hashes": [fact_mapping["dispatch_binding_hash"]],
+                "nonce": evidence_request.nonce,
+                "expires_at": evidence_request.expires_at,
+                "registry_binding_hash": _hash("0"),
+            },
+        )
+
+    thread = threading.Thread(target=host_reply, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        InheritedHandleHostBridge,
+        "from_environment",
+        classmethod(lambda cls, environ=None, *, platform=None: child),
+    )
+    session = host_session.HostSession.from_environment(
+        environ={}, platform="posix", clock=lambda: 1_700_000_000
+    )
+    try:
+        assert (
+            adapter.prepare_verified_host_facts(
+                session,
+                preparation_id="dispatch-private-2",
+                request=request,
+                reasoning_effort="high",
+            )
+            == adapter.NO_SAFE_WORK
+        )
+    finally:
+        thread.join(timeout=2)
+        child.close()
+        host.close()
 
 
 @pytest.mark.parametrize(
