@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import copy
 import hashlib
+import importlib.util
 import json
+import os
+from pathlib import Path
+
+import pytest
 
 
 def _canonical_hash(value: object) -> str:
@@ -92,101 +98,6 @@ def test_storage_intent_rejects_isolated_surrogate_with_stable_code() -> None:
         raise AssertionError("invalid surrogate was accepted")
 
 
-class _StorageBindingRoutingCore:
-    def load_policy_v5(self) -> dict[str, object]:
-        return {}
-
-    def policy_hash_v5(self, policy: object) -> str:
-        del policy
-        return _canonical_hash({"policy": "storage-binding"})
-
-    def _normalise_request_v5(
-        self, request: dict[str, object], policy: object
-    ) -> dict[str, object]:
-        del policy
-        return request
-
-    def v5_request_binding_hash(self, request: object) -> str:
-        return _canonical_hash(request)
-
-    def route_v5(
-        self, request: dict[str, object], *, policy: object
-    ) -> dict[str, object]:
-        del policy
-        task = request["task"]
-        assert isinstance(task, dict)
-        return {
-            "schema": "2718lab-devkit/fastlane-routing-result-v5",
-            "status": "resolved",
-            "task_id": task["task_id"],
-            "route": {
-                "model": "gpt-5.6-luna",
-                "effort": "max",
-                "inherit_current_session_model": False,
-            },
-        }
-
-
-class _StorageBindingApi:
-    def __init__(self) -> None:
-        self.core = _StorageBindingRoutingCore()
-
-    def _mapping(self, value: object, field: str) -> dict[str, object]:
-        assert isinstance(value, dict), field
-        return value
-
-    def _task_id(self, value: object, field: str) -> str:
-        assert isinstance(value, str), field
-        return value
-
-    def _normalised_scopes(self, value: object, field: str = "scope") -> list[str]:
-        assert isinstance(value, list), field
-        return value
-
-    def _canonical_json(self, value: object) -> str:
-        return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-
-    def _sha256_json(self, value: object) -> str:
-        return _canonical_hash(value)
-
-    def _hash(self, value: object, field: str) -> str:
-        assert isinstance(value, str), field
-        return value
-
-    def _text(self, value: object, field: str, *, maximum: int) -> str:
-        assert isinstance(value, str) and len(value) <= maximum, field
-        return value
-
-    def _exact_keys(
-        self, value: dict[str, object], expected: frozenset[str], field: str
-    ) -> None:
-        assert set(value) == expected, field
-
-    def _fast_lane_routing_core(self) -> _StorageBindingRoutingCore:
-        return self.core
-
-
-def _storage_binding_unit(task_id: str, dispatch_order: int) -> dict[str, object]:
-    return {
-        "task": {
-            "schema": "2718lab-devkit/task-routing-profile-v5",
-            "task_id": task_id,
-            "role": "execution",
-            "access": "workspace_write",
-            "write_scope_count": 1,
-            "overlap_risk": "none",
-            "overlap_count": 0,
-        },
-        "dependency_state": {"task_id": task_id},
-        "write_scope": [f"src/{task_id}.py"],
-        "concurrency_mode": "parallel",
-        "dispatch_order": dispatch_order,
-        "index_context_hash": "sha256:" + "b" * 64,
-        "workflow_id_hash": "sha256:" + "c" * 64,
-        "storage_budget": {"bytes": 4096, "files": 8},
-    }
-
-
 def _storage_binding_context() -> dict[str, object]:
     return {
         "execution_context_hash": "sha256:" + "4" * 64,
@@ -201,77 +112,190 @@ def _storage_binding_context() -> dict[str, object]:
     }
 
 
-def _storage_binding_request(
-    api: _StorageBindingApi, unit: dict[str, object], source_plan_hash: str
-) -> tuple[dict[str, object], dict[str, object]]:
-    task = unit["task"]
-    assert isinstance(task, dict)
-    request: dict[str, object] = {
-        "task": task,
-        "scheduler_facts": {"route_epoch": 1},
-        "child_route_attestation": None,
-    }
-    binding_hash = api.core.v5_request_binding_hash(request)
-    attestation: dict[str, object] = {
-        "request_binding_hash": binding_hash,
-        "attestation": {
-            "status": "attested",
-            "request_binding_hash": binding_hash,
+def _host_storage_intent(
+    *, task_id: str, plan_binding: str, context_hash: str
+) -> dict[str, object]:
+    context = _storage_binding_context()
+    descriptor = {
+        "schema": "2718lab.storage.target.v1",
+        "artifact_kind": "fastlane-task",
+        **{
+            key: value
+            for key, value in context.items()
+            if key != "execution_context_hash"
         },
     }
-    attestation_payload = attestation["attestation"]
-    assert isinstance(attestation_payload, dict)
-    attestation_payload["attestation_hash"] = _canonical_hash(
+    intent = {
+        "schema": "2718lab.storage.intent.v1",
+        "task_id": task_id,
+        "plan_binding": plan_binding,
+        "context_hash": context_hash,
+        "requested_bytes": 4096,
+        "requested_files": 8,
+        "target_descriptor": descriptor,
+    }
+    intent["storage_intent_hash"] = _canonical_hash(
         {
-            key: value
-            for key, value in attestation_payload.items()
-            if key != "attestation_hash"
+            key: intent[key]
+            for key in (
+                "target_descriptor",
+                "task_id",
+                "plan_binding",
+                "context_hash",
+                "requested_bytes",
+                "requested_files",
+            )
         }
     )
-    item = {
-        "task_id": task["task_id"],
-        "request_binding_hash": binding_hash,
-        "attestation": attestation_payload,
+    return intent
+
+
+def test_host_intent_requires_one_canonical_storage_binding_and_typed_failures() -> None:
+    from test_fastlane_host_intent import _intent, _with_binding
+    from devkit_runtime.fastlane_host_intent import (
+        NO_SAFE_WORK,
+        STORAGE_TARGET_KEY_INVALID,
+        StorageIntentError,
+        parse_host_execution_intent,
+        validate_host_execution_intent,
+    )
+
+    legacy = _intent()
+    legacy_result = parse_host_execution_intent(legacy)
+    assert isinstance(legacy_result, StorageIntentError)
+    assert legacy_result.code == STORAGE_TARGET_KEY_INVALID
+    assert validate_host_execution_intent(legacy) is NO_SAFE_WORK
+
+    candidate = _intent()
+    task_id = candidate["assignment"]["predecessor"]["task_id"]
+    source_plan_hash = candidate["source_plan_hash"]
+    context_hash = "sha256:" + "4" * 64
+    storage_intent = _host_storage_intent(
+        task_id=task_id,
+        plan_binding=source_plan_hash,
+        context_hash=context_hash,
+    )
+    candidate["storage_intent"] = storage_intent
+    candidate["execution_context_hash"] = context_hash
+    candidate["intent_hash"] = _canonical_hash(
+        {key: value for key, value in candidate.items() if key != "intent_hash"}
+    )
+    assert parse_host_execution_intent(candidate).storage_intent is not None
+
+    duplicate = copy.deepcopy(candidate)
+    duplicate["assignment"]["storage_intent"] = storage_intent
+    duplicate["assignment"] = _with_binding(
+        duplicate["assignment"], "assignment_binding_hash"
+    )
+    duplicate["intent_hash"] = _canonical_hash(
+        {key: value for key, value in duplicate.items() if key != "intent_hash"}
+    )
+    duplicate_result = parse_host_execution_intent(duplicate)
+    conflict = copy.deepcopy(candidate)
+    conflict["storage_intent"] = _host_storage_intent(
+        task_id=task_id,
+        plan_binding=source_plan_hash,
+        context_hash="sha256:" + "3" * 64,
+    )
+    conflict = _with_binding(conflict, "intent_hash")
+    conflict_result = parse_host_execution_intent(conflict)
+    for result in (duplicate_result, conflict_result):
+        assert isinstance(result, StorageIntentError)
+        assert result.code == STORAGE_TARGET_KEY_INVALID
+
+
+def _real_storage_request() -> tuple[
+    object,
+    object,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    str | None,
+]:
+    test_module_path = (
+        Path(__file__).resolve().parents[1]
+        / "devkit_fastlane"
+        / "tests"
+        / "test_team_efficiency.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "storage_test_team_efficiency_tests", test_module_path
+    )
+    assert spec is not None and spec.loader is not None
+    tests_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tests_module)
+
+    previous_task_temp = os.environ.get("CODEX_TASK_TEMP")
+    if previous_task_temp is None:
+        os.environ["CODEX_TASK_TEMP"] = str(
+            Path(__file__).resolve().parents[3]
+            / ".codex-task-temp"
+        )
+    fixture = tests_module.TeamEfficiencyTests("runTest")
+    fixture.setUp()
+    helper = tests_module.load_efficiency()
+    request = fixture.fast_lane_request(helper)
+    task_ids = [item["task_id"] for item in request["execution_contexts"]]
+    descriptor = {
+        key: value
+        for key, value in _storage_binding_context().items()
+        if key != "execution_context_hash"
     }
-    del source_plan_hash
-    return request, item
+    for context in request["execution_contexts"]:
+        context.update(
+            {
+                **descriptor,
+                "execution_context_hash": _canonical_hash(
+                    {"storage_context": context["task_id"]}
+                ),
+            }
+        )
+    request["storage_budgets"] = {
+        task_id: {"bytes": 4096 + index, "files": 8 + index}
+        for index, task_id in enumerate(task_ids)
+    }
+    host_status = fixture.fast_lane_host_status(helper, request)
+    route_request = host_status["routing_context"]["routes"][0]["request"]
+    host = copy.deepcopy(route_request["host_capabilities"])
+    host["models"] = [
+        {**model, "efforts": sorted(model["efforts"])} for model in host["models"]
+    ]
+    scheduler = route_request["scheduler_facts"]
+    return fixture, helper, request, host, scheduler, previous_task_temp
 
 
-def test_every_fastlane_wave_carries_plan_context_bound_storage_intent() -> None:
-    from devkit_fastlane.scripts.authenticated_v5_planner import compile_skeletons
+def test_real_prepare_entry_binds_initial_successor_and_missing_facts_fail_closed() -> None:
+    fixture, helper, request, host, scheduler, previous_task_temp = _real_storage_request()
+    try:
+        prepared = helper.prepare_authenticated_v5_routing_from_request(
+            request,
+            index_context_hash=helper._sha256_json({"index": "storage-real-entry"}),
+            host_capabilities=host,
+            scheduler_facts=scheduler,
+        )
+        for wave in (prepared["units"], prepared["remaining_units"]):
+            assert wave
+            for unit in wave:
+                intent = unit["storage_intent"]
+                assert intent["task_id"] == unit["task"]["task_id"]
+                assert intent["plan_binding"] == prepared["source_plan_hash"]
+                assert intent["context_hash"] == _canonical_hash(
+                    {"storage_context": unit["task"]["task_id"]}
+                )
 
-    api = _StorageBindingApi()
-    plan_hash = "sha256:" + "a" * 64
-    context = _storage_binding_context()
-    first_unit = _storage_binding_unit("task-01", 0)
-    successor_unit = _storage_binding_unit("task-02", 1)
-
-    first_request, first_attestation = _storage_binding_request(
-        api, first_unit, plan_hash
-    )
-    successor_request, successor_attestation = _storage_binding_request(
-        api, successor_unit, plan_hash
-    )
-    first = compile_skeletons(
-        api,
-        [first_unit],
-        source_plan_hash=plan_hash,
-        routing_requests=[first_request],
-        attestation_items=[first_attestation],
-        context=context,
-    )
-    successor = compile_skeletons(
-        api,
-        [successor_unit],
-        source_plan_hash=plan_hash,
-        routing_requests=[successor_request],
-        attestation_items=[successor_attestation],
-        context=context,
-    )
-
-    for wave in (first["assignment_skeletons"], successor["assignment_skeletons"]):
-        for assignment in wave:
-            intent = assignment["storage_intent"]
-            assert intent["task_id"] == assignment["task_id"]
-            assert intent["plan_binding"] == plan_hash
-            assert intent["context_hash"] == context["execution_context_hash"]
+        missing = copy.deepcopy(request)
+        for context in missing["execution_contexts"]:
+            context.pop("execution_context_hash")
+        with pytest.raises(ValueError, match="STORAGE_POLICY_MISSING"):
+            helper.prepare_authenticated_v5_routing_from_request(
+                missing,
+                index_context_hash=helper._sha256_json({"index": "storage-real-entry"}),
+                host_capabilities=host,
+                scheduler_facts=scheduler,
+            )
+    finally:
+        fixture.tearDown()
+        if previous_task_temp is None:
+            os.environ.pop("CODEX_TASK_TEMP", None)
+        else:
+            os.environ["CODEX_TASK_TEMP"] = previous_task_temp

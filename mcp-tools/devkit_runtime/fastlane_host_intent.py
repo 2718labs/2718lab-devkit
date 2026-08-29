@@ -62,10 +62,6 @@ _ASSIGNMENT_KEYS: Final = frozenset(
         "assignment_binding_hash",
     }
 )
-_ASSIGNMENT_STORAGE_KEYS: Final = _ASSIGNMENT_KEYS | {
-    "storage_intent",
-    "execution_context_hash",
-}
 _PREDECESSOR_KEYS: Final = frozenset(
     {
         "schema",
@@ -363,12 +359,14 @@ def validate_host_execution_intent(
 
 def parse_host_execution_intent(
     candidate: object,
-) -> ParsedHostExecutionIntent | Literal["NO_SAFE_WORK"]:
+) -> ParsedHostExecutionIntent | StorageIntentError | Literal["NO_SAFE_WORK"]:
     """Parse a candidate structurally; the result is never an authorization."""
 
     try:
         parsed = _parse(candidate)
-    except Exception:
+    except StorageIntentError as error:
+        return error
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, UnicodeError):
         return NO_SAFE_WORK
     return parsed if parsed is not None else NO_SAFE_WORK
 
@@ -407,11 +405,21 @@ def classify_host_scheduler_topology(
 
 
 def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
-    root = _bound_mapping_variant(
-        candidate,
-        (_ROOT_KEYS, _ROOT_STORAGE_KEYS),
-        "intent_hash",
-    )
+    if isinstance(candidate, dict) and candidate.get("schema") == _SCHEMA:
+        assignment_candidate = candidate.get("assignment")
+        if (
+            "storage_intent" not in candidate
+            or "execution_context_hash" not in candidate
+            or (
+                isinstance(assignment_candidate, dict)
+                and (
+                    "storage_intent" in assignment_candidate
+                    or "execution_context_hash" in assignment_candidate
+                )
+            )
+        ):
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+    root = _bound_mapping(candidate, _ROOT_STORAGE_KEYS, "intent_hash")
     if root is None or _text(root, "schema") != _SCHEMA:
         return None
 
@@ -427,10 +435,8 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
     ):
         return None
 
-    assignment = _bound_mapping_variant(
-        root["assignment"],
-        (_ASSIGNMENT_KEYS, _ASSIGNMENT_STORAGE_KEYS),
-        "assignment_binding_hash",
+    assignment = _bound_mapping(
+        root["assignment"], _ASSIGNMENT_KEYS, "assignment_binding_hash"
     )
     route = _bound_mapping(root["route"], _ROUTE_KEYS, "route_binding_hash")
     packets = _bound_mapping(root["packets"], _PACKET_KEYS, "packet_binding_hash")
@@ -510,30 +516,22 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         active_lease_set_hash,
     ) = validated_predecessor
 
-    storage_intent: StorageIntent | None = None
-    execution_context_hash: str | None = None
-    raw_storage_intent = root.get("storage_intent")
-    if raw_storage_intent is None and assignment is not None:
-        raw_storage_intent = assignment.get("storage_intent")
-    if raw_storage_intent is not None:
-        try:
-            storage_intent = parse_storage_intent(raw_storage_intent)
-        except StorageIntentError:
-            raise
-        except Exception as error:
-            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID) from error
-        raw_execution_context_hash = root.get("execution_context_hash")
-        if raw_execution_context_hash is None and assignment is not None:
-            raw_execution_context_hash = assignment.get("execution_context_hash")
-        if not _is_hash_value(raw_execution_context_hash):
-            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
-        execution_context_hash = cast(str, raw_execution_context_hash)
-        if (
-            storage_intent.task_id != task_id
-            or storage_intent.plan_binding != source_plan_hash
-            or storage_intent.context_hash != execution_context_hash
-        ):
-            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+    try:
+        storage_intent = parse_storage_intent(root["storage_intent"])
+    except StorageIntentError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError) as error:
+        raise StorageIntentError(STORAGE_TARGET_KEY_INVALID) from error
+    raw_execution_context_hash = root["execution_context_hash"]
+    if not _is_hash_value(raw_execution_context_hash):
+        raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+    execution_context_hash = cast(str, raw_execution_context_hash)
+    if (
+        storage_intent.task_id != task_id
+        or storage_intent.plan_binding != source_plan_hash
+        or storage_intent.context_hash != execution_context_hash
+    ):
+        raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
 
     capability_facts = _validate_capability_facts(root["capability_facts"])
     if capability_facts is None or not _has_candidate_capability_claim(

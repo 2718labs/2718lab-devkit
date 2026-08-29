@@ -85,10 +85,9 @@ def _storage_context_for_task(
 
 def _storage_value(
     context: Mapping[str, Any],
-    source_unit: Mapping[str, Any],
     field: str,
 ) -> object:
-    """Read one attested descriptor value from context or source unit."""
+    """Read one attested descriptor value from the canonical context."""
 
     candidates: list[Mapping[str, Any]] = [context]
     for container_name in (
@@ -105,31 +104,17 @@ def _storage_value(
     for candidate in candidates:
         if field in candidate:
             return candidate[field]
-    if field in source_unit:
-        return source_unit[field]
-    task = source_unit.get("task")
-    if isinstance(task, Mapping) and field in task:
-        return task[field]
     return None
 
 
-def _storage_execution_context_hash(
-    context: Mapping[str, Any], source_unit: Mapping[str, Any]
-) -> object:
-    value = context.get("execution_context_hash")
-    if value is None:
-        value = source_unit.get("execution_context_hash")
-    return value
+def _storage_execution_context_hash(context: Mapping[str, Any]) -> object:
+    return context.get("execution_context_hash")
 
 
 def _storage_budget(
     source_unit: Mapping[str, Any],
 ) -> tuple[int, int]:
     budget = source_unit.get("storage_budget")
-    if budget is None:
-        task = source_unit.get("task")
-        if isinstance(task, Mapping):
-            budget = task.get("storage_budget")
     if not isinstance(budget, Mapping):
         raise ValueError(_STORAGE_POLICY_MISSING)
     requested_bytes = budget.get("bytes")
@@ -158,7 +143,7 @@ def _make_storage_intent(
 
     source_hash = api._hash(source_plan_hash, "source_plan_hash")
     task_context = _storage_context_for_task(context, task_id)
-    context_hash = _storage_execution_context_hash(task_context, source_unit)
+    context_hash = _storage_execution_context_hash(task_context)
     try:
         context_hash = api._hash(
             context_hash,
@@ -171,7 +156,7 @@ def _make_storage_intent(
         "schema": _STORAGE_TARGET_SCHEMA,
         "artifact_kind": "fastlane-task",
         **{
-            field: _storage_value(task_context, source_unit, field)
+            field: _storage_value(task_context, field)
             for field in _STORAGE_DESCRIPTOR_FIELDS
         },
     }
@@ -225,7 +210,9 @@ def _validate_storage_intent(
         code = getattr(error, "code", _STORAGE_TARGET_KEY_INVALID)
         raise ValueError(code) from error
     task_context = _storage_context_for_task(context, task_id)
-    expected_context = _storage_execution_context_hash(task_context, source_unit)
+    expected_context = _storage_execution_context_hash(task_context)
+    if context is not None and expected_context is None:
+        raise ValueError(_STORAGE_POLICY_MISSING)
     if expected_context is not None:
         try:
             expected_context = api._hash(
@@ -264,6 +251,9 @@ def _unit_storage_intent(
     source_plan_hash: str,
     context: Mapping[str, Any] | None,
 ) -> dict[str, object]:
+    # A pre-bound intent is not permission to invent a budget at compile time.
+    # Every compiler unit must carry the explicit request/source-unit budget.
+    _storage_budget(unit)
     supplied = unit.get("storage_intent")
     if supplied is None:
         return _make_storage_intent(
