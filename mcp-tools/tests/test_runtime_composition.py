@@ -1243,6 +1243,41 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
         store.close()
 
 
+@pytest.mark.parametrize("schema_version", (6, 7, 8, 9, 10))
+def test_sqlite_store_bootstraps_verified_legacy_empty_outbox(
+    tmp_path: Path, schema_version: int
+) -> None:
+    database, _, _ = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=f"sha256:{'a' * 64}"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        for trigger_name in (
+            "atlas_finalizations_no_update",
+            "atlas_finalizations_no_delete",
+            "atlas_finalizations_require_projected_outbox",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+        connection.execute("DROP TABLE atlas_finalizations")
+        connection.execute("DELETE FROM atlas_ingestion_outbox")
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+            (str(schema_version),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SQLiteStore(database)
+    try:
+        assert store.schema_version() == 13
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
 def test_sqlite_store_fails_closed_for_legacy_null_outbox_key(tmp_path: Path) -> None:
     database, _, _ = _legacy_v10_atlas_outbox_database(tmp_path, ingestion_key=None)
 
