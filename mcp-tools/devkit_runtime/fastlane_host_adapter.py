@@ -167,6 +167,7 @@ class _PreparedHostFacts:
     preparation_id: str | None = None
     call_intent_hash: str | None = None
     storage_budgets: tuple[tuple[str, int, int], ...] = ()
+    storage_intents: tuple[dict[str, object], ...] = field(default=(), repr=False)
 
 
 def _normalized_storage_budgets(
@@ -368,6 +369,7 @@ def prepare_verified_host_facts(
     try:
         normalized_storage_budgets = _normalized_storage_budgets(storage_budgets)
         bridge_attested = False
+        skeletons: tuple[dict[str, object], ...] = ()
         if request is not None or reasoning_effort is not None:
             normalized_request = _planner_request(request)
             request_bytes = _canonical_bytes(normalized_request)
@@ -432,6 +434,7 @@ def prepare_verified_host_facts(
                     str, routing_registry_binding_hash
                 ),
                 storage_task_ids=(storage_task_ids if normalized_storage_budgets else ()),
+                storage_budget_bindings=normalized_storage_budgets,
             )
             if not bridge_attested:
                 return NO_SAFE_WORK
@@ -449,6 +452,24 @@ def prepare_verified_host_facts(
         expires_at = session.compiler_evidence_expires_at(evidence)
         if expires_at is None:
             return NO_SAFE_WORK
+        storage_intents: tuple[dict[str, object], ...] = ()
+        if normalized_storage_budgets:
+            profiles = session.storage_profiles_for_compiler_evidence(evidence)
+            if type(profiles) is not tuple:
+                return NO_SAFE_WORK
+            storage_intents = tuple(
+                _storage_intents_for_profiles(
+                    profiles,
+                    skeletons,
+                    normalized_storage_budgets,
+                )
+            )
+            if not session.bind_storage_intent_proof(
+                evidence,
+                storage_budgets=normalized_storage_budgets,
+                storage_intents=storage_intents,
+            ):
+                return NO_SAFE_WORK
         return _PreparedHostFacts(
             session=session,
             evidence=evidence,
@@ -460,6 +481,7 @@ def prepare_verified_host_facts(
                 cast(str, call_intent_hash) if bridge_attested else None
             ),
             storage_budgets=normalized_storage_budgets,
+            storage_intents=storage_intents,
         )
     except Exception:
         return NO_SAFE_WORK
@@ -567,16 +589,35 @@ def compile_fast_lane_with_host_facts(
         _validate_batch_fences(facts)
         # Storage intents are local compiler proof material only in Task4a.  Do
         # not extend the established dispatch-batch schema before Task4b owns
-        # Host admission/execution.  Constructing them here still validates the
-        # Host profile order, the caller budgets, and every profile/dispatch
-        # binding after the full compiler evidence response has been verified.
+        # Host admission/execution. They are constructed and sealed into the
+        # private compiler invocation after the profile exchange, then
+        # re-derived here to reject a changed budget/profile/intent binding.
         if prepared.storage_budgets:
-            _storage_intents_for_profiles(
-                material.storage_profiles,
-                fact_mappings,
-                prepared.storage_budgets,
+            storage_intents = tuple(
+                _storage_intents_for_profiles(
+                    material.storage_profiles,
+                    fact_mappings,
+                    prepared.storage_budgets,
+                )
             )
-        elif material.storage_profiles:
+            storage_intent_hashes = tuple(
+                cast(str, intent["storage_intent_hash"])
+                for intent in storage_intents
+            )
+            if (
+                material.storage_budget_bindings != prepared.storage_budgets
+                or material.storage_intents != storage_intents
+                or material.storage_intent_hashes != storage_intent_hashes
+                or prepared.storage_intents != storage_intents
+            ):
+                return NO_SAFE_WORK
+        elif (
+            material.storage_profiles
+            or material.storage_budget_bindings
+            or material.storage_intents
+            or material.storage_intent_hashes
+            or prepared.storage_intents
+        ):
             return NO_SAFE_WORK
         batch: dict[str, object] = {
             "schema": "2718lab-devkit/fastlane-host-dispatch-batch-v1",

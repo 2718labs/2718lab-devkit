@@ -123,6 +123,7 @@ def _authenticated_v5_fixture() -> dict[str, object]:
         "dispatch_order": 0,
         "index_context_hash": hash_a,
         "predecessor_hash": hash_b,
+        "storage_budget": {"bytes": 4096, "files": 8},
     }
     api = team_efficiency._AuthenticatedV5Api()
     planner = team_efficiency._authenticated_v5_helper_module("authenticated_v5_planner")
@@ -449,6 +450,8 @@ def test_verified_private_profile_round_trip_constructs_local_intent(
             storage_budgets={"TASK-V5": {"bytes": 4096, "files": 8}},
         )
         assert type(prepared).__name__ == "_PreparedHostFacts"
+        assert len(prepared.storage_intents) == 1
+        assert prepared.storage_intents[0]["task_id"] == "TASK-V5"
         batch = adapter.compile_fast_lane_with_host_facts(
             fixture["planner_request"],
             reasoning_effort="max",

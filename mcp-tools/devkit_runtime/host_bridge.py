@@ -3081,7 +3081,12 @@ def _storage_profile_action_id(request: StorageProfileRequest) -> str:
     normalized = _normalize_storage_profile_request(
         _storage_profile_request_payload(request)
     )
-    return normalized.request_hash[7:]
+    # The Host multiplexes the private profile exchange under the same
+    # preparation action as compiler evidence.  ``request_hash`` is still
+    # verified from the exact eight-field payload, but it is not a wire action
+    # identifier; Rust therefore requires this exact preparation id on both
+    # the request and response frames.
+    return normalized.preparation_id
 
 
 def _parse_storage_profile_request(
