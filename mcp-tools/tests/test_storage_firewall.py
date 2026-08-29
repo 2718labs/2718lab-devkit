@@ -561,6 +561,7 @@ def test_storage_admission_rejects_substitution_and_unknown_fields() -> None:
     for field, value in (("target_key", _hash("f")), ("storage_intent_hash", _hash("f")),
                          ("profile_attestation_hash", _hash("f")), ("reserved_bytes", True),
                          ("reserved_files", 9), ("expires_at", 1_700_000_000),
+                         ("free_space_floor", 0),
                          ("admission_id", "G:/private"), ("assigned_root", "G:/private")):
         candidate = copy.deepcopy(response)
         candidate["receipt"][field] = value
