@@ -177,6 +177,8 @@ _VALIDATED_PRIVATE_KINDS: Final = frozenset(
         "proof_continuation",
         "compiler_evidence_request",
         "compiler_evidence_response",
+        "storage_profile_request",
+        "storage_profile_response",
         "project_index_attestation",
         "routing_attestation_request",
         "routing_attestation_response",
