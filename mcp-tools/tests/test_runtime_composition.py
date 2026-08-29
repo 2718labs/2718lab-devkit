@@ -1616,6 +1616,48 @@ def test_sqlite_store_rejects_legacy_atlas_outbox_row_contract_drift(
         connection.close()
 
 
+@pytest.mark.parametrize("binding_drift", ("identity", "payload"))
+def test_sqlite_store_rejects_legacy_outbox_acceptance_binding_drift(
+    tmp_path: Path, binding_drift: str
+) -> None:
+    database, acceptance_id, _ = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=f"sha256:{'a' * 64}"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        if binding_drift == "identity":
+            other_acceptance_id, _ = _insert_legacy_atlas_acceptance(
+                connection, suffix="b"
+            )
+            connection.execute(
+                "UPDATE atlas_ingestion_outbox SET acceptance_id = ?",
+                (other_acceptance_id,),
+            )
+        else:
+            connection.execute(
+                "UPDATE code_task_acceptances SET payload_json = ? "
+                "WHERE acceptance_id = ?",
+                ('{"different":true}', acceptance_id),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreError, match="legacy atlas outbox row is invalid"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("10",)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
 def test_sqlite_store_bootstraps_verified_legacy_empty_outbox(
     tmp_path: Path,
 ) -> None:
