@@ -7084,11 +7084,33 @@ class SQLiteStore:
                 0 if name == "ingestion_key" else not_null,
                 primary_key,
                 0,
+                None,
             )
             for name, column_type, not_null, primary_key in _ATLAS_OUTBOX_COLUMN_CONTRACT
         )
-        if _table_column_contract(cursor, "atlas_ingestion_outbox") != expected_columns:
+        actual_columns = tuple(
+            (
+                str(row["name"]),
+                str(row["type"]).casefold(),
+                int(row["notnull"]),
+                int(row["pk"]),
+                int(row["hidden"]),
+                row["dflt_value"],
+            )
+            for row in cursor.execute(
+                "PRAGMA table_xinfo(atlas_ingestion_outbox)"
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
             raise StoreError("orchestrator store is not prepared")
+
+        table_sql = _table_sql(cursor, "atlas_ingestion_outbox")
+        table_tokens = _sqlite_schema_tokens(table_sql)
+        for index, token in enumerate(table_tokens):
+            if token == "collate" and (
+                index + 1 == len(table_tokens) or table_tokens[index + 1] != "binary"
+            ):
+                raise StoreError("orchestrator store is not prepared")
 
         def index_columns(index_name: object) -> tuple[str, ...]:
             if type(index_name) is not str:
@@ -7099,6 +7121,44 @@ class SQLiteStore:
                 for row in cursor.execute(f'PRAGMA index_info("{identifier}")').fetchall()
             )
 
+        def validate_index_xinfo(
+            index_name: object, expected_columns: tuple[str, ...]
+        ) -> None:
+            if type(index_name) is not str:
+                raise ValueError("index name is invalid")
+            identifier = index_name.replace('"', '""')
+            info_rows = cursor.execute(
+                f'PRAGMA index_xinfo("{identifier}")'
+            ).fetchall()
+            key_rows = [row for row in info_rows if int(row["key"])]
+            if len(key_rows) != len(expected_columns):
+                raise StoreError("orchestrator store is not prepared")
+            for sequence, (row, expected_column) in enumerate(
+                zip(key_rows, expected_columns, strict=True)
+            ):
+                if (
+                    int(row["seqno"]) != sequence
+                    or int(row["cid"]) != _ATLAS_OUTBOX_COLUMNS.index(expected_column)
+                    or row["name"] != expected_column
+                    or str(row["coll"]).casefold() != "binary"
+                    or int(row["desc"]) != 0
+                    or int(row["key"]) != 1
+                ):
+                    raise StoreError("orchestrator store is not prepared")
+            non_key_rows = [row for row in info_rows if not int(row["key"])]
+            if len(non_key_rows) != 1:
+                raise StoreError("orchestrator store is not prepared")
+            non_key = non_key_rows[0]
+            if (
+                int(non_key["seqno"]) != len(expected_columns)
+                or int(non_key["cid"]) != -1
+                or non_key["name"] is not None
+                or str(non_key["coll"]).casefold() != "binary"
+                or int(non_key["desc"]) != 0
+                or int(non_key["key"]) != 0
+            ):
+                raise StoreError("orchestrator store is not prepared")
+
         unique_indexes: set[tuple[tuple[str, ...], str]] = set()
         non_unique_indexes: set[tuple[tuple[str, ...], str, str]] = set()
         index_rows = cursor.execute(
@@ -7108,6 +7168,7 @@ class SQLiteStore:
             if int(index["partial"]):
                 raise StoreError("orchestrator store is not prepared")
             columns = index_columns(index["name"])
+            validate_index_xinfo(index["name"], columns)
             origin = str(index["origin"]).casefold()
             if int(index["unique"]):
                 unique_indexes.add((columns, origin))
@@ -7146,10 +7207,7 @@ class SQLiteStore:
         if (
             _foreign_key_contract(cursor, "atlas_ingestion_outbox")
             != expected_foreign_keys
-            or _sqlite_check_expressions(
-                _table_sql(cursor, "atlas_ingestion_outbox")
-            )
-            != _ATLAS_OUTBOX_REQUIRED_CHECKS
+            or _sqlite_check_expressions(table_sql) != _ATLAS_OUTBOX_REQUIRED_CHECKS
         ):
             raise StoreError("orchestrator store is not prepared")
 
@@ -7192,6 +7250,11 @@ class SQLiteStore:
                     row["state"] == "pending"
                     and row["attempt_count"] > 0
                     and not row["last_error_code"]
+                )
+                or (
+                    row["state"] == "pending"
+                    and row["attempt_count"] == 0
+                    and row["last_error_code"] != ""
                 )
             ):
                 raise StoreError("legacy atlas outbox row is invalid")
