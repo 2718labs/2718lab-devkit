@@ -7259,20 +7259,48 @@ class SQLiteStore:
                 )
             ):
                 raise StoreError("legacy atlas outbox row is invalid")
-            acceptance = cursor.execute(
-                "SELECT acceptance_id, payload_hash, payload_json "
-                "FROM code_task_acceptances WHERE acceptance_id = ?",
-                (row["acceptance_id"],),
-            ).fetchone()
-            if (
-                acceptance is None
-                or row["acceptance_id"] != acceptance["acceptance_id"]
-                or row["ingestion_key"] != acceptance["payload_hash"]
-                or row["acceptance_id"] != acceptance["payload_hash"]
-                or row["payload_json"] != acceptance["payload_json"]
-            ):
-                raise StoreError("legacy atlas outbox row is invalid")
             try:
+                acceptance = cursor.execute(
+                    """
+                    SELECT acceptance_id, workflow_id, code_task_id,
+                           code_task_version, input_snapshot_id,
+                           output_snapshot_id, indexed_diff_hash, intent_id,
+                           language, framework, payload_json, payload_hash
+                    FROM code_task_acceptances
+                    WHERE acceptance_id = ?
+                    """,
+                    (row["acceptance_id"],),
+                ).fetchone()
+                if acceptance is None:
+                    raise ValueError("referenced acceptance is missing")
+                canonical_acceptance_payload = (
+                    cls._canonical_code_task_acceptance_payload(
+                        workflow_id=acceptance["workflow_id"],
+                        task_id=acceptance["code_task_id"],
+                        task_version=acceptance["code_task_version"],
+                        input_snapshot_id=acceptance["input_snapshot_id"],
+                        output_snapshot_id=acceptance["output_snapshot_id"],
+                        indexed_diff_hash=acceptance["indexed_diff_hash"],
+                        intent_id=acceptance["intent_id"],
+                        language=acceptance["language"],
+                        framework=acceptance["framework"],
+                    )
+                )
+                canonical_acceptance_hash = _payload_hash(
+                    canonical_acceptance_payload
+                )
+                if (
+                    row["acceptance_id"] != acceptance["acceptance_id"]
+                    or row["ingestion_key"] != acceptance["payload_hash"]
+                    or row["acceptance_id"] != acceptance["payload_hash"]
+                    or row["payload_json"] != acceptance["payload_json"]
+                    or acceptance["payload_json"] != canonical_acceptance_payload
+                    or acceptance["payload_hash"] != canonical_acceptance_hash
+                    or acceptance["acceptance_id"] != canonical_acceptance_hash
+                    or row["payload_hash"] != _payload_hash(row["payload_json"])
+                    or row["payload_hash"] != canonical_acceptance_hash
+                ):
+                    raise ValueError("legacy acceptance content address mismatch")
                 if (
                     row["created_at"] != _utc_timestamp(row["created_at"])
                     or row["updated_at"] != _utc_timestamp(row["updated_at"])
