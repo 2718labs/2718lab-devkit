@@ -841,21 +841,25 @@ def _atlas_outbox_schema(
     equality_check: str = "CHECK (ingestion_key = payload_hash)",
     state_check: str = "CHECK (state IN ('pending', 'projected', 'quarantined'))",
     attempt_check: str = "CHECK (attempt_count BETWEEN 0 AND 16)",
+    column_collation: str = "",
 ) -> str:
     def not_null(column: str) -> str:
         return "" if nullable_column == column else " NOT NULL"
 
+    def text_type(column: str) -> str:
+        return f"TEXT{column_collation}{not_null(column)}"
+
     payload_json = (
-        f"payload_json TEXT{not_null('payload_json')},"
+        f"payload_json {text_type('payload_json')},"
         if include_payload_json
         else ""
     )
     if partial_unique_indexes:
         acceptance_id = (
-            f"acceptance_id TEXT{not_null('acceptance_id')} "
+            f"acceptance_id {text_type('acceptance_id')} "
             "REFERENCES code_task_acceptances(acceptance_id),"
         )
-        payload_hash = f"payload_hash TEXT{not_null('payload_hash')},"
+        payload_hash = f"payload_hash {text_type('payload_hash')},"
         unique_indexes = """
             CREATE UNIQUE INDEX atlas_outbox_acceptance_partial
                 ON atlas_ingestion_outbox(acceptance_id)
@@ -866,23 +870,23 @@ def _atlas_outbox_schema(
         """
     else:
         acceptance_id = (
-            f"acceptance_id TEXT{not_null('acceptance_id')} UNIQUE "
+            f"acceptance_id {text_type('acceptance_id')} UNIQUE "
             "REFERENCES code_task_acceptances(acceptance_id),"
         )
-        payload_hash = f"payload_hash TEXT{not_null('payload_hash')} UNIQUE,"
+        payload_hash = f"payload_hash {text_type('payload_hash')} UNIQUE,"
         unique_indexes = ""
     return f"""
         CREATE TABLE atlas_ingestion_outbox (
-            ingestion_key TEXT PRIMARY KEY,
+            ingestion_key TEXT{column_collation} PRIMARY KEY,
             {acceptance_id}
             {payload_json}
             {payload_hash}
-            state TEXT{not_null('state')} {state_check},
+            state {text_type('state')} {state_check},
             attempt_count INTEGER{not_null('attempt_count')} {attempt_check},
-            last_error_code TEXT{not_null('last_error_code')},
-            reason_codes_json TEXT{not_null('reason_codes_json')},
-            created_at TEXT{not_null('created_at')},
-            updated_at TEXT{not_null('updated_at')},
+            last_error_code {text_type('last_error_code')},
+            reason_codes_json {text_type('reason_codes_json')},
+            created_at {text_type('created_at')},
+            updated_at {text_type('updated_at')},
             {equality_check}
         );
         {unique_indexes}
@@ -940,9 +944,11 @@ def _legacy_v6_schema() -> str:
         );
         CREATE INDEX idx_code_task_receipt_owners_task
             ON code_task_receipt_owners(task_id, code_task_version, attestation_hash, receipt_id);
-        {_atlas_outbox_schema()}
+        {_atlas_outbox_schema(column_collation=" COLLATE BINARY")}
         CREATE INDEX idx_atlas_outbox_pending
-            ON atlas_ingestion_outbox(state, created_at, ingestion_key);
+            ON atlas_ingestion_outbox(
+                state ASC, created_at ASC, ingestion_key ASC
+            );
         CREATE TABLE task_dependencies (
             task_id TEXT NOT NULL REFERENCES tasks(id), dependency_id TEXT NOT NULL REFERENCES tasks(id),
             PRIMARY KEY (task_id, dependency_id)
@@ -1495,11 +1501,55 @@ def test_sqlite_store_bootstraps_true_legacy_v6_empty_outbox(
 
 
 @pytest.mark.parametrize(
+    "semantic_drift", ("column-nocase", "pending-nocase-desc")
+)
+def test_sqlite_store_rejects_legacy_v6_semantic_shape_drift(
+    tmp_path: Path, semantic_drift: str
+) -> None:
+    database, _, _ = _legacy_v6_atlas_outbox_database(
+        tmp_path, ingestion_key=f"sha256:{'a' * 64}"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        if semantic_drift == "column-nocase":
+            connection.execute("DROP TABLE atlas_ingestion_outbox")
+            connection.executescript(
+                _atlas_outbox_schema(column_collation=" COLLATE NOCASE")
+            )
+            connection.execute(
+                "CREATE INDEX idx_atlas_outbox_pending "
+                "ON atlas_ingestion_outbox(state ASC, created_at ASC, ingestion_key ASC)"
+            )
+        else:
+            connection.execute("DROP INDEX idx_atlas_outbox_pending")
+            connection.execute(
+                "CREATE INDEX idx_atlas_outbox_pending "
+                "ON atlas_ingestion_outbox("
+                "state COLLATE NOCASE DESC, created_at ASC, ingestion_key ASC)"
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("6",)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
     "outbox_update",
     (
         {"state": "projected", "attempt_count": 0, "last_error_code": "ERR"},
         {"state": "quarantined", "attempt_count": 0, "last_error_code": ""},
         {"state": "pending", "attempt_count": 1, "last_error_code": ""},
+        {"state": "pending", "attempt_count": 0, "last_error_code": "ERR"},
         {
             "state": "pending",
             "attempt_count": 0,
@@ -1512,6 +1562,7 @@ def test_sqlite_store_bootstraps_true_legacy_v6_empty_outbox(
         "projected-error",
         "quarantined-missing-error",
         "pending-retry-missing-error",
+        "pending-initial-error",
         "non-utc-timestamp",
     ),
 )
