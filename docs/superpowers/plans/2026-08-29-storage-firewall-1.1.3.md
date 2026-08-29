@@ -8,12 +8,16 @@
 
 **Tech Stack:** Python 3.11 standard library (`dataclasses`, `hashlib`, `json`, `pathlib`), MCP FastMCP/Pydantic, Rust 2021, `serde`/`serde_json`, `sha2`, Tokio, platform filesystem-capacity APIs, and the existing authenticated inherited-handle bridge.
 
-**Revision status (2026-08-30):** This is an unpublished protocol revision made
-after the existing Task 4a slice passed its compile checks. That result does
-not mean admission, group reservations, or successor production wiring below
-is implemented. The unpublished admission-v1 request changes from exact4 to
-exact5; intent/target/profile-v1 stay unchanged. If exact4 has been deployed
-outside these worktrees, use admission-v2 instead and reject downgrade.
+**Revision status (2026-08-30):** This is an unpublished protocol revision.
+Preserve the implemented Task 4 profile/Sent/admission exchange and Task 5
+shared codec/kernel contracts and their recorded compile evidence; the Host
+aggregate two-crate check at `99e5` was reported exit 0. That is not Task 6
+production acceptance. Task 6 below records the remaining configuration,
+runtime sharing, filesystem ordering, process-proof, and postcheck work; no
+checkbox is completed by this documentation update. The unpublished
+admission-v1 request is exact5, replacing exact4; intent/target/profile-v1 stay
+unchanged. If exact4 has been deployed outside these worktrees, use admission-v2
+instead and reject downgrade.
 
 **Compile-first execution:** Reuse the Host's existing
 `G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\target`,
@@ -27,10 +31,10 @@ claims that the revised contract is complete.
 
 ## Scope and file map
 
-All line references are against commit `37029a9` in the DevKit worktree and
-commit `552fe8035d` in the Codex Host worktree. A worker must re-read the
-symbol at the listed line before editing because earlier tasks can shift line
-numbers.
+Original line references are against commit `37029a9` in the DevKit worktree
+and commit `552fe8035d` in the Codex Host worktree. Task 6's symbol map was
+refreshed from the Host `f26f6ae` working tree and concurrent Task 4/5 repairs.
+Re-read each named symbol before editing; later commits shift line numbers.
 
 DevKit files:
 
@@ -83,20 +87,49 @@ Codex Host files:
   to share Host-derived profile construction with selected-wave authority;
   successor materialization must not fabricate a bridge request.
 - Modify `codex-rs/core/src/fast_lane_host_dispatch/registry.rs:567-1668` to
-  reserve the target-family key before writer preparation and
-  `coordinator.rs:393-580,1218-1260` to release the admission on terminal or
-  recovery paths.
+  reserve/seal before filesystem materialization and consume before writer
+  preparation; modify `coordinator.rs:393-580,1218-1260` to settle only after
+  confirmed process-tree shutdown and successful family postcheck.
 - Modify `codex-rs/core/src/fast_lane_host_dispatch/codex_adapter.rs:1-1444`
   at worker environment construction so the host-issued root is the sole
   `CARGO_TARGET_DIR`/task-temp value.
 - Modify the existing `codex-rs/core/src/fast_lane_host_dispatch/storage_firewall_tests.rs`;
   preserve its sibling-module registration in `mod.rs`.
-- Modify `codex-rs/core/Cargo.toml:80-145` by adding
-  `[target.'cfg(target_os = "windows")'.dependencies] windows-sys = {
-  version = "0.52", features = ["Win32_Storage_FileSystem"] }`, matching the
-  existing CLI dependency version; then update `codex-rs/Cargo.lock` and
-  `MODULE.bazel.lock` at the Host repository root in the same Host commit
-  when dependency changes require them.
+- Modify `codex-rs/config/src/config_toml.rs` (`ConfigToml`),
+  `codex-rs/core/src/config/mod.rs` (`Config::load_config_with_layer_stack`),
+  and generated `codex-rs/core/config.schema.json` for the explicit Host
+  storage block. Read existing `config/src/config_layer_source.rs` for trust
+  provenance and `config/src/schema.rs::write_config_schema` for generation.
+- Modify `codex-rs/app-server/src/message_processor.rs`,
+  `codex-rs/core/src/thread_manager.rs` (`ThreadManagerState`),
+  `codex-rs/core/src/session/mod.rs` (`SessionSpawnArgs`),
+  `codex-rs/core/src/session/session.rs`, and
+  `codex-rs/core/src/state/service.rs` (`SessionServices`) to inject one
+  Host-runtime service Arc into all registries. Create
+  `codex-rs/core/src/fast_lane_host_dispatch/storage_service.rs` for that
+  authority/ledger facade, registering it in the existing dispatch `mod.rs`.
+- Modify `codex-rs/core/src/mcp_tool_call.rs` and
+  `codex-rs/core/src/fast_lane_host_dispatch/worktree.rs` for planned versus
+  materialized roots; no pre-admission `create_dir_all` remains.
+- Modify `codex-rs/core/src/unified_exec/mod.rs`, `process.rs`, and
+  `process_manager.rs`; `codex-rs/utils/pty/src/process.rs` and `win/job.rs`;
+  and `codex-rs/core/src/session/handlers.rs` and `agent/control/legacy.rs`
+  for actual owned-process termination evidence. Read/reuse
+  `codex-rs/exec-server/src/process.rs` lifecycle events; modify that boundary
+  only if its existing exit events cannot carry the required confirmation.
+- Modify `codex-rs/protocol/src/shell_environment.rs` at final environment
+  assembly, alongside core permissions/worker configuration, so reserved
+  environment values survive filtering and cannot be replaced by per-call
+  overrides in the storage-managed execution path.
+- Create `codex-rs/core/src/fast_lane_host_dispatch/storage_postcheck.rs` and
+  register it in `mod.rs`: real no-follow family/member observations after
+  the process fence, not caller-supplied counters.
+
+The capacity provider now reuses existing platform FFI; no new Windows
+dependency is required. Do not change manifests/locks for this documentation
+or add a dependency merely because an older example requested it.
+`MODULE.bazel.lock`, if a separately justified dependency change needs it,
+is at the Host repository root, not under `codex-rs`.
 
 The worker must not edit any file outside this map. The ledger, preview/apply,
 source authorization, and session CAS changes belong to Plans 2 and 3.
@@ -143,8 +176,12 @@ The exact successful `StorageAdmissionReceipt` decision has these fields:
 `expires_at`, `receipt_hash`.
 
 Its schema is `2718lab.storage.admission-receipt.v1`; `receipt_hash` hashes
-all decision fields except itself. The successful private response envelope
-is exact `{schema, correlation_id, request_hash, receipt}` with schema
+all decision fields except itself. Both Host-minted IDs, `admission_id` and
+`target_family_lease_id` (the internal family lease ID), are strictly
+`sha256:` followed by 64 lowercase hexadecimal characters, not UUIDs, paths,
+or arbitrary opaque strings. Keep that exact wire field name; do not add a
+second `family_lease_id` alias to the exact receipt. The successful private
+response envelope is exact `{schema, correlation_id, request_hash, receipt}` with schema
 `2718lab.storage.admission-response.v1`. A failure uses the existing bounded
 transport error path with a stable code, never a fabricated zero reservation.
 The internal transport-completion receipt separately records response hash,
@@ -491,8 +528,6 @@ Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2';
 - Create: `codex-rs/core/src/fast_lane_host_dispatch/storage_firewall.rs`
 - Modify: `codex-rs/core/src/fast_lane_host_dispatch/storage_firewall_tests.rs`
 - Modify: `codex-rs/core/src/fast_lane_host_dispatch/mod.rs:1-49`
-- Modify: `codex-rs/core/Cargo.toml:80-145`
-- Modify if dependencies change: `codex-rs/Cargo.lock` and Host-root `MODULE.bazel.lock`
 
 - [ ] **Step 1: Add the Rust RED target-key vectors.**
 
@@ -553,11 +588,17 @@ This permits scope-disjoint writers in the same wave instead of making the
 second same-key assignment permanently `NO_SAFE_WORK`.
 
 Map the family to `approved_root/generated/<target_key digest>` using strict
-child/reparse checks. Member scratch directories are separate Host-assigned
-children; the Cargo cache remains one shared canonical target root. Do not
-put task/member suffixes in `target_key` or duplicate the Cargo cache. Shared
-cache writes require the supported Cargo locking contract; other outputs
-must remain in disjoint member grants. Family ownership survives until the
+child/reparse checks. Every admitted artifact kind has the common
+`<family>/cargo-target` child, including the existing `fastlane-task` intent;
+`cargo_target_root()` supplies the worker's Cargo cache independently of its
+primary artifact/output root. Scratch and non-Cargo outputs are private
+`<family>/members/<owner identity>/<task identity>/{scratch,output}` children.
+For `cargo-target`, the assigned primary root may be the common cache; never
+send another artifact's output into that cache. Do not put task/member
+suffixes in `target_key`, rewrite `fastlane-task` on the wire, or trust the
+caller to select a Host-authorized job kind. Shared cache writes require the
+supported Cargo locking contract; other outputs remain in disjoint member
+grants. Family ownership survives until the
 last member's confirmed shutdown and successful postcheck; cloning a grant
 or replaying a request neither reserves nor releases capacity. Admission
 expiry is a deadline for starting/attaching a grant, not permission to release
@@ -575,8 +616,9 @@ test seam, but production admission requires verified Host authority.
 
 - [ ] **Step 3: Implement platform capacity providers using the existing CLI doctor implementation as the reference.**
 
-On Unix call `libc::statvfs`; on Windows call
-`GetDiskFreeSpaceExW`; on unsupported platforms return
+On Unix call the existing `libc::statvfs` binding; on Windows reuse the kernel's
+existing `GetDiskFreeSpaceExW` FFI without adding a new crate dependency;
+on unsupported platforms return
 `STORAGE_STAT_UNAVAILABLE`. The provider is injected as a trait in tests so
 tests do not query the real G drive. `StorageFirewall::new` must not create the
 approved root or target directory during construction or failed admission.
@@ -599,84 +641,208 @@ do not create a second Cargo target or repeatedly rerun the suite.
 - [ ] **Step 5: Commit the host firewall.**
 
 ```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/rmcp-client/src/storage_intent.rs codex-rs/rmcp-client/src/lib.rs codex-rs/core/src/fast_lane_host_dispatch/storage_firewall.rs codex-rs/core/src/fast_lane_host_dispatch/storage_firewall_tests.rs codex-rs/core/src/fast_lane_host_dispatch/mod.rs codex-rs/core/Cargo.toml codex-rs/Cargo.lock MODULE.bazel.lock; git commit -m 'feat: enforce deterministic storage admission'; Pop-Location
+Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/rmcp-client/src/storage_intent.rs codex-rs/rmcp-client/src/lib.rs codex-rs/core/src/fast_lane_host_dispatch/storage_firewall.rs codex-rs/core/src/fast_lane_host_dispatch/storage_firewall_tests.rs codex-rs/core/src/fast_lane_host_dispatch/mod.rs; git commit -m 'feat: enforce deterministic storage admission'; Pop-Location
 ```
 
 ### Task 6: Connect admission to preparation, worker environment, and terminal release
 
-**Files:**
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/registry.rs:567-1668`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/coordinator.rs:393-580,1218-1260`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/codex_adapter.rs:1-1444`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/contract.rs`
-- Modify: `codex-rs/core/src/fast_lane_host_dispatch/storage_profile.rs`
-- Modify: `codex-rs/rmcp-client/src/inherited_host_bridge_protocol.rs`
-- Modify: `codex-rs/rmcp-client/src/inherited_host_bridge_protocol/session.rs`
-- Modify: `codex-rs/rmcp-client/src/inherited_host_bridge_protocol/pump.rs`
-- Modify: `mcp-tools/devkit_runtime/fastlane_host_adapter.py`
-- Modify: `mcp-tools/devkit_runtime/host_bridge.py`
-- Modify: `mcp-tools/devkit_runtime/host_session.py`
-- Modify: `mcp-tools/server.py:1008-1314`
-- Test: `mcp-tools/tests/test_storage_firewall.py`
-- Test: `codex-rs/core/src/fast_lane_host_dispatch/storage_firewall_tests.rs`
+**Independent file groups:** All paths below are within the scope map above.
 
-- [ ] **Step 1: Add a RED production-path assertion that an admitted root is present only in host-owned worker facts.**
+| Slice | Files and existing attachment points |
+| --- | --- |
+| 6a configuration/service | `config/src/config_toml.rs::ConfigToml`, `core/src/config/mod.rs::Config::load_config_with_layer_stack`, generated `core/config.schema.json`; new `core/src/fast_lane_host_dispatch/storage_service.rs` and `mod.rs`; `app-server/src/message_processor.rs`, `core/src/thread_manager.rs::ThreadManagerState`, `core/src/session/mod.rs::SessionSpawnArgs`, `core/src/session/session.rs`, `core/src/state/service.rs::SessionServices` |
+| 6b authority/write ordering | `core/src/fast_lane_host_dispatch/{registry,contract,storage_profile,worktree}.rs`, `core/src/mcp_tool_call.rs`; existing rmcp-client refill protocol/session/pump; DevKit `fastlane_host_adapter.py`, `host_bridge.py`, `host_session.py`, `server.py` |
+| 6c worker isolation | `core/src/fast_lane_host_dispatch/codex_adapter.rs::{HostWriterContext,CodexHostDispatchFacts,prepare_batch}`, `core/src/config/mod.rs::Permissions`, `protocol/src/shell_environment.rs`, `core/src/unified_exec/process_manager.rs` |
+| 6d real termination | `core/src/unified_exec/{mod,process,process_manager}.rs`, `utils/pty/src/{process,win/job}.rs`, `core/src/session/handlers.rs`, `core/src/agent/control/legacy.rs`; reuse `exec-server/src/process.rs` event boundary |
+| 6e postcheck/settlement | new `core/src/fast_lane_host_dispatch/storage_postcheck.rs`, `mod.rs`, existing `codex_adapter.rs` terminal/recovery methods and `coordinator.rs` observers; existing storage firewall tests |
 
-```python
-def test_fastlane_dispatch_forwards_receipt_identity_without_public_path():
-    result = dispatch_fixture_with_storage_intent()
-    assert result["storage_admission"]["assigned_root_identity"].startswith("sha256:")
-    assert "assigned_root" not in result
-    assert "CARGO_TARGET_DIR" not in result
-```
+Host paths in this table are relative to `codex-rs`; DevKit runtime filenames
+are under `mcp-tools/devkit_runtime`, with `server.py` under `mcp-tools`.
+6a can compile independently with storage disabled. 6d can be implemented
+independently of admission. 6b depends on 6a and the preserved Task 4/5
+contracts, plus the bounded control-allocation prerequisite below for durable
+refill registration; 6c depends on 6b. Successful release in 6e requires both phases of
+6d, not just worker wiring or a green compile. Coordinate shared files rather
+than concurrently editing registry/adapter/process-manager from two slices.
 
-- [ ] **Step 2: Connect both authority sources to one reservation service and consume sealed grants exactly once.**
+- [ ] **Step 6a: Load explicit trusted configuration and inject one runtime-owned service.**
+
+Add an optional `storage_firewall` block to `ConfigToml`, containing exactly
+nine required fields: `approved_root`, `task_byte_limit`, `task_file_limit`,
+`target_family_byte_limit`, `target_family_file_limit`,
+`global_reserved_byte_limit`, `global_reserved_file_limit`,
+`free_space_floor_bytes`, and `emergency_floor_bytes`. The root must be an
+explicit absolute Host-approved directory; each numeric value must pass the
+kernel's positive/checked policy validation, including emergency <= floor.
+Do not supply numerical defaults, derive authority from free disk space, or
+create an approved root while loading configuration. Missing block disables
+storage admission with `STORAGE_POLICY_MISSING`; malformed blocks are rejected.
+
+Use the existing `ConfigLayerSource` provenance, not merged values alone.
+System/enterprise-managed/operator user configuration may supply the block;
+workspace `Project` configuration cannot set or override it. Treat session
+flags as authority only when the Host startup path explicitly validates an
+operator override, never when copied from worker/caller facts. Reject an
+untrusted storage override instead of silently merging individual fields.
+Generate `core/config.schema.json` through the existing
+`config/src/schema.rs::write_config_schema` path.
+
+Construct one service at the process-scoped Host runtime's ThreadManager
+creation in `app-server/src/message_processor.rs`; store the same Arc in
+`ThreadManagerState`, forward through `SessionSpawnArgs`/`SessionServices`,
+and give every `FastLaneHostFactsRegistry` a reference to it. The new
+`storage_service.rs` facade owns the single kernel accounting state and
+immutable resolved policy/root, not another independent reservation ledger.
+Adapt every constructor/call site; test-only construction may be explicitly
+disabled or use an injected fixture, never a permissive production default.
+Current `session/session.rs` creates registries per Session: keep that facts
+scope but do not create a firewall there. Per-thread config reload must not
+reset global reservations or replace policy/root while grants are retained.
+
+This is cross-session sharing inside one Host runtime, not a cross-process
+ledger. An independent Host process must not claim the same active storage
+root without exclusive root authority; multi-process persistence/recovery
+remains Plan 2. An in-memory Arc cannot prove that exclusivity by itself.
+
+- [ ] **Step 6b: Admit/seal before any task-root write, then consume once.**
 
 Initial `claim_storage_admission` resolves the Task 4 `Sent` profile and calls
-`reserve_member_once` for the Host's original runtime batch owner. Store each
-decision, `StorageAssignmentBinding`, and private grant in registry/runtime
-state. `consume_batch` validates the original batch and exact member coverage,
-seals the group, and transfers/attaches those grants to `HostWriterContext`.
-It does not regenerate route/lease facts, rekey batch indexes, or reserve again.
+`reserve_member_once` for the original Host runtime batch. Each task retains
+its own profile/attestation hash; group authority comes from verified original
+batch/preparation/call/generation, not equality of per-task profile hashes.
+Keep each decision, `StorageAssignmentBinding`, and grant in private Host
+state. Seal against the original exact task set before filesystem writes.
+`consume_batch` revalidates that sealed set and consumes/transfers the grants
+before setting `BatchConsumed`, removing `by_batch`, or activating scope
+leases. On failure preserve a recoverable consistent state. It neither
+rewrites original route/lease hashes nor reserves a second time.
 
-Successors are materialized natively by `consume_refill_queue`, not by a new
-Python prepare call. Extend the exact refill codec/ledger with explicit
-per-task budgets and bind them into the queue hash. `register_refill_queue`
-validates coverage against its existing verified remaining skeletons and
-index refs; it must not allocate capacity for all remaining work. After the
-selected wave passes dependency/scope gates, resolve and revalidate its Host
-profile provenance, construct intent and `StorageAssignmentBinding`, and call
-the same `reserve_member_once` service with native selected-wave authority.
-Do not manufacture bridge requests, correlations, nonces, or transport
-receipts for this internal path. Attach sealed grants before the selected
-wave can prepare. Failed admission does not advance the queue cursor; an old
-queue without required budget/provenance is not silently upgraded or admitted.
+`mcp_tool_call.rs` currently creates a hardcoded per-session/call task root
+before constructing `GitWorktreeBroker`; remove this pre-admission mkdir.
+Split `GitWorktreeBroker::new`'s current existing-root canonicalization into
+planned-root validation against the approved existing parent and later
+materialization with identity/reparse revalidation. Materialize only after
+successful admission/seal and before the first durable queue write or
+`reserve_batch`; adapter preparation revalidates the materialized binding.
 
-`CodexHostDispatchAdapter::prepare_batch` must require the already-sealed
-grants before `worktree_broker.reserve_batch`, and must never call admission
-again. At worker config construction, inject the private common Cargo target
-and per-member scratch into `config.permissions.shell_environment_policy.r#set`
-as `CARGO_TARGET_DIR` and `CODEX_TASK_TEMP`. These paths stay in private
-`HostWriterContext`, not the caller's receipt or bounded public context.
+Python currently registers the refill queue before dispatch, while Host
+`refill_authority_root_binding` canonicalizes an already-existing task root.
+Move initial admission/seal before queue registration; delaying mkdir only
+until `prepare_batch` is insufficient. Put queue metadata, atomic-replacement
+temporaries, and worktree roots under explicit accounted ownership, but do
+not place durable queue records in a member's releasable scratch/output.
+Their lifecycle spans waves: releasing/cleaning the initial member must not
+erase an active queue, and retaining its Cargo family lease for the queue
+would permanently block a different-owner same-key successor.
 
-On prepare/dispatch failure, revoke unused member grants; after a writer has
-started, terminal/recovery/integration paths must first confirm child shutdown
-and perform postcheck. Release each member once and the family lease only
-after the last member succeeds. A clone, timeout, or terminal ACK alone is
-not release evidence. Postcheck failure returns `STORAGE_POSTCHECK_FAILED`
-and retains ownership for later recovery; it never triggers a broad delete.
+Durable refill registration therefore depends on an independently bounded
+Host ledger/control allocation with a queue-lifetime owner, explicit positive
+byte/file allowance, safe private root, and terminal queue settlement. Plan 2
+must provide that control-allocation contract before this part of 6b is
+enabled; implement no ledger or new artifact/wire field in this Plan 1 update.
+Until it exists, reject durable registration before any write. Do not invent
+a control task/lease, take an unrequested budget, or exempt metadata from
+accounting. Its owner must not hold the shared Cargo family lease; verify
+that initial member release preserves the queue while same-key successors
+can acquire their own group lease. This prerequisite changes the execution
+order, not the frozen admission-v1 or target-v1 contract.
 
-- [ ] **Step 3: Make the DevKit Fast Lane result expose only stable storage code and receipt identity.**
+Successors remain native to `consume_refill_queue`. Extend the exact refill
+codec and durable snapshot with task-keyed remaining budgets covered by the
+queue hash; verify exact remaining-task coverage and existing index refs at
+registration. Allocate only the selected wave after dependency/scope gates.
+Use its verified native authority to build profile provenance, intent, and
+binding and invoke the same service; no synthetic bridge request/correlation
+or fabricated transport receipt. Seal/attach before prepare, and commit queue
+cursor/budget consumption consistently with the attempt outcome. Admission
+failure does not advance the queue. Old snapshots without required budget
+provenance fail closed, not silent upgrade or all-backlog initial reservation.
 
-```python
-public = {
-    "storage_code": receipt.code,
-    "storage_receipt_hash": receipt.receipt_hash,
-    "target_key": receipt.target_key,
-}
-```
+- [ ] **Step 6c: Attach grants to workers and enforce reserved paths at final environment/permission assembly.**
 
-- [ ] **Step 4: Run the one production-path probe plus compile-first gates.**
+`CodexHostDispatchAdapter::prepare_batch` checks sealed grants before
+`worktree_broker.reserve_batch`; it never invokes admission again. Carry
+private grant/binding state in `HostWriterContext`/`CodexHostDispatchFacts`.
+Use `cargo_target_root()` for `CARGO_TARGET_DIR` for every artifact kind,
+including `fastlane-task`, and the private scratch getter for
+`CODEX_TASK_TEMP`; non-Cargo outputs use the member output root. No path is
+put into the decision, public bounded context, or DevKit result.
+
+Setting `config.permissions.shell_environment_policy.r#set` alone is not
+sufficient: `include_only` is applied afterward and per-call overrides can
+replace values. Preserve/reject overrides of reserved values at final
+storage-managed environment assembly. Update actual `Permissions` using its
+workspace-root/effective-profile APIs as well as `Config.workspace_roots`,
+granting only the member paths and shared cache while respecting managed
+denies. Do not make all of approved_root writable. Environment variables alone
+do not confine arbitrary shell writes; the sandbox and descendant fence must
+cover those writes, or the managed-storage execution path remains unavailable.
+
+- [ ] **Step 6d.1: Retain process handles and await real exit, without minting terminal proof yet.**
+
+`ProcessStore` currently has no wait operation. Its
+`terminate_all_processes` drains entries then issues non-confirming terminate
+calls; an empty map is not shutdown proof. `UnifiedExecProcess::terminate_confirmed`
+also synthesizes `signal_exit` after termination without waiting for a real
+local exit. Replace this use with an asynchronous confirmed boundary that
+closes new process admission, retains ownership/handles, propagates kill
+errors, and waits for the existing local `SpawnedPty.exit_rx`/wait task or
+ExecServer `Exited` event. Distinguish actual exit from closed channels,
+unknown exit, timeout, and synthetic status. Preserve retained grants and
+recovery handles on failure; never turn an error into success by draining.
+
+`utils/pty::ProcessHandle::terminate` currently ignores killer errors and
+drops its wait handle; extend that boundary so the caller can await actual
+termination. This phase establishes managed root-process exit only, not proof
+that all descendants have stopped writing.
+
+- [ ] **Step 6d.2: Fence owned descendants and shutdown-time writers before issuing TerminalProof.**
+
+`shutdown_agent_tree` waits for agent threads, not an OS process tree.
+For storage-managed processes enforce retained, non-escaping process-family
+ownership; on Windows the JobObject path must not use `preserve_descendants`
+and must confirm no active owned processes remain after termination. Use an
+equivalent owned process-family fence on supported platforms; unsupported or
+unconfirmable cases retain ownership/fail closed. Do not scan/kill unrelated
+processes or equate root PID exit with descendant exit.
+
+Cover code-mode, MCP, prewarm, and hooks that can write into grants.
+`shutdown_session_runtime` currently runs session-end hooks after terminating
+unified exec: run all permitted shutdown work before the final write fence,
+or explicitly deny those paths once fenced. Prevent post-proof process or
+writer creation. Bind the Host-created terminal evidence to the actual
+member/group/generation and owned process set. Neither assistant `Completed`,
+terminal ACK, nor `ShutdownComplete` establishes this evidence.
+
+A never-started cancellation is allowed only when Host lifecycle state proves
+no worker/process was ever created. A prepared endpoint with no assistant
+input can already have prewarm/hooks; it requires the same termination fence.
+Failed prepare/recovery must leave storage ownership in the shared service
+even if adapter runtime objects are removed. Until both 6d phases hold, do not
+wire a synthetic TerminalProof just to enable successful release.
+
+- [ ] **Step 6e: Scan real family contents after the fence and settle exactly once.**
+
+`WriterIntegrationCandidate::collect_terminal` proves Git/worktree state, not
+disk usage. Implement the new `storage_postcheck.rs` collector over private
+grant paths: bounded no-follow/reparse-safe traversal, checked byte/file
+sums, and path identity revalidation. Inaccessible, unstable, or unbounded
+observations return `STORAGE_POSTCHECK_FAILED` and retain ownership. Never
+accept caller counters or delete data to make a postcheck pass.
+
+Attach member terminal handling at adapter
+`shutdown_and_validate_terminal_success` and its recovery paths, with
+coordinator observers retaining the group barrier. A fenced member's private
+scratch/output can be checked independently; shared cache/family counts
+require every active member in that family to be quiet. Count shared files
+once, retain family observed usage across released tombstones, and release
+the family lease only after the last required postcheck succeeds. Scope-lease
+release and terminal ACK are not substitutes for storage settlement.
+
+- [ ] **Step 6f: Compile changed slices first, then keep only bounded acceptance probes.**
+
+Retain the current Task 4/5 compile evidence rather than rerunning unchanged
+slices. For newly changed wiring, run from DevKit `mcp-tools`:
 
 ```powershell
 python -m py_compile server.py devkit_runtime/host_bridge.py devkit_runtime/host_session.py
@@ -688,18 +854,23 @@ Pop-Location
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; python -m pytest tests/test_storage_firewall.py::test_fastlane_dispatch_forwards_receipt_identity_without_public_path -q -o cache_dir=G:\2718lab\_codex\.codex-task-temp\storage-113-firewall-pytest
 ```
 
-Expected: Python probe passes, `py_compile` is silent, and `cargo check`
-finishes successfully with no new warning. Stop before probes if compilation
-fails. Keep one bounded Host successor/shared-group regression; Python-only
-initial evidence is not full production acceptance. Do not run the full
-workspace suite or repeatedly rebuild unchanged slices.
+Also compile changed app-server/PTY/protocol callers in the relevant slice,
+using the same existing target, `CARGO_INCREMENTAL=0`, and `--locked -j1`.
+The two-crate check alone does not cover an edited app-server constructor.
+Stop before probes on compile failure. Preserve one selected public-path
+non-disclosure probe, one native-successor/shared-group regression, and one
+bounded termination-failure/retained-ownership probe. Do not run the full
+workspace suite, regenerate old RED evidence, or repeatedly rebuild unchanged
+slices. Python-only initial evidence is not full production acceptance.
 
-- [ ] **Step 5: Commit the production wiring.**
+- [ ] **Step 6g: Commit each compiled file group with explicit remaining gates.**
 
-```powershell
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\devkit-1.1.2-recovery'; git add mcp-tools/server.py mcp-tools/devkit_runtime/fastlane_host_adapter.py mcp-tools/devkit_runtime/host_bridge.py mcp-tools/devkit_runtime/host_session.py mcp-tools/tests/test_storage_firewall.py; git commit -m 'feat: bind admitted storage roots to fast lane workers'; Pop-Location
-Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2'; git add codex-rs/core/src/fast_lane_host_dispatch/registry.rs codex-rs/core/src/fast_lane_host_dispatch/coordinator.rs codex-rs/core/src/fast_lane_host_dispatch/codex_adapter.rs codex-rs/core/src/fast_lane_host_dispatch/contract.rs codex-rs/core/src/fast_lane_host_dispatch/storage_profile.rs codex-rs/core/src/fast_lane_host_dispatch/storage_firewall_tests.rs codex-rs/rmcp-client/src/inherited_host_bridge_protocol.rs codex-rs/rmcp-client/src/inherited_host_bridge_protocol/session.rs codex-rs/rmcp-client/src/inherited_host_bridge_protocol/pump.rs; git commit -m 'feat: bind admitted storage roots to fast lane workers'; Pop-Location
-```
+Stage only that slice's named files after `git diff --check`; do not use a
+broad `git add` or include another worker's dirty adapter/registry changes.
+Record the compile scope and unverified process/platform/config conditions
+with each handoff. A disabled 6a service or root-process-only 6d.1 can be a
+compiled intermediate slice, but cannot be reported as Task 6 storage release
+or complete Plan 1 acceptance.
 
 ## Plan 1 acceptance gate and handoff
 
@@ -708,4 +879,8 @@ Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2';
 - [ ] Run `python -m py_compile` on changed DevKit Python files and `cargo check -p codex-rmcp-client -p codex-core --lib --locked -j1` with the existing Host `codex-rs\target` and `CARGO_INCREMENTAL=0`; retain current compile evidence instead of rerunning unchanged slices.
 - [ ] Record one controlled admission receipt proving same semantics reuse one target key and one changed semantic forks it; record one low-space/policy-failure receipt proving no directory was created.
 - [ ] Verify exact5 session lookup/core `Sent` binding, unchanged original batch hashes, same-owner member sharing with exact sealing, cross-owner conflict, and a native selected-successor admission without a second reservation. Do not label initial-only wiring complete.
+- [ ] Verify explicit trusted root plus eight policy values, one Host-runtime service shared across Sessions, and no pre-admission task/control/queue directory writes. Record the single-runtime versus independent-Host-process ownership boundary.
+- [ ] Before enabling durable refill, obtain Plan 2's bounded queue-lifetime control allocation: initial member release cannot remove active metadata, and that allocation cannot retain the Cargo family lease or block same-key successors. Missing allocation rejects registration before writes; no free budget or fabricated task is allowed.
+- [ ] Verify actual process and descendant shutdown evidence, denial of post-proof writers, and a real all-members-quiet family scan before release. Failure/timeout retains ownership; `Completed`, `ShutdownComplete`, ACK, or an empty ProcessStore is not sufficient.
+- [ ] Obtain the operator's approved absolute root and eight policy values before production enablement; do not invent them or reuse example test capacities as configuration. Record any unsupported process-containment platform as a remaining activation gate.
 - [ ] Do not implement ledger persistence, preview/apply, source deletion, session deletion, compression, or remote synchronization in this plan. Plan 2 consumes `StorageAdmissionReceipt`; Plan 3 consumes the released/observed storage records.
