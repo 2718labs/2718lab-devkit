@@ -1130,6 +1130,20 @@ def _fastlane_authenticated_dispatch(
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         initial_units = projected["units"]
         remaining_units = projected["remaining_units"]
+        initial_storage_budgets = {
+            unit["task"]["task_id"]: unit["storage_budget"]
+            for unit in initial_units
+            if "storage_budget" in unit
+        }
+        # The compiler/profile exchange can attest only the live initial
+        # skeletons. Remaining work is materialized later by the Host-owned
+        # refill registry, which has no storage-profile proof channel yet.
+        # Budgeted successors therefore fail closed before publication.
+        if (
+            len(initial_storage_budgets) not in {0, len(initial_units)}
+            or any("storage_budget" in unit for unit in remaining_units)
+        ):
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         initial_task_ids = {
             unit["task"]["task_id"] for unit in initial_units
         }
@@ -1228,6 +1242,7 @@ def _fastlane_authenticated_dispatch(
             request=planner_request,
             reasoning_effort=reasoning_effort,
             requested_routes=requested_routes,
+            storage_budgets=initial_storage_budgets,
         )
         if prepared == NO_SAFE_WORK:
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
