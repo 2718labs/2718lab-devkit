@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -582,13 +583,15 @@ def test_storage_admission_rejects_substitution_and_unknown_fields() -> None:
         host.close()
 
 
-def test_storage_admission_deadline_and_close_cancel_blocked_io() -> None:
+def test_storage_admission_deadline_and_close_cancel_blocked_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from devkit_runtime import host_bridge, host_session
     from devkit_runtime.storage_intent import parse_storage_intent
 
     # Real pipe I/O with a fixed trusted clock: the transport deadline must
     # still advance monotonically. Peer never returns an admission response.
-    for scenario in ("no_reply", "full_pipe", "close"):
+    for scenario in ("no_reply", "full_pipe", "close", "direct_close"):
         child, host = _pipe_pair()
         profile_request = _storage_profile_request()
         pending = child.send_storage_profile_request(**{
@@ -605,7 +608,7 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io() -> None:
         # preparation enrollment itself is covered by the round-trip test.
         session._completed_storage_profiles[_hash("7")] = host_session._CompletedStorageProfile(
             profile=profile, bridge=child,
-            expires_at=1_700_000_060 if scenario == "close" else 1_700_000_001,
+            expires_at=1_700_000_060 if scenario in {"close", "direct_close"} else 1_700_000_001,
             requested_bytes=4096, requested_files=8,
         )
         intent = parse_storage_intent(_storage_intent(
@@ -621,6 +624,20 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io() -> None:
                         break
                 else:
                     raise AssertionError("fixture pipe did not reach bounded capacity")
+        restore_reached = threading.Event()
+        restore_allowed = threading.Event()
+        original_writer = host_bridge._nonblocking_pipe_writer
+        if scenario == "direct_close":
+            @contextmanager
+            def paused_restore(descriptor: int):
+                with original_writer(descriptor) as write:
+                    try:
+                        yield write
+                    finally:
+                        restore_reached.set()
+                        assert restore_allowed.wait(timeout=3), "mode-restore barrier was not released"
+
+            monkeypatch.setattr(host_bridge, "_nonblocking_pipe_writer", paused_restore)
         result: list[object] = []
         worker = threading.Thread(target=lambda: result.append(session.request_storage_admission(
             intent, profile_attestation_hash=_hash("7")
@@ -636,20 +653,35 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io() -> None:
                 closer.start()
                 closer.join(timeout=2)
                 assert not closer.is_alive(), "close waited behind admission's business lock"
+            if scenario == "direct_close":
+                assert restore_reached.wait(timeout=2)
+                borrowed_fd = child._write_fd
+                child.close()
+                child.close()  # repeated close must not bypass deferred cleanup
+                assert not child.is_available
+                assert child._active_io_count == 1
+                assert not child._descriptors_closed
+                assert child._write_fd == borrowed_fd
+                os.fstat(borrowed_fd)  # mode restoration still owns this exact fd
+                restore_allowed.set()
             worker.join(timeout=3)
             assert not worker.is_alive(), "admission did not terminate at its transport deadline"
             assert result == ["STORAGE_STAT_UNAVAILABLE"]
             assert not child._storage_admission_completions
             assert not child._storage_admission_decisions
+            assert child._active_io_count == 0
+            assert child._descriptors_closed
         finally:
             # Only test-owned descriptors/threads; ensure a failing regression
             # cannot leave a blocked peer alive in the test process.
+            restore_allowed.set()
             child.close()
             host.close()
             worker.join(timeout=2)
             if closer is not None:
                 closer.join(timeout=2)
             session.close()
+            monkeypatch.setattr(host_bridge, "_nonblocking_pipe_writer", original_writer)
 
 
 def test_profile_tamper_or_missing_field_fails_closed() -> None:

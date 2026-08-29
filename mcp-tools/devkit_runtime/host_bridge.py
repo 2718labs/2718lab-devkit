@@ -438,6 +438,8 @@ class InheritedHandleHostBridge:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
         self._cancel_event = Event()
         self._close_lock = Lock()
+        self._active_io_count = 0
+        self._descriptors_closed = False
         # A session has one framed sequence in each direction.  Serialize all
         # bridge I/O so concurrent Fast Lane waves cannot interleave bytes or
         # consume one another's sequence slot.
@@ -1983,7 +1985,7 @@ class InheritedHandleHostBridge:
     def _receive_private(self, *, deadline: float | None = None) -> PrivateHostMessage:
         """Read one framed message for a typed private validator."""
 
-        with self._io_lock:
+        with self._io_lock, self._active_io():
             self._ensure_open()
             try:
                 frame = _decode_frame(
@@ -2032,34 +2034,51 @@ class InheritedHandleHostBridge:
             pass
 
     def close(self) -> None:
-        """Close only the descriptor(s) this bridge owns."""
+        """Cancel immediately; close owned fds after the last active I/O exits.
+
+        This does not wait on the I/O lock, including when _poison calls us
+        reentrantly. A legacy blocking write may retain its fds until that OS
+        call returns; close returning is not evidence of kernel I/O shutdown.
+        """
 
         with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._signal_cancel_locked()
-            cancel_descriptors = {
-                self._cancel_read_fd,
-                self._cancel_write_fd,
-            }
-            self._cancel_read_fd = -1
-            self._cancel_write_fd = -1
-            for descriptor in cancel_descriptors:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            if not self._owns_descriptors:
-                return
-            descriptors = {self._read_fd, self._write_fd}
+            if not self._closed:
+                self._closed = True
+                self._signal_cancel_locked()
+            if self._active_io_count == 0:
+                self._close_descriptors_locked()
+
+    @contextmanager
+    def _active_io(self) -> Iterator[None]:
+        # Enrollment and close's unavailable transition are atomic. No new
+        # operation may borrow an fd after close/cancel has begun.
+        with self._close_lock:
+            self._ensure_open()
+            self._active_io_count += 1
+        try:
+            yield
+        finally:
+            with self._close_lock:
+                self._active_io_count -= 1
+                if self._closed and self._active_io_count == 0:
+                    self._close_descriptors_locked()
+
+    def _close_descriptors_locked(self) -> None:
+        if self._descriptors_closed:
+            return
+        self._descriptors_closed = True
+        descriptors = {self._cancel_read_fd, self._cancel_write_fd}
+        self._cancel_read_fd = -1
+        self._cancel_write_fd = -1
+        if self._owns_descriptors:
+            descriptors.update((self._read_fd, self._write_fd))
             self._read_fd = -1
             self._write_fd = -1
-            for descriptor in descriptors:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
     def _frame_bytes(
         self, *, kind: str, action_id: str, sequence: int, payload: dict[str, object]
@@ -2145,6 +2164,12 @@ class InheritedHandleHostBridge:
         )
 
     def _write_complete(self, payload: bytes, *, deadline: float | None = None) -> None:
+        # Keep the descriptor/HANDLE alive through the writer's finally mode
+        # restoration, including direct bridge.close() from another caller.
+        with self._active_io():
+            self._write_complete_active(payload, deadline=deadline)
+
+    def _write_complete_active(self, payload: bytes, *, deadline: float | None) -> None:
         try:
             if deadline is not None:
                 with _nonblocking_pipe_writer(self._write_fd) as write:
