@@ -16,11 +16,271 @@ _UNIT_FIELDS = frozenset(
         "dispatch_order",
         "index_context_hash",
         "predecessor_hash",
+        "storage_budget",
+        "storage_intent",
     }
 )
+_LEGACY_UNIT_FIELDS = _UNIT_FIELDS - {"storage_budget", "storage_intent"}
+_BUDGET_UNIT_FIELDS = _LEGACY_UNIT_FIELDS | {"storage_budget"}
+_INTENT_UNIT_FIELDS = _LEGACY_UNIT_FIELDS | {"storage_intent"}
 _CONTEXTUAL_UNIT_FIELDS = (_UNIT_FIELDS - {"predecessor_hash"}) | {"workflow_id_hash"}
+_LEGACY_CONTEXTUAL_UNIT_FIELDS = _CONTEXTUAL_UNIT_FIELDS - {
+    "storage_budget",
+    "storage_intent",
+}
+_BUDGET_CONTEXTUAL_UNIT_FIELDS = _LEGACY_CONTEXTUAL_UNIT_FIELDS | {"storage_budget"}
+_INTENT_CONTEXTUAL_UNIT_FIELDS = _LEGACY_CONTEXTUAL_UNIT_FIELDS | {"storage_intent"}
 _ATTESTATION_ITEM_FIELDS = frozenset({"task_id", "request_binding_hash", "attestation"})
 _CONCURRENCY_MODES = frozenset({"parallel", "serial", "isolated_worktree"})
+_STORAGE_INTENT_SCHEMA = "2718lab.storage.intent.v1"
+_STORAGE_TARGET_SCHEMA = "2718lab.storage.target.v1"
+_STORAGE_POLICY_MISSING = "STORAGE_POLICY_MISSING"
+_STORAGE_TARGET_KEY_INVALID = "STORAGE_TARGET_KEY_INVALID"
+_STORAGE_DESCRIPTOR_FIELDS = (
+    "repository_identity",
+    "workspace_manifest_hash",
+    "cargo_lock_hash",
+    "toolchain_digest",
+    "target_triple",
+    "profile",
+    "features_hash",
+    "build_env_class",
+)
+
+
+def _storage_context_for_task(
+    context: Mapping[str, Any] | None,
+    task_id: str,
+) -> Mapping[str, Any]:
+    """Resolve a task context without inventing any storage facts."""
+
+    if isinstance(context, Sequence) and not isinstance(
+        context, (str, bytes, bytearray)
+    ):
+        for item in context:
+            if isinstance(item, Mapping) and item.get("task_id") == task_id:
+                return item
+        return {}
+    if not isinstance(context, Mapping):
+        return {}
+    if "task_id" in context and context.get("task_id") != task_id:
+        return {}
+    direct = context.get(task_id)
+    if isinstance(direct, Mapping):
+        return direct
+    for field in ("by_task", "contexts", "execution_contexts"):
+        grouped = context.get(field)
+        if isinstance(grouped, Mapping):
+            direct = grouped.get(task_id)
+            if isinstance(direct, Mapping):
+                return direct
+        elif isinstance(grouped, Sequence) and not isinstance(
+            grouped, (str, bytes, bytearray)
+        ):
+            for item in grouped:
+                if isinstance(item, Mapping) and item.get("task_id") == task_id:
+                    return item
+    return context
+
+
+def _storage_value(
+    context: Mapping[str, Any],
+    source_unit: Mapping[str, Any],
+    field: str,
+) -> object:
+    """Read one attested descriptor value from context or source unit."""
+
+    candidates: list[Mapping[str, Any]] = [context]
+    for container_name in (
+        "storage_descriptor",
+        "target_descriptor",
+        "storage_target",
+        "build_context",
+        "bootstrap_plan",
+        "storage",
+    ):
+        container = context.get(container_name)
+        if isinstance(container, Mapping):
+            candidates.insert(0, container)
+    for candidate in candidates:
+        if field in candidate:
+            return candidate[field]
+    if field in source_unit:
+        return source_unit[field]
+    task = source_unit.get("task")
+    if isinstance(task, Mapping) and field in task:
+        return task[field]
+    return None
+
+
+def _storage_execution_context_hash(
+    context: Mapping[str, Any], source_unit: Mapping[str, Any]
+) -> object:
+    value = context.get("execution_context_hash")
+    if value is None:
+        value = source_unit.get("execution_context_hash")
+    return value
+
+
+def _storage_budget(
+    source_unit: Mapping[str, Any],
+) -> tuple[int, int]:
+    budget = source_unit.get("storage_budget")
+    if budget is None:
+        task = source_unit.get("task")
+        if isinstance(task, Mapping):
+            budget = task.get("storage_budget")
+    if not isinstance(budget, Mapping):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    requested_bytes = budget.get("bytes")
+    requested_files = budget.get("files")
+    if (
+        type(requested_bytes) is not int
+        or requested_bytes <= 0
+        or requested_bytes > (1 << 64) - 1
+        or type(requested_files) is not int
+        or requested_files <= 0
+        or requested_files > (1 << 64) - 1
+    ):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    return requested_bytes, requested_files
+
+
+def _make_storage_intent(
+    api: Any,
+    source_unit: Mapping[str, Any],
+    *,
+    task_id: str,
+    source_plan_hash: object,
+    context: Mapping[str, Any] | None,
+) -> dict[str, object]:
+    """Build one path-free intent from a normalized unit and context."""
+
+    source_hash = api._hash(source_plan_hash, "source_plan_hash")
+    task_context = _storage_context_for_task(context, task_id)
+    context_hash = _storage_execution_context_hash(task_context, source_unit)
+    try:
+        context_hash = api._hash(
+            context_hash,
+            f"storage context {task_id}.execution_context_hash",
+        )
+    except Exception as error:
+        raise ValueError(_STORAGE_POLICY_MISSING) from error
+    requested_bytes, requested_files = _storage_budget(source_unit)
+    descriptor = {
+        "schema": _STORAGE_TARGET_SCHEMA,
+        "artifact_kind": "fastlane-task",
+        **{
+            field: _storage_value(task_context, source_unit, field)
+            for field in _STORAGE_DESCRIPTOR_FIELDS
+        },
+    }
+    if any(descriptor[field] is None for field in _STORAGE_DESCRIPTOR_FIELDS):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    intent_without_hash = {
+        "schema": _STORAGE_INTENT_SCHEMA,
+        "task_id": task_id,
+        "plan_binding": source_hash,
+        "context_hash": context_hash,
+        "requested_bytes": requested_bytes,
+        "requested_files": requested_files,
+        "target_descriptor": descriptor,
+    }
+    intent = {
+        **intent_without_hash,
+        "storage_intent_hash": api._sha256_json(
+            {
+                "target_descriptor": descriptor,
+                "task_id": task_id,
+                "plan_binding": source_hash,
+                "context_hash": context_hash,
+                "requested_bytes": requested_bytes,
+                "requested_files": requested_files,
+            }
+        ),
+    }
+    try:
+        from devkit_runtime.storage_intent import parse_storage_intent
+
+        return parse_storage_intent(intent).to_dict()
+    except Exception as error:
+        code = getattr(error, "code", _STORAGE_TARGET_KEY_INVALID)
+        raise ValueError(code) from error
+
+
+def _validate_storage_intent(
+    value: object,
+    *,
+    task_id: str,
+    source_plan_hash: str,
+    context: Mapping[str, Any] | None,
+    source_unit: Mapping[str, Any],
+    api: Any,
+) -> dict[str, object]:
+    try:
+        from devkit_runtime.storage_intent import parse_storage_intent
+
+        parsed = parse_storage_intent(value)
+    except Exception as error:
+        code = getattr(error, "code", _STORAGE_TARGET_KEY_INVALID)
+        raise ValueError(code) from error
+    task_context = _storage_context_for_task(context, task_id)
+    expected_context = _storage_execution_context_hash(task_context, source_unit)
+    if expected_context is not None:
+        try:
+            expected_context = api._hash(
+                expected_context,
+                f"storage context {task_id}.execution_context_hash",
+            )
+        except Exception as error:
+            raise ValueError(_STORAGE_TARGET_KEY_INVALID) from error
+    if "storage_budget" in source_unit:
+        try:
+            requested_bytes, requested_files = _storage_budget(source_unit)
+        except ValueError as error:
+            raise ValueError(_STORAGE_POLICY_MISSING) from error
+        if (
+            parsed.requested_bytes != requested_bytes
+            or parsed.requested_files != requested_files
+        ):
+            raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+    if (
+        parsed.task_id != task_id
+        or parsed.plan_binding != source_plan_hash
+        or (
+            expected_context is not None
+            and parsed.context_hash != expected_context
+        )
+    ):
+        raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+    return parsed.to_dict()
+
+
+def _unit_storage_intent(
+    api: Any,
+    unit: Mapping[str, Any],
+    *,
+    task_id: str,
+    source_plan_hash: str,
+    context: Mapping[str, Any] | None,
+) -> dict[str, object]:
+    supplied = unit.get("storage_intent")
+    if supplied is None:
+        return _make_storage_intent(
+            api,
+            unit,
+            task_id=task_id,
+            source_plan_hash=source_plan_hash,
+            context=context,
+        )
+    return _validate_storage_intent(
+        supplied,
+        task_id=task_id,
+        source_plan_hash=source_plan_hash,
+        context=context,
+        source_unit=unit,
+        api=api,
+    )
 
 
 def owned_scope_hash(api: Any, task_id: object, write_scope: object) -> str:
@@ -49,7 +309,16 @@ def normalize_units(
     normalized: list[dict[str, Any]] = []
     for index, raw_unit in enumerate(units):
         unit = api._mapping(raw_unit, f"authenticated V5 units[{index}]")
-        if set(unit) not in {_UNIT_FIELDS, _CONTEXTUAL_UNIT_FIELDS}:
+        if set(unit) not in {
+            _UNIT_FIELDS,
+            _CONTEXTUAL_UNIT_FIELDS,
+            _LEGACY_UNIT_FIELDS,
+            _LEGACY_CONTEXTUAL_UNIT_FIELDS,
+            _BUDGET_UNIT_FIELDS,
+            _BUDGET_CONTEXTUAL_UNIT_FIELDS,
+            _INTENT_UNIT_FIELDS,
+            _INTENT_CONTEXTUAL_UNIT_FIELDS,
+        }:
             raise ValueError(f"authenticated V5 units[{index}] has unsupported fields")
         task = dict(api._mapping(unit["task"], f"authenticated V5 units[{index}].task"))
         api._task_id(
@@ -79,37 +348,53 @@ def normalize_units(
             or not 0 <= dispatch_order < 16
         ):
             raise ValueError("authenticated V5 dispatch facts are invalid")
-        normalized.append(
-            {
-                "task": task,
-                "dependency_state": json.loads(
-                    api._canonical_json(unit["dependency_state"])
-                ),
-                "write_scope": write_scope,
-                "concurrency_mode": concurrency_mode,
-                "dispatch_order": dispatch_order,
-                "index_context_hash": api._hash(
-                    unit["index_context_hash"],
-                    f"authenticated V5 units[{index}].index_context_hash",
-                ),
-                "predecessor_hash": (
-                    api._hash(
-                        unit["predecessor_hash"],
-                        f"authenticated V5 units[{index}].predecessor_hash",
-                    )
-                    if "predecessor_hash" in unit
-                    else None
-                ),
-                "workflow_id_hash": (
-                    api._hash(
-                        unit["workflow_id_hash"],
-                        f"authenticated V5 units[{index}].workflow_id_hash",
-                    )
-                    if "workflow_id_hash" in unit
-                    else None
-                ),
-            }
-        )
+        normalized_unit = {
+            "task": task,
+            "dependency_state": json.loads(
+                api._canonical_json(unit["dependency_state"])
+            ),
+            "write_scope": write_scope,
+            "concurrency_mode": concurrency_mode,
+            "dispatch_order": dispatch_order,
+            "index_context_hash": api._hash(
+                unit["index_context_hash"],
+                f"authenticated V5 units[{index}].index_context_hash",
+            ),
+            "predecessor_hash": (
+                api._hash(
+                    unit["predecessor_hash"],
+                    f"authenticated V5 units[{index}].predecessor_hash",
+                )
+                if "predecessor_hash" in unit
+                else None
+            ),
+            "workflow_id_hash": (
+                api._hash(
+                    unit["workflow_id_hash"],
+                    f"authenticated V5 units[{index}].workflow_id_hash",
+                )
+                if "workflow_id_hash" in unit
+                else None
+            ),
+        }
+        if "storage_budget" in unit:
+            budget = unit["storage_budget"]
+            if not isinstance(budget, Mapping):
+                raise ValueError(_STORAGE_POLICY_MISSING)
+            normalized_unit["storage_budget"] = json.loads(
+                api._canonical_json(budget)
+            )
+        if "storage_intent" in unit:
+            try:
+                from devkit_runtime.storage_intent import parse_storage_intent
+
+                normalized_unit["storage_intent"] = parse_storage_intent(
+                    unit["storage_intent"]
+                ).to_dict()
+            except Exception as error:
+                code = getattr(error, "code", _STORAGE_TARGET_KEY_INVALID)
+                raise ValueError(code) from error
+        normalized.append(normalized_unit)
     task_ids = [str(item["task"]["task_id"]) for item in normalized]
     orders = [int(item["dispatch_order"]) for item in normalized]
     if (
@@ -175,6 +460,7 @@ def compile_skeletons(
     source_plan_hash: object,
     routing_requests: Sequence[Mapping[str, Any]],
     attestation_items: Sequence[Mapping[str, Any]],
+    context: Mapping[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     source_hash = api._hash(source_plan_hash, "source_plan_hash")
     normalized_units = normalize_units(api, units)
@@ -259,6 +545,13 @@ def compile_skeletons(
     route_pairs: set[tuple[str, str]] = set()
     for unit in normalized_units:
         task_id = str(unit["task"]["task_id"])
+        storage_intent = _unit_storage_intent(
+            api,
+            unit,
+            task_id=task_id,
+            source_plan_hash=source_hash,
+            context=context,
+        )
         request = request_by_task.get(task_id)
         attestation = attestation_by_task.get(task_id)
         if request is None or attestation is None:
@@ -328,6 +621,7 @@ def compile_skeletons(
                 "index_context_hash": unit["index_context_hash"],
                 "predecessor_hash": predecessor_hash,
                 "source_plan_hash": source_hash,
+                "storage_intent": storage_intent,
             }
         )
         route_pairs.add((model, effort))
@@ -387,6 +681,16 @@ def validate_skeleton_package(
                 skeleton.get("task_id"),
                 f"authenticated V5 {wave_name} skeletons[{index}].task_id",
             )
+            storage_intent = _validate_storage_intent(
+                skeleton.get("storage_intent"),
+                task_id=task_id,
+                source_plan_hash=source_hash,
+                context=None,
+                source_unit={},
+                api=api,
+            )
+            if skeleton.get("storage_intent") != storage_intent:
+                raise ValueError("authenticated V5 storage intent is not canonical")
             order = skeleton.get("dispatch_order")
             if type(order) is not int or not 0 <= order < len(source_ids):
                 raise ValueError("authenticated V5 package dispatch order is invalid")

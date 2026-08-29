@@ -5,6 +5,123 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+_STORAGE_INTENT_SCHEMA = "2718lab.storage.intent.v1"
+_STORAGE_TARGET_SCHEMA = "2718lab.storage.target.v1"
+_STORAGE_POLICY_MISSING = "STORAGE_POLICY_MISSING"
+_STORAGE_TARGET_KEY_INVALID = "STORAGE_TARGET_KEY_INVALID"
+_STORAGE_DESCRIPTOR_FIELDS = (
+    "repository_identity",
+    "workspace_manifest_hash",
+    "cargo_lock_hash",
+    "toolchain_digest",
+    "target_triple",
+    "profile",
+    "features_hash",
+    "build_env_class",
+)
+
+
+def _storage_context_value(
+    context: Mapping[str, Any], source_unit: Mapping[str, Any], field: str
+) -> object:
+    candidates: list[Mapping[str, Any]] = [context]
+    for container_name in (
+        "storage_descriptor",
+        "target_descriptor",
+        "storage_target",
+        "build_context",
+        "bootstrap_plan",
+        "storage",
+    ):
+        container = context.get(container_name)
+        if isinstance(container, Mapping):
+            candidates.insert(0, container)
+    for candidate in candidates:
+        if field in candidate:
+            return candidate[field]
+    task = source_unit.get("task")
+    if isinstance(task, Mapping) and field in task:
+        return task[field]
+    return source_unit.get(field)
+
+
+def _make_storage_intent(
+    api: Any,
+    source_unit: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    task_id: str,
+    source_plan_hash: str,
+) -> dict[str, object]:
+    context_hash = context.get("execution_context_hash")
+    if context_hash is None:
+        context_hash = source_unit.get("execution_context_hash")
+    try:
+        context_hash = api._hash(
+            context_hash,
+            f"storage context {task_id}.execution_context_hash",
+        )
+    except Exception as error:
+        raise ValueError(_STORAGE_POLICY_MISSING) from error
+    budget = source_unit.get("storage_budget")
+    if budget is None:
+        task = source_unit.get("task")
+        if isinstance(task, Mapping):
+            budget = task.get("storage_budget")
+    if not isinstance(budget, Mapping):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    requested_bytes = budget.get("bytes")
+    requested_files = budget.get("files")
+    if (
+        type(requested_bytes) is not int
+        or requested_bytes <= 0
+        or requested_bytes > (1 << 64) - 1
+        or type(requested_files) is not int
+        or requested_files <= 0
+        or requested_files > (1 << 64) - 1
+    ):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    descriptor = {
+        "schema": _STORAGE_TARGET_SCHEMA,
+        "artifact_kind": "fastlane-task",
+        **{
+            field: _storage_context_value(context, source_unit, field)
+            for field in _STORAGE_DESCRIPTOR_FIELDS
+        },
+    }
+    if any(descriptor[field] is None for field in _STORAGE_DESCRIPTOR_FIELDS):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    intent_preimage = {
+        "target_descriptor": descriptor,
+        "task_id": task_id,
+        "plan_binding": source_plan_hash,
+        "context_hash": context_hash,
+        "requested_bytes": requested_bytes,
+        "requested_files": requested_files,
+    }
+    intent = {
+        "schema": _STORAGE_INTENT_SCHEMA,
+        **{
+            key: intent_preimage[key]
+            for key in (
+                "task_id",
+                "plan_binding",
+                "context_hash",
+                "requested_bytes",
+                "requested_files",
+                "target_descriptor",
+            )
+        },
+        "storage_intent_hash": api._sha256_json(intent_preimage),
+    }
+    try:
+        from devkit_runtime.storage_intent import parse_storage_intent
+
+        return parse_storage_intent(intent).to_dict()
+    except Exception as error:
+        code = getattr(error, "code", _STORAGE_TARGET_KEY_INVALID)
+        raise ValueError(code) from error
+
 
 def project_units(
     api: Any,
@@ -220,6 +337,13 @@ def project_units_with_waves(
                 **dependency_without_hash,
                 "dependency_state_hash": api._sha256_json(dependency_without_hash),
             }
+            storage_intent = _make_storage_intent(
+                api,
+                source_unit,
+                context_by_task[task_id],
+                task_id=task_id,
+                source_plan_hash=source_plan_hash,
+            )
             criticality = {
                 "Terra High": "normal",
                 "Terra Max": "high",
@@ -231,6 +355,10 @@ def project_units_with_waves(
                 "source_unit": source_unit,
                 "target_gates": target,
                 "dependency_state": dependency_state,
+                # Keep the complete intent in the projection preimage.  A
+                # later dispatch binding therefore cannot omit storage
+                # semantics while retaining the same profile evidence hash.
+                "storage_intent": storage_intent,
             }
             task = {
                 "schema": "2718lab-devkit/task-routing-profile-v5",
@@ -276,6 +404,7 @@ def project_units_with_waves(
                     "dispatch_order": dispatch_order,
                     "index_context_hash": index_hash,
                     "workflow_id_hash": workflow_hash,
+                    "storage_intent": storage_intent,
                 }
             )
         return projected_slice
