@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-
 MCP_TOOLS = Path(__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent
 for _path in (MCP_TOOLS, TESTS):
@@ -364,10 +363,47 @@ def test_pre_host_skeleton_remains_the_legacy_exact_eight_fields() -> None:
 def test_verified_private_profile_round_trip_constructs_local_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _verified_profile_round_trip(monkeypatch, admit=False)
+
+
+def test_storage_admission_request_is_session_bound_and_replay_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _verified_profile_round_trip(monkeypatch, admit=True)
+
+
+def _admission_response(request: dict[str, object]) -> dict[str, object]:
+    intent = request["storage_intent"]
+    receipt = {
+        "schema": "2718lab.storage.admission-receipt.v1",
+        "admission_id": _hash("a"),
+        "profile_attestation_hash": request["profile_attestation_hash"],
+        "storage_intent_hash": intent["storage_intent_hash"],
+        "storage_binding_hash": _hash("b"),
+        "target_key": _canonical_hash(intent["target_descriptor"]),
+        "assigned_root_identity": _hash("c"),
+        "target_family_lease_id": _hash("d"),
+        "reserved_bytes": intent["requested_bytes"],
+        "reserved_files": intent["requested_files"],
+        "free_space_before": 8192,
+        "free_space_after_reserve": 4096,
+        "free_space_floor": 1024,
+        "expires_at": 1_700_000_060,
+    }
+    receipt["receipt_hash"] = _canonical_hash(receipt)
+    return {
+        "schema": "2718lab.storage.admission-response.v1",
+        "correlation_id": request["correlation_id"],
+        "request_hash": request["request_hash"],
+        "receipt": receipt,
+    }
+
+
+def _verified_profile_round_trip(monkeypatch: pytest.MonkeyPatch, *, admit: bool) -> None:
     """Exercise the framed Host bridge and local post-profile compilation."""
 
-    from devkit_runtime import fastlane_host_adapter as adapter
     import devkit_runtime.host_session as host_session
+    from devkit_runtime import fastlane_host_adapter as adapter
     from devkit_runtime.host_bridge import InheritedHandleHostBridge
 
     fixture = _authenticated_v5_fixture()
@@ -376,6 +412,7 @@ def test_verified_private_profile_round_trip_constructs_local_intent(
     fact_mapping = adapter._dispatch_fact_mapping(fact)
     lease_hash = adapter._lease_scope_binding_hash(fact)
     failure: list[BaseException] = []
+    admission_requests: list[dict[str, object]] = []
 
     def host_reply() -> None:
         try:
@@ -416,6 +453,22 @@ def test_verified_private_profile_round_trip_constructs_local_intent(
                 request=profile_request,
                 response=_storage_profile_response(profile_request),
             )
+            if admit:
+                for _ in range(2):
+                    message = host._receive_private()
+                    request = message.payload
+                    assert message.kind == "storage_admission_request"
+                    assert message.action_id == request["correlation_id"]
+                    assert set(request) == {"schema", "correlation_id", "profile_attestation_hash", "storage_intent", "request_hash"}
+                    assert request["schema"] == "2718lab.storage.admission-request.v1"
+                    assert request["request_hash"] == _canonical_hash(
+                        {key: value for key, value in request.items() if key != "request_hash"}
+                    )
+                    admission_requests.append(request)
+                    host._send_validated_private(
+                        kind="storage_admission_response", action_id=message.action_id,
+                        payload=_admission_response(request),
+                    )
         except BaseException as error:  # report peer errors after the round trip
             failure.append(error)
 
@@ -452,6 +505,31 @@ def test_verified_private_profile_round_trip_constructs_local_intent(
         assert type(prepared).__name__ == "_PreparedHostFacts"
         assert len(prepared.storage_intents) == 1
         assert prepared.storage_intents[0]["task_id"] == "TASK-V5"
+        if admit:
+            from devkit_runtime.host_bridge import (
+                HostBridgeError,
+                StorageAdmissionReceipt,
+            )
+            from devkit_runtime.storage_intent import parse_storage_intent
+
+            intent = parse_storage_intent(prepared.storage_intents[0])
+            # Same attestation/profile facts on another Python session do not
+            # become an issued reference, even when the bridge object matches.
+            foreign = host_session.HostSession(bridge=child, clock=lambda: 1_700_000_000)
+            assert foreign.request_storage_admission(intent, profile_attestation_hash=_hash("7")) == "STORAGE_TARGET_KEY_INVALID"
+            first = session.request_storage_admission(intent, profile_attestation_hash=_hash("7"))
+            second = session.request_storage_admission(intent, profile_attestation_hash=_hash("7"))
+            assert isinstance(first, StorageAdmissionReceipt)
+            assert first == second
+            assert len(admission_requests) == 2  # no local decision/cache admission
+            assert admission_requests[0]["correlation_id"] != admission_requests[1]["correlation_id"]
+            assert len(child._storage_admission_completions) == 2
+            with pytest.raises(HostBridgeError, match="HOST_BRIDGE_STORAGE_ADMISSION_INVALID"):
+                child.request_storage_admission(
+                    admission_requests[0], now=1_700_000_000, expires_at=1_700_000_120,
+                    clock=lambda: 1_700_000_000,
+                )
+            assert set(first.to_dict()) == set(_admission_response(admission_requests[0])["receipt"])
         batch = adapter.compile_fast_lane_with_host_facts(
             fixture["planner_request"],
             reasoning_effort="max",
@@ -465,6 +543,41 @@ def test_verified_private_profile_round_trip_constructs_local_intent(
     worker.join(timeout=2)
     assert not worker.is_alive()
     assert not failure
+
+
+def test_storage_admission_rejects_substitution_and_unknown_fields() -> None:
+    from devkit_runtime import host_bridge
+    from devkit_runtime.storage_intent import parse_storage_intent
+
+    intent = parse_storage_intent(_storage_intent(
+        task_id="TASK-V5", plan_binding=_hash("8"), context_hash=_hash("6")
+    ))
+    request = host_bridge.build_storage_admission_request(intent, profile_attestation_hash=_hash("7"))
+    response = _admission_response(request)
+    malformed = [dict(request, assigned_root="G:/private"), {key: value for key, value in request.items() if key != "profile_attestation_hash"}]
+    for candidate in malformed:
+        with pytest.raises(host_bridge.HostBridgeError):
+            host_bridge._normalize_storage_admission_request(candidate)
+    for field, value in (("target_key", _hash("f")), ("storage_intent_hash", _hash("f")),
+                         ("profile_attestation_hash", _hash("f")), ("reserved_bytes", True),
+                         ("reserved_files", 9), ("expires_at", 1_700_000_000),
+                         ("admission_id", "G:/private"), ("assigned_root", "G:/private")):
+        candidate = copy.deepcopy(response)
+        candidate["receipt"][field] = value
+        candidate["receipt"]["receipt_hash"] = _canonical_hash(
+            {key: value for key, value in candidate["receipt"].items() if key != "receipt_hash"}
+        )
+        with pytest.raises(host_bridge.HostBridgeError):
+            host_bridge._normalize_storage_admission_response(
+                candidate, request=request, now=1_700_000_000, expires_at=1_700_000_120
+            )
+    child, host = _pipe_pair()
+    try:
+        with pytest.raises(host_bridge.HostBridgeError, match="HOST_BRIDGE_STORAGE_PROFILE_INVALID"):
+            child.request_storage_admission(request, now=1_700_000_000, expires_at=1_700_000_120, clock=lambda: 1_700_000_000)
+    finally:
+        child.close()
+        host.close()
 
 
 def test_profile_tamper_or_missing_field_fails_closed() -> None:
@@ -485,6 +598,7 @@ def test_profile_tamper_or_missing_field_fails_closed() -> None:
 
 def test_v2_remains_compatible_while_v3_requires_one_root_storage_intent() -> None:
     from test_fastlane_host_intent import _intent, _with_binding
+
     from devkit_runtime.fastlane_host_intent import (
         NO_SAFE_WORK,
         StorageIntentError,

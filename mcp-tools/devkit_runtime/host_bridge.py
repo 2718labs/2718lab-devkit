@@ -20,7 +20,7 @@ import select
 import stat
 import struct
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from threading import Event, Lock, RLock
 from typing import Final, cast
@@ -30,6 +30,7 @@ from . import (
     host_envelopes,
     project_index_attestation_protocol,
 )
+from .storage_intent import StorageIntent, StorageIntentError, parse_storage_intent
 
 _FRAME_SCHEMA: Final = "2718lab-devkit/host-bridge-v1"
 _CAPABILITY_PROBE_SCHEMA: Final = "2718lab-devkit/host-capability-probe-v1"
@@ -49,6 +50,19 @@ _STORAGE_PROFILE_REQUEST_SCHEMA: Final = (
     "2718lab-devkit/storage-profile-request-v1"
 )
 _STORAGE_PROFILE_SCHEMA: Final = "2718lab-devkit/storage-profile-v1"
+_STORAGE_ADMISSION_REQUEST_SCHEMA: Final = "2718lab.storage.admission-request.v1"
+_STORAGE_ADMISSION_RESPONSE_SCHEMA: Final = "2718lab.storage.admission-response.v1"
+_STORAGE_ADMISSION_RECEIPT_SCHEMA: Final = "2718lab.storage.admission-receipt.v1"
+_STORAGE_ADMISSION_REQUEST_FIELDS: Final = frozenset(
+    {"schema", "correlation_id", "profile_attestation_hash", "storage_intent", "request_hash"}
+)
+_STORAGE_ADMISSION_RECEIPT_FIELDS: Final = frozenset(
+    {"schema", "admission_id", "profile_attestation_hash", "storage_intent_hash",
+     "storage_binding_hash", "target_key", "assigned_root_identity",
+     "target_family_lease_id", "reserved_bytes", "reserved_files",
+     "free_space_before", "free_space_after_reserve", "free_space_floor",
+     "expires_at", "receipt_hash"}
+)
 _PROJECT_INDEX_ATTESTATION_SCHEMA: Final = (
     project_index_attestation_protocol.ATTESTATION_SCHEMA
 )
@@ -160,6 +174,8 @@ _MESSAGE_KINDS: Final = frozenset(
         "compiler_evidence_response",
         "storage_profile_request",
         "storage_profile_response",
+        "storage_admission_request",
+        "storage_admission_response",
         "project_index_attestation",
         "routing_attestation_request",
         "routing_attestation_response",
@@ -179,6 +195,8 @@ _VALIDATED_PRIVATE_KINDS: Final = frozenset(
         "compiler_evidence_response",
         "storage_profile_request",
         "storage_profile_response",
+        "storage_admission_request",
+        "storage_admission_response",
         "project_index_attestation",
         "routing_attestation_request",
         "routing_attestation_response",
@@ -304,6 +322,45 @@ class StorageProfileRequest:
     request_hash: str
 
 
+@dataclass(frozen=True, slots=True)
+class StorageAdmissionReceipt:
+    """Host decision, never a local reservation or a private filesystem path."""
+
+    schema: str
+    admission_id: str
+    profile_attestation_hash: str
+    storage_intent_hash: str
+    storage_binding_hash: str
+    target_key: str
+    assigned_root_identity: str
+    target_family_lease_id: str
+    reserved_bytes: int
+    reserved_files: int
+    free_space_before: int
+    free_space_after_reserve: int
+    free_space_floor: int
+    expires_at: int
+    receipt_hash: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in sorted(_STORAGE_ADMISSION_RECEIPT_FIELDS)}
+
+
+@dataclass(frozen=True)
+class _StorageAdmissionCompletion:
+    """Local authenticated reception, separate from the Host capacity decision.
+
+    Host generation stays opaque in profile-v1; bridge identity below only
+    identifies this Python transport instance, not a fabricated Host generation.
+    """
+
+    request_hash: str
+    response_hash: str
+    bridge_identity: object = field(repr=False)
+    expires_at: int
+    completed_at: int
+
+
 @dataclass(frozen=True)
 class FastLaneRefillRegistryRequest:
     """One authenticated queue of remaining V5 skeletons.
@@ -406,6 +463,11 @@ class InheritedHandleHostBridge:
         self._received_compiler_evidence: set[str] = set()
         self._pending_storage_profiles: dict[str, StorageProfileRequest] = {}
         self._received_storage_profiles: set[str] = set()
+        self._completed_storage_profiles: dict[str, dict[str, object]] = {}
+        self._storage_admission_correlations: set[str] = set()
+        self._storage_admission_decisions: dict[str, StorageAdmissionReceipt] = {}
+        self._storage_admission_completions: dict[str, _StorageAdmissionCompletion] = {}
+        self._storage_transport_identity = object()
         self._sent_fast_lane_refill_registries: set[str] = set()
         self._received_fast_lane_refill_registries: set[str] = set()
         self._received_project_index_attestations: set[str] = set()
@@ -1548,7 +1610,83 @@ class InheritedHandleHostBridge:
             self._poison()
             raise
         del self._pending_storage_profiles[normalized_request.request_hash]
+        attestation = cast(str, normalized["attestation_hash"])
+        previous = self._completed_storage_profiles.get(attestation)
+        if previous is not None and previous != normalized:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        self._completed_storage_profiles[attestation] = dict(normalized)
         return normalized
+
+    def request_storage_admission(
+        self, request: Mapping[str, object], *, now: int, expires_at: int,
+        clock: Callable[[], float],
+    ) -> StorageAdmissionReceipt:
+        """Exchange one decision before terminal reception starts; never admit locally.
+
+        The owning HostSession serializes this round trip with preparation and
+        terminal-reader startup. The existing bridge I/O lock owns both frames.
+        """
+        with self._io_lock:
+            normalized = _normalize_storage_admission_request(request)
+            correlation = cast(str, normalized["correlation_id"])
+            attestation = cast(str, normalized["profile_attestation_hash"])
+            profile = self._completed_storage_profiles.get(attestation)
+            intent = parse_storage_intent(normalized["storage_intent"])
+            if profile is None:
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+            _validate_storage_admission_profile(intent, profile)
+            if (
+                type(now) is not int or type(expires_at) is not int
+                or not 0 <= now < expires_at <= (1 << 64) - 1
+                or correlation in self._storage_admission_correlations
+            ):
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+            previous = self._storage_admission_decisions.get(attestation)
+            if previous is not None and previous.storage_intent_hash != intent.storage_intent_hash:
+                raise HostBridgeError("STORAGE_LEASE_CONFLICT")
+            # Burn before writing, including transport failure; retry must use a
+            # fresh correlation and still obtain a decision from the Host.
+            self._storage_admission_correlations.add(correlation)
+            try:
+                self._send_validated_private(
+                    kind="storage_admission_request", action_id=correlation, payload=normalized
+                )
+                message = self._receive_private()
+                if message.kind != "storage_admission_response" or message.action_id != correlation:
+                    raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+                completed_time = clock()
+                if (
+                    type(completed_time) not in (int, float)
+                    or not math.isfinite(completed_time) or completed_time < now
+                ):
+                    raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+                completed_at = int(completed_time)
+                receipt = _normalize_storage_admission_response(
+                    message.payload, request=normalized, now=completed_at, expires_at=expires_at
+                )
+                if previous is not None and previous != receipt:
+                    raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+            except HostBridgeError:
+                self._poison()
+                raise
+            self._storage_admission_decisions[attestation] = receipt
+            self._storage_admission_completions[correlation] = _StorageAdmissionCompletion(
+                request_hash=cast(str, normalized["request_hash"]),
+                response_hash=_private_payload_hash(message.payload),
+                bridge_identity=self._storage_transport_identity,
+                expires_at=receipt.expires_at,
+                completed_at=completed_at,
+            )
+            return receipt
+
+    def has_completed_storage_profile(self, profile: Mapping[str, object]) -> bool:
+        """Lookup transport-completed facts; caller-supplied hashes cannot enroll."""
+        attestation = profile.get("attestation_hash")
+        return (
+            self.is_available and type(attestation) is str
+            and self._completed_storage_profiles.get(attestation) == profile
+        )
 
     def receive_operation(
         self,
@@ -3006,6 +3144,110 @@ def build_project_index_attestation(
 
 def _is_index_correlation(value: object) -> bool:
     return project_index_attestation_protocol.is_index_correlation(value)
+
+
+def build_storage_admission_request(
+    intent: StorageIntent, *, profile_attestation_hash: str
+) -> dict[str, object]:
+    """Build exact5; a canonical digest is a reference, never proof of issuance."""
+    if type(intent) is not StorageIntent:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    unsigned = {
+        "schema": _STORAGE_ADMISSION_REQUEST_SCHEMA,
+        "correlation_id": "storage-admit-" + secrets.token_hex(32),
+        "profile_attestation_hash": profile_attestation_hash,
+        "storage_intent": intent.to_dict(),
+    }
+    return _normalize_storage_admission_request(
+        {**unsigned, "request_hash": _private_payload_hash(unsigned)}
+    )
+
+
+def _normalize_storage_admission_request(value: object) -> dict[str, object]:
+    if (
+        type(value) is not dict or set(value) != _STORAGE_ADMISSION_REQUEST_FIELDS
+        or value.get("schema") != _STORAGE_ADMISSION_REQUEST_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    _validate_private_packet_size(value, _MAX_OPERATION_PACKET_BYTES)
+    correlation = value.get("correlation_id")
+    if type(correlation) is not str or _IDENTIFIER.fullmatch(correlation) is None:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    for name in ("profile_attestation_hash", "request_hash"):
+        if type(value[name]) is not str or _DIGEST.fullmatch(value[name]) is None:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    try:
+        intent = parse_storage_intent(value["storage_intent"])
+    except StorageIntentError as error:
+        raise HostBridgeError(error.code) from error
+    normalized = {**value, "storage_intent": intent.to_dict()}
+    if normalized["request_hash"] != _private_payload_hash(
+        {name: item for name, item in normalized.items() if name != "request_hash"}
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    return normalized
+
+
+def _validate_storage_admission_profile(
+    intent: StorageIntent, profile: Mapping[str, object]
+) -> None:
+    if (
+        intent.task_id != profile.get("task_id")
+        or intent.plan_binding != profile.get("source_plan_hash")
+        or intent.context_hash != profile.get("execution_context_hash")
+        or intent.target_descriptor["artifact_kind"] != "fastlane-task"
+        or any(intent.target_descriptor[name] != profile.get(name)
+               for name in _STORAGE_DESCRIPTOR_FIELDS)
+    ):
+        raise HostBridgeError("STORAGE_TARGET_KEY_INVALID")
+
+
+def _normalize_storage_admission_response(
+    value: object, *, request: Mapping[str, object], now: int, expires_at: int
+) -> StorageAdmissionReceipt:
+    request = _normalize_storage_admission_request(request)
+    if (
+        type(value) is not dict
+        or set(value) != {"schema", "correlation_id", "request_hash", "receipt"}
+        or value.get("schema") != _STORAGE_ADMISSION_RESPONSE_SCHEMA
+        or value.get("correlation_id") != request["correlation_id"]
+        or value.get("request_hash") != request["request_hash"]
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    _validate_private_packet_size(value, _MAX_OPERATION_PACKET_BYTES)
+    receipt = value["receipt"]
+    if (
+        type(receipt) is not dict or set(receipt) != _STORAGE_ADMISSION_RECEIPT_FIELDS
+        or receipt.get("schema") != _STORAGE_ADMISSION_RECEIPT_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    # Both Host-minted IDs are frozen SHA-256 identities, not UUIDs or paths.
+    for name in ("admission_id", "target_family_lease_id", "profile_attestation_hash",
+                 "storage_intent_hash", "storage_binding_hash", "target_key",
+                 "assigned_root_identity", "receipt_hash"):
+        if type(receipt[name]) is not str or _DIGEST.fullmatch(receipt[name]) is None:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    for name in ("reserved_bytes", "reserved_files", "free_space_before",
+                 "free_space_after_reserve", "free_space_floor", "expires_at"):
+        if type(receipt[name]) is not int or not 0 <= receipt[name] <= (1 << 64) - 1:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    intent = parse_storage_intent(request["storage_intent"])
+    if (
+        type(now) is not int or type(expires_at) is not int
+        or not 0 <= now < receipt["expires_at"] <= expires_at <= (1 << 64) - 1
+        or receipt["profile_attestation_hash"] != request["profile_attestation_hash"]
+        or receipt["storage_intent_hash"] != intent.storage_intent_hash
+        or receipt["target_key"] != _private_payload_hash(dict(intent.target_descriptor))
+        or receipt["reserved_bytes"] != intent.requested_bytes
+        or receipt["reserved_files"] != intent.requested_files
+        or receipt["free_space_after_reserve"] > receipt["free_space_before"] - receipt["reserved_bytes"]
+        or receipt["free_space_after_reserve"] < receipt["free_space_floor"]
+        or receipt["receipt_hash"] != _private_payload_hash(
+            {name: item for name, item in receipt.items() if name != "receipt_hash"}
+        )
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    return StorageAdmissionReceipt(**receipt)
 
 
 def _normalize_storage_profile_request(value: object) -> StorageProfileRequest:
