@@ -24,6 +24,33 @@ _STORAGE_CONTEXT_FIELDS = frozenset(
 )
 _STORAGE_REQUEST_FIELDS = frozenset({"storage_budgets", "storage_contexts"})
 _STORAGE_CONTEXT_CONTAINERS = ("storage_context", "storage_descriptor")
+_PROFILE_EVIDENCE_SCHEMA = "team-efficiency/fast-lane-v5-profile-evidence-v1"
+_PROFILE_UNIT_FIELDS = (
+    "task",
+    "dependency_state",
+    "write_scope",
+    "concurrency_mode",
+    "dispatch_order",
+    "index_context_hash",
+    "workflow_id_hash",
+    "storage_budget",
+    "storage_intent",
+)
+
+
+def _routing_profile_material(
+    source_plan_hash: str, unit: Mapping[str, Any]
+) -> dict[str, Any]:
+    task = dict(unit["task"])
+    task.pop("profile_evidence_hash", None)
+    return {
+        "schema": _PROFILE_EVIDENCE_SCHEMA,
+        "source_plan_hash": source_plan_hash,
+        "unit": {
+            field: task if field == "task" else unit[field]
+            for field in _PROFILE_UNIT_FIELDS
+        },
+    }
 
 
 def _storage_record_for_task(
@@ -499,17 +526,6 @@ def project_units_with_waves(
                 "Terra Max": "high",
                 "Sol High": "critical",
             }.get(str(source_unit.get("recommended_route")), "critical")
-            profile_material = {
-                "schema": "team-efficiency/fast-lane-v5-profile-evidence-v1",
-                "source_plan_hash": source_plan_hash,
-                "source_unit": source_unit,
-                "target_gates": target,
-                "dependency_state": dependency_state,
-                # Keep the complete intent in the projection preimage.  A
-                # later dispatch binding therefore cannot omit storage
-                # semantics while retaining the same profile evidence hash.
-                "storage_intent": storage_intent,
-            }
             task = {
                 "schema": "2718lab-devkit/task-routing-profile-v5",
                 "task_id": task_id,
@@ -543,8 +559,22 @@ def project_units_with_waves(
                 "narrow_decoupling_eligible": False,
                 "strike": None,
                 "gate_matrix_hash": api._sha256_json(target),
-                "profile_evidence_hash": api._sha256_json(profile_material),
             }
+            profile_material = _routing_profile_material(
+                source_plan_hash,
+                {
+                    "task": task,
+                    "dependency_state": dependency_state,
+                    "write_scope": write_scope,
+                    "concurrency_mode": "parallel",
+                    "dispatch_order": dispatch_order,
+                    "index_context_hash": index_hash,
+                    "workflow_id_hash": workflow_hash,
+                    "storage_budget": source_unit["storage_budget"],
+                    "storage_intent": storage_intent,
+                },
+            )
+            task["profile_evidence_hash"] = api._sha256_json(profile_material)
             projected_slice.append(
                 {
                     "task": task,
