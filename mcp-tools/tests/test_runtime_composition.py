@@ -889,6 +889,137 @@ def _atlas_outbox_schema(
     """
 
 
+def _legacy_v6_schema() -> str:
+    """Build the complete v6 schema without passing through the current store."""
+
+    return f"""
+        CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE workflows (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+            product_summary TEXT NOT NULL, state TEXT NOT NULL,
+            version INTEGER NOT NULL, policy_version TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            title TEXT NOT NULL, owner_role TEXT NOT NULL, state TEXT NOT NULL,
+            write_scope TEXT NOT NULL, card_hash TEXT NOT NULL,
+            result_hash TEXT NOT NULL, version INTEGER NOT NULL,
+            task_kind TEXT NOT NULL DEFAULT 'general',
+            intent_id TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '',
+            framework TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_tasks_workflow_state ON tasks(workflow_id, state);
+        CREATE TABLE code_task_acceptances (
+            acceptance_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            code_task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), code_task_version INTEGER NOT NULL,
+            input_snapshot_id TEXT NOT NULL, output_snapshot_id TEXT NOT NULL,
+            indexed_diff_hash TEXT NOT NULL, intent_id TEXT NOT NULL,
+            language TEXT NOT NULL, framework TEXT NOT NULL,
+            payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            CHECK (acceptance_id = payload_hash)
+        );
+        CREATE INDEX idx_code_task_acceptances_workflow
+            ON code_task_acceptances(workflow_id, created_at, acceptance_id);
+        CREATE TABLE code_task_receipt_attestations (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id), workflow_id TEXT NOT NULL REFERENCES workflows(id),
+            code_task_version INTEGER NOT NULL, input_snapshot_id TEXT NOT NULL,
+            output_snapshot_id TEXT NOT NULL, workspace_hash TEXT NOT NULL,
+            execution_receipt_ids TEXT NOT NULL, attestation_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            UNIQUE (task_id, code_task_version, attestation_hash)
+        );
+        CREATE INDEX idx_code_task_receipt_attestations_workflow
+            ON code_task_receipt_attestations(workflow_id, code_task_version, task_id);
+        CREATE TABLE code_task_receipt_owners (
+            receipt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+            code_task_version INTEGER NOT NULL, attestation_hash TEXT NOT NULL,
+            FOREIGN KEY (task_id, code_task_version, attestation_hash)
+                REFERENCES code_task_receipt_attestations(task_id, code_task_version, attestation_hash)
+        );
+        CREATE INDEX idx_code_task_receipt_owners_task
+            ON code_task_receipt_owners(task_id, code_task_version, attestation_hash, receipt_id);
+        {_atlas_outbox_schema()}
+        CREATE INDEX idx_atlas_outbox_pending
+            ON atlas_ingestion_outbox(state, created_at, ingestion_key);
+        CREATE TABLE task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id), dependency_id TEXT NOT NULL REFERENCES tasks(id),
+            PRIMARY KEY (task_id, dependency_id)
+        );
+        CREATE INDEX idx_task_dependencies_dependency ON task_dependencies(dependency_id);
+        CREATE TABLE lease_epochs (task_id TEXT PRIMARY KEY REFERENCES tasks(id), epoch INTEGER NOT NULL);
+        CREATE TABLE leases (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id), owner TEXT NOT NULL,
+            epoch INTEGER NOT NULL, expires_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL, host_target TEXT
+        );
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id), task_id TEXT REFERENCES tasks(id),
+            event_type TEXT NOT NULL, redacted_payload TEXT NOT NULL,
+            payload_hash TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_events_workflow_sequence ON events(workflow_id, sequence);
+        CREATE TABLE artifacts (
+            content_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, safe_path TEXT NOT NULL,
+            size INTEGER NOT NULL, redaction_version TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE task_inputs (task_id TEXT PRIMARY KEY REFERENCES tasks(id), input_hash TEXT NOT NULL);
+        CREATE TABLE artifact_owners (content_hash TEXT PRIMARY KEY REFERENCES artifacts(content_hash), task_id TEXT NOT NULL REFERENCES tasks(id));
+        CREATE TABLE task_cards (task_id TEXT PRIMARY KEY REFERENCES tasks(id), card_hash TEXT NOT NULL, card_body TEXT NOT NULL);
+        CREATE TABLE task_contract_subscriptions (
+            task_id TEXT NOT NULL REFERENCES tasks(id), contract_hash TEXT NOT NULL,
+            PRIMARY KEY (task_id, contract_hash)
+        );
+        CREATE TABLE task_required_evidence (
+            task_id TEXT NOT NULL REFERENCES tasks(id), position INTEGER NOT NULL,
+            evidence TEXT NOT NULL,
+            PRIMARY KEY (task_id, position)
+        );
+        CREATE TABLE task_index_bindings (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id), workspace_root TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '', input_snapshot_id TEXT NOT NULL,
+            output_snapshot_id TEXT NOT NULL, task_node_ids TEXT NOT NULL,
+            contract_node_ids TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+            indexed_diff_hash TEXT NOT NULL, fallback_count INTEGER NOT NULL
+        );
+        CREATE TABLE task_index_query_receipts (
+            task_id TEXT NOT NULL REFERENCES tasks(id), trace_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL, miss_escape_used INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, trace_id)
+        );
+        CREATE INDEX idx_task_index_query_snapshot ON task_index_query_receipts(task_id, snapshot_id);
+        CREATE TABLE task_index_verification_artifacts (
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            content_hash TEXT NOT NULL REFERENCES artifacts(content_hash), snapshot_id TEXT NOT NULL,
+            PRIMARY KEY (task_id, content_hash)
+        );
+        CREATE TABLE task_index_binding_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
+            event_type TEXT NOT NULL, snapshot_id TEXT NOT NULL,
+            trace_id TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE peer_capabilities (
+            workflow_id TEXT NOT NULL REFERENCES workflows(id), sender_task_id TEXT NOT NULL REFERENCES tasks(id),
+            recipient_task_id TEXT NOT NULL REFERENCES tasks(id), relationship TEXT NOT NULL,
+            capability TEXT NOT NULL UNIQUE,
+            PRIMARY KEY (workflow_id, sender_task_id, recipient_task_id, relationship)
+        );
+        CREATE TABLE messages (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id TEXT NOT NULL UNIQUE,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id), sender_task_id TEXT NOT NULL REFERENCES tasks(id),
+            recipient_task_id TEXT NOT NULL REFERENCES tasks(id), correlation_id TEXT NOT NULL,
+            artifact_hash TEXT NOT NULL REFERENCES artifacts(content_hash), redacted_metadata TEXT NOT NULL,
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+            delivery_state TEXT NOT NULL, acknowledged_at TEXT,
+            UNIQUE (workflow_id, sender_task_id, recipient_task_id, correlation_id)
+        );
+        CREATE INDEX idx_messages_recipient_inbox ON messages(workflow_id, recipient_task_id, sequence);
+    """
+
+
 def _runtime_with_malformed_atlas_outbox(
     tmp_path: Path, outbox_schema: str
 ) -> RuntimeConfig:
@@ -1042,7 +1173,7 @@ def test_prepared_sqlite_store_enables_foreign_keys_on_raw_connection(
 def _insert_legacy_atlas_acceptance(
     connection: sqlite3.Connection, *, suffix: str
 ) -> tuple[str, str]:
-    timestamp = "2026-08-09T00:00:00Z"
+    timestamp = "2026-08-09T00:00:00+00:00"
     workflow_id = "legacy-workflow"
     task_id = f"legacy-task-{suffix}"
     acceptance_id = f"sha256:{suffix * 64}"
@@ -1112,6 +1243,49 @@ def _insert_legacy_atlas_acceptance(
     return acceptance_id, timestamp
 
 
+def _legacy_v6_atlas_outbox_database(
+    tmp_path: Path, *, ingestion_key: str | None
+) -> tuple[Path, str, str]:
+    """Create a complete historical v6 store, without bootstrapping v13 first."""
+
+    database = tmp_path / "legacy-v6-atlas-outbox.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(_legacy_v6_schema())
+        acceptance_id, timestamp = _insert_legacy_atlas_acceptance(
+            connection, suffix="a"
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+            ("schema_version", "6"),
+        )
+        connection.execute(
+            """
+            INSERT INTO atlas_ingestion_outbox (
+                ingestion_key, acceptance_id, payload_json, payload_hash, state,
+                attempt_count, last_error_code, reason_codes_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ingestion_key,
+                acceptance_id,
+                "{}",
+                acceptance_id,
+                "pending",
+                0,
+                "",
+                "[]",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return database, acceptance_id, timestamp
+
+
 def _legacy_v10_atlas_outbox_database(
     tmp_path: Path, *, ingestion_key: str | None
 ) -> tuple[Path, str, str]:
@@ -1139,6 +1313,10 @@ def _legacy_v10_atlas_outbox_database(
         )
         connection.execute("DROP TABLE atlas_ingestion_outbox")
         connection.executescript(_atlas_outbox_schema())
+        connection.execute(
+            "CREATE INDEX idx_atlas_outbox_pending "
+            "ON atlas_ingestion_outbox(state, created_at, ingestion_key)"
+        )
         connection.execute(
             """
             INSERT INTO atlas_ingestion_outbox (
@@ -1243,9 +1421,152 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
         store.close()
 
 
-@pytest.mark.parametrize("schema_version", (6, 7, 8, 9, 10))
+@pytest.mark.parametrize("missing_object", ("table", "pending-index"))
+def test_sqlite_store_rejects_legacy_v6_outbox_drift_before_current_ddl(
+    tmp_path: Path, missing_object: str
+) -> None:
+    database, _, _ = _legacy_v6_atlas_outbox_database(
+        tmp_path, ingestion_key=f"sha256:{'a' * 64}"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        if missing_object == "table":
+            connection.execute("DROP TABLE atlas_ingestion_outbox")
+        else:
+            connection.execute("DROP INDEX idx_atlas_outbox_pending")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreError, match="orchestrator store is not prepared"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "6"
+        if missing_object == "table":
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'atlas_ingestion_outbox'"
+            ).fetchone() is None
+        else:
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_atlas_outbox_pending'"
+            ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def test_sqlite_store_bootstraps_true_legacy_v6_empty_outbox(
+    tmp_path: Path,
+) -> None:
+    database, _, _ = _legacy_v6_atlas_outbox_database(
+        tmp_path, ingestion_key=f"sha256:{'a' * 64}"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DELETE FROM atlas_ingestion_outbox")
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("6",)
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'atlas_finalizations'"
+        ).fetchone() is None
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SQLiteStore(database)
+    try:
+        assert store.schema_version() == 13
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+        ).fetchone()[0] == 0
+        assert store._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'atlas_finalizations'"
+        ).fetchone() is not None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "outbox_update",
+    (
+        {"state": "projected", "attempt_count": 0, "last_error_code": "ERR"},
+        {"state": "quarantined", "attempt_count": 0, "last_error_code": ""},
+        {"state": "pending", "attempt_count": 1, "last_error_code": ""},
+        {
+            "state": "pending",
+            "attempt_count": 0,
+            "last_error_code": "",
+            "created_at": "2026-08-09T00:00:00+08:00",
+            "updated_at": "2026-08-09T00:00:00+08:00",
+        },
+    ),
+    ids=(
+        "projected-error",
+        "quarantined-missing-error",
+        "pending-retry-missing-error",
+        "non-utc-timestamp",
+    ),
+)
+def test_sqlite_store_rejects_legacy_atlas_outbox_row_contract_drift(
+    tmp_path: Path, outbox_update: dict[str, object]
+) -> None:
+    database, _, _ = _legacy_v10_atlas_outbox_database(
+        tmp_path, ingestion_key=f"sha256:{'a' * 64}"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        assignments = {
+            "state": outbox_update.get("state", "pending"),
+            "attempt_count": outbox_update.get("attempt_count", 0),
+            "last_error_code": outbox_update.get("last_error_code", ""),
+            "created_at": outbox_update.get(
+                "created_at", "2026-08-09T00:00:00+00:00"
+            ),
+            "updated_at": outbox_update.get(
+                "updated_at", "2026-08-09T00:00:00+00:00"
+            ),
+        }
+        connection.execute(
+            """
+            UPDATE atlas_ingestion_outbox
+            SET state = ?, attempt_count = ?, last_error_code = ?,
+                created_at = ?, updated_at = ?
+            """,
+            tuple(assignments.values()),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreError, match="legacy atlas outbox row is invalid"):
+        SQLiteStore(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "10"
+        columns = {
+            str(row[1]): int(row[3])
+            for row in connection.execute(
+                "PRAGMA table_info(atlas_ingestion_outbox)"
+            ).fetchall()
+        }
+        assert columns["ingestion_key"] == 0
+    finally:
+        connection.close()
+
+
 def test_sqlite_store_bootstraps_verified_legacy_empty_outbox(
-    tmp_path: Path, schema_version: int
+    tmp_path: Path,
 ) -> None:
     database, _, _ = _legacy_v10_atlas_outbox_database(
         tmp_path, ingestion_key=f"sha256:{'a' * 64}"
@@ -1260,10 +1581,6 @@ def test_sqlite_store_bootstraps_verified_legacy_empty_outbox(
             connection.execute(f"DROP TRIGGER {trigger_name}")
         connection.execute("DROP TABLE atlas_finalizations")
         connection.execute("DELETE FROM atlas_ingestion_outbox")
-        connection.execute(
-            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
-            (str(schema_version),),
-        )
         connection.commit()
     finally:
         connection.close()

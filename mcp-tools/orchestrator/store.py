@@ -7099,8 +7099,8 @@ class SQLiteStore:
                 for row in cursor.execute(f'PRAGMA index_info("{identifier}")').fetchall()
             )
 
-        unique_indexes: set[tuple[str, ...]] = set()
-        non_unique_indexes: set[tuple[str, ...]] = set()
+        unique_indexes: set[tuple[tuple[str, ...], str]] = set()
+        non_unique_indexes: set[tuple[tuple[str, ...], str, str]] = set()
         index_rows = cursor.execute(
             "PRAGMA index_list(atlas_ingestion_outbox)"
         ).fetchall()
@@ -7108,14 +7108,19 @@ class SQLiteStore:
             if int(index["partial"]):
                 raise StoreError("orchestrator store is not prepared")
             columns = index_columns(index["name"])
-            (unique_indexes if int(index["unique"]) else non_unique_indexes).add(columns)
+            origin = str(index["origin"]).casefold()
+            if int(index["unique"]):
+                unique_indexes.add((columns, origin))
+            else:
+                non_unique_indexes.add((columns, origin, str(index["name"])))
         expected_unique_indexes = {
-            ("ingestion_key",),
-            ("acceptance_id",),
-            ("payload_hash",),
-            _ATLAS_OUTBOX_IDENTITY,
+            (("ingestion_key",), "pk"),
+            (("acceptance_id",), "u"),
+            (("payload_hash",), "u"),
         }
-        expected_non_unique_indexes = {("state", "created_at", "ingestion_key")}
+        expected_non_unique_indexes = {
+            (("state", "created_at", "ingestion_key"), "c", "idx_atlas_outbox_pending")
+        }
         if (
             unique_indexes != expected_unique_indexes
             or non_unique_indexes != expected_non_unique_indexes
@@ -7175,9 +7180,27 @@ class SQLiteStore:
                 row["state"] not in {"pending", "projected", "quarantined"}
                 or not 0 <= row["attempt_count"] <= cls._MAX_ATLAS_OUTBOX_ATTEMPTS
                 or row["ingestion_key"] != row["payload_hash"]
+                or (
+                    row["state"] == "projected"
+                    and row["last_error_code"] != ""
+                )
+                or (
+                    row["state"] == "quarantined"
+                    and not row["last_error_code"]
+                )
+                or (
+                    row["state"] == "pending"
+                    and row["attempt_count"] > 0
+                    and not row["last_error_code"]
+                )
             ):
                 raise StoreError("legacy atlas outbox row is invalid")
             try:
+                if (
+                    row["created_at"] != _utc_timestamp(row["created_at"])
+                    or row["updated_at"] != _utc_timestamp(row["updated_at"])
+                ):
+                    raise ValueError("outbox timestamps are not canonical UTC")
                 cls._safe_acceptance_identifier("ingestion_key", row["ingestion_key"])
                 cls._safe_acceptance_identifier("acceptance_id", row["acceptance_id"])
                 cls._safe_acceptance_identifier("payload_hash", row["payload_hash"])
@@ -7242,7 +7265,6 @@ class SQLiteStore:
                 return
             if source_version not in range(6, 11):
                 raise StoreError("orchestrator store is not prepared")
-            cls._validate_legacy_atlas_outbox_shape(cursor)
             cls._validate_legacy_atlas_outbox_rows(cursor)
             cursor.execute(
                 """
@@ -7305,6 +7327,27 @@ class SQLiteStore:
         except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
             raise StoreError("orchestrator schema is corrupt") from error
 
+    @classmethod
+    def _preflight_legacy_atlas_outbox_before_schema_ddl(
+        cls, cursor: sqlite3.Cursor, *, fresh_database: bool
+    ) -> None:
+        """Validate legacy outbox DDL before current CREATE/INDEX statements run."""
+
+        if fresh_database:
+            return
+        try:
+            source_version = _schema_version_from_connection(cursor)
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator store is not prepared") from error
+        if source_version is None or source_version not in range(6, 11):
+            return
+        try:
+            cls._validate_legacy_atlas_outbox_shape(cursor)
+        except StoreError:
+            raise
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+            raise StoreError("orchestrator store is not prepared") from error
+
     @staticmethod
     def _drop_atlas_finalization_projection_trigger_for_outbox_rebuild(
         cursor: sqlite3.Cursor,
@@ -7361,6 +7404,9 @@ class SQLiteStore:
                 ).fetchone() is None
             except sqlite3.DatabaseError as error:
                 raise StoreError("orchestrator schema is corrupt") from error
+            self._preflight_legacy_atlas_outbox_before_schema_ddl(
+                cursor, fresh_database=fresh_database
+            )
             _execute_schema_statements(
                 cursor,
                 """
