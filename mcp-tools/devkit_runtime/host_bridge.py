@@ -45,6 +45,10 @@ _COMPILER_EVIDENCE_REQUEST_SCHEMA: Final = (
 _COMPILER_EVIDENCE_RESPONSE_SCHEMA: Final = (
     "2718lab-devkit/compiler-evidence-response-v1"
 )
+_STORAGE_PROFILE_REQUEST_SCHEMA: Final = (
+    "2718lab-devkit/storage-profile-request-v1"
+)
+_STORAGE_PROFILE_SCHEMA: Final = "2718lab-devkit/storage-profile-v1"
 _PROJECT_INDEX_ATTESTATION_SCHEMA: Final = (
     project_index_attestation_protocol.ATTESTATION_SCHEMA
 )
@@ -74,6 +78,47 @@ _MAX_PROOF_CONTINUATION_BYTES: Final = 2 * 1024
 _MAX_TERMINAL_OPERATION_TOMBSTONES: Final = 256
 _MAX_COMPILER_EVIDENCE_BYTES: Final = 40 * 1024
 _COMPILER_EVIDENCE_TTL_SECONDS: Final = 120
+_MAX_STORAGE_PROFILE_BYTES: Final = 8 * 1024
+_STORAGE_DESCRIPTOR_FIELDS: Final = (
+    "repository_identity",
+    "workspace_manifest_hash",
+    "cargo_lock_hash",
+    "toolchain_digest",
+    "target_triple",
+    "profile",
+    "features_hash",
+    "build_env_class",
+)
+_STORAGE_PROFILE_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "call_intent_hash",
+        "preparation_id",
+        "task_id",
+        "source_plan_hash",
+        "index_attestation_hash",
+        "execution_context_hash",
+        *_STORAGE_DESCRIPTOR_FIELDS,
+        "profile_hash",
+        "attestation_hash",
+    }
+)
+_STORAGE_PROFILE_REQUEST_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "call_intent_hash",
+        "preparation_id",
+        "task_id",
+        "source_plan_hash",
+        "index_attestation_hash",
+        "nonce",
+        "request_hash",
+    }
+)
+_STORAGE_PROFILE_BUILD_ENV_CLASSES: Final = frozenset(
+    {"managed_read_only", "managed_workspace", "disabled", "external"}
+)
+_STORAGE_PROFILE_SCALAR: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 _CAPABILITY_V2_TTL_SECONDS: Final = 120
 _MAX_PROJECT_INDEX_ATTESTATION_BYTES: Final = (
     project_index_attestation_protocol.MAX_ATTESTATION_BYTES
@@ -113,6 +158,8 @@ _MESSAGE_KINDS: Final = frozenset(
         "proof_continuation",
         "compiler_evidence_request",
         "compiler_evidence_response",
+        "storage_profile_request",
+        "storage_profile_response",
         "project_index_attestation",
         "routing_attestation_request",
         "routing_attestation_response",
@@ -243,6 +290,19 @@ class CompilerEvidenceRequest:
 
 
 @dataclass(frozen=True)
+class StorageProfileRequest:
+    """One private, replay-bound request for Host-owned storage profile facts."""
+
+    call_intent_hash: str
+    preparation_id: str
+    task_id: str
+    source_plan_hash: str
+    index_attestation_hash: str
+    nonce: str = field(repr=False)
+    request_hash: str
+
+
+@dataclass(frozen=True)
 class FastLaneRefillRegistryRequest:
     """One authenticated queue of remaining V5 skeletons.
 
@@ -342,6 +402,8 @@ class InheritedHandleHostBridge:
         self._received_operations: dict[str, OperationReceipt] = {}
         self._pending_compiler_evidence: dict[str, CompilerEvidenceRequest] = {}
         self._received_compiler_evidence: set[str] = set()
+        self._pending_storage_profiles: dict[str, StorageProfileRequest] = {}
+        self._received_storage_profiles: set[str] = set()
         self._sent_fast_lane_refill_registries: set[str] = set()
         self._received_fast_lane_refill_registries: set[str] = set()
         self._received_project_index_attestations: set[str] = set()
@@ -1381,6 +1443,109 @@ class InheritedHandleHostBridge:
             self._poison()
             raise
         del self._pending_compiler_evidence[request.preparation_id]
+        return normalized
+
+    def send_storage_profile_request(
+        self,
+        *,
+        call_intent_hash: str,
+        preparation_id: str,
+        task_id: str,
+        source_plan_hash: str,
+        index_attestation_hash: str,
+    ) -> StorageProfileRequest:
+        """Ask the Host for one path-free profile tied to a private session."""
+
+        nonce = _b64encode(secrets.token_bytes(32))
+        unsigned = {
+            "schema": _STORAGE_PROFILE_REQUEST_SCHEMA,
+            "call_intent_hash": call_intent_hash,
+            "preparation_id": preparation_id,
+            "task_id": task_id,
+            "source_plan_hash": source_plan_hash,
+            "index_attestation_hash": index_attestation_hash,
+            "nonce": nonce,
+        }
+        request = _normalize_storage_profile_request(
+            {**unsigned, "request_hash": _private_payload_hash(unsigned)}
+        )
+        if request.request_hash in self._pending_storage_profiles:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        payload = _storage_profile_request_payload(request)
+        _validate_private_packet_size(payload, _MAX_STORAGE_PROFILE_BYTES)
+        self._send_validated_private(
+            kind="storage_profile_request",
+            action_id=_storage_profile_action_id(request),
+            payload=payload,
+        )
+        self._pending_storage_profiles[request.request_hash] = request
+        return request
+
+    def receive_storage_profile_request(self) -> StorageProfileRequest:
+        """Receive exactly one Host-bound storage profile request once."""
+
+        try:
+            message = self._receive_private()
+            request = _parse_storage_profile_request(message)
+            if request.request_hash in self._received_storage_profiles:
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        except HostBridgeError:
+            self._poison()
+            raise
+        self._received_storage_profiles.add(request.request_hash)
+        return request
+
+    def send_storage_profile_response(
+        self,
+        *,
+        request: StorageProfileRequest,
+        response: Mapping[str, object],
+    ) -> None:
+        """Return one exact Host profile to the request's private session."""
+
+        normalized_request = _normalize_storage_profile_request(
+            _storage_profile_request_payload(request)
+        )
+        if normalized_request.request_hash not in self._received_storage_profiles:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        normalized = _normalize_storage_profile_response(
+            response, request=normalized_request
+        )
+        _validate_private_packet_size(normalized, _MAX_STORAGE_PROFILE_BYTES)
+        self._send_validated_private(
+            kind="storage_profile_response",
+            action_id=_storage_profile_action_id(normalized_request),
+            payload=normalized,
+        )
+        self._received_storage_profiles.remove(normalized_request.request_hash)
+
+    def receive_storage_profile_response(
+        self, *, request: StorageProfileRequest
+    ) -> dict[str, object]:
+        """Consume one exact response bound to its still-pending request."""
+
+        normalized_request = _normalize_storage_profile_request(
+            _storage_profile_request_payload(request)
+        )
+        if (
+            self._pending_storage_profiles.get(normalized_request.request_hash)
+            != normalized_request
+        ):
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        try:
+            message = self._receive_private()
+            if (
+                message.kind != "storage_profile_response"
+                or message.action_id != _storage_profile_action_id(normalized_request)
+            ):
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+            normalized = _normalize_storage_profile_response(
+                message.payload, request=normalized_request
+            )
+        except HostBridgeError:
+            self._poison()
+            raise
+        del self._pending_storage_profiles[normalized_request.request_hash]
         return normalized
 
     def receive_operation(
@@ -2839,6 +3004,174 @@ def build_project_index_attestation(
 
 def _is_index_correlation(value: object) -> bool:
     return project_index_attestation_protocol.is_index_correlation(value)
+
+
+def _normalize_storage_profile_request(value: object) -> StorageProfileRequest:
+    """Validate one exact, nonce-bound private profile request."""
+
+    if (
+        type(value) is not dict
+        or set(value) != _STORAGE_PROFILE_REQUEST_FIELDS
+        or value.get("schema") != _STORAGE_PROFILE_REQUEST_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    call_intent_hash = value.get("call_intent_hash")
+    preparation_id = value.get("preparation_id")
+    task_id = value.get("task_id")
+    source_plan_hash = value.get("source_plan_hash")
+    index_attestation_hash = value.get("index_attestation_hash")
+    nonce = value.get("nonce")
+    request_hash = value.get("request_hash")
+    if (
+        type(call_intent_hash) is not str
+        or len(call_intent_hash) != 64
+        or any(character not in "0123456789abcdef" for character in call_intent_hash)
+        or type(preparation_id) is not str
+        or _IDENTIFIER.fullmatch(preparation_id) is None
+        or type(task_id) is not str
+        or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+        or type(source_plan_hash) is not str
+        or _DIGEST.fullmatch(source_plan_hash) is None
+        or type(index_attestation_hash) is not str
+        or _DIGEST.fullmatch(index_attestation_hash) is None
+        or type(nonce) is not str
+        or type(request_hash) is not str
+        or _DIGEST.fullmatch(request_hash) is None
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    try:
+        decoded_nonce = _b64decode(nonce)
+    except ValueError as error:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID") from error
+    if len(decoded_nonce) != 32 or _b64encode(decoded_nonce) != nonce:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    unsigned = dict(value)
+    unsigned.pop("request_hash")
+    if not hmac.compare_digest(request_hash, _private_payload_hash(unsigned)):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    return StorageProfileRequest(
+        call_intent_hash=call_intent_hash,
+        preparation_id=preparation_id,
+        task_id=task_id,
+        source_plan_hash=source_plan_hash,
+        index_attestation_hash=index_attestation_hash,
+        nonce=nonce,
+        request_hash=request_hash,
+    )
+
+
+def _storage_profile_request_payload(
+    request: StorageProfileRequest,
+) -> dict[str, object]:
+    if type(request) is not StorageProfileRequest:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    return {
+        "schema": _STORAGE_PROFILE_REQUEST_SCHEMA,
+        "call_intent_hash": request.call_intent_hash,
+        "preparation_id": request.preparation_id,
+        "task_id": request.task_id,
+        "source_plan_hash": request.source_plan_hash,
+        "index_attestation_hash": request.index_attestation_hash,
+        "nonce": request.nonce,
+        "request_hash": request.request_hash,
+    }
+
+
+def _storage_profile_action_id(request: StorageProfileRequest) -> str:
+    normalized = _normalize_storage_profile_request(
+        _storage_profile_request_payload(request)
+    )
+    return normalized.request_hash[7:]
+
+
+def _parse_storage_profile_request(
+    message: PrivateHostMessage,
+) -> StorageProfileRequest:
+    if message.kind != "storage_profile_request":
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    request = _normalize_storage_profile_request(message.payload)
+    if message.action_id != _storage_profile_action_id(request):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    _validate_private_packet_size(message.payload, _MAX_STORAGE_PROFILE_BYTES)
+    return request
+
+
+def _normalize_storage_profile_response(
+    value: object,
+    *,
+    request: StorageProfileRequest,
+) -> dict[str, object]:
+    """Validate the exact Host-owned profile and its request bindings.
+
+    ``attestation_hash`` deliberately remains opaque: the Host includes its
+    private bridge generation and expiry deadline in that attestation, neither
+    of which crosses this Python protocol boundary.  The authenticated frame,
+    pending request, and exact profile hash still make substitution fail closed.
+    """
+
+    if type(request) is not StorageProfileRequest:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    normalized_request = _normalize_storage_profile_request(
+        _storage_profile_request_payload(request)
+    )
+    if (
+        type(value) is not dict
+        or set(value) != _STORAGE_PROFILE_FIELDS
+        or value.get("schema") != _STORAGE_PROFILE_SCHEMA
+        or value.get("call_intent_hash") != normalized_request.call_intent_hash
+        or value.get("preparation_id") != normalized_request.preparation_id
+        or value.get("task_id") != normalized_request.task_id
+        or value.get("source_plan_hash") != normalized_request.source_plan_hash
+        or value.get("index_attestation_hash")
+        != normalized_request.index_attestation_hash
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    call_intent_hash = value.get("call_intent_hash")
+    preparation_id = value.get("preparation_id")
+    task_id = value.get("task_id")
+    if (
+        type(call_intent_hash) is not str
+        or len(call_intent_hash) != 64
+        or any(character not in "0123456789abcdef" for character in call_intent_hash)
+        or type(preparation_id) is not str
+        or _IDENTIFIER.fullmatch(preparation_id) is None
+        or type(task_id) is not str
+        or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    for field_name in (
+        "source_plan_hash",
+        "index_attestation_hash",
+        "execution_context_hash",
+        "repository_identity",
+        "workspace_manifest_hash",
+        "cargo_lock_hash",
+        "toolchain_digest",
+        "features_hash",
+        "profile_hash",
+        "attestation_hash",
+    ):
+        item = value.get(field_name)
+        if type(item) is not str or _DIGEST.fullmatch(item) is None:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    target_triple = value.get("target_triple")
+    if (
+        type(target_triple) is not str
+        or _STORAGE_PROFILE_SCALAR.fullmatch(target_triple) is None
+        or value.get("profile") != "dev"
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    if value.get("build_env_class") not in _STORAGE_PROFILE_BUILD_ENV_CLASSES:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    unsigned = {
+        field_name: value[field_name]
+        for field_name in _STORAGE_PROFILE_FIELDS
+        if field_name not in {"profile_hash", "attestation_hash"}
+    }
+    profile_hash = cast(str, value["profile_hash"])
+    if not hmac.compare_digest(profile_hash, _private_payload_hash(unsigned)):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    return {field_name: value[field_name] for field_name in sorted(_STORAGE_PROFILE_FIELDS)}
 
 
 def _normalize_compiler_evidence_response(

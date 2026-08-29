@@ -1,132 +1,316 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
-import importlib.util
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 
+MCP_TOOLS = Path(__file__).resolve().parents[1]
+TESTS = Path(__file__).resolve().parent
+for _path in (MCP_TOOLS, TESTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+
+def _hash(character: str) -> str:
+    return "sha256:" + character * 64
+
+
 def _canonical_hash(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
-def _intent_with_unknown_descriptor_key(
-    key: str, value: str
-) -> dict[str, object]:
-    descriptor: dict[str, str] = {
-        "schema": "2718lab.storage.target.v1",
-        "artifact_kind": "cargo-target",
-        "repository_identity": "sha256:" + "d" * 64,
-        "workspace_manifest_hash": "sha256:" + "e" * 64,
-        "cargo_lock_hash": "sha256:" + "f" * 64,
-        "toolchain_digest": "sha256:" + "1" * 64,
-        "target_triple": "x86_64-pc-windows-msvc",
-        "profile": "dev",
-        "features_hash": "sha256:" + "2" * 64,
-        "build_env_class": "windows-msvc",
+def _authenticated_v5_fixture() -> dict[str, object]:
+    """Build a canonical legacy V5 skeleton without any storage field."""
+
+    from devkit_fastlane.scripts import fastlane_routing, team_efficiency
+
+    hash_a = _canonical_hash({"fixture": "a"})
+    hash_b = _canonical_hash({"fixture": "b"})
+    source_plan_hash = _canonical_hash({"fixture": "plan"})
+    dependency: dict[str, object] = {
+        "schema": "2718lab-devkit/dependency-state-v1",
+        "graph_epoch": 1,
+        "direct_dependency_ids": [],
+        "completed_dependency_ids": [],
     }
-    intent: dict[str, object] = {
-        "schema": "2718lab.storage.intent.v1",
-        "task_id": "task-01",
-        "plan_binding": "sha256:" + "a" * 64,
-        "context_hash": "sha256:" + "b" * 64,
-        "requested_bytes": 1,
-        "requested_files": 1,
-        "target_descriptor": descriptor,
+    dependency["dependency_state_hash"] = _canonical_hash(dependency)
+    scheduler = {
+        "event_seq": 1,
+        "route_epoch": 1,
+        "override_epoch": 0,
+        "recovery_epoch": 0,
+        "ready_event_seq": 1,
+        "dispatch_cause": "task_ready",
+        "transport_state": "connected",
+        "execution_state": "unknown",
+        "lease_state": "unclaimed",
+        "evidence_state": "none",
+        "lease_epoch": 0,
+        "recovery_probe_count_epoch": 0,
+        "fence_count_epoch": 0,
+        "fenced_replacement_count_task": 0,
     }
-    intent["storage_intent_hash"] = _canonical_hash(
+    host = {
+        "schema": "2718lab-devkit/host-capabilities-v1",
+        "host_id_hash": hash_a,
+        "capability_epoch": 1,
+        "total_slots": 4,
+        "model_slot_limits": {"luna": 4, "terra": 0, "sol": 0, "spark": 0},
+        "models": [
+            {
+                "model_id": "gpt-5.6-luna",
+                "status": "available",
+                "efforts": ["max"],
+            }
+        ],
+        "entitlements": [],
+    }
+    unit = {
+        "task": {
+            "schema": "2718lab-devkit/task-routing-profile-v5",
+            "task_id": "TASK-V5",
+            "role": "execution",
+            "access": "workspace_write",
+            "write_scope_count": 1,
+            "write_scope_breadth": "single_file",
+            "read_scope_count": 0,
+            "read_scope_breadth": "none",
+            "overlap_risk": "none",
+            "overlap_count": 0,
+            "dependency_depth": 0,
+            "downstream_critical_count": 0,
+            "critical_path": False,
+            "criticality": "low",
+            "cross_module": False,
+            "database_work": False,
+            "migration": False,
+            "security_sensitive": False,
+            "destructive": False,
+            "external_boundary": False,
+            "architecture_conflict": False,
+            "design_ambiguity": False,
+            "verification_cost": "none",
+            "blocker_severity": "none",
+            "authorization": "not_required",
+            "authorization_evidence_hash": None,
+            "narrow_decoupling_eligible": False,
+            "strike": None,
+            "gate_matrix_hash": hash_a,
+            "profile_evidence_hash": hash_b,
+        },
+        "dependency_state": dependency,
+        "write_scope": ["src/task_v5.py"],
+        "concurrency_mode": "parallel",
+        "dispatch_order": 0,
+        "index_context_hash": hash_a,
+        "predecessor_hash": hash_b,
+    }
+    api = team_efficiency._AuthenticatedV5Api()
+    planner = team_efficiency._authenticated_v5_helper_module("authenticated_v5_planner")
+    normalized_unit = planner.normalize_units(api, [unit])[0]
+    unit["task"]["profile_evidence_hash"] = team_efficiency._sha256_json(
+        planner._routing_profile_material(source_plan_hash, normalized_unit)
+    )
+    routing_requests = team_efficiency.prepare_authenticated_v5_routing_requests(
+        [unit],
+        source_plan_hash=source_plan_hash,
+        host_capabilities=host,
+        scheduler_facts=scheduler,
+    )
+    request_binding_hash = fastlane_routing.v5_request_binding_hash(routing_requests[0])
+    attestation: dict[str, object] = {
+        "schema": "2718lab-devkit/host-child-route-attestation-v1",
+        "status": "attested",
+        "request_binding_hash": request_binding_hash,
+        "host_id_hash": hash_a,
+        "capability_epoch": 1,
+        "lease_epoch": 0,
+        "issued_event_seq": 1,
+        "expires_event_seq": 1,
+        "route": {
+            "lane": "luna",
+            "model": "gpt-5.6-luna",
+            "effort": "max",
+            "rank": 40,
+        },
+        "inherit_current_session_model": False,
+        "refusal_code": None,
+    }
+    attestation["attestation_hash"] = _canonical_hash(attestation)
+    attestation_items = [
         {
-            "target_descriptor": descriptor,
-            "task_id": intent["task_id"],
-            "plan_binding": intent["plan_binding"],
-            "context_hash": intent["context_hash"],
-            "requested_bytes": intent["requested_bytes"],
-            "requested_files": intent["requested_files"],
+            "task_id": "TASK-V5",
+            "request_binding_hash": request_binding_hash,
+            "attestation": attestation,
         }
+    ]
+    compiled = team_efficiency.compile_authenticated_v5_assignment_skeletons(
+        [unit],
+        source_plan_hash=source_plan_hash,
+        routing_requests=routing_requests,
+        attestation_items=attestation_items,
     )
-    descriptor[key] = value
-    return intent
-
-
-def _assert_storage_intent_rejected(value: dict[str, object]) -> None:
-    from devkit_runtime.storage_intent import StorageIntentError, parse_storage_intent
-
-    try:
-        parse_storage_intent(value)
-    except StorageIntentError as error:
-        assert error.code == "STORAGE_TARGET_KEY_INVALID"
-    else:
-        raise AssertionError("invalid descriptor was accepted")
-
-
-def test_storage_intent_rejects_absolute_path_and_unknown_descriptor_key() -> None:
-    _assert_storage_intent_rejected(
-        _intent_with_unknown_descriptor_key("path", "G:/unapproved")
-    )
-
-
-def test_storage_intent_rejects_plain_unknown_descriptor_key() -> None:
-    _assert_storage_intent_rejected(
-        _intent_with_unknown_descriptor_key("unexpected", "cache")
-    )
-
-
-def test_storage_intent_rejects_isolated_surrogate_with_stable_code() -> None:
-    value = _intent_with_unknown_descriptor_key("unexpected", "cache")
-    descriptor = value["target_descriptor"]
-    assert isinstance(descriptor, dict)
-    descriptor.pop("unexpected")
-    descriptor["target_triple"] = "\ud800"
-
-    from devkit_runtime.storage_intent import StorageIntentError, parse_storage_intent
-
-    try:
-        parse_storage_intent(value)
-    except StorageIntentError as error:
-        assert error.code == "STORAGE_TARGET_KEY_INVALID"
-    else:
-        raise AssertionError("invalid surrogate was accepted")
-
-
-def _storage_binding_context() -> dict[str, object]:
+    index_ref = {
+        "task_id": "TASK-V5",
+        "correlation_id": "index-" + "c" * 64,
+        "workspace_id": _hash("d"),
+        "workspace_binding_hash": _hash("e"),
+        "root_identity_hash": _hash("f"),
+        "snapshot_id": _hash("0"),
+        "snapshot_attestation_hash": _hash("1"),
+        "query_receipt_hash": _hash("6"),
+        "index_context_hash": hash_a,
+        "attestation_hash": _hash("7"),
+    }
     return {
-        "execution_context_hash": "sha256:" + "4" * 64,
-        "repository_identity": "sha256:" + "5" * 64,
-        "workspace_manifest_hash": "sha256:" + "6" * 64,
-        "cargo_lock_hash": "sha256:" + "7" * 64,
-        "toolchain_digest": "sha256:" + "8" * 64,
-        "target_triple": "x86_64-pc-windows-msvc",
-        "profile": "dev",
-        "features_hash": "sha256:" + "9" * 64,
-        "build_env_class": "windows-msvc",
+        "call_intent_hash": "a" * 64,
+        "preparation_id": "dispatch-v5-1",
+        "host": host,
+        "scheduler": scheduler,
+        "source_plan_hash": source_plan_hash,
+        "routing_requests": routing_requests,
+        "attestation_items": attestation_items,
+        "compiled": compiled,
+        "planner_request": {
+            "schema": "2718lab-devkit/fastlane-host-planner-request-v1",
+            "action": "plan_dispatch",
+            "assignment_skeletons": compiled["assignment_skeletons"],
+            "project_index_attestation_refs": [index_ref],
+        },
     }
 
 
-def _host_storage_intent(
+def _v5_dispatch_fact(adapter: object, fixture: dict[str, object]) -> object:
+    skeleton = fixture["compiled"]["assignment_skeletons"][0]
+    proof = skeleton["routing_proof"]
+    result_route = proof["result"]["route"]
+    return adapter._HostDispatchFact(
+        task_id=skeleton["task_id"],
+        route=adapter._HostDispatchRoute(
+            model=result_route["model"],
+            reasoning_effort=result_route["effort"],
+            routing_context_hash=proof["routing_context_hash"],
+            routing_result_hash=proof["routing_result_hash"],
+            require_explicit_route=True,
+        ),
+        lease_id="lease-task-v5",
+        lease_epoch=1,
+        task_version=1,
+        assignment_token=_hash("3"),
+        write_scope=tuple(skeleton["write_scope"]),
+        concurrency_mode=skeleton["concurrency_mode"],
+        dispatch_order=skeleton["dispatch_order"],
+        index_context_hash=skeleton["index_context_hash"],
+        worktree_identity=_hash("4"),
+        worktree_base=_hash("5"),
+        integration_head=_hash("6"),
+        predecessor_hash=skeleton["predecessor_hash"],
+        source_plan_hash=skeleton["source_plan_hash"],
+        ledger_epoch=11,
+        active_lease_set_hash=_hash("b"),
+    )
+
+
+def _pipe_pair() -> tuple[object, object]:
+    from devkit_runtime.host_bridge import InheritedHandleHostBridge
+
+    child_to_host_read, child_to_host_write = os.pipe()
+    host_to_child_read, host_to_child_write = os.pipe()
+    return (
+        InheritedHandleHostBridge.from_file_descriptors(
+            read_fd=host_to_child_read,
+            write_fd=child_to_host_write,
+            session_key=b"k" * 32,
+            session_nonce=b"fastlane-storage-private-nonce",
+        ),
+        InheritedHandleHostBridge.from_file_descriptors(
+            read_fd=child_to_host_read,
+            write_fd=host_to_child_write,
+            session_key=b"k" * 32,
+            session_nonce=b"fastlane-storage-private-nonce",
+        ),
+    )
+
+
+def _storage_profile_response(request: object) -> dict[str, object]:
+    from devkit_runtime.host_bridge import StorageProfileRequest
+
+    assert isinstance(request, StorageProfileRequest)
+    response: dict[str, object] = {
+        "schema": "2718lab-devkit/storage-profile-v1",
+        "call_intent_hash": request.call_intent_hash,
+        "preparation_id": request.preparation_id,
+        "task_id": request.task_id,
+        "source_plan_hash": request.source_plan_hash,
+        "index_attestation_hash": request.index_attestation_hash,
+        "repository_identity": _hash("1"),
+        "workspace_manifest_hash": _hash("2"),
+        "cargo_lock_hash": _hash("3"),
+        "toolchain_digest": _hash("4"),
+        "target_triple": "x86_64-pc-windows-msvc",
+        "profile": "dev",
+        "features_hash": _hash("5"),
+        "build_env_class": "managed_workspace",
+        "execution_context_hash": _hash("6"),
+    }
+    response["profile_hash"] = _canonical_hash(response)
+    # The Host alone binds generation and TTL into this opaque attestation.
+    response["attestation_hash"] = _hash("7")
+    return response
+
+
+def _storage_profile_request() -> object:
+    from devkit_runtime import host_bridge
+
+    nonce = base64.urlsafe_b64encode(b"n" * 32).decode("ascii").rstrip("=")
+    request = {
+        "schema": "2718lab-devkit/storage-profile-request-v1",
+        "call_intent_hash": "a" * 64,
+        "preparation_id": "storage-profile-1",
+        "task_id": "TASK-V5",
+        "source_plan_hash": _hash("8"),
+        "index_attestation_hash": _hash("9"),
+        "nonce": nonce,
+    }
+    request["request_hash"] = _canonical_hash(request)
+    return host_bridge._normalize_storage_profile_request(request)
+
+
+def _storage_intent(
     *, task_id: str, plan_binding: str, context_hash: str
 ) -> dict[str, object]:
-    context = _storage_binding_context()
     descriptor = {
         "schema": "2718lab.storage.target.v1",
         "artifact_kind": "fastlane-task",
-        **{
-            key: value
-            for key, value in context.items()
-            if key != "execution_context_hash"
-        },
+        "repository_identity": _hash("1"),
+        "workspace_manifest_hash": _hash("2"),
+        "cargo_lock_hash": _hash("3"),
+        "toolchain_digest": _hash("4"),
+        "target_triple": "x86_64-pc-windows-msvc",
+        "profile": "dev",
+        "features_hash": _hash("5"),
+        "build_env_class": "managed_workspace",
     }
-    intent = {
+    intent: dict[str, object] = {
         "schema": "2718lab.storage.intent.v1",
         "task_id": task_id,
         "plan_binding": plan_binding,
@@ -137,25 +321,169 @@ def _host_storage_intent(
     }
     intent["storage_intent_hash"] = _canonical_hash(
         {
-            key: intent[key]
-            for key in (
-                "target_descriptor",
-                "task_id",
-                "plan_binding",
-                "context_hash",
-                "requested_bytes",
-                "requested_files",
-            )
+            "target_descriptor": descriptor,
+            "task_id": task_id,
+            "plan_binding": plan_binding,
+            "context_hash": context_hash,
+            "requested_bytes": 4096,
+            "requested_files": 8,
         }
     )
     return intent
 
 
-def test_host_intent_requires_one_canonical_storage_binding_and_typed_failures() -> None:
+def test_public_request_rejects_caller_storage_descriptors() -> None:
+    from devkit_fastlane.scripts import authenticated_v5_projection as projection
+
+    with pytest.raises(ValueError, match="STORAGE_TARGET_KEY_INVALID"):
+        projection._reject_public_storage_facts(
+            {"storage_contexts": {"TASK-V5": {"repository_identity": _hash("1")}}}
+        )
+    with pytest.raises(ValueError, match="STORAGE_TARGET_KEY_INVALID"):
+        projection._reject_public_storage_facts(
+            [{"execution_context_hash": _hash("2")}]
+        )
+
+
+def test_pre_host_skeleton_remains_the_legacy_exact_eight_fields() -> None:
+    fixture = _authenticated_v5_fixture()
+    skeleton = fixture["compiled"]["assignment_skeletons"][0]
+    assert set(skeleton) == {
+        "task_id",
+        "routing_proof",
+        "write_scope",
+        "concurrency_mode",
+        "dispatch_order",
+        "index_context_hash",
+        "predecessor_hash",
+        "source_plan_hash",
+    }
+
+
+def test_verified_private_profile_round_trip_constructs_local_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the framed Host bridge and local post-profile compilation."""
+
+    from devkit_runtime import fastlane_host_adapter as adapter
+    import devkit_runtime.host_session as host_session
+    from devkit_runtime.host_bridge import InheritedHandleHostBridge
+
+    fixture = _authenticated_v5_fixture()
+    child, host = _pipe_pair()
+    fact = _v5_dispatch_fact(adapter, fixture)
+    fact_mapping = adapter._dispatch_fact_mapping(fact)
+    lease_hash = adapter._lease_scope_binding_hash(fact)
+    failure: list[BaseException] = []
+
+    def host_reply() -> None:
+        try:
+            probe = host.receive_capability_probe_v2(now=1_700_000_000)
+            host.send_capability_report_v2(
+                probe=probe,
+                host_capabilities=fixture["host"],
+                scheduler_facts=fixture["scheduler"],
+                now=1_700_000_000,
+            )
+            routing_request = host.receive_routing_attestation_request(now=1_700_000_000)
+            host.send_routing_attestation_response(
+                request=routing_request,
+                attestations=fixture["attestation_items"],
+                now=1_700_000_000,
+            )
+            evidence_request = host.receive_compiler_evidence_request(now=1_700_000_000)
+            response = {
+                "schema": "2718lab-devkit/compiler-evidence-response-v1",
+                "preparation_id": evidence_request.preparation_id,
+                "request_hash": evidence_request.request_hash,
+                "reasoning_effort": evidence_request.reasoning_effort,
+                "verified_route_result_hashes": [fact.route.routing_result_hash],
+                "verified_lease_scope_bindings": [lease_hash],
+                "dispatch_facts": [fact_mapping],
+                "dispatch_binding_hashes": [fact_mapping["dispatch_binding_hash"]],
+                "nonce": evidence_request.nonce,
+                "expires_at": evidence_request.expires_at,
+            }
+            response["registry_binding_hash"] = _canonical_hash(response)
+            host.send_compiler_evidence_response(
+                request=evidence_request,
+                response=response,
+                now=1_700_000_000,
+            )
+            profile_request = host.receive_storage_profile_request()
+            host.send_storage_profile_response(
+                request=profile_request,
+                response=_storage_profile_response(profile_request),
+            )
+        except BaseException as error:  # report peer errors after the round trip
+            failure.append(error)
+
+    worker = threading.Thread(target=host_reply, daemon=True)
+    worker.start()
+    monkeypatch.setattr(
+        InheritedHandleHostBridge,
+        "from_environment",
+        classmethod(lambda cls, environ=None, *, platform=None: child),
+    )
+    session = host_session.HostSession.from_environment(
+        environ={}, platform="posix", clock=lambda: 1_700_000_000
+    )
+    try:
+        assert session.resolve_capability_snapshot_v2(
+            call_intent_hash=fixture["call_intent_hash"],
+            preparation_id=fixture["preparation_id"],
+        ) is not None
+        routing = session.resolve_routing_attestations(
+            call_intent_hash=fixture["call_intent_hash"],
+            preparation_id=fixture["preparation_id"],
+            routing_requests=fixture["routing_requests"],
+        )
+        assert routing is not None
+        prepared = adapter.prepare_verified_host_facts(
+            session,
+            preparation_id=fixture["preparation_id"],
+            call_intent_hash=fixture["call_intent_hash"],
+            routing_registry_binding_hash=routing.routing_registry_binding_hash,
+            request=fixture["planner_request"],
+            reasoning_effort="max",
+            storage_budgets={"TASK-V5": {"bytes": 4096, "files": 8}},
+        )
+        assert type(prepared).__name__ == "_PreparedHostFacts"
+        batch = adapter.compile_fast_lane_with_host_facts(
+            fixture["planner_request"],
+            reasoning_effort="max",
+            verified_host_facts=prepared,
+        )
+        assert isinstance(batch, dict)
+        assert "storage_intents" not in batch
+    finally:
+        session.close()
+        host.close()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert not failure
+
+
+def test_profile_tamper_or_missing_field_fails_closed() -> None:
+    from devkit_runtime import host_bridge
+    from devkit_runtime.host_bridge import HostBridgeError
+
+    request = _storage_profile_request()
+    profile = _storage_profile_response(request)
+    tampered = copy.deepcopy(profile)
+    tampered["profile_hash"] = _hash("f")
+    with pytest.raises(HostBridgeError, match="HOST_BRIDGE_STORAGE_PROFILE_INVALID"):
+        host_bridge._normalize_storage_profile_response(tampered, request=request)
+    missing = copy.deepcopy(profile)
+    missing.pop("attestation_hash")
+    with pytest.raises(HostBridgeError, match="HOST_BRIDGE_STORAGE_PROFILE_INVALID"):
+        host_bridge._normalize_storage_profile_response(missing, request=request)
+
+
+def test_v2_remains_compatible_while_v3_requires_one_root_storage_intent() -> None:
     from test_fastlane_host_intent import _intent, _with_binding
     from devkit_runtime.fastlane_host_intent import (
         NO_SAFE_WORK,
-        STORAGE_TARGET_KEY_INVALID,
         StorageIntentError,
         parse_host_execution_intent,
         validate_host_execution_intent,
@@ -163,195 +491,42 @@ def test_host_intent_requires_one_canonical_storage_binding_and_typed_failures()
 
     legacy = _intent()
     legacy_result = parse_host_execution_intent(legacy)
-    assert isinstance(legacy_result, StorageIntentError)
-    assert legacy_result.code == STORAGE_TARGET_KEY_INVALID
+    assert legacy_result != NO_SAFE_WORK
+    assert not isinstance(legacy_result, StorageIntentError)
+    assert legacy_result.schema.endswith("-v2")
+    assert legacy_result.storage_intent is None
     assert validate_host_execution_intent(legacy) is NO_SAFE_WORK
 
     candidate = _intent()
+    candidate["schema"] = "2718lab-devkit/fastlane-host-execution-intent-v3"
     task_id = candidate["assignment"]["predecessor"]["task_id"]
-    source_plan_hash = candidate["source_plan_hash"]
-    context_hash = "sha256:" + "4" * 64
-    storage_intent = _host_storage_intent(
+    context_hash = _hash("a")
+    candidate["storage_intent"] = _storage_intent(
         task_id=task_id,
-        plan_binding=source_plan_hash,
+        plan_binding=candidate["source_plan_hash"],
         context_hash=context_hash,
     )
-    candidate["storage_intent"] = storage_intent
     candidate["execution_context_hash"] = context_hash
-    candidate["intent_hash"] = _canonical_hash(
-        {key: value for key, value in candidate.items() if key != "intent_hash"}
-    )
-    assert parse_host_execution_intent(candidate).storage_intent is not None
+    candidate = _with_binding(candidate, "intent_hash")
+    parsed = parse_host_execution_intent(candidate)
+    assert not isinstance(parsed, StorageIntentError)
+    assert parsed != NO_SAFE_WORK
+    assert parsed.schema.endswith("-v3")
+    assert parsed.storage_intent is not None
+    assert validate_host_execution_intent(candidate) is NO_SAFE_WORK
 
     duplicate = copy.deepcopy(candidate)
-    duplicate["assignment"]["storage_intent"] = storage_intent
+    duplicate["assignment"]["storage_intent"] = copy.deepcopy(
+        candidate["storage_intent"]
+    )
     duplicate["assignment"] = _with_binding(
         duplicate["assignment"], "assignment_binding_hash"
     )
-    duplicate["intent_hash"] = _canonical_hash(
-        {key: value for key, value in duplicate.items() if key != "intent_hash"}
-    )
-    duplicate_result = parse_host_execution_intent(duplicate)
-    conflict = copy.deepcopy(candidate)
-    conflict["storage_intent"] = _host_storage_intent(
-        task_id=task_id,
-        plan_binding=source_plan_hash,
-        context_hash="sha256:" + "3" * 64,
-    )
-    conflict = _with_binding(conflict, "intent_hash")
-    conflict_result = parse_host_execution_intent(conflict)
-    for result in (duplicate_result, conflict_result):
+    duplicate = _with_binding(duplicate, "intent_hash")
+    missing = copy.deepcopy(candidate)
+    missing.pop("storage_intent")
+    missing = _with_binding(missing, "intent_hash")
+    for malformed in (duplicate, missing):
+        result = parse_host_execution_intent(malformed)
         assert isinstance(result, StorageIntentError)
-        assert result.code == STORAGE_TARGET_KEY_INVALID
-
-
-def _real_storage_request() -> tuple[
-    object,
-    object,
-    dict[str, object],
-    dict[str, object],
-    dict[str, object],
-    str | None,
-]:
-    test_module_path = (
-        Path(__file__).resolve().parents[1]
-        / "devkit_fastlane"
-        / "tests"
-        / "test_team_efficiency.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "storage_test_team_efficiency_tests", test_module_path
-    )
-    assert spec is not None and spec.loader is not None
-    tests_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tests_module)
-
-    previous_task_temp = os.environ.get("CODEX_TASK_TEMP")
-    if previous_task_temp is None:
-        os.environ["CODEX_TASK_TEMP"] = str(
-            Path(__file__).resolve().parents[3]
-            / ".codex-task-temp"
-        )
-    fixture = tests_module.TeamEfficiencyTests("runTest")
-    fixture.setUp()
-    helper = tests_module.load_efficiency()
-    request = fixture.fast_lane_request(helper)
-    task_ids = [item["task_id"] for item in request["execution_contexts"]]
-    descriptor = {
-        key: value
-        for key, value in _storage_binding_context().items()
-        if key != "execution_context_hash"
-    }
-    for context in request["execution_contexts"]:
-        context.update(
-            {
-                **descriptor,
-                "execution_context_hash": _canonical_hash(
-                    {"storage_context": context["task_id"]}
-                ),
-            }
-        )
-    request["storage_budgets"] = {
-        task_id: {"bytes": 4096 + index, "files": 8 + index}
-        for index, task_id in enumerate(task_ids)
-    }
-    host_status = fixture.fast_lane_host_status(helper, request)
-    route_request = host_status["routing_context"]["routes"][0]["request"]
-    host = copy.deepcopy(route_request["host_capabilities"])
-    host["models"] = [
-        {**model, "efforts": sorted(model["efforts"])} for model in host["models"]
-    ]
-    scheduler = route_request["scheduler_facts"]
-    return fixture, helper, request, host, scheduler, previous_task_temp
-
-
-def test_real_prepare_entry_binds_initial_successor_and_missing_facts_fail_closed() -> None:
-    fixture, helper, request, host, scheduler, previous_task_temp = _real_storage_request()
-    try:
-        prepared = helper.prepare_authenticated_v5_routing_from_request(
-            request,
-            index_context_hash=helper._sha256_json({"index": "storage-real-entry"}),
-            host_capabilities=host,
-            scheduler_facts=scheduler,
-        )
-        for wave in (prepared["units"], prepared["remaining_units"]):
-            assert wave
-            for unit in wave:
-                intent = unit["storage_intent"]
-                assert intent["task_id"] == unit["task"]["task_id"]
-                assert intent["plan_binding"] == prepared["source_plan_hash"]
-                assert intent["context_hash"] == _canonical_hash(
-                    {"storage_context": unit["task"]["task_id"]}
-                )
-
-        missing = copy.deepcopy(request)
-        for context in missing["execution_contexts"]:
-            context.pop("execution_context_hash")
-        with pytest.raises(ValueError, match="STORAGE_POLICY_MISSING"):
-            helper.prepare_authenticated_v5_routing_from_request(
-                missing,
-                index_context_hash=helper._sha256_json({"index": "storage-real-entry"}),
-                host_capabilities=host,
-                scheduler_facts=scheduler,
-            )
-    finally:
-        fixture.tearDown()
-        if previous_task_temp is None:
-            os.environ.pop("CODEX_TASK_TEMP", None)
-        else:
-            os.environ["CODEX_TASK_TEMP"] = previous_task_temp
-
-
-def test_attested_routing_rejects_storage_rebind_after_attestation() -> None:
-    fixture, helper, request, host, scheduler, previous_task_temp = _real_storage_request()
-    try:
-        prepared = helper.prepare_authenticated_v5_routing_from_request(
-            request,
-            index_context_hash=helper._sha256_json({"index": "storage-real-entry"}),
-            host_capabilities=host,
-            scheduler_facts=scheduler,
-        )
-        routing_request = prepared["routing_requests"][0]
-        core = sys.modules["fastlane_routing"]
-        request_binding_hash = core.v5_request_binding_hash(routing_request)
-        attestation = {
-            "schema": "2718lab-devkit/host-child-route-attestation-v1",
-            "status": "attested",
-            "request_binding_hash": request_binding_hash,
-            "host_id_hash": host["host_id_hash"],
-            "capability_epoch": 1,
-            "lease_epoch": 0,
-            "issued_event_seq": 1,
-            "expires_event_seq": 1,
-            "route": {"lane": "sol", "model": "gpt-5.6-sol", "effort": "high", "rank": 40},
-            "inherit_current_session_model": False,
-            "refusal_code": None,
-        }
-        attestation["attestation_hash"] = helper._sha256_json(attestation)
-        tampered = copy.deepcopy(prepared["units"][0])
-        budget = {"bytes": tampered["storage_budget"]["bytes"] + 1, "files": tampered["storage_budget"]["files"] + 1}
-        tampered["storage_budget"] = budget
-        intent = tampered["storage_intent"] = copy.deepcopy(tampered["storage_intent"])
-        intent.update({"requested_bytes": budget["bytes"], "requested_files": budget["files"]})
-        intent["storage_intent_hash"] = _canonical_hash(
-            {key: intent[key] for key in ("target_descriptor", "task_id", "plan_binding", "context_hash", "requested_bytes", "requested_files")}
-        )
-        with pytest.raises(ValueError, match="routing profile"):
-            helper.compile_authenticated_v5_assignment_skeletons(
-                [tampered],
-                source_plan_hash=prepared["source_plan_hash"],
-                routing_requests=[routing_request],
-                attestation_items=[
-                    {
-                        "task_id": routing_request["task"]["task_id"],
-                        "request_binding_hash": request_binding_hash,
-                        "attestation": attestation,
-                    }
-                ],
-            )
-    finally:
-        fixture.tearDown()
-        if previous_task_temp is None:
-            os.environ.pop("CODEX_TASK_TEMP", None)
-        else:
-            os.environ["CODEX_TASK_TEMP"] = previous_task_temp
+        assert result.code == "STORAGE_TARGET_KEY_INVALID"

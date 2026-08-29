@@ -24,7 +24,8 @@ from .storage_intent import (
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 UNSPLITTABLE: Final = "UNSPLITTABLE"
 
-_SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
+_SCHEMA_V2: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
+_SCHEMA_V3: Final = "2718lab-devkit/fastlane-host-execution-intent-v3"
 _RELAY_HOST_SCHEDULER_SLOT_SCHEMA: Final = (
     "2718lab-devkit/relay-host-scheduler-slot-v1"
 )
@@ -405,7 +406,12 @@ def classify_host_scheduler_topology(
 
 
 def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
-    if isinstance(candidate, dict) and candidate.get("schema") == _SCHEMA:
+    schema = candidate.get("schema") if isinstance(candidate, dict) else None
+    if schema == _SCHEMA_V2:
+        root = _bound_mapping(candidate, _ROOT_KEYS, "intent_hash")
+        storage_intent: StorageIntent | None = None
+        execution_context_hash: str | None = None
+    elif schema == _SCHEMA_V3:
         assignment_candidate = candidate.get("assignment")
         if (
             "storage_intent" not in candidate
@@ -419,8 +425,22 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
             )
         ):
             raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
-    root = _bound_mapping(candidate, _ROOT_STORAGE_KEYS, "intent_hash")
-    if root is None or _text(root, "schema") != _SCHEMA:
+        root = _bound_mapping(candidate, _ROOT_STORAGE_KEYS, "intent_hash")
+        if root is None:
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+        try:
+            storage_intent = parse_storage_intent(root["storage_intent"])
+        except StorageIntentError:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError, UnicodeError) as error:
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID) from error
+        raw_execution_context_hash = root["execution_context_hash"]
+        if not _is_hash_value(raw_execution_context_hash):
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+        execution_context_hash = cast(str, raw_execution_context_hash)
+    else:
+        return None
+    if root is None or _text(root, "schema") != schema:
         return None
 
     projection_hash = _valid_hash(root, "projection_hash")
@@ -516,18 +536,10 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         active_lease_set_hash,
     ) = validated_predecessor
 
-    try:
-        storage_intent = parse_storage_intent(root["storage_intent"])
-    except StorageIntentError:
-        raise
-    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError) as error:
-        raise StorageIntentError(STORAGE_TARGET_KEY_INVALID) from error
-    raw_execution_context_hash = root["execution_context_hash"]
-    if not _is_hash_value(raw_execution_context_hash):
-        raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
-    execution_context_hash = cast(str, raw_execution_context_hash)
-    if (
-        storage_intent.task_id != task_id
+    if schema == _SCHEMA_V3 and (
+        storage_intent is None
+        or execution_context_hash is None
+        or storage_intent.task_id != task_id
         or storage_intent.plan_binding != source_plan_hash
         or storage_intent.context_hash != execution_context_hash
     ):
@@ -597,7 +609,7 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         return None
 
     return ParsedHostExecutionIntent(
-        schema=_SCHEMA,
+        schema=cast(str, schema),
         intent_hash=intent_hash,
         projection_hash=projection_hash,
         source_plan_hash=source_plan_hash,
