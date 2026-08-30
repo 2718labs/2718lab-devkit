@@ -172,7 +172,7 @@ Absent/ActiveOld -> CandidateVerified -> CandidateProtected -> ScmSwitched
 - Modify: `MODULE.bazel.lock`
 
 - [ ] Add workspace member `storage-broker-windows` and workspace dependency `codex-storage-broker-windows = { path = "storage-broker-windows" }`. The crate exposes protocol/client types on every OS; service/provisioning modules are `cfg(windows)`, and non-Windows `BrokerClient::connect` returns `STORAGE_BROKER_UNSUPPORTED`.
-- [ ] Implement the locked header, `BoundedControlPayload::try_from(Vec<u8>)`, exact encode/decode functions, and a closed `BrokerErrorCode` enum. Use checked arithmetic before allocation and return only stable codes plus bounded diagnostic text.
+- [ ] Implement the locked header, `BoundedControlPayload::try_from(Vec<u8>)`, exact encode/decode functions, and a closed `BrokerErrorCode` enum. Use checked arithmetic before allocation and return only stable codes plus bounded diagnostic text. Define `ErrorDisposition::{Retryable, Sticky}` locally with an exhaustive match: only `STORAGE_BROKER_BUSY`, `STORAGE_BROKER_CONNECT_TIMEOUT`, and `STORAGE_BROKER_SERVICE_STARTING` are retryable; identity/protocol/root mismatch, recovery-required, commit-uncertain, downgrade, unprovisioned, and every unknown code are sticky. The wire has no `retryable` field, so a service response cannot choose or widen its disposition.
 - [ ] Implement strict `ActiveProvisionRecordV1` decoding with `serde(deny_unknown_fields)`, a maximum 16 KiB file, one active and at most one rollback Host hash, exact `BROKER_RELEASE_SEQUENCE`, fixed service/pipe names, fixed protected base directories, and `RootIdentity`. Reject environment-supplied Program Files/ProgramData paths; Windows code resolves known folders.
 - [ ] Keep public API minimal and path-free:
 
@@ -305,9 +305,15 @@ git commit -m "feat: make broker the protected root writer"
 - Modify: `codex-rs/Cargo.lock`
 - Modify: `MODULE.bazel.lock`
 
-- [ ] Add the broker crate dependency. `HostStorageService` keeps validated root-plus-eight configuration and the in-memory policy evaluator, but replaces `RootStorageLedger` with a cached `Result<Arc<BrokerClient>, BrokerError>` frozen per runtime.
+- [ ] Add the broker crate dependency. `HostStorageService` keeps validated root-plus-eight configuration and the in-memory policy evaluator, but replaces `RootStorageLedger` with this runtime state (or a type-equivalent state):
+
+```rust
+broker: Mutex<Option<Result<Arc<BrokerClient>, BrokerError>>>
+```
+
+`None` means not attempted or a prior retryable attempt was deliberately not cached, `Some(Ok(client))` is the verified shared client, and `Some(Err(error))` contains only a sticky error frozen for the runtime. Never store a retryable error in the mutex.
 - [ ] Preserve the existing `Arc<HostStorageService>` sharing from `ThreadManager` through ordinary and delegated sessions. A session cannot construct a broker, select a pipe/root, replace the cached client, or obtain a session-local writer; all Host processes still converge on the service's single root transaction.
-- [ ] `HostStorageService::new` performs no writes and does not start/install the service. Connection remains lazy. Missing config returns `STORAGE_POLICY_MISSING`; configured but missing active record/service returns `STORAGE_BROKER_UNPROVISIONED`; identity/protocol/recovery failures retain their exact stable code.
+- [ ] `HostStorageService::new` performs no writes and does not start/install the service. Connection remains lazy. Each storage operation makes at most one bounded connect/mutation attempt. `BUSY`, pipe-connect timeout, or service-starting returns to that caller without caching the error; the next storage operation may make one fresh bounded attempt. Identity/protocol/root mismatch, recovery-required, commit-uncertain, downgrade, unprovisioned, and unknown errors are cached as sticky. Missing config returns `STORAGE_POLICY_MISSING`; configured but missing active record/service returns sticky `STORAGE_BROKER_UNPROVISIONED` and requires explicit provisioning plus Host restart. There is no spin, background poll, timer/TTL takeover, or retry while holding the runtime mutex.
 - [ ] Expose the three path-free client calls using the sealed Host provenance type:
 
 ```rust
@@ -493,6 +499,7 @@ git commit -m "docs: gate storage lifecycle on protected broker"
 - [ ] Protocol allocation, request count, payload, concurrency, and I/O time are hard-capped before use.
 - [ ] The broker owns `ReserveOnce`, `ReplaceVerified`, and `Settle`; receipt publication follows durable commit; uncertain state freezes and protects stage/recovery data.
 - [ ] Missing configuration is disabled. Installed but unprovisioned, unsupported OS, service absent, signature mismatch, downgrade, root mismatch, or recovery state fails closed with no local fallback.
+- [ ] Retry disposition is an exhaustive Host-side match: only busy/connect-timeout/service-starting remain uncached for one attempt on a later storage operation; all safety/identity/protocol/root/recovery/commit/downgrade/unprovisioned/unknown failures freeze the runtime, with no self-retry loop, background poll, TTL, or takeover.
 - [ ] Provisioning occurs only through an explicitly elevated administrator command or the fixed enterprise policy registry source. Build, package, install, Host startup, and config load never invoke it.
 - [ ] Upgrades reject rollback/downgrade and publish active state last. Every failure retains the old service version, old active record, and old root; no candidate or stage is automatically deleted.
 - [ ] Windows release builds sign and package both binaries, while package assembly proves no SCM/ACL/root mutation.
