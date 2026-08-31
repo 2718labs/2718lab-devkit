@@ -4,7 +4,7 @@
 
 **Goal:** Make every Cargo, Python, MCP-package, and Fast Lane write begin with one host-approved deterministic generated root and a fail-closed byte/file/free-space reservation.
 
-**Architecture:** DevKit emits a bounded, path-free `StorageIntent` whose hash is bound to the Fast Lane task, source plan, execution context, and project identity. The Codex Host resolves an already-issued profile, validates the intent, and reserves a deterministic target family for a Host-owned wave with per-task member grants. Receipts contain identities only; private worker facts carry paths. Existing route/lease batch hashes remain unchanged. Lease persistence, cleanup, GitHub source authorization, and session CAS are separate follow-up plans.
+**Architecture:** DevKit emits a bounded, path-free `StorageIntent` whose hash is bound to the Fast Lane task, source plan, execution context, and project identity. The Codex Host resolves an already-issued profile, validates the intent, and reserves a deterministic target family for a Host-owned wave with per-task member grants. The Host remains an authenticated client of `codex-storage-broker-windows`; it never owns protected-root writer handles or falls back to a local ledger. Receipts contain identities only; private worker facts carry paths. Existing route/lease batch hashes remain unchanged. Lease persistence, cleanup, GitHub source authorization, and session CAS are separate follow-up plans.
 
 **Tech Stack:** Python 3.11 standard library (`dataclasses`, `hashlib`, `json`, `pathlib`), MCP FastMCP/Pydantic, Rust 2021, `serde`/`serde_json`, `sha2`, Tokio, platform filesystem-capacity APIs, and the existing authenticated inherited-handle bridge.
 
@@ -18,6 +18,11 @@ checkbox is completed by this documentation update. The unpublished
 admission-v1 request is exact5, replacing exact4; intent/target/profile-v1 stay
 unchanged. If exact4 has been deployed outside these worktrees, use admission-v2
 instead and reject downgrade.
+
+**Protected-broker handoff (2026-08-31):** The dependency text below treats
+storage broker Tasks 1-6 as prerequisites, not completed work. Broker delivery
+does not authorize cleanup or live activation. This revision claims no Task 7
+probe result, elevated provisioning/acceptance, or Bazel completion.
 
 **Compile-first execution:** Reuse the Host's existing
 `G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\target`,
@@ -105,9 +110,11 @@ Codex Host files:
   `codex-rs/core/src/session/mod.rs` (`SessionSpawnArgs`),
   `codex-rs/core/src/session/session.rs`, and
   `codex-rs/core/src/state/service.rs` (`SessionServices`) to inject one
-  Host-runtime service Arc into all registries. Create
+  Host-runtime service Arc into all registries. Reuse/modify
   `codex-rs/core/src/fast_lane_host_dispatch/storage_service.rs` for that
-  authority/ledger facade, registering it in the existing dispatch `mod.rs`.
+  authenticated client/policy facade, registering it in the existing dispatch
+  `mod.rs`; reuse the broker plan's `storage_broker.rs` and do not recreate a
+  root writer or local fallback in core.
 - Modify `codex-rs/core/src/mcp_tool_call.rs` and
   `codex-rs/core/src/fast_lane_host_dispatch/worktree.rs` for planned versus
   materialized roots; no pre-admission `create_dir_all` remains.
@@ -125,11 +132,11 @@ Codex Host files:
   register it in `mod.rs`: real no-follow family/member observations after
   the process fence, not caller-supplied counters.
 
-The capacity provider now reuses existing platform FFI; no new Windows
-dependency is required. Do not change manifests/locks for this documentation
-or add a dependency merely because an older example requested it.
-`MODULE.bazel.lock`, if a separately justified dependency change needs it,
-is at the Host repository root, not under `codex-rs`.
+The Task 5 capacity provider itself still reuses existing platform FFI. Task 6
+consumes the broker crate dependency established by storage broker Tasks 1-6;
+do not add another writer dependency or alter manifests/locks in this
+documentation-only revision. `MODULE.bazel.lock` remains a broker-plan gate at
+the Host repository root, not evidence that Bazel completion already occurred.
 
 The worker must not edit any file outside this map. The ledger, preview/apply,
 source authorization, and session CAS changes belong to Plans 2 and 3.
@@ -646,11 +653,24 @@ Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2';
 
 ### Task 6: Connect admission to preparation, worker environment, and terminal release
 
+Use this exact implementation dependency order:
+
+```text
+storage broker Tasks 1-6
+  -> Plan 2 P2-base Task 1 control transactions
+  -> Plan 1 Task 6 durable refill/lifecycle wiring
+  -> Plan 2 remaining P2-base owner recovery
+  -> Plan 2 P2-apply preview and generated cleanup
+```
+
+Broker completion unblocks only Plan 2 P2-base Task 1. It does not authorize
+cleanup or live activation, and it does not by itself complete this Task 6.
+
 **Independent file groups:** All paths below are within the scope map above.
 
 | Slice | Files and existing attachment points |
 | --- | --- |
-| 6a configuration/service | `config/src/config_toml.rs::ConfigToml`, `core/src/config/mod.rs::Config::load_config_with_layer_stack`, generated `core/config.schema.json`; new `core/src/fast_lane_host_dispatch/storage_service.rs` and `mod.rs`; `app-server/src/message_processor.rs`, `core/src/thread_manager.rs::ThreadManagerState`, `core/src/session/mod.rs::SessionSpawnArgs`, `core/src/session/session.rs`, `core/src/state/service.rs::SessionServices` |
+| 6a configuration/service | `config/src/config_toml.rs::ConfigToml`, `core/src/config/mod.rs::Config::load_config_with_layer_stack`, generated `core/config.schema.json`; core `storage_service.rs`, broker-plan `storage_broker.rs`, and `mod.rs` as the authenticated Host client only; `app-server/src/message_processor.rs`, `core/src/thread_manager.rs::ThreadManagerState`, `core/src/session/mod.rs::SessionSpawnArgs`, `core/src/session/session.rs`, `core/src/state/service.rs::SessionServices` |
 | 6b authority/write ordering | `core/src/fast_lane_host_dispatch/{registry,contract,storage_profile,worktree}.rs`, `core/src/mcp_tool_call.rs`; existing rmcp-client refill protocol/session/pump; DevKit `fastlane_host_adapter.py`, `host_bridge.py`, `host_session.py`, `server.py` |
 | 6c worker isolation | `core/src/fast_lane_host_dispatch/codex_adapter.rs::{HostWriterContext,CodexHostDispatchFacts,prepare_batch}`, `core/src/config/mod.rs::Permissions`, `protocol/src/shell_environment.rs`, `core/src/unified_exec/process_manager.rs` |
 | 6d real termination | `core/src/unified_exec/{mod,process,process_manager}.rs`, `utils/pty/src/{process,win/job}.rs`, `core/src/session/handlers.rs`, `core/src/agent/control/legacy.rs`; reuse `exec-server/src/process.rs` event boundary |
@@ -659,11 +679,11 @@ Push-Location 'G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2';
 Host paths in this table are relative to `codex-rs`; DevKit runtime filenames
 are under `mcp-tools/devkit_runtime`, with `server.py` under `mcp-tools`.
 6a can compile independently with storage disabled. 6d can be implemented
-independently of admission. 6b depends on 6a and the preserved Task 4/5
-contracts, plus the bounded control-allocation prerequisite below for durable
-refill registration; 6c depends on 6b. Successful release in 6e requires both phases of
-6d, not just worker wiring or a green compile. Coordinate shared files rather
-than concurrently editing registry/adapter/process-manager from two slices.
+independently of admission. Durable 6b depends on storage broker Tasks 1-6,
+Plan 2 P2-base Task 1, 6a, and the preserved Task 4/5 contracts; 6c depends on
+6b. Successful release in 6e requires both phases of 6d, not just worker wiring
+or a green compile. Coordinate shared files rather than concurrently editing
+registry/adapter/process-manager from two slices.
 
 - [ ] **Step 6a: Load explicit trusted configuration and inject one runtime-owned service.**
 
@@ -710,8 +730,9 @@ The Host runtime caller in `app-server/src/message_processor.rs` supplies
 that base configuration. Store the same Arc in `ThreadManagerState`, forward
 through `SessionSpawnArgs`/`SessionServices`, and give every
 `FastLaneHostFactsRegistry` a reference to it. The new
-`storage_service.rs` facade owns the single kernel accounting state and
-immutable resolved policy/root, not another independent reservation ledger.
+`storage_service.rs` facade owns the single Host-side policy evaluator and
+authenticated broker client for the immutable resolved policy/root, not an
+independent reservation ledger or protected-root handle.
 Adapt every constructor/call site; test-only construction may be explicitly
 disabled or use an injected fixture, never a permissive production default.
 Current `session/session.rs` creates registries per Session: keep that facts
@@ -719,10 +740,11 @@ scope but do not create a firewall there. Per-thread config reload must not
 reset global reservations or replace policy/root; reject a differing storage
 configuration with the local `STORAGE_CONFIG_RESTART_REQUIRED` diagnostic.
 
-This is cross-session sharing inside one Host runtime, not a cross-process
-ledger. An independent Host process must not claim the same active storage
-root without exclusive root authority; multi-process persistence/recovery
-remains Plan 2. An in-memory Arc cannot prove that exclusivity by itself.
+This is cross-session sharing of one authenticated client inside one Host
+runtime. Cross-process serialization, persistence, and root ownership belong
+only to `codex-storage-broker-windows`; an independent Host process is another
+authenticated client and cannot claim the root. Remaining owner recovery stays
+in Plan 2 after this Task 6. An in-memory Arc is never root authority.
 
 - [ ] **Step 6b: Admit/seal before any task-root write, then consume once.**
 
@@ -755,10 +777,12 @@ Their lifecycle spans waves: releasing/cleaning the initial member must not
 erase an active queue, and retaining its Cargo family lease for the queue
 would permanently block a different-owner same-key successor.
 
-Durable refill registration therefore depends on an independently bounded
-Host ledger/control allocation with a queue-lifetime owner, explicit positive
-byte/file allowance, safe private root, and terminal queue settlement. Plan 2
-must provide that control-allocation contract before this part of 6b is
+Durable refill registration therefore depends first on storage broker Tasks
+1-6 and then on Plan 2 P2-base Task 1 binding an independently bounded
+broker-owned control allocation to a verified queue-lifetime owner, explicit
+positive byte/file allowance, safe private root, and terminal queue settlement.
+The Host accesses those control transactions only as an authenticated client.
+Plan 2 must provide that control-allocation contract before this part of 6b is
 enabled; implement no ledger or new artifact/wire field in this Plan 1 update.
 Until it exists, reject durable registration before any write. Do not invent
 a control task/lease, take an unrequested budget, or exempt metadata from
@@ -899,8 +923,20 @@ or complete Plan 1 acceptance.
 - [ ] Run `python -m py_compile` on changed DevKit Python files and `cargo check -p codex-rmcp-client -p codex-core --lib --locked -j1` with the existing Host `codex-rs\target` and `CARGO_INCREMENTAL=0`; retain current compile evidence instead of rerunning unchanged slices.
 - [ ] Record one controlled admission receipt proving same semantics reuse one target key and one changed semantic forks it; record one low-space/policy-failure receipt proving no directory was created.
 - [ ] Verify exact5 session lookup/core `Sent` binding, unchanged original batch hashes, same-owner member sharing with exact sealing, cross-owner conflict, and a native selected-successor admission without a second reservation. Do not label initial-only wiring complete.
-- [ ] Verify explicit trusted root plus eight policy values, one Host-runtime service shared across Sessions, and no pre-admission task/control/queue directory writes. Record the single-runtime versus independent-Host-process ownership boundary.
-- [ ] Before enabling durable refill, obtain Plan 2's bounded queue-lifetime control allocation: initial member release cannot remove active metadata, and that allocation cannot retain the Cargo family lease or block same-key successors. Missing allocation rejects registration before writes; no free budget or fabricated task is allowed.
+- [ ] Verify explicit trusted root plus eight policy values, one authenticated
+  Host client service shared across Sessions, and no pre-admission
+  task/control/queue directory writes. Verify the broker is the sole root writer
+  and no Host-local fallback exists across independent Host processes.
+- [ ] Before enabling durable refill, complete storage broker Tasks 1-6 and
+  obtain Plan 2 P2-base Task 1's broker-backed bounded queue-lifetime control
+  allocation: initial member release cannot remove active metadata, and that
+  allocation cannot retain the Cargo family lease or block same-key successors.
+  Missing allocation rejects registration before writes; no free budget or
+  fabricated task is allowed. Remaining P2-base owner recovery follows this
+  Task 6; P2-apply follows only after that recovery.
 - [ ] Verify actual process and descendant shutdown evidence, denial of post-proof writers, and a real all-members-quiet family scan before release. Failure/timeout retains ownership; `Completed`, `ShutdownComplete`, ACK, or an empty ProcessStore is not sufficient.
 - [ ] Obtain the operator's approved absolute root and eight policy values before production enablement; do not invent them or reuse example test capacities as configuration. Record any unsupported process-containment platform as a remaining activation gate.
 - [ ] Do not implement ledger persistence, preview/apply, source deletion, session deletion, compression, or remote synchronization in this plan. Plan 2 consumes `StorageAdmissionReceipt`; Plan 3 consumes the released/observed storage records.
+- [ ] Treat broker completion, package presence, compile/probe success, and any
+  later elevated provisioning acceptance as separate gates. None authorizes
+  cleanup or live activation; this plan revision claims none complete.
