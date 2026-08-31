@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give the existing Host storage service one durable family/member/control accounting authority, then add explicitly authorized, bounded generated-cache cleanup.
+**Goal:** Give the protected storage broker one durable family/member/control accounting authority, keep the Host as its authenticated client, then add explicitly authorized, bounded generated-cache cleanup.
 
-**Architecture:** Plan 1 supplies strict intents, verified group/member authority, and a single service per runtime. Plan 2 moves kernel state into a root-shared transactional ledger: every Host transaction takes an OS fence, reloads current state, rechecks epoch/owners, transitions and atomically persists. Admission is one transition, not an admission followed by another reservation. Independently owned control allocations keep bootstrap/queue metadata bounded across waves without holding Cargo family leases. Cleanup is a later handle-fenced transaction over proven disposable objects, not a consequence of release, expiry, size, or age.
+**Architecture:** Plan 1 supplies strict intents, verified group/member authority, and a single Host service per runtime. Plan 2 extends the root-shared transactional ledger owned by `codex-storage-broker-windows`: each protected-root transaction runs inside the broker under its OS fence, reloads current state, rechecks epoch/owners, transitions and atomically persists. The Host is only an authenticated, path-free client and has no local writer fallback. Admission is one transition, not an admission followed by another reservation. Independently owned control allocations keep bootstrap/queue metadata bounded across waves without holding Cargo family leases. Cleanup is a later handle-fenced broker transaction over proven disposable objects, not a consequence of release, expiry, size, or age.
 
 **Tech Stack:** Existing Rust `serde`/`serde_json`/`sha2`, platform filesystem/process handles, existing durable replacement helpers, and the authenticated bridge; Python is a path-free projection only.
 
@@ -14,6 +14,10 @@ The main thread records Host `841fdaf` three-crate compile exit 0 and DevKit
 `b2aff` three selected final tests exit 0 for the existing slices. Retain that
 scope of evidence; it does not prove the new Plan 2 ledger/cleanup exists.
 Production cleanup and the 1.1.3 release remain incomplete.
+
+**Protected-broker handoff (2026-08-31):** Storage broker Tasks 1-6 are a
+prerequisite, not work completed by this plan revision. This edit claims no
+Task 7 probe result, elevated provisioning/acceptance, or Bazel completion.
 
 **Compile first:** Reuse only
 `G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\target`,
@@ -27,36 +31,45 @@ this documentation-only revision. No live cleanup/configuration is authorized.
 
 ## Dependency order and bounded file map
 
-Implement **P2-base** (Tasks 1-3: root guard, unique ledger transaction,
-bootstrap/control allocations and restart protection) before enabling Plan 1
-Task 6's durable refill registration. Plan 1 does not depend on **P2-apply**
-(Tasks 4-5: preview/delete tooling). Conversely P2-apply depends on Plan 1's
-real process/descendant terminal fence and a correct family postcheck.
-Never unblock a circular dependency with free metadata writes or fake proof.
-The next production integration order is P2-base/control, then Plan 1's
-remaining lifecycle/terminal wiring, then P2-apply. The root and eight policy
-values are still awaiting the user's confirmation; this plan requires no
-additional control-budget choice and fills in no values on the user's behalf.
+Use this exact implementation dependency order:
 
-All Host paths below are relative to
+```text
+storage broker Tasks 1-6
+  -> Plan 2 P2-base Task 1 control transactions
+  -> Plan 1 Task 6 durable refill/lifecycle wiring
+  -> Plan 2 remaining P2-base owner recovery
+  -> Plan 2 P2-apply preview and generated cleanup
+```
+
+Broker completion unblocks only Plan 2 P2-base Task 1; it does not authorize
+cleanup or live activation. Plan 1 does not depend on **P2-apply** (Tasks 4-5),
+while P2-apply depends on Plan 1's real process/descendant terminal fence and
+a correct family postcheck plus the remaining P2-base owner recovery. Never
+unblock a dependency with free metadata writes or fake proof. The root and
+eight policy values are still awaiting the user's confirmation; this plan
+requires no additional control-budget choice and fills in no values on the
+user's behalf.
+
+All Host-repository paths below are relative to
 `G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2`.
 DevKit paths are relative to
 `G:\2718lab\_codex\.codex-task-temp\devkit-1.1.2-recovery`.
 Re-read current symbols before editing; unrelated dirty work stays untouched.
-Bare Host module filenames below resolve within
-`codex-rs/core/src/fast_lane_host_dispatch/`; other paths are explicitly prefixed.
+Protected-root writer modules resolve within
+`codex-rs/storage-broker-windows/src/`; Host client modules resolve within
+`codex-rs/core/src/fast_lane_host_dispatch/`. Do not recreate a writer in core.
 
 | Slice | Files and ownership |
 | --- | --- |
-| Base state/transactions | Create `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger.rs` for typed snapshots, `RootStorageLedger` transactions, bounded commit/recovery and control ownership; its local mutex serializes only this Host's callers, never replaces the cross-process fence/reload; register in `mod.rs`. |
-| Real OS boundary | Create `codex-rs/core/src/fast_lane_host_dispatch/storage_fs.rs` for root/process exclusion, owned directory/file handles, bounded durable replacement and deletion primitives; no permissive path-string fallback. |
-| Existing kernel integration | Modify `storage_firewall.rs` to evaluate transitions against freshly loaded transaction state instead of its own independent `Mutex<State>`; modify `storage_service.rs::HostStorageService` to own one ledger/checker entry point per runtime into the shared root state. |
-| Runtime/base initialization | Modify `codex-rs/core/src/thread_manager.rs` and existing service/session construction only as required to initialize the shared base-Config service once. Registries do not reopen a ledger per session. |
+| Base state/transactions | Extend broker-owned `codex-rs/storage-broker-windows/src/{ledger,ledger_codec,service}.rs` for typed snapshots, bounded commit/recovery and control ownership. The broker transaction mutex and OS fence/reload remain authoritative; no second compilable writer may remain in `codex-core`. |
+| Real OS boundary | Extend broker-owned `codex-rs/storage-broker-windows/src/root_fs.rs` for root/process exclusion, owned directory/file handles, bounded durable replacement and later deletion primitives; no permissive path-string fallback. |
+| Existing kernel integration | Modify core `storage_firewall.rs` to evaluate transitions through the broker-backed operation boundary instead of its own independent `Mutex<State>`; keep `storage_service.rs::HostStorageService` plus `storage_broker.rs` as one authenticated client entry point per runtime, with no local ledger/root handles or fallback. |
+| Runtime/base initialization | Modify `codex-rs/core/src/thread_manager.rs` and existing service/session construction only as required to initialize the shared base-Config client service once. Registries do not construct a broker client or writer per session. |
 | Authority/queue lifecycle | Modify `fast_lane_host_dispatch/registry.rs` at initial admission, `consume_batch`, `register_refill_queue`, `consume_refill_queue` and queue persistence; modify `codex_adapter.rs`/`coordinator.rs` only at lifecycle settlement seams. Keep original route/lease hashes unchanged. |
-| Later cleanup | Create `fast_lane_host_dispatch/storage_cleanup.rs` for candidate classification/manifest and apply state machine; reuse `storage_fs.rs` and Plan 1 terminal/postcheck evidence. |
+| Later cleanup | Add the candidate classification/manifest and apply state machine under `codex-rs/storage-broker-windows/src/`, reusing broker `root_fs.rs` and Plan 1 terminal/postcheck evidence; core exposes only the authenticated path-free client operation. |
 | Later wire projection | Modify `codex-rs/rmcp-client/src/inherited_host_bridge_protocol.rs` and its `envelope.rs`/`session.rs`/`pump.rs` only for status/preview/apply; keep the single authenticated writer/receiver arrangement. |
 | Later DevKit projection | Create `mcp-tools/devkit_runtime/storage_ledger.py`; modify existing `host_bridge.py`, `host_session.py`, `mcp-tools/server.py` and `devkit_runtime/tool_metadata.py` for typed read-only status/preview and explicitly destructive apply. |
-| Bounded verification | Create `codex-rs/core/src/fast_lane_host_dispatch/storage_ledger_tests.rs`; reuse existing firewall tests. Add only the necessary exact Python request/tool-annotation assertion in `mcp-tools/tests/test_storage_ledger.py` / `test_mcp_contract.py`. |
+| Bounded verification | Put protected-root transaction/apply cases in `codex-storage-broker-windows`; reuse core firewall/client tests only for Host policy and fail-closed client behavior. Add only the necessary exact Python request/tool-annotation assertion in `mcp-tools/tests/test_storage_ledger.py` / `test_mcp_contract.py`. |
 
 No source/session deletion, GitHub reachability, CAS, compression, remote sync,
 new dependency, or live configuration change belongs to this revision.
@@ -102,21 +115,23 @@ Do not persist or deserialize live handle/termination capabilities.
 
 ### Single ownership and arithmetic
 
-`RootStorageLedger::transact` is the sole state-mutation/commit boundary.
-Every transaction acquires the real cross-process root fence, reloads the
-latest bounded snapshot, rechecks epoch/policy/owners, computes a transition
-and atomically persists before releasing the fence. `HostStorageService`
-remains one entry point per runtime, constructed from its manager's base
-Config and shared across its sessions. Multiple Host processes coordinate
-through this same root transaction protocol, not separate cached counters.
-The kernel evaluates only the current transaction state. An optional cached
-snapshot is non-authoritative for reservation, release, recovery or deletion.
+The broker's `RootWriter::apply`/ledger transaction is the sole
+state-mutation/commit boundary. Every transaction acquires the broker's real
+cross-process root fence, reloads the latest bounded snapshot, rechecks
+epoch/policy/owners, computes a transition and atomically persists before
+releasing the fence. `HostStorageService` remains one authenticated client
+entry point per runtime, constructed from its manager's base Config and shared
+across its sessions. Multiple Host processes coordinate through the broker,
+not separate cached counters or local writers. The kernel evaluates only the
+current broker transaction state. A Host-side cached snapshot is
+non-authoritative for reservation, release, recovery or deletion.
 
-Move the current `State` into this durable authority rather than mirroring it. Do not expose a new
-`ledger.reserve(receipt)` after `reserve_member_once`. Receipt delivery/replay,
-group sealing and member attachment do not reserve again. Kernel public
-wrappers must delegate into the same ledger transaction, never recursively
-lock the old firewall while a ledger transaction is held.
+Move the current `State` into the broker's durable authority rather than
+mirroring it in core. Do not expose a new `ledger.reserve(receipt)` after
+`reserve_member_once`. Receipt delivery/replay, group sealing and member
+attachment do not reserve again. Kernel public wrappers must issue sealed,
+path-free authenticated broker operations into the same transaction, never
+open the protected root or recursively lock the old firewall.
 
 Compute/validate aggregate caches from authoritative records at load and
 commit; never trust a serialized global total independently:
@@ -150,8 +165,9 @@ No pressure state authorizes killing a process or deleting data.
 
 ## Real authority and filesystem interfaces
 
-Implement these interfaces as private RAII/handle types in `storage_fs.rs`;
-the names describe new implementation work, not an existing capability:
+Implement these interfaces as private RAII/handle types in broker-owned
+`codex-rs/storage-broker-windows/src/root_fs.rs`; the names describe planned
+Plan 2 capability, not work completed by the broker dependency handoff:
 
 ```rust
 trait RootOwnershipProvider {
@@ -171,50 +187,55 @@ trait OwnedFilesystem {
 }
 ```
 
-`ApprovedRoot`, `SingleComponent` and handles have private constructors.
+`ApprovedRoot`, `SingleComponent` and handles have broker-private constructors.
+The Host authenticated client cannot construct, receive, or serialize them.
 `RootTransactionGuard` retains the opened root identity and actual exclusive
 OS lock for one reload/recheck/transition/persist transaction. Release it
-after commit so another Host can transact against the new epoch; never keep
-one Host's cached state authoritative after releasing it.
+after commit so another authenticated Host client can transact against the
+new epoch; never keep one Host's cached state authoritative after releasing it.
 `NamespaceMutationFence` excludes admissions
 and namespace writers for the exact owned subtree until final observation/
 commit. Neither type is serde, a boolean, a deadline, or a caller token.
 
-On Windows, acquire a machine-wide named mutex keyed from the opened local
-volume/file identity before creating lock/ledger files; validate ownership,
+On Windows, the broker acquires a machine-wide named mutex keyed from the
+opened local volume/file identity before creating lock/ledger files; validate ownership,
 abandonment and collisions. Retain no-follow directory handles and compare
 volume/file IDs; reject reparse points. Child deletion uses verified handles
 and the platform disposition API, not `remove_dir_all` on a reconstructed
 string. Sharing/ACL rules and the process fence must exclude rename/replacement
-by writers during the operation. The guard must also cover every Host process
-using that root, not merely one Rust mutex.
+by writers during the operation. The broker guard must serialize every Host
+client using that root, not merely one core Rust mutex.
 
-On Unix, use an actual exclusive OS lock on an already-open approved
-directory where supported, and directory-relative no-follow opens plus
-`fstat` identity checks. Relative unlink operations still require a real
-namespace-mutation fence; `openat` or a final string comparison alone does
-not close a leaf-replacement race. If the backend cannot prove that fence,
-apply is unavailable. Do not claim a portable secure delete from a trait
-stub. Remote/shared filesystems without a cross-host locking guarantee are
-unsupported for this local-root implementation.
+On non-Windows platforms the protected broker is unsupported and writer/apply
+operations remain unavailable. Do not reintroduce a core-local Unix writer or
+claim a portable secure delete from a trait stub. Remote/shared filesystems
+without the broker's locking guarantee are unsupported.
 
-Keep lock order explicit: OS root transaction guard, then this runtime's
-transaction mutex, then the specific namespace fence. Reload after taking
-the OS guard, not before. Await actual writer shutdown
-**before** the transaction and validate the Host-owned terminal evidence
-nonblockingly inside it, as required by `HostStorageTerminationEvidence`.
-Do not hold the OS/accounting locks while waiting for child exit or call back
-into the firewall from a proof provider. Busy/unavailable/abandoned/unknown
-results fail closed and never trigger takeover by TTL.
+Keep broker lock order explicit: OS root transaction guard, then the broker
+transaction mutex, then the specific namespace fence. Reload after taking the
+OS guard, not before. The Host awaits actual writer shutdown **before** its
+authenticated request; the broker validates the sealed Host-owned terminal
+evidence nonblockingly inside the transaction, as required by
+`HostStorageTerminationEvidence`. Do not hold broker OS/accounting locks while
+waiting for child exit or call back into the firewall from a proof provider.
+Busy/unavailable/abandoned/unknown results fail closed and never trigger a
+Host fallback or takeover by TTL.
 
 ## P2-base implementation tasks
 
-### Task 1: Own bootstrap and control writes before opening a ledger
+### Task 1: Wire bootstrap and control transactions through the broker
 
-**Files:** `storage_fs.rs`, `storage_ledger.rs`, `storage_service.rs`, `mod.rs`.
+**Files:** broker `root_fs.rs`, `ledger.rs`, `ledger_codec.rs`, `service.rs`, and
+`protocol.rs`; Host client `storage_broker.rs`, `storage_service.rs`, `mod.rs`,
+and the bounded queue-provenance seam in `registry.rs`.
 
-- [ ] Open/validate the configured root without writing, obtain its OS
-  transaction guard, reload any current root snapshot, verify the unchanged
+**Precondition:** Storage broker Tasks 1-6 are delivered and compiled. This
+task does not recreate their root writer; it binds verified Plan 2 control
+ownership/lifecycle to the broker's three path-free transactions. Every root
+open/write below is broker-side. The Host remains an authenticated client.
+
+- [ ] In the broker, open/validate the configured root without writing, obtain
+  its OS transaction guard, reload any current root snapshot, verify the unchanged
   trusted base policy and measure available capacity. An existing valid
   ledger is joined transactionally, never overwritten with an empty state.
   No new user fields are needed or allowed: all policy values remain pending
@@ -230,7 +251,7 @@ results fail closed and never trigger takeover by TTL.
   current collection sizes and the proposed records. Stop encoding/scanning
   at the remaining admitted bound. Reject overflow or an unprovable bound;
   do not invent a record count, unlimited log or free bootstrap exception.
-- [ ] Before a ledger exists, the live root transaction guard owns this startup
+- [ ] Before a ledger exists, the broker's live root transaction guard owns this startup
   reservation in memory and excludes concurrent root transactions. Write the first durable
   snapshot containing that same control reservation, then release the guard
   and publish the service. For an existing ledger reserve only this operation's
@@ -245,10 +266,11 @@ results fail closed and never trigger takeover by TTL.
   Already-accounted file extents are not summed again as parent and child.
 - [ ] The bootstrap allocation belongs to the root lifetime, not the first
   Host process. Record its last mutator for audit, but do not release it on
-  that Host's exit or reserve it again when another Host opens the ledger.
-- [ ] Provide `reserve_control_once`, `replace_control_payload` and
-  `settle_control` on the same service transaction, taking verified Host
-  queue provenance and bounded encoded payloads, not caller paths/owners.
+  that Host's exit or reserve it again when another authenticated Host client
+  joins the same broker-owned ledger.
+- [ ] Wire the broker-owned `reserve_control_once`, `replace_control_payload`
+  and `settle_control` operations through the same service transaction, taking
+  verified Host queue provenance and bounded encoded payloads, not caller paths/owners.
   Queue control lives under the private `approved_root/control` namespace,
   outside `generated/<target>/members` and outside the common Cargo cache.
 - [ ] A queue allocation survives initial member release and all intermediate
@@ -263,17 +285,30 @@ results fail closed and never trigger takeover by TTL.
   tombstones or live queue records to make it fit. Terminal metadata retirement
   needs its own proven lifecycle/epoch rule; no age-only trimming.
 
+- [ ] Report this control-transaction slice ready only after the broker and
+  Host client compile together with verified queue provenance still sealed.
+  Only then may Plan 1 Task 6 durable refill/lifecycle wiring proceed. This
+  does not complete remaining P2-base recovery or authorize cleanup/activation.
+
+### Remaining P2-base after Plan 1 Task 6
+
 ### Task 2: Make kernel transitions one durable transaction
 
-**Files:** `storage_ledger.rs`, `storage_firewall.rs`, `storage_service.rs`;
-later attachment points in `registry.rs`, `codex_adapter.rs`, `coordinator.rs`.
+**Files:** broker `ledger.rs`, `ledger_codec.rs`, `service.rs`, and `protocol.rs`;
+Host client/evaluator `storage_broker.rs`, `storage_firewall.rs`, and
+`storage_service.rs`; later attachment points in `registry.rs`,
+`codex_adapter.rs`, and `coordinator.rs`.
+
+**Precondition:** Plan 1 Task 6 durable refill/lifecycle wiring follows the
+broker-backed Task 1 control boundary above. This remaining P2-base slice must
+not be pulled ahead of that lifecycle wiring.
 
 - [ ] Replace the private kernel state mutex with the reloaded ledger transaction state.
   Preserve `create_group`, `reserve_member_once`, `seal_group`,
   `consume_member_once`, `revoke_unused_member` and
   `release_member_after_postcheck` semantics. Internal transition evaluators
   take transaction state rather than reacquiring a separate lock.
-- [ ] Under a newly acquired root guard/transaction lock: reload the committed
+- [ ] Under a newly acquired broker root guard/transaction lock: reload the committed
   snapshot, verify expected epoch, current and other recorded owners/policy,
   exact authority and namespace identities; compute the
   next family/group/member/control snapshot and peak metadata reservation.
@@ -307,10 +342,12 @@ later attachment points in `registry.rs`, `codex_adapter.rs`, `coordinator.rs`.
 
 ### Task 3: Recover epochs/owners without inventing live authority
 
-**Files:** `storage_ledger.rs`, `storage_fs.rs`, `storage_service.rs` and queue
-recovery seams in `registry.rs`; use Plan 1 process-lifecycle evidence.
+**Files:** broker `ledger.rs`, `ledger_codec.rs`, `root_fs.rs`, and `service.rs`;
+Host client `storage_broker.rs`/`storage_service.rs` and queue recovery seams in
+`registry.rs`; use Plan 1 process-lifecycle evidence.
 
-- [ ] Acquire the real root transaction guard and reload before advancing state.
+- [ ] Have the broker acquire the real root transaction guard and reload before
+  advancing state.
   Validate exact snapshot-v2 structure, checksum/predecessor epoch and pending
   operation evidence under bounded reads. Unknown/malformed/regressing state
   is protected; a self-consistent hash alone is not trusted owner authority.
@@ -340,15 +377,21 @@ recovery seams in `registry.rs`; use Plan 1 process-lifecycle evidence.
   one family lease per task. Unknown versions fail closed. Existing data and
   raw legacy evidence remain untouched pending an explicit audited recovery.
   A missing ledger never authorizes adoption/deletion of unknown artifacts.
-- [ ] Report P2-base ready only when the shared ledger, bounded bootstrap/queue
-  allocations and fail-closed restart gate are wired and compiled. This lets
-  Plan 1 Task 6 proceed; it does not enable cleanup apply.
+- [ ] Report remaining P2-base ready only after Plan 1 Task 6 and the
+  broker-backed owner recovery/restart gate are wired and compiled. It does
+  not enable cleanup apply or live activation.
 
 ## P2-apply: classification, preview and locked deletion
 
 ### Task 4: Classify only proven disposable, unowned generated objects
 
-**Files:** `storage_cleanup.rs`, `storage_fs.rs`, `storage_ledger.rs`.
+**Files:** broker-owned cleanup/classification module plus `root_fs.rs`,
+`ledger.rs`, `ledger_codec.rs`, `service.rs`, and the path-free protocol;
+Host retains only its authenticated client/projection seams.
+
+**Precondition:** Broker Tasks 1-6, Plan 2 P2-base Task 1, Plan 1 Task 6, and
+the remaining P2-base owner recovery are complete in that order. None of those
+prerequisites authorizes preview/apply or live activation.
 
 - [ ] Build candidates from registered family/member generated roots only.
   Eligibility requires verified producer/classification evidence, released
@@ -376,11 +419,12 @@ recovery seams in `registry.rs`; use Plan 1 process-lifecycle evidence.
 
 ### Task 5: Acquire fences first, then recheck and journal apply
 
-**Files:** `storage_cleanup.rs`, `storage_fs.rs`, `storage_ledger.rs`;
-only afterward the mapped rmcp-client and DevKit projection files.
+**Files:** the broker-owned cleanup module, `root_fs.rs`, `ledger.rs`,
+`ledger_codec.rs`, `service.rs`, and protocol; only afterward the Host
+authenticated-client, mapped rmcp-client, and DevKit projection files.
 
-- [ ] Resolve the Host-held preview reference, acquire the root transaction
-  lock and real namespace-mutation fence, then freshly reopen/remeasure the
+- [ ] Resolve the broker-issued preview reference, have the broker acquire the
+  root transaction lock and real namespace-mutation fence, then freshly reopen/remeasure the
   exact candidate set through retained no-follow handles. Recheck owner/
   member/control references, policy, expected epoch, classification, identity,
   content manifest and finite bounds **inside** that fenced interval.
@@ -394,7 +438,7 @@ only afterward the mapped rmcp-client and DevKit projection files.
   selected identities/expected epoch before the first delete. The root lock
   prevents another admission during this transition; retain the namespace
   fence through deletion, post-stat and final ledger commit.
-- [ ] Delete only via `OwnedFilesystem::remove_verified_tree` with finite
+- [ ] Delete only through the broker's `OwnedFilesystem::remove_verified_tree` with finite
   bytes/files/depth/time limits, no links/mount traversal, stable opened parent
   identities and the supported platform's actual mutation exclusion.
   Reject multiply linked or unowned entries when ownership cannot be proved.
@@ -441,14 +485,14 @@ and unbounded apply batches if the bridge projection changes. Do not recreate
 old missing-module RED failures or introduce a broad test matrix.
 
 After a changed slice compiles, run the relevant case once, from Host
-`codex-rs`:
+`codex-rs`; protected-root transaction/apply cases belong to the broker crate:
 
 ```powershell
 $env:CARGO_TARGET_DIR='G:\2718lab\_codex\.codex-task-temp\codex-host-mcp-fix-recovery2\codex-rs\target'
 $env:CARGO_INCREMENTAL='0'
-cargo check -p codex-rmcp-client -p codex-core --lib --locked -j1
-cargo test -p codex-core shared_family_control_transaction_is_single_charge --locked -j1
-cargo test -p codex-core apply_rechecks_identity_under_fence_and_retains_failed_shutdown --locked -j1
+cargo check -p codex-storage-broker-windows --bins -p codex-rmcp-client -p codex-core --lib --locked -j1
+cargo test -p codex-storage-broker-windows shared_family_control_transaction_is_single_charge --locked -j1
+cargo test -p codex-storage-broker-windows apply_rechecks_identity_under_fence_and_retains_failed_shutdown --locked -j1
 ```
 
 Stop before probes if compilation fails; no repeated full-suite runs. Compile
@@ -467,17 +511,19 @@ is needed for these document/base slices.
 
 ## Plan 2 acceptance gates and handoff
 
-- [ ] One service per runtime enters the same cross-process root transaction:
-  OS fence, reload/recheck epoch/owner state, transition, durable commit.
-  Other live Host owners remain active and globally counted; no independent
-  per-Host authoritative counter cache exists. Same-key members share the lease, and no path performs
+- [ ] One authenticated Host client per runtime submits path-free operations to
+  the broker's cross-process root transaction: OS fence, reload/recheck
+  epoch/owner state, transition, durable commit. Other live Host owners remain
+  active and globally counted; no core-local writer or per-Host authoritative
+  counter cache exists. Same-key members share the lease, and no path performs
   firewall admission followed by independent ledger reservation.
 - [ ] Root-plus-eight trusted configuration remains unchanged and numerically
   pending the user. Bootstrap/queue/snapshot/stage/journal bytes/files are
   bounded and charged before writes from the existing global limits;
   unprovable capacity/bounds fail closed without creating metadata.
-- [ ] P2-base enables Plan 1's durable refill dependency independently of
-  cleanup apply: live queues survive initial member settlement without
+- [ ] After broker Tasks 1-6, P2-base Task 1 alone enables Plan 1's durable
+  refill/lifecycle dependency; only afterward may remaining P2-base owner
+  recovery proceed. Live queues survive initial member settlement without
   occupying its Cargo family lease or releasable member paths.
 - [ ] Real cross-process root exclusion, epoch/creation identity, recovery
   protection and no-follow handle fences exist. TTL/strings/PID equality
@@ -490,6 +536,10 @@ is needed for these document/base slices.
   eligibility/identity checks, with bounded journal/delete/postcheck.
   Record a fixture stale-candidate/no-delete result before any separately
   authorized live apply; this plan edit itself authorizes none.
+- [ ] Broker completion, package presence, compile/probe success, or later
+  provisioning does not authorize cleanup or live activation. Record those as
+  separate gates; this revision claims no Task 7 probes, elevated acceptance,
+  or Bazel completion.
 - [ ] No generated/source/session/queue data was deleted merely to complete a
   test, satisfy pressure, or repair a snapshot. Plan 3 receives protected
   classifications and the real fence, not permission for broader deletion.
