@@ -1192,11 +1192,27 @@ def _fastlane_authenticated_dispatch(
             "index_context_hash",
             "attestation_hash",
         )
-        skeletons = compiled["assignment_skeletons"]
+        raw_skeletons = compiled.get("assignment_skeletons")
+        raw_remaining_skeletons = compiled_remaining.get("assignment_skeletons")
+        if type(raw_skeletons) is not list or type(raw_remaining_skeletons) is not list:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        skeletons: list[dict[str, object]] = []
+        remaining_skeletons: list[dict[str, object]] = []
+        for raw_skeleton, destination in (
+            (raw_skeletons, skeletons),
+            (raw_remaining_skeletons, remaining_skeletons),
+        ):
+            for skeleton in raw_skeleton:
+                if (
+                    type(skeleton) is not dict
+                    or type(skeleton.get("task_id")) is not str
+                ):
+                    return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+                destination.append(skeleton)
         skeleton_package_hash = validate_authenticated_v5_skeleton_package(
             projected["all_units"],
             skeletons,
-            compiled_remaining["assignment_skeletons"],
+            remaining_skeletons,
             source_plan_hash=projected["source_plan_hash"],
         )
         index_refs = [
@@ -1255,7 +1271,7 @@ def _fastlane_authenticated_dispatch(
                     unit["task"]["task_id"] for unit in projected["all_units"]
                 ],
                 initial_skeletons=skeletons,
-                remaining_skeletons=compiled_remaining["assignment_skeletons"],
+                remaining_skeletons=remaining_skeletons,
                 index_attestation_refs=[
                     {
                         "task_id": skeleton["task_id"],
@@ -1264,7 +1280,7 @@ def _fastlane_authenticated_dispatch(
                             for field in attestation_ref_fields
                         },
                     }
-                    for skeleton in compiled_remaining["assignment_skeletons"]
+                    for skeleton in remaining_skeletons
                 ],
                 skeleton_package_hash=skeleton_package_hash,
                 now=now,
@@ -1287,10 +1303,7 @@ def _fastlane_authenticated_dispatch(
                     ).encode("utf-8")
                 ).hexdigest()
             )
-            queued_ids = [
-                skeleton["task_id"]
-                for skeleton in compiled_remaining["assignment_skeletons"]
-            ]
+            queued_ids = [skeleton["task_id"] for skeleton in remaining_skeletons]
             return {
                 "schema": "2718lab-devkit/fastlane-refill-receipt-v1",
                 "state": ("QUEUED_WAVE_PENDING" if queued_ids else "NO_QUEUED_WORK"),
