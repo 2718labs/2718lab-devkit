@@ -2168,7 +2168,12 @@ def _legacy_metadata_database(
 def test_sqlite_store_migrates_trustworthy_legacy_schema_metadata(
     tmp_path: Path, legacy_version: str
 ) -> None:
-    database = _legacy_metadata_database(tmp_path, version=legacy_version)
+    if legacy_version == "10":
+        database, _, _ = _legacy_v10_atlas_outbox_database(
+            tmp_path, ingestion_key=f"sha256:{'a' * 64}"
+        )
+    else:
+        database = _legacy_metadata_database(tmp_path, version=legacy_version)
 
     store = SQLiteStore(database)
     try:
