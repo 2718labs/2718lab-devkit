@@ -15,6 +15,13 @@ v1.1.3 包；已提交的 manifest 和 allowlist 定义可执行运行时范围�
 `NO_SAFE_WORK` 与零 assignments：不会消费 host-status 或实时账号输入，也没有
 worktree 执行路径。宿主执行属于未来外部 Desktop-host bridge 合同的要求。
 
+对于受存储治理的执行，v1.1.3 只引用 Ayleovelle 用户 fork 上的兼容 Host 源码：
+[`codex/host-1.1.3-storage-governance-upstream`](https://github.com/Ayleovelle/codex/tree/codex/host-1.1.3-storage-governance-upstream)
+分支，固定到不可变提交
+[`c3dde23bec21c45d10740f2eec09d9a1b87cd329`](https://github.com/Ayleovelle/codex/commit/c3dde23bec21c45d10740f2eec09d9a1b87cd329)。
+该 fork 是可构建的 Host 源码，不是 OpenAI upstream 合并，也不随本包交付。
+stock Codex Host 没有经过证明的 protected broker，继续 fail-closed。
+
 > [!IMPORTANT]
 > **工作流提醒：** 先用有界证据路由。A1/A2/A3 并行只允许发生在互不重叠、独占
 > 的写入范围，并各自使用 G: 盘隔离任务根。执行前必须 claim 并 bind；prewarm

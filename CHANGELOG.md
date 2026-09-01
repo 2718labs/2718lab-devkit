@@ -42,10 +42,14 @@ only after the CI and artifact checks pass.
   path-free intent and private protocol, but does not authenticate or provision
   the Windows protected broker, create its root, activate cleanup, or provide a
   local writer fallback.
-- The compatible Host boundary is still awaiting final protected-broker
-  compile, probe, and runtime receipts from the separate Host branch. This
-  release does not claim that upstream Codex or an ordinary Codex Host supports
-  protected-broker storage execution.
+- Compatible, buildable Host source exists only on Ayleovelle's user-fork
+  [`codex/host-1.1.3-storage-governance-upstream`](https://github.com/Ayleovelle/codex/tree/codex/host-1.1.3-storage-governance-upstream)
+  branch, fixed at immutable commit
+  [`c3dde23bec21c45d10740f2eec09d9a1b87cd329`](https://github.com/Ayleovelle/codex/commit/c3dde23bec21c45d10740f2eec09d9a1b87cd329).
+  This identifies the separate Host source boundary only: it is not merged into
+  OpenAI upstream and is not shipped or activated by this plugin. Stock Codex
+  Hosts still fail closed, and final protected-broker compile, probe, and
+  runtime receipts remain Host-side release evidence rather than DevKit claims.
 
 ## [1.1.2] - 2026-08-27
 

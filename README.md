@@ -18,6 +18,15 @@ and CLI return `NO_SAFE_WORK` with zero assignments: they do not consume host
 status or live-account inputs, and have no worktree execution path. Host
 execution remains an external Desktop-host bridge requirement.
 
+For storage-governed execution, v1.1.3 references compatible Host source only
+on Ayleovelle's user-fork
+[`codex/host-1.1.3-storage-governance-upstream`](https://github.com/Ayleovelle/codex/tree/codex/host-1.1.3-storage-governance-upstream)
+branch, pinned to immutable commit
+[`c3dde23bec21c45d10740f2eec09d9a1b87cd329`](https://github.com/Ayleovelle/codex/commit/c3dde23bec21c45d10740f2eec09d9a1b87cd329).
+That fork is buildable Host source, not an OpenAI upstream merge or a component
+shipped by this package. Stock Codex Hosts have no attested protected broker
+and continue to fail closed.
+
 > [!IMPORTANT]
 > **Workflow reminder:** route from bounded evidence. Parallel A1/A2/A3 work is
 > allowed only with disjoint, exclusively owned write scopes and independent G:
