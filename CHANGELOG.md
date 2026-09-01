@@ -8,6 +8,8 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-08-27
+
 ### Fixed
 
 - Replaced inherited numeric Windows host-bridge handles with a strict local
@@ -15,11 +17,6 @@ only after the CI and artifact checks pass.
   FILETIME while preserving the Unix inherited-FD contract. Untagged,
   path-like, remote, malformed, PID-mismatched, or creation-mismatched selectors
   now fail closed before any session key is sent.
-
-## [1.1.2] - 2026-08-27
-
-### Fixed
-
 - Treat a newly opened project without an index as normal cold start: initialize
   it with one bounded `project_index_register -> project_index_sync` sequence
   before considering degraded mode, including when README, configuration, or

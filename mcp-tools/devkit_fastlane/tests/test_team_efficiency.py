@@ -6353,7 +6353,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "NO_SAFE_WORK",
             "PROJECT_AUTHORITY_UNAVAILABLE",
             "apply_bootstrap_plan",
-            "不存在可执行的",
+            "不存在自行创建 worktree",
             "worker effort 禁止 `ultra`",
             "prewarm 始终是独立的只读证据角色",
             "归档不是 adapter 操作",

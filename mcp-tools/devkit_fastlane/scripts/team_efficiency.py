@@ -4846,8 +4846,7 @@ def prepare_authenticated_v5_routing_from_request(
         [*units, *remaining_units], key=lambda unit: int(unit["dispatch_order"])
     )
     order_by_task = {
-        str(unit["task"]["task_id"]): int(unit["dispatch_order"])
-        for unit in all_units
+        str(unit["task"]["task_id"]): int(unit["dispatch_order"]) for unit in all_units
     }
     all_routing_requests = sorted(
         [*routing_requests, *remaining_routing_requests],
