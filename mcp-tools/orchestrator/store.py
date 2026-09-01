@@ -7454,9 +7454,13 @@ class SQLiteStore:
             except (TypeError, ValueError) as error:
                 raise StoreError("orchestrator store is not prepared") from error
             if str(source_version) != source_version_value or not (
-                6 <= source_version <= cls._SCHEMA_VERSION
+                1 <= source_version <= cls._SCHEMA_VERSION
             ):
                 raise StoreError("orchestrator store is not prepared")
+            if source_version < 6:
+                if not int(ingestion_key["notnull"]):
+                    raise StoreError("orchestrator store is not prepared")
+                return
             if int(ingestion_key["notnull"]):
                 return
             if source_version not in range(6, 11):

@@ -20,6 +20,7 @@ from orchestrator.store import (
     CardHashMismatchError,
     LeaseConflictError,
     SQLiteStore,
+    StoreError,
     StrictIndexError,
     VersionConflictError,
     WorkflowCancelledError,
@@ -376,6 +377,46 @@ class SQLiteStoreServiceApiTests(unittest.TestCase):
             )
         finally:
             migrated.close()
+
+    def test_pre_v6_database_with_nullable_atlas_outbox_fails_closed(self) -> None:
+        legacy_database = (
+            Path(self._temporary_directory.name) / "legacy-v5-outbox.sqlite"
+        )
+        seeded = SQLiteStore(legacy_database)
+        seeded.close()
+
+        connection = sqlite3.connect(legacy_database)
+        try:
+            connection.execute("DROP TABLE atlas_ingestion_outbox")
+            connection.executescript(
+                """
+                CREATE TABLE atlas_ingestion_outbox (
+                    ingestion_key TEXT PRIMARY KEY,
+                    acceptance_id TEXT NOT NULL UNIQUE
+                        REFERENCES code_task_acceptances(acceptance_id),
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('pending', 'projected', 'quarantined')),
+                    attempt_count INTEGER NOT NULL
+                        CHECK (attempt_count BETWEEN 0 AND 16),
+                    last_error_code TEXT NOT NULL,
+                    reason_codes_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (ingestion_key = payload_hash)
+                );
+                CREATE INDEX idx_atlas_outbox_pending
+                    ON atlas_ingestion_outbox(state, created_at, ingestion_key);
+                """
+            )
+            _replace_schema_metadata_with_legacy_version(connection, "5")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(StoreError, "orchestrator store is not prepared"):
+            SQLiteStore(legacy_database)
 
     def test_v4_database_additively_migrates_receipt_trust_tables_and_keeps_data(
         self,
