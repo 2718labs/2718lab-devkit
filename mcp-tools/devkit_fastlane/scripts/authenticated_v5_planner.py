@@ -174,7 +174,7 @@ def _normalize_host_storage_profile(
         try:
             api._hash(item, f"Host storage profile {task_id}.{field}")
         except Exception as error:
-            raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+            raise ValueError(_STORAGE_TARGET_KEY_INVALID) from error
     unsigned = {
         key: profile[key]
         for key in _STORAGE_PROFILE_FIELDS
@@ -734,7 +734,7 @@ def validate_skeleton_package(
                 raise ValueError("authenticated V5 skeleton fields are invalid")
             if skeleton.get("source_plan_hash") != source_hash:
                 raise ValueError("authenticated V5 skeleton source hash is invalid")
-            task_id = api._task_id(
+            api._task_id(
                 skeleton.get("task_id"),
                 f"authenticated V5 {wave_name} skeletons[{index}].task_id",
             )

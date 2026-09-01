@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
 
-
 STORAGE_INTENT_SCHEMA: Final = "2718lab.storage.intent.v1"
 TARGET_DESCRIPTOR_SCHEMA: Final = "2718lab.storage.target.v1"
 STORAGE_TARGET_KEY_INVALID: Final = "STORAGE_TARGET_KEY_INVALID"
