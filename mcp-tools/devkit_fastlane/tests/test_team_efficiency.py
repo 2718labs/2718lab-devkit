@@ -8781,6 +8781,11 @@ class TeamEfficiencyTests(unittest.TestCase):
             "index_context_hash": hash_a,
             "predecessor_hash": hash_b,
         }
+        planner = helper._authenticated_v5_helper_module("authenticated_v5_planner")
+        normalized_unit = helper._authenticated_v5_units([unit])[0]
+        unit["task"]["profile_evidence_hash"] = helper._sha256_json(
+            planner._routing_profile_material(source_plan_hash, normalized_unit)
+        )
         requests = helper.prepare_authenticated_v5_routing_requests(
             [unit],
             source_plan_hash=source_plan_hash,
