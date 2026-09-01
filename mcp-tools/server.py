@@ -1087,6 +1087,9 @@ def _fastlane_authenticated_dispatch(
         )
         if index_attestation is None:
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        index_context_hash = index_attestation.get("index_context_hash")
+        if type(index_context_hash) is not str:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         project_binding = request.get("project_binding")
         work_package = request.get("work_package")
         if (
@@ -1114,7 +1117,7 @@ def _fastlane_authenticated_dispatch(
 
         projected = prepare_authenticated_v5_routing_from_request(
             request,
-            index_context_hash=index_attestation["index_context_hash"],
+            index_context_hash=index_context_hash,
             host_capabilities=capability_snapshot.host_capabilities,
             scheduler_facts=capability_snapshot.scheduler_facts,
         )
@@ -1130,11 +1133,19 @@ def _fastlane_authenticated_dispatch(
         initial_task_ids = {
             unit["task"]["task_id"] for unit in initial_units
         }
-        initial_requests = [
-            item
-            for item in routing_snapshot.routing_requests
-            if item["task"]["task_id"] in initial_task_ids
-        ]
+        initial_requests: list[dict[str, object]] = []
+        remaining_requests: list[dict[str, object]] = []
+        for item in routing_snapshot.routing_requests:
+            task = item.get("task")
+            if type(task) is not dict:
+                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+            task_id = task.get("task_id")
+            if type(task_id) is not str:
+                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+            if task_id in initial_task_ids:
+                initial_requests.append(item)
+            else:
+                remaining_requests.append(item)
         initial_attestations = [
             item
             for item in routing_snapshot.attestations
@@ -1154,12 +1165,7 @@ def _fastlane_authenticated_dispatch(
             compile_authenticated_v5_assignment_skeletons(
                 remaining_units,
                 source_plan_hash=projected["source_plan_hash"],
-                routing_requests=[
-                    item
-                    for item in routing_snapshot.routing_requests
-                    if item["task"]["task_id"]
-                    not in initial_task_ids
-                ],
+                routing_requests=remaining_requests,
                 attestation_items=[
                     item
                     for item in routing_snapshot.attestations
@@ -1234,7 +1240,7 @@ def _fastlane_authenticated_dispatch(
                 call_intent_hash=call_intent_hash,
                 preparation_id=preparation_id,
                 source_plan_hash=projected["source_plan_hash"],
-                index_context_hash=index_attestation["index_context_hash"],
+                index_context_hash=index_context_hash,
                 routing_registry_binding_hash=(
                     routing_snapshot.routing_registry_binding_hash
                 ),

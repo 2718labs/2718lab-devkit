@@ -1108,7 +1108,7 @@ def test_fast_lane_terminal_ack_removes_only_completed_assignment() -> None:
         host_bridge._normalize_fast_lane_worker_terminal_result(
             terminal,
             expected=expected,
-            expires_at=1_699_999_999,
+            expires_at=1_700_000_120,
             now=1_700_000_000,
         )
         == terminal
