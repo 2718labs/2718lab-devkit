@@ -688,9 +688,7 @@ class ProjectIndexService:
         """Project current persisted facts into path-free Host-side digests."""
 
         registered_id, root = self._workspace_for_reference(workspace_id)
-        root_identity_hash = _opaque_hash(
-            {"root_identity": workspace_identity(root)}
-        )
+        root_identity_hash = _opaque_hash({"root_identity": workspace_identity(root)})
         workspace_binding_hash = _opaque_hash(
             {
                 "workspace_id": registered_id,
@@ -1777,15 +1775,18 @@ def _encoded_size(value: object) -> int:
 
 
 def _opaque_hash(value: object) -> str:
-    return "sha256:" + hashlib.sha256(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 def _public_query_node(node: IndexNode) -> dict[str, object]:
