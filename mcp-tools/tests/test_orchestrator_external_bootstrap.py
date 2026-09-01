@@ -36,6 +36,34 @@ def _replace_schema_metadata_with_legacy_version(
     connection: sqlite3.Connection,
     version: str,
 ) -> None:
+    if version in {"6", "7", "8", "9", "10"}:
+        connection.execute("DROP TABLE atlas_ingestion_outbox")
+        connection.execute(
+            """
+            CREATE TABLE atlas_ingestion_outbox (
+                ingestion_key TEXT PRIMARY KEY,
+                acceptance_id TEXT NOT NULL UNIQUE
+                    REFERENCES code_task_acceptances(acceptance_id),
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL
+                    CHECK (state IN ('pending', 'projected', 'quarantined')),
+                attempt_count INTEGER NOT NULL
+                    CHECK (attempt_count BETWEEN 0 AND 16),
+                last_error_code TEXT NOT NULL,
+                reason_codes_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (ingestion_key = payload_hash)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_atlas_outbox_pending
+                ON atlas_ingestion_outbox(state, created_at, ingestion_key)
+            """
+        )
     connection.execute("DROP TABLE schema_metadata")
     connection.execute(
         """
