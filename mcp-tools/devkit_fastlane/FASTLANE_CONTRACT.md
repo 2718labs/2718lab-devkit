@@ -106,8 +106,9 @@ does not weaken host capability, lease, worktree, review, or safety gates.
 source-plan hash 必须包含该整个 binding，因此相同 task/workflow 在不同项目、workspace 或输入
 snapshot 下不能共用计划、lease、receipt 或恢复状态。
 
-manifest 中的 fence 只是可验证的结构与 hash 输入，绝不是 authority。当前仓库没有 Desktop-host
-durable registry 或真正私有的跨边界 authority bridge，因此没有任何同进程 provider、module
+manifest 中的 fence 只是可验证的结构与 hash 输入，绝不是 authority。DevKit 不拥有 Desktop-host
+durable registry；已认证 inherited host bridge 只能按一次性 nonce/expiry 向宿主 registry 请求
+compiler evidence。因此没有任何同进程 provider、module
 attribute、closure、环境变量、请求 JSON、repo/task root、路径名或 caller-supplied ID 可被当作
 live authority。公开 `compile_fast_lane` 与 `fast-lane` CLI 对 structurally valid V2 一律产出
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`，零本地 assignment、零队列、零外部派发；V2
@@ -117,18 +118,18 @@ envelope/hash 无效、其内层 canonical v1 `package` 不能完成纯诊断解
 公开 MCP request 若试图携带明确的 host-private 字段（如 `host_status`、账号用量或 index
 evidence），则是适配器输入违规，必须在编译前以 `FASTLANE_REQUEST_INVALID` 拒绝，而不是把
 该值当作可诊断的计划输入。
-增加
-Desktop-host durable registry、跨进程 authority 传递或公开 MCP 参数属于后续外部 host 合同，不能由
-工作包 JSON 或 Python 私有命名假装已经存在。
+`compiler-evidence-request-v1/response-v1` 与 typed dispatch batch 是唯一跨进程
+authority 通道：request/response 必须 exact-key、同 bridge generation、一次性且完整绑定 route、
+lease、scope、context、predecessor、worktree identity 与 registry hash。它不接受 actual path，
+也不能由工作包 JSON、环境变量值或 Python 私有命名伪造。
 
 同一限制覆盖 `bootstrap --apply` 及 import-callable `apply_bootstrap_plan`：当前公开入口在构建
 caller-supplied bootstrap plan 或调用 worktree mutation 前，无条件以
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 失败关闭，因而不能到达
 `git worktree add`。不带 `--apply` 的 `bootstrap` 仍只输出 dry-run 诊断计划；其中的 project、
-root、worktree 和任何 JSON 都不是 sealed V2 execution context。仓库当前不存在可执行的
-host-authorized worktree path：没有 module-private capability、runner、Git probe 或 adapter 可绕过
-该关闭结果。Desktop host registry 与真正私有的跨边界 execution bridge 是外部前置条件；它们尚未在
-本仓库实现，也不能用 Python module attribute、closure 或 caller-supplied JSON 伪装。
+root、worktree 和任何 JSON 都不是 sealed V2 execution context。DevKit 仍不存在自行创建 worktree
+的可执行路径；authenticated compiler evidence 只允许将 typed batch 提交给宿主，不能绕过宿主的
+worktree broker、Git probe 或 coordinator gate。
 
 ### 4. 接地后再写
 
@@ -140,13 +141,13 @@ host-authorized worktree path：没有 module-private capability、runner、Git 
 
 #### Ultra Fast Lane
 
-下面是未来外部 Desktop bridge 的 host 合同形状：
+下面的 CLI host-status 仍是未启用的外部合同形状；已交付的 inherited bridge 不读取该文件：
 
 ```text
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
-`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。当前仓库的公开 `fast-lane` CLI/API 不消费 host-status、额度或 index 输入来激活该合同：在外部 Desktop authority bridge 实现并验收前，它始终输出 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 的零 assignment/队列预览。下文的 descriptor、route 与 host dispatch 约束只定义未来 bridge 的接入要求，不是本仓库存在的执行通路。`fast-lane` 本身不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；是否需要 Sol 设计/独立终审由精确的 host-attested route 决定，编译器不硬锁某个模型。
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。公开 `fast-lane` CLI/API 不消费 host-status、额度或 index 输入，因此仍输出 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 的零 assignment/队列预览。只有 MCP 进程持有已认证 inherited bridge 且宿主返回 exact registry binding 时，私有 adapter 才能机械提交 `dispatch_all`；worker effort 禁止 `ultra`。编译器本身不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任。
 
 host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
 `routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整

@@ -12,6 +12,11 @@ only after the CI and artifact checks pass.
 
 ### Fixed
 
+- Replaced inherited numeric Windows host-bridge handles with a strict local
+  named-pipe selector bound to the exact launcher PID and process creation
+  FILETIME while preserving the Unix inherited-FD contract. Untagged,
+  path-like, remote, malformed, PID-mismatched, or creation-mismatched selectors
+  now fail closed before any session key is sent.
 - Treat a newly opened project without an index as normal cold start: initialize
   it with one bounded `project_index_register -> project_index_sync` sequence
   before considering degraded mode, including when README, configuration, or

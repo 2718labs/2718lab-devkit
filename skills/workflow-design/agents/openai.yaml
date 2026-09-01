@@ -1,0 +1,7 @@
+interface:
+  display_name: "Workflow Design"
+  short_description: "Design bounded DevKit workflows"
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "2718lab-devkit"

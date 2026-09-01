@@ -47,6 +47,9 @@ EXPECTED_FILES = (
     "mcp-tools/devkit_fastlane/scripts/team_efficiency.py",
 )
 EXPECTED_TREES = (
+    "skills/fast-lane-routing",
+    "skills/code-atlas",
+    "skills/workflow-design",
     "mcp-tools/bugkiller",
     "mcp-tools/devkit_atlas",
     "mcp-tools/devkit_relay",
@@ -97,7 +100,7 @@ def _copy_fixture(destination: Path) -> Path:
 
     excluded = {
         "mcp-tools/tests/not-runtime.py": "raise AssertionError('not packaged')\n",
-        "skills/not-primary.txt": "legacy skill\n",
+        "skills/not-primary.txt": "unselected skill\n",
         "agents/not-primary.md": "legacy agent\n",
         "commands/not-primary.md": "legacy command\n",
         "hooks/not-primary.py": "legacy hook\n",
@@ -159,7 +162,7 @@ def _expected_names(plugin_root: Path) -> list[str]:
     return sorted(names)
 
 
-def test_primary_allowlist_is_explicit_and_runtime_only() -> None:
+def test_primary_allowlist_is_explicit_and_plugin_complete() -> None:
     allowlist = _load_allowlist()
 
     assert set(allowlist) == {"schema", "files", "trees"}
@@ -264,6 +267,16 @@ def test_two_builds_are_byte_identical_with_normalized_zip_metadata(
         assert all((info.external_attr >> 16) & 0o777 == 0o644 for info in infos)
         assert all("tests/" not in name for name in names)
         assert all("__pycache__/" not in name for name in names)
+        allowed_skill_prefixes = (
+            "skills/fast-lane-routing/",
+            "skills/code-atlas/",
+            "skills/workflow-design/",
+        )
+        skill_members = [name for name in names if name.startswith("skills/")]
+        assert skill_members
+        assert all(name.startswith(allowed_skill_prefixes) for name in skill_members)
+        assert "skills/bugkiller/SKILL.md" not in names
+        assert "skills/not-primary.txt" not in names
 
 
 def _run_barrier_action(

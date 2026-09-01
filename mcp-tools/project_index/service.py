@@ -14,7 +14,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 if TYPE_CHECKING:
     from devkit_runtime.workspace_authority import WorkspaceRootAuthority
@@ -677,6 +677,126 @@ class ProjectIndexService:
     def query_receipt(self, trace_id: str) -> QueryReceipt:
         """Compatibility alias for fetching a successful query receipt."""
         return self.get_query_receipt(trace_id)
+
+    def host_attestation_material(
+        self,
+        workspace_id: str,
+        *,
+        snapshot_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> dict[str, str]:
+        """Project current persisted facts into path-free Host-side digests."""
+
+        registered_id, root = self._workspace_for_reference(workspace_id)
+        root_identity_hash = _opaque_hash({"root_identity": workspace_identity(root)})
+        workspace_binding_hash = _opaque_hash(
+            {
+                "workspace_id": registered_id,
+                "root_identity_hash": root_identity_hash,
+            }
+        )
+        material = {
+            "workspace_id": registered_id,
+            "root_identity_hash": root_identity_hash,
+            "workspace_binding_hash": workspace_binding_hash,
+        }
+        if snapshot_id is None:
+            if trace_id is not None:
+                raise IndexError("INVALID_QUERY", "query attestation needs a snapshot")
+            return material
+        snapshot = self.assert_current(registered_id, snapshot_id)
+        if (
+            not snapshot.head
+            or not snapshot.manifest_hash
+            or not snapshot.parser_set_hash
+        ):
+            raise IndexError("INDEX_STALE", "snapshot has no provable head")
+        head_hash = _opaque_hash({"head": snapshot.head})
+        snapshot_attestation_hash = _opaque_hash(
+            {
+                **material,
+                "snapshot_id": snapshot.snapshot_id,
+                "head_hash": head_hash,
+                "manifest_hash": snapshot.manifest_hash,
+                "parser_set_hash": snapshot.parser_set_hash,
+            }
+        )
+        material.update(
+            {
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_attestation_hash": snapshot_attestation_hash,
+                "head_hash": head_hash,
+                "manifest_hash": snapshot.manifest_hash,
+                "parser_set_hash": snapshot.parser_set_hash,
+            }
+        )
+        if trace_id is None:
+            return material
+        receipt = self.get_query_receipt(trace_id)
+        if receipt.snapshot_id != snapshot.snapshot_id:
+            raise IndexError("INDEX_STALE", "query receipt snapshot changed")
+        query_projection = self._public_query_projection(registered_id, receipt)
+        index_context_hash = _opaque_hash(query_projection)
+        query_receipt_hash = _opaque_hash(
+            {
+                "schema": "2718lab-devkit/project-index-query-receipt-binding-v1",
+                "receipt": asdict(receipt),
+                "index_context_hash": index_context_hash,
+            }
+        )
+        material.update(
+            {
+                "query_receipt_hash": query_receipt_hash,
+                "index_context_hash": index_context_hash,
+            }
+        )
+        return material
+
+    def _public_query_projection(
+        self, workspace_id: str, receipt: QueryReceipt
+    ) -> dict[str, object]:
+        """Rebuild the exact bounded public query facts hashed for the Host."""
+
+        nodes_by_id = {
+            node.node_id: node for node in self._store.nodes(receipt.snapshot_id)
+        }
+        edges_by_id = {
+            edge.edge_id: edge for edge in self._store.edges(receipt.snapshot_id)
+        }
+        try:
+            nodes = [
+                _public_query_node(nodes_by_id[node_id])
+                for node_id in receipt.returned_node_ids
+            ]
+            edges = [
+                _public_query_edge(edges_by_id[edge_id])
+                for edge_id in receipt.returned_edge_ids
+            ]
+        except KeyError as exc:
+            raise IndexError(
+                "INDEX_CORRUPT", "project index query receipt is corrupt"
+            ) from exc
+        return {
+            "workspace_id": workspace_id,
+            "snapshot_id": receipt.snapshot_id,
+            "trace_id": receipt.trace_id,
+            "nodes": nodes,
+            "edges": edges,
+            "source_windows": [
+                {
+                    "path": path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "content_hash": content_hash,
+                }
+                for path, start_line, end_line, content_hash in receipt.returned_source_windows
+            ],
+            "gaps": [
+                {"path": gap.path, "code": gap.code, "message": gap.message}
+                for gap in receipt.gaps
+            ],
+            "truncated": receipt.truncated,
+        }
 
     def diff(
         self, workspace_id: str, from_snapshot_id: str, to_snapshot_id: str
@@ -1646,9 +1766,66 @@ def _bounded_items(
 def _encoded_size(value: object) -> int:
     return len(
         json.dumps(
-            asdict(value), ensure_ascii=True, separators=(",", ":"), sort_keys=True
+            asdict(cast(Any, value)),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
         ).encode("utf-8")
     )
+
+
+def _opaque_hash(value: object) -> str:
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def _public_query_node(node: IndexNode) -> dict[str, object]:
+    """Mirror the stable public Project Index node projection."""
+
+    return {
+        "node_id": node.node_id,
+        "kind": node.kind,
+        "path": node.path,
+        "name": node.name,
+        "qualified_name": node.qualified_name,
+        "start_line": node.start_line,
+        "end_line": node.end_line,
+        "content_hash": node.content_hash,
+        "attributes": [
+            {"name": name, "value": value} for name, value in node.attributes
+        ],
+        "extractor_id": node.extractor_id,
+        "extractor_version": node.extractor_version,
+        "provenance": node.provenance,
+    }
+
+
+def _public_query_edge(edge: IndexEdge) -> dict[str, object]:
+    """Mirror the stable public Project Index edge projection."""
+
+    return {
+        "edge_id": edge.edge_id,
+        "source_id": edge.source_id,
+        "target_id": edge.target_id,
+        "relation": edge.relation,
+        "path": edge.path,
+        "start_line": edge.start_line,
+        "end_line": edge.end_line,
+        "content_hash": edge.content_hash,
+        "extractor_id": edge.extractor_id,
+        "extractor_version": edge.extractor_version,
+        "provenance": edge.provenance,
+    }
 
 
 def _node_order(node: IndexNode) -> tuple[object, ...]:

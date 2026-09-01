@@ -1,0 +1,303 @@
+{
+  "frame": {
+    "action_id": "dispatch-vector-1",
+    "canonical_payload_hash": "sha256:5ed44f2adf7478b0599a483c9690a995d614e9add464afe52a4878a585d0d587",
+    "kind": "compiler_evidence_request",
+    "mac": "4093949ca660d2ce1f545e6ad47c3545c3f8999684353ac0dccaef4a59902fd2",
+    "sequence": 1,
+    "session_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "session_nonce_hex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+  },
+  "project_index_attestations": [
+    {
+      "mac": "53cab9ff30fb8fb145e3fdc09faaa6356fc47b52c4c9658aeb8fd9a7d00c2268",
+      "payload": {
+        "attestation_hash": "sha256:bda7ebd6721915bfe5b1f275f71fd0bd7e42c6859016c375151d67148dd9ecab",
+        "correlation_id": "index-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "expires_at": 1700000120,
+        "operation": "register",
+        "root_identity_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "schema": "2718lab-devkit/project-index-attestation-v1",
+        "workspace_binding_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "workspace_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "sequence": 1
+    },
+    {
+      "mac": "c52d0ae1afe3ae4ff976676b9cf934814513d5b06b278bf53b1bd75812172375",
+      "payload": {
+        "attestation_hash": "sha256:dfd0a43ac856d250030d111778992eac8938082a90dcd1960c7975573495fd49",
+        "correlation_id": "index-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "expires_at": 1700000120,
+        "head_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "manifest_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "operation": "sync",
+        "parser_set_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "root_identity_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "schema": "2718lab-devkit/project-index-attestation-v1",
+        "snapshot_attestation_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "workspace_binding_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "workspace_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "sequence": 2
+    },
+    {
+      "mac": "d03860eb971a56bbf97944ebaa19bfa582d0566f75437faa71b2da503c2e711c",
+      "payload": {
+        "attestation_hash": "sha256:be52b379bac39a7522eeb43d1c58852d440859df713b98fe7c44b35fedf61c62",
+        "correlation_id": "index-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "expires_at": 1700000120,
+        "head_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "index_context_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "manifest_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "operation": "query",
+        "parser_set_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "query_receipt_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "root_identity_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "schema": "2718lab-devkit/project-index-attestation-v1",
+        "snapshot_attestation_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "workspace_binding_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "workspace_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "sequence": 3
+    }
+  ],
+  "request": {
+    "assignment_skeletons": [
+      {
+        "concurrency_mode": "parallel",
+        "dispatch_order": 0,
+        "index_context_hash": "sha256:335e66a9b631f72cfe45f8e239041a57a6631cd9469ae99b37a367e88b8a420d",
+        "predecessor_hash": "sha256:ac101b412eec57e00c9997e92da946314f7c04319a9553606deb89a6e4d58214",
+        "routing_proof": {
+          "attestation_hash": "sha256:04261cd1bcca69437bc6262f726398a4616155f445a7035d7f28e97d660263ba",
+          "request": {
+            "child_route_attestation": {
+              "attestation_hash": "sha256:04261cd1bcca69437bc6262f726398a4616155f445a7035d7f28e97d660263ba",
+              "capability_epoch": 1,
+              "expires_event_seq": 1,
+              "host_id_hash": "sha256:335e66a9b631f72cfe45f8e239041a57a6631cd9469ae99b37a367e88b8a420d",
+              "inherit_current_session_model": false,
+              "issued_event_seq": 1,
+              "lease_epoch": 0,
+              "refusal_code": null,
+              "request_binding_hash": "sha256:9a7ac4a9557fdadb1140c6bd55b2b8ed4a1ca9f57792ebc0b23bc1c56988c0a7",
+              "route": {
+                "effort": "max",
+                "lane": "luna",
+                "model": "gpt-5.6-luna",
+                "rank": 40
+              },
+              "schema": "2718lab-devkit/host-child-route-attestation-v1",
+              "status": "attested"
+            },
+            "dependency_state": {
+              "completed_dependency_ids": [],
+              "dependency_state_hash": "sha256:db5f8b37d7802dd65890de8c13e1dbd49bd82fd1886e0c166b1703347167d77e",
+              "direct_dependency_ids": [],
+              "graph_epoch": 1,
+              "schema": "2718lab-devkit/dependency-state-v1"
+            },
+            "host_capabilities": {
+              "capability_epoch": 1,
+              "entitlements": [],
+              "host_id_hash": "sha256:335e66a9b631f72cfe45f8e239041a57a6631cd9469ae99b37a367e88b8a420d",
+              "model_slot_limits": {
+                "luna": 4,
+                "sol": 0,
+                "spark": 0,
+                "terra": 0
+              },
+              "models": [
+                {
+                  "efforts": [
+                    "max"
+                  ],
+                  "model_id": "gpt-5.6-luna",
+                  "status": "available"
+                }
+              ],
+              "schema": "2718lab-devkit/host-capabilities-v1",
+              "total_slots": 4
+            },
+            "legacy": null,
+            "policy_hash": "sha256:2078016c714f889fdfe9d7156a622a1cb8f157b64cc15ead5e328ae1bc40eea5",
+            "scheduler_facts": {
+              "dispatch_cause": "task_ready",
+              "event_seq": 1,
+              "evidence_state": "none",
+              "execution_state": "unknown",
+              "fence_count_epoch": 0,
+              "fenced_replacement_count_task": 0,
+              "lease_epoch": 0,
+              "lease_state": "unclaimed",
+              "override_epoch": 0,
+              "ready_event_seq": 1,
+              "recovery_epoch": 0,
+              "recovery_probe_count_epoch": 0,
+              "route_epoch": 1,
+              "transport_state": "connected"
+            },
+            "schema": "2718lab-devkit/fastlane-routing-request-v5",
+            "scope_state": {
+              "active_writer_task_ids": [],
+              "conflicting_task_ids": [],
+              "owned_scope_hash": "sha256:5a94938500ddd7a0c9d76bf448af74a0b4b395571755ca88dbc5bc727c997bce",
+              "schema": "2718lab-devkit/scope-state-v1",
+              "scope_epoch": 1
+            },
+            "task": {
+              "access": "workspace_write",
+              "architecture_conflict": false,
+              "authorization": "not_required",
+              "authorization_evidence_hash": null,
+              "blocker_severity": "none",
+              "critical_path": false,
+              "criticality": "low",
+              "cross_module": false,
+              "database_work": false,
+              "dependency_depth": 0,
+              "design_ambiguity": false,
+              "destructive": false,
+              "downstream_critical_count": 0,
+              "external_boundary": false,
+              "gate_matrix_hash": "sha256:335e66a9b631f72cfe45f8e239041a57a6631cd9469ae99b37a367e88b8a420d",
+              "migration": false,
+              "narrow_decoupling_eligible": false,
+              "overlap_count": 0,
+              "overlap_risk": "none",
+              "profile_evidence_hash": "sha256:ac101b412eec57e00c9997e92da946314f7c04319a9553606deb89a6e4d58214",
+              "read_scope_breadth": "none",
+              "read_scope_count": 0,
+              "role": "execution",
+              "schema": "2718lab-devkit/task-routing-profile-v5",
+              "security_sensitive": false,
+              "strike": null,
+              "task_id": "TASK-V5",
+              "verification_cost": "none",
+              "write_scope_breadth": "single_file",
+              "write_scope_count": 1
+            }
+          },
+          "request_binding_hash": "sha256:9a7ac4a9557fdadb1140c6bd55b2b8ed4a1ca9f57792ebc0b23bc1c56988c0a7",
+          "result": {
+            "access": "workspace_write",
+            "capability_resolution": {
+              "attestation_hash": "sha256:04261cd1bcca69437bc6262f726398a4616155f445a7035d7f28e97d660263ba",
+              "state": "host_attested"
+            },
+            "dispatch": {
+              "requires_host_execution": true,
+              "state": "not_dispatched"
+            },
+            "effective_role": "execution",
+            "policy_hash": "sha256:2078016c714f889fdfe9d7156a622a1cb8f157b64cc15ead5e328ae1bc40eea5",
+            "reason_codes": [
+              "floor_role"
+            ],
+            "render_hash": "sha256:ffcd81c377739833799c8f45185cf99520f90aadbc97c6aa1d4371d6ab3e0c77",
+            "route": {
+              "effort": "max",
+              "inherit_current_session_model": false,
+              "lane": "luna",
+              "model": "gpt-5.6-luna",
+              "rank": 40
+            },
+            "safety_floor": {
+              "rank": 20
+            },
+            "schema": "2718lab-devkit/fastlane-routing-result-v5",
+            "status": "resolved",
+            "task_fingerprint": "sha256:be2326dd3da066a5b7992c92d97b3bf9d82db4a0fd9186cbeb1f18b15ae2dd22",
+            "task_id": "TASK-V5"
+          },
+          "routing_context_hash": "sha256:f3755042b0902f7b6af7989a6f2550acbf8619e30109afc1c8dd8287c4be3dfd",
+          "routing_result_hash": "sha256:de6e37a57ea259de6108650b888eb3154cea3b1ed6ff395498e78c0efc4bbb7e"
+        },
+        "source_plan_hash": "sha256:b95bed09962fdf8ccb165848bb022734d0966c54dc033def24645b2e7a199ea4",
+        "task_id": "TASK-V5",
+        "write_scope": [
+          "src/task_v5.py"
+        ]
+      }
+    ],
+    "call_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expires_at": 1700000120,
+    "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "preparation_id": "dispatch-vector-1",
+    "project_index_attestation_refs": [
+      {
+        "attestation_hash": "sha256:06b5a11446f7267a05390dd404db32f85267a66771535988d6413a974439ec24",
+        "correlation_id": "index-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "index_context_hash": "sha256:335e66a9b631f72cfe45f8e239041a57a6631cd9469ae99b37a367e88b8a420d",
+        "query_receipt_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "root_identity_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "snapshot_attestation_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "snapshot_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "task_id": "TASK-V5",
+        "workspace_binding_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "workspace_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    ],
+    "reasoning_effort": "max",
+    "request_hash": "sha256:1de656b46197cd4bc5fcb01ca6eeb1b4e7573a8b78310a7c84d6bef63ec87a8a",
+    "requested_route_pairs": [
+      {
+        "effort": "max",
+        "model": "gpt-5.6-luna"
+      }
+    ],
+    "routing_registry_binding_hash": "sha256:1b76b3443a306420a571bd3e6cf548e0ce2e71cb3963ce99eda19bca74b182cd",
+    "schema": "2718lab-devkit/compiler-evidence-request-v1"
+  },
+  "response": {
+    "dispatch_binding_hashes": [
+      "sha256:06ea274ea0d15ca7156ca81ebe097dff145baf7b4ae00b8832e303dc3a2df26e"
+    ],
+    "dispatch_facts": [
+      {
+        "active_lease_set_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "assignment_token": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "concurrency_mode": "parallel",
+        "dispatch_binding_hash": "sha256:06ea274ea0d15ca7156ca81ebe097dff145baf7b4ae00b8832e303dc3a2df26e",
+        "dispatch_order": 0,
+        "index_context_hash": "sha256:335e66a9b631f72cfe45f8e239041a57a6631cd9469ae99b37a367e88b8a420d",
+        "integration_head": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "lease_epoch": 1,
+        "lease_id": "lease-task-v5",
+        "ledger_epoch": 11,
+        "predecessor_hash": "sha256:ac101b412eec57e00c9997e92da946314f7c04319a9553606deb89a6e4d58214",
+        "route": {
+          "model": "gpt-5.6-luna",
+          "reasoning_effort": "max",
+          "require_explicit_route": true,
+          "routing_context_hash": "sha256:f3755042b0902f7b6af7989a6f2550acbf8619e30109afc1c8dd8287c4be3dfd",
+          "routing_result_hash": "sha256:de6e37a57ea259de6108650b888eb3154cea3b1ed6ff395498e78c0efc4bbb7e"
+        },
+        "source_plan_hash": "sha256:b95bed09962fdf8ccb165848bb022734d0966c54dc033def24645b2e7a199ea4",
+        "task_id": "TASK-V5",
+        "task_version": 1,
+        "worktree_base": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "worktree_identity": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "write_scope": [
+          "src/task_v5.py"
+        ]
+      }
+    ],
+    "expires_at": 1700000120,
+    "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "preparation_id": "dispatch-vector-1",
+    "reasoning_effort": "max",
+    "registry_binding_hash": "sha256:4cf01212c6065dcc86d09c019c822af669d79c290e800426f1dcf58f7491b3b9",
+    "request_hash": "sha256:1de656b46197cd4bc5fcb01ca6eeb1b4e7573a8b78310a7c84d6bef63ec87a8a",
+    "schema": "2718lab-devkit/compiler-evidence-response-v1",
+    "verified_lease_scope_bindings": [
+      "sha256:2d1c461dbcf7144b28b2ffa4fef63e6cf8c2a2042302a2449a0228df46ef6faf"
+    ],
+    "verified_route_result_hashes": [
+      "sha256:de6e37a57ea259de6108650b888eb3154cea3b1ed6ff395498e78c0efc4bbb7e"
+    ]
+  }
+}

@@ -6353,7 +6353,7 @@ class TeamEfficiencyTests(unittest.TestCase):
             "NO_SAFE_WORK",
             "PROJECT_AUTHORITY_UNAVAILABLE",
             "apply_bootstrap_plan",
-            "不存在可执行的",
+            "不存在自行创建 worktree",
             "worker effort 禁止 `ultra`",
             "prewarm 始终是独立的只读证据角色",
             "归档不是 adapter 操作",
@@ -8695,6 +8695,275 @@ class TeamEfficiencyTests(unittest.TestCase):
                         ],
                     }
                 ],
+            )
+
+    def test_authenticated_v5_planner_emits_exact_proofs_and_skeletons(self) -> None:
+        helper = load_efficiency()
+        core = load_fastlane_routing()
+        hash_a = helper._sha256_json({"fixture": "a"})
+        hash_b = helper._sha256_json({"fixture": "b"})
+        source_plan_hash = helper._sha256_json({"fixture": "plan"})
+        dependency = {
+            "schema": "2718lab-devkit/dependency-state-v1",
+            "graph_epoch": 1,
+            "direct_dependency_ids": [],
+            "completed_dependency_ids": [],
+        }
+        dependency["dependency_state_hash"] = helper._sha256_json(dependency)
+        scheduler = {
+            "event_seq": 1,
+            "route_epoch": 1,
+            "override_epoch": 0,
+            "recovery_epoch": 0,
+            "ready_event_seq": 1,
+            "dispatch_cause": "task_ready",
+            "transport_state": "connected",
+            "execution_state": "unknown",
+            "lease_state": "unclaimed",
+            "evidence_state": "none",
+            "lease_epoch": 0,
+            "recovery_probe_count_epoch": 0,
+            "fence_count_epoch": 0,
+            "fenced_replacement_count_task": 0,
+        }
+        host = {
+            "schema": "2718lab-devkit/host-capabilities-v1",
+            "host_id_hash": hash_a,
+            "capability_epoch": 1,
+            "total_slots": 4,
+            "model_slot_limits": {"luna": 4, "terra": 0, "sol": 0, "spark": 0},
+            "models": [
+                {
+                    "model_id": "gpt-5.6-luna",
+                    "status": "available",
+                    "efforts": ["max"],
+                }
+            ],
+            "entitlements": [],
+        }
+        unit = {
+            "task": {
+                "schema": "2718lab-devkit/task-routing-profile-v5",
+                "task_id": "TASK-V5",
+                "role": "execution",
+                "access": "workspace_write",
+                "write_scope_count": 1,
+                "write_scope_breadth": "single_file",
+                "read_scope_count": 0,
+                "read_scope_breadth": "none",
+                "overlap_risk": "none",
+                "overlap_count": 0,
+                "dependency_depth": 0,
+                "downstream_critical_count": 0,
+                "critical_path": False,
+                "criticality": "low",
+                "cross_module": False,
+                "database_work": False,
+                "migration": False,
+                "security_sensitive": False,
+                "destructive": False,
+                "external_boundary": False,
+                "architecture_conflict": False,
+                "design_ambiguity": False,
+                "verification_cost": "none",
+                "blocker_severity": "none",
+                "authorization": "not_required",
+                "authorization_evidence_hash": None,
+                "narrow_decoupling_eligible": False,
+                "strike": None,
+                "gate_matrix_hash": hash_a,
+                "profile_evidence_hash": hash_b,
+            },
+            "dependency_state": dependency,
+            "write_scope": ["src/task_v5.py"],
+            "concurrency_mode": "parallel",
+            "dispatch_order": 0,
+            "index_context_hash": hash_a,
+            "predecessor_hash": hash_b,
+        }
+        requests = helper.prepare_authenticated_v5_routing_requests(
+            [unit],
+            source_plan_hash=source_plan_hash,
+            host_capabilities=host,
+            scheduler_facts=scheduler,
+        )
+        self.assertIsNone(requests[0]["child_route_attestation"])
+        binding_hash = core.v5_request_binding_hash(requests[0])
+        attestation = {
+            "schema": "2718lab-devkit/host-child-route-attestation-v1",
+            "status": "attested",
+            "request_binding_hash": binding_hash,
+            "host_id_hash": hash_a,
+            "capability_epoch": 1,
+            "lease_epoch": 0,
+            "issued_event_seq": 1,
+            "expires_event_seq": 1,
+            "route": {
+                "lane": "luna",
+                "model": "gpt-5.6-luna",
+                "effort": "max",
+                "rank": 40,
+            },
+            "inherit_current_session_model": False,
+            "refusal_code": None,
+        }
+        attestation["attestation_hash"] = helper._sha256_json(attestation)
+        compiled = helper.compile_authenticated_v5_assignment_skeletons(
+            [unit],
+            source_plan_hash=source_plan_hash,
+            routing_requests=requests,
+            attestation_items=[
+                {
+                    "task_id": "TASK-V5",
+                    "request_binding_hash": binding_hash,
+                    "attestation": attestation,
+                }
+            ],
+        )
+        self.assertEqual(
+            [{"model": "gpt-5.6-luna", "effort": "max"}],
+            compiled["requested_route_pairs"],
+        )
+        skeleton = compiled["assignment_skeletons"][0]
+        self.assertEqual(
+            {
+                "task_id",
+                "routing_proof",
+                "write_scope",
+                "concurrency_mode",
+                "dispatch_order",
+                "index_context_hash",
+                "predecessor_hash",
+                "source_plan_hash",
+            },
+            set(skeleton),
+        )
+        self.assertEqual(
+            {
+                "request",
+                "result",
+                "request_binding_hash",
+                "attestation_hash",
+                "routing_context_hash",
+                "routing_result_hash",
+            },
+            set(skeleton["routing_proof"]),
+        )
+
+    def test_authenticated_v5_raw_request_projects_ready_units(self) -> None:
+        helper = load_efficiency()
+        request = self.fast_lane_request(helper)
+        source_plan = helper.decompose(request["work_package"])
+        ready_ids = sorted(unit["task_id"] for unit in source_plan["waves"][0])
+        index_context_hash = helper._sha256_json({"index": "workspace-query"})
+        scheduler = {
+            "event_seq": 1,
+            "route_epoch": 1,
+            "override_epoch": 0,
+            "recovery_epoch": 0,
+            "ready_event_seq": 1,
+            "dispatch_cause": "task_ready",
+            "transport_state": "connected",
+            "execution_state": "unknown",
+            "lease_state": "unclaimed",
+            "evidence_state": "none",
+            "lease_epoch": 0,
+            "recovery_probe_count_epoch": 0,
+            "fence_count_epoch": 0,
+            "fenced_replacement_count_task": 0,
+        }
+        host = {
+            "schema": "2718lab-devkit/host-capabilities-v1",
+            "host_id_hash": helper._sha256_json({"host": "raw-projection"}),
+            "capability_epoch": 1,
+            "total_slots": 4,
+            "model_slot_limits": {"luna": 4, "terra": 0, "sol": 0, "spark": 0},
+            "models": [
+                {
+                    "model_id": "gpt-5.6-luna",
+                    "status": "available",
+                    "efforts": ["max"],
+                }
+            ],
+            "entitlements": [],
+        }
+
+        prepared = helper.prepare_authenticated_v5_routing_from_request(
+            request,
+            index_context_hash=index_context_hash,
+            host_capabilities=host,
+            scheduler_facts=scheduler,
+        )
+
+        self.assertEqual(helper._sha256_json(source_plan), prepared["source_plan_hash"])
+        self.assertEqual(
+            ready_ids, [unit["task"]["task_id"] for unit in prepared["units"]]
+        )
+        self.assertEqual(
+            ready_ids,
+            [item["task"]["task_id"] for item in prepared["routing_requests"]],
+        )
+        for unit, routing_request in zip(
+            prepared["units"], prepared["routing_requests"], strict=True
+        ):
+            self.assertNotIn("predecessor_hash", unit)
+            self.assertIn("workflow_id_hash", unit)
+            self.assertIsNone(routing_request["child_route_attestation"])
+            self.assertEqual(index_context_hash, unit["index_context_hash"])
+
+        core = load_fastlane_routing()
+        attestation_items = []
+        for routing_request in prepared["routing_requests"]:
+            binding_hash = core.v5_request_binding_hash(routing_request)
+            attestation = {
+                "schema": "2718lab-devkit/host-child-route-attestation-v1",
+                "status": "attested",
+                "request_binding_hash": binding_hash,
+                "host_id_hash": host["host_id_hash"],
+                "capability_epoch": 1,
+                "lease_epoch": 0,
+                "issued_event_seq": 1,
+                "expires_event_seq": 1,
+                "route": {
+                    "lane": "luna",
+                    "model": "gpt-5.6-luna",
+                    "effort": "max",
+                    "rank": 40,
+                },
+                "inherit_current_session_model": False,
+                "refusal_code": None,
+            }
+            attestation["attestation_hash"] = helper._sha256_json(attestation)
+            attestation_items.append(
+                {
+                    "task_id": routing_request["task"]["task_id"],
+                    "request_binding_hash": binding_hash,
+                    "attestation": attestation,
+                }
+            )
+        compiled = helper.compile_authenticated_v5_assignment_skeletons(
+            prepared["units"],
+            source_plan_hash=prepared["source_plan_hash"],
+            routing_requests=prepared["routing_requests"],
+            attestation_items=attestation_items,
+        )
+        for skeleton in compiled["assignment_skeletons"]:
+            proof = skeleton["routing_proof"]
+            predecessor = {
+                "schema": "team-efficiency/fast-lane-external-lease-predecessor-v1",
+                "source_plan_hash": prepared["source_plan_hash"],
+                "workflow_id_hash": next(
+                    unit["workflow_id_hash"]
+                    for unit in prepared["units"]
+                    if unit["task"]["task_id"] == skeleton["task_id"]
+                ),
+                "task_id": skeleton["task_id"],
+                "role": "execution",
+                "context_hash": proof["routing_context_hash"],
+                "routing_result_hash": proof["routing_result_hash"],
+            }
+            self.assertEqual(
+                helper._sha256_json(predecessor), skeleton["predecessor_hash"]
             )
 
 

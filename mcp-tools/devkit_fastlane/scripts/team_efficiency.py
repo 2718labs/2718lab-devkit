@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,7 +63,7 @@ _PYTHON_CACHE_REPRESENTATIVE_SOURCES = (
     Path("mcp-tools/devkit_fastlane/tests/test_team_efficiency.py"),
 )
 
-_TASK_ID = re.compile(r"^(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|FLR1-[0-9a-f]{24})$")
+_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _GIT_ID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _SHA256 = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
@@ -70,6 +71,16 @@ _PROJECT_FENCE_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PROJECT_FENCE_PROJECT_ID = re.compile(r"^[0-9a-f]{64}$")
 _UTC_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _PATH_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+)
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _ENDPOINT = re.compile(
     r"^/[A-Za-z0-9][A-Za-z0-9._/-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
@@ -1194,10 +1205,21 @@ def _project_execution_block_details(
 
 def _relative_scope(value: object, field: str) -> str:
     text = _text(value, field, maximum=256)
-    if text.startswith("/") or "\\" in text or ":" in text:
+    if (
+        text.startswith("/")
+        or "\\" in text
+        or ":" in text
+        or any(ord(character) < 32 for character in text)
+    ):
         raise ValueError(f"{field} must be a bounded relative path")
-    parts = text.split("/")
-    if any(not _PATH_PART.fullmatch(part) for part in parts):
+    parts = unicodedata.normalize("NFC", text).casefold().split("/")
+    if any(
+        not _PATH_PART.fullmatch(part)
+        or part in {".", ".."}
+        or part.endswith((".", " "))
+        or part.rstrip(" .").split(".", 1)[0] in _WINDOWS_RESERVED_NAMES
+        for part in parts
+    ):
         raise ValueError(f"{field} must be a bounded relative path")
     return "/".join(parts)
 
@@ -3041,7 +3063,7 @@ def _episode_units(
     ]
     if not episode_ids:
         raise AtlasEvidenceError("ATLAS_TASK_EPISODE_MISSING")
-    if len(episode_ids) >= MAX_MANIFEST_UNITS:
+    if len(episode_ids) > MAX_MANIFEST_UNITS:
         raise AtlasEvidenceError("ATLAS_UNIT_BUDGET_EXCEEDED")
 
     change_edges: dict[str, list[dict[str, Any]]] = {
@@ -3282,9 +3304,9 @@ def _ensure_acyclic(units: Mapping[str, Mapping[str, Any]]) -> None:
 
 def _scope_conflicts(left: Sequence[str], right: Sequence[str]) -> bool:
     for first in left:
-        first_parts = first.split("/")
+        first_parts = [part.casefold() for part in first.split("/")]
         for second in right:
-            second_parts = second.split("/")
+            second_parts = [part.casefold() for part in second.split("/")]
             shared = min(len(first_parts), len(second_parts))
             if first_parts[:shared] == second_parts[:shared]:
                 return True
@@ -4720,6 +4742,178 @@ def _fast_lane_routing_core() -> Any | None:
     except (ImportError, OSError, AttributeError, TypeError, ValueError):
         sys.modules.pop(module_name, None)
         return None
+
+
+def _authenticated_v5_helper_module(module_name: str) -> Any:
+    """Load one sibling V5 helper without changing public import topology."""
+
+    qualified_name = f"_team_efficiency_{module_name}"
+    module_path = Path(__file__).with_name(f"{module_name}.py").resolve()
+    loaded = sys.modules.get(qualified_name)
+    if (
+        loaded is not None
+        and Path(str(getattr(loaded, "__file__", ""))).resolve() == module_path
+    ):
+        return loaded
+    spec = importlib.util.spec_from_file_location(qualified_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("authenticated V5 helper is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[qualified_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(qualified_name, None)
+        raise
+    return module
+
+
+class _AuthenticatedV5Api:
+    """Late-bound view over this module, including spec-loaded test imports."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return globals()[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+
+def authenticated_v5_owned_scope_hash(task_id: object, write_scope: object) -> str:
+    planner = _authenticated_v5_helper_module("authenticated_v5_planner")
+    return planner.owned_scope_hash(_AuthenticatedV5Api(), task_id, write_scope)
+
+
+def _authenticated_v5_units(
+    units: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    planner = _authenticated_v5_helper_module("authenticated_v5_planner")
+    return planner.normalize_units(_AuthenticatedV5Api(), units)
+
+
+def _authenticated_v5_raw_projection(
+    request: Mapping[str, Any],
+    *,
+    index_context_hash: object,
+    scheduler_facts: Mapping[str, Any],
+    host_capabilities: Mapping[str, Any] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    projection = _authenticated_v5_helper_module("authenticated_v5_projection")
+    return projection.project_units(
+        _AuthenticatedV5Api(),
+        request,
+        index_context_hash=index_context_hash,
+        scheduler_facts=scheduler_facts,
+        host_capabilities=host_capabilities,
+    )
+
+
+def prepare_authenticated_v5_routing_from_request(
+    request: Mapping[str, Any],
+    *,
+    index_context_hash: object,
+    host_capabilities: Mapping[str, Any],
+    scheduler_facts: Mapping[str, Any],
+) -> dict[str, Any]:
+    projection = _authenticated_v5_helper_module("authenticated_v5_projection")
+    (
+        source_plan_hash,
+        units,
+        remaining_units,
+    ) = projection.project_units_with_waves(
+        _AuthenticatedV5Api(),
+        request,
+        index_context_hash=index_context_hash,
+        scheduler_facts=scheduler_facts,
+        host_capabilities=host_capabilities,
+    )
+    routing_requests = prepare_authenticated_v5_routing_requests(
+        units,
+        source_plan_hash=source_plan_hash,
+        host_capabilities=host_capabilities,
+        scheduler_facts=scheduler_facts,
+    )
+    remaining_routing_requests = (
+        prepare_authenticated_v5_routing_requests(
+            remaining_units,
+            source_plan_hash=source_plan_hash,
+            host_capabilities=host_capabilities,
+            scheduler_facts=scheduler_facts,
+        )
+        if remaining_units
+        else []
+    )
+    all_units = sorted(
+        [*units, *remaining_units], key=lambda unit: int(unit["dispatch_order"])
+    )
+    order_by_task = {
+        str(unit["task"]["task_id"]): int(unit["dispatch_order"]) for unit in all_units
+    }
+    all_routing_requests = sorted(
+        [*routing_requests, *remaining_routing_requests],
+        key=lambda request: order_by_task[str(request["task"]["task_id"])],
+    )
+    return {
+        "source_plan_hash": source_plan_hash,
+        "units": units,
+        "routing_requests": routing_requests,
+        "remaining_units": remaining_units,
+        "remaining_routing_requests": remaining_routing_requests,
+        "all_units": all_units,
+        "all_routing_requests": all_routing_requests,
+    }
+
+
+def prepare_authenticated_v5_routing_requests(
+    units: Sequence[Mapping[str, Any]],
+    *,
+    source_plan_hash: object,
+    host_capabilities: Mapping[str, Any],
+    scheduler_facts: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    planner = _authenticated_v5_helper_module("authenticated_v5_planner")
+    return planner.prepare_requests(
+        _AuthenticatedV5Api(),
+        units,
+        source_plan_hash=source_plan_hash,
+        host_capabilities=host_capabilities,
+        scheduler_facts=scheduler_facts,
+    )
+
+
+def compile_authenticated_v5_assignment_skeletons(
+    units: Sequence[Mapping[str, Any]],
+    *,
+    source_plan_hash: object,
+    routing_requests: Sequence[Mapping[str, Any]],
+    attestation_items: Sequence[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    planner = _authenticated_v5_helper_module("authenticated_v5_planner")
+    return planner.compile_skeletons(
+        _AuthenticatedV5Api(),
+        units,
+        source_plan_hash=source_plan_hash,
+        routing_requests=routing_requests,
+        attestation_items=attestation_items,
+    )
+
+
+def validate_authenticated_v5_skeleton_package(
+    source_plan_units: Sequence[Mapping[str, Any]],
+    initial_skeletons: Sequence[Mapping[str, Any]],
+    remaining_skeletons: Sequence[Mapping[str, Any]],
+    *,
+    source_plan_hash: object,
+) -> str:
+    """Validate and hash the complete package at the wave boundary."""
+
+    planner = _authenticated_v5_helper_module("authenticated_v5_planner")
+    return planner.validate_skeleton_package(
+        _AuthenticatedV5Api(),
+        source_plan_units,
+        initial_skeletons,
+        remaining_skeletons,
+        source_plan_hash=source_plan_hash,
+    )
 
 
 def _fast_lane_failure_reason(value: object) -> str:

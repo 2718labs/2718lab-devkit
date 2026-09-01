@@ -169,7 +169,16 @@ Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协�
 - CODEX_PROJECT_ID、CODEX_WORKSPACE_ID、CODEX_THREAD_ID
 
 这些是 selector 或 identity 名称，不是应该自行编造或塞进任务消息的值。后五项
-会把持久化状态限定在单个项目或线程，避免投影到另一个工作区。需要私有
+会把持久化状态限定在单个项目或线程，避免投影到另一个工作区。
+在 Windows 上，CODEX_DEVKIT_HOST_BRIDGE_HANDLE 为兼容既有环境变量名而保留，
+但值只能是 `pipe:codex-devkit-<宿主PID>-<创建FILETIME>-<128位小写十六进制令牌>`，
+其中创建时间是 16 位小写十六进制 Windows FILETIME。运行时只会把该不透明
+selector 映射到本机 `\\.\pipe\` 命名空间，并在发送 session key 之前证明
+已连接管道的 server PID 与进程创建时间都与 selector 完全相同；数字 HANDLE、
+路径、远程 UNC 名称及未加标签的值都会被拒绝。可信 launcher 负责用 CSPRNG 生成令牌、
+以 first-instance 与拒绝远程客户端模式创建管道，并设置仅 owner 可访问的 ACL。
+Unix 仍只通过 CODEX_DEVKIT_HOST_BRIDGE_FD 接受数字形式的继承描述符。
+需要私有
 宿主 capability broker 或 proof registry 的 Relay 生命周期变更，在宿主
 没有提供可证明能力时会失败关闭，并返回
 RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也不会
@@ -184,8 +193,11 @@ allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择�
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
 表面是 MCP 服务器；ZIP 同时携带 Fast Lane 契约、必需参考资料和策略 assets、
-`team_efficiency.py` 兼容入口及其路由模块。它明确不包含可选的 Skill 说明书 bundle、
-命令辅助文件、hooks、CI 文件、宿主私有状态、prompts、静态 agent 或任意仓库文件。
+`team_efficiency.py` 兼容入口、路由模块，以及明确依赖该 MCP 服务器的
+`fast-lane-routing`、`code-atlas`、`workflow-design` 三个 Skill 目录及其
+`agents/openai.yaml`。builder 的 allowlist 只支持文件或目录根，因此这里逐项
+列出三个目录，并由归档测试拒绝其他 Skill 目录。命令辅助文件、hooks、CI 文件、
+宿主私有状态、prompts、顶层静态 agent 和任意仓库文件仍不进入主产物。
 
 Fast Lane 可通过以下可执行入口检查其 fail-closed 结果：
 
@@ -272,13 +284,18 @@ Fast Lane 编译器位于
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py 和
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
 `fastlane_compile`；当前每一次调用都会刻意以 `NO_SAFE_WORK` 和零 assignments
-被阻断。
+被阻断；唯一例外是 exact-key 的 `fastlane-host-dispatch-request-v1`，且当前 MCP
+进程确实持有经过认证的 inherited host bridge。此时宿主通过一次性、registry-bound
+的 compiler evidence 回传精确事实，并接收 typed dispatch batch。
 
-- `ultra` 和 `--enable` 只选择被阻断结果的形状，不会激活调度。
+- `reasoning_effort` 必填且只接受 `low`、`medium`、`high`、`xhigh` 或
+  `max`；worker 调度永不接受 `ultra`。
 - 公共编译器/CLI 不消费 host-status、账号用量、index evidence 或 worktree root。
-- 它不会派发会话、创建 worktree、补位或运行命令；仓库内不存在这些动作的执行路径。
-- 外部 Desktop-host bridge 未来可以提供经证明的项目权限和执行能力。
-  这只是未来合同，不是已交付实现，也不是任何 Desktop host 源码已经存在的声明。
+- 编译器不会创建 worktree、选择路由或运行命令；认证 session 只在 terminal ACK
+  后请求下一宿主边界补位。编译器只能把完整 hash-bound batch 提交给私有宿主桥，
+  真正执行权限仍属于宿主。
+- evidence 缺失、过期、错配、重放或来自 caller 自报时仍保持 `NO_SAFE_WORK`；
+  filesystem path 永远不能充当 compiler evidence。
 
 ### 账号用量边界
 

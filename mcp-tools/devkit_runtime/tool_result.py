@@ -32,6 +32,7 @@ from devkit_atlas.models import (
 from devkit_relay.compiler import RelayPlanError
 from devkit_relay.service import RelayError
 from devkit_relay.store import RelayStoreError
+from devkit_runtime.tool_metadata import TOOL_ANNOTATIONS
 from project_index.checkpoints import Checkpoint, RestoreResult
 from project_index.models import (
     CoverageGap,
@@ -50,6 +51,7 @@ from project_index.models import (
 )
 
 RESULT_SCHEMA: Final = "2718lab-devkit/tool-result-v1"
+TOOL_ANNOTATION_TABLE = TOOL_ANNOTATIONS
 MAX_RESULT_BYTES: Final = 524_288
 MAX_STRING_BYTES: Final = 65_536
 MAX_LIST_ITEMS: Final = 512
@@ -60,27 +62,6 @@ PACKAGE_PAGE_BYTE_BUDGET: Final = 320_000
 
 SUCCESS_KEYS: Final = frozenset({"schema", "ok", "data"})
 FAILURE_KEYS: Final = frozenset({"schema", "ok", "error"})
-
-TOOL_ANNOTATIONS: Final[dict[str, tuple[bool, bool, bool, bool]]] = {
-    "project_index_register": (False, False, True, False),
-    "project_index_sync": (False, False, True, False),
-    "project_index_status": (True, False, True, False),
-    "project_index_query": (False, False, True, False),
-    "worktree_checkpoint_create": (False, False, True, False),
-    "worktree_checkpoint_status": (True, False, True, False),
-    "worktree_checkpoint_restore": (False, True, False, False),
-    "atlas_query": (True, False, True, False),
-    "atlas_prepare": (False, False, True, False),
-    "atlas_render": (True, False, True, False),
-    "atlas_accept": (False, False, True, False),
-    "relay_compile": (True, False, True, False),
-    "fastlane_compile": (True, False, True, False),
-    "relay_start": (False, False, True, False),
-    "relay_status": (True, False, True, False),
-    "relay_handoff": (False, False, False, False),
-    "relay_integrate": (False, True, False, False),
-}
-TOOL_ANNOTATION_TABLE = TOOL_ANNOTATIONS
 
 
 class ResultContractError(ValueError):
@@ -585,7 +566,10 @@ def _package_page_data(
     public_packages: list[dict[str, object]] = []
     for package in packages:
         candidate = _package_descriptor(package)
-        if _encoded_size({"packages": [*public_packages, candidate]}) > PACKAGE_PAGE_BYTE_BUDGET:
+        if (
+            _encoded_size({"packages": [*public_packages, candidate]})
+            > PACKAGE_PAGE_BYTE_BUDGET
+        ):
             break
         public_packages.append(candidate)
     if packages and not public_packages:

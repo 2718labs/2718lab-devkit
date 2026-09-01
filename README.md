@@ -192,6 +192,19 @@ private host-bridge selector names and optional project/thread scope identifiers
 These are selector or identity names, not values to invent or copy into a task
 message. The latter identifiers keep durable state scoped to one project or
 thread instead of leaking it into another workspace.
+On Windows, CODEX_DEVKIT_HOST_BRIDGE_HANDLE is intentionally named for
+compatibility but accepts only
+`pipe:codex-devkit-<launcher-pid>-<creation-filetime>-<high-entropy-token>` (a
+launcher PID, its 16-hex Windows creation FILETIME, and a launcher-generated
+128-bit lowercase hex token). The runtime
+maps that opaque selector only into the local `\\.\pipe\` namespace, verifies
+that the connected pipe server has exactly the encoded launcher PID and process
+creation time before sending the session key, and rejects inherited numeric
+handles, paths, remote UNC names, and untagged values. The launcher remains
+responsible for CSPRNG
+generation, first-instance creation, remote-client rejection, and an owner-only
+ACL. Unix continues to accept only a numeric inherited descriptor through
+CODEX_DEVKIT_HOST_BRIDGE_FD.
 Relay lifecycle mutations that need the private host capability broker or proof
 registry fail closed when the host does not provide an attested capability,
 using RELAY_CAPABILITY_BROKER_UNAVAILABLE. The server never exposes raw
@@ -207,11 +220,14 @@ tree. Choose an output directory outside the source tree:
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
 .codex-plugin/main-artifact-allowlist.json. Its executable runtime surface is
-the MCP server; the ZIP also carries the Fast Lane contract, required references
+the MCP server. The ZIP also carries the Fast Lane contract, required references
 and policy assets, the `team_efficiency.py` compatibility entry point, its
-routing modules. It deliberately excludes the optional Skill manual bundle,
-command helpers, hooks, CI files, host-private state, prompts, static agents,
-and arbitrary repository files.
+routing modules, and the exact `fast-lane-routing`, `code-atlas`, and
+`workflow-design` Skill directories whose `agents/openai.yaml` files require
+that MCP server. The builder only supports file and directory allowlist roots,
+so those three directories are named individually and archive tests reject any
+other Skill directory. Command helpers, hooks, CI files, host-private state,
+prompts, top-level static agents, and arbitrary repository files remain excluded.
 
 Run Fast Lane through its executable entry point to inspect its fail-closed
 result:
@@ -311,17 +327,22 @@ The Fast Lane compiler is in
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py and
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The public MCP entry is
 `fastlane_compile`; every current invocation is deliberately blocked with
-`NO_SAFE_WORK` and zero assignments.
+`NO_SAFE_WORK` and zero assignments unless the request is the closed
+`fastlane-host-dispatch-request-v1` shape and this MCP process owns an
+authenticated inherited host bridge. In that private case the host supplies
+one-time registry-bound compiler evidence and receives a typed dispatch batch.
 
-- `ultra` and `--enable` only select the shape of the blocked result; they do
-  not activate scheduling.
+- `reasoning_effort` is required and accepts only `low`, `medium`, `high`,
+  `xhigh`, or `max`; worker dispatch never accepts `ultra`.
 - The public compiler/CLI does not consume host status, account usage, index
   evidence, or a worktree root.
-- It never dispatches a session, creates a worktree, refills a slot, or runs a
-  command. No in-repository execution path exists for those actions.
-- An external Desktop-host bridge may later provide attested project authority
-  and execution. That is a future contract, not a
-  shipped implementation or a claim that any Desktop host source exists.
+- The compiler never creates a worktree, selects a route, or runs a command.
+  The authenticated session ACKs terminal slots and requests refill only at the
+  next host boundary. The compiler can only commit the fully hash-bound batch to the private
+  host bridge; the host remains the execution authority.
+- Missing, stale, mismatched, replayed, or caller-supplied evidence keeps the
+  result at `NO_SAFE_WORK`. Filesystem paths are never accepted as compiler
+  evidence.
 
 ### Account-usage boundary
 
