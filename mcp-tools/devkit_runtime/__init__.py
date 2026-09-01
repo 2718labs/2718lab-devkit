@@ -5,9 +5,13 @@ from .sqlite_snapshot import (
     VerifiedSqliteSnapshot,
     open_verified_sqlite_snapshot,
 )
+from .storage_intent import StorageIntent, StorageIntentError, parse_storage_intent
 
 __all__ = [
     "SqliteSnapshotError",
     "VerifiedSqliteSnapshot",
     "open_verified_sqlite_snapshot",
+    "StorageIntent",
+    "StorageIntentError",
+    "parse_storage_intent",
 ]

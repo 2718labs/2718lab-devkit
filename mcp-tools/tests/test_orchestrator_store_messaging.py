@@ -299,7 +299,10 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
             contract_subscriptions=(self._hash("contract"),),
         )
         self.coordinator_lease = self.store.acquire_lease(
-            "coordinator", "coordinator-owner", "2026-08-03T01:00:00+00:00", now=self._NOW
+            "coordinator",
+            "coordinator-owner",
+            "2026-08-03T01:00:00+00:00",
+            now=self._NOW,
         )
         self.worker_one_lease = self.store.acquire_lease(
             "worker-one", "worker-one-owner", "2026-08-03T01:00:00+00:00", now=self._NOW
@@ -324,7 +327,9 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
         self.store.close()
         self._temporary_directory.cleanup()
 
-    def _assignment_kwargs(self, *, correlation_id: str = "assignment-one") -> dict[str, object]:
+    def _assignment_kwargs(
+        self, *, correlation_id: str = "assignment-one"
+    ) -> dict[str, object]:
         return {
             "recipient_epoch": self.worker_one_lease.epoch,
             "direction": "coordinator_to_worker",
@@ -345,7 +350,9 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
 
     def _role_row_count(self) -> int:
         return int(
-            self.store._connection.execute("SELECT COUNT(*) FROM role_envelopes").fetchone()[0]
+            self.store._connection.execute(
+                "SELECT COUNT(*) FROM role_envelopes"
+            ).fetchone()[0]
         )
 
     def test_sensitive_fields_each_reject_without_any_role_row_or_event(self) -> None:
@@ -375,7 +382,9 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
                 self.assertEqual(0, self._role_row_count())
                 self.assertEqual((), self.store.list_events(self.workflow.id))
 
-    def test_terminal_sensitive_fields_each_reject_without_a_new_row_or_event(self) -> None:
+    def test_terminal_sensitive_fields_each_reject_without_a_new_row_or_event(
+        self,
+    ) -> None:
         self.store.enqueue_role_envelope(
             self.workflow.id,
             "coordinator",
@@ -449,7 +458,9 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
                     )
                 self.assertEqual("ROLE_ENVELOPE_INVALID", captured.exception.code)
                 self.assertEqual(baseline_rows, self._role_row_count())
-                self.assertEqual(baseline_events, len(self.store.list_events(self.workflow.id)))
+                self.assertEqual(
+                    baseline_events, len(self.store.list_events(self.workflow.id))
+                )
 
     def test_peer_sensitive_fields_each_reject_without_a_new_row_or_event(self) -> None:
         self.store.enqueue_role_envelope(
@@ -522,7 +533,9 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
                     )
                 self.assertEqual("ROLE_ENVELOPE_INVALID", captured.exception.code)
                 self.assertEqual(baseline_rows, self._role_row_count())
-                self.assertEqual(baseline_events, len(self.store.list_events(self.workflow.id)))
+                self.assertEqual(
+                    baseline_events, len(self.store.list_events(self.workflow.id))
+                )
 
     def test_wrong_peer_capability_fails_without_a_new_role_envelope(self) -> None:
         assignment = self.store.enqueue_role_envelope(
@@ -573,11 +586,15 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
                 now=self._NOW,
             )
         self.assertEqual("CAPABILITY_INVALID", captured.exception.code)
-        self.assertEqual(assignment.delivery_id, self.store._role_envelope_from_row(
-            self.store._connection.execute(
-                "SELECT * FROM role_envelopes WHERE delivery_id = ?", (assignment.delivery_id,)
-            ).fetchone()
-        ).delivery_id)
+        self.assertEqual(
+            assignment.delivery_id,
+            self.store._role_envelope_from_row(
+                self.store._connection.execute(
+                    "SELECT * FROM role_envelopes WHERE delivery_id = ?",
+                    (assignment.delivery_id,),
+                ).fetchone()
+            ).delivery_id,
+        )
         self.assertEqual(1, self._role_row_count())
         self.assertEqual(event_count, len(self.store.list_events(self.workflow.id)))
 
@@ -585,7 +602,9 @@ class SQLiteStoreRoleEnvelopeTests(unittest.TestCase):
 class SQLiteStoreRoleEnvelopeSchemaTests(unittest.TestCase):
     """The v6 upgrade creates the same unique envelope hash surface as a fresh v7 DB."""
 
-    def test_v6_upgrade_and_fresh_v7_have_the_partial_unique_envelope_hash_index(self) -> None:
+    def test_v6_upgrade_and_fresh_v7_have_the_partial_unique_envelope_hash_index(
+        self,
+    ) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         legacy_database = Path(temporary.name) / "legacy.sqlite"
@@ -617,6 +636,32 @@ class SQLiteStoreRoleEnvelopeSchemaTests(unittest.TestCase):
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE atlas_ingestion_outbox (
+                    ingestion_key TEXT PRIMARY KEY,
+                    acceptance_id TEXT NOT NULL UNIQUE
+                        REFERENCES code_task_acceptances(acceptance_id),
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('pending', 'projected', 'quarantined')),
+                    attempt_count INTEGER NOT NULL
+                        CHECK (attempt_count BETWEEN 0 AND 16),
+                    last_error_code TEXT NOT NULL,
+                    reason_codes_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (ingestion_key = payload_hash)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_atlas_outbox_pending
+                    ON atlas_ingestion_outbox(state, created_at, ingestion_key)
+                """
+            )
             connection.commit()
         finally:
             connection.close()
@@ -629,7 +674,9 @@ class SQLiteStoreRoleEnvelopeSchemaTests(unittest.TestCase):
         for store in (legacy, fresh):
             indexes = {
                 str(row["name"]): int(row["unique"])
-                for row in store._connection.execute("PRAGMA index_list(role_envelopes)").fetchall()
+                for row in store._connection.execute(
+                    "PRAGMA index_list(role_envelopes)"
+                ).fetchall()
             }
             self.assertEqual(1, indexes[expected_index])
             sql = store._connection.execute(

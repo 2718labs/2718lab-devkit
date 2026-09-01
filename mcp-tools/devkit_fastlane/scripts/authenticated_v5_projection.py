@@ -5,6 +5,133 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+_STORAGE_POLICY_MISSING = "STORAGE_POLICY_MISSING"
+_STORAGE_TARGET_KEY_INVALID = "STORAGE_TARGET_KEY_INVALID"
+_STORAGE_DESCRIPTOR_FIELDS = (
+    "repository_identity",
+    "workspace_manifest_hash",
+    "cargo_lock_hash",
+    "toolchain_digest",
+    "target_triple",
+    "profile",
+    "features_hash",
+    "build_env_class",
+)
+_STORAGE_REQUEST_FIELDS = frozenset({"storage_budgets"})
+_STORAGE_CONTEXT_FIELDS = frozenset(
+    {"execution_context_hash", *_STORAGE_DESCRIPTOR_FIELDS}
+)
+_STORAGE_PUBLIC_DESCRIPTOR_KEYS = _STORAGE_CONTEXT_FIELDS | frozenset(
+    {
+        "storage_context",
+        "storage_contexts",
+        "storage_descriptor",
+        "storage_profile",
+        "storage_profiles",
+        "target_descriptor",
+    }
+)
+_PROFILE_EVIDENCE_SCHEMA = "team-efficiency/fast-lane-v5-profile-evidence-v1"
+_PROFILE_UNIT_FIELDS = (
+    "task",
+    "dependency_state",
+    "write_scope",
+    "concurrency_mode",
+    "dispatch_order",
+    "index_context_hash",
+    "workflow_id_hash",
+)
+
+
+def _routing_profile_material(
+    source_plan_hash: str, unit: Mapping[str, Any]
+) -> dict[str, Any]:
+    task = dict(unit["task"])
+    task.pop("profile_evidence_hash", None)
+    fields = _PROFILE_UNIT_FIELDS + (
+        ("storage_budget",) if "storage_budget" in unit else ()
+    )
+    return {
+        "schema": _PROFILE_EVIDENCE_SCHEMA,
+        "source_plan_hash": source_plan_hash,
+        "unit": {field: task if field == "task" else unit[field] for field in fields},
+    }
+
+
+def _storage_request_without_extensions(value: Mapping[str, Any], api: Any) -> None:
+    if "storage_contexts" in value:
+        raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+    base = {
+        key: item for key, item in value.items() if key not in _STORAGE_REQUEST_FIELDS
+    }
+    api._exact_keys(base, api._FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+
+
+def _reject_public_storage_facts(value: object) -> None:
+    """Reject descriptor facts supplied through the public request."""
+
+    if isinstance(value, Mapping):
+        if set(value).intersection(_STORAGE_PUBLIC_DESCRIPTOR_KEYS):
+            raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+        for item in value.values():
+            _reject_public_storage_facts(item)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            _reject_public_storage_facts(item)
+
+
+def _validated_storage_budget(value: object) -> dict[str, int]:
+    if not isinstance(value, Mapping) or set(value) != {"bytes", "files"}:
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    requested_bytes = value.get("bytes")
+    requested_files = value.get("files")
+    if (
+        type(requested_bytes) is not int
+        or requested_bytes <= 0
+        or requested_bytes > (1 << 64) - 1
+        or type(requested_files) is not int
+        or requested_files <= 0
+        or requested_files > (1 << 64) - 1
+    ):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    return {"bytes": requested_bytes, "files": requested_files}
+
+
+def _validated_request_storage_budgets(
+    value: object, task_ids: Sequence[str]
+) -> dict[str, dict[str, int]]:
+    """Accept only exact per-task public budgets; no default or surplus task."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or set(value) != set(task_ids):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    return {task_id: _validated_storage_budget(value[task_id]) for task_id in task_ids}
+
+
+def _attach_storage_budget(
+    source_unit: Mapping[str, Any],
+    request_budgets: Mapping[str, Mapping[str, int]],
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    result = dict(source_unit)
+    source_budget = source_unit.get("storage_budget")
+    request_budget = request_budgets.get(task_id)
+    if source_budget is not None:
+        source_budget = _validated_storage_budget(source_budget)
+    if request_budget is not None:
+        request_budget = _validated_storage_budget(request_budget)
+    if source_budget is not None and request_budget is not None:
+        if source_budget != request_budget:
+            raise ValueError(_STORAGE_TARGET_KEY_INVALID)
+    elif source_budget is None:
+        source_budget = request_budget
+    if source_budget is None:
+        return result
+    result["storage_budget"] = _validated_storage_budget(source_budget)
+    return result
+
 
 def project_units(
     api: Any,
@@ -49,7 +176,7 @@ def project_units_with_waves(
     """
 
     candidate = api._mapping(request, "fast-lane request")
-    api._exact_keys(candidate, api._FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+    _storage_request_without_extensions(candidate, api)
     if (
         candidate.get("schema") != "team-efficiency/fast-lane-request-v1"
         or len(api._json_bytes(candidate)) > api.MAX_MANIFEST_INPUT_BYTES
@@ -57,9 +184,11 @@ def project_units_with_waves(
     ):
         raise ValueError("authenticated V5 raw request is unsupported")
     source_plan = api.decompose(candidate["work_package"])
+    raw_execution_contexts = candidate["execution_contexts"]
+    _reject_public_storage_facts(raw_execution_contexts)
+    source_plan_hash = api._sha256_json(source_plan)
     if source_plan.get("status") != "planned":
         raise ValueError("authenticated V5 source plan is not schedulable")
-    source_plan_hash = api._sha256_json(source_plan)
     project_binding = api._validated_project_binding(candidate["project_binding"])
     project_authority = api._mapping(
         source_plan.get("project_authority"), "source plan.project_authority"
@@ -98,7 +227,25 @@ def project_units_with_waves(
     if remediation is not None or state["phase"] != "execution":
         raise ValueError("authenticated V5 scheduler phase is unsupported")
 
-    units_by_task = api._fast_lane_unit_index(source_plan)
+    raw_units_by_task = api._fast_lane_unit_index(source_plan)
+    request_budgets = _validated_request_storage_budgets(
+        candidate.get("storage_budgets"), tuple(raw_units_by_task)
+    )
+    source_budget_task_ids = {
+        task_id
+        for task_id, source_unit in raw_units_by_task.items()
+        if "storage_budget" in source_unit
+    }
+    if source_budget_task_ids and source_budget_task_ids != set(raw_units_by_task):
+        raise ValueError(_STORAGE_POLICY_MISSING)
+    units_by_task = {
+        task_id: _attach_storage_budget(
+            source_unit,
+            request_budgets,
+            task_id=task_id,
+        )
+        for task_id, source_unit in raw_units_by_task.items()
+    }
     if not 1 <= len(units_by_task) <= 16:
         raise ValueError("authenticated V5 source plan exceeds the bounded queue")
     config_capacity = source_plan.get("capacity")
@@ -145,7 +292,6 @@ def project_units_with_waves(
         )
     ]
     index_hash = api._hash(index_context_hash, "index_context_hash")
-    context_by_task = {item["task_id"]: item for item in execution_contexts}
     target_by_task = {item["task_id"]: item for item in target_gates}
     workflow_hash = api._sha256_json({"workflow_id": project_binding["workflow_id"]})
 
@@ -192,10 +338,7 @@ def project_units_with_waves(
             # remains the complete 0..N-1 sequence.
             dispatch_order = package_order[task_id]
             source_unit = units_by_task[task_id]
-            if (
-                context_by_task.get(task_id) is None
-                or target_by_task.get(task_id) is None
-            ):
+            if target_by_task.get(task_id) is None:
                 raise ValueError("authenticated V5 execution context is incomplete")
             target = target_by_task[task_id]
             write_scope = api._normalised_scopes(source_unit.get("write_scope", []))
@@ -225,13 +368,6 @@ def project_units_with_waves(
                 "Terra Max": "high",
                 "Sol High": "critical",
             }.get(str(source_unit.get("recommended_route")), "critical")
-            profile_material = {
-                "schema": "team-efficiency/fast-lane-v5-profile-evidence-v1",
-                "source_plan_hash": source_plan_hash,
-                "source_unit": source_unit,
-                "target_gates": target,
-                "dependency_state": dependency_state,
-            }
             task = {
                 "schema": "2718lab-devkit/task-routing-profile-v5",
                 "task_id": task_id,
@@ -265,19 +401,23 @@ def project_units_with_waves(
                 "narrow_decoupling_eligible": False,
                 "strike": None,
                 "gate_matrix_hash": api._sha256_json(target),
-                "profile_evidence_hash": api._sha256_json(profile_material),
             }
-            projected_slice.append(
-                {
-                    "task": task,
-                    "dependency_state": dependency_state,
-                    "write_scope": write_scope,
-                    "concurrency_mode": "parallel",
-                    "dispatch_order": dispatch_order,
-                    "index_context_hash": index_hash,
-                    "workflow_id_hash": workflow_hash,
-                }
-            )
+            profile_unit: dict[str, Any] = {
+                "task": task,
+                "dependency_state": dependency_state,
+                "write_scope": write_scope,
+                "concurrency_mode": "parallel",
+                "dispatch_order": dispatch_order,
+                "index_context_hash": index_hash,
+                "workflow_id_hash": workflow_hash,
+            }
+            if "storage_budget" in source_unit:
+                profile_unit["storage_budget"] = source_unit["storage_budget"]
+            profile_material = _routing_profile_material(source_plan_hash, profile_unit)
+            task["profile_evidence_hash"] = api._sha256_json(profile_material)
+            projected_unit = dict(profile_unit)
+            projected_unit["task"] = task
+            projected_slice.append(projected_unit)
         return projected_slice
 
     return (

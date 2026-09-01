@@ -127,15 +127,20 @@ def _authenticated_v5_fixture() -> dict[str, object]:
         "index_context_hash": hash_a,
         "predecessor_hash": hash_b,
     }
+    planner = team_efficiency._authenticated_v5_helper_module(
+        "authenticated_v5_planner"
+    )
+    normalized_unit = team_efficiency._authenticated_v5_units([unit])[0]
+    unit["task"]["profile_evidence_hash"] = team_efficiency._sha256_json(
+        planner._routing_profile_material(source_plan_hash, normalized_unit)
+    )
     routing_requests = team_efficiency.prepare_authenticated_v5_routing_requests(
         [unit],
         source_plan_hash=source_plan_hash,
         host_capabilities=host,
         scheduler_facts=scheduler,
     )
-    request_binding_hash = fastlane_routing.v5_request_binding_hash(
-        routing_requests[0]
-    )
+    request_binding_hash = fastlane_routing.v5_request_binding_hash(routing_requests[0])
     attestation: dict[str, object] = {
         "schema": "2718lab-devkit/host-child-route-attestation-v1",
         "status": "attested",
@@ -907,9 +912,10 @@ def test_environment_session_round_trips_evidence_and_typed_dispatch(
     received: list[OperationReceipt] = []
 
     def host_reply() -> None:
-        assert host.receive_project_index_attestation(now=1_700_000_000) == fixture[
-            "index_query"
-        ]
+        assert (
+            host.receive_project_index_attestation(now=1_700_000_000)
+            == fixture["index_query"]
+        )
         probe = host.receive_capability_probe_v2(now=1_700_000_000)
         host.send_capability_report_v2(
             probe=probe,
@@ -917,9 +923,7 @@ def test_environment_session_round_trips_evidence_and_typed_dispatch(
             scheduler_facts=fixture["scheduler"],
             now=1_700_000_000,
         )
-        routing_request = host.receive_routing_attestation_request(
-            now=1_700_000_000
-        )
+        routing_request = host.receive_routing_attestation_request(now=1_700_000_000)
         assert list(routing_request.routing_requests) == fixture["routing_requests"]
         host.send_routing_attestation_response(
             request=routing_request,
@@ -957,9 +961,10 @@ def test_environment_session_round_trips_evidence_and_typed_dispatch(
     session = host_session.HostSession.from_environment(
         environ={}, platform="posix", clock=lambda: 1_700_000_000
     )
-    assert session.send_project_index_attestation(fixture["index_query"]) == fixture[
-        "index_query"
-    ]
+    assert (
+        session.send_project_index_attestation(fixture["index_query"])
+        == fixture["index_query"]
+    )
     capability = session.resolve_capability_snapshot_v2(
         call_intent_hash=fixture["call_intent_hash"],
         preparation_id=fixture["preparation_id"],
@@ -1033,9 +1038,7 @@ def test_fast_lane_terminal_ack_removes_only_completed_assignment() -> None:
         write_scope=("src/task_v5_b.py",),
         dispatch_order=1,
     )
-    mappings = [
-        adapter._dispatch_fact_mapping(fact) for fact in (fact_a, fact_b)
-    ]
+    mappings = [adapter._dispatch_fact_mapping(fact) for fact in (fact_a, fact_b)]
     batch: dict[str, object] = {
         "schema": "2718lab-devkit/fastlane-host-dispatch-batch-v1",
         "action": "dispatch_all",
@@ -1069,6 +1072,7 @@ def test_fast_lane_terminal_ack_removes_only_completed_assignment() -> None:
         receipt = {"state": "NO_QUEUED_WORK", **dict(trigger)}
         refill_receipts.append(receipt)
         return receipt
+
     dispatch_reader = threading.Thread(
         target=lambda: received_dispatch.append(
             host.receive_fast_lane_dispatch_batch(now=1_700_000_000)
@@ -1089,7 +1093,9 @@ def test_fast_lane_terminal_ack_removes_only_completed_assignment() -> None:
     dispatch_reader.join(timeout=2)
     assert received_dispatch == [receipt]
     expected = dict(
-        session._pending_fast_lane_terminals[(batch["batch_hash"], fact_a.task_id)].expected
+        session._pending_fast_lane_terminals[
+            (batch["batch_hash"], fact_a.task_id)
+        ].expected
     )
     terminal: dict[str, object] = {
         "schema": "2718lab-devkit/fastlane-worker-terminal-result-v1",
@@ -1155,7 +1161,10 @@ def test_fast_lane_terminal_ack_removes_only_completed_assignment() -> None:
         time.sleep(0.01)
     assert len(refill_receipts) == 1
     assert ack["refill_trigger_hash"] == refill_receipts[0]["refill_trigger_hash"]
-    assert (batch["batch_hash"], fact_a.task_id) not in session._pending_fast_lane_terminals
+    assert (
+        batch["batch_hash"],
+        fact_a.task_id,
+    ) not in session._pending_fast_lane_terminals
     assert (batch["batch_hash"], fact_b.task_id) in session._pending_fast_lane_terminals
     close_started = time.monotonic()
     session.close()
@@ -1185,16 +1194,22 @@ def test_compiler_evidence_cross_language_fixed_vector() -> None:
         "predecessor_hash",
         "source_plan_hash",
     }
-    assert host_bridge._normalize_compiler_evidence_response(
-        vector["response"], request=request, now=1_700_000_000
-    ) == vector["response"]
+    assert (
+        host_bridge._normalize_compiler_evidence_response(
+            vector["response"], request=request, now=1_700_000_000
+        )
+        == vector["response"]
+    )
     assert vector["frame"]["canonical_payload_hash"] == _canonical_hash(
         vector["request"]
     )
     for item in vector["project_index_attestations"]:
-        assert host_bridge._normalize_project_index_attestation(
-            item["payload"], now=1_700_000_000
-        ) == item["payload"]
+        assert (
+            host_bridge._normalize_project_index_attestation(
+                item["payload"], now=1_700_000_000
+            )
+            == item["payload"]
+        )
     read_fd, write_fd = os.pipe()
     bridge = host_bridge.InheritedHandleHostBridge.from_file_descriptors(
         read_fd=read_fd,
@@ -1228,34 +1243,42 @@ def test_registry_hash_tamper_never_issues_compiler_evidence(
 ) -> None:
     adapter = _adapter()
     import devkit_runtime.host_session as host_session
-    from devkit_runtime.host_bridge import InheritedHandleHostBridge
+    from devkit_runtime.host_bridge import HostBridgeError, InheritedHandleHostBridge
 
     child, host = _pipe_pair()
     fact = _dispatch_fact(adapter, task="task-1", scope="src/a.py")
     request = _planner_request(adapter, (fact,))
     fact_mapping = adapter._dispatch_fact_mapping(fact)
+    shutdown = threading.Event()
+    evidence_request_received = threading.Event()
+    unexpected_errors: list[HostBridgeError] = []
 
     def host_reply() -> None:
-        evidence_request = host.receive_compiler_evidence_request(now=1_700_000_000)
-        host._send_private(
-            kind="compiler_evidence_response",
-            action_id=evidence_request.preparation_id,
-            payload={
-                "schema": "2718lab-devkit/compiler-evidence-response-v1",
-                "preparation_id": evidence_request.preparation_id,
-                "request_hash": evidence_request.request_hash,
-                "reasoning_effort": evidence_request.reasoning_effort,
-                "verified_route_result_hashes": [fact.route.routing_result_hash],
-                "verified_lease_scope_bindings": [
-                    adapter._lease_scope_binding_hash(fact)
-                ],
-                "dispatch_facts": [fact_mapping],
-                "dispatch_binding_hashes": [fact_mapping["dispatch_binding_hash"]],
-                "nonce": evidence_request.nonce,
-                "expires_at": evidence_request.expires_at,
-                "registry_binding_hash": _hash("0"),
-            },
-        )
+        try:
+            evidence_request = host.receive_compiler_evidence_request(now=1_700_000_000)
+            evidence_request_received.set()
+            host._send_private(
+                kind="compiler_evidence_response",
+                action_id=evidence_request.preparation_id,
+                payload={
+                    "schema": "2718lab-devkit/compiler-evidence-response-v1",
+                    "preparation_id": evidence_request.preparation_id,
+                    "request_hash": evidence_request.request_hash,
+                    "reasoning_effort": evidence_request.reasoning_effort,
+                    "verified_route_result_hashes": [fact.route.routing_result_hash],
+                    "verified_lease_scope_bindings": [
+                        adapter._lease_scope_binding_hash(fact)
+                    ],
+                    "dispatch_facts": [fact_mapping],
+                    "dispatch_binding_hashes": [fact_mapping["dispatch_binding_hash"]],
+                    "nonce": evidence_request.nonce,
+                    "expires_at": evidence_request.expires_at,
+                    "registry_binding_hash": _hash("0"),
+                },
+            )
+        except HostBridgeError as error:
+            if not shutdown.is_set():
+                unexpected_errors.append(error)
 
     thread = threading.Thread(target=host_reply, daemon=True)
     thread.start()
@@ -1278,9 +1301,13 @@ def test_registry_hash_tamper_never_issues_compiler_evidence(
             == adapter.NO_SAFE_WORK
         )
     finally:
-        thread.join(timeout=2)
+        shutdown.set()
         child.close()
+        thread.join(timeout=2)
         host.close()
+    assert not thread.is_alive()
+    assert not evidence_request_received.is_set()
+    assert unexpected_errors == []
 
 
 @pytest.mark.parametrize(

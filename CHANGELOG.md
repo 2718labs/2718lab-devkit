@@ -8,6 +8,49 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-09-01
+
+### Added
+
+- Added a canonical, exact-key, path-free storage-intent contract for Cargo
+  targets, Python caches, MCP packages, and Fast Lane task storage. Intent
+  hashes bind task, plan, context, byte/file budgets, and the complete target
+  descriptor without allowing DevKit to choose a filesystem path or claim a
+  storage lease.
+- Added DevKit-side storage profile/admission validation and compiler-proof
+  plumbing for compatible Hosts. Budgets participate in wave/profile evidence
+  and intent proofs can be privately bound, while the legacy eight-field
+  pre-Host skeleton and public dispatch batch remain free of storage intents;
+  production worker admission is not activated by this repository.
+
+### Fixed
+
+- Hardened verified legacy runtime-store migration so physical and semantic
+  schema shape, metadata, content addresses, acceptance identities, and exact
+  Atlas outbox/finalization bindings are checked before current DDL can run.
+  Schema drift, null/orphan rows, half-upgraded state, or content-address
+  mismatch fail closed.
+- Bounded storage-admission frames, deadlines, cancellation, and active bridge
+  I/O teardown; zero free-space floors and mismatched or unknown receipt fields
+  are rejected before a storage decision can be consumed.
+
+### Security
+
+- On an ordinary Host, the missing compatible private profile/authority
+  exchange keeps budgeted Fast Lane fail-closed with
+  `FASTLANE_HOST_AUTHORITY_UNAVAILABLE`/`NO_SAFE_WORK`. DevKit provides the
+  path-free intent and private protocol, but does not authenticate or provision
+  the Windows protected broker, create its root, activate cleanup, or provide a
+  local writer fallback.
+- Compatible, buildable Host source exists only on Ayleovelle's user-fork
+  [`codex/host-1.1.3-storage-governance-upstream`](https://github.com/Ayleovelle/codex/tree/codex/host-1.1.3-storage-governance-upstream)
+  branch, fixed at immutable commit
+  [`c3dde23bec21c45d10740f2eec09d9a1b87cd329`](https://github.com/Ayleovelle/codex/commit/c3dde23bec21c45d10740f2eec09d9a1b87cd329).
+  This identifies the separate Host source boundary only: it is not merged into
+  OpenAI upstream and is not shipped or activated by this plugin. Stock Codex
+  Hosts still fail closed, and final protected-broker compile, probe, and
+  runtime receipts remain Host-side release evidence rather than DevKit claims.
+
 ## [1.1.2] - 2026-08-27
 
 ### Fixed
