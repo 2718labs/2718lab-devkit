@@ -19,6 +19,11 @@ MANUAL_SKILLS = {
     "python-engineering",
     "workflow-design",
 }
+MCP_DEPENDENCY_SKILLS = {
+    "code-atlas",
+    "fast-lane-routing",
+    "workflow-design",
+}
 RETIRED_MANUAL_SURFACE = re.compile(
     r"(?i)(?:^|[^a-z0-9_-])(?:agents|assets|commands|scripts)[\\/]|"
     r"bugkiller-(?:sol|terra)-"
@@ -148,6 +153,10 @@ class BugkillerMetadataTests(unittest.TestCase):
                         or (
                             relative.startswith("references/")
                             and relative.endswith(".md")
+                        )
+                        or (
+                            skill_name in MCP_DEPENDENCY_SKILLS
+                            and relative == "agents/openai.yaml"
                         )
                         for relative in files
                     ),

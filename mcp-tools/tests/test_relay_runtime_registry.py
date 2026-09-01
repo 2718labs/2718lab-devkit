@@ -381,6 +381,7 @@ def test_windows_named_pipe_selector_opens_duplex_and_exchanges_frames(
 
     errors: list[BaseException] = []
     release_silent_server = threading.Event()
+    server_received_ping = threading.Event()
 
     def serve() -> None:
         nonlocal server_handle
@@ -405,6 +406,7 @@ def test_windows_named_pipe_selector_opens_duplex_and_exchanges_frames(
                 "pipe-ping",
                 {},
             )
+            server_received_ping.set()
             if reply_mode == "pong":
                 host.send_private(
                     kind="capability_ack", action_id="pipe-pong", payload={}
@@ -447,19 +449,10 @@ def test_windows_named_pipe_selector_opens_duplex_and_exchanges_frames(
 
         client_thread = threading.Thread(target=exchange, daemon=True)
         client_thread.start()
+        assert server_received_ping.wait(timeout=2)
+        if reply_mode == "silent":
+            release_silent_server.set()
         client_thread.join(timeout=2)
-        if client_thread.is_alive():
-            assert client_thread.native_id is not None
-            thread_handle = open_thread(0x0001, False, client_thread.native_id)
-            if not thread_handle:
-                raise OSError(ctypes.get_last_error(), "OpenThread failed")
-            try:
-                if not cancel_synchronous_io(thread_handle):
-                    raise OSError(ctypes.get_last_error(), "CancelSynchronousIo failed")
-            finally:
-                close_handle(thread_handle)
-            client_thread.join(timeout=2)
-        release_silent_server.set()
         if reply_mode == "pong":
             assert client_errors == []
         else:
@@ -651,10 +644,13 @@ def test_partial_private_write_poison_session_without_prepared_delivery(
 ) -> None:
     child, host = _pipe_pair()
     original_write = host_bridge_module.os.write
+    transport_write_fd = child._write_fd
     writes = 0
 
     def partial_then_transport_error(descriptor: int, payload: object) -> int:
         nonlocal writes
+        if descriptor != transport_write_fd:
+            return original_write(descriptor, payload)
         writes += 1
         if writes == 1:
             assert isinstance(payload, bytes | memoryview)
