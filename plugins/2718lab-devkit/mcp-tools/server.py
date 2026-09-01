@@ -1008,9 +1008,7 @@ def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
 @mcp.tool(annotations=_tool_annotations("fastlane_compile"))
 def fastlane_compile(
     request: dict[str, object],
-    reasoning_effort: Literal[
-        "low", "medium", "high", "xhigh", "max"
-    ],
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"],
     enable: bool = False,
 ) -> dict[str, object]:
     """Compile inert Fast Lane descriptors without receiving host-private evidence.
@@ -1077,10 +1075,7 @@ def _fastlane_authenticated_dispatch(
         if reasoning_effort == "ultra":
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         session = _host_session()
-        if (
-            type(session) is not HostSession
-            or not session.is_available
-        ):
+        if type(session) is not HostSession or not session.is_available:
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         index_attestation = session.project_index_query_attestation(
             correlation_id=index_query_correlation
@@ -1130,9 +1125,20 @@ def _fastlane_authenticated_dispatch(
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         initial_units = projected["units"]
         remaining_units = projected["remaining_units"]
-        initial_task_ids = {
-            unit["task"]["task_id"] for unit in initial_units
+        initial_storage_budgets = {
+            unit["task"]["task_id"]: unit["storage_budget"]
+            for unit in initial_units
+            if "storage_budget" in unit
         }
+        # The compiler/profile exchange can attest only the live initial
+        # skeletons. Remaining work is materialized later by the Host-owned
+        # refill registry, which has no storage-profile proof channel yet.
+        # Budgeted successors therefore fail closed before publication.
+        if len(initial_storage_budgets) not in {0, len(initial_units)} or any(
+            "storage_budget" in unit for unit in remaining_units
+        ):
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        initial_task_ids = {unit["task"]["task_id"] for unit in initial_units}
         initial_requests: list[dict[str, object]] = []
         remaining_requests: list[dict[str, object]] = []
         for item in routing_snapshot.routing_requests:
@@ -1186,11 +1192,27 @@ def _fastlane_authenticated_dispatch(
             "index_context_hash",
             "attestation_hash",
         )
-        skeletons = compiled["assignment_skeletons"]
+        raw_skeletons = compiled.get("assignment_skeletons")
+        raw_remaining_skeletons = compiled_remaining.get("assignment_skeletons")
+        if type(raw_skeletons) is not list or type(raw_remaining_skeletons) is not list:
+            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+        skeletons: list[dict[str, object]] = []
+        remaining_skeletons: list[dict[str, object]] = []
+        for raw_skeleton, destination in (
+            (raw_skeletons, skeletons),
+            (raw_remaining_skeletons, remaining_skeletons),
+        ):
+            for skeleton in raw_skeleton:
+                if (
+                    type(skeleton) is not dict
+                    or type(skeleton.get("task_id")) is not str
+                ):
+                    return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
+                destination.append(skeleton)
         skeleton_package_hash = validate_authenticated_v5_skeleton_package(
             projected["all_units"],
             skeletons,
-            compiled_remaining["assignment_skeletons"],
+            remaining_skeletons,
             source_plan_hash=projected["source_plan_hash"],
         )
         index_refs = [
@@ -1228,6 +1250,7 @@ def _fastlane_authenticated_dispatch(
             request=planner_request,
             reasoning_effort=reasoning_effort,
             requested_routes=requested_routes,
+            storage_budgets=initial_storage_budgets,
         )
         if prepared == NO_SAFE_WORK:
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
@@ -1248,7 +1271,7 @@ def _fastlane_authenticated_dispatch(
                     unit["task"]["task_id"] for unit in projected["all_units"]
                 ],
                 initial_skeletons=skeletons,
-                remaining_skeletons=compiled_remaining["assignment_skeletons"],
+                remaining_skeletons=remaining_skeletons,
                 index_attestation_refs=[
                     {
                         "task_id": skeleton["task_id"],
@@ -1257,7 +1280,7 @@ def _fastlane_authenticated_dispatch(
                             for field in attestation_ref_fields
                         },
                     }
-                    for skeleton in compiled_remaining["assignment_skeletons"]
+                    for skeleton in remaining_skeletons
                 ],
                 skeleton_package_hash=skeleton_package_hash,
                 now=now,
@@ -1268,24 +1291,22 @@ def _fastlane_authenticated_dispatch(
         def refill_callback(trigger: Mapping[str, object]) -> dict[str, object]:
             """Record the real next-boundary result for this fully dispatched plan."""
 
-            request_hash = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    request,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                ).encode("utf-8")
-            ).hexdigest()
-            queued_ids = [
-                skeleton["task_id"]
-                for skeleton in compiled_remaining["assignment_skeletons"]
-            ]
+            request_hash = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        request,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            queued_ids = [skeleton["task_id"] for skeleton in remaining_skeletons]
             return {
                 "schema": "2718lab-devkit/fastlane-refill-receipt-v1",
-                "state": (
-                    "QUEUED_WAVE_PENDING" if queued_ids else "NO_QUEUED_WORK"
-                ),
+                "state": ("QUEUED_WAVE_PENDING" if queued_ids else "NO_QUEUED_WORK"),
                 "request_hash": request_hash,
                 "refill_trigger_hash": trigger["refill_trigger_hash"],
                 "queue_registry_hash": (

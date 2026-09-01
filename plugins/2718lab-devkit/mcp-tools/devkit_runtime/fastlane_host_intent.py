@@ -14,13 +14,19 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Final, Literal, cast
 
+from .storage_intent import (
+    STORAGE_TARGET_KEY_INVALID,
+    StorageIntent,
+    StorageIntentError,
+    parse_storage_intent,
+)
+
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 UNSPLITTABLE: Final = "UNSPLITTABLE"
 
-_SCHEMA: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
-_RELAY_HOST_SCHEDULER_SLOT_SCHEMA: Final = (
-    "2718lab-devkit/relay-host-scheduler-slot-v1"
-)
+_SCHEMA_V2: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
+_SCHEMA_V3: Final = "2718lab-devkit/fastlane-host-execution-intent-v3"
+_RELAY_HOST_SCHEDULER_SLOT_SCHEMA: Final = "2718lab-devkit/relay-host-scheduler-slot-v1"
 _HOST_TOPOLOGY_SCHEMA: Final = "2718lab-devkit/host-scheduler-topology-v1"
 _PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v2"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -46,6 +52,7 @@ _ROOT_KEYS: Final = frozenset(
         "intent_hash",
     }
 )
+_ROOT_STORAGE_KEYS: Final = _ROOT_KEYS | {"storage_intent", "execution_context_hash"}
 _ASSIGNMENT_KEYS: Final = frozenset(
     {
         "assignment_id",
@@ -240,6 +247,8 @@ class HostExecutionExpectationProjection:
     lease_owner: str
     lease_epoch: int
     lease_fencing_token: str
+    storage_intent: StorageIntent | None = None
+    execution_context_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +296,8 @@ class ParsedHostExecutionIntent:
     lease_epoch: int
     lease_fencing_token: str
     lease_binding_hash: str
+    storage_intent: StorageIntent | None = None
+    execution_context_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,12 +358,14 @@ def validate_host_execution_intent(
 
 def parse_host_execution_intent(
     candidate: object,
-) -> ParsedHostExecutionIntent | Literal["NO_SAFE_WORK"]:
+) -> ParsedHostExecutionIntent | StorageIntentError | Literal["NO_SAFE_WORK"]:
     """Parse a candidate structurally; the result is never an authorization."""
 
     try:
         parsed = _parse(candidate)
-    except Exception:
+    except StorageIntentError as error:
+        return error
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, UnicodeError):
         return NO_SAFE_WORK
     return parsed if parsed is not None else NO_SAFE_WORK
 
@@ -391,8 +404,41 @@ def classify_host_scheduler_topology(
 
 
 def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
-    root = _bound_mapping(candidate, _ROOT_KEYS, "intent_hash")
-    if root is None or _text(root, "schema") != _SCHEMA:
+    schema = candidate.get("schema") if isinstance(candidate, dict) else None
+    if schema == _SCHEMA_V2:
+        root = _bound_mapping(candidate, _ROOT_KEYS, "intent_hash")
+        storage_intent: StorageIntent | None = None
+        execution_context_hash: str | None = None
+    elif schema == _SCHEMA_V3:
+        assignment_candidate = candidate.get("assignment")
+        if (
+            "storage_intent" not in candidate
+            or "execution_context_hash" not in candidate
+            or (
+                isinstance(assignment_candidate, dict)
+                and (
+                    "storage_intent" in assignment_candidate
+                    or "execution_context_hash" in assignment_candidate
+                )
+            )
+        ):
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+        root = _bound_mapping(candidate, _ROOT_STORAGE_KEYS, "intent_hash")
+        if root is None:
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+        try:
+            storage_intent = parse_storage_intent(root["storage_intent"])
+        except StorageIntentError:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError, UnicodeError) as error:
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID) from error
+        raw_execution_context_hash = root["execution_context_hash"]
+        if not _is_hash_value(raw_execution_context_hash):
+            raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+        execution_context_hash = cast(str, raw_execution_context_hash)
+    else:
+        return None
+    if root is None or _text(root, "schema") != schema:
         return None
 
     projection_hash = _valid_hash(root, "projection_hash")
@@ -416,8 +462,7 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
     create = _bound_mapping(root["create"], _CREATE_KEYS, "create_binding_hash")
     lease = _bound_mapping(root["lease"], _LEASE_KEYS, "lease_binding_hash")
     if any(
-        value is None
-        for value in (assignment, route, packets, source, create, lease)
+        value is None for value in (assignment, route, packets, source, create, lease)
     ):
         return None
 
@@ -488,6 +533,15 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         active_lease_set_hash,
     ) = validated_predecessor
 
+    if schema == _SCHEMA_V3 and (
+        storage_intent is None
+        or execution_context_hash is None
+        or storage_intent.task_id != task_id
+        or storage_intent.plan_binding != source_plan_hash
+        or storage_intent.context_hash != execution_context_hash
+    ):
+        raise StorageIntentError(STORAGE_TARGET_KEY_INVALID)
+
     capability_facts = _validate_capability_facts(root["capability_facts"])
     if capability_facts is None or not _has_candidate_capability_claim(
         capability_facts,
@@ -552,7 +606,7 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         return None
 
     return ParsedHostExecutionIntent(
-        schema=_SCHEMA,
+        schema=cast(str, schema),
         intent_hash=intent_hash,
         projection_hash=projection_hash,
         source_plan_hash=source_plan_hash,
@@ -593,6 +647,8 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
         lease_epoch=lease_epoch,
         lease_fencing_token=lease_fencing_token,
         lease_binding_hash=lease_binding_hash,
+        storage_intent=storage_intent,
+        execution_context_hash=execution_context_hash,
     )
 
 
@@ -969,6 +1025,15 @@ def matches_host_execution_expectation(
         and expectation_projection.lease_epoch == parsed_intent.lease_epoch
         and expectation_projection.lease_fencing_token
         == parsed_intent.lease_fencing_token
+        and (
+            expectation_projection.storage_intent is None
+            or expectation_projection.storage_intent == parsed_intent.storage_intent
+        )
+        and (
+            expectation_projection.execution_context_hash is None
+            or expectation_projection.execution_context_hash
+            == parsed_intent.execution_context_hash
+        )
     )
 
 
@@ -978,6 +1043,15 @@ def _is_expectation_projection(
     """Validate comparison fields without simulating a Host trust decision."""
 
     if not _capability_expectations_are_valid(expectation.capability_facts):
+        return False
+    if (
+        expectation.storage_intent is not None
+        and type(expectation.storage_intent) is not StorageIntent
+    ):
+        return False
+    if expectation.execution_context_hash is not None and not _is_hash_value(
+        expectation.execution_context_hash
+    ):
         return False
     hash_values = (
         expectation.candidate_intent_hash,
@@ -1128,6 +1202,22 @@ def _bound_mapping(
     return mapping if _canonical_hash(unbound) == binding_hash else None
 
 
+def _bound_mapping_variant(
+    value: object,
+    expected_keys: tuple[frozenset[str], ...],
+    binding_field: str,
+) -> dict[str, object] | None:
+    mapping = _exact_mapping_variant(value, expected_keys)
+    if mapping is None:
+        return None
+    binding_hash = _valid_hash(mapping, binding_field)
+    if binding_hash is None:
+        return None
+    unbound = dict(mapping)
+    del unbound[binding_field]
+    return mapping if _canonical_hash(unbound) == binding_hash else None
+
+
 def _exact_mapping(
     value: object,
     expected_keys: frozenset[str],
@@ -1136,6 +1226,16 @@ def _exact_mapping(
         return None
     mapping = cast(dict[str, object], value)
     return mapping if set(mapping) == expected_keys else None
+
+
+def _exact_mapping_variant(
+    value: object,
+    expected_keys: tuple[frozenset[str], ...],
+) -> dict[str, object] | None:
+    if type(value) is not dict:
+        return None
+    mapping = cast(dict[str, object], value)
+    return mapping if any(set(mapping) == keys for keys in expected_keys) else None
 
 
 def _text(mapping: dict[str, object], field: str) -> str | None:
