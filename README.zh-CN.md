@@ -1,14 +1,14 @@
 [English](README.md)
 
-# 2718lab DevKit —— Codex + MCP v1.1.2
+# 2718lab DevKit —— Codex + MCP v1.1.3
 
-[![版本](https://img.shields.io/badge/version-v1.1.2-blue)](./.codex-plugin/plugin.json)
+[![版本](https://img.shields.io/badge/version-v1.1.3-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit 是一个 Codex-first 工程工具包：它包含一个本地、仅 stdio
 传输的 MCP 运行时，用于有边界的项目索引、Atlas 证据、Relay 生命周期协调和
 确定性的 Fast Lane 规划；同时还包含一组精简的 Skill 说明书。本仓库承载版本化的
-v1.1.2 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
+v1.1.3 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
 安装、构建和验证章节共同给出支持的工作流。
 
 当前版本保留刻意 fail-closed 的 Fast Lane 预览。公共编译器和 CLI 固定返回
@@ -148,7 +148,7 @@ Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协�
 
 维护者使用专用的 marketplace allowlist 构建该快照：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.2.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.3.zip
 
 ## 本地安装与运行
 
@@ -188,7 +188,7 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.2.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.3.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
@@ -329,7 +329,7 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 ## 版本
 
-本仓库代表版本化的 v1.1.2 包。发布说明见
+本仓库代表版本化的 v1.1.3 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
 和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
 后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。
