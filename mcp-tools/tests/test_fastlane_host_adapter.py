@@ -127,6 +127,13 @@ def _authenticated_v5_fixture() -> dict[str, object]:
         "index_context_hash": hash_a,
         "predecessor_hash": hash_b,
     }
+    planner = team_efficiency._authenticated_v5_helper_module(
+        "authenticated_v5_planner"
+    )
+    normalized_unit = team_efficiency._authenticated_v5_units([unit])[0]
+    unit["task"]["profile_evidence_hash"] = team_efficiency._sha256_json(
+        planner._routing_profile_material(source_plan_hash, normalized_unit)
+    )
     routing_requests = team_efficiency.prepare_authenticated_v5_routing_requests(
         [unit],
         source_plan_hash=source_plan_hash,
