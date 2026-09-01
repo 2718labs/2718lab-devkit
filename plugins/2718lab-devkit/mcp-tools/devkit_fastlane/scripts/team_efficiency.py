@@ -4886,7 +4886,8 @@ def compile_authenticated_v5_assignment_skeletons(
     source_plan_hash: object,
     routing_requests: Sequence[Mapping[str, Any]],
     attestation_items: Sequence[Mapping[str, Any]],
-) -> dict[str, list[dict[str, Any]]]:
+    storage_profiles: object = None,
+) -> dict[str, object]:
     planner = _authenticated_v5_helper_module("authenticated_v5_planner")
     return planner.compile_skeletons(
         _AuthenticatedV5Api(),
@@ -4894,6 +4895,7 @@ def compile_authenticated_v5_assignment_skeletons(
         source_plan_hash=source_plan_hash,
         routing_requests=routing_requests,
         attestation_items=attestation_items,
+        storage_profiles=storage_profiles,
     )
 
 

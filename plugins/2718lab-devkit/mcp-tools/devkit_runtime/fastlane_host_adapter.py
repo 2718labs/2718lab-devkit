@@ -7,6 +7,7 @@ this boundary. Public capability claims remain insufficient to start work.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import unicodedata
@@ -25,7 +26,48 @@ from .host_session import (
 
 NO_SAFE_WORK: Final = "NO_SAFE_WORK"
 _HASH: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_RAW_HASH: Final = re.compile(r"[0-9a-f]{64}\Z")
+_STORAGE_PROFILE_SCHEMA: Final = "2718lab-devkit/storage-profile-v1"
+_STORAGE_INTENT_SCHEMA: Final = "2718lab.storage.intent.v1"
+_STORAGE_TARGET_SCHEMA: Final = "2718lab.storage.target.v1"
+_STORAGE_PROFILE_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "call_intent_hash",
+        "preparation_id",
+        "task_id",
+        "source_plan_hash",
+        "index_attestation_hash",
+        "execution_context_hash",
+        "repository_identity",
+        "workspace_manifest_hash",
+        "cargo_lock_hash",
+        "toolchain_digest",
+        "target_triple",
+        "profile",
+        "features_hash",
+        "build_env_class",
+        "profile_hash",
+        "attestation_hash",
+    }
+)
+_STORAGE_DESCRIPTOR_FIELDS: Final = (
+    "repository_identity",
+    "workspace_manifest_hash",
+    "cargo_lock_hash",
+    "toolchain_digest",
+    "target_triple",
+    "profile",
+    "features_hash",
+    "build_env_class",
+)
 _LABEL: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_PREPARATION_ID: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+_FAST_LANE_TASK_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z")
+_STORAGE_PROFILE_SCALAR: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
+_STORAGE_PROFILE_BUILD_ENV_CLASSES: Final = frozenset(
+    {"managed_read_only", "managed_workspace", "disabled", "external"}
+)
 _PATH_PART: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _WINDOWS_RESERVED_NAMES: Final = frozenset(
     {
@@ -124,6 +166,178 @@ class _PreparedHostFacts:
     evidence_expires_at: int | None = None
     preparation_id: str | None = None
     call_intent_hash: str | None = None
+    storage_budgets: tuple[tuple[str, int, int], ...] = ()
+    storage_intents: tuple[dict[str, object], ...] = field(default=(), repr=False)
+
+
+def _normalized_storage_budgets(
+    value: object,
+) -> tuple[tuple[str, int, int], ...]:
+    """Normalize caller budgets kept outside the pre-Host skeleton."""
+
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping) or len(value) > 16:
+        raise ValueError("storage budgets are unavailable")
+    normalized: list[tuple[str, int, int]] = []
+    for raw_task_id, raw_budget in value.items():
+        if (
+            type(raw_task_id) is not str
+            or _FAST_LANE_TASK_ID.fullmatch(raw_task_id) is None
+            or not isinstance(raw_budget, Mapping)
+        ):
+            raise ValueError("storage budget is invalid")
+        task_id = raw_task_id
+        if set(raw_budget) != {"bytes", "files"}:
+            raise ValueError("storage budget is invalid")
+        requested_bytes = raw_budget.get("bytes")
+        requested_files = raw_budget.get("files")
+        if (
+            type(requested_bytes) is not int
+            or not 0 < requested_bytes <= (1 << 64) - 1
+            or type(requested_files) is not int
+            or not 0 < requested_files <= (1 << 64) - 1
+        ):
+            raise ValueError("storage budget is invalid")
+        normalized.append((task_id, requested_bytes, requested_files))
+    normalized.sort(key=lambda item: item[0])
+    if len({item[0] for item in normalized}) != len(normalized):
+        raise ValueError("storage budget tasks are duplicated")
+    return tuple(normalized)
+
+
+def _storage_intents_for_profiles(
+    profiles: tuple[dict[str, object], ...],
+    assignments: Sequence[Mapping[str, object]],
+    budgets: tuple[tuple[str, int, int], ...],
+) -> list[dict[str, object]]:
+    """Construct post-Host intents from Host facts and external budgets."""
+
+    if not profiles:
+        if budgets:
+            raise ValueError("Host storage profiles are unavailable")
+        return []
+    if not budgets or len(profiles) != len(assignments):
+        raise ValueError("Host storage profiles are incomplete")
+    budget_by_task = {task_id: (bytes_, files) for task_id, bytes_, files in budgets}
+    assignment_task_ids: list[str] = []
+    for assignment in assignments:
+        task_id = assignment.get("task_id")
+        source_plan_hash = assignment.get("source_plan_hash")
+        if (
+            type(task_id) is not str
+            or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+            or type(source_plan_hash) is not str
+            or _HASH.fullmatch(source_plan_hash) is None
+        ):
+            raise ValueError("storage profile assignment binding is invalid")
+        assignment_task_ids.append(task_id)
+    if len(set(assignment_task_ids)) != len(assignment_task_ids) or set(
+        budget_by_task
+    ) != set(assignment_task_ids):
+        raise ValueError("storage budget/profile bindings are invalid")
+    profile_task_ids: list[str] = []
+    for profile in profiles:
+        if type(profile) is not dict or set(profile) != _STORAGE_PROFILE_FIELDS:
+            raise ValueError("Host storage profile fields are invalid")
+        task_id = profile.get("task_id")
+        call_intent_hash = profile.get("call_intent_hash")
+        preparation_id = profile.get("preparation_id")
+        if (
+            type(task_id) is not str
+            or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+            or type(call_intent_hash) is not str
+            or _RAW_HASH.fullmatch(call_intent_hash) is None
+            or type(preparation_id) is not str
+            or _PREPARATION_ID.fullmatch(preparation_id) is None
+            or profile.get("schema") != _STORAGE_PROFILE_SCHEMA
+        ):
+            raise ValueError("Host storage profile is invalid")
+        for field_name in (
+            "source_plan_hash",
+            "index_attestation_hash",
+            "execution_context_hash",
+            "repository_identity",
+            "workspace_manifest_hash",
+            "cargo_lock_hash",
+            "toolchain_digest",
+            "features_hash",
+            "profile_hash",
+            "attestation_hash",
+        ):
+            value = profile.get(field_name)
+            if type(value) is not str or _HASH.fullmatch(value) is None:
+                raise ValueError("Host storage profile hashes are invalid")
+        target_triple = profile.get("target_triple")
+        if (
+            type(target_triple) is not str
+            or _STORAGE_PROFILE_SCALAR.fullmatch(target_triple) is None
+            or profile.get("profile") != "dev"
+        ):
+            raise ValueError("Host storage profile scalar is invalid")
+        if profile.get("build_env_class") not in _STORAGE_PROFILE_BUILD_ENV_CLASSES:
+            raise ValueError("Host storage profile build environment is invalid")
+        unsigned = {
+            key: profile[key]
+            for key in _STORAGE_PROFILE_FIELDS
+            if key not in {"profile_hash", "attestation_hash"}
+        }
+        if not hmac.compare_digest(
+            cast(str, profile["profile_hash"]), _canonical_hash(unsigned)
+        ):
+            raise ValueError("Host storage profile binding is invalid")
+        profile_task_ids.append(task_id)
+    if profile_task_ids != assignment_task_ids:
+        raise ValueError("storage budget/profile bindings are invalid")
+    intents: list[dict[str, object]] = []
+    for assignment, profile in zip(assignments, profiles, strict=True):
+        task_id = assignment.get("task_id")
+        source_plan_hash = assignment.get("source_plan_hash")
+        assert type(task_id) is str
+        budget = budget_by_task.get(task_id)
+        if budget is None or profile.get("source_plan_hash") != source_plan_hash:
+            raise ValueError("storage profile assignment binding is invalid")
+        context_hash = profile.get("execution_context_hash")
+        if (
+            type(source_plan_hash) is not str
+            or _HASH.fullmatch(source_plan_hash) is None
+            or type(context_hash) is not str
+            or _HASH.fullmatch(context_hash) is None
+        ):
+            raise ValueError("storage profile hashes are invalid")
+        descriptor = {
+            "schema": _STORAGE_TARGET_SCHEMA,
+            "artifact_kind": "fastlane-task",
+            **{field: profile.get(field) for field in _STORAGE_DESCRIPTOR_FIELDS},
+        }
+        if any(
+            type(descriptor[field]) is not str or not descriptor[field]
+            for field in _STORAGE_DESCRIPTOR_FIELDS
+        ):
+            raise ValueError("storage profile descriptor is invalid")
+        requested_bytes, requested_files = budget
+        intent_preimage = {
+            "target_descriptor": descriptor,
+            "task_id": task_id,
+            "plan_binding": source_plan_hash,
+            "context_hash": context_hash,
+            "requested_bytes": requested_bytes,
+            "requested_files": requested_files,
+        }
+        intent = {
+            "schema": _STORAGE_INTENT_SCHEMA,
+            "task_id": task_id,
+            "plan_binding": source_plan_hash,
+            "context_hash": context_hash,
+            "storage_intent_hash": _canonical_hash(intent_preimage),
+            "requested_bytes": requested_bytes,
+            "requested_files": requested_files,
+            "target_descriptor": descriptor,
+        }
+        from .storage_intent import parse_storage_intent
+
+        intents.append(parse_storage_intent(intent).to_dict())
+    return intents
 
 
 def prepare_verified_host_facts(
@@ -136,6 +350,7 @@ def prepare_verified_host_facts(
     request: object = None,
     reasoning_effort: object = None,
     requested_routes: Sequence[HostRoute] | object = None,
+    storage_budgets: object = None,
 ) -> _PreparedHostFacts | str:
     """Accept no public substitute for session-owned compiler evidence."""
 
@@ -148,7 +363,9 @@ def prepare_verified_host_facts(
     ):
         return NO_SAFE_WORK
     try:
+        normalized_storage_budgets = _normalized_storage_budgets(storage_budgets)
         bridge_attested = False
+        skeletons: tuple[dict[str, object], ...] = ()
         if request is not None or reasoning_effort is not None:
             normalized_request = _planner_request(request)
             request_bytes = _canonical_bytes(normalized_request)
@@ -183,28 +400,43 @@ def prepare_verified_host_facts(
                 return NO_SAFE_WORK
             else:
                 requested_routes = tuple(requested_routes)
+            skeletons = tuple(
+                cast(
+                    list[dict[str, object]],
+                    normalized_request["assignment_skeletons"],
+                )
+            )
+            storage_task_ids = tuple(
+                cast(str, skeleton["task_id"]) for skeleton in skeletons
+            )
+            if normalized_storage_budgets and {
+                task_id for task_id, _bytes, _files in normalized_storage_budgets
+            } != set(storage_task_ids):
+                return NO_SAFE_WORK
             bridge_attested = session.bind_compiler_request(
                 preparation_id=normalized_preparation_id,
                 call_intent_hash=cast(str, call_intent_hash),
                 request_hash=_hash_bytes(request_bytes),
                 reasoning_effort=reasoning_effort,
                 requested_routes=requested_routes,
-                assignment_skeletons=tuple(
-                    cast(list[dict[str, object]], normalized_request["assignment_skeletons"])
-                ),
+                assignment_skeletons=skeletons,
                 project_index_attestation_refs=tuple(
                     cast(
                         list[dict[str, object]],
                         normalized_request["project_index_attestation_refs"],
                     )
                 ),
-                routing_registry_binding_hash=cast(
-                    str, routing_registry_binding_hash
+                routing_registry_binding_hash=cast(str, routing_registry_binding_hash),
+                storage_task_ids=(
+                    storage_task_ids if normalized_storage_budgets else ()
                 ),
+                storage_budget_bindings=normalized_storage_budgets,
             )
             if not bridge_attested:
                 return NO_SAFE_WORK
         else:
+            if normalized_storage_budgets:
+                return NO_SAFE_WORK
             scheduling = session.scheduling_facts(tuple(capability_facts))
             if type(scheduling) is not HostSchedulingFacts:
                 return NO_SAFE_WORK
@@ -216,6 +448,24 @@ def prepare_verified_host_facts(
         expires_at = session.compiler_evidence_expires_at(evidence)
         if expires_at is None:
             return NO_SAFE_WORK
+        storage_intents: tuple[dict[str, object], ...] = ()
+        if normalized_storage_budgets:
+            profiles = session.storage_profiles_for_compiler_evidence(evidence)
+            if type(profiles) is not tuple:
+                return NO_SAFE_WORK
+            storage_intents = tuple(
+                _storage_intents_for_profiles(
+                    profiles,
+                    skeletons,
+                    normalized_storage_budgets,
+                )
+            )
+            if not session.bind_storage_intent_proof(
+                evidence,
+                storage_budgets=normalized_storage_budgets,
+                storage_intents=storage_intents,
+            ):
+                return NO_SAFE_WORK
         return _PreparedHostFacts(
             session=session,
             evidence=evidence,
@@ -223,9 +473,9 @@ def prepare_verified_host_facts(
             bridge_attested=bridge_attested,
             evidence_expires_at=expires_at,
             preparation_id=normalized_preparation_id,
-            call_intent_hash=(
-                cast(str, call_intent_hash) if bridge_attested else None
-            ),
+            call_intent_hash=(cast(str, call_intent_hash) if bridge_attested else None),
+            storage_budgets=normalized_storage_budgets,
+            storage_intents=storage_intents,
         )
     except Exception:
         return NO_SAFE_WORK
@@ -331,6 +581,37 @@ def compile_fast_lane_with_host_facts(
         ):
             return NO_SAFE_WORK
         _validate_batch_fences(facts)
+        # Storage intents are local compiler proof material only in Task4a.  Do
+        # not extend the established dispatch-batch schema before Task4b owns
+        # Host admission/execution. They are constructed and sealed into the
+        # private compiler invocation after the profile exchange, then
+        # re-derived here to reject a changed budget/profile/intent binding.
+        if prepared.storage_budgets:
+            storage_intents = tuple(
+                _storage_intents_for_profiles(
+                    material.storage_profiles,
+                    fact_mappings,
+                    prepared.storage_budgets,
+                )
+            )
+            storage_intent_hashes = tuple(
+                cast(str, intent["storage_intent_hash"]) for intent in storage_intents
+            )
+            if (
+                material.storage_budget_bindings != prepared.storage_budgets
+                or material.storage_intents != storage_intents
+                or material.storage_intent_hashes != storage_intent_hashes
+                or prepared.storage_intents != storage_intents
+            ):
+                return NO_SAFE_WORK
+        elif (
+            material.storage_profiles
+            or material.storage_budget_bindings
+            or material.storage_intents
+            or material.storage_intent_hashes
+            or prepared.storage_intents
+        ):
+            return NO_SAFE_WORK
         batch: dict[str, object] = {
             "schema": "2718lab-devkit/fastlane-host-dispatch-batch-v1",
             "action": "dispatch_all",
@@ -817,9 +1098,10 @@ def _dispatch_fact_from_mapping(value: object) -> _HostDispatchFact:
         ledger_epoch=cast(int, normalized["ledger_epoch"]),
         active_lease_set_hash=cast(str, normalized["active_lease_set_hash"]),
     )
-    if normalized["dispatch_binding_hash"] != _dispatch_fact_mapping(fact)[
-        "dispatch_binding_hash"
-    ]:
+    if (
+        normalized["dispatch_binding_hash"]
+        != _dispatch_fact_mapping(fact)["dispatch_binding_hash"]
+    ):
         raise ValueError("dispatch binding hash is invalid")
     return fact
 

@@ -20,7 +20,8 @@ import select
 import stat
 import struct
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Event, Lock, RLock
 from typing import Final, cast
@@ -30,6 +31,7 @@ from . import (
     host_envelopes,
     project_index_attestation_protocol,
 )
+from .storage_intent import StorageIntent, StorageIntentError, parse_storage_intent
 
 _FRAME_SCHEMA: Final = "2718lab-devkit/host-bridge-v1"
 _CAPABILITY_PROBE_SCHEMA: Final = "2718lab-devkit/host-capability-probe-v1"
@@ -39,11 +41,42 @@ _CAPABILITY_REPORT_SCHEMA_V2: Final = "2718lab-devkit/host-capability-report-v2"
 _OPERATION_REQUEST_SCHEMA: Final = "2718lab-devkit/host-operation-request-v1"
 _TERMINAL_RESULT_SCHEMA: Final = "2718lab-devkit/host-terminal-result-v1"
 _PROOF_CONTINUATION_SCHEMA: Final = "2718lab-devkit/host-proof-continuation-v1"
-_COMPILER_EVIDENCE_REQUEST_SCHEMA: Final = (
-    "2718lab-devkit/compiler-evidence-request-v1"
-)
+_COMPILER_EVIDENCE_REQUEST_SCHEMA: Final = "2718lab-devkit/compiler-evidence-request-v1"
 _COMPILER_EVIDENCE_RESPONSE_SCHEMA: Final = (
     "2718lab-devkit/compiler-evidence-response-v1"
+)
+_STORAGE_PROFILE_REQUEST_SCHEMA: Final = "2718lab-devkit/storage-profile-request-v1"
+_STORAGE_PROFILE_SCHEMA: Final = "2718lab-devkit/storage-profile-v1"
+_STORAGE_ADMISSION_REQUEST_SCHEMA: Final = "2718lab.storage.admission-request.v1"
+_STORAGE_ADMISSION_RESPONSE_SCHEMA: Final = "2718lab.storage.admission-response.v1"
+_STORAGE_ADMISSION_RECEIPT_SCHEMA: Final = "2718lab.storage.admission-receipt.v1"
+_STORAGE_ADMISSION_REQUEST_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "correlation_id",
+        "profile_attestation_hash",
+        "storage_intent",
+        "request_hash",
+    }
+)
+_STORAGE_ADMISSION_RECEIPT_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "admission_id",
+        "profile_attestation_hash",
+        "storage_intent_hash",
+        "storage_binding_hash",
+        "target_key",
+        "assigned_root_identity",
+        "target_family_lease_id",
+        "reserved_bytes",
+        "reserved_files",
+        "free_space_before",
+        "free_space_after_reserve",
+        "free_space_floor",
+        "expires_at",
+        "receipt_hash",
+    }
 )
 _PROJECT_INDEX_ATTESTATION_SCHEMA: Final = (
     project_index_attestation_protocol.ATTESTATION_SCHEMA
@@ -58,9 +91,7 @@ _FAST_LANE_TERMINAL_RESULT_SCHEMA: Final = (
     fastlane_terminal_protocol.TERMINAL_RESULT_SCHEMA
 )
 _FAST_LANE_TERMINAL_ACK_SCHEMA: Final = fastlane_terminal_protocol.TERMINAL_ACK_SCHEMA
-_FAST_LANE_REFILL_REGISTRY_SCHEMA: Final = (
-    "2718lab-devkit/fast_lane_refill_registry-v1"
-)
+_FAST_LANE_REFILL_REGISTRY_SCHEMA: Final = "2718lab-devkit/fast_lane_refill_registry-v1"
 _FAST_LANE_REFILL_REGISTRY_ACTION_PREFIX: Final = "refill-registry-"
 _FRAME_FIELDS: Final = frozenset(
     {"schema", "kind", "action_id", "session_nonce", "sequence", "payload", "mac"}
@@ -74,6 +105,47 @@ _MAX_PROOF_CONTINUATION_BYTES: Final = 2 * 1024
 _MAX_TERMINAL_OPERATION_TOMBSTONES: Final = 256
 _MAX_COMPILER_EVIDENCE_BYTES: Final = 40 * 1024
 _COMPILER_EVIDENCE_TTL_SECONDS: Final = 120
+_MAX_STORAGE_PROFILE_BYTES: Final = 8 * 1024
+_STORAGE_DESCRIPTOR_FIELDS: Final = (
+    "repository_identity",
+    "workspace_manifest_hash",
+    "cargo_lock_hash",
+    "toolchain_digest",
+    "target_triple",
+    "profile",
+    "features_hash",
+    "build_env_class",
+)
+_STORAGE_PROFILE_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "call_intent_hash",
+        "preparation_id",
+        "task_id",
+        "source_plan_hash",
+        "index_attestation_hash",
+        "execution_context_hash",
+        *_STORAGE_DESCRIPTOR_FIELDS,
+        "profile_hash",
+        "attestation_hash",
+    }
+)
+_STORAGE_PROFILE_REQUEST_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "call_intent_hash",
+        "preparation_id",
+        "task_id",
+        "source_plan_hash",
+        "index_attestation_hash",
+        "nonce",
+        "request_hash",
+    }
+)
+_STORAGE_PROFILE_BUILD_ENV_CLASSES: Final = frozenset(
+    {"managed_read_only", "managed_workspace", "disabled", "external"}
+)
+_STORAGE_PROFILE_SCALAR: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 _CAPABILITY_V2_TTL_SECONDS: Final = 120
 _MAX_PROJECT_INDEX_ATTESTATION_BYTES: Final = (
     project_index_attestation_protocol.MAX_ATTESTATION_BYTES
@@ -88,9 +160,7 @@ _FAST_LANE_TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z")
 _ENDPOINT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MAC = re.compile(r"[0-9a-f]{64}\Z")
-_FAST_LANE_REFILL_REGISTRY_ACTION = re.compile(
-    r"refill-registry-[0-9a-f]{64}\Z"
-)
+_FAST_LANE_REFILL_REGISTRY_ACTION = re.compile(r"refill-registry-[0-9a-f]{64}\Z")
 _FD_SELECTOR = re.compile(r"[0-9]{1,18}\Z")
 _WINDOWS_PIPE_SELECTOR = re.compile(
     r"pipe:(?P<name>codex-devkit-(?P<server_pid>[1-9][0-9]{0,9})-"
@@ -113,6 +183,10 @@ _MESSAGE_KINDS: Final = frozenset(
         "proof_continuation",
         "compiler_evidence_request",
         "compiler_evidence_response",
+        "storage_profile_request",
+        "storage_profile_response",
+        "storage_admission_request",
+        "storage_admission_response",
         "project_index_attestation",
         "routing_attestation_request",
         "routing_attestation_response",
@@ -130,6 +204,10 @@ _VALIDATED_PRIVATE_KINDS: Final = frozenset(
         "proof_continuation",
         "compiler_evidence_request",
         "compiler_evidence_response",
+        "storage_profile_request",
+        "storage_profile_response",
+        "storage_admission_request",
+        "storage_admission_response",
         "project_index_attestation",
         "routing_attestation_request",
         "routing_attestation_response",
@@ -243,6 +321,61 @@ class CompilerEvidenceRequest:
 
 
 @dataclass(frozen=True)
+class StorageProfileRequest:
+    """One private, replay-bound request for Host-owned storage profile facts."""
+
+    call_intent_hash: str
+    preparation_id: str
+    task_id: str
+    source_plan_hash: str
+    index_attestation_hash: str
+    nonce: str = field(repr=False)
+    request_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class StorageAdmissionReceipt:
+    """Host decision, never a local reservation or a private filesystem path."""
+
+    schema: str
+    admission_id: str
+    profile_attestation_hash: str
+    storage_intent_hash: str
+    storage_binding_hash: str
+    target_key: str
+    assigned_root_identity: str
+    target_family_lease_id: str
+    reserved_bytes: int
+    reserved_files: int
+    free_space_before: int
+    free_space_after_reserve: int
+    free_space_floor: int
+    expires_at: int
+    receipt_hash: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            name: getattr(self, name)
+            for name in sorted(_STORAGE_ADMISSION_RECEIPT_FIELDS)
+        }
+
+
+@dataclass(frozen=True)
+class _StorageAdmissionCompletion:
+    """Local authenticated reception, separate from the Host capacity decision.
+
+    Host generation stays opaque in profile-v1; bridge identity below only
+    identifies this Python transport instance, not a fabricated Host generation.
+    """
+
+    request_hash: str
+    response_hash: str
+    bridge_identity: object = field(repr=False)
+    expires_at: int
+    completed_at: int
+
+
+@dataclass(frozen=True)
 class FastLaneRefillRegistryRequest:
     """One authenticated queue of remaining V5 skeletons.
 
@@ -318,6 +451,8 @@ class InheritedHandleHostBridge:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
         self._cancel_event = Event()
         self._close_lock = Lock()
+        self._active_io_count = 0
+        self._descriptors_closed = False
         # A session has one framed sequence in each direction.  Serialize all
         # bridge I/O so concurrent Fast Lane waves cannot interleave bytes or
         # consume one another's sequence slot.
@@ -342,6 +477,13 @@ class InheritedHandleHostBridge:
         self._received_operations: dict[str, OperationReceipt] = {}
         self._pending_compiler_evidence: dict[str, CompilerEvidenceRequest] = {}
         self._received_compiler_evidence: set[str] = set()
+        self._pending_storage_profiles: dict[str, StorageProfileRequest] = {}
+        self._received_storage_profiles: set[str] = set()
+        self._completed_storage_profiles: dict[str, dict[str, object]] = {}
+        self._storage_admission_correlations: set[str] = set()
+        self._storage_admission_decisions: dict[str, StorageAdmissionReceipt] = {}
+        self._storage_admission_completions: dict[str, _StorageAdmissionCompletion] = {}
+        self._storage_transport_identity = object()
         self._sent_fast_lane_refill_registries: set[str] = set()
         self._received_fast_lane_refill_registries: set[str] = set()
         self._received_project_index_attestations: set[str] = set()
@@ -514,7 +656,7 @@ class InheritedHandleHostBridge:
 
     @property
     def is_available(self) -> bool:
-        return not self._closed
+        return not self._closed and not self._cancel_event.is_set()
 
     def prepare_capability(
         self,
@@ -726,9 +868,10 @@ class InheritedHandleHostBridge:
         attestations: Sequence[Mapping[str, object]],
         now: int,
     ) -> dict[str, object]:
-        if self._received_routing_attestations.get(
-            request.routing_request_set_hash
-        ) != request:
+        if (
+            self._received_routing_attestations.get(request.routing_request_set_hash)
+            != request
+        ):
             raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
         unsigned: dict[str, object] = {
             "schema": _ROUTING_ATTESTATION_RESPONSE_SCHEMA,
@@ -756,9 +899,10 @@ class InheritedHandleHostBridge:
     def receive_routing_attestation_response(
         self, *, request: RoutingAttestationRequest, now: int
     ) -> dict[str, object]:
-        if self._pending_routing_attestations.get(
-            request.routing_request_set_hash
-        ) != request:
+        if (
+            self._pending_routing_attestations.get(request.routing_request_set_hash)
+            != request
+        ):
             raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
         try:
             message = self._receive_private()
@@ -1010,7 +1154,8 @@ class InheritedHandleHostBridge:
             if (
                 message.kind != "fast_lane_refill_registry"
                 or message.action_id != expected_action
-                or request.queue_registry_hash in self._received_fast_lane_refill_registries
+                or request.queue_registry_hash
+                in self._received_fast_lane_refill_registries
             ):
                 raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
         except HostBridgeError:
@@ -1248,9 +1393,7 @@ class InheritedHandleHostBridge:
                 "reasoning_effort": reasoning_effort,
                 "requested_route_pairs": list(requested_route_pairs),
                 "assignment_skeletons": list(assignment_skeletons),
-                "project_index_attestation_refs": list(
-                    project_index_attestation_refs
-                ),
+                "project_index_attestation_refs": list(project_index_attestation_refs),
                 "routing_registry_binding_hash": routing_registry_binding_hash,
                 "nonce": nonce,
                 "expires_at": now + _COMPILER_EVIDENCE_TTL_SECONDS,
@@ -1279,9 +1422,7 @@ class InheritedHandleHostBridge:
         assert type(attestation_hash) is str
         if attestation_hash in self._received_project_index_attestations:
             raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
-        _validate_private_packet_size(
-            normalized, _MAX_PROJECT_INDEX_ATTESTATION_BYTES
-        )
+        _validate_private_packet_size(normalized, _MAX_PROJECT_INDEX_ATTESTATION_BYTES)
         self._send_validated_private(
             kind="project_index_attestation",
             action_id=cast(str, normalized["correlation_id"]),
@@ -1296,22 +1437,14 @@ class InheritedHandleHostBridge:
         try:
             message = self._receive_private()
             if message.kind != "project_index_attestation":
-                raise HostBridgeError(
-                    "HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID"
-                )
-            normalized = _normalize_project_index_attestation(
-                message.payload, now=now
-            )
+                raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
+            normalized = _normalize_project_index_attestation(message.payload, now=now)
             if message.action_id != normalized["correlation_id"]:
-                raise HostBridgeError(
-                    "HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID"
-                )
+                raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
             attestation_hash = normalized["attestation_hash"]
             assert type(attestation_hash) is str
             if attestation_hash in self._received_project_index_attestations:
-                raise HostBridgeError(
-                    "HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID"
-                )
+                raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
         except HostBridgeError:
             self._poison()
             raise
@@ -1382,6 +1515,228 @@ class InheritedHandleHostBridge:
             raise
         del self._pending_compiler_evidence[request.preparation_id]
         return normalized
+
+    def send_storage_profile_request(
+        self,
+        *,
+        call_intent_hash: str,
+        preparation_id: str,
+        task_id: str,
+        source_plan_hash: str,
+        index_attestation_hash: str,
+    ) -> StorageProfileRequest:
+        """Ask the Host for one path-free profile tied to a private session."""
+
+        nonce = _b64encode(secrets.token_bytes(32))
+        unsigned = {
+            "schema": _STORAGE_PROFILE_REQUEST_SCHEMA,
+            "call_intent_hash": call_intent_hash,
+            "preparation_id": preparation_id,
+            "task_id": task_id,
+            "source_plan_hash": source_plan_hash,
+            "index_attestation_hash": index_attestation_hash,
+            "nonce": nonce,
+        }
+        request = _normalize_storage_profile_request(
+            {**unsigned, "request_hash": _private_payload_hash(unsigned)}
+        )
+        if request.request_hash in self._pending_storage_profiles:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        payload = _storage_profile_request_payload(request)
+        _validate_private_packet_size(payload, _MAX_STORAGE_PROFILE_BYTES)
+        self._send_validated_private(
+            kind="storage_profile_request",
+            action_id=_storage_profile_action_id(request),
+            payload=payload,
+        )
+        self._pending_storage_profiles[request.request_hash] = request
+        return request
+
+    def receive_storage_profile_request(self) -> StorageProfileRequest:
+        """Receive exactly one Host-bound storage profile request once."""
+
+        try:
+            message = self._receive_private()
+            request = _parse_storage_profile_request(message)
+            if request.request_hash in self._received_storage_profiles:
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        except HostBridgeError:
+            self._poison()
+            raise
+        self._received_storage_profiles.add(request.request_hash)
+        return request
+
+    def send_storage_profile_response(
+        self,
+        *,
+        request: StorageProfileRequest,
+        response: Mapping[str, object],
+    ) -> None:
+        """Return one exact Host profile to the request's private session."""
+
+        normalized_request = _normalize_storage_profile_request(
+            _storage_profile_request_payload(request)
+        )
+        if normalized_request.request_hash not in self._received_storage_profiles:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        normalized = _normalize_storage_profile_response(
+            response, request=normalized_request
+        )
+        _validate_private_packet_size(normalized, _MAX_STORAGE_PROFILE_BYTES)
+        self._send_validated_private(
+            kind="storage_profile_response",
+            action_id=_storage_profile_action_id(normalized_request),
+            payload=normalized,
+        )
+        self._received_storage_profiles.remove(normalized_request.request_hash)
+
+    def receive_storage_profile_response(
+        self, *, request: StorageProfileRequest
+    ) -> dict[str, object]:
+        """Consume one exact response bound to its still-pending request."""
+
+        normalized_request = _normalize_storage_profile_request(
+            _storage_profile_request_payload(request)
+        )
+        if (
+            self._pending_storage_profiles.get(normalized_request.request_hash)
+            != normalized_request
+        ):
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        try:
+            message = self._receive_private()
+            if (
+                message.kind != "storage_profile_response"
+                or message.action_id != _storage_profile_action_id(normalized_request)
+            ):
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+            normalized = _normalize_storage_profile_response(
+                message.payload, request=normalized_request
+            )
+        except HostBridgeError:
+            self._poison()
+            raise
+        del self._pending_storage_profiles[normalized_request.request_hash]
+        attestation = cast(str, normalized["attestation_hash"])
+        previous = self._completed_storage_profiles.get(attestation)
+        if previous is not None and previous != normalized:
+            self._poison()
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+        self._completed_storage_profiles[attestation] = dict(normalized)
+        return normalized
+
+    def request_storage_admission(
+        self,
+        request: Mapping[str, object],
+        *,
+        now: int,
+        expires_at: int,
+        clock: Callable[[], float],
+    ) -> StorageAdmissionReceipt:
+        """Exchange one decision before terminal reception starts; never admit locally.
+
+        The owning HostSession serializes this round trip with preparation and
+        terminal-reader startup. The existing bridge I/O lock owns both frames.
+        """
+        with self._storage_admission_io(now=now, expires_at=expires_at) as deadline:
+            normalized = _normalize_storage_admission_request(request)
+            correlation = cast(str, normalized["correlation_id"])
+            attestation = cast(str, normalized["profile_attestation_hash"])
+            profile = self._completed_storage_profiles.get(attestation)
+            intent = parse_storage_intent(normalized["storage_intent"])
+            if profile is None:
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+            _validate_storage_admission_profile(intent, profile)
+            if (
+                type(now) is not int
+                or type(expires_at) is not int
+                or not 0 <= now < expires_at <= (1 << 64) - 1
+                or correlation in self._storage_admission_correlations
+            ):
+                raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+            previous = self._storage_admission_decisions.get(attestation)
+            if (
+                previous is not None
+                and previous.storage_intent_hash != intent.storage_intent_hash
+            ):
+                raise HostBridgeError("STORAGE_LEASE_CONFLICT")
+            # Burn before writing, including transport failure; retry must use a
+            # fresh correlation and still obtain a decision from the Host.
+            self._storage_admission_correlations.add(correlation)
+            try:
+                self._send_validated_private(
+                    kind="storage_admission_request",
+                    action_id=correlation,
+                    payload=normalized,
+                    deadline=deadline,
+                )
+                message = self._receive_private(deadline=deadline)
+                if (
+                    message.kind != "storage_admission_response"
+                    or message.action_id != correlation
+                ):
+                    raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+                completed_time = clock()
+                if (
+                    type(completed_time) not in (int, float)
+                    or not math.isfinite(completed_time)
+                    or completed_time < now
+                ):
+                    raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+                completed_at = int(completed_time)
+                receipt = _normalize_storage_admission_response(
+                    message.payload,
+                    request=normalized,
+                    now=completed_at,
+                    expires_at=expires_at,
+                )
+                if previous is not None and previous != receipt:
+                    raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+            except HostBridgeError:
+                self._poison()
+                raise
+            self._storage_admission_decisions[attestation] = receipt
+            self._storage_admission_completions[correlation] = (
+                _StorageAdmissionCompletion(
+                    request_hash=cast(str, normalized["request_hash"]),
+                    response_hash=_private_payload_hash(message.payload),
+                    bridge_identity=self._storage_transport_identity,
+                    expires_at=receipt.expires_at,
+                    completed_at=completed_at,
+                )
+            )
+            return receipt
+
+    @contextmanager
+    def _storage_admission_io(self, *, now: int, expires_at: int) -> Iterator[float]:
+        if (
+            type(now) is not int
+            or type(expires_at) is not int
+            or not 0 <= now < expires_at <= (1 << 64) - 1
+        ):
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+        # One monotonic deadline covers lock acquisition, bootstrap/request
+        # writes, reply length prefix, and reply payload. Partial progress must
+        # never restart the authority-derived transport budget.
+        deadline = time.monotonic() + (expires_at - now)
+        while not self._io_lock.acquire(
+            timeout=min(0.1, _remaining_io_time(deadline, self._cancel_event))
+        ):
+            pass
+        try:
+            self._ensure_open()
+            yield deadline
+        finally:
+            self._io_lock.release()
+
+    def has_completed_storage_profile(self, profile: Mapping[str, object]) -> bool:
+        """Lookup transport-completed facts; caller-supplied hashes cannot enroll."""
+        attestation = profile.get("attestation_hash")
+        return (
+            self.is_available
+            and type(attestation) is str
+            and self._completed_storage_profiles.get(attestation) == profile
+        )
 
     def receive_operation(
         self,
@@ -1598,16 +1953,28 @@ class InheritedHandleHostBridge:
         self._send_private(kind=kind, action_id=action_id, payload=payload)
 
     def _send_validated_private(
-        self, *, kind: str, action_id: str, payload: Mapping[str, object]
+        self,
+        *,
+        kind: str,
+        action_id: str,
+        payload: Mapping[str, object],
+        deadline: float | None = None,
     ) -> None:
         """Write a packet only after its typed private validator has succeeded."""
 
         if kind not in _VALIDATED_PRIVATE_KINDS:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
-        self._send_private(kind=kind, action_id=action_id, payload=payload)
+        self._send_private(
+            kind=kind, action_id=action_id, payload=payload, deadline=deadline
+        )
 
     def _send_private(
-        self, *, kind: str, action_id: str, payload: Mapping[str, object]
+        self,
+        *,
+        kind: str,
+        action_id: str,
+        payload: Mapping[str, object],
+        deadline: float | None = None,
     ) -> None:
         with self._io_lock:
             if kind not in _MESSAGE_KINDS or kind == "session_open":
@@ -1636,9 +2003,9 @@ class InheritedHandleHostBridge:
                 self._poison()
                 raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID") from None
             if bootstrap is not None:
-                self._write_complete(bootstrap)
+                self._write_complete(bootstrap, deadline=deadline)
                 self._bootstrap_sent = True
-            self._write_complete(private_frame)
+            self._write_complete(private_frame, deadline=deadline)
             self._next_out += 1
 
     def receive(self) -> PrivateHostMessage:
@@ -1650,10 +2017,10 @@ class InheritedHandleHostBridge:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
         return message
 
-    def _receive_private(self) -> PrivateHostMessage:
+    def _receive_private(self, *, deadline: float | None = None) -> PrivateHostMessage:
         """Read one framed message for a typed private validator."""
 
-        with self._io_lock:
+        with self._io_lock, self._active_io():
             self._ensure_open()
             try:
                 frame = _decode_frame(
@@ -1661,6 +2028,7 @@ class InheritedHandleHostBridge:
                         self._read_fd,
                         cancel_event=self._cancel_event,
                         cancel_fd=self._cancel_read_fd,
+                        deadline=deadline,
                     )
                 )
                 self._verify_frame(frame, expected_sequence=self._next_in)
@@ -1686,39 +2054,66 @@ class InheritedHandleHostBridge:
                 payload=payload,
             )
 
+    def cancel_read(self) -> None:
+        """Cancel blocked I/O without waiting for its lock or closing its fd."""
+        with self._close_lock:
+            self._signal_cancel_locked()
+
+    def _signal_cancel_locked(self) -> None:
+        if self._cancel_event.is_set():
+            return
+        self._cancel_event.set()
+        try:
+            os.write(self._cancel_write_fd, b"\x00")
+        except OSError:
+            pass
+
     def close(self) -> None:
-        """Close only the descriptor(s) this bridge owns."""
+        """Cancel immediately; close owned fds after the last active I/O exits.
+
+        This does not wait on the I/O lock, including when _poison calls us
+        reentrantly. A legacy blocking write may retain its fds until that OS
+        call returns; close returning is not evidence of kernel I/O shutdown.
+        """
 
         with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._cancel_event.set()
-            try:
-                os.write(self._cancel_write_fd, b"\\x00")
-            except OSError:
-                pass
-            cancel_descriptors = {
-                self._cancel_read_fd,
-                self._cancel_write_fd,
-            }
-            self._cancel_read_fd = -1
-            self._cancel_write_fd = -1
-            for descriptor in cancel_descriptors:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            if not self._owns_descriptors:
-                return
-            descriptors = {self._read_fd, self._write_fd}
+            if not self._closed:
+                self._closed = True
+                self._signal_cancel_locked()
+            if self._active_io_count == 0:
+                self._close_descriptors_locked()
+
+    @contextmanager
+    def _active_io(self) -> Iterator[None]:
+        # Enrollment and close's unavailable transition are atomic. No new
+        # operation may borrow an fd after close/cancel has begun.
+        with self._close_lock:
+            self._ensure_open()
+            self._active_io_count += 1
+        try:
+            yield
+        finally:
+            with self._close_lock:
+                self._active_io_count -= 1
+                if self._closed and self._active_io_count == 0:
+                    self._close_descriptors_locked()
+
+    def _close_descriptors_locked(self) -> None:
+        if self._descriptors_closed:
+            return
+        self._descriptors_closed = True
+        descriptors = {self._cancel_read_fd, self._cancel_write_fd}
+        self._cancel_read_fd = -1
+        self._cancel_write_fd = -1
+        if self._owns_descriptors:
+            descriptors.update((self._read_fd, self._write_fd))
             self._read_fd = -1
             self._write_fd = -1
-            for descriptor in descriptors:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
     def _frame_bytes(
         self, *, kind: str, action_id: str, sequence: int, payload: dict[str, object]
@@ -1789,21 +2184,68 @@ class InheritedHandleHostBridge:
         *,
         cancel_event: Event | None = None,
         cancel_fd: int | None = None,
+        deadline: float | None = None,
     ) -> bytes:
         header = _read_exact(
-            descriptor, 4, cancel_event=cancel_event, cancel_fd=cancel_fd
+            descriptor,
+            4,
+            cancel_event=cancel_event,
+            cancel_fd=cancel_fd,
+            deadline=deadline,
         )
         size = struct.unpack("!I", header)[0]
         if size == 0 or size > _MAX_FRAME_BYTES:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
         return _read_exact(
-            descriptor, size, cancel_event=cancel_event, cancel_fd=cancel_fd
+            descriptor,
+            size,
+            cancel_event=cancel_event,
+            cancel_fd=cancel_fd,
+            deadline=deadline,
         )
 
-    def _write_complete(self, payload: bytes) -> None:
+    def _write_complete(self, payload: bytes, *, deadline: float | None = None) -> None:
+        # Keep the descriptor/HANDLE alive through the writer's finally mode
+        # restoration, including direct bridge.close() from another caller.
+        with self._active_io():
+            self._write_complete_active(payload, deadline=deadline)
+
+    def _write_complete_active(self, payload: bytes, *, deadline: float | None) -> None:
         try:
+            if deadline is not None:
+                with _nonblocking_pipe_writer(self._write_fd) as write:
+                    offset = 0
+                    while offset < len(payload):
+                        remaining = _remaining_io_time(deadline, self._cancel_event)
+                        if os.name != "nt":
+                            readable, writable, _ = select.select(
+                                [self._cancel_read_fd],
+                                [self._write_fd],
+                                [],
+                                min(0.1, remaining),
+                            )
+                            if readable:
+                                raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+                            if not writable:
+                                continue
+                        try:
+                            written = write(payload[offset:])
+                        except BlockingIOError:
+                            written = 0
+                        if written < 0 or written > len(payload) - offset:
+                            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+                        offset += written
+                        if written == 0:
+                            self._cancel_event.wait(
+                                min(
+                                    0.05,
+                                    _remaining_io_time(deadline, self._cancel_event),
+                                )
+                            )
+                    _remaining_io_time(deadline, self._cancel_event)
+                return
             written = os.write(self._write_fd, payload)
-        except OSError as error:
+        except (HostBridgeError, OSError, ValueError) as error:
             self._poison()
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
         if written != len(payload):
@@ -1867,7 +2309,12 @@ class InheritedHandleHostBridge:
             del self._terminal_operation_tombstones[key]
 
     def _ensure_open(self) -> None:
-        if self._closed or self._read_fd < 0 or self._write_fd < 0:
+        if (
+            self._closed
+            or self._cancel_event.is_set()
+            or self._read_fd < 0
+            or self._write_fd < 0
+        ):
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
 
 
@@ -2087,9 +2534,10 @@ def _normalize_routing_attestation_response(
                 raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
             task_id = original_request["task"]["task_id"]
             binding_hash = fastlane_routing.v5_request_binding_hash(original_request)
-            if item.get("task_id") != task_id or item.get(
-                "request_binding_hash"
-            ) != binding_hash:
+            if (
+                item.get("task_id") != task_id
+                or item.get("request_binding_hash") != binding_hash
+            ):
                 raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
             routed_request = dict(original_request)
             routed_request["child_route_attestation"] = item.get("attestation")
@@ -2631,10 +3079,11 @@ def _validate_skeleton_package_coverage(
         or len(set(source_ids)) != len(source_ids)
     ):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
-    if not isinstance(initial_skeletons, Sequence) or isinstance(
-        initial_skeletons, (str, bytes, bytearray)
-    ) or not isinstance(remaining_skeletons, Sequence) or isinstance(
-        remaining_skeletons, (str, bytes, bytearray)
+    if (
+        not isinstance(initial_skeletons, Sequence)
+        or isinstance(initial_skeletons, (str, bytes, bytearray))
+        or not isinstance(remaining_skeletons, Sequence)
+        or isinstance(remaining_skeletons, (str, bytes, bytearray))
     ):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
     combined = [*initial_skeletons, *remaining_skeletons]
@@ -2780,8 +3229,7 @@ def _normalize_fast_lane_refill_registry_request(
     if not hmac.compare_digest(skeleton_package_hash, expected_package_hash):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
     if any(
-        item["index_context_hash"] != index_context_hash
-        for item in normalized_initial
+        item["index_context_hash"] != index_context_hash for item in normalized_initial
     ):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
     unsigned = dict(value)
@@ -2839,6 +3287,307 @@ def build_project_index_attestation(
 
 def _is_index_correlation(value: object) -> bool:
     return project_index_attestation_protocol.is_index_correlation(value)
+
+
+def build_storage_admission_request(
+    intent: StorageIntent, *, profile_attestation_hash: str
+) -> dict[str, object]:
+    """Build exact5; a canonical digest is a reference, never proof of issuance."""
+    if type(intent) is not StorageIntent:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    unsigned = {
+        "schema": _STORAGE_ADMISSION_REQUEST_SCHEMA,
+        "correlation_id": "storage-admit-" + secrets.token_hex(32),
+        "profile_attestation_hash": profile_attestation_hash,
+        "storage_intent": intent.to_dict(),
+    }
+    return _normalize_storage_admission_request(
+        {**unsigned, "request_hash": _private_payload_hash(unsigned)}
+    )
+
+
+def _normalize_storage_admission_request(value: object) -> dict[str, object]:
+    if (
+        type(value) is not dict
+        or set(value) != _STORAGE_ADMISSION_REQUEST_FIELDS
+        or value.get("schema") != _STORAGE_ADMISSION_REQUEST_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    _validate_private_packet_size(value, _MAX_OPERATION_PACKET_BYTES)
+    correlation = value.get("correlation_id")
+    if type(correlation) is not str or _IDENTIFIER.fullmatch(correlation) is None:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    for name in ("profile_attestation_hash", "request_hash"):
+        if type(value[name]) is not str or _DIGEST.fullmatch(value[name]) is None:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    try:
+        intent = parse_storage_intent(value["storage_intent"])
+    except StorageIntentError as error:
+        raise HostBridgeError(error.code) from error
+    normalized = {**value, "storage_intent": intent.to_dict()}
+    if normalized["request_hash"] != _private_payload_hash(
+        {name: item for name, item in normalized.items() if name != "request_hash"}
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    return normalized
+
+
+def _validate_storage_admission_profile(
+    intent: StorageIntent, profile: Mapping[str, object]
+) -> None:
+    if (
+        intent.task_id != profile.get("task_id")
+        or intent.plan_binding != profile.get("source_plan_hash")
+        or intent.context_hash != profile.get("execution_context_hash")
+        or intent.target_descriptor["artifact_kind"] != "fastlane-task"
+        or any(
+            intent.target_descriptor[name] != profile.get(name)
+            for name in _STORAGE_DESCRIPTOR_FIELDS
+        )
+    ):
+        raise HostBridgeError("STORAGE_TARGET_KEY_INVALID")
+
+
+def _normalize_storage_admission_response(
+    value: object, *, request: Mapping[str, object], now: int, expires_at: int
+) -> StorageAdmissionReceipt:
+    request = _normalize_storage_admission_request(request)
+    if (
+        type(value) is not dict
+        or set(value) != {"schema", "correlation_id", "request_hash", "receipt"}
+        or value.get("schema") != _STORAGE_ADMISSION_RESPONSE_SCHEMA
+        or value.get("correlation_id") != request["correlation_id"]
+        or value.get("request_hash") != request["request_hash"]
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    _validate_private_packet_size(value, _MAX_OPERATION_PACKET_BYTES)
+    receipt = value["receipt"]
+    if (
+        type(receipt) is not dict
+        or set(receipt) != _STORAGE_ADMISSION_RECEIPT_FIELDS
+        or receipt.get("schema") != _STORAGE_ADMISSION_RECEIPT_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    # Both Host-minted IDs are frozen SHA-256 identities, not UUIDs or paths.
+    for name in (
+        "admission_id",
+        "target_family_lease_id",
+        "profile_attestation_hash",
+        "storage_intent_hash",
+        "storage_binding_hash",
+        "target_key",
+        "assigned_root_identity",
+        "receipt_hash",
+    ):
+        if type(receipt[name]) is not str or _DIGEST.fullmatch(receipt[name]) is None:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    for name in (
+        "reserved_bytes",
+        "reserved_files",
+        "free_space_before",
+        "free_space_after_reserve",
+        "free_space_floor",
+        "expires_at",
+    ):
+        if type(receipt[name]) is not int or not 0 <= receipt[name] <= (1 << 64) - 1:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    intent = parse_storage_intent(request["storage_intent"])
+    if (
+        type(now) is not int
+        or type(expires_at) is not int
+        or not 0 <= now < receipt["expires_at"] <= expires_at <= (1 << 64) - 1
+        or receipt["profile_attestation_hash"] != request["profile_attestation_hash"]
+        or receipt["storage_intent_hash"] != intent.storage_intent_hash
+        or receipt["target_key"]
+        != _private_payload_hash(dict(intent.target_descriptor))
+        or receipt["reserved_bytes"] != intent.requested_bytes
+        or receipt["reserved_files"] != intent.requested_files
+        or receipt["free_space_floor"] == 0
+        or receipt["free_space_after_reserve"]
+        > receipt["free_space_before"] - receipt["reserved_bytes"]
+        or receipt["free_space_after_reserve"] < receipt["free_space_floor"]
+        or receipt["receipt_hash"]
+        != _private_payload_hash(
+            {name: item for name, item in receipt.items() if name != "receipt_hash"}
+        )
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
+    return StorageAdmissionReceipt(**receipt)
+
+
+def _normalize_storage_profile_request(value: object) -> StorageProfileRequest:
+    """Validate one exact, nonce-bound private profile request."""
+
+    if (
+        type(value) is not dict
+        or set(value) != _STORAGE_PROFILE_REQUEST_FIELDS
+        or value.get("schema") != _STORAGE_PROFILE_REQUEST_SCHEMA
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    call_intent_hash = value.get("call_intent_hash")
+    preparation_id = value.get("preparation_id")
+    task_id = value.get("task_id")
+    source_plan_hash = value.get("source_plan_hash")
+    index_attestation_hash = value.get("index_attestation_hash")
+    nonce = value.get("nonce")
+    request_hash = value.get("request_hash")
+    if (
+        type(call_intent_hash) is not str
+        or len(call_intent_hash) != 64
+        or any(character not in "0123456789abcdef" for character in call_intent_hash)
+        or type(preparation_id) is not str
+        or _IDENTIFIER.fullmatch(preparation_id) is None
+        or type(task_id) is not str
+        or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+        or type(source_plan_hash) is not str
+        or _DIGEST.fullmatch(source_plan_hash) is None
+        or type(index_attestation_hash) is not str
+        or _DIGEST.fullmatch(index_attestation_hash) is None
+        or type(nonce) is not str
+        or type(request_hash) is not str
+        or _DIGEST.fullmatch(request_hash) is None
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    try:
+        decoded_nonce = _b64decode(nonce)
+    except ValueError as error:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID") from error
+    if len(decoded_nonce) != 32 or _b64encode(decoded_nonce) != nonce:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    unsigned = dict(value)
+    unsigned.pop("request_hash")
+    if not hmac.compare_digest(request_hash, _private_payload_hash(unsigned)):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    return StorageProfileRequest(
+        call_intent_hash=call_intent_hash,
+        preparation_id=preparation_id,
+        task_id=task_id,
+        source_plan_hash=source_plan_hash,
+        index_attestation_hash=index_attestation_hash,
+        nonce=nonce,
+        request_hash=request_hash,
+    )
+
+
+def _storage_profile_request_payload(
+    request: StorageProfileRequest,
+) -> dict[str, object]:
+    if type(request) is not StorageProfileRequest:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    return {
+        "schema": _STORAGE_PROFILE_REQUEST_SCHEMA,
+        "call_intent_hash": request.call_intent_hash,
+        "preparation_id": request.preparation_id,
+        "task_id": request.task_id,
+        "source_plan_hash": request.source_plan_hash,
+        "index_attestation_hash": request.index_attestation_hash,
+        "nonce": request.nonce,
+        "request_hash": request.request_hash,
+    }
+
+
+def _storage_profile_action_id(request: StorageProfileRequest) -> str:
+    normalized = _normalize_storage_profile_request(
+        _storage_profile_request_payload(request)
+    )
+    # The Host multiplexes the private profile exchange under the same
+    # preparation action as compiler evidence.  ``request_hash`` is still
+    # verified from the exact eight-field payload, but it is not a wire action
+    # identifier; Rust therefore requires this exact preparation id on both
+    # the request and response frames.
+    return normalized.preparation_id
+
+
+def _parse_storage_profile_request(
+    message: PrivateHostMessage,
+) -> StorageProfileRequest:
+    if message.kind != "storage_profile_request":
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    request = _normalize_storage_profile_request(message.payload)
+    if message.action_id != _storage_profile_action_id(request):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    _validate_private_packet_size(message.payload, _MAX_STORAGE_PROFILE_BYTES)
+    return request
+
+
+def _normalize_storage_profile_response(
+    value: object,
+    *,
+    request: StorageProfileRequest,
+) -> dict[str, object]:
+    """Validate the exact Host-owned profile and its request bindings.
+
+    ``attestation_hash`` deliberately remains opaque: the Host includes its
+    private bridge generation and expiry deadline in that attestation, neither
+    of which crosses this Python protocol boundary.  The authenticated frame,
+    pending request, and exact profile hash still make substitution fail closed.
+    """
+
+    if type(request) is not StorageProfileRequest:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    normalized_request = _normalize_storage_profile_request(
+        _storage_profile_request_payload(request)
+    )
+    if (
+        type(value) is not dict
+        or set(value) != _STORAGE_PROFILE_FIELDS
+        or value.get("schema") != _STORAGE_PROFILE_SCHEMA
+        or value.get("call_intent_hash") != normalized_request.call_intent_hash
+        or value.get("preparation_id") != normalized_request.preparation_id
+        or value.get("task_id") != normalized_request.task_id
+        or value.get("source_plan_hash") != normalized_request.source_plan_hash
+        or value.get("index_attestation_hash")
+        != normalized_request.index_attestation_hash
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    call_intent_hash = value.get("call_intent_hash")
+    preparation_id = value.get("preparation_id")
+    task_id = value.get("task_id")
+    if (
+        type(call_intent_hash) is not str
+        or len(call_intent_hash) != 64
+        or any(character not in "0123456789abcdef" for character in call_intent_hash)
+        or type(preparation_id) is not str
+        or _IDENTIFIER.fullmatch(preparation_id) is None
+        or type(task_id) is not str
+        or _FAST_LANE_TASK_ID.fullmatch(task_id) is None
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    for field_name in (
+        "source_plan_hash",
+        "index_attestation_hash",
+        "execution_context_hash",
+        "repository_identity",
+        "workspace_manifest_hash",
+        "cargo_lock_hash",
+        "toolchain_digest",
+        "features_hash",
+        "profile_hash",
+        "attestation_hash",
+    ):
+        item = value.get(field_name)
+        if type(item) is not str or _DIGEST.fullmatch(item) is None:
+            raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    target_triple = value.get("target_triple")
+    if (
+        type(target_triple) is not str
+        or _STORAGE_PROFILE_SCALAR.fullmatch(target_triple) is None
+        or value.get("profile") != "dev"
+    ):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    if value.get("build_env_class") not in _STORAGE_PROFILE_BUILD_ENV_CLASSES:
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    unsigned = {
+        field_name: value[field_name]
+        for field_name in _STORAGE_PROFILE_FIELDS
+        if field_name not in {"profile_hash", "attestation_hash"}
+    }
+    profile_hash = cast(str, value["profile_hash"])
+    if not hmac.compare_digest(profile_hash, _private_payload_hash(unsigned)):
+        raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
+    return {
+        field_name: value[field_name] for field_name in sorted(_STORAGE_PROFILE_FIELDS)
+    }
 
 
 def _normalize_compiler_evidence_response(
@@ -2909,13 +3658,17 @@ def _normalize_compiler_evidence_response(
         )
     except Exception as error:
         raise HostBridgeError("HOST_BRIDGE_COMPILER_EVIDENCE_INVALID") from error
-    requested_pairs = {(model, effort) for model, effort in request.requested_route_pairs}
+    requested_pairs = {
+        (model, effort) for model, effort in request.requested_route_pairs
+    }
     fact_pairs = {
         (fact.route.model, fact.route.reasoning_effort) for fact in normalized_facts
     }
     skeletons = request.assignment_skeletons
     skeleton_by_task = {item["task_id"]: item for item in skeletons}
-    if len(skeleton_by_task) != len(skeletons) or len(normalized_facts) != len(skeletons):
+    if len(skeleton_by_task) != len(skeletons) or len(normalized_facts) != len(
+        skeletons
+    ):
         raise HostBridgeError("HOST_BRIDGE_COMPILER_EVIDENCE_INVALID")
     for fact, mapping in zip(normalized_facts, normalized_mappings, strict=True):
         skeleton = skeleton_by_task.get(fact.task_id)
@@ -2957,7 +3710,9 @@ def _normalize_compiler_evidence_response(
     if (
         type(registry_binding_hash) is not str
         or _DIGEST.fullmatch(registry_binding_hash) is None
-        or not hmac.compare_digest(registry_binding_hash, _private_payload_hash(unsigned))
+        or not hmac.compare_digest(
+            registry_binding_hash, _private_payload_hash(unsigned)
+        )
     ):
         raise HostBridgeError("HOST_BRIDGE_COMPILER_EVIDENCE_INVALID")
     _validate_private_packet_size(value, _MAX_COMPILER_EVIDENCE_BYTES)
@@ -3413,17 +4168,138 @@ def _windows_file_access_mask(handle: int) -> int:
     return access_mask.value
 
 
+def _remaining_io_time(deadline: float, cancel_event: Event | None) -> float:
+    if cancel_event is not None and cancel_event.is_set():
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+    return remaining
+
+
+@contextmanager
+def _nonblocking_pipe_writer(descriptor: int) -> Iterator[Callable[[bytes], int]]:
+    """Temporarily use synchronous nonblocking writes; never spawn an I/O worker.
+
+    Windows PIPE_NOWAIT supports our synchronous named and anonymous handles.
+    Query/verify/restore the exact original mode; unsupported handles fail
+    closed, never fall back to a blocking WriteFile. Partial/zero writes are
+    handled by the caller's single absolute deadline loop.
+    """
+    if os.name != "nt":
+        previous = os.get_blocking(descriptor)
+        os.set_blocking(descriptor, False)
+        try:
+            yield lambda payload: os.write(descriptor, payload)
+        finally:
+            os.set_blocking(descriptor, previous)
+        return
+
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = msvcrt.get_osfhandle(descriptor)
+    get_state = kernel32.GetNamedPipeHandleStateW
+    get_state.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    )
+    get_state.restype = ctypes.c_int
+    set_state = kernel32.SetNamedPipeHandleState
+    set_state.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    set_state.restype = ctypes.c_int
+    write_file = kernel32.WriteFile
+    write_file.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
+    )
+    write_file.restype = ctypes.c_int
+
+    def read_mode() -> int:
+        state = ctypes.c_ulong()
+        if not get_state(handle, ctypes.byref(state), None, None, None, None, 0):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if state.value & ~3:  # only PIPE_NOWAIT | PIPE_READMODE_MESSAGE
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        return state.value
+
+    def set_mode(mode: int) -> None:
+        state = ctypes.c_ulong(mode)
+        if not set_state(handle, ctypes.byref(state), None, None):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        if read_mode() != mode:
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+
+    def write(payload: bytes) -> int:
+        buffer = ctypes.create_string_buffer(payload)
+        written = ctypes.c_ulong()
+        if not write_file(handle, buffer, len(payload), ctypes.byref(written), None):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        return written.value
+
+    original = read_mode()
+    try:
+        set_mode(original | 1)  # PIPE_NOWAIT; retain the original read mode
+        yield write
+    finally:
+        set_mode(original)
+
+
 def _read_exact(
     descriptor: int,
     size: int,
     *,
     cancel_event: Event | None = None,
     cancel_fd: int | None = None,
+    deadline: float | None = None,
 ) -> bytes:
     chunks: list[bytes] = []
     remaining = size
     while remaining:
-        if cancel_event is not None:
+        read_size = remaining
+        if deadline is not None:
+            timeout = min(0.1, _remaining_io_time(deadline, cancel_event))
+            if os.name == "nt":
+                # Only this receiver can consume these bytes. Never request
+                # more than PeekNamedPipe reported, or read an unknown handle.
+                available = _windows_pipe_available_bytes(descriptor)
+                if not available:
+                    if cancel_event is not None:
+                        cancel_event.wait(min(0.05, timeout))
+                    else:
+                        time.sleep(min(0.05, timeout))
+                    continue
+                read_size = min(remaining, available)
+            else:
+                wait_fds = [descriptor]
+                if cancel_fd is not None and cancel_fd >= 0:
+                    wait_fds.append(cancel_fd)
+                try:
+                    readable, _, _ = select.select(wait_fds, [], [], timeout)
+                except (OSError, ValueError) as error:
+                    raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
+                if cancel_fd is not None and cancel_fd in readable:
+                    raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+                if descriptor not in readable:
+                    continue
+            _remaining_io_time(deadline, cancel_event)
+        elif cancel_event is not None:
             if cancel_event.is_set():
                 raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
             # POSIX pipes can be waited on together with the private wake fd.
@@ -3448,14 +4324,48 @@ def _read_exact(
                     time.sleep(0.05)
                     continue
         try:
-            chunk = os.read(descriptor, remaining)
+            chunk = os.read(descriptor, read_size)
         except OSError as error:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
         if not chunk:
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         chunks.append(chunk)
         remaining -= len(chunk)
+    if deadline is not None:
+        _remaining_io_time(deadline, cancel_event)
     return b"".join(chunks)
+
+
+def _windows_pipe_available_bytes(descriptor: int) -> int:
+    """A bounded-read prerequisite; unsupported/closed handles fail closed."""
+    try:
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        peek = kernel32.PeekNamedPipe
+        peek.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_void_p,
+        )
+        peek.restype = ctypes.c_int
+        available = ctypes.c_ulong()
+        if not peek(
+            msvcrt.get_osfhandle(descriptor),
+            None,
+            0,
+            None,
+            ctypes.byref(available),
+            None,
+        ):
+            raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
+        return available.value
+    except (AttributeError, ImportError, OSError, OverflowError, ValueError) as error:
+        raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE") from error
 
 
 def _windows_pipe_readable(descriptor: int) -> bool | None:
