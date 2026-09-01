@@ -288,7 +288,13 @@ def _validate_quiescent_wal_pair(
             _u32(frame_header, 20, byteorder="big"),
         ):
             raise StoreError("orchestrator store is not prepared")
-    if frame_count and _u32(wal_bytes, 32 + (frame_count - 1) * (24 + page_size) + 4, byteorder="big") == 0:
+    if (
+        frame_count
+        and _u32(
+            wal_bytes, 32 + (frame_count - 1) * (24 + page_size) + 4, byteorder="big"
+        )
+        == 0
+    ):
         raise StoreError("orchestrator store is not prepared")
     if frame_count and frame_checksum != (
         _u32(wal_index, 24, byteorder=native_byteorder),
@@ -305,9 +311,7 @@ def _schema_version_from_connection(connection: sqlite3.Connection) -> int | Non
         return None
     if len(row) != 1 or row[0] != "table":
         raise StoreError("orchestrator store is not prepared")
-    rows = connection.execute(
-        "SELECT key, value FROM schema_metadata"
-    ).fetchall()
+    rows = connection.execute("SELECT key, value FROM schema_metadata").fetchall()
     if len(rows) != 1 or rows[0][0] != "schema_version":
         raise StoreError("orchestrator store is not prepared")
     try:
@@ -327,7 +331,9 @@ def _main_database_path(connection: sqlite3.Connection) -> Path:
     raise StoreError("orchestrator store is not prepared")
 
 
-def _transition_to_delete_journal(connection: sqlite3.Connection, database: Path) -> None:
+def _transition_to_delete_journal(
+    connection: sqlite3.Connection, database: Path
+) -> None:
     """Checkpoint a valid legacy WAL exactly, then make DELETE durable."""
     row = connection.execute("PRAGMA journal_mode").fetchone()
     if row is None or len(row) != 1 or not isinstance(row[0], str):
@@ -364,6 +370,7 @@ def _transition_to_delete_journal(connection: sqlite3.Connection, database: Path
     for sidecar in _sqlite_wal_sidecars(database):
         _require_absent_sqlite_sidecar(sidecar)
 
+
 _ATLAS_OUTBOX_REQUIRED_CHECKS = frozenset(
     {
         ("ingestion_key", "=", "payload_hash"),
@@ -392,7 +399,11 @@ def _sqlite_check_expressions(table_sql: object) -> frozenset[tuple[str, ...]]:
     checks: set[tuple[str, ...]] = set()
     index = 0
     while index < len(tokens):
-        if tokens[index] != "check" or index + 1 == len(tokens) or tokens[index + 1] != "(":
+        if (
+            tokens[index] != "check"
+            or index + 1 == len(tokens)
+            or tokens[index + 1] != "("
+        ):
             index += 1
             continue
         expression, index = _sqlite_parenthesized_tokens(tokens, index + 1)
@@ -546,9 +557,7 @@ def _foreign_key_contract(
     )
 
 
-def _table_sql(
-    executor: sqlite3.Connection | sqlite3.Cursor, table_name: str
-) -> str:
+def _table_sql(executor: sqlite3.Connection | sqlite3.Cursor, table_name: str) -> str:
     row = executor.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
         (table_name,),
@@ -1014,7 +1023,13 @@ class SQLiteStore:
                 for row in sorted(columns.values(), key=lambda row: int(row["pk"]))
                 if int(row["pk"])
             )
-        except (IndexError, OSError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+        except (
+            IndexError,
+            OSError,
+            TypeError,
+            ValueError,
+            sqlite3.DatabaseError,
+        ) as error:
             raise StoreError("orchestrator schema is corrupt") from error
         return columns, primary_key
 
@@ -1069,8 +1084,7 @@ class SQLiteStore:
                 or type(metadata_rows[0]["key"]) is not str
                 or metadata_rows[0]["key"] != "schema_version"
                 or type(metadata_rows[0]["value"]) is not str
-                or metadata_rows[0]["value"]
-                not in {"12", str(cls._SCHEMA_VERSION)}
+                or metadata_rows[0]["value"] not in {"12", str(cls._SCHEMA_VERSION)}
             ):
                 raise StoreError("orchestrator store is not prepared")
             return
@@ -1109,9 +1123,7 @@ class SQLiteStore:
                 """
             )
             cursor.execute("DROP TABLE schema_metadata")
-            cursor.execute(
-                "ALTER TABLE schema_metadata_v12 RENAME TO schema_metadata"
-            )
+            cursor.execute("ALTER TABLE schema_metadata_v12 RENAME TO schema_metadata")
         except sqlite3.IntegrityError as error:
             raise StoreError("orchestrator store is not prepared") from error
         except sqlite3.DatabaseError as error:
@@ -1188,7 +1200,13 @@ class SQLiteStore:
             foreign_key_violation = connection.execute(
                 "PRAGMA foreign_key_check"
             ).fetchone()
-        except (IndexError, OSError, TypeError, ValueError, sqlite3.DatabaseError) as error:
+        except (
+            IndexError,
+            OSError,
+            TypeError,
+            ValueError,
+            sqlite3.DatabaseError,
+        ) as error:
             raise StoreError("orchestrator schema is corrupt") from error
         if (
             not required_tables.issubset(tables)
@@ -1231,7 +1249,9 @@ class SQLiteStore:
                 )
             }
         )
-        unique_indexes = set(_unique_index_contract(connection, "atlas_ingestion_outbox"))
+        unique_indexes = set(
+            _unique_index_contract(connection, "atlas_ingestion_outbox")
+        )
         if (
             _table_column_contract(connection, "atlas_ingestion_outbox")
             != expected_columns
@@ -1242,7 +1262,9 @@ class SQLiteStore:
             )
             or _foreign_key_contract(connection, "atlas_ingestion_outbox")
             != expected_foreign_keys
-            or _sqlite_check_expressions(_table_sql(connection, "atlas_ingestion_outbox"))
+            or _sqlite_check_expressions(
+                _table_sql(connection, "atlas_ingestion_outbox")
+            )
             != _ATLAS_OUTBOX_REQUIRED_CHECKS
         ):
             raise StoreError("orchestrator store is not prepared")
@@ -1309,8 +1331,7 @@ class SQLiteStore:
         """Verify the immutable certificate table and its exact anchors."""
         expected_columns = tuple(
             (name, column_type.casefold(), not_null, primary_key, 0)
-            for name, column_type, not_null, primary_key
-            in _ATLAS_FINALIZATION_COLUMN_CONTRACT
+            for name, column_type, not_null, primary_key in _ATLAS_FINALIZATION_COLUMN_CONTRACT
         )
         expected_foreign_keys = frozenset(
             {
@@ -1357,7 +1378,8 @@ class SQLiteStore:
             if type(row["sql"]) is str
         }
         if (
-            _table_column_contract(connection, "atlas_finalizations") != expected_columns
+            _table_column_contract(connection, "atlas_finalizations")
+            != expected_columns
             or set(_unique_index_contract(connection, "atlas_finalizations"))
             != {("finalization_hash",), ("acceptance_id",), ("ingestion_key",)}
             or _foreign_key_contract(connection, "atlas_finalizations")
@@ -1369,9 +1391,7 @@ class SQLiteStore:
             raise StoreError("orchestrator store is not prepared")
 
     @classmethod
-    def _migrate_atlas_finalization_binding(
-        cls, cursor: sqlite3.Cursor
-    ) -> None:
+    def _migrate_atlas_finalization_binding(cls, cursor: sqlite3.Cursor) -> None:
         """Upgrade only the previous v13 certificate layout to exact outbox binding."""
 
         try:
@@ -1381,8 +1401,7 @@ class SQLiteStore:
             pass
         expected_columns = tuple(
             (name, column_type.casefold(), not_null, primary_key, 0)
-            for name, column_type, not_null, primary_key
-            in _ATLAS_FINALIZATION_COLUMN_CONTRACT
+            for name, column_type, not_null, primary_key in _ATLAS_FINALIZATION_COLUMN_CONTRACT
         )
         expected_previous_foreign_keys = frozenset(
             {
@@ -1653,14 +1672,20 @@ class SQLiteStore:
             }
         )
         with self._transaction() as cursor:
-            batch_exists = cursor.execute(
-                "SELECT 1 FROM external_bootstrap_batches WHERE batch_hash = ?",
-                (batch.batch_hash,),
-            ).fetchone() is not None
-            grant_exists = cursor.execute(
-                "SELECT 1 FROM external_dispatch_grants WHERE grant_id = ?",
-                (grant.grant_id,),
-            ).fetchone() is not None
+            batch_exists = (
+                cursor.execute(
+                    "SELECT 1 FROM external_bootstrap_batches WHERE batch_hash = ?",
+                    (batch.batch_hash,),
+                ).fetchone()
+                is not None
+            )
+            grant_exists = (
+                cursor.execute(
+                    "SELECT 1 FROM external_dispatch_grants WHERE grant_id = ?",
+                    (grant.grant_id,),
+                ).fetchone()
+                is not None
+            )
             self._require_external_payload(
                 cursor,
                 "external_bootstrap_descriptors",
@@ -1690,7 +1715,9 @@ class SQLiteStore:
                 existing_idempotency is not None
                 and str(existing_idempotency["batch_hash"]) != batch.batch_hash
             ):
-                raise ExternalBootstrapConflictError("bootstrap idempotency binding conflicts")
+                raise ExternalBootstrapConflictError(
+                    "bootstrap idempotency binding conflicts"
+                )
             existing_grant_binding = cursor.execute(
                 """
                 SELECT grant_id FROM external_dispatch_grants
@@ -1706,7 +1733,9 @@ class SQLiteStore:
                 existing_grant_binding is not None
                 and str(existing_grant_binding["grant_id"]) != grant.grant_id
             ):
-                raise ExternalBootstrapConflictError("external dispatch grant binding conflicts")
+                raise ExternalBootstrapConflictError(
+                    "external dispatch grant binding conflicts"
+                )
             existing_composite_binding = cursor.execute(
                 "SELECT * FROM external_dispatch_grant_bindings WHERE grant_id = ?",
                 (grant.grant_id,),
@@ -1755,7 +1784,9 @@ class SQLiteStore:
                 ),
             )
             for item in batch.items:
-                item_payload = _canonical_payload_json(self._external_batch_item_payload(item))
+                item_payload = _canonical_payload_json(
+                    self._external_batch_item_payload(item)
+                )
                 row = cursor.execute(
                     """
                     SELECT payload_json FROM external_bootstrap_batch_items
@@ -1764,7 +1795,9 @@ class SQLiteStore:
                     (batch.batch_hash, item.item_index),
                 ).fetchone()
                 if row is not None and str(row["payload_json"]) != item_payload:
-                    raise ExternalBootstrapConflictError("bootstrap batch item conflicts")
+                    raise ExternalBootstrapConflictError(
+                        "bootstrap batch item conflicts"
+                    )
                 cursor.execute(
                     """
                     INSERT OR IGNORE INTO external_bootstrap_batch_items
@@ -1870,9 +1903,16 @@ class SQLiteStore:
                 (grant.grant_id,),
             ).fetchone()
             self._validate_external_grant_binding_at_read(grant_row, cursor=cursor)
-        return descriptor, batch, self._external_outbox_from_row(outbox_row), self._external_grant_from_row(grant_row)
+        return (
+            descriptor,
+            batch,
+            self._external_outbox_from_row(outbox_row),
+            self._external_grant_from_row(grant_row),
+        )
 
-    def get_external_dispatch_grant(self, grant_id: str) -> ExternalDispatchGrant | None:
+    def get_external_dispatch_grant(
+        self, grant_id: str
+    ) -> ExternalDispatchGrant | None:
         row = self._connection.execute(
             "SELECT * FROM external_dispatch_grants WHERE grant_id = ?", (grant_id,)
         ).fetchone()
@@ -1920,7 +1960,9 @@ class SQLiteStore:
                 ),
             )
             if cursor.rowcount != 1:
-                raise ExternalDispatchGrantError("external dispatch grant is expired, replayed, or unbound")
+                raise ExternalDispatchGrantError(
+                    "external dispatch grant is expired, replayed, or unbound"
+                )
             row = cursor.execute(
                 "SELECT * FROM external_dispatch_grants WHERE grant_id = ?", (grant_id,)
             ).fetchone()
@@ -2368,7 +2410,9 @@ class SQLiteStore:
                 workflow_id=workflow_id,
                 recipient_task_id=recipient_task_id,
                 recipient_epoch=(
-                    int(recipient_lease["epoch"]) if recipient_lease is not None else None
+                    int(recipient_lease["epoch"])
+                    if recipient_lease is not None
+                    else None
                 ),
                 now=now_utc,
                 incoming_bytes=artifact_size,
@@ -2460,7 +2504,9 @@ class SQLiteStore:
             datetime.fromisoformat(now_utc) + timedelta(seconds=ttl_seconds)
         ).isoformat()
         with self._transaction() as cursor:
-            self._require_current_lease(cursor, sender_task_id, owner, epoch, now=now_utc)
+            self._require_current_lease(
+                cursor, sender_task_id, owner, epoch, now=now_utc
+            )
             self._require_task_in_workflow(
                 cursor, workflow_id, sender_task_id, RoleEnvelopeForbiddenError
             )
@@ -2792,7 +2838,9 @@ class SQLiteStore:
                 "SELECT owner_role FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             if task is None or str(task["owner_role"]) != "worker":
-                raise RoleEnvelopeForbiddenError("archive report is not owned by a worker")
+                raise RoleEnvelopeForbiddenError(
+                    "archive report is not owned by a worker"
+                )
             existing = cursor.execute(
                 "SELECT * FROM host_operation_receipts WHERE operation_id = ?",
                 (operation_id,),
@@ -4820,7 +4868,9 @@ class SQLiteStore:
         try:
             return RoleEnvelopeDirection(value)
         except (TypeError, ValueError) as error:
-            raise RoleEnvelopeInvalidError("role envelope direction is not supported") from error
+            raise RoleEnvelopeInvalidError(
+                "role envelope direction is not supported"
+            ) from error
 
     @classmethod
     def _safe_role_identifier(cls, value: object) -> bool:
@@ -4833,7 +4883,10 @@ class SQLiteStore:
 
     @classmethod
     def _require_role_hash(cls, value: object, label: str) -> str:
-        if not isinstance(value, str) or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None:
+        if (
+            not isinstance(value, str)
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(value) is None
+        ):
             raise RoleEnvelopeInvalidError(f"{label} must be a sha256 reference")
         return value
 
@@ -4853,9 +4906,7 @@ class SQLiteStore:
         return hashes
 
     @classmethod
-    def _role_risk_items(
-        cls, value: object
-    ) -> tuple[RoleRiskItem, ...]:
+    def _role_risk_items(cls, value: object) -> tuple[RoleRiskItem, ...]:
         if not isinstance(value, tuple) or len(value) > cls._MAX_ROLE_RISK_ITEMS:
             raise RoleEnvelopeInvalidError("risk items are outside the bounded schema")
         items: list[RoleRiskItem] = []
@@ -4884,7 +4935,11 @@ class SQLiteStore:
             ):
                 raise RoleEnvelopeInvalidError("risk item is not a bounded reference")
             items.append(
-                RoleRiskItem(code, severity, cls._require_role_hash(evidence_hash, "risk evidence"))
+                RoleRiskItem(
+                    code,
+                    severity,
+                    cls._require_role_hash(evidence_hash, "risk evidence"),
+                )
             )
         if len({item.code for item in items}) != len(items):
             raise RoleEnvelopeInvalidError("risk item codes must be unique")
@@ -4905,18 +4960,28 @@ class SQLiteStore:
         now: str,
     ) -> tuple[str, int]:
         if direction is RoleEnvelopeDirection.COORDINATOR_TO_WORKER:
-            if coordinator_task_id not in (None, sender_task_id) or coordinator_epoch not in (
+            if coordinator_task_id not in (
+                None,
+                sender_task_id,
+            ) or coordinator_epoch not in (
                 None,
                 sender_epoch,
             ):
-                raise RoleEnvelopeInvalidError("coordinator binding does not match sender")
+                raise RoleEnvelopeInvalidError(
+                    "coordinator binding does not match sender"
+                )
             return sender_task_id, sender_epoch
         if direction is RoleEnvelopeDirection.WORKER_TO_COORDINATOR:
-            if coordinator_task_id not in (None, recipient_task_id) or coordinator_epoch not in (
+            if coordinator_task_id not in (
+                None,
+                recipient_task_id,
+            ) or coordinator_epoch not in (
                 None,
                 recipient_epoch,
             ):
-                raise RoleEnvelopeInvalidError("coordinator binding does not match recipient")
+                raise RoleEnvelopeInvalidError(
+                    "coordinator binding does not match recipient"
+                )
             return recipient_task_id, recipient_epoch
         if (
             not self._safe_role_identifier(coordinator_task_id)
@@ -4924,7 +4989,9 @@ class SQLiteStore:
             or isinstance(coordinator_epoch, bool)
             or coordinator_epoch < 1
         ):
-            raise RoleEnvelopeInvalidError("peer envelope needs an exact coordinator binding")
+            raise RoleEnvelopeInvalidError(
+                "peer envelope needs an exact coordinator binding"
+            )
         self._require_task_in_workflow(
             cursor, workflow_id, coordinator_task_id, RoleEnvelopeForbiddenError
         )
@@ -4955,13 +5022,18 @@ class SQLiteStore:
             RoleEnvelopeDirection.PEER_TO_PEER: ("worker", "worker"),
         }[direction]
         if (sender_role, recipient_role) != expected:
-            raise RoleEnvelopeInvalidError("role direction does not match sender and recipient")
+            raise RoleEnvelopeInvalidError(
+                "role direction does not match sender and recipient"
+            )
         rows = cursor.execute(
             "SELECT id, owner_role FROM tasks WHERE id IN (?, ?)",
             (sender_task_id, recipient_task_id),
         ).fetchall()
         roles = {str(row["id"]): str(row["owner_role"]) for row in rows}
-        if roles.get(sender_task_id) != sender_role or roles.get(recipient_task_id) != recipient_role:
+        if (
+            roles.get(sender_task_id) != sender_role
+            or roles.get(recipient_task_id) != recipient_role
+        ):
             raise RoleEnvelopeForbiddenError("task role is not authoritative")
 
     @staticmethod
@@ -4973,11 +5045,7 @@ class SQLiteStore:
         row = cursor.execute(
             "SELECT epoch, expires_at FROM leases WHERE task_id = ?", (task_id,)
         ).fetchone()
-        if (
-            row is None
-            or int(row["epoch"]) != epoch
-            or str(row["expires_at"]) <= now
-        ):
+        if row is None or int(row["epoch"]) != epoch or str(row["expires_at"]) <= now:
             raise StaleLeaseError(f"lease is stale for task {task_id!r}")
 
     def _require_role_peer_capability(
@@ -5007,7 +5075,9 @@ class SQLiteStore:
             or not isinstance(capability, str)
             or not secrets.compare_digest(str(row["capability"]), capability)
         ):
-            raise CapabilityInvalidError("delivery capability is not valid for this peer")
+            raise CapabilityInvalidError(
+                "delivery capability is not valid for this peer"
+            )
         return _payload_hash(capability)
 
     def _role_envelope_payload(
@@ -5071,7 +5141,9 @@ class SQLiteStore:
             terminal = self._require_role_hash(terminal_result_hash, "terminal result")
         risks = self._role_risk_items(risk_items)
         if not {risk.evidence_hash for risk in risks}.issubset(set(evidence)):
-            raise RoleEnvelopeInvalidError("risk evidence must be an envelope evidence reference")
+            raise RoleEnvelopeInvalidError(
+                "risk evidence must be an envelope evidence reference"
+            )
         if direction is RoleEnvelopeDirection.COORDINATOR_TO_WORKER:
             if (
                 not card_hash
@@ -5083,7 +5155,9 @@ class SQLiteStore:
                 or risks
                 or recipient_capability_hash
             ):
-                raise RoleEnvelopeInvalidError("coordinator envelope schema is not exact")
+                raise RoleEnvelopeInvalidError(
+                    "coordinator envelope schema is not exact"
+                )
         elif direction is RoleEnvelopeDirection.WORKER_TO_COORDINATOR:
             if (
                 card_hash
@@ -5172,7 +5246,9 @@ class SQLiteStore:
             "SELECT card_hash FROM task_cards WHERE task_id = ?", (recipient_task_id,)
         ).fetchone()
         if card is None or str(card["card_hash"]) != payload["task_card_hash"]:
-            raise RoleEnvelopeForbiddenError("task card reference is not recipient-bound")
+            raise RoleEnvelopeForbiddenError(
+                "task card reference is not recipient-bound"
+            )
         allowed_contracts = {
             str(row["contract_hash"])
             for row in cursor.execute(
@@ -5181,8 +5257,12 @@ class SQLiteStore:
             ).fetchall()
         }
         requested_contracts = tuple(str(item) for item in payload["contract_hashes"])
-        if not requested_contracts or not set(requested_contracts).issubset(allowed_contracts):
-            raise RoleEnvelopeForbiddenError("contract references are not recipient-bound")
+        if not requested_contracts or not set(requested_contracts).issubset(
+            allowed_contracts
+        ):
+            raise RoleEnvelopeForbiddenError(
+                "contract references are not recipient-bound"
+            )
 
     def _require_live_role_assignment(
         self,
@@ -5234,7 +5314,9 @@ class SQLiteStore:
             ),
         ).fetchone()
         if row is None:
-            raise RoleEnvelopeForbiddenError("no live coordinator assignment matches envelope")
+            raise RoleEnvelopeForbiddenError(
+                "no live coordinator assignment matches envelope"
+            )
 
     def _role_reference_bytes(
         self,
@@ -6266,7 +6348,9 @@ class SQLiteStore:
             not isinstance(value, str)
             or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(value) is None
         ):
-            raise ExternalBootstrapConflictError(f"{label} is outside the bounded schema")
+            raise ExternalBootstrapConflictError(
+                f"{label} is outside the bounded schema"
+            )
 
     @classmethod
     def _external_descriptor_payload(
@@ -6306,7 +6390,9 @@ class SQLiteStore:
         }
 
     @classmethod
-    def _external_batch_payload(cls, batch: ExternalBootstrapBatch) -> dict[str, object]:
+    def _external_batch_payload(
+        cls, batch: ExternalBootstrapBatch
+    ) -> dict[str, object]:
         return {
             "availability": batch.availability,
             "batch_hash": batch.batch_hash,
@@ -6531,7 +6617,10 @@ class SQLiteStore:
                 raise ValueError("grant does not bind a batch")
             batch = self._external_batch_from_row(
                 batch_row,
-                tuple(self._external_batch_item_from_row(item_row) for item_row in item_rows),
+                tuple(
+                    self._external_batch_item_from_row(item_row)
+                    for item_row in item_rows
+                ),
             )
             if (
                 descriptor.descriptor_hash != grant.descriptor_hash
@@ -6600,7 +6689,9 @@ class SQLiteStore:
                     )
                 )
             ):
-                raise ValueError("external bootstrap commitment chain is absent or mismatched")
+                raise ValueError(
+                    "external bootstrap commitment chain is absent or mismatched"
+                )
         except (
             KeyError,
             TypeError,
@@ -6632,7 +6723,9 @@ class SQLiteStore:
             or not batch.items
             or len(batch.items) > cls._MAX_EXTERNAL_BOOTSTRAP_BATCH_ITEMS
         ):
-            raise ExternalBootstrapConflictError("external bootstrap batch is not pending")
+            raise ExternalBootstrapConflictError(
+                "external bootstrap batch is not pending"
+            )
         cls._validate_external_hash(batch.batch_hash, "batch_hash")
         cls._validate_external_hash(batch.descriptor_hash, "descriptor_hash")
         cls._validate_external_identifier(batch.idempotency_key, "idempotency_key")
@@ -6648,14 +6741,18 @@ class SQLiteStore:
                 or isinstance(item.lease_epoch, bool)
                 or item.lease_epoch < 0
             ):
-                raise ExternalBootstrapConflictError("batch item ordering or lease is invalid")
+                raise ExternalBootstrapConflictError(
+                    "batch item ordering or lease is invalid"
+                )
             cls._validate_external_identifier(item.workflow_id, "workflow_id")
             cls._validate_external_identifier(item.task_id, "task_id")
             for label, value in cls._external_batch_item_payload(item).items():
                 if str(label).endswith("_hash"):
                     cls._validate_external_hash(value, str(label))
             if item.assignment_hash in assignment_hashes:
-                raise ExternalBootstrapConflictError("batch assignment hashes must be unique")
+                raise ExternalBootstrapConflictError(
+                    "batch assignment hashes must be unique"
+                )
             assignment_hashes.add(item.assignment_hash)
         if (
             not isinstance(grant, ExternalDispatchGrant)
@@ -6663,7 +6760,9 @@ class SQLiteStore:
             or grant.availability != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
             or grant.consumed_at is not None
         ):
-            raise ExternalBootstrapConflictError("external dispatch grant is not pending")
+            raise ExternalBootstrapConflictError(
+                "external dispatch grant is not pending"
+            )
         cls._validate_external_identifier(grant.grant_id, "grant_id")
         for label, value in cls._external_grant_payload(grant).items():
             if str(label).endswith("_hash"):
@@ -6675,7 +6774,9 @@ class SQLiteStore:
             or grant.expires_at != batch.expires_at
             or grant.assignment_hash not in assignment_hashes
         ):
-            raise ExternalBootstrapConflictError("grant is not bound to descriptor batch assignment")
+            raise ExternalBootstrapConflictError(
+                "grant is not bound to descriptor batch assignment"
+            )
 
     @staticmethod
     def _insert_or_require_external_commitment(
@@ -6702,7 +6803,9 @@ class SQLiteStore:
             )
             return
         if any(str(row[column]) != value for column, value in values.items()):
-            raise ExternalBootstrapConflictError("external bootstrap commitment conflicts")
+            raise ExternalBootstrapConflictError(
+                "external bootstrap commitment conflicts"
+            )
 
     @staticmethod
     def _require_external_payload(
@@ -6864,9 +6967,7 @@ class SQLiteStore:
             or payload["lease_epoch"] < 0
             or type(payload["workflow_id"]) is not str
             or type(payload["task_id"]) is not str
-            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
-                payload["workflow_id"]
-            )
+            or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(payload["workflow_id"])
             is None
             or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(payload["task_id"])
             is None
@@ -6908,15 +7009,13 @@ class SQLiteStore:
         if set(payload) != expected_fields or type(payload["items"]) is not list:
             raise ValueError("batch payload shape is invalid")
         if any(
-            type(payload[field]) is not str
-            for field in expected_fields - {"items"}
+            type(payload[field]) is not str for field in expected_fields - {"items"}
         ):
             raise ValueError("batch payload values are invalid")
         if (
             payload["state"] != ExternalBootstrapState.PENDING.value
             or payload["availability"] != cls._EXTERNAL_BOOTSTRAP_AVAILABILITY
-            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload["batch_hash"])
-            is None
+            or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload["batch_hash"]) is None
             or cls._SHA256_IDENTIFIER_PATTERN.fullmatch(payload["descriptor_hash"])
             is None
             or cls._SAFE_ACCEPTANCE_IDENTIFIER_PATTERN.fullmatch(
@@ -7049,10 +7148,11 @@ class SQLiteStore:
                     if (
                         str(row["expires_at"]) != raw_expiry
                         or str(row["payload_json"]) != raw_payload_json
-                        or str(row["payload_hash"])
-                        != _payload_hash(raw_payload_json)
+                        or str(row["payload_hash"]) != _payload_hash(raw_payload_json)
                     ):
-                        raise ValueError("raw expiry column, payload, and hash disagree")
+                        raise ValueError(
+                            "raw expiry column, payload, and hash disagree"
+                        )
                     payload["expires_at"] = _utc_timestamp(raw_expiry)
                     canonical_payload = _canonical_payload_json(payload)
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -7118,7 +7218,9 @@ class SQLiteStore:
             identifier = index_name.replace('"', '""')
             return tuple(
                 str(row["name"])
-                for row in cursor.execute(f'PRAGMA index_info("{identifier}")').fetchall()
+                for row in cursor.execute(
+                    f'PRAGMA index_info("{identifier}")'
+                ).fetchall()
             )
 
         def validate_index_xinfo(
@@ -7127,9 +7229,7 @@ class SQLiteStore:
             if type(index_name) is not str:
                 raise ValueError("index name is invalid")
             identifier = index_name.replace('"', '""')
-            info_rows = cursor.execute(
-                f'PRAGMA index_xinfo("{identifier}")'
-            ).fetchall()
+            info_rows = cursor.execute(f'PRAGMA index_xinfo("{identifier}")').fetchall()
             key_rows = [row for row in info_rows if int(row["key"])]
             if len(key_rows) != len(expected_columns):
                 raise StoreError("orchestrator store is not prepared")
@@ -7239,14 +7339,8 @@ class SQLiteStore:
                 or not 0 <= row["attempt_count"] <= cls._MAX_ATLAS_OUTBOX_ATTEMPTS
                 or row["ingestion_key"] != row["payload_hash"]
                 or row["acceptance_id"] != row["ingestion_key"]
-                or (
-                    row["state"] == "projected"
-                    and row["last_error_code"] != ""
-                )
-                or (
-                    row["state"] == "quarantined"
-                    and not row["last_error_code"]
-                )
+                or (row["state"] == "projected" and row["last_error_code"] != "")
+                or (row["state"] == "quarantined" and not row["last_error_code"])
                 or (
                     row["state"] == "pending"
                     and row["attempt_count"] > 0
@@ -7286,9 +7380,7 @@ class SQLiteStore:
                         framework=acceptance["framework"],
                     )
                 )
-                canonical_acceptance_hash = _payload_hash(
-                    canonical_acceptance_payload
-                )
+                canonical_acceptance_hash = _payload_hash(canonical_acceptance_payload)
                 if (
                     row["acceptance_id"] != acceptance["acceptance_id"]
                     or row["ingestion_key"] != acceptance["payload_hash"]
@@ -7301,10 +7393,9 @@ class SQLiteStore:
                     or row["payload_hash"] != canonical_acceptance_hash
                 ):
                     raise ValueError("legacy acceptance content address mismatch")
-                if (
-                    row["created_at"] != _utc_timestamp(row["created_at"])
-                    or row["updated_at"] != _utc_timestamp(row["updated_at"])
-                ):
+                if row["created_at"] != _utc_timestamp(row["created_at"]) or row[
+                    "updated_at"
+                ] != _utc_timestamp(row["updated_at"]):
                     raise ValueError("outbox timestamps are not canonical UTC")
                 cls._safe_acceptance_identifier("ingestion_key", row["ingestion_key"])
                 cls._safe_acceptance_identifier("acceptance_id", row["acceptance_id"])
@@ -7403,9 +7494,7 @@ class SQLiteStore:
                 FROM atlas_ingestion_outbox
                 """
             )
-            cls._drop_atlas_finalization_projection_trigger_for_outbox_rebuild(
-                cursor
-            )
+            cls._drop_atlas_finalization_projection_trigger_for_outbox_rebuild(cursor)
             cursor.execute("DROP TABLE atlas_ingestion_outbox")
             cursor.execute(
                 "ALTER TABLE atlas_ingestion_outbox_v11 RENAME TO atlas_ingestion_outbox"
@@ -7500,13 +7589,16 @@ class SQLiteStore:
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
             try:
-                fresh_database = cursor.execute(
-                    """
+                fresh_database = (
+                    cursor.execute(
+                        """
                     SELECT 1 FROM sqlite_master
                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
                     LIMIT 1
                     """
-                ).fetchone() is None
+                    ).fetchone()
+                    is None
+                )
             except sqlite3.DatabaseError as error:
                 raise StoreError("orchestrator schema is corrupt") from error
             self._preflight_legacy_atlas_outbox_before_schema_ddl(
@@ -8178,7 +8270,9 @@ class SQLiteStore:
                 raise TypeError("role payload is not an object")
             if payload.get("schema_version") != self._ROLE_ENVELOPE_SCHEMA_VERSION:
                 raise ValueError("role payload schema is not current")
-            if _payload_hash(_canonical_payload_json(payload)) != str(row["envelope_hash"]):
+            if _payload_hash(_canonical_payload_json(payload)) != str(
+                row["envelope_hash"]
+            ):
                 raise ValueError("role envelope hash is corrupt")
             direction = RoleEnvelopeDirection(str(row["direction"]))
             bindings = {
@@ -8203,7 +8297,9 @@ class SQLiteStore:
             if any(payload.get(key) != value for key, value in bindings.items()):
                 raise ValueError("role envelope bindings are corrupt")
             contracts = tuple(str(item) for item in payload["contract_hashes"])
-            index_evidence = tuple(str(item) for item in payload["index_evidence_hashes"])
+            index_evidence = tuple(
+                str(item) for item in payload["index_evidence_hashes"]
+            )
             evidence = tuple(str(item) for item in payload["evidence_hashes"])
             dependencies = tuple(str(item) for item in payload["dependency_hashes"])
             risks = self._role_risk_items(tuple(payload["risk_items"]))
@@ -8247,7 +8343,9 @@ class SQLiteStore:
                 str(row["envelope_hash"]),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise RoleEnvelopeInvalidError("durable role envelope is corrupt") from error
+            raise RoleEnvelopeInvalidError(
+                "durable role envelope is corrupt"
+            ) from error
 
     def _host_operation_receipt_from_row(
         self, row: sqlite3.Row
@@ -8269,7 +8367,9 @@ class SQLiteStore:
                 "status_code": str(row["status_code"]),
                 "outcome": str(row["outcome"]),
             }
-            if _payload_hash(_canonical_payload_json(payload)) != str(row["receipt_hash"]):
+            if _payload_hash(_canonical_payload_json(payload)) != str(
+                row["receipt_hash"]
+            ):
                 raise ValueError("host operation receipt hash is corrupt")
             return HostOperationReceipt(
                 str(row["operation_id"]),
@@ -8289,7 +8389,9 @@ class SQLiteStore:
                 str(row["reported_at"]),
             )
         except (KeyError, TypeError, ValueError) as error:
-            raise HostOperationConflictError("durable host operation receipt is corrupt") from error
+            raise HostOperationConflictError(
+                "durable host operation receipt is corrupt"
+            ) from error
 
     @staticmethod
     def _last_lease_epoch(cursor: sqlite3.Cursor, task_id: str) -> int:

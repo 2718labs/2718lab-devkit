@@ -214,10 +214,7 @@ def _make_storage_intent(
     descriptor = {
         "schema": _STORAGE_TARGET_SCHEMA,
         "artifact_kind": "fastlane-task",
-        **{
-            field: profile.get(field)
-            for field in _STORAGE_DESCRIPTOR_FIELDS
-        },
+        **{field: profile.get(field) for field in _STORAGE_DESCRIPTOR_FIELDS},
     }
     if any(descriptor[field] is None for field in _STORAGE_DESCRIPTOR_FIELDS):
         raise ValueError(_STORAGE_POLICY_MISSING)
@@ -283,10 +280,7 @@ def _routing_profile_material(
     return {
         "schema": _PROFILE_EVIDENCE_SCHEMA,
         "source_plan_hash": source_plan_hash,
-        "unit": {
-            field: task if field == "task" else unit[field]
-            for field in fields
-        },
+        "unit": {field: task if field == "task" else unit[field] for field in fields},
     }
 
 
@@ -728,7 +722,9 @@ def validate_skeleton_package(
             raise ValueError(f"authenticated V5 {wave_name} skeletons are invalid")
         for index, raw_skeleton in enumerate(wave):
             skeleton = dict(
-                api._mapping(raw_skeleton, f"authenticated V5 {wave_name} skeletons[{index}]")
+                api._mapping(
+                    raw_skeleton, f"authenticated V5 {wave_name} skeletons[{index}]"
+                )
             )
             if set(skeleton) != _SKELETON_FIELDS:
                 raise ValueError("authenticated V5 skeleton fields are invalid")
@@ -739,7 +735,9 @@ def validate_skeleton_package(
                 f"authenticated V5 {wave_name} skeletons[{index}].task_id",
             )
             if "storage_intent" in skeleton:
-                raise ValueError("authenticated V5 pre-host skeleton carries storage intent")
+                raise ValueError(
+                    "authenticated V5 pre-host skeleton carries storage intent"
+                )
             order = skeleton.get("dispatch_order")
             if type(order) is not int or not 0 <= order < len(source_ids):
                 raise ValueError("authenticated V5 package dispatch order is invalid")

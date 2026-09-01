@@ -850,9 +850,7 @@ def _atlas_outbox_schema(
         return f"TEXT{column_collation}{not_null(column)}"
 
     payload_json = (
-        f"payload_json {text_type('payload_json')},"
-        if include_payload_json
-        else ""
+        f"payload_json {text_type('payload_json')}," if include_payload_json else ""
     )
     if partial_unique_indexes:
         acceptance_id = (
@@ -881,12 +879,12 @@ def _atlas_outbox_schema(
             {acceptance_id}
             {payload_json}
             {payload_hash}
-            state {text_type('state')} {state_check},
-            attempt_count INTEGER{not_null('attempt_count')} {attempt_check},
-            last_error_code {text_type('last_error_code')},
-            reason_codes_json {text_type('reason_codes_json')},
-            created_at {text_type('created_at')},
-            updated_at {text_type('updated_at')},
+            state {text_type("state")} {state_check},
+            attempt_count INTEGER{not_null("attempt_count")} {attempt_check},
+            last_error_code {text_type("last_error_code")},
+            reason_codes_json {text_type("reason_codes_json")},
+            created_at {text_type("created_at")},
+            updated_at {text_type("updated_at")},
             {equality_check}
         );
         {unique_indexes}
@@ -1071,9 +1069,7 @@ def _runtime_with_malformed_atlas_outbox(
             )
         ),
         _atlas_outbox_schema(
-            attempt_check=(
-                "CHECK (1) /* CHECK (attempt_count BETWEEN 0 AND 16) */"
-            )
+            attempt_check=("CHECK (1) /* CHECK (attempt_count BETWEEN 0 AND 16) */")
         ),
     ),
     ids=(
@@ -1418,9 +1414,7 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
             0,
         )
 
-        next_acceptance_id, _ = _insert_legacy_atlas_acceptance(
-            connection, suffix="b"
-        )
+        next_acceptance_id, _ = _insert_legacy_atlas_acceptance(connection, suffix="b")
         with pytest.raises(
             sqlite3.IntegrityError,
             match="NOT NULL constraint failed: atlas_ingestion_outbox.ingestion_key",
@@ -1445,9 +1439,12 @@ def test_sqlite_store_migrates_v10_outbox_to_reject_null_ingestion_keys(
                     timestamp,
                 ),
             )
-        assert connection.execute(
-            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         store.close()
 
@@ -1474,19 +1471,28 @@ def test_sqlite_store_rejects_legacy_v6_outbox_drift_before_current_ddl(
 
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "6"
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "6"
+        )
         if missing_object == "table":
-            assert connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'atlas_ingestion_outbox'"
-            ).fetchone() is None
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'atlas_ingestion_outbox'"
+                ).fetchone()
+                is None
+            )
         else:
-            assert connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
-                "AND name = 'idx_atlas_outbox_pending'"
-            ).fetchone() is None
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                    "AND name = 'idx_atlas_outbox_pending'"
+                ).fetchone()
+                is None
+            )
     finally:
         connection.close()
 
@@ -1503,10 +1509,13 @@ def test_sqlite_store_bootstraps_true_legacy_v6_empty_outbox(
         assert connection.execute(
             "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
         ).fetchone() == ("6",)
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'atlas_finalizations'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'atlas_finalizations'"
+            ).fetchone()
+            is None
+        )
         connection.commit()
     finally:
         connection.close()
@@ -1514,20 +1523,24 @@ def test_sqlite_store_bootstraps_true_legacy_v6_empty_outbox(
     store = SQLiteStore(database)
     try:
         assert store.schema_version() == 13
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'atlas_finalizations'"
-        ).fetchone() is not None
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'atlas_finalizations'"
+            ).fetchone()
+            is not None
+        )
     finally:
         store.close()
 
 
-@pytest.mark.parametrize(
-    "semantic_drift", ("column-nocase", "pending-nocase-desc")
-)
+@pytest.mark.parametrize("semantic_drift", ("column-nocase", "pending-nocase-desc"))
 def test_sqlite_store_rejects_legacy_v6_semantic_shape_drift(
     tmp_path: Path, semantic_drift: str
 ) -> None:
@@ -1603,12 +1616,8 @@ def test_sqlite_store_rejects_legacy_atlas_outbox_row_contract_drift(
             "state": outbox_update.get("state", "pending"),
             "attempt_count": outbox_update.get("attempt_count", 0),
             "last_error_code": outbox_update.get("last_error_code", ""),
-            "created_at": outbox_update.get(
-                "created_at", "2026-08-09T00:00:00+00:00"
-            ),
-            "updated_at": outbox_update.get(
-                "updated_at", "2026-08-09T00:00:00+00:00"
-            ),
+            "created_at": outbox_update.get("created_at", "2026-08-09T00:00:00+00:00"),
+            "updated_at": outbox_update.get("updated_at", "2026-08-09T00:00:00+00:00"),
         }
         connection.execute(
             """
@@ -1627,9 +1636,12 @@ def test_sqlite_store_rejects_legacy_atlas_outbox_row_contract_drift(
 
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "10"
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "10"
+        )
         columns = {
             str(row[1]): int(row[3])
             for row in connection.execute(
@@ -1680,9 +1692,12 @@ def test_sqlite_store_rejects_legacy_outbox_acceptance_binding_drift(
         assert connection.execute(
             "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
         ).fetchone() == ("10",)
-        assert connection.execute(
-            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         connection.close()
 
@@ -1710,9 +1725,12 @@ def test_sqlite_store_bootstraps_verified_legacy_empty_outbox(
     store = SQLiteStore(database)
     try:
         assert store.schema_version() == 13
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM atlas_ingestion_outbox"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM atlas_ingestion_outbox"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 
@@ -1725,12 +1743,18 @@ def test_sqlite_store_fails_closed_for_legacy_null_outbox_key(tmp_path: Path) ->
 
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute(
-            "SELECT ingestion_key FROM atlas_ingestion_outbox"
-        ).fetchone()[0] is None
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "10"
+        assert (
+            connection.execute(
+                "SELECT ingestion_key FROM atlas_ingestion_outbox"
+            ).fetchone()[0]
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "10"
+        )
     finally:
         connection.close()
 
@@ -1745,9 +1769,7 @@ def test_sqlite_store_fails_closed_for_noncanonical_finalization_guard_during_v1
     )
     connection = sqlite3.connect(database)
     try:
-        connection.execute(
-            "DROP TRIGGER atlas_finalizations_require_projected_outbox"
-        )
+        connection.execute("DROP TRIGGER atlas_finalizations_require_projected_outbox")
         connection.execute(
             """
             CREATE TRIGGER atlas_finalizations_require_projected_outbox
@@ -1818,8 +1840,8 @@ def _legacy_v10_incomplete_atlas_outbox_database(
 def test_sqlite_store_rolls_back_incomplete_v10_outbox_upgrade(
     tmp_path: Path,
 ) -> None:
-    database, ingestion_key, acceptance_id = _legacy_v10_incomplete_atlas_outbox_database(
-        tmp_path
+    database, ingestion_key, acceptance_id = (
+        _legacy_v10_incomplete_atlas_outbox_database(tmp_path)
     )
 
     with pytest.raises(StoreError):
@@ -1839,13 +1861,19 @@ def test_sqlite_store_rolls_back_incomplete_v10_outbox_upgrade(
             for row in connection.execute("PRAGMA table_info(schema_metadata)")
         }
         assert metadata_columns["key"] == 0
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'schema_metadata_v12'"
-        ).fetchone() is None
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "10"
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'schema_metadata_v12'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "10"
+        )
         assert tuple(
             connection.execute(
                 """
@@ -1887,8 +1915,8 @@ def _malformed_v11_nullable_atlas_outbox_database(
 def test_sqlite_store_preserves_malformed_v11_nullable_outbox(
     tmp_path: Path,
 ) -> None:
-    database, ingestion_key, acceptance_id = _malformed_v11_nullable_atlas_outbox_database(
-        tmp_path
+    database, ingestion_key, acceptance_id = (
+        _malformed_v11_nullable_atlas_outbox_database(tmp_path)
     )
 
     with pytest.raises(StoreError):
@@ -1902,9 +1930,12 @@ def test_sqlite_store_preserves_malformed_v11_nullable_outbox(
             for row in connection.execute("PRAGMA table_info(atlas_ingestion_outbox)")
         }
         assert columns["ingestion_key"] == 0
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "11"
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "11"
+        )
         assert tuple(
             connection.execute(
                 """
@@ -2086,12 +2117,18 @@ def test_sqlite_store_rejects_null_schema_metadata_key(
             for row in connection.execute("PRAGMA table_info(schema_metadata)")
         }
         assert columns["key"] == 0
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key IS NULL"
-        ).fetchone()[0] == "invalid-null-key"
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "11"
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key IS NULL"
+            ).fetchone()[0]
+            == "invalid-null-key"
+        )
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "11"
+        )
     finally:
         connection.close()
 
@@ -2179,15 +2216,21 @@ def test_sqlite_store_rejects_untrusted_legacy_schema_metadata(
             for row in connection.execute("PRAGMA table_info(schema_metadata)")
         }
         assert columns["key"] == 0
-        assert tuple(
-            connection.execute(
-                "SELECT key, value FROM schema_metadata ORDER BY key, value"
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT key, value FROM schema_metadata ORDER BY key, value"
+                )
             )
-        ) == expected_rows
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'schema_metadata_v12'"
-        ).fetchone() is None
+            == expected_rows
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'schema_metadata_v12'"
+            ).fetchone()
+            is None
+        )
     finally:
         connection.close()
 
@@ -2257,11 +2300,14 @@ def test_sqlite_store_rejects_noncanonical_strict_schema_metadata(
             for row in connection.execute("PRAGMA table_info(schema_metadata)")
         }
         assert columns["key"] == 1
-        assert tuple(
-            connection.execute(
-                "SELECT key, value FROM schema_metadata ORDER BY key, value"
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT key, value FROM schema_metadata ORDER BY key, value"
+                )
             )
-        ) == expected_rows
+            == expected_rows
+        )
     finally:
         connection.close()
 
@@ -2316,13 +2362,19 @@ def test_sqlite_store_rejects_generated_schema_metadata_column(
             str(row["name"])
             for row in connection.execute("PRAGMA table_xinfo(schema_metadata)")
         } == {"key", "value", "generated_marker"}
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()["value"] == "12"
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'schema_metadata_v12'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()["value"]
+            == "12"
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'schema_metadata_v12'"
+            ).fetchone()
+            is None
+        )
     finally:
         connection.close()
 
@@ -2379,13 +2431,19 @@ def test_sqlite_store_rejects_generated_schema_metadata_value(
             for row in connection.execute("PRAGMA table_xinfo(schema_metadata)")
         }
         assert columns == {"key": (1, 0), "value": (1, 3)}
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()["value"] == "12"
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'schema_metadata_v12'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()["value"]
+            == "12"
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'schema_metadata_v12'"
+            ).fetchone()
+            is None
+        )
     finally:
         connection.close()
 
@@ -2433,12 +2491,18 @@ def test_sqlite_store_rejects_legacy_generated_schema_metadata_value(
             for row in connection.execute("PRAGMA table_xinfo(schema_metadata)")
         }
         assert columns == {"key": (0, 0), "value": (1, 3)}
-        assert connection.execute(
-            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-        ).fetchone()["value"] == "11"
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'schema_metadata_v12'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()["value"]
+            == "11"
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'schema_metadata_v12'"
+            ).fetchone()
+            is None
+        )
     finally:
         connection.close()

@@ -127,7 +127,9 @@ def _authenticated_v5_fixture() -> dict[str, object]:
         "storage_budget": {"bytes": 4096, "files": 8},
     }
     api = team_efficiency._AuthenticatedV5Api()
-    planner = team_efficiency._authenticated_v5_helper_module("authenticated_v5_planner")
+    planner = team_efficiency._authenticated_v5_helper_module(
+        "authenticated_v5_planner"
+    )
     normalized_unit = planner.normalize_units(api, [unit])[0]
     unit["task"]["profile_evidence_hash"] = team_efficiency._sha256_json(
         planner._routing_profile_material(source_plan_hash, normalized_unit)
@@ -401,7 +403,9 @@ def _admission_response(request: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _verified_profile_round_trip(monkeypatch: pytest.MonkeyPatch, *, admit: bool) -> None:
+def _verified_profile_round_trip(
+    monkeypatch: pytest.MonkeyPatch, *, admit: bool
+) -> None:
     """Exercise the framed Host bridge and local post-profile compilation."""
 
     import devkit_runtime.host_session as host_session
@@ -425,7 +429,9 @@ def _verified_profile_round_trip(monkeypatch: pytest.MonkeyPatch, *, admit: bool
                 scheduler_facts=fixture["scheduler"],
                 now=1_700_000_000,
             )
-            routing_request = host.receive_routing_attestation_request(now=1_700_000_000)
+            routing_request = host.receive_routing_attestation_request(
+                now=1_700_000_000
+            )
             host.send_routing_attestation_response(
                 request=routing_request,
                 attestations=fixture["attestation_items"],
@@ -461,14 +467,25 @@ def _verified_profile_round_trip(monkeypatch: pytest.MonkeyPatch, *, admit: bool
                     request = message.payload
                     assert message.kind == "storage_admission_request"
                     assert message.action_id == request["correlation_id"]
-                    assert set(request) == {"schema", "correlation_id", "profile_attestation_hash", "storage_intent", "request_hash"}
+                    assert set(request) == {
+                        "schema",
+                        "correlation_id",
+                        "profile_attestation_hash",
+                        "storage_intent",
+                        "request_hash",
+                    }
                     assert request["schema"] == "2718lab.storage.admission-request.v1"
                     assert request["request_hash"] == _canonical_hash(
-                        {key: value for key, value in request.items() if key != "request_hash"}
+                        {
+                            key: value
+                            for key, value in request.items()
+                            if key != "request_hash"
+                        }
                     )
                     admission_requests.append(request)
                     host._send_validated_private(
-                        kind="storage_admission_response", action_id=message.action_id,
+                        kind="storage_admission_response",
+                        action_id=message.action_id,
                         payload=_admission_response(request),
                     )
         except BaseException as error:  # report peer errors after the round trip
@@ -485,10 +502,13 @@ def _verified_profile_round_trip(monkeypatch: pytest.MonkeyPatch, *, admit: bool
         environ={}, platform="posix", clock=lambda: 1_700_000_000
     )
     try:
-        assert session.resolve_capability_snapshot_v2(
-            call_intent_hash=fixture["call_intent_hash"],
-            preparation_id=fixture["preparation_id"],
-        ) is not None
+        assert (
+            session.resolve_capability_snapshot_v2(
+                call_intent_hash=fixture["call_intent_hash"],
+                preparation_id=fixture["preparation_id"],
+            )
+            is not None
+        )
         routing = session.resolve_routing_attestations(
             call_intent_hash=fixture["call_intent_hash"],
             preparation_id=fixture["preparation_id"],
@@ -517,21 +537,41 @@ def _verified_profile_round_trip(monkeypatch: pytest.MonkeyPatch, *, admit: bool
             intent = parse_storage_intent(prepared.storage_intents[0])
             # Same attestation/profile facts on another Python session do not
             # become an issued reference, even when the bridge object matches.
-            foreign = host_session.HostSession(bridge=child, clock=lambda: 1_700_000_000)
-            assert foreign.request_storage_admission(intent, profile_attestation_hash=_hash("7")) == "STORAGE_TARGET_KEY_INVALID"
-            first = session.request_storage_admission(intent, profile_attestation_hash=_hash("7"))
-            second = session.request_storage_admission(intent, profile_attestation_hash=_hash("7"))
+            foreign = host_session.HostSession(
+                bridge=child, clock=lambda: 1_700_000_000
+            )
+            assert (
+                foreign.request_storage_admission(
+                    intent, profile_attestation_hash=_hash("7")
+                )
+                == "STORAGE_TARGET_KEY_INVALID"
+            )
+            first = session.request_storage_admission(
+                intent, profile_attestation_hash=_hash("7")
+            )
+            second = session.request_storage_admission(
+                intent, profile_attestation_hash=_hash("7")
+            )
             assert isinstance(first, StorageAdmissionReceipt)
             assert first == second
             assert len(admission_requests) == 2  # no local decision/cache admission
-            assert admission_requests[0]["correlation_id"] != admission_requests[1]["correlation_id"]
+            assert (
+                admission_requests[0]["correlation_id"]
+                != admission_requests[1]["correlation_id"]
+            )
             assert len(child._storage_admission_completions) == 2
-            with pytest.raises(HostBridgeError, match="HOST_BRIDGE_STORAGE_ADMISSION_INVALID"):
+            with pytest.raises(
+                HostBridgeError, match="HOST_BRIDGE_STORAGE_ADMISSION_INVALID"
+            ):
                 child.request_storage_admission(
-                    admission_requests[0], now=1_700_000_000, expires_at=1_700_000_120,
+                    admission_requests[0],
+                    now=1_700_000_000,
+                    expires_at=1_700_000_120,
                     clock=lambda: 1_700_000_000,
                 )
-            assert set(first.to_dict()) == set(_admission_response(admission_requests[0])["receipt"])
+            assert set(first.to_dict()) == set(
+                _admission_response(admission_requests[0])["receipt"]
+            )
         batch = adapter.compile_fast_lane_with_host_facts(
             fixture["planner_request"],
             reasoning_effort="max",
@@ -551,24 +591,45 @@ def test_storage_admission_rejects_substitution_and_unknown_fields() -> None:
     from devkit_runtime import host_bridge
     from devkit_runtime.storage_intent import parse_storage_intent
 
-    intent = parse_storage_intent(_storage_intent(
-        task_id="TASK-V5", plan_binding=_hash("8"), context_hash=_hash("6")
-    ))
-    request = host_bridge.build_storage_admission_request(intent, profile_attestation_hash=_hash("7"))
+    intent = parse_storage_intent(
+        _storage_intent(
+            task_id="TASK-V5", plan_binding=_hash("8"), context_hash=_hash("6")
+        )
+    )
+    request = host_bridge.build_storage_admission_request(
+        intent, profile_attestation_hash=_hash("7")
+    )
     response = _admission_response(request)
-    malformed = [dict(request, assigned_root="G:/private"), {key: value for key, value in request.items() if key != "profile_attestation_hash"}]
+    malformed = [
+        dict(request, assigned_root="G:/private"),
+        {
+            key: value
+            for key, value in request.items()
+            if key != "profile_attestation_hash"
+        },
+    ]
     for candidate in malformed:
         with pytest.raises(host_bridge.HostBridgeError):
             host_bridge._normalize_storage_admission_request(candidate)
-    for field, value in (("target_key", _hash("f")), ("storage_intent_hash", _hash("f")),
-                         ("profile_attestation_hash", _hash("f")), ("reserved_bytes", True),
-                         ("reserved_files", 9), ("expires_at", 1_700_000_000),
-                         ("free_space_floor", 0),
-                         ("admission_id", "G:/private"), ("assigned_root", "G:/private")):
+    for field, value in (
+        ("target_key", _hash("f")),
+        ("storage_intent_hash", _hash("f")),
+        ("profile_attestation_hash", _hash("f")),
+        ("reserved_bytes", True),
+        ("reserved_files", 9),
+        ("expires_at", 1_700_000_000),
+        ("free_space_floor", 0),
+        ("admission_id", "G:/private"),
+        ("assigned_root", "G:/private"),
+    ):
         candidate = copy.deepcopy(response)
         candidate["receipt"][field] = value
         candidate["receipt"]["receipt_hash"] = _canonical_hash(
-            {key: value for key, value in candidate["receipt"].items() if key != "receipt_hash"}
+            {
+                key: value
+                for key, value in candidate["receipt"].items()
+                if key != "receipt_hash"
+            }
         )
         with pytest.raises(host_bridge.HostBridgeError):
             host_bridge._normalize_storage_admission_response(
@@ -576,8 +637,15 @@ def test_storage_admission_rejects_substitution_and_unknown_fields() -> None:
             )
     child, host = _pipe_pair()
     try:
-        with pytest.raises(host_bridge.HostBridgeError, match="HOST_BRIDGE_STORAGE_PROFILE_INVALID"):
-            child.request_storage_admission(request, now=1_700_000_000, expires_at=1_700_000_120, clock=lambda: 1_700_000_000)
+        with pytest.raises(
+            host_bridge.HostBridgeError, match="HOST_BRIDGE_STORAGE_PROFILE_INVALID"
+        ):
+            child.request_storage_admission(
+                request,
+                now=1_700_000_000,
+                expires_at=1_700_000_120,
+                clock=lambda: 1_700_000_000,
+            )
     finally:
         child.close()
         host.close()
@@ -594,26 +662,42 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io(
     for scenario in ("no_reply", "full_pipe", "close", "direct_close"):
         child, host = _pipe_pair()
         profile_request = _storage_profile_request()
-        pending = child.send_storage_profile_request(**{
-            name: getattr(profile_request, name) for name in (
-                "call_intent_hash", "preparation_id", "task_id",
-                "source_plan_hash", "index_attestation_hash",
-            )
-        })
+        pending = child.send_storage_profile_request(
+            **{
+                name: getattr(profile_request, name)
+                for name in (
+                    "call_intent_hash",
+                    "preparation_id",
+                    "task_id",
+                    "source_plan_hash",
+                    "index_attestation_hash",
+                )
+            }
+        )
         peer_request = host.receive_storage_profile_request()
-        host.send_storage_profile_response(request=peer_request, response=_storage_profile_response(peer_request))
+        host.send_storage_profile_response(
+            request=peer_request, response=_storage_profile_response(peer_request)
+        )
         profile = child.receive_storage_profile_response(request=pending)
         session = host_session.HostSession(bridge=child, clock=lambda: 1_700_000_000)
         # This test isolates transport lifecycle after actual profile delivery;
         # preparation enrollment itself is covered by the round-trip test.
-        session._completed_storage_profiles[_hash("7")] = host_session._CompletedStorageProfile(
-            profile=profile, bridge=child,
-            expires_at=1_700_000_060 if scenario in {"close", "direct_close"} else 1_700_000_001,
-            requested_bytes=4096, requested_files=8,
+        session._completed_storage_profiles[_hash("7")] = (
+            host_session._CompletedStorageProfile(
+                profile=profile,
+                bridge=child,
+                expires_at=1_700_000_060
+                if scenario in {"close", "direct_close"}
+                else 1_700_000_001,
+                requested_bytes=4096,
+                requested_files=8,
+            )
         )
-        intent = parse_storage_intent(_storage_intent(
-            task_id="TASK-V5", plan_binding=_hash("8"), context_hash=_hash("6")
-        ))
+        intent = parse_storage_intent(
+            _storage_intent(
+                task_id="TASK-V5", plan_binding=_hash("8"), context_hash=_hash("6")
+            )
+        )
         if scenario == "full_pipe":
             with host_bridge._nonblocking_pipe_writer(child._write_fd) as write:
                 for _ in range(1024):
@@ -628,6 +712,7 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io(
         restore_allowed = threading.Event()
         original_writer = host_bridge._nonblocking_pipe_writer
         if scenario == "direct_close":
+
             @contextmanager
             def paused_restore(descriptor: int):
                 with original_writer(descriptor) as write:
@@ -635,13 +720,20 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io(
                         yield write
                     finally:
                         restore_reached.set()
-                        assert restore_allowed.wait(timeout=3), "mode-restore barrier was not released"
+                        assert restore_allowed.wait(timeout=3), (
+                            "mode-restore barrier was not released"
+                        )
 
             monkeypatch.setattr(host_bridge, "_nonblocking_pipe_writer", paused_restore)
         result: list[object] = []
-        worker = threading.Thread(target=lambda: result.append(session.request_storage_admission(
-            intent, profile_attestation_hash=_hash("7")
-        )), daemon=True)
+        worker = threading.Thread(
+            target=lambda: result.append(
+                session.request_storage_admission(
+                    intent, profile_attestation_hash=_hash("7")
+                )
+            ),
+            daemon=True,
+        )
         closer: threading.Thread | None = None
         worker.start()
         try:
@@ -652,7 +744,9 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io(
                 closer = threading.Thread(target=session.close, daemon=True)
                 closer.start()
                 closer.join(timeout=2)
-                assert not closer.is_alive(), "close waited behind admission's business lock"
+                assert not closer.is_alive(), (
+                    "close waited behind admission's business lock"
+                )
             if scenario == "direct_close":
                 assert restore_reached.wait(timeout=2)
                 borrowed_fd = child._write_fd
@@ -665,7 +759,9 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io(
                 os.fstat(borrowed_fd)  # mode restoration still owns this exact fd
                 restore_allowed.set()
             worker.join(timeout=3)
-            assert not worker.is_alive(), "admission did not terminate at its transport deadline"
+            assert not worker.is_alive(), (
+                "admission did not terminate at its transport deadline"
+            )
             assert result == ["STORAGE_STAT_UNAVAILABLE"]
             assert not child._storage_admission_completions
             assert not child._storage_admission_decisions
@@ -681,7 +777,9 @@ def test_storage_admission_deadline_and_close_cancel_blocked_io(
             if closer is not None:
                 closer.join(timeout=2)
             session.close()
-            monkeypatch.setattr(host_bridge, "_nonblocking_pipe_writer", original_writer)
+            monkeypatch.setattr(
+                host_bridge, "_nonblocking_pipe_writer", original_writer
+            )
 
 
 def test_profile_tamper_or_missing_field_fails_closed() -> None:

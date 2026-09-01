@@ -1008,9 +1008,7 @@ def relay_compile(request: RelayCompileRequest) -> dict[str, object]:
 @mcp.tool(annotations=_tool_annotations("fastlane_compile"))
 def fastlane_compile(
     request: dict[str, object],
-    reasoning_effort: Literal[
-        "low", "medium", "high", "xhigh", "max"
-    ],
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"],
     enable: bool = False,
 ) -> dict[str, object]:
     """Compile inert Fast Lane descriptors without receiving host-private evidence.
@@ -1077,10 +1075,7 @@ def _fastlane_authenticated_dispatch(
         if reasoning_effort == "ultra":
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         session = _host_session()
-        if (
-            type(session) is not HostSession
-            or not session.is_available
-        ):
+        if type(session) is not HostSession or not session.is_available:
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
         index_attestation = session.project_index_query_attestation(
             correlation_id=index_query_correlation
@@ -1139,14 +1134,11 @@ def _fastlane_authenticated_dispatch(
         # skeletons. Remaining work is materialized later by the Host-owned
         # refill registry, which has no storage-profile proof channel yet.
         # Budgeted successors therefore fail closed before publication.
-        if (
-            len(initial_storage_budgets) not in {0, len(initial_units)}
-            or any("storage_budget" in unit for unit in remaining_units)
+        if len(initial_storage_budgets) not in {0, len(initial_units)} or any(
+            "storage_budget" in unit for unit in remaining_units
         ):
             return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        initial_task_ids = {
-            unit["task"]["task_id"] for unit in initial_units
-        }
+        initial_task_ids = {unit["task"]["task_id"] for unit in initial_units}
         initial_requests: list[dict[str, object]] = []
         remaining_requests: list[dict[str, object]] = []
         for item in routing_snapshot.routing_requests:
@@ -1283,24 +1275,25 @@ def _fastlane_authenticated_dispatch(
         def refill_callback(trigger: Mapping[str, object]) -> dict[str, object]:
             """Record the real next-boundary result for this fully dispatched plan."""
 
-            request_hash = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    request,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                ).encode("utf-8")
-            ).hexdigest()
+            request_hash = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        request,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
             queued_ids = [
                 skeleton["task_id"]
                 for skeleton in compiled_remaining["assignment_skeletons"]
             ]
             return {
                 "schema": "2718lab-devkit/fastlane-refill-receipt-v1",
-                "state": (
-                    "QUEUED_WAVE_PENDING" if queued_ids else "NO_QUEUED_WORK"
-                ),
+                "state": ("QUEUED_WAVE_PENDING" if queued_ids else "NO_QUEUED_WORK"),
                 "request_hash": request_hash,
                 "refill_trigger_hash": trigger["refill_trigger_hash"],
                 "queue_registry_hash": (

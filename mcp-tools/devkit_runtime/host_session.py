@@ -350,11 +350,7 @@ class HostSession:
         self._clock = clock
         self._last_trusted_clock: float | None = None
         self._closed = False
-        self._frozen = (
-            bridge is None
-            or not callable(clock)
-            or not bridge.is_available
-        )
+        self._frozen = bridge is None or not callable(clock) or not bridge.is_available
         self._attested_capabilities: dict[tuple[str, str], _CapabilityRecord] = {}
         self._consumed_predecessors: set[tuple[str, str, str, str, str]] = set()
         self._last_unavailable: HostUnavailableFacts | None = None
@@ -427,7 +423,9 @@ class HostSession:
             or not self.is_available
             or type(call_intent_hash) is not str
             or len(call_intent_hash) != 64
-            or any(character not in "0123456789abcdef" for character in call_intent_hash)
+            or any(
+                character not in "0123456789abcdef" for character in call_intent_hash
+            )
             or type(preparation_id) is not str
             or _IDENTIFIER.fullmatch(preparation_id) is None
             or (
@@ -642,9 +640,14 @@ class HostSession:
             # Only the actual authenticated profile round trip can enroll a
             # reference; an injected resolver/provider cannot mint authority.
             bridge = self._bridge
-            if bridge is not None and binding_resolver == self._resolve_bridge_compiler_invocation:
-                budgets = {task: (byte_count, files) for task, byte_count, files
-                           in material.storage_budget_bindings}
+            if (
+                bridge is not None
+                and binding_resolver == self._resolve_bridge_compiler_invocation
+            ):
+                budgets = {
+                    task: (byte_count, files)
+                    for task, byte_count, files in material.storage_budget_bindings
+                }
                 completed_profiles: dict[str, _CompletedStorageProfile] = {}
                 for profile in material.storage_profiles:
                     if not bridge.has_completed_storage_profile(profile):
@@ -652,10 +655,15 @@ class HostSession:
                     attestation = cast(str, profile["attestation_hash"])
                     byte_count, files = budgets[cast(str, profile["task_id"])]
                     completed = _CompletedStorageProfile(
-                        profile=dict(profile), bridge=bridge, expires_at=int(expires_at),
-                        requested_bytes=byte_count, requested_files=files,
+                        profile=dict(profile),
+                        bridge=bridge,
+                        expires_at=int(expires_at),
+                        requested_bytes=byte_count,
+                        requested_files=files,
                     )
-                    previous = completed_profiles.get(attestation) or self._completed_storage_profiles.get(attestation)
+                    previous = completed_profiles.get(
+                        attestation
+                    ) or self._completed_storage_profiles.get(attestation)
                     if previous is not None and previous != completed:
                         return _NO_SAFE_WORK
                     completed_profiles[attestation] = completed
@@ -688,7 +696,10 @@ class HostSession:
                 or _IDENTIFIER.fullmatch(preparation_id) is None
                 or type(call_intent_hash) is not str
                 or len(call_intent_hash) != 64
-                or any(character not in "0123456789abcdef" for character in call_intent_hash)
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in call_intent_hash
+                )
                 or not _is_hash(request_hash)
                 or not _is_hash(routing_registry_binding_hash)
                 or reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
@@ -804,9 +815,7 @@ class HostSession:
             ):
                 skeleton_mapping = _mapping(skeleton)
                 index_mapping = _mapping(index_ref)
-                task_id = _required_fast_lane_task_id(
-                    skeleton_mapping.get("task_id")
-                )
+                task_id = _required_fast_lane_task_id(skeleton_mapping.get("task_id"))
                 source_plan_hash = _required_hash(
                     skeleton_mapping.get("source_plan_hash")
                 )
@@ -817,7 +826,8 @@ class HostSession:
                     index_mapping.get("task_id") != task_id
                     or fact.task_id != task_id
                     or fact.source_plan_hash != source_plan_hash
-                    or fact.index_context_hash != skeleton_mapping.get("index_context_hash")
+                    or fact.index_context_hash
+                    != skeleton_mapping.get("index_context_hash")
                 ):
                     return None
                 profile_request = bridge.send_storage_profile_request(
@@ -835,12 +845,10 @@ class HostSession:
             request_hash=_required_hash(response["request_hash"]),
             reasoning_effort=str(response["reasoning_effort"]),
             verified_route_result_hashes=tuple(
-                _required_hash(value)
-                for value in route_hashes
+                _required_hash(value) for value in route_hashes
             ),
             verified_lease_scope_bindings=tuple(
-                _required_hash(value)
-                for value in lease_hashes
+                _required_hash(value) for value in lease_hashes
             ),
             dispatch_facts=dispatch_facts,
             dispatch_binding_hashes=tuple(
@@ -914,21 +922,27 @@ class HostSession:
                 return "STORAGE_TARGET_KEY_INVALID"
             try:
                 now = int(self._read_trusted_clock())
-                if now >= completed.expires_at or not bridge.has_completed_storage_profile(completed.profile):
+                if (
+                    now >= completed.expires_at
+                    or not bridge.has_completed_storage_profile(completed.profile)
+                ):
                     return "STORAGE_STAT_UNAVAILABLE"
                 if type(intent) is not StorageIntent:
                     return "STORAGE_TARGET_KEY_INVALID"
                 parsed = parse_storage_intent(intent.to_dict())
                 _validate_storage_admission_profile(parsed, completed.profile)
                 if (parsed.requested_bytes, parsed.requested_files) != (
-                    completed.requested_bytes, completed.requested_files
+                    completed.requested_bytes,
+                    completed.requested_files,
                 ):
                     return "STORAGE_LEASE_CONFLICT"
                 request = build_storage_admission_request(
                     parsed, profile_attestation_hash=profile_attestation_hash
                 )
                 receipt = bridge.request_storage_admission(
-                    request, now=now, expires_at=completed.expires_at,
+                    request,
+                    now=now,
+                    expires_at=completed.expires_at,
                     clock=self._read_trusted_clock,
                 )
                 # Re-read the trusted clock after blocking I/O. A valid frame
@@ -939,7 +953,10 @@ class HostSession:
             except StorageIntentError as error:
                 return error.code
             except HostBridgeError as error:
-                if error.code in {"STORAGE_TARGET_KEY_INVALID", "STORAGE_LEASE_CONFLICT"}:
+                if error.code in {
+                    "STORAGE_TARGET_KEY_INVALID",
+                    "STORAGE_LEASE_CONFLICT",
+                }:
                     return error.code
                 self._freeze()
                 return "STORAGE_STAT_UNAVAILABLE"
@@ -1008,9 +1025,7 @@ class HostSession:
                 return False
             try:
                 now = self._read_trusted_clock()
-                budget_bindings = _normalized_storage_budget_bindings(
-                    storage_budgets
-                )
+                budget_bindings = _normalized_storage_budget_bindings(storage_budgets)
                 if (
                     now >= material.expires_at
                     or not budget_bindings
@@ -1030,8 +1045,7 @@ class HostSession:
                     preparation_id=material.preparation_id,
                 )
                 intent_hashes = tuple(
-                    _required_hash(intent["storage_intent_hash"])
-                    for intent in intents
+                    _required_hash(intent["storage_intent_hash"]) for intent in intents
                 )
                 rebound = replace(
                     material,
@@ -1041,9 +1055,7 @@ class HostSession:
                 )
                 rebound = replace(
                     rebound,
-                    binding_hash=_hash(
-                        _compiler_invocation_binding_material(rebound)
-                    ),
+                    binding_hash=_hash(_compiler_invocation_binding_material(rebound)),
                 )
             except (KeyError, TypeError, ValueError):
                 return False
@@ -1067,10 +1079,8 @@ class HostSession:
                 now = self._read_trusted_clock()
             except (TypeError, ValueError):
                 return _NO_SAFE_WORK
-            if (
-                now >= material.expires_at
-                or material.binding_hash
-                != _hash(_compiler_invocation_binding_material(material))
+            if now >= material.expires_at or material.binding_hash != _hash(
+                _compiler_invocation_binding_material(material)
             ):
                 return _NO_SAFE_WORK
             return material
@@ -1112,7 +1122,10 @@ class HostSession:
                 if (
                     type(call_intent_hash) is not str
                     or len(call_intent_hash) != 64
-                    or any(character not in "0123456789abcdef" for character in call_intent_hash)
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in call_intent_hash
+                    )
                     or type(preparation_id) is not str
                     or _IDENTIFIER.fullmatch(preparation_id) is None
                 ):
@@ -1142,7 +1155,9 @@ class HostSession:
                         "lease_epoch": assignment.get("lease_epoch"),
                         "task_version": assignment.get("task_version"),
                         "assignment_token": assignment.get("assignment_token"),
-                        "dispatch_binding_hash": assignment.get("dispatch_binding_hash"),
+                        "dispatch_binding_hash": assignment.get(
+                            "dispatch_binding_hash"
+                        ),
                         "routing_result_hash": route.get("routing_result_hash"),
                         "worktree_identity": assignment.get("worktree_identity"),
                         "worktree_base": assignment.get("worktree_base"),
@@ -1175,8 +1190,12 @@ class HostSession:
                     now=now,
                 )
                 self._pending_fast_lane_terminals.update(pending)
-                if refill_callback is not None and not self.start_fast_lane_terminal_receiver(
-                    batch_hash=cast(str, batch_hash), refill_callback=refill_callback
+                if (
+                    refill_callback is not None
+                    and not self.start_fast_lane_terminal_receiver(
+                        batch_hash=cast(str, batch_hash),
+                        refill_callback=refill_callback,
+                    )
                 ):
                     raise ValueError("Fast Lane terminal receiver was not started")
                 return receipt
@@ -1303,7 +1322,9 @@ class HostSession:
         with self._compiler_evidence_lock:
             if (
                 not self.is_available
-                or not any(key[0] == batch_hash for key in self._pending_fast_lane_terminals)
+                or not any(
+                    key[0] == batch_hash for key in self._pending_fast_lane_terminals
+                )
                 or batch_hash in self._fast_lane_refill_callbacks
             ):
                 return False
@@ -1651,8 +1672,7 @@ class HostSession:
                         type(action) is not HostAuthoritativeActionFact
                         or not _is_hash(action.plan_hash)
                         or _IDENTIFIER.fullmatch(action.task_id) is None
-                        or action.kind
-                        not in {"implementation", "prewarm", "design"}
+                        or action.kind not in {"implementation", "prewarm", "design"}
                         or _IDENTIFIER.fullmatch(action.target) is None
                         or not _is_hash(action.group_binding_hash)
                         or action.plan_hash != fact.plan_hash
@@ -1681,9 +1701,7 @@ class HostSession:
                         )
                         for action in fact.authoritative_actions
                     )
-                    or len(
-                        {action.task_id for action in fact.authoritative_actions}
-                    )
+                    or len({action.task_id for action in fact.authoritative_actions})
                     != len(fact.authoritative_actions)
                     or fact.scheduler_id in facts_by_scheduler
                 ):
@@ -2155,7 +2173,10 @@ def _normalized_storage_profiles(
         if mapping["profile_hash"] != _hash(unsigned):
             raise ValueError("compiler storage profile hash is invalid")
         normalized.append(
-            {field_name: mapping[field_name] for field_name in sorted(_STORAGE_PROFILE_FIELDS)}
+            {
+                field_name: mapping[field_name]
+                for field_name in sorted(_STORAGE_PROFILE_FIELDS)
+            }
         )
     task_ids = [cast(str, profile["task_id"]) for profile in normalized]
     if len(task_ids) != len(set(task_ids)):
@@ -2192,8 +2213,7 @@ def _normalized_storage_intent_proof(
             for fact in dispatch_facts
         )
         fact_source_plan_hashes = tuple(
-            _required_hash(getattr(fact, "source_plan_hash"))
-            for fact in dispatch_facts
+            _required_hash(getattr(fact, "source_plan_hash")) for fact in dispatch_facts
         )
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("compiler storage dispatch facts are invalid") from error
@@ -2318,7 +2338,8 @@ def _normalized_compiler_invocation_binding(
     if bool(storage_budget_bindings) != bool(storage_profiles):
         raise ValueError("compiler storage proof is incomplete")
     if storage_budget_bindings and {
-        task_id for task_id, _requested_bytes, _requested_files in storage_budget_bindings
+        task_id
+        for task_id, _requested_bytes, _requested_files in storage_budget_bindings
     } != {cast(str, profile["task_id"]) for profile in storage_profiles}:
         raise ValueError("compiler storage profile budget bindings are invalid")
     return _CompilerInvocationBinding(

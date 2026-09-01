@@ -54,16 +54,11 @@ def _routing_profile_material(
     return {
         "schema": _PROFILE_EVIDENCE_SCHEMA,
         "source_plan_hash": source_plan_hash,
-        "unit": {
-            field: task if field == "task" else unit[field]
-            for field in fields
-        },
+        "unit": {field: task if field == "task" else unit[field] for field in fields},
     }
 
 
-def _storage_request_without_extensions(
-    value: Mapping[str, Any], api: Any
-) -> None:
+def _storage_request_without_extensions(value: Mapping[str, Any], api: Any) -> None:
     if "storage_contexts" in value:
         raise ValueError(_STORAGE_TARGET_KEY_INVALID)
     base = {
@@ -111,10 +106,7 @@ def _validated_request_storage_budgets(
         return {}
     if not isinstance(value, Mapping) or set(value) != set(task_ids):
         raise ValueError(_STORAGE_POLICY_MISSING)
-    return {
-        task_id: _validated_storage_budget(value[task_id])
-        for task_id in task_ids
-    }
+    return {task_id: _validated_storage_budget(value[task_id]) for task_id in task_ids}
 
 
 def _attach_storage_budget(
@@ -346,9 +338,7 @@ def project_units_with_waves(
             # remains the complete 0..N-1 sequence.
             dispatch_order = package_order[task_id]
             source_unit = units_by_task[task_id]
-            if (
-                target_by_task.get(task_id) is None
-            ):
+            if target_by_task.get(task_id) is None:
                 raise ValueError("authenticated V5 execution context is incomplete")
             target = target_by_task[task_id]
             write_scope = api._normalised_scopes(source_unit.get("write_scope", []))

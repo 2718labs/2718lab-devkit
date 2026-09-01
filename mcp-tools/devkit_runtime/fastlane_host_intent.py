@@ -26,9 +26,7 @@ UNSPLITTABLE: Final = "UNSPLITTABLE"
 
 _SCHEMA_V2: Final = "2718lab-devkit/fastlane-host-execution-intent-v2"
 _SCHEMA_V3: Final = "2718lab-devkit/fastlane-host-execution-intent-v3"
-_RELAY_HOST_SCHEDULER_SLOT_SCHEMA: Final = (
-    "2718lab-devkit/relay-host-scheduler-slot-v1"
-)
+_RELAY_HOST_SCHEDULER_SLOT_SCHEMA: Final = "2718lab-devkit/relay-host-scheduler-slot-v1"
 _HOST_TOPOLOGY_SCHEMA: Final = "2718lab-devkit/host-scheduler-topology-v1"
 _PREDECESSOR_SCHEMA: Final = "2718lab-devkit/fastlane-external-lease-predecessor-v2"
 _HASH_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -464,8 +462,7 @@ def _parse(candidate: object) -> ParsedHostExecutionIntent | None:
     create = _bound_mapping(root["create"], _CREATE_KEYS, "create_binding_hash")
     lease = _bound_mapping(root["lease"], _LEASE_KEYS, "lease_binding_hash")
     if any(
-        value is None
-        for value in (assignment, route, packets, source, create, lease)
+        value is None for value in (assignment, route, packets, source, create, lease)
     ):
         return None
 
@@ -1047,9 +1044,10 @@ def _is_expectation_projection(
 
     if not _capability_expectations_are_valid(expectation.capability_facts):
         return False
-    if expectation.storage_intent is not None and type(
-        expectation.storage_intent
-    ) is not StorageIntent:
+    if (
+        expectation.storage_intent is not None
+        and type(expectation.storage_intent) is not StorageIntent
+    ):
         return False
     if expectation.execution_context_hash is not None and not _is_hash_value(
         expectation.execution_context_hash

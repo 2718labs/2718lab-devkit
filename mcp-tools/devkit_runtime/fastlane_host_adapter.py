@@ -232,10 +232,9 @@ def _storage_intents_for_profiles(
         ):
             raise ValueError("storage profile assignment binding is invalid")
         assignment_task_ids.append(task_id)
-    if (
-        len(set(assignment_task_ids)) != len(assignment_task_ids)
-        or set(budget_by_task) != set(assignment_task_ids)
-    ):
+    if len(set(assignment_task_ids)) != len(assignment_task_ids) or set(
+        budget_by_task
+    ) != set(assignment_task_ids):
         raise ValueError("storage budget/profile bindings are invalid")
     profile_task_ids: list[str] = []
     for profile in profiles:
@@ -296,10 +295,7 @@ def _storage_intents_for_profiles(
         source_plan_hash = assignment.get("source_plan_hash")
         assert type(task_id) is str
         budget = budget_by_task.get(task_id)
-        if (
-            budget is None
-            or profile.get("source_plan_hash") != source_plan_hash
-        ):
+        if budget is None or profile.get("source_plan_hash") != source_plan_hash:
             raise ValueError("storage profile assignment binding is invalid")
         context_hash = profile.get("execution_context_hash")
         if (
@@ -430,10 +426,10 @@ def prepare_verified_host_facts(
                         normalized_request["project_index_attestation_refs"],
                     )
                 ),
-                routing_registry_binding_hash=cast(
-                    str, routing_registry_binding_hash
+                routing_registry_binding_hash=cast(str, routing_registry_binding_hash),
+                storage_task_ids=(
+                    storage_task_ids if normalized_storage_budgets else ()
                 ),
-                storage_task_ids=(storage_task_ids if normalized_storage_budgets else ()),
                 storage_budget_bindings=normalized_storage_budgets,
             )
             if not bridge_attested:
@@ -477,9 +473,7 @@ def prepare_verified_host_facts(
             bridge_attested=bridge_attested,
             evidence_expires_at=expires_at,
             preparation_id=normalized_preparation_id,
-            call_intent_hash=(
-                cast(str, call_intent_hash) if bridge_attested else None
-            ),
+            call_intent_hash=(cast(str, call_intent_hash) if bridge_attested else None),
             storage_budgets=normalized_storage_budgets,
             storage_intents=storage_intents,
         )
@@ -601,8 +595,7 @@ def compile_fast_lane_with_host_facts(
                 )
             )
             storage_intent_hashes = tuple(
-                cast(str, intent["storage_intent_hash"])
-                for intent in storage_intents
+                cast(str, intent["storage_intent_hash"]) for intent in storage_intents
             )
             if (
                 material.storage_budget_bindings != prepared.storage_budgets
@@ -1105,9 +1098,10 @@ def _dispatch_fact_from_mapping(value: object) -> _HostDispatchFact:
         ledger_epoch=cast(int, normalized["ledger_epoch"]),
         active_lease_set_hash=cast(str, normalized["active_lease_set_hash"]),
     )
-    if normalized["dispatch_binding_hash"] != _dispatch_fact_mapping(fact)[
-        "dispatch_binding_hash"
-    ]:
+    if (
+        normalized["dispatch_binding_hash"]
+        != _dispatch_fact_mapping(fact)["dispatch_binding_hash"]
+    ):
         raise ValueError("dispatch binding hash is invalid")
     return fact
 

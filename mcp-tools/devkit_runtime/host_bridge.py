@@ -41,28 +41,42 @@ _CAPABILITY_REPORT_SCHEMA_V2: Final = "2718lab-devkit/host-capability-report-v2"
 _OPERATION_REQUEST_SCHEMA: Final = "2718lab-devkit/host-operation-request-v1"
 _TERMINAL_RESULT_SCHEMA: Final = "2718lab-devkit/host-terminal-result-v1"
 _PROOF_CONTINUATION_SCHEMA: Final = "2718lab-devkit/host-proof-continuation-v1"
-_COMPILER_EVIDENCE_REQUEST_SCHEMA: Final = (
-    "2718lab-devkit/compiler-evidence-request-v1"
-)
+_COMPILER_EVIDENCE_REQUEST_SCHEMA: Final = "2718lab-devkit/compiler-evidence-request-v1"
 _COMPILER_EVIDENCE_RESPONSE_SCHEMA: Final = (
     "2718lab-devkit/compiler-evidence-response-v1"
 )
-_STORAGE_PROFILE_REQUEST_SCHEMA: Final = (
-    "2718lab-devkit/storage-profile-request-v1"
-)
+_STORAGE_PROFILE_REQUEST_SCHEMA: Final = "2718lab-devkit/storage-profile-request-v1"
 _STORAGE_PROFILE_SCHEMA: Final = "2718lab-devkit/storage-profile-v1"
 _STORAGE_ADMISSION_REQUEST_SCHEMA: Final = "2718lab.storage.admission-request.v1"
 _STORAGE_ADMISSION_RESPONSE_SCHEMA: Final = "2718lab.storage.admission-response.v1"
 _STORAGE_ADMISSION_RECEIPT_SCHEMA: Final = "2718lab.storage.admission-receipt.v1"
 _STORAGE_ADMISSION_REQUEST_FIELDS: Final = frozenset(
-    {"schema", "correlation_id", "profile_attestation_hash", "storage_intent", "request_hash"}
+    {
+        "schema",
+        "correlation_id",
+        "profile_attestation_hash",
+        "storage_intent",
+        "request_hash",
+    }
 )
 _STORAGE_ADMISSION_RECEIPT_FIELDS: Final = frozenset(
-    {"schema", "admission_id", "profile_attestation_hash", "storage_intent_hash",
-     "storage_binding_hash", "target_key", "assigned_root_identity",
-     "target_family_lease_id", "reserved_bytes", "reserved_files",
-     "free_space_before", "free_space_after_reserve", "free_space_floor",
-     "expires_at", "receipt_hash"}
+    {
+        "schema",
+        "admission_id",
+        "profile_attestation_hash",
+        "storage_intent_hash",
+        "storage_binding_hash",
+        "target_key",
+        "assigned_root_identity",
+        "target_family_lease_id",
+        "reserved_bytes",
+        "reserved_files",
+        "free_space_before",
+        "free_space_after_reserve",
+        "free_space_floor",
+        "expires_at",
+        "receipt_hash",
+    }
 )
 _PROJECT_INDEX_ATTESTATION_SCHEMA: Final = (
     project_index_attestation_protocol.ATTESTATION_SCHEMA
@@ -77,9 +91,7 @@ _FAST_LANE_TERMINAL_RESULT_SCHEMA: Final = (
     fastlane_terminal_protocol.TERMINAL_RESULT_SCHEMA
 )
 _FAST_LANE_TERMINAL_ACK_SCHEMA: Final = fastlane_terminal_protocol.TERMINAL_ACK_SCHEMA
-_FAST_LANE_REFILL_REGISTRY_SCHEMA: Final = (
-    "2718lab-devkit/fast_lane_refill_registry-v1"
-)
+_FAST_LANE_REFILL_REGISTRY_SCHEMA: Final = "2718lab-devkit/fast_lane_refill_registry-v1"
 _FAST_LANE_REFILL_REGISTRY_ACTION_PREFIX: Final = "refill-registry-"
 _FRAME_FIELDS: Final = frozenset(
     {"schema", "kind", "action_id", "session_nonce", "sequence", "payload", "mac"}
@@ -148,9 +160,7 @@ _FAST_LANE_TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z")
 _ENDPOINT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MAC = re.compile(r"[0-9a-f]{64}\Z")
-_FAST_LANE_REFILL_REGISTRY_ACTION = re.compile(
-    r"refill-registry-[0-9a-f]{64}\Z"
-)
+_FAST_LANE_REFILL_REGISTRY_ACTION = re.compile(r"refill-registry-[0-9a-f]{64}\Z")
 _FD_SELECTOR = re.compile(r"[0-9]{1,18}\Z")
 _WINDOWS_PIPE_SELECTOR = re.compile(
     r"pipe:(?P<name>codex-devkit-(?P<server_pid>[1-9][0-9]{0,9})-"
@@ -344,7 +354,10 @@ class StorageAdmissionReceipt:
     receipt_hash: str
 
     def to_dict(self) -> dict[str, object]:
-        return {name: getattr(self, name) for name in sorted(_STORAGE_ADMISSION_RECEIPT_FIELDS)}
+        return {
+            name: getattr(self, name)
+            for name in sorted(_STORAGE_ADMISSION_RECEIPT_FIELDS)
+        }
 
 
 @dataclass(frozen=True)
@@ -855,9 +868,10 @@ class InheritedHandleHostBridge:
         attestations: Sequence[Mapping[str, object]],
         now: int,
     ) -> dict[str, object]:
-        if self._received_routing_attestations.get(
-            request.routing_request_set_hash
-        ) != request:
+        if (
+            self._received_routing_attestations.get(request.routing_request_set_hash)
+            != request
+        ):
             raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
         unsigned: dict[str, object] = {
             "schema": _ROUTING_ATTESTATION_RESPONSE_SCHEMA,
@@ -885,9 +899,10 @@ class InheritedHandleHostBridge:
     def receive_routing_attestation_response(
         self, *, request: RoutingAttestationRequest, now: int
     ) -> dict[str, object]:
-        if self._pending_routing_attestations.get(
-            request.routing_request_set_hash
-        ) != request:
+        if (
+            self._pending_routing_attestations.get(request.routing_request_set_hash)
+            != request
+        ):
             raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
         try:
             message = self._receive_private()
@@ -1139,7 +1154,8 @@ class InheritedHandleHostBridge:
             if (
                 message.kind != "fast_lane_refill_registry"
                 or message.action_id != expected_action
-                or request.queue_registry_hash in self._received_fast_lane_refill_registries
+                or request.queue_registry_hash
+                in self._received_fast_lane_refill_registries
             ):
                 raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
         except HostBridgeError:
@@ -1377,9 +1393,7 @@ class InheritedHandleHostBridge:
                 "reasoning_effort": reasoning_effort,
                 "requested_route_pairs": list(requested_route_pairs),
                 "assignment_skeletons": list(assignment_skeletons),
-                "project_index_attestation_refs": list(
-                    project_index_attestation_refs
-                ),
+                "project_index_attestation_refs": list(project_index_attestation_refs),
                 "routing_registry_binding_hash": routing_registry_binding_hash,
                 "nonce": nonce,
                 "expires_at": now + _COMPILER_EVIDENCE_TTL_SECONDS,
@@ -1408,9 +1422,7 @@ class InheritedHandleHostBridge:
         assert type(attestation_hash) is str
         if attestation_hash in self._received_project_index_attestations:
             raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
-        _validate_private_packet_size(
-            normalized, _MAX_PROJECT_INDEX_ATTESTATION_BYTES
-        )
+        _validate_private_packet_size(normalized, _MAX_PROJECT_INDEX_ATTESTATION_BYTES)
         self._send_validated_private(
             kind="project_index_attestation",
             action_id=cast(str, normalized["correlation_id"]),
@@ -1425,22 +1437,14 @@ class InheritedHandleHostBridge:
         try:
             message = self._receive_private()
             if message.kind != "project_index_attestation":
-                raise HostBridgeError(
-                    "HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID"
-                )
-            normalized = _normalize_project_index_attestation(
-                message.payload, now=now
-            )
+                raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
+            normalized = _normalize_project_index_attestation(message.payload, now=now)
             if message.action_id != normalized["correlation_id"]:
-                raise HostBridgeError(
-                    "HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID"
-                )
+                raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
             attestation_hash = normalized["attestation_hash"]
             assert type(attestation_hash) is str
             if attestation_hash in self._received_project_index_attestations:
-                raise HostBridgeError(
-                    "HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID"
-                )
+                raise HostBridgeError("HOST_BRIDGE_PROJECT_INDEX_ATTESTATION_INVALID")
         except HostBridgeError:
             self._poison()
             raise
@@ -1622,7 +1626,11 @@ class InheritedHandleHostBridge:
         return normalized
 
     def request_storage_admission(
-        self, request: Mapping[str, object], *, now: int, expires_at: int,
+        self,
+        request: Mapping[str, object],
+        *,
+        now: int,
+        expires_at: int,
         clock: Callable[[], float],
     ) -> StorageAdmissionReceipt:
         """Exchange one decision before terminal reception starts; never admit locally.
@@ -1640,34 +1648,47 @@ class InheritedHandleHostBridge:
                 raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
             _validate_storage_admission_profile(intent, profile)
             if (
-                type(now) is not int or type(expires_at) is not int
+                type(now) is not int
+                or type(expires_at) is not int
                 or not 0 <= now < expires_at <= (1 << 64) - 1
                 or correlation in self._storage_admission_correlations
             ):
                 raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
             previous = self._storage_admission_decisions.get(attestation)
-            if previous is not None and previous.storage_intent_hash != intent.storage_intent_hash:
+            if (
+                previous is not None
+                and previous.storage_intent_hash != intent.storage_intent_hash
+            ):
                 raise HostBridgeError("STORAGE_LEASE_CONFLICT")
             # Burn before writing, including transport failure; retry must use a
             # fresh correlation and still obtain a decision from the Host.
             self._storage_admission_correlations.add(correlation)
             try:
                 self._send_validated_private(
-                    kind="storage_admission_request", action_id=correlation, payload=normalized,
+                    kind="storage_admission_request",
+                    action_id=correlation,
+                    payload=normalized,
                     deadline=deadline,
                 )
                 message = self._receive_private(deadline=deadline)
-                if message.kind != "storage_admission_response" or message.action_id != correlation:
+                if (
+                    message.kind != "storage_admission_response"
+                    or message.action_id != correlation
+                ):
                     raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
                 completed_time = clock()
                 if (
                     type(completed_time) not in (int, float)
-                    or not math.isfinite(completed_time) or completed_time < now
+                    or not math.isfinite(completed_time)
+                    or completed_time < now
                 ):
                     raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
                 completed_at = int(completed_time)
                 receipt = _normalize_storage_admission_response(
-                    message.payload, request=normalized, now=completed_at, expires_at=expires_at
+                    message.payload,
+                    request=normalized,
+                    now=completed_at,
+                    expires_at=expires_at,
                 )
                 if previous is not None and previous != receipt:
                     raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
@@ -1675,19 +1696,22 @@ class InheritedHandleHostBridge:
                 self._poison()
                 raise
             self._storage_admission_decisions[attestation] = receipt
-            self._storage_admission_completions[correlation] = _StorageAdmissionCompletion(
-                request_hash=cast(str, normalized["request_hash"]),
-                response_hash=_private_payload_hash(message.payload),
-                bridge_identity=self._storage_transport_identity,
-                expires_at=receipt.expires_at,
-                completed_at=completed_at,
+            self._storage_admission_completions[correlation] = (
+                _StorageAdmissionCompletion(
+                    request_hash=cast(str, normalized["request_hash"]),
+                    response_hash=_private_payload_hash(message.payload),
+                    bridge_identity=self._storage_transport_identity,
+                    expires_at=receipt.expires_at,
+                    completed_at=completed_at,
+                )
             )
             return receipt
 
     @contextmanager
     def _storage_admission_io(self, *, now: int, expires_at: int) -> Iterator[float]:
         if (
-            type(now) is not int or type(expires_at) is not int
+            type(now) is not int
+            or type(expires_at) is not int
             or not 0 <= now < expires_at <= (1 << 64) - 1
         ):
             raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
@@ -1709,7 +1733,8 @@ class InheritedHandleHostBridge:
         """Lookup transport-completed facts; caller-supplied hashes cannot enroll."""
         attestation = profile.get("attestation_hash")
         return (
-            self.is_available and type(attestation) is str
+            self.is_available
+            and type(attestation) is str
             and self._completed_storage_profiles.get(attestation) == profile
         )
 
@@ -1928,17 +1953,27 @@ class InheritedHandleHostBridge:
         self._send_private(kind=kind, action_id=action_id, payload=payload)
 
     def _send_validated_private(
-        self, *, kind: str, action_id: str, payload: Mapping[str, object],
+        self,
+        *,
+        kind: str,
+        action_id: str,
+        payload: Mapping[str, object],
         deadline: float | None = None,
     ) -> None:
         """Write a packet only after its typed private validator has succeeded."""
 
         if kind not in _VALIDATED_PRIVATE_KINDS:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
-        self._send_private(kind=kind, action_id=action_id, payload=payload, deadline=deadline)
+        self._send_private(
+            kind=kind, action_id=action_id, payload=payload, deadline=deadline
+        )
 
     def _send_private(
-        self, *, kind: str, action_id: str, payload: Mapping[str, object],
+        self,
+        *,
+        kind: str,
+        action_id: str,
+        payload: Mapping[str, object],
         deadline: float | None = None,
     ) -> None:
         with self._io_lock:
@@ -2152,14 +2187,20 @@ class InheritedHandleHostBridge:
         deadline: float | None = None,
     ) -> bytes:
         header = _read_exact(
-            descriptor, 4, cancel_event=cancel_event, cancel_fd=cancel_fd,
+            descriptor,
+            4,
+            cancel_event=cancel_event,
+            cancel_fd=cancel_fd,
             deadline=deadline,
         )
         size = struct.unpack("!I", header)[0]
         if size == 0 or size > _MAX_FRAME_BYTES:
             raise HostBridgeError("HOST_BRIDGE_FRAME_INVALID")
         return _read_exact(
-            descriptor, size, cancel_event=cancel_event, cancel_fd=cancel_fd,
+            descriptor,
+            size,
+            cancel_event=cancel_event,
+            cancel_fd=cancel_fd,
             deadline=deadline,
         )
 
@@ -2178,7 +2219,10 @@ class InheritedHandleHostBridge:
                         remaining = _remaining_io_time(deadline, self._cancel_event)
                         if os.name != "nt":
                             readable, writable, _ = select.select(
-                                [self._cancel_read_fd], [self._write_fd], [], min(0.1, remaining)
+                                [self._cancel_read_fd],
+                                [self._write_fd],
+                                [],
+                                min(0.1, remaining),
                             )
                             if readable:
                                 raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
@@ -2192,7 +2236,12 @@ class InheritedHandleHostBridge:
                             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
                         offset += written
                         if written == 0:
-                            self._cancel_event.wait(min(0.05, _remaining_io_time(deadline, self._cancel_event)))
+                            self._cancel_event.wait(
+                                min(
+                                    0.05,
+                                    _remaining_io_time(deadline, self._cancel_event),
+                                )
+                            )
                     _remaining_io_time(deadline, self._cancel_event)
                 return
             written = os.write(self._write_fd, payload)
@@ -2260,7 +2309,12 @@ class InheritedHandleHostBridge:
             del self._terminal_operation_tombstones[key]
 
     def _ensure_open(self) -> None:
-        if self._closed or self._cancel_event.is_set() or self._read_fd < 0 or self._write_fd < 0:
+        if (
+            self._closed
+            or self._cancel_event.is_set()
+            or self._read_fd < 0
+            or self._write_fd < 0
+        ):
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
 
 
@@ -2480,9 +2534,10 @@ def _normalize_routing_attestation_response(
                 raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
             task_id = original_request["task"]["task_id"]
             binding_hash = fastlane_routing.v5_request_binding_hash(original_request)
-            if item.get("task_id") != task_id or item.get(
-                "request_binding_hash"
-            ) != binding_hash:
+            if (
+                item.get("task_id") != task_id
+                or item.get("request_binding_hash") != binding_hash
+            ):
                 raise HostBridgeError("HOST_BRIDGE_ROUTING_ATTESTATION_INVALID")
             routed_request = dict(original_request)
             routed_request["child_route_attestation"] = item.get("attestation")
@@ -3024,10 +3079,11 @@ def _validate_skeleton_package_coverage(
         or len(set(source_ids)) != len(source_ids)
     ):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
-    if not isinstance(initial_skeletons, Sequence) or isinstance(
-        initial_skeletons, (str, bytes, bytearray)
-    ) or not isinstance(remaining_skeletons, Sequence) or isinstance(
-        remaining_skeletons, (str, bytes, bytearray)
+    if (
+        not isinstance(initial_skeletons, Sequence)
+        or isinstance(initial_skeletons, (str, bytes, bytearray))
+        or not isinstance(remaining_skeletons, Sequence)
+        or isinstance(remaining_skeletons, (str, bytes, bytearray))
     ):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
     combined = [*initial_skeletons, *remaining_skeletons]
@@ -3173,8 +3229,7 @@ def _normalize_fast_lane_refill_registry_request(
     if not hmac.compare_digest(skeleton_package_hash, expected_package_hash):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
     if any(
-        item["index_context_hash"] != index_context_hash
-        for item in normalized_initial
+        item["index_context_hash"] != index_context_hash for item in normalized_initial
     ):
         raise HostBridgeError("HOST_BRIDGE_FAST_LANE_REFILL_INVALID")
     unsigned = dict(value)
@@ -3253,7 +3308,8 @@ def build_storage_admission_request(
 
 def _normalize_storage_admission_request(value: object) -> dict[str, object]:
     if (
-        type(value) is not dict or set(value) != _STORAGE_ADMISSION_REQUEST_FIELDS
+        type(value) is not dict
+        or set(value) != _STORAGE_ADMISSION_REQUEST_FIELDS
         or value.get("schema") != _STORAGE_ADMISSION_REQUEST_SCHEMA
     ):
         raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
@@ -3284,8 +3340,10 @@ def _validate_storage_admission_profile(
         or intent.plan_binding != profile.get("source_plan_hash")
         or intent.context_hash != profile.get("execution_context_hash")
         or intent.target_descriptor["artifact_kind"] != "fastlane-task"
-        or any(intent.target_descriptor[name] != profile.get(name)
-               for name in _STORAGE_DESCRIPTOR_FIELDS)
+        or any(
+            intent.target_descriptor[name] != profile.get(name)
+            for name in _STORAGE_DESCRIPTOR_FIELDS
+        )
     ):
         raise HostBridgeError("STORAGE_TARGET_KEY_INVALID")
 
@@ -3305,33 +3363,51 @@ def _normalize_storage_admission_response(
     _validate_private_packet_size(value, _MAX_OPERATION_PACKET_BYTES)
     receipt = value["receipt"]
     if (
-        type(receipt) is not dict or set(receipt) != _STORAGE_ADMISSION_RECEIPT_FIELDS
+        type(receipt) is not dict
+        or set(receipt) != _STORAGE_ADMISSION_RECEIPT_FIELDS
         or receipt.get("schema") != _STORAGE_ADMISSION_RECEIPT_SCHEMA
     ):
         raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
     # Both Host-minted IDs are frozen SHA-256 identities, not UUIDs or paths.
-    for name in ("admission_id", "target_family_lease_id", "profile_attestation_hash",
-                 "storage_intent_hash", "storage_binding_hash", "target_key",
-                 "assigned_root_identity", "receipt_hash"):
+    for name in (
+        "admission_id",
+        "target_family_lease_id",
+        "profile_attestation_hash",
+        "storage_intent_hash",
+        "storage_binding_hash",
+        "target_key",
+        "assigned_root_identity",
+        "receipt_hash",
+    ):
         if type(receipt[name]) is not str or _DIGEST.fullmatch(receipt[name]) is None:
             raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
-    for name in ("reserved_bytes", "reserved_files", "free_space_before",
-                 "free_space_after_reserve", "free_space_floor", "expires_at"):
+    for name in (
+        "reserved_bytes",
+        "reserved_files",
+        "free_space_before",
+        "free_space_after_reserve",
+        "free_space_floor",
+        "expires_at",
+    ):
         if type(receipt[name]) is not int or not 0 <= receipt[name] <= (1 << 64) - 1:
             raise HostBridgeError("HOST_BRIDGE_STORAGE_ADMISSION_INVALID")
     intent = parse_storage_intent(request["storage_intent"])
     if (
-        type(now) is not int or type(expires_at) is not int
+        type(now) is not int
+        or type(expires_at) is not int
         or not 0 <= now < receipt["expires_at"] <= expires_at <= (1 << 64) - 1
         or receipt["profile_attestation_hash"] != request["profile_attestation_hash"]
         or receipt["storage_intent_hash"] != intent.storage_intent_hash
-        or receipt["target_key"] != _private_payload_hash(dict(intent.target_descriptor))
+        or receipt["target_key"]
+        != _private_payload_hash(dict(intent.target_descriptor))
         or receipt["reserved_bytes"] != intent.requested_bytes
         or receipt["reserved_files"] != intent.requested_files
         or receipt["free_space_floor"] == 0
-        or receipt["free_space_after_reserve"] > receipt["free_space_before"] - receipt["reserved_bytes"]
+        or receipt["free_space_after_reserve"]
+        > receipt["free_space_before"] - receipt["reserved_bytes"]
         or receipt["free_space_after_reserve"] < receipt["free_space_floor"]
-        or receipt["receipt_hash"] != _private_payload_hash(
+        or receipt["receipt_hash"]
+        != _private_payload_hash(
             {name: item for name, item in receipt.items() if name != "receipt_hash"}
         )
     ):
@@ -3509,7 +3585,9 @@ def _normalize_storage_profile_response(
     profile_hash = cast(str, value["profile_hash"])
     if not hmac.compare_digest(profile_hash, _private_payload_hash(unsigned)):
         raise HostBridgeError("HOST_BRIDGE_STORAGE_PROFILE_INVALID")
-    return {field_name: value[field_name] for field_name in sorted(_STORAGE_PROFILE_FIELDS)}
+    return {
+        field_name: value[field_name] for field_name in sorted(_STORAGE_PROFILE_FIELDS)
+    }
 
 
 def _normalize_compiler_evidence_response(
@@ -3580,13 +3658,17 @@ def _normalize_compiler_evidence_response(
         )
     except Exception as error:
         raise HostBridgeError("HOST_BRIDGE_COMPILER_EVIDENCE_INVALID") from error
-    requested_pairs = {(model, effort) for model, effort in request.requested_route_pairs}
+    requested_pairs = {
+        (model, effort) for model, effort in request.requested_route_pairs
+    }
     fact_pairs = {
         (fact.route.model, fact.route.reasoning_effort) for fact in normalized_facts
     }
     skeletons = request.assignment_skeletons
     skeleton_by_task = {item["task_id"]: item for item in skeletons}
-    if len(skeleton_by_task) != len(skeletons) or len(normalized_facts) != len(skeletons):
+    if len(skeleton_by_task) != len(skeletons) or len(normalized_facts) != len(
+        skeletons
+    ):
         raise HostBridgeError("HOST_BRIDGE_COMPILER_EVIDENCE_INVALID")
     for fact, mapping in zip(normalized_facts, normalized_mappings, strict=True):
         skeleton = skeleton_by_task.get(fact.task_id)
@@ -3628,7 +3710,9 @@ def _normalize_compiler_evidence_response(
     if (
         type(registry_binding_hash) is not str
         or _DIGEST.fullmatch(registry_binding_hash) is None
-        or not hmac.compare_digest(registry_binding_hash, _private_payload_hash(unsigned))
+        or not hmac.compare_digest(
+            registry_binding_hash, _private_payload_hash(unsigned)
+        )
     ):
         raise HostBridgeError("HOST_BRIDGE_COMPILER_EVIDENCE_INVALID")
     _validate_private_packet_size(value, _MAX_COMPILER_EVIDENCE_BYTES)
@@ -4120,19 +4204,30 @@ def _nonblocking_pipe_writer(descriptor: int) -> Iterator[Callable[[bytes], int]
     handle = msvcrt.get_osfhandle(descriptor)
     get_state = kernel32.GetNamedPipeHandleStateW
     get_state.argtypes = (
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
     )
     get_state.restype = ctypes.c_int
     set_state = kernel32.SetNamedPipeHandleState
     set_state.argtypes = (
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
     )
     set_state.restype = ctypes.c_int
     write_file = kernel32.WriteFile
     write_file.argtypes = (
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
-        ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
     )
     write_file.restype = ctypes.c_int
 
@@ -4250,12 +4345,23 @@ def _windows_pipe_available_bytes(descriptor: int) -> int:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         peek = kernel32.PeekNamedPipe
         peek.argtypes = (
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_void_p,
         )
         peek.restype = ctypes.c_int
         available = ctypes.c_ulong()
-        if not peek(msvcrt.get_osfhandle(descriptor), None, 0, None, ctypes.byref(available), None):
+        if not peek(
+            msvcrt.get_osfhandle(descriptor),
+            None,
+            0,
+            None,
+            ctypes.byref(available),
+            None,
+        ):
             raise HostBridgeError("HOST_BRIDGE_UNAVAILABLE")
         return available.value
     except (AttributeError, ImportError, OSError, OverflowError, ValueError) as error:
