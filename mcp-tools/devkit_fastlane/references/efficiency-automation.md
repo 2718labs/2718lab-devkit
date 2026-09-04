@@ -158,23 +158,26 @@ still canonical diagnostic input and the required future external-host contract:
 }
 ```
 
-The diagnostic decomposition and inert public blocked-plan hash incorporate
-this full binding into `source_plan_hash`. The manifest provides structural fence data, never
+The diagnostic decomposition and plan hash incorporate this full binding into
+`source_plan_hash`. The manifest provides structural fence data, never execution
 authority; no environment project ID, root path, worktree path, task-root
 component, caller-supplied identifier, Python module attribute, or closure can
-replace a live host record. This repository has no Desktop-host durable
-registry or external private bridge, so its public `compile_fast_lane` and
-`fast-lane` CLI do not compare against an in-process provider and cannot
-activate V2: a structurally valid V2 request always yields
-`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` with zero assignments, local
-queues, and external-session assignments. An invalid V2 envelope/hash yields
+authorize execution. The public Python `compile_fast_lane` and `fast-lane` CLI
+remain plan-v1 diagnostics: a structurally valid V2 request yields
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` with zero assignments, local queues,
+and external-session assignments. An invalid V2 envelope/hash yields
 `PROJECT_BINDING_INVALID`; so does an inner canonical-v1 `package` that fails
 pure diagnostic parsing, or an invalid fast-lane request schema/key/byte shell.
-Those checks occur before any host, account-usage, or index input is read. V1 yields
-`NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`.
-An MCP request that explicitly carries host-private fields such as `host_status`,
-account-usage, or index evidence is not a diagnostic plan shell: the public adapter must
-reject it as `FASTLANE_REQUEST_INVALID` before compilation.
+V1 yields `NO_SAFE_WORK/LEGACY_PROJECT_UNBOUND`.
+
+MCP `fastlane_compile` resolves the same caller IDs only as selectors through a
+read-only RuntimeRoot UoW. Its server-private path requires a current,
+`INDEX_READY`, Git-HEAD-bound snapshot whose persisted `include_paths` fully
+cover every writer `write_scope`, then emits
+`team-efficiency/fast-lane-plan-v2`. The private index/root/Git material is not a
+public Python argument or package export. An MCP request that explicitly carries
+`host_status`, account usage, index evidence, a root, or Git HEAD is rejected as
+`FASTLANE_REQUEST_INVALID` before compilation.
 Public `bootstrap --apply` and import-callable `apply_bootstrap_plan` are both
 blocked before any caller plan, path, provider override, closure, or JSON can
 reach a worktree helper, because no such helper exists in this repository.
@@ -319,13 +322,22 @@ workspace, trace id, or snapshot id from Atlas evidence.
 
 ## Ultra Fast Lane
 
-`fast-lane` compiles the exact
+The public Python/CLI `fast-lane` path compiles the exact
 `team-efficiency/fast-lane-request-v1` request into a deterministic
 `team-efficiency/fast-lane-plan-v1` result. It is a pure compiler: all target gates,
 contexts, receipts, tokens, and workflow operations are inert dispatch descriptors. The
 helper performs no model call, agent spawn, remote service contact, gate run,
 Git mutation, workflow call, lease claim, endpoint bind, or workflow
 completion.
+
+The MCP tool response uses `team-efficiency/fast-lane-plan-v2`. It fixes
+`plan_only=true`, `dispatch_state="not_dispatched"`, and
+`execution_authorized=false`; each `team-efficiency/local-writer-plan-v1`
+assignment is planned/unclaimed, and path-free
+`team-efficiency/local-index-evidence-v1` exposes only binding hashes including
+`include_paths_hash` and the compiled writer `scope_hash`. `INDEX_PARTIAL`
+rejects both an incomplete snapshot and omitted writer-scope coverage;
+`INDEX_STALE` rejects filesystem or Git drift.
 
 The host invokes `fast-lane` with an explicit reasoning effort. `ultra` is the
 automatic activation path (`ultra_auto`); lower efforts require explicit

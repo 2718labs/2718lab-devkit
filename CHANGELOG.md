@@ -8,6 +8,31 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-09-04
+
+### Added
+
+- Added a hostless, compile-only MCP Fast Lane planning path. Caller-supplied
+  workspace and snapshot identifiers remain selectors: a read-only local
+  RuntimeRoot resolves the registered workspace, requires the exact current
+  `INDEX_READY` snapshot and Git binding, and emits a bounded, exact-key
+  `team-efficiency/fast-lane-plan-v2` descriptor.
+
+### Fixed
+
+- Normalize the no-null public plan before calculating assignment and plan
+  identities, so `plan_item_id` and `plan_hash` can be recomputed exactly from
+  inactive plans and read-only as well as writer assignments.
+- Fail closed with the snapshot's precise stable error whenever local planning
+  observes any Project Index state other than `INDEX_READY`.
+
+### Security
+
+- Plan-v2 is planning data only: it fixes `plan_only=true`,
+  `dispatch_state="not_dispatched"`, and `execution_authorized=false`. It does
+  not spawn an agent, claim a lease, create a worktree, mutate Git, or dispatch
+  work; those actions remain outside the compiler contract.
+
 ## [1.1.3] - 2026-09-01
 
 ### Added

@@ -1,24 +1,26 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — Codex + MCP v1.1.3
+# 2718lab DevKit — Codex + MCP v1.1.4
 
-[![version](https://img.shields.io/badge/version-v1.1.3-blue)](./.codex-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-v1.1.4-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
 runtime for bounded project indexing, Atlas evidence, Relay lifecycle
 coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
-of reference manuals. This repository carries the versioned v1.1.3 package.
+of reference manuals. This repository carries the versioned v1.1.4 package.
 The checked-in manifest and allowlist define the executable runtime surface;
 the manual map, install, build, and verification sections below describe the
 supported workflow.
 
-The current release retains a deliberately fail-closed Fast Lane preview. The public compiler
-and CLI return `NO_SAFE_WORK` with zero assignments: they do not consume host
-status or live-account inputs, and have no worktree execution path. Host
-execution remains an external Desktop-host bridge requirement.
+The public Python compiler and CLI retain the deliberately fail-closed
+`team-efficiency/fast-lane-plan-v1` preview. The MCP `fastlane_compile` tool
+instead resolves caller-supplied workspace/snapshot selectors through its local
+RuntimeRoot and returns a verified `team-efficiency/fast-lane-plan-v2` planning
+descriptor. That descriptor is `plan_only`: it never dispatches, claims a
+lease, creates a worktree, or authorizes execution.
 
-For storage-governed execution, v1.1.3 references compatible Host source only
+The prior v1.1.3 storage-governance integration references compatible Host source only
 on Ayleovelle's user-fork
 [`codex/host-1.1.3-storage-governance-upstream`](https://github.com/Ayleovelle/codex/tree/codex/host-1.1.3-storage-governance-upstream)
 branch, pinned to immutable commit
@@ -59,12 +61,12 @@ and continue to fail closed.
 - The optional Codex Skill bundle is part of DevKit's documentation surface. It
   provides short, module-specific manuals without becoming a second runtime or
   an executable prompt/agent surface.
-- Fast Lane is a pure MCP runtime compiler. Its public surface is presently
-  authority-inert and fail-closed: it emits no assignments and never spawns
-  agents, edits Git, runs commands, or executes worktrees. Host execution is
-  reserved for a future external Desktop-host bridge contract. The RuntimeRoot
-  host-private V2/V3 bootstrap path is covered with injected test doubles only;
-  no external host embedding or operational/host-integrated GO is claimed.
+- Fast Lane is a pure planning compiler. The MCP tool can emit bounded
+  `team-efficiency/fast-lane-plan-v2` assignments only after its private
+  RuntimeRoot verifies a registered `INDEX_READY` snapshot, Git HEAD, and full
+  write-scope coverage. Every result remains `plan_only`; no agent, Git command,
+  lease, or worktree action is executed. The public Python compiler/CLI remains
+  the authority-inert plan-v1 diagnostic surface.
 
 ## Module overview
 
@@ -82,11 +84,11 @@ and continue to fail closed.
 ## Overall workflow
 
 The repository workflow defaults to Fast Lane. `workflow-design` prepares a
-bounded input; `fastlane_compile` or `team_efficiency.py` then returns an
-authority-inert, fail-closed plan. `fast-lane-routing` documents the intended
-future host-consumption boundary; neither a skill nor the current compiler
-starts agents or creates/executes cross-session worktrees. The current path is
-to inspect the blocked plan and retain authority outside this repository.
+bounded input. MCP `fastlane_compile` verifies the persisted local project
+snapshot and returns a plan-v2 descriptor; `team_efficiency.py` retains the
+blocked plan-v1 diagnostic path. Neither path starts agents or creates/executes
+cross-session worktrees. A coordinator must separately validate route
+availability, claim a lease, and dispatch any selected work.
 
 ```mermaid
 flowchart TD
@@ -95,9 +97,9 @@ flowchart TD
         C["mcp-tools/server.py<br/>stdio entry"] --> D["Project Index / Checkpoint<br/>Atlas / Relay"] --> E["Bounded result<br/>host action"]
     end
     subgraph FAST["Fast Lane"]
-        F["fast-lane request"] --> G["team_efficiency.py<br/>public compiler"]
-        G --> X["Fail closed<br/>NO_SAFE_WORK, zero assignments"]
-        H["Future external Desktop-host bridge<br/>contract only"] -. "not shipped or invoked" .-> G
+        F["fast-lane request"] --> G["MCP fastlane_compile<br/>private RuntimeRoot verification"]
+        G --> X["plan-v2<br/>plan_only, not dispatched"]
+        F --> H["public Python / CLI"] --> I["plan-v1<br/>NO_SAFE_WORK"]
     end
     B -->|MCP tools| C
     B -->|Fast Lane| F
@@ -177,7 +179,7 @@ source of record remains `main` and immutable release tags.
 
 Maintainers build that snapshot with the dedicated marketplace allowlist:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.3.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.4.zip
 
 ## Install and run locally
 
@@ -224,7 +226,7 @@ handles or falls back to an unrelated local start.
 The allowlisted builder creates a deterministic ZIP outside the plugin source
 tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.3.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.4.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
@@ -334,24 +336,27 @@ cleanup target.
 
 The Fast Lane compiler is in
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py and
-mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The public MCP entry is
-`fastlane_compile`; every current invocation is deliberately blocked with
-`NO_SAFE_WORK` and zero assignments unless the request is the closed
-`fastlane-host-dispatch-request-v1` shape and this MCP process owns an
-authenticated inherited host bridge. In that private case the host supplies
-one-time registry-bound compiler evidence and receives a typed dispatch batch.
+mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The MCP `fastlane_compile`
+entry returns `team-efficiency/fast-lane-plan-v2` only after a read-only
+RuntimeRoot unit of work resolves the registered workspace and snapshot. The
+snapshot must be current, `INDEX_READY`, bound to the repository Git HEAD, and
+its persisted `include_paths` must fully cover every writer `write_scope`.
 
 - `reasoning_effort` is required and accepts only `low`, `medium`, `high`,
-  `xhigh`, or `max`; worker dispatch never accepts `ultra`.
-- The public compiler/CLI does not consume host status, account usage, index
-  evidence, or a worktree root.
-- The compiler never creates a worktree, selects a route, or runs a command.
-  The authenticated session ACKs terminal slots and requests refill only at the
-  next host boundary. The compiler can only commit the fully hash-bound batch to the private
-  host bridge; the host remains the execution authority.
-- Missing, stale, mismatched, replayed, or caller-supplied evidence keeps the
-  result at `NO_SAFE_WORK`. Filesystem paths are never accepted as compiler
-  evidence.
+  `xhigh`, or `max`; the MCP output never dispatches a worker.
+- `team-efficiency/fast-lane-plan-v2` fixes `plan_only=true`,
+  `dispatch_state="not_dispatched"`, and `execution_authorized=false`.
+  Assignments use `team-efficiency/local-writer-plan-v1`; path-free
+  `index_evidence` includes snapshot/binding hashes, `include_paths_hash`, and
+  the compiled `scope_hash`.
+- `INDEX_STALE` rejects filesystem or Git drift. `INDEX_PARTIAL` rejects either
+  a partial snapshot or any snapshot whose include roots omit a writer scope.
+- Caller IDs are selectors, not authority material. The public MCP request and
+  public `compile_fast_lane` Python API accept no local index root, Git HEAD, or
+  private planning material.
+- The public Python compiler/CLI still does not consume host status, account
+  usage, index evidence, or a worktree root and remains the blocked plan-v1
+  diagnostic boundary.
 
 ### Account-usage boundary
 
@@ -390,7 +395,7 @@ freeze a transient regression count.
 
 ## Version
 
-This repository represents the versioned v1.1.3 package. Release notes are
+This repository represents the versioned v1.1.4 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
 artifact allowlist, and locked dependency set. A maintainer dispatches Release
 from current `main`; it validates all declared gates, creates the annotated tag,

@@ -708,6 +708,120 @@ _ROUTES = {
     "complex": "Terra Max",
     "exceptional": "Sol High",
 }
+_LOCAL_ROUTE_MODELS = {
+    "Luna": "gpt-5.6-luna",
+    "Terra": "gpt-5.6-terra",
+    "Sol": "gpt-5.6-sol",
+}
+_LOCAL_ROUTE_FLOOR_RANKS = {
+    "low": 20,
+    "medium": 40,
+    "high": 60,
+    "xhigh": 80,
+    "max": 100,
+}
+_LOCAL_PLAN_MATERIAL_FIELDS = frozenset(
+    {
+        "workspace_id",
+        "root_identity_hash",
+        "workspace_binding_hash",
+        "snapshot_id",
+        "snapshot_attestation_hash",
+        "head_hash",
+        "manifest_hash",
+        "parser_set_hash",
+        "workspace_root",
+        "git_head",
+        "include_paths",
+        "include_paths_hash",
+    }
+)
+_LOCAL_PLAN_V2_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "decision_code",
+        "plan_only",
+        "dispatch_state",
+        "execution_authorized",
+        "activation",
+        "source_plan_hash",
+        "phase",
+        "subagent_capacity",
+        "assignments",
+        "idle_slots",
+        "index_evidence",
+        "workflow_policy",
+        "plan_hash",
+    }
+)
+_LOCAL_PLAN_ASSIGNMENT_FIELDS = frozenset(
+    {
+        "schema",
+        "slot_id",
+        "task_id",
+        "role",
+        "goal",
+        "output_boundary",
+        "execution_state",
+        "dispatch_state",
+        "execution_authorized",
+        "lease_state",
+        "worktree",
+        "model",
+        "reasoning_effort",
+        "routing_context_hash",
+        "routing_result_hash",
+        "task_fingerprint",
+        "routing_reason_codes",
+        "depends_on",
+        "required_evidence",
+        "index_evidence",
+        "plan_item_id",
+    }
+)
+_LOCAL_PLAN_WORKTREE_FIELDS = frozenset(
+    {
+        "state",
+        "identity_hash",
+        "base_commit",
+        "branch",
+        "write_scope",
+        "write_scope_hash",
+    }
+)
+_LOCAL_PLAN_READ_WORKTREE_FIELDS = frozenset(
+    {"state", "identity_hash", "write_scope", "write_scope_hash"}
+)
+_LOCAL_PLAN_POLICY_FIELDS = frozenset(
+    {
+        "schema",
+        "consumer",
+        "dispatch_tool",
+        "explicit_route_required",
+        "lease_claim_required_before_execution",
+        "compiler_side_effects",
+    }
+)
+_LOCAL_PLAN_INDEX_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema",
+        "workspace_id",
+        "root_identity_hash",
+        "workspace_binding_hash",
+        "snapshot_id",
+        "snapshot_attestation_hash",
+        "head_hash",
+        "manifest_hash",
+        "parser_set_hash",
+        "include_paths_hash",
+        "scope_hash",
+        "evidence_hash",
+    }
+)
+_LOCAL_PLAN_ACTIVATION_FIELDS = frozenset({"reasoning_effort", "reason"})
+_LOCAL_PLAN_INACTIVE_ACTIVATION_FIELDS = frozenset({"reasoning_effort"})
+_LOCAL_PLAN_IDLE_SLOT_FIELDS = frozenset({"slot_id", "reason_code"})
 _ARTIFACT_SOURCE_KINDS = frozenset({"explicit_artifact_boundaries"})
 _ATLAS_SOURCE_KINDS = frozenset({"code_atlas_packet", "task_episode_graph"})
 _ATLAS_PACKET_FIELDS = frozenset(
@@ -9441,6 +9555,535 @@ def _fast_lane_apply_index_evidence(
     if len(_json_bytes(bound)) > MAX_MANIFEST_BYTES:
         raise ValueError("fast-lane plan exceeds its byte budget")
     return bound
+
+
+class _FastLaneLocalPlanError(ValueError):
+    """One precise local planning failure safe to expose at the MCP boundary."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _fast_lane_local_selector(request: Mapping[str, Any]) -> tuple[str, str]:
+    """Return registry selectors from a fully validated indexed V2 envelope.
+
+    The opaque values select persisted local state only.  They do not grant
+    execution, lease, worktree, or dispatch authority.
+    """
+
+    reason_code, source_identity = _project_execution_block_details(request)
+    if reason_code != "PROJECT_AUTHORITY_UNAVAILABLE" or source_identity is None:
+        raise _FastLaneLocalPlanError(reason_code)
+    authority = _mapping(
+        source_identity.get("project_authority"), "project authority selector"
+    )
+    return (
+        _hash(authority.get("workspace_id"), "project authority.workspace_id"),
+        _hash(
+            authority.get("input_snapshot_id"),
+            "project authority.input_snapshot_id",
+        ),
+    )
+
+
+def _fast_lane_public_value(value: object) -> Any:
+    """Apply the MCP no-null projection before any public identity is hashed."""
+
+    if type(value) is dict:
+        return {
+            key: _fast_lane_public_value(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if type(value) is list:
+        return [_fast_lane_public_value(item) for item in value if item is not None]
+    return value
+
+
+def _validated_fast_lane_local_index_evidence(value: object) -> dict[str, Any]:
+    evidence = _mapping(value, "local plan index evidence")
+    _exact_keys(
+        evidence,
+        _LOCAL_PLAN_INDEX_EVIDENCE_FIELDS,
+        "local plan index evidence",
+    )
+    if evidence["schema"] != "team-efficiency/local-index-evidence-v1":
+        raise ValueError("local plan index evidence schema is invalid")
+    supplied_hash = _hash(
+        evidence["evidence_hash"], "local plan index evidence.evidence_hash"
+    )
+    normalized = {key: item for key, item in evidence.items() if key != "evidence_hash"}
+    if supplied_hash != _sha256_json(normalized):
+        raise ValueError("local plan index evidence hash is invalid")
+    for field in _LOCAL_PLAN_INDEX_EVIDENCE_FIELDS - {"schema", "evidence_hash"}:
+        _hash(evidence[field], f"local plan index evidence.{field}")
+    return dict(evidence)
+
+
+def _validated_fast_lane_local_worktree(value: object, *, role: str) -> dict[str, Any]:
+    worktree = _mapping(value, "local planned worktree")
+    expected = (
+        _LOCAL_PLAN_WORKTREE_FIELDS
+        if role == "execution"
+        else _LOCAL_PLAN_READ_WORKTREE_FIELDS
+    )
+    _exact_keys(worktree, expected, "local planned worktree")
+    if worktree["state"] != "planned":
+        raise ValueError("local planned worktree state is invalid")
+    scopes = _normalised_list(
+        worktree["write_scope"],
+        "local planned worktree.write_scope",
+        _relative_scope,
+        maximum=MAX_WRITE_SCOPES,
+    )
+    if worktree["write_scope"] != scopes:
+        raise ValueError("local planned worktree write scope is not canonical")
+    _hash(
+        worktree["write_scope_hash"],
+        "local planned worktree.write_scope_hash",
+    )
+    _hash(worktree["identity_hash"], "local planned worktree.identity_hash")
+    if role == "execution":
+        _git_id(worktree["base_commit"], "local planned worktree.base_commit")
+        _branch(worktree["branch"])
+    return dict(worktree)
+
+
+def _validated_fast_lane_local_assignment(value: object) -> dict[str, Any]:
+    assignment = _mapping(value, "local planned assignment")
+    _exact_keys(
+        assignment,
+        _LOCAL_PLAN_ASSIGNMENT_FIELDS,
+        "local planned assignment",
+    )
+    if assignment["schema"] != "team-efficiency/local-writer-plan-v1":
+        raise ValueError("local planned assignment schema is invalid")
+    role = _text(assignment["role"], "local planned assignment.role", maximum=32)
+    if role not in _FAST_LANE_ROLES:
+        raise ValueError("local planned assignment role is invalid")
+    if (
+        assignment["execution_state"] != "plan_only"
+        or assignment["dispatch_state"] != "not_dispatched"
+        or assignment["execution_authorized"] is not False
+        or assignment["lease_state"] != "unclaimed"
+    ):
+        raise ValueError("local planned assignment execution state is invalid")
+    _validated_fast_lane_local_worktree(assignment["worktree"], role=role)
+    _validated_fast_lane_local_index_evidence(assignment["index_evidence"])
+    supplied_id = _hash(
+        assignment["plan_item_id"], "local planned assignment.plan_item_id"
+    )
+    normalized = {
+        key: item for key, item in assignment.items() if key != "plan_item_id"
+    }
+    if supplied_id != _sha256_json(normalized):
+        raise ValueError("local planned assignment identity is invalid")
+    return dict(assignment)
+
+
+def _validated_fast_lane_local_policy(value: object) -> dict[str, Any]:
+    policy = _mapping(value, "local plan workflow policy")
+    _exact_keys(policy, _LOCAL_PLAN_POLICY_FIELDS, "local plan workflow policy")
+    if dict(policy) != {
+        "schema": "team-efficiency/local-plan-consumer-policy-v1",
+        "consumer": "main_coordinator",
+        "dispatch_tool": "collaboration.spawn_agent",
+        "explicit_route_required": True,
+        "lease_claim_required_before_execution": True,
+        "compiler_side_effects": False,
+    }:
+        raise ValueError("local plan workflow policy is invalid")
+    return dict(policy)
+
+
+def _validated_fast_lane_local_plan(value: object) -> dict[str, Any]:
+    plan = _mapping(value, "fast-lane local plan")
+    _exact_keys(plan, _LOCAL_PLAN_V2_FIELDS, "fast-lane local plan")
+    if plan["schema"] != "team-efficiency/fast-lane-plan-v2":
+        raise ValueError("fast-lane local plan schema is invalid")
+    if (
+        plan["plan_only"] is not True
+        or plan["dispatch_state"] != "not_dispatched"
+        or plan["execution_authorized"] is not False
+    ):
+        raise ValueError("fast-lane local plan execution state is invalid")
+
+    activation = _mapping(plan["activation"], "fast-lane local plan activation")
+    activation_fields = (
+        _LOCAL_PLAN_ACTIVATION_FIELDS
+        if "reason" in activation
+        else _LOCAL_PLAN_INACTIVE_ACTIVATION_FIELDS
+    )
+    _exact_keys(activation, activation_fields, "fast-lane local plan activation")
+
+    index_evidence = _validated_fast_lane_local_index_evidence(plan["index_evidence"])
+    assignments = plan["assignments"]
+    if type(assignments) is not list or len(assignments) > len(FAST_LANE_SLOT_IDS):
+        raise ValueError("fast-lane local plan assignments are invalid")
+    for assignment_value in assignments:
+        assignment = _validated_fast_lane_local_assignment(assignment_value)
+        if assignment["index_evidence"] != index_evidence:
+            raise ValueError("local planned assignment index evidence is not bound")
+
+    idle_slots = plan["idle_slots"]
+    if type(idle_slots) is not list or len(idle_slots) > len(FAST_LANE_SLOT_IDS):
+        raise ValueError("fast-lane local plan idle slots are invalid")
+    for index, idle_value in enumerate(idle_slots):
+        idle = _mapping(idle_value, f"fast-lane local plan idle_slots[{index}]")
+        _exact_keys(
+            idle,
+            _LOCAL_PLAN_IDLE_SLOT_FIELDS,
+            f"fast-lane local plan idle_slots[{index}]",
+        )
+
+    _validated_fast_lane_local_policy(plan["workflow_policy"])
+    supplied_hash = _hash(plan["plan_hash"], "fast-lane local plan.plan_hash")
+    normalized = {key: item for key, item in plan.items() if key != "plan_hash"}
+    if supplied_hash != _sha256_json(normalized):
+        raise ValueError("fast-lane local plan hash is invalid")
+    return dict(plan)
+
+
+def _fast_lane_local_routing_context(
+    source_plan: Mapping[str, Any], source_plan_hash: str
+) -> dict[str, Any]:
+    """Resolve the package-owned route policy without capability claims.
+
+    These are coordinator inputs, not observations that a model or worker is
+    currently available.  The collaboration boundary remains responsible for
+    rejecting an unavailable explicit route.
+    """
+
+    decisions: dict[tuple[str, str], dict[str, Any]] = {}
+    reasons: dict[tuple[str, str], str] = {}
+    for task_id, unit in sorted(_fast_lane_unit_index(source_plan).items()):
+        route_text = _text(
+            unit.get("recommended_route"),
+            f"source unit {task_id}.recommended_route",
+            maximum=64,
+        )
+        try:
+            family, effort_text = route_text.split(" ", 1)
+            model = _LOCAL_ROUTE_MODELS[family]
+            effort = effort_text.casefold()
+            floor_rank = _LOCAL_ROUTE_FLOOR_RANKS[effort]
+        except (KeyError, ValueError) as error:
+            raise _FastLaneLocalPlanError("FASTLANE_ROUTE_UNAVAILABLE") from error
+        for role in sorted(_FAST_LANE_ROLES):
+            route_input = {
+                "schema": "team-efficiency/local-route-input-v1",
+                "source_plan_hash": source_plan_hash,
+                "task_id": task_id,
+                "role": role,
+                "recommended_route": route_text,
+            }
+            route_result = {
+                "schema": "team-efficiency/local-route-result-v1",
+                "task_id": task_id,
+                "role": role,
+                "model": model,
+                "reasoning_effort": effort,
+                "source": "package_policy",
+            }
+            decisions[(task_id, role)] = {
+                "model": model,
+                "reasoning_effort": effort,
+                "routing_context_hash": _sha256_json(route_input),
+                "routing_result_hash": _sha256_json(route_result),
+                "task_fingerprint": _sha256_json(
+                    {
+                        "task_id": task_id,
+                        "goal": unit.get("goal"),
+                        "write_scope": unit.get("write_scope", []),
+                    }
+                ),
+                "routing_reason_codes": ["package_policy_route"],
+                "routing_safety_floor_rank": floor_rank,
+                "routing_render_hash": _sha256_json(
+                    {"model": model, "reasoning_effort": effort}
+                ),
+                "routing_input": route_input,
+            }
+            reasons[(task_id, role)] = ""
+    return {
+        "decisions": decisions,
+        "reasons": reasons,
+        "default_reason": "routing_context_missing",
+        "global_failure_reason": None,
+    }
+
+
+def _validated_fast_lane_local_material(
+    material_value: Mapping[str, Any],
+    *,
+    request: Mapping[str, Any],
+    validated: Mapping[str, Any],
+) -> tuple[dict[str, str], Path]:
+    material = _mapping(material_value, "local plan material")
+    _exact_keys(material, _LOCAL_PLAN_MATERIAL_FIELDS, "local plan material")
+    workspace_id = _hash(material["workspace_id"], "local material.workspace_id")
+    snapshot_id = _hash(material["snapshot_id"], "local material.snapshot_id")
+    root_identity_hash = _hash(
+        material["root_identity_hash"], "local material.root_identity_hash"
+    )
+    workspace_binding_hash = _hash(
+        material["workspace_binding_hash"], "local material.workspace_binding_hash"
+    )
+    snapshot_attestation_hash = _hash(
+        material["snapshot_attestation_hash"],
+        "local material.snapshot_attestation_hash",
+    )
+    head_hash = _hash(material["head_hash"], "local material.head_hash")
+    manifest_hash = _hash(material["manifest_hash"], "local material.manifest_hash")
+    parser_set_hash = _hash(
+        material["parser_set_hash"], "local material.parser_set_hash"
+    )
+    git_head = _git_id(material["git_head"], "local material.git_head").casefold()
+    workspace_root = _absolute_path(
+        material["workspace_root"], "local material.workspace_root"
+    ).resolve(strict=True)
+
+    selected_workspace_id, selected_snapshot_id = _fast_lane_local_selector(request)
+    if workspace_id != selected_workspace_id:
+        raise _FastLaneLocalPlanError("FASTLANE_WORKSPACE_MISMATCH")
+    if snapshot_id != selected_snapshot_id:
+        raise _FastLaneLocalPlanError("FASTLANE_SNAPSHOT_MISMATCH")
+
+    include_paths_value = material["include_paths"]
+    if not isinstance(include_paths_value, Sequence) or isinstance(
+        include_paths_value, (str, bytes, bytearray)
+    ):
+        raise _FastLaneLocalPlanError("FASTLANE_INDEX_BINDING_INVALID")
+    try:
+        include_paths = tuple(
+            _relative_scope(value, "local material.include_paths")
+            for value in include_paths_value
+        )
+    except (TypeError, ValueError) as error:
+        raise _FastLaneLocalPlanError("FASTLANE_INDEX_BINDING_INVALID") from error
+    if include_paths != tuple(sorted(set(include_paths))):
+        raise _FastLaneLocalPlanError("FASTLANE_INDEX_BINDING_INVALID")
+    include_paths_hash = _hash(
+        material["include_paths_hash"], "local material.include_paths_hash"
+    )
+    if include_paths_hash != _sha256_json({"include_paths": include_paths}):
+        raise _FastLaneLocalPlanError("FASTLANE_INDEX_BINDING_INVALID")
+
+    base_material = {
+        "workspace_id": workspace_id,
+        "root_identity_hash": root_identity_hash,
+        "workspace_binding_hash": workspace_binding_hash,
+    }
+    if workspace_binding_hash != _sha256_json(
+        {
+            "workspace_id": workspace_id,
+            "root_identity_hash": root_identity_hash,
+        }
+    ):
+        raise _FastLaneLocalPlanError("FASTLANE_INDEX_BINDING_INVALID")
+    if head_hash != _sha256_json({"head": git_head}):
+        raise _FastLaneLocalPlanError("FASTLANE_GIT_BINDING_INVALID")
+    if snapshot_attestation_hash != _sha256_json(
+        {
+            **base_material,
+            "snapshot_id": snapshot_id,
+            "head_hash": head_hash,
+            "manifest_hash": manifest_hash,
+            "parser_set_hash": parser_set_hash,
+        }
+    ):
+        raise _FastLaneLocalPlanError("FASTLANE_INDEX_BINDING_INVALID")
+
+    state = _mapping(validated["scheduler_state"], "scheduler state")
+    if state["integration_state"]["commit"].casefold() != git_head:
+        raise _FastLaneLocalPlanError("FASTLANE_GIT_HEAD_MISMATCH")
+    for context in validated["execution_contexts"]:
+        plan = context["bootstrap_plan"]
+        repo = _absolute_path(plan["repo"], "bootstrap plan.repo").resolve(strict=True)
+        if _fast_lane_path_identity(repo) != _fast_lane_path_identity(workspace_root):
+            raise _FastLaneLocalPlanError("FASTLANE_WORKSPACE_MISMATCH")
+        if plan["base_commit"].casefold() != git_head:
+            raise _FastLaneLocalPlanError("FASTLANE_GIT_HEAD_MISMATCH")
+
+    scopes = sorted(
+        {
+            scope
+            for unit in validated["source_plan"].get("units", [])
+            for scope in unit.get("write_scope", [])
+        }
+    )
+    if include_paths and any(
+        not any(
+            scope == include or scope.startswith(f"{include}/")
+            for include in include_paths
+        )
+        for scope in scopes
+    ):
+        raise _FastLaneLocalPlanError("INDEX_PARTIAL")
+    public_evidence = {
+        "schema": "team-efficiency/local-index-evidence-v1",
+        **base_material,
+        "snapshot_id": snapshot_id,
+        "snapshot_attestation_hash": snapshot_attestation_hash,
+        "head_hash": head_hash,
+        "manifest_hash": manifest_hash,
+        "parser_set_hash": parser_set_hash,
+        "include_paths_hash": include_paths_hash,
+        "scope_hash": _sha256_json(scopes),
+    }
+    public_evidence["evidence_hash"] = _sha256_json(public_evidence)
+    return public_evidence, workspace_root
+
+
+def _fast_lane_local_assignment_output(
+    validated: Mapping[str, Any],
+    assignment: Mapping[str, Any],
+    *,
+    index_evidence: Mapping[str, str],
+) -> dict[str, Any]:
+    task_id = _task_id(assignment["task_id"], "planned assignment.task_id")
+    role = _text(assignment["role"], "planned assignment.role", maximum=32)
+    unit = _fast_lane_unit_index(validated["source_plan"])[task_id]
+    context = _mapping(assignment.get("_context"), "planned assignment context")
+    execution_context = next(
+        (
+            item
+            for item in validated["execution_contexts"]
+            if item["task_id"] == task_id
+        ),
+        None,
+    )
+    if role == "execution" and execution_context is None:
+        raise _FastLaneLocalPlanError("FASTLANE_EXECUTION_CONTEXT_MISSING")
+    read_context = next(
+        (
+            item
+            for item in validated["read_contexts"]
+            if item["task_id"] == task_id and item["role"] == role
+        ),
+        None,
+    )
+    if role != "execution" and read_context is None:
+        raise _FastLaneLocalPlanError("FASTLANE_READ_CONTEXT_MISSING")
+    bootstrap = (
+        None if execution_context is None else execution_context["bootstrap_plan"]
+    )
+    worktree_path = (
+        bootstrap["worktree"]
+        if role == "execution" and bootstrap is not None
+        else read_context["worktree"]
+    )
+    worktree_value = {
+        "state": "planned",
+        "identity_hash": _sha256_json({"worktree": worktree_path}),
+        "base_commit": context["base_commit"],
+        "branch": context["branch"],
+        "write_scope": list(unit.get("write_scope", [])),
+        "write_scope_hash": context["write_scope_hash"],
+    }
+    worktree = _fast_lane_public_value(worktree_value)
+    if type(worktree) is not dict:
+        raise ValueError("local planned worktree is invalid")
+    item_value = {
+        "schema": "team-efficiency/local-writer-plan-v1",
+        "slot_id": assignment["slot_id"],
+        "task_id": task_id,
+        "role": role,
+        "goal": unit["goal"],
+        "output_boundary": unit["output_boundary"],
+        "execution_state": "plan_only",
+        "dispatch_state": "not_dispatched",
+        "execution_authorized": False,
+        "lease_state": "unclaimed",
+        "worktree": worktree,
+        "model": assignment["model"],
+        "reasoning_effort": assignment["reasoning_effort"],
+        "routing_context_hash": assignment["routing_context_hash"],
+        "routing_result_hash": assignment["routing_result_hash"],
+        "task_fingerprint": assignment["task_fingerprint"],
+        "routing_reason_codes": list(assignment["routing_reason_codes"]),
+        "depends_on": list(unit.get("depends_on", [])),
+        "required_evidence": list(unit.get("required_evidence", [])),
+        "index_evidence": dict(index_evidence),
+    }
+    item = _fast_lane_public_value(item_value)
+    if type(item) is not dict:
+        raise ValueError("local planned assignment is invalid")
+    item["plan_item_id"] = _sha256_json(item)
+    return _validated_fast_lane_local_assignment(item)
+
+
+def _compile_fast_lane_local_plan(
+    request: Mapping[str, Any],
+    *,
+    reasoning_effort: str,
+    enable: bool,
+    local_plan_material: Mapping[str, Any],
+) -> dict[str, Any]:
+    activation = _fast_lane_activation(reasoning_effort, enable)
+    validated = _validated_fast_lane_request(request)
+    validated = {
+        **validated,
+        "routing_context": _fast_lane_local_routing_context(
+            validated["source_plan"], validated["source_plan_hash"]
+        ),
+    }
+    if validated["scheduler_state"]["running_assignments"]:
+        raise _FastLaneLocalPlanError("FASTLANE_RUNTIME_STATE_UNSUPPORTED")
+    index_evidence, _workspace_root = _validated_fast_lane_local_material(
+        local_plan_material,
+        request=request,
+        validated=validated,
+    )
+    if activation["reason"] is None:
+        planned_assignments: list[dict[str, Any]] = []
+        idle_slots = _fast_lane_idle_slots("OPT_IN_REQUIRED")
+        status = "inactive"
+        decision_code = "EXPLICIT_OPT_IN_REQUIRED"
+    else:
+        selected, idle_slots = _fast_lane_select_actions(validated, activation)
+        planned_assignments = [
+            _fast_lane_local_assignment_output(
+                validated, assignment, index_evidence=index_evidence
+            )
+            for assignment in selected
+        ]
+        status = "planned" if planned_assignments else "blocked"
+        decision_code = (
+            "FAST_LANE_PLANNED" if planned_assignments else "NO_SAFE_LOCAL_PLAN"
+        )
+    result_value: dict[str, Any] = {
+        "schema": "team-efficiency/fast-lane-plan-v2",
+        "status": status,
+        "decision_code": decision_code,
+        "plan_only": True,
+        "dispatch_state": "not_dispatched",
+        "execution_authorized": False,
+        "activation": dict(activation),
+        "source_plan_hash": validated["source_plan_hash"],
+        "phase": validated["scheduler_state"]["phase"],
+        "subagent_capacity": len(FAST_LANE_SLOT_IDS),
+        "assignments": planned_assignments,
+        "idle_slots": list(idle_slots),
+        "index_evidence": index_evidence,
+        "workflow_policy": {
+            "schema": "team-efficiency/local-plan-consumer-policy-v1",
+            "consumer": "main_coordinator",
+            "dispatch_tool": "collaboration.spawn_agent",
+            "explicit_route_required": True,
+            "lease_claim_required_before_execution": True,
+            "compiler_side_effects": False,
+        },
+    }
+    result = _fast_lane_public_value(result_value)
+    if type(result) is not dict:
+        raise ValueError("fast-lane local plan is invalid")
+    result["plan_hash"] = _sha256_json(result)
+    result = _validated_fast_lane_local_plan(result)
+    if len(_json_bytes(result)) > MAX_MANIFEST_BYTES:
+        raise ValueError("fast-lane plan exceeds its byte budget")
+    return result
 
 
 def compile_fast_lane(

@@ -1,21 +1,23 @@
 [English](README.md)
 
-# 2718lab DevKit —— Codex + MCP v1.1.3
+# 2718lab DevKit —— Codex + MCP v1.1.4
 
-[![版本](https://img.shields.io/badge/version-v1.1.3-blue)](./.codex-plugin/plugin.json)
+[![版本](https://img.shields.io/badge/version-v1.1.4-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit 是一个 Codex-first 工程工具包：它包含一个本地、仅 stdio
 传输的 MCP 运行时，用于有边界的项目索引、Atlas 证据、Relay 生命周期协调和
 确定性的 Fast Lane 规划；同时还包含一组精简的 Skill 说明书。本仓库承载版本化的
-v1.1.3 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
+v1.1.4 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
 安装、构建和验证章节共同给出支持的工作流。
 
-当前版本保留刻意 fail-closed 的 Fast Lane 预览。公共编译器和 CLI 固定返回
-`NO_SAFE_WORK` 与零 assignments：不会消费 host-status 或实时账号输入，也没有
-worktree 执行路径。宿主执行属于未来外部 Desktop-host bridge 合同的要求。
+公共 Python 编译器和 CLI 继续保留刻意 fail-closed 的
+`team-efficiency/fast-lane-plan-v1` 预览。MCP `fastlane_compile` 则通过本地
+RuntimeRoot 解析 caller 提供的 workspace/snapshot selector，并返回已验证的
+`team-efficiency/fast-lane-plan-v2` 规划描述符。该描述符固定为 `plan_only`：不会
+派发、领取 lease、创建 worktree 或授权执行。
 
-对于受存储治理的执行，v1.1.3 只引用 Ayleovelle 用户 fork 上的兼容 Host 源码：
+此前 v1.1.3 的存储治理集成只引用 Ayleovelle 用户 fork 上的兼容 Host 源码：
 [`codex/host-1.1.3-storage-governance-upstream`](https://github.com/Ayleovelle/codex/tree/codex/host-1.1.3-storage-governance-upstream)
 分支，固定到不可变提交
 [`c3dde23bec21c45d10740f2eec09d9a1b87cd329`](https://github.com/Ayleovelle/codex/commit/c3dde23bec21c45d10740f2eec09d9a1b87cd329)。
@@ -45,11 +47,11 @@ stock Codex Host 没有经过证明的 protected broker，继续 fail-closed。
   静态 prompt agent 或模型运行器。
 - 可选的 Codex Skill bundle 是 DevKit 的说明书表面，提供简短的模块化手册；
   它不构成第二个运行时，也不是可执行的 prompt/agent 表面。
-- Fast Lane 是 MCP runtime 中的纯本地编译器。其公共面当前没有调度权限并且
-  fail-closed：不会产生 assignment，也不会 spawn agent、修改 Git、运行命令或
-  执行 worktree。宿主执行预留给未来的外部 Desktop-host bridge 合同。
-  RuntimeRoot 的 host-private V2/V3 bootstrap 仅由注入的测试替身覆盖；
-  没有 external host embedding 实证，也不声称 operational/host-integrated GO。
+- Fast Lane 是纯规划编译器。只有 server 私有 RuntimeRoot 验证已注册的
+  `INDEX_READY` snapshot、Git HEAD 和完整 writer scope 覆盖后，MCP 工具才会
+  产出有界的 `team-efficiency/fast-lane-plan-v2` assignments。所有结果仍为
+  `plan_only`，不执行 agent、Git 命令、lease 或 worktree 动作。公共 Python
+  编译器/CLI 继续作为无 authority 的 plan-v1 诊断面。
 
 ## 核心模块速览
 
@@ -66,11 +68,11 @@ stock Codex Host 没有经过证明的 protected broker，继续 fail-closed。
 
 ## 整体工作流
 
-仓库级默认工作流是 Fast Lane。`workflow-design` 准备有界输入；
-`fastlane_compile` 或 `team_efficiency.py` 随后只返回无权限、fail-closed 的计划。
-`fast-lane-routing` 记录的是预期的未来宿主消费边界；skill 和当前编译器均不会
-启动 agent，也不会创建或执行跨会话工作树。当前路径只用于检查被阻断的计划，
-权限仍保留在本仓库之外。
+仓库级默认工作流是 Fast Lane。`workflow-design` 准备有界输入；MCP
+`fastlane_compile` 验证持久化本地项目 snapshot 后返回 plan-v2 描述符，
+`team_efficiency.py` 则保留被阻断的 plan-v1 诊断路径。两条路径都不会启动 agent，
+也不会创建或执行跨会话工作树。协调器必须另行验证 route availability、领取 lease
+并派发所选工作。
 
 ```mermaid
 flowchart TD
@@ -79,9 +81,9 @@ flowchart TD
         C["mcp-tools/server.py<br/>stdio 入口"] --> D["Project Index / Checkpoint<br/>Atlas / Relay"] --> E["有界结果<br/>宿主动作"]
     end
     subgraph FAST["Fast Lane"]
-        F["fast-lane request"] --> G["team_efficiency.py<br/>公共编译器"]
-        G --> X["失败关闭<br/>NO_SAFE_WORK，零 assignments"]
-        H["未来外部 Desktop-host bridge<br/>仅合同"] -. "未交付或调用" .-> G
+        F["fast-lane request"] --> G["MCP fastlane_compile<br/>私有 RuntimeRoot 验证"]
+        G --> X["plan-v2<br/>plan_only，未派发"]
+        F --> H["公共 Python / CLI"] --> I["plan-v1<br/>NO_SAFE_WORK"]
     end
     B -->|MCP 工具| C
     B -->|Fast Lane| F
@@ -155,7 +157,7 @@ Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协�
 
 维护者使用专用的 marketplace allowlist 构建该快照：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.3.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.4.zip
 
 ## 本地安装与运行
 
@@ -195,7 +197,7 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.3.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.4.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
@@ -289,20 +291,24 @@ embedding 或本地路径放宽的证据。
 
 Fast Lane 编译器位于
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py 和
-mcp-tools/devkit_fastlane/scripts/team_efficiency.py。公共 MCP 入口为
-`fastlane_compile`；当前每一次调用都会刻意以 `NO_SAFE_WORK` 和零 assignments
-被阻断；唯一例外是 exact-key 的 `fastlane-host-dispatch-request-v1`，且当前 MCP
-进程确实持有经过认证的 inherited host bridge。此时宿主通过一次性、registry-bound
-的 compiler evidence 回传精确事实，并接收 typed dispatch batch。
+mcp-tools/devkit_fastlane/scripts/team_efficiency.py。MCP `fastlane_compile` 只有在
+只读 RuntimeRoot UoW 解析已注册 workspace/snapshot 后才返回
+`team-efficiency/fast-lane-plan-v2`。snapshot 必须 current、处于 `INDEX_READY`、
+绑定仓库 Git HEAD，且持久化 `include_paths` 完整覆盖每个 writer `write_scope`。
 
 - `reasoning_effort` 必填且只接受 `low`、`medium`、`high`、`xhigh` 或
-  `max`；worker 调度永不接受 `ultra`。
-- 公共编译器/CLI 不消费 host-status、账号用量、index evidence 或 worktree root。
-- 编译器不会创建 worktree、选择路由或运行命令；认证 session 只在 terminal ACK
-  后请求下一宿主边界补位。编译器只能把完整 hash-bound batch 提交给私有宿主桥，
-  真正执行权限仍属于宿主。
-- evidence 缺失、过期、错配、重放或来自 caller 自报时仍保持 `NO_SAFE_WORK`；
-  filesystem path 永远不能充当 compiler evidence。
+  `max`；MCP 输出永不派发 worker。
+- `team-efficiency/fast-lane-plan-v2` 固定 `plan_only=true`、
+  `dispatch_state="not_dispatched"`、`execution_authorized=false`。
+  assignment 使用 `team-efficiency/local-writer-plan-v1`；无路径的
+  `index_evidence` 包含 snapshot/binding hashes、`include_paths_hash` 与已编译
+  `scope_hash`。
+- filesystem 或 Git 漂移返回 `INDEX_STALE`；snapshot 本身 partial，或其 include
+  roots 遗漏任一 writer scope，均返回 `INDEX_PARTIAL`。
+- caller ID 只是 selector，不是 authority material。公共 MCP request 与公共
+  `compile_fast_lane` Python API 均不接受本地 index root、Git HEAD 或私有规划材料。
+- 公共 Python 编译器/CLI 仍不消费 host-status、账号用量、index evidence 或
+  worktree root，并继续作为被阻断的 plan-v1 诊断边界。
 
 ### 账号用量边界
 
@@ -336,7 +342,7 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 ## 版本
 
-本仓库代表版本化的 v1.1.3 包。发布说明见
+本仓库代表版本化的 v1.1.4 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
 和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
 后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。

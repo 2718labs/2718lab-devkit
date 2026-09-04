@@ -752,6 +752,62 @@ class ProjectIndexService:
         )
         return material
 
+    def local_plan_material(
+        self,
+        workspace_id: str,
+        *,
+        snapshot_id: str,
+    ) -> dict[str, object]:
+        """Return current registry, index, and Git facts for local planning.
+
+        Unlike ``host_attestation_material``, this projection is consumed only
+        inside the MCP process.  The root and raw Git head are deliberately
+        private inputs used to bind caller selectors and dry-run worktree
+        descriptors to the registered workspace; callers receive only the
+        path-free evidence projection produced by the Fast Lane compiler.
+        """
+
+        registered_id, root = self._workspace_for_reference(workspace_id)
+        material = self.host_attestation_material(
+            registered_id,
+            snapshot_id=snapshot_id,
+        )
+        snapshot = self._require_snapshot(registered_id, snapshot_id)
+        if snapshot.state is not IndexState.INDEX_READY:
+            raise IndexError(
+                snapshot.state.name,
+                "Fast Lane planning requires an INDEX_READY project index snapshot",
+            )
+        try:
+            include_paths = self._store.include_paths(snapshot.snapshot_id)
+            normalized_include_paths = self._normalize_paths(include_paths)
+        except (IndexError, StoreError, sqlite3.DatabaseError, ValueError) as exc:
+            raise IndexError(
+                "INDEX_CORRUPT", "project index include paths are corrupt"
+            ) from exc
+        if include_paths != normalized_include_paths:
+            raise IndexError(
+                "INDEX_CORRUPT", "project index include paths are not canonical"
+            )
+        git_head = _git_head(root)
+        if git_head is None:
+            raise IndexError(
+                "GIT_WORKSPACE_REQUIRED",
+                "Fast Lane planning requires a registered Git workspace",
+            )
+        if snapshot.head is None or snapshot.head.casefold() != git_head:
+            raise IndexError(
+                "INDEX_STALE",
+                "project index snapshot does not match the Git HEAD",
+            )
+        return {
+            **material,
+            "workspace_root": str(root),
+            "git_head": git_head,
+            "include_paths": include_paths,
+            "include_paths_hash": _opaque_hash({"include_paths": include_paths}),
+        }
+
     def _public_query_projection(
         self, workspace_id: str, receipt: QueryReceipt
     ) -> dict[str, object]:

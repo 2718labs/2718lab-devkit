@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import atexit
-import hashlib
-import json
 import os
-import secrets
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -352,45 +349,6 @@ def _current_index_correlation() -> str | None:
     if meta is None or type(meta.model_extra) is not dict:
         return None
     value = meta.model_extra.get("2718lab/host-index-correlation")
-    if (
-        type(value) is not str
-        or len(value) != 70
-        or not value.startswith("index-")
-        or any(character not in "0123456789abcdef" for character in value[6:])
-    ):
-        return None
-    return value
-
-
-def _current_fastlane_intent_hash() -> str | None:
-    """Read the Host call intent from current MCP metadata only."""
-
-    try:
-        meta = mcp.get_context().request_context.meta
-    except (LookupError, ValueError):
-        return None
-    if meta is None or type(meta.model_extra) is not dict:
-        return None
-    value = meta.model_extra.get("2718lab/host-fastlane-intent-hash")
-    if (
-        type(value) is not str
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        return None
-    return value
-
-
-def _current_fastlane_index_query_correlation() -> str | None:
-    """Read the Host-selected Fast Lane query receipt from reserved metadata."""
-
-    try:
-        meta = mcp.get_context().request_context.meta
-    except (LookupError, ValueError):
-        return None
-    if meta is None or type(meta.model_extra) is not dict:
-        return None
-    value = meta.model_extra.get("2718lab/host-fastlane-index-query-correlation")
     if (
         type(value) is not str
         or len(value) != 70
@@ -1011,346 +969,51 @@ def fastlane_compile(
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"],
     enable: bool = False,
 ) -> dict[str, object]:
-    """Compile inert Fast Lane descriptors without receiving host-private evidence.
+    """Compile a locally verified, side-effect-free Fast Lane writer plan.
 
-    The host remains responsible for capability attestations, worktree/lease fencing,
-    model dispatch, terminal receipts, and execution.  This MCP boundary only
-    validates and renders the deterministic local scheduling plan.
+    Caller workspace and snapshot identifiers are selectors only.  A read-only
+    runtime UoW resolves them through the local registry, verifies the current
+    index and Git HEAD, and supplies private facts to the compiler.  The result
+    never dispatches, creates a worktree, claims a lease, or authorizes execution.
     """
 
     if type(request) is not dict or type(enable) is not bool:
         return _failure("FASTLANE_REQUEST_INVALID")
-    session = _host_session()
-    intent_hash = _current_fastlane_intent_hash()
-    index_query_correlation = _current_fastlane_index_query_correlation()
-    from devkit_runtime.host_session import HostSession
-
-    if type(session) is HostSession and session.is_available:
-        if intent_hash is None or index_query_correlation is None or not enable:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        return _fastlane_authenticated_dispatch(
-            request,
-            reasoning_effort,
-            call_intent_hash=intent_hash,
-            index_query_correlation=index_query_correlation,
-        )
-    from devkit_fastlane import compile_fast_lane
+    from devkit_fastlane.scripts.team_efficiency import (
+        _compile_fast_lane_local_plan,
+        _fast_lane_local_selector,
+        _FastLaneLocalPlanError,
+    )
+    from devkit_runtime.config import RuntimeConfigError
     from devkit_runtime.tool_result import ResultContractError, envelope_success
+    from project_index.models import IndexError as ProjectIndexError
 
     try:
-        plan = compile_fast_lane(
-            request,
-            reasoning_effort=reasoning_effort,
-            enable=enable,
-        )
-        return envelope_success(_fastlane_public_value(plan))
+        workspace_id, snapshot_id = _fast_lane_local_selector(request)
+        with _runtime_root().open_uow(read_only=True) as uow:
+            local_plan_material = (
+                uow.project_checkpoint.project_index.local_plan_material(
+                    workspace_id,
+                    snapshot_id=snapshot_id,
+                )
+            )
+            plan = _compile_fast_lane_local_plan(
+                request,
+                reasoning_effort=reasoning_effort,
+                enable=enable,
+                local_plan_material=local_plan_material,
+            )
+        return envelope_success(plan)
+    except _FastLaneLocalPlanError as error:
+        return _failure(error.code)
+    except ProjectIndexError as error:
+        return _failure(error.code)
+    except RuntimeConfigError as error:
+        return _runtime_failure(error)
     except ResultContractError:
         return _failure("INTERNAL_ERROR")
     except (TypeError, ValueError):
         return _failure("FASTLANE_REQUEST_INVALID")
-
-
-def _fastlane_authenticated_dispatch(
-    request: dict[str, object],
-    reasoning_effort: str,
-    *,
-    call_intent_hash: str,
-    index_query_correlation: str,
-) -> dict[str, object]:
-    """Use no request-carried authority; the inherited bridge is the only gate."""
-
-    from devkit_runtime.fastlane_host_adapter import (
-        NO_SAFE_WORK,
-        dispatch_fast_lane_with_host_facts,
-        prepare_verified_host_facts,
-    )
-    from devkit_runtime.host_bridge import (
-        FastLaneRefillRegistryRequest,
-        OperationReceipt,
-    )
-    from devkit_runtime.host_session import HostRoute, HostSession
-    from devkit_runtime.tool_result import ResultContractError, envelope_success
-
-    try:
-        if reasoning_effort == "ultra":
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        session = _host_session()
-        if type(session) is not HostSession or not session.is_available:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        index_attestation = session.project_index_query_attestation(
-            correlation_id=index_query_correlation
-        )
-        if index_attestation is None:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        index_context_hash = index_attestation.get("index_context_hash")
-        if type(index_context_hash) is not str:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        project_binding = request.get("project_binding")
-        work_package = request.get("work_package")
-        if (
-            type(project_binding) is not dict
-            or type(work_package) is not dict
-            or project_binding.get("workspace_id")
-            != index_attestation.get("workspace_id")
-            or work_package.get("input_snapshot_id")
-            != index_attestation.get("snapshot_id")
-        ):
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        preparation_id = f"compiler-{secrets.token_hex(16)}"
-        capability_snapshot = session.resolve_capability_snapshot_v2(
-            call_intent_hash=call_intent_hash,
-            preparation_id=preparation_id,
-            expires_at_ceiling=cast(int, index_attestation["expires_at"]),
-        )
-        if capability_snapshot is None:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        from devkit_fastlane.scripts.team_efficiency import (
-            compile_authenticated_v5_assignment_skeletons,
-            prepare_authenticated_v5_routing_from_request,
-            validate_authenticated_v5_skeleton_package,
-        )
-
-        projected = prepare_authenticated_v5_routing_from_request(
-            request,
-            index_context_hash=index_context_hash,
-            host_capabilities=capability_snapshot.host_capabilities,
-            scheduler_facts=capability_snapshot.scheduler_facts,
-        )
-        routing_snapshot = session.resolve_routing_attestations(
-            call_intent_hash=call_intent_hash,
-            preparation_id=preparation_id,
-            routing_requests=projected["all_routing_requests"],
-        )
-        if routing_snapshot is None:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        initial_units = projected["units"]
-        remaining_units = projected["remaining_units"]
-        initial_storage_budgets = {
-            unit["task"]["task_id"]: unit["storage_budget"]
-            for unit in initial_units
-            if "storage_budget" in unit
-        }
-        # The compiler/profile exchange can attest only the live initial
-        # skeletons. Remaining work is materialized later by the Host-owned
-        # refill registry, which has no storage-profile proof channel yet.
-        # Budgeted successors therefore fail closed before publication.
-        if len(initial_storage_budgets) not in {0, len(initial_units)} or any(
-            "storage_budget" in unit for unit in remaining_units
-        ):
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        initial_task_ids = {unit["task"]["task_id"] for unit in initial_units}
-        initial_requests: list[dict[str, object]] = []
-        remaining_requests: list[dict[str, object]] = []
-        for item in routing_snapshot.routing_requests:
-            task = item.get("task")
-            if type(task) is not dict:
-                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-            task_id = task.get("task_id")
-            if type(task_id) is not str:
-                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-            if task_id in initial_task_ids:
-                initial_requests.append(item)
-            else:
-                remaining_requests.append(item)
-        initial_attestations = [
-            item
-            for item in routing_snapshot.attestations
-            if item["task_id"] in initial_task_ids
-        ]
-        if len(initial_requests) != len(initial_units) or len(
-            initial_attestations
-        ) != len(initial_units):
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        compiled = compile_authenticated_v5_assignment_skeletons(
-            initial_units,
-            source_plan_hash=projected["source_plan_hash"],
-            routing_requests=initial_requests,
-            attestation_items=initial_attestations,
-        )
-        compiled_remaining = (
-            compile_authenticated_v5_assignment_skeletons(
-                remaining_units,
-                source_plan_hash=projected["source_plan_hash"],
-                routing_requests=remaining_requests,
-                attestation_items=[
-                    item
-                    for item in routing_snapshot.attestations
-                    if item["task_id"] not in initial_task_ids
-                ],
-            )
-            if remaining_units
-            else {"assignment_skeletons": [], "requested_route_pairs": []}
-        )
-        attestation_ref_fields = (
-            "correlation_id",
-            "workspace_id",
-            "workspace_binding_hash",
-            "root_identity_hash",
-            "snapshot_id",
-            "snapshot_attestation_hash",
-            "query_receipt_hash",
-            "index_context_hash",
-            "attestation_hash",
-        )
-        raw_skeletons = compiled.get("assignment_skeletons")
-        raw_remaining_skeletons = compiled_remaining.get("assignment_skeletons")
-        if type(raw_skeletons) is not list or type(raw_remaining_skeletons) is not list:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        skeletons: list[dict[str, object]] = []
-        remaining_skeletons: list[dict[str, object]] = []
-        for raw_skeleton, destination in (
-            (raw_skeletons, skeletons),
-            (raw_remaining_skeletons, remaining_skeletons),
-        ):
-            for skeleton in raw_skeleton:
-                if (
-                    type(skeleton) is not dict
-                    or type(skeleton.get("task_id")) is not str
-                ):
-                    return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-                destination.append(skeleton)
-        skeleton_package_hash = validate_authenticated_v5_skeleton_package(
-            projected["all_units"],
-            skeletons,
-            remaining_skeletons,
-            source_plan_hash=projected["source_plan_hash"],
-        )
-        index_refs = [
-            {
-                "task_id": skeleton["task_id"],
-                **{field: index_attestation[field] for field in attestation_ref_fields},
-            }
-            for skeleton in skeletons
-        ]
-        planner_request = {
-            "schema": "2718lab-devkit/fastlane-host-planner-request-v1",
-            "action": "plan_dispatch",
-            "assignment_skeletons": skeletons,
-            "project_index_attestation_refs": index_refs,
-        }
-        requested_route_pairs: set[tuple[str, str]] = set()
-        for item in routing_snapshot.attestations:
-            route = cast(dict[str, object], item["route"])
-            model = route.get("model")
-            effort = route.get("effort")
-            if type(model) is not str or type(effort) is not str:
-                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-            requested_route_pairs.add((model, effort))
-        requested_routes = tuple(
-            HostRoute(model=model, effort=effort)
-            for model, effort in sorted(requested_route_pairs)
-        )
-        prepared = prepare_verified_host_facts(
-            session,
-            preparation_id=preparation_id,
-            call_intent_hash=call_intent_hash,
-            routing_registry_binding_hash=(
-                routing_snapshot.routing_registry_binding_hash
-            ),
-            request=planner_request,
-            reasoning_effort=reasoning_effort,
-            requested_routes=requested_routes,
-            storage_budgets=initial_storage_budgets,
-        )
-        if prepared == NO_SAFE_WORK:
-            return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-        now = int(time.time())
-        correlation_id = f"operation-{secrets.randbelow(999_999_999_999) + 1}"
-
-        queue_registry = None
-        if remaining_units:
-            queue_registry = session.send_fast_lane_refill_registry(
-                call_intent_hash=call_intent_hash,
-                preparation_id=preparation_id,
-                source_plan_hash=projected["source_plan_hash"],
-                index_context_hash=index_context_hash,
-                routing_registry_binding_hash=(
-                    routing_snapshot.routing_registry_binding_hash
-                ),
-                source_plan_task_ids=[
-                    unit["task"]["task_id"] for unit in projected["all_units"]
-                ],
-                initial_skeletons=skeletons,
-                remaining_skeletons=remaining_skeletons,
-                index_attestation_refs=[
-                    {
-                        "task_id": skeleton["task_id"],
-                        **{
-                            field: index_attestation[field]
-                            for field in attestation_ref_fields
-                        },
-                    }
-                    for skeleton in remaining_skeletons
-                ],
-                skeleton_package_hash=skeleton_package_hash,
-                now=now,
-            )
-            if type(queue_registry) is not FastLaneRefillRegistryRequest:
-                return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-
-        def refill_callback(trigger: Mapping[str, object]) -> dict[str, object]:
-            """Record the real next-boundary result for this fully dispatched plan."""
-
-            request_hash = (
-                "sha256:"
-                + hashlib.sha256(
-                    json.dumps(
-                        request,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ).encode("utf-8")
-                ).hexdigest()
-            )
-            queued_ids = [skeleton["task_id"] for skeleton in remaining_skeletons]
-            return {
-                "schema": "2718lab-devkit/fastlane-refill-receipt-v1",
-                "state": ("QUEUED_WAVE_PENDING" if queued_ids else "NO_QUEUED_WORK"),
-                "request_hash": request_hash,
-                "refill_trigger_hash": trigger["refill_trigger_hash"],
-                "queue_registry_hash": (
-                    queue_registry.queue_registry_hash if queue_registry else None
-                ),
-                "queued_task_ids": queued_ids,
-            }
-
-        receipt = dispatch_fast_lane_with_host_facts(
-            planner_request,
-            reasoning_effort=reasoning_effort,
-            verified_host_facts=prepared,
-            correlation_id=correlation_id,
-            now=now,
-            refill_callback=refill_callback,
-        )
-        if type(receipt) is not OperationReceipt:
-            return _failure("FASTLANE_HOST_DISPATCH_REJECTED")
-        return envelope_success(
-            {
-                "state": "DISPATCH_COMMITTED",
-                "task_id": receipt.task_id,
-                "correlation_id": receipt.correlation_id,
-                "dispatch_envelope_hash": receipt.envelope_hash,
-            }
-        )
-    except ResultContractError:
-        return _failure("INTERNAL_ERROR")
-    except Exception:
-        return _failure("FASTLANE_HOST_AUTHORITY_UNAVAILABLE")
-
-
-def _fastlane_public_value(value: object) -> object:
-    """Remove compiler-only null sentinels before the no-null MCP envelope."""
-
-    if type(value) is dict:
-        return {
-            key: _fastlane_public_value(item)
-            for key, item in value.items()
-            if item is not None
-        }
-    if type(value) is list:
-        return [_fastlane_public_value(item) for item in value if item is not None]
-    return value
 
 
 @mcp.tool(annotations=_tool_annotations("relay_start"))

@@ -231,14 +231,14 @@ def test_python_project_and_lock_use_pep440_stable_v1_metadata() -> None:
 
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == "1.1.3"
+    assert project["project"]["version"] == "1.1.4"
     assert project["project"]["dependencies"] == ["mcp[cli]>=1,<2"]
     assert "devkit_atlas" in project["tool"]["pyright"]["include"]
     assert "devkit_runtime" in project["tool"]["pyright"]["include"]
     assert "code_atlas" not in project["tool"]["pyright"]["include"]
     lock_text = lock_path.read_text(encoding="utf-8")
     assert 'name = "2718lab-devkit-mcp"' in lock_text
-    assert 'version = "1.1.3"' in lock_text
+    assert 'version = "1.1.4"' in lock_text
 
 
 def test_two_builds_are_byte_identical_with_normalized_zip_metadata(
