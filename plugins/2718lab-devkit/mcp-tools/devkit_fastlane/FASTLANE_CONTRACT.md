@@ -106,30 +106,48 @@ does not weaken host capability, lease, worktree, review, or safety gates.
 source-plan hash 必须包含该整个 binding，因此相同 task/workflow 在不同项目、workspace 或输入
 snapshot 下不能共用计划、lease、receipt 或恢复状态。
 
-manifest 中的 fence 只是可验证的结构与 hash 输入，绝不是 authority。DevKit 不拥有 Desktop-host
-durable registry；已认证 inherited host bridge 只能按一次性 nonce/expiry 向宿主 registry 请求
-compiler evidence。因此没有任何同进程 provider、module
-attribute、closure、环境变量、请求 JSON、repo/task root、路径名或 caller-supplied ID 可被当作
-live authority。公开 `compile_fast_lane` 与 `fast-lane` CLI 对 structurally valid V2 一律产出
-`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`，零本地 assignment、零队列、零外部派发；V2
+manifest 中的 fence 只是可验证的结构与 hash 输入，绝不是执行 authority。没有任何 module
+attribute、closure、环境变量、请求 JSON、repo/task root、路径名或 caller-supplied ID 可以授权
+spawn、lease、worktree 或 Git mutation。公开 Python `compile_fast_lane` 与 `fast-lane` CLI 对
+structurally valid V2 继续产出 `team-efficiency/fast-lane-plan-v1` 的
+`NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE`，零 assignment、零队列、零外部派发；V2
 envelope/hash 无效、其内层 canonical v1 `package` 不能完成纯诊断解析，或 fast-lane request
 壳的 schema/key/字节边界无效时，必须是 `PROJECT_BINDING_INVALID`；v1 保持
-`LEGACY_PROJECT_UNBOUND`。这些结构预检不读取 host、账号用量或 index 输入，也不触及 scheduler。
-公开 MCP request 若试图携带明确的 host-private 字段（如 `host_status`、账号用量或 index
-evidence），则是适配器输入违规，必须在编译前以 `FASTLANE_REQUEST_INVALID` 拒绝，而不是把
-该值当作可诊断的计划输入。
-`compiler-evidence-request-v1/response-v1` 与 typed dispatch batch 是唯一跨进程
-authority 通道：request/response 必须 exact-key、同 bridge generation、一次性且完整绑定 route、
-lease、scope、context、predecessor、worktree identity 与 registry hash。它不接受 actual path，
-也不能由工作包 JSON、环境变量值或 Python 私有命名伪造。
+`LEGACY_PROJECT_UNBOUND`。
+
+MCP `fastlane_compile` 使用不同的 server-private planning path。公开 request 中的
+`workspace_id` 与 `input_snapshot_id` 只作为 selector；server 在只读 RuntimeRoot UoW 内解析
+持久 registry，并由 Project Index service 读取 current snapshot、canonical `include_paths` 与
+真实 Git HEAD，再把这些事实直接交给 module-private 编译入口。该材料入口不是公开 Python API
+参数，也不从 `devkit_fastlane/__init__.py` 导出。公开 MCP request 若携带 `host_status`、账号
+用量、index evidence、root 或 Git HEAD 等 caller 自报材料，必须在编译前以
+`FASTLANE_REQUEST_INVALID` 拒绝。
+
+server-private 编译在创建任何 planned assignment 前必须同时证明：workspace/snapshot binding
+匹配 selector；snapshot 为 current `INDEX_READY`；snapshot head、scheduler integration commit
+与每个 bootstrap base commit 都等于真实 Git HEAD；bootstrap repo 等于 registry root；持久化
+`include_paths` 为 canonical 且完整覆盖 source plan 中每个 writer `write_scope`。空
+`include_paths` 表示完整 workspace snapshot；非空 include root 必须等于 scope 或是 scope 的
+祖先。snapshot 自身有 gap，或任一 writer scope 未被覆盖，均精确返回 `INDEX_PARTIAL`；文件或
+Git 漂移返回 `INDEX_STALE`；binding、root、snapshot 或 HEAD 错配必须 fail closed，不能产生
+部分计划。
+
+成功响应 schema 为 `team-efficiency/fast-lane-plan-v2`。顶层固定
+`plan_only=true`、`dispatch_state="not_dispatched"`、`execution_authorized=false`；assignment
+使用 `team-efficiency/local-writer-plan-v1`，固定 `execution_state="plan_only"`、
+`lease_state="unclaimed"` 与 `worktree.state="planned"`。path-free `index_evidence` 使用
+`team-efficiency/local-index-evidence-v1`，包含 workspace/snapshot/head/manifest/parser binding
+hash、`include_paths_hash`、所有 writer scopes 的 `scope_hash` 与最终 `evidence_hash`，但不返回
+registry root、raw Git HEAD 或 include path 文本。`workflow_policy` 只说明协调器后续必须显式
+验证 route、领取 lease 并调用 dispatch tool；它不是执行许可，编译器也不调用该工具。
 
 同一限制覆盖 `bootstrap --apply` 及 import-callable `apply_bootstrap_plan`：当前公开入口在构建
 caller-supplied bootstrap plan 或调用 worktree mutation 前，无条件以
 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 失败关闭，因而不能到达
 `git worktree add`。不带 `--apply` 的 `bootstrap` 仍只输出 dry-run 诊断计划；其中的 project、
 root、worktree 和任何 JSON 都不是 sealed V2 execution context。DevKit 仍不存在自行创建 worktree
-的可执行路径；authenticated compiler evidence 只允许将 typed batch 提交给宿主，不能绕过宿主的
-worktree broker、Git probe 或 coordinator gate。
+的可执行路径；plan-v2 不是 typed dispatch batch，也不能绕过外部宿主的 worktree broker、Git
+probe 或 coordinator gate。
 
 ### 4. 接地后再写
 
@@ -147,7 +165,10 @@ worktree broker、Git probe 或 coordinator gate。
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
-`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须由 host 显式传入 `--enable`，否则得到 inactive plan。公开 `fast-lane` CLI/API 不消费 host-status、额度或 index 输入，因此仍输出 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 的零 assignment/队列预览。只有 MCP 进程持有已认证 inherited bridge 且宿主返回 exact registry binding 时，私有 adapter 才能机械提交 `dispatch_all`；worker effort 禁止 `ultra`。编译器本身不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任。
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须显式传入 `--enable`，否则得到 inactive plan。这个 CLI/API 不消费 host-status、额度或 index 输入，因此仍输出 plan-v1 的 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 零 assignment/队列预览。MCP 工具只接受 `low`、`medium`、`high`、`xhigh`、`max`，并在 `enable=true` 时返回上述 plan-v2；`enable=false` 返回同 schema 的 inactive、零 assignment 计划，但仍先验证 registry/index/Git binding。两种编译路径都不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；同时负责 route availability 与 dispatch。
+
+以下 host-status、`host_dispatch`、cross-session projection 与 refill 规则只描述 plan-v1 的外部
+host contract；它们不由当前 MCP `fastlane_compile` 调用，也不能把 plan-v2 变成 dispatch receipt。
 
 host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
 `routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整
