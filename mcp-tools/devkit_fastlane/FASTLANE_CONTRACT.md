@@ -100,7 +100,8 @@ does not weaken host capability, lease, worktree, review, or safety gates.
 状态的 Fast Lane 编译调用，遇到 v1 必须返回 `NO_SAFE_WORK` 和
 `LEGACY_PROJECT_UNBOUND`，零 assignment、零队列、零外部派发。
 
-未来外部 Desktop bridge 如要消费的载荷必须是 `team-efficiency/work-package-v2` exact-key envelope，包含原始 canonical v1
+legacy request-v1 bridge 消费 `team-efficiency/work-package-v2` exact-key envelope；
+新 request-v2 使用下述同边界的 work-package-v3。两者都包含原始 canonical v1
 `package`、其 `package_payload_hash`、`project_fence`（仅 `project_id`、
 `binding_digest`、`binding_version`）、`workspace_id` 与 `input_snapshot_id`。V2 的
 source-plan hash 必须包含该整个 binding，因此相同 task/workflow 在不同项目、workspace 或输入
@@ -132,7 +133,7 @@ server-private 编译在创建任何 planned assignment 前必须同时证明：
 Git 漂移返回 `INDEX_STALE`；binding、root、snapshot 或 HEAD 错配必须 fail closed，不能产生
 部分计划。
 
-成功响应 schema 为 `team-efficiency/fast-lane-plan-v2`。顶层固定
+legacy request-v1 的成功响应 schema 为 `team-efficiency/fast-lane-plan-v2`。顶层固定
 `plan_only=true`、`dispatch_state="not_dispatched"`、`execution_authorized=false`；assignment
 使用 `team-efficiency/local-writer-plan-v1`，固定 `execution_state="plan_only"`、
 `lease_state="unclaimed"` 与 `worktree.state="planned"`。path-free `index_evidence` 使用
@@ -140,6 +141,46 @@ Git 漂移返回 `INDEX_STALE`；binding、root、snapshot 或 HEAD 错配必须
 hash、`include_paths_hash`、所有 writer scopes 的 `scope_hash` 与最终 `evidence_hash`，但不返回
 registry root、raw Git HEAD 或 include path 文本。`workflow_policy` 只说明协调器后续必须显式
 验证 route、领取 lease 并调用 dispatch tool；它不是执行许可，编译器也不调用该工具。
+
+#### Model-neutral 新任务入口（V3）
+
+新任务默认使用 `team-efficiency/fast-lane-request-v2`，并与
+`team-efficiency/work-package-v3` exact-key 配对；request-v1 只能与
+work-package-v2 配对。两个方向的版本混配都返回 invalid。work-package-v3 保留原
+project authority、payload hash 与全部 local registry/index/Git 安全边界，但它生成
+`decomposition-plan-v2`：unit 不再公开带品牌的 `recommended_route`，而是携带
+`model-route-requirements-v1`。
+
+现有 request-v1 可显式转换为新入口（命令只生成 JSON，不授予 authority）：
+
+```text
+cd mcp-tools
+uv run --locked python -c "import json,sys; from devkit_fastlane import prepare_model_neutral_fast_lane_request as prepare; request=json.load(open(sys.argv[1], encoding='utf-8')); print(json.dumps(prepare(request), ensure_ascii=False, sort_keys=True))" request-v1.json
+```
+
+MCP `fastlane_compile` 对该请求返回 `team-efficiency/fast-lane-plan-v3`，assignment
+schema 为 `team-efficiency/local-writer-plan-v2`。每个 assignment 包含
+`route_requirements`（complexity、capability tags、effort/cost preference、worker
+ultra 禁令、可选 exact explicit intent）以及
+`selection={state:"unselected", owner:"coordinator",
+catalog_source:"codex_tool_metadata", availability_gate:"dispatch_tool"}`。
+`unselected` 是正常 planned 状态，不因没有 Host 或持久 catalog 而 blocked；协调器只根据
+本次 Codex dispatch tool 暴露的 metadata 做判断。DevKit 不实现 model rank、品牌白名单、
+catalog 服务或 availability authority。
+
+协调器选定路线后调用公开 `record_model_selection`。生成的
+`model-selection-record-v1` 绑定 assignment 的 `plan_item_id`、`requirement_hash`、exact
+`model_id`、`reasoning_effort` 与选择理由，且固定
+`execution_state="selection_only"`、`dispatch_state="not_dispatched"`、
+`execution_authorized=false`。任何 bounded model ID 均可记录；effort 必须是 dispatch tool
+支持的标准值且 worker 禁止 `ultra`。如果 request 已指定 exact model/effort，记录必须完全
+相同，否则拒绝，不能 silent fallback。记录本身不证明模型可用，真实 dispatch tool 仍是唯一
+availability gate。
+
+request-v2 的完整 canonical request hash 进入 plan-v3，explicit intent 又进入
+`requirement_hash` 与 `plan_item_id`，从而选择记录可被精确重放。旧
+request-v1/work-package-v2、plan-v2、`fastlane_routing.py` v3/v4/v5 policy/hash 与旧 receipt
+validator 继续按原字节和语义重放，不用新规则解释历史记录。
 
 同一限制覆盖 `bootstrap --apply` 及 import-callable `apply_bootstrap_plan`：当前公开入口在构建
 caller-supplied bootstrap plan 或调用 worktree mutation 前，无条件以
@@ -165,10 +206,10 @@ probe 或 coordinator gate。
 python scripts/team_efficiency.py fast-lane --input <fast-lane-request.json> --host-status <fast-lane-host-status.json> --reasoning-effort ultra
 ```
 
-`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须显式传入 `--enable`，否则得到 inactive plan。这个 CLI/API 不消费 host-status、额度或 index 输入，因此仍输出 plan-v1 的 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 零 assignment/队列预览。MCP 工具只接受 `low`、`medium`、`high`、`xhigh`、`max`，并在 `enable=true` 时返回上述 plan-v2；`enable=false` 返回同 schema 的 inactive、零 assignment 计划，但仍先验证 registry/index/Git binding。两种编译路径都不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；同时负责 route availability 与 dispatch。
+`ultra` 自动激活（Ultra automatic activation）；低于 Ultra 的 effort 必须显式传入 `--enable`，否则得到 inactive plan。这个 CLI/API 不消费 host-status、额度或 index 输入，因此仍输出 plan-v1 的 `NO_SAFE_WORK/PROJECT_AUTHORITY_UNAVAILABLE` 零 assignment/队列预览。MCP 工具只接受 `low`、`medium`、`high`、`xhigh`、`max`；新 request-v2 在 `enable=true` 时返回上述 plan-v3，legacy request-v1 仍返回 plan-v2；`enable=false` 返回各自同 schema 的 inactive、零 assignment 计划，但仍先验证 registry/index/Git binding。两种编译路径都不调用模型、不启动 agent、不创建会话或工作树、不运行 gate、不改写 Git、不领取或完成 workflow。协调器 lane 保有设计、集成、风险决策和最终验收责任；同时负责 route availability 与 dispatch。
 
 以下 host-status、`host_dispatch`、cross-session projection 与 refill 规则只描述 plan-v1 的外部
-host contract；它们不由当前 MCP `fastlane_compile` 调用，也不能把 plan-v2 变成 dispatch receipt。
+host contract；它们不由当前 MCP `fastlane_compile` 调用，也不能把 plan-v2/plan-v3 变成 dispatch receipt。
 
 host 通过不超过 3 MiB、有 exact-key 的 `--host-status` 传入 `workflow_id`、当前 lease/binding 与
 `routing_context`。后者按 `(task_id, scheduler_role)` 唯一关联完整

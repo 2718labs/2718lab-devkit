@@ -1,21 +1,23 @@
 [English](README.md)
 
-# 2718lab DevKit —— Codex + MCP v1.1.4
+# 2718lab DevKit —— Codex + MCP v1.1.5
 
-[![版本](https://img.shields.io/badge/version-v1.1.4-blue)](./.codex-plugin/plugin.json)
+[![版本](https://img.shields.io/badge/version-v1.1.5-blue)](./.codex-plugin/plugin.json)
 [![许可证](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit 是一个 Codex-first 工程工具包：它包含一个本地、仅 stdio
 传输的 MCP 运行时，用于有边界的项目索引、Atlas 证据、Relay 生命周期协调和
 确定性的 Fast Lane 规划；同时还包含一组精简的 Skill 说明书。本仓库承载版本化的
-v1.1.4 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
+v1.1.5 包；已提交的 manifest 和 allowlist 定义可执行运行时范围，说明书导航、
 安装、构建和验证章节共同给出支持的工作流。
 
 公共 Python 编译器和 CLI 继续保留刻意 fail-closed 的
-`team-efficiency/fast-lane-plan-v1` 预览。MCP `fastlane_compile` 则通过本地
-RuntimeRoot 解析 caller 提供的 workspace/snapshot selector，并返回已验证的
-`team-efficiency/fast-lane-plan-v2` 规划描述符。该描述符固定为 `plan_only`：不会
-派发、领取 lease、创建 worktree 或授权执行。
+`team-efficiency/fast-lane-plan-v1` 预览。新任务先用
+`prepare_model_neutral_fast_lane_request` 准备 `fast-lane-request-v2`；MCP
+`fastlane_compile` 再通过本地 RuntimeRoot 解析 workspace/snapshot selector，并返回
+已验证的 `team-efficiency/fast-lane-plan-v3`。assignment 只描述需求，由协调器根据
+本次 Codex 工具 metadata 选择模型。描述符仍固定为 `plan_only`：不会派发、领取
+lease、创建 worktree 或授权执行。request-v1/plan-v2 仅保留精确历史重放。
 
 此前 v1.1.3 的存储治理集成只引用 Ayleovelle 用户 fork 上的兼容 Host 源码：
 [`codex/host-1.1.3-storage-governance-upstream`](https://github.com/Ayleovelle/codex/tree/codex/host-1.1.3-storage-governance-upstream)
@@ -47,11 +49,12 @@ stock Codex Host 没有经过证明的 protected broker，继续 fail-closed。
   静态 prompt agent 或模型运行器。
 - 可选的 Codex Skill bundle 是 DevKit 的说明书表面，提供简短的模块化手册；
   它不构成第二个运行时，也不是可执行的 prompt/agent 表面。
-- Fast Lane 是纯规划编译器。只有 server 私有 RuntimeRoot 验证已注册的
+- Fast Lane 是纯规划编译器。新 model-neutral request 只有在 server 私有 RuntimeRoot 验证已注册的
   `INDEX_READY` snapshot、Git HEAD 和完整 writer scope 覆盖后，MCP 工具才会
-  产出有界的 `team-efficiency/fast-lane-plan-v2` assignments。所有结果仍为
-  `plan_only`，不执行 agent、Git 命令、lease 或 worktree 动作。公共 Python
-  编译器/CLI 继续作为无 authority 的 plan-v1 诊断面。
+  产出有界的 `team-efficiency/fast-lane-plan-v3` assignments。assignment 不带
+  默认模型名；协调器先记录 exact model/effort，再由 dispatch tool 校验可用性。
+  所有结果仍为 `plan_only`，不执行 agent、Git 命令、lease 或 worktree 动作。
+  公共 Python 编译器/CLI 继续作为无 authority 的 plan-v1 诊断面。
 
 ## 核心模块速览
 
@@ -68,8 +71,9 @@ stock Codex Host 没有经过证明的 protected broker，继续 fail-closed。
 
 ## 整体工作流
 
-仓库级默认工作流是 Fast Lane。`workflow-design` 准备有界输入；MCP
-`fastlane_compile` 验证持久化本地项目 snapshot 后返回 plan-v2 描述符，
+仓库级默认工作流是 Fast Lane。`workflow-design` 准备有界的 model-neutral
+request-v2 输入；MCP `fastlane_compile` 验证持久化本地项目 snapshot 后返回
+plan-v3 描述符，
 `team_efficiency.py` 则保留被阻断的 plan-v1 诊断路径。两条路径都不会启动 agent，
 也不会创建或执行跨会话工作树。协调器必须另行验证 route availability、领取 lease
 并派发所选工作。
@@ -82,7 +86,7 @@ flowchart TD
     end
     subgraph FAST["Fast Lane"]
         F["fast-lane request"] --> G["MCP fastlane_compile<br/>私有 RuntimeRoot 验证"]
-        G --> X["plan-v2<br/>plan_only，未派发"]
+        G --> X["plan-v3 requirements<br/>未选择，plan_only"]
         F --> H["公共 Python / CLI"] --> I["plan-v1<br/>NO_SAFE_WORK"]
     end
     B -->|MCP 工具| C
@@ -157,7 +161,7 @@ Fast Lane 不含额度协调器合同；公共编译器和 CLI 不读取、协�
 
 维护者使用专用的 marketplace allowlist 构建该快照：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.4.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.5.zip
 
 ## 本地安装与运行
 
@@ -197,7 +201,7 @@ RELAY_CAPABILITY_BROKER_UNAVAILABLE。服务器不会暴露原始 handle，也�
 
 allowlist builder 会在插件源码树之外生成确定性的 ZIP。请选择源码树之外的输出目录：
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.4.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.5.zip
 
 产物包含 manifest、.mcp.json、LICENSE、锁定的 Python 项目，以及
 .codex-plugin/main-artifact-allowlist.json 选中的运行时文件。它的可执行运行时
@@ -293,16 +297,21 @@ Fast Lane 编译器位于
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py 和
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py。MCP `fastlane_compile` 只有在
 只读 RuntimeRoot UoW 解析已注册 workspace/snapshot 后才返回
-`team-efficiency/fast-lane-plan-v2`。snapshot 必须 current、处于 `INDEX_READY`、
+model-neutral request 返回 `team-efficiency/fast-lane-plan-v3`。snapshot 必须
+current、处于 `INDEX_READY`、
 绑定仓库 Git HEAD，且持久化 `include_paths` 完整覆盖每个 writer `write_scope`。
 
 - `reasoning_effort` 必填且只接受 `low`、`medium`、`high`、`xhigh` 或
   `max`；MCP 输出永不派发 worker。
-- `team-efficiency/fast-lane-plan-v2` 固定 `plan_only=true`、
+- `team-efficiency/fast-lane-plan-v3` 固定 `plan_only=true`、
   `dispatch_state="not_dispatched"`、`execution_authorized=false`。
-  assignment 使用 `team-efficiency/local-writer-plan-v1`；无路径的
+  assignment 使用 `team-efficiency/local-writer-plan-v2`，包含有界
+  `route_requirements` 与协调器负责的 `selection.state="unselected"`；无路径的
   `index_evidence` 包含 snapshot/binding hashes、`include_paths_hash` 与已编译
   `scope_hash`。
+- `record_model_selection` 绑定 `plan_item_id`、`requirement_hash`、exact model ID、
+  effort 与协调器选择理由。该记录仍为 `selection_only/not_dispatched`，可用性只由
+  dispatch tool 校验；显式请求的模型不得被 fallback 替换。
 - filesystem 或 Git 漂移返回 `INDEX_STALE`；snapshot 本身 partial，或其 include
   roots 遗漏任一 writer scope，均返回 `INDEX_PARTIAL`。
 - caller ID 只是 selector，不是 authority material。公共 MCP request 与公共
@@ -342,7 +351,7 @@ CI 和全新产物检查才是当前测试计数的唯一来源。它们验证�
 
 ## 版本
 
-本仓库代表版本化的 v1.1.4 包。发布说明见
+本仓库代表版本化的 v1.1.5 包。发布说明见
 [CHANGELOG.md](CHANGELOG.md)；构建和安装请以已提交的 manifest、产物 allowlist
 和锁定依赖为准。维护者从 current `main` 手动 dispatch Release；它通过全部 gates
 后才创建注释 tag 并发布匹配的 GitHub Release。单独 push tag 不会触发发布。
