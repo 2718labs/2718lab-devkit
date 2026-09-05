@@ -157,6 +157,7 @@ _FAST_LANE_REQUEST_FIELDS = frozenset(
         "scheduler_state",
     }
 )
+_FAST_LANE_REQUEST_V2_FIELDS = _FAST_LANE_REQUEST_FIELDS | frozenset({"route_intents"})
 _FAST_LANE_REQUEST_HOST_PRIVATE_FIELDS = frozenset(
     {
         "host_status",
@@ -189,6 +190,9 @@ _PROJECT_FENCE_FIELDS = frozenset(
 )
 _PROJECT_FENCE_SCHEMA = "team-efficiency/project-fence-v1"
 _WORK_PACKAGE_V2_SCHEMA = "team-efficiency/work-package-v2"
+_WORK_PACKAGE_V3_SCHEMA = "team-efficiency/work-package-v3"
+_FAST_LANE_REQUEST_V2_SCHEMA = "team-efficiency/fast-lane-request-v2"
+_ROUTE_INTENT_FIELDS = frozenset({"task_id", "role", "model_id", "reasoning_effort"})
 _PROJECT_BINDING_SCHEMA = "2718lab-devkit/project-binding-v1"
 _BOOTSTRAP_ATTESTATION_SCHEMA = "2718lab-devkit/new-project-bootstrap-attestation-v1"
 _PROJECT_BINDING_FIELDS = frozenset(
@@ -755,6 +759,7 @@ _LOCAL_PLAN_V2_FIELDS = frozenset(
         "plan_hash",
     }
 )
+_LOCAL_PLAN_V3_FIELDS = _LOCAL_PLAN_V2_FIELDS | frozenset({"request_hash"})
 _LOCAL_PLAN_ASSIGNMENT_FIELDS = frozenset(
     {
         "schema",
@@ -774,6 +779,27 @@ _LOCAL_PLAN_ASSIGNMENT_FIELDS = frozenset(
         "routing_result_hash",
         "task_fingerprint",
         "routing_reason_codes",
+        "depends_on",
+        "required_evidence",
+        "index_evidence",
+        "plan_item_id",
+    }
+)
+_LOCAL_PLAN_ASSIGNMENT_V2_FIELDS = frozenset(
+    {
+        "schema",
+        "slot_id",
+        "task_id",
+        "role",
+        "goal",
+        "output_boundary",
+        "execution_state",
+        "dispatch_state",
+        "execution_authorized",
+        "lease_state",
+        "worktree",
+        "route_requirements",
+        "selection",
         "depends_on",
         "required_evidence",
         "index_evidence",
@@ -802,6 +828,49 @@ _LOCAL_PLAN_POLICY_FIELDS = frozenset(
         "lease_claim_required_before_execution",
         "compiler_side_effects",
     }
+)
+_LOCAL_PLAN_POLICY_V2_FIELDS = _LOCAL_PLAN_POLICY_FIELDS | frozenset(
+    {"selection_owner", "catalog_source", "availability_gate", "selection_record"}
+)
+_ROUTE_REQUIREMENT_FIELDS = frozenset(
+    {
+        "schema",
+        "complexity",
+        "capability_tags",
+        "effort_preference",
+        "cost_preference",
+        "worker_ultra_forbidden",
+        "explicit_intent",
+        "requirement_hash",
+    }
+)
+_MODEL_SELECTION_FIELDS = frozenset(
+    {
+        "schema",
+        "state",
+        "owner",
+        "catalog_source",
+        "availability_gate",
+        "record_schema",
+    }
+)
+_MODEL_SELECTION_RECORD_FIELDS = frozenset(
+    {
+        "schema",
+        "plan_item_id",
+        "requirement_hash",
+        "model_id",
+        "reasoning_effort",
+        "selection_reason",
+        "availability_gate",
+        "execution_state",
+        "dispatch_state",
+        "execution_authorized",
+        "selection_record_hash",
+    }
+)
+_MODEL_NEUTRAL_WORKER_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
 _LOCAL_PLAN_INDEX_EVIDENCE_FIELDS = frozenset(
     {
@@ -1103,6 +1172,17 @@ def _validated_work_package_v2(value: object) -> dict[str, Any]:
     }
 
 
+def _validated_work_package_v3(value: object) -> dict[str, Any]:
+    """Validate the model-neutral envelope without changing V2 replay bytes."""
+
+    source = _mapping(value, "work-package v3 envelope")
+    _exact_keys(source, _WORK_PACKAGE_V2_FIELDS, "work-package v3 envelope")
+    if source["schema"] != _WORK_PACKAGE_V3_SCHEMA:
+        raise ValueError("work-package v3 schema is invalid")
+    legacy_shape = {**dict(source), "schema": _WORK_PACKAGE_V2_SCHEMA}
+    return _validated_work_package_v2(legacy_shape)
+
+
 def _validated_project_binding(value: object) -> dict[str, Any]:
     """Validate Task 2's exact opaque project-binding-v1 wrapper locally."""
 
@@ -1244,8 +1324,17 @@ def _project_execution_block_details(
         return "BOOTSTRAP_ATTESTATION_REQUIRED", None
 
     try:
-        _exact_keys(raw_request, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
-        if raw_request["schema"] != "team-efficiency/fast-lane-request-v1":
+        request_schema = raw_request.get("schema")
+        request_fields = (
+            _FAST_LANE_REQUEST_V2_FIELDS
+            if request_schema == _FAST_LANE_REQUEST_V2_SCHEMA
+            else _FAST_LANE_REQUEST_FIELDS
+        )
+        _exact_keys(raw_request, request_fields, "fast-lane request")
+        if request_schema not in {
+            "team-efficiency/fast-lane-request-v1",
+            _FAST_LANE_REQUEST_V2_SCHEMA,
+        }:
             return "PROJECT_BINDING_INVALID", None
         if len(_json_bytes(raw_request)) > MAX_MANIFEST_INPUT_BYTES:
             return "PROJECT_BINDING_INVALID", None
@@ -1257,14 +1346,26 @@ def _project_execution_block_details(
         return "PROJECT_BINDING_INVALID", None
     if package.get("schema") == "team-efficiency/work-package-v1":
         return "LEGACY_PROJECT_UNBOUND", None
-    if package.get("schema") == _WORK_PACKAGE_V2_SCHEMA:
+    package_schema = package.get("schema")
+    if package_schema in {_WORK_PACKAGE_V2_SCHEMA, _WORK_PACKAGE_V3_SCHEMA}:
+        expected_package_schema = (
+            _WORK_PACKAGE_V3_SCHEMA
+            if request_schema == _FAST_LANE_REQUEST_V2_SCHEMA
+            else _WORK_PACKAGE_V2_SCHEMA
+        )
+        if package_schema != expected_package_schema:
+            return "PROJECT_BINDING_INVALID", None
         try:
-            v2 = _validated_work_package_v2(package)
+            envelope = (
+                _validated_work_package_v3(package)
+                if package_schema == _WORK_PACKAGE_V3_SCHEMA
+                else _validated_work_package_v2(package)
+            )
             # Validate the canonical V1 payload before classifying the V2
             # envelope as merely missing external authority.  This is a pure
             # diagnostic parse: it cannot reach scheduler, host, or index,
             # worktree, or dispatch logic.
-            _decompose_v1(v2["package"])
+            _decompose_v1(envelope["package"])
         except (TypeError, ValueError):
             return "PROJECT_BINDING_INVALID", None
         try:
@@ -1274,11 +1375,11 @@ def _project_execution_block_details(
         except (TypeError, ValueError):
             return "BOOTSTRAP_ATTESTATION_UNKNOWN", None
         if (
-            binding["workspace_id"] != v2["project_authority"]["workspace_id"]
+            binding["workspace_id"] != envelope["project_authority"]["workspace_id"]
             or binding["project_id"]
-            != f"sha256:{v2['project_authority']['project_id']}"
+            != f"sha256:{envelope['project_authority']['project_id']}"
             or binding["attestation"]["attested_input_snapshot_id"]
-            != v2["project_authority"]["input_snapshot_id"]
+            != envelope["project_authority"]["input_snapshot_id"]
         ):
             return "BOOTSTRAP_ATTESTATION_MISMATCH", None
         if binding["mode"] == "new_empty_bootstrap":
@@ -1310,8 +1411,8 @@ def _project_execution_block_details(
             "PROJECT_AUTHORITY_UNAVAILABLE",
             {
                 "schema": "team-efficiency/project-fence-blocked-v2",
-                "package_payload_hash": v2["package_payload_hash"],
-                "project_authority": v2["project_authority"],
+                "package_payload_hash": envelope["package_payload_hash"],
+                "project_authority": envelope["project_authority"],
             },
         )
     return "PROJECT_BINDING_INVALID", None
@@ -3895,6 +3996,18 @@ def _fast_lane_assignment(
     epoch = int(state.get("slot_epochs", {}).get(slot_id, 0)) + 1
     task_id = str(unit["task_id"])
     context = _fast_lane_build_dispatch_context(validated, unit, role)
+    if "route_requirements" in route:
+        return {
+            "slot_id": slot_id,
+            "action": "start",
+            "task_id": task_id,
+            "role": role,
+            "assignment_epoch": epoch,
+            "context_hash": context["context_hash"],
+            "route_requirements": dict(route["route_requirements"]),
+            "selection": dict(route["selection"]),
+            "_context": context,
+        }
     receipt = {
         "schema": "team-efficiency/fast-lane-dispatch-receipt-v1",
         "source_plan_hash": validated["source_plan_hash"],
@@ -4471,7 +4584,9 @@ def _registration_plan(
                     "workflow_id": _host_binding("workflow_id"),
                     "task_id": unit["task_id"],
                     "title": unit["goal"],
-                    "owner_role": unit["recommended_route"],
+                    "owner_role": unit.get(
+                        "recommended_route", "coordinator_model_selection"
+                    ),
                     "card": card,
                     "dependencies": list(unit["depends_on"]),
                     "write_scope": list(unit["write_scope"]),
@@ -4649,6 +4764,124 @@ def _scheduled_plan(
     }
 
 
+def _route_requirements(
+    complexity: str,
+    *,
+    role: str = "execution",
+    explicit_intent: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe task needs without naming a model or claiming availability."""
+
+    if complexity not in {"routine", "moderate", "complex", "exceptional"}:
+        raise ValueError("route requirement complexity is invalid")
+    capability_tags = {
+        "routine": {"bounded_task_execution"},
+        "moderate": {"multi_step_task_execution"},
+        "complex": {"complex_task_execution", "cross_module_reasoning"},
+        "exceptional": {"highest_available_capability", "deep_reasoning"},
+    }[complexity]
+    if role == "design_probe":
+        capability_tags.update({"architecture_design", "highest_available_capability"})
+        complexity = "exceptional"
+    elif role == "review":
+        capability_tags.add("independent_review")
+    elif role == "verification":
+        capability_tags.add("verification")
+    elif role == "prewarm":
+        capability_tags.add("read_only_prewarm")
+    effort_preference = {
+        "routine": "medium",
+        "moderate": "high",
+        "complex": "max",
+        "exceptional": "max",
+    }[complexity]
+    cost_preference = {
+        "routine": "cost_efficient",
+        "moderate": "balanced",
+        "complex": "capability_first",
+        "exceptional": "capability_first",
+    }[complexity]
+    intent = (
+        {"state": "unspecified"}
+        if explicit_intent is None
+        else {
+            "state": "required",
+            "model_id": explicit_intent["model_id"],
+            "reasoning_effort": explicit_intent["reasoning_effort"],
+        }
+    )
+    requirement: dict[str, Any] = {
+        "schema": "team-efficiency/model-route-requirements-v1",
+        "complexity": complexity,
+        "capability_tags": sorted(capability_tags),
+        "effort_preference": effort_preference,
+        "cost_preference": cost_preference,
+        "worker_ultra_forbidden": True,
+        "explicit_intent": intent,
+    }
+    requirement["requirement_hash"] = _sha256_json(requirement)
+    return requirement
+
+
+def _model_neutral_source_plan(
+    legacy_plan: Mapping[str, Any], package: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project a new source-plan schema while leaving legacy replay untouched."""
+
+    if legacy_plan.get("status") != "planned":
+        result = dict(legacy_plan)
+        result["schema"] = "team-efficiency/decomposition-plan-v2"
+        if result.get("reason") == "Semantic decomposition requires Sol-owned design.":
+            result["reason"] = (
+                "Semantic decomposition requires coordinator-owned design."
+            )
+        return result
+    artifact_complexities = {
+        str(item.get("task_id")): str(item.get("complexity"))
+        for item in package.get("artifacts", [])
+        if isinstance(item, Mapping)
+    }
+    legacy_units = {
+        str(item["task_id"]): item
+        for item in legacy_plan.get("units", [])
+        if isinstance(item, Mapping)
+    }
+    units: list[dict[str, Any]] = []
+    for task_id, old in sorted(legacy_units.items()):
+        complexity = artifact_complexities.get(task_id)
+        if complexity not in {"routine", "moderate", "complex", "exceptional"}:
+            complexity = (
+                "moderate" if old.get("unit_kind") == "verification" else "routine"
+            )
+        unit = {
+            key: json.loads(_canonical_json(value))
+            for key, value in old.items()
+            if key != "recommended_route"
+        }
+        unit["route_requirements"] = _route_requirements(complexity)
+        units.append(unit)
+    unit_by_id = {unit["task_id"]: unit for unit in units}
+    waves = [
+        [unit_by_id[str(item["task_id"])] for item in wave]
+        for wave in legacy_plan.get("waves", [])
+    ]
+    return {
+        **{
+            key: json.loads(_canonical_json(value))
+            for key, value in legacy_plan.items()
+            if key not in {"schema", "units", "waves", "registration_plan"}
+        },
+        "schema": "team-efficiency/decomposition-plan-v2",
+        "units": units,
+        "waves": waves,
+        "registration_plan": _registration_plan(
+            units,
+            waves,
+            strict_index=legacy_plan.get("source_kind") in _ATLAS_SOURCE_KINDS,
+        ),
+    }
+
+
 def _decompose_v1(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Compile manual boundaries or verified Code Atlas evidence into safe waves."""
 
@@ -4785,6 +5018,14 @@ def decompose(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """
 
     source = _mapping(manifest, "work-package manifest")
+    if source.get("schema") == _WORK_PACKAGE_V3_SCHEMA:
+        v3 = _validated_work_package_v3(source)
+        plan = _model_neutral_source_plan(_decompose_v1(v3["package"]), v3["package"])
+        return {
+            **plan,
+            "project_authority": v3["project_authority"],
+            "package_payload_hash": v3["package_payload_hash"],
+        }
     if source.get("schema") != _WORK_PACKAGE_V2_SCHEMA:
         return _decompose_v1(source)
     v2 = _validated_work_package_v2(source)
@@ -4806,6 +5047,13 @@ def _fast_lane_effort(value: object) -> str:
     effort = _text(value, "reasoning_effort", maximum=16)
     if effort not in FAST_LANE_REASONING_EFFORTS:
         raise ValueError("reasoning_effort is invalid")
+    return effort
+
+
+def _model_neutral_worker_effort(value: object) -> str:
+    effort = _text(value, "reasoning_effort", maximum=16)
+    if effort not in _MODEL_NEUTRAL_WORKER_EFFORTS:
+        raise ValueError("worker reasoning_effort is unavailable")
     return effort
 
 
@@ -6759,6 +7007,9 @@ def _fast_lane_source_with_remediation(
     source_plan: Mapping[str, Any], remediation: Mapping[str, Any]
 ) -> dict[str, Any]:
     unit = _fast_lane_remediation_unit(remediation)
+    if source_plan.get("schema") == "team-efficiency/decomposition-plan-v2":
+        unit = {key: value for key, value in unit.items() if key != "recommended_route"}
+        unit["route_requirements"] = _route_requirements("complex")
     return {
         **source_plan,
         "units": [*source_plan["units"], unit],
@@ -7503,6 +7754,32 @@ def _validated_fast_lane_scheduler_state(
     return normalized, remediation
 
 
+def _validated_route_intents(
+    value: object, *, task_ids: frozenset[str]
+) -> dict[tuple[str, str], dict[str, str]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("route_intents must be a list")
+    if len(value) > MAX_FAST_LANE_ROUTING_ENTRIES:
+        raise ValueError("route_intents exceeds its bound")
+    intents: dict[tuple[str, str], dict[str, str]] = {}
+    for index, raw in enumerate(value):
+        item = _mapping(raw, f"route_intents[{index}]")
+        _exact_keys(item, _ROUTE_INTENT_FIELDS, f"route_intents[{index}]")
+        task_id = _task_id(item["task_id"], f"route_intents[{index}].task_id")
+        role = _text(item["role"], f"route_intents[{index}].role", maximum=32)
+        if task_id not in task_ids or role not in _FAST_LANE_ROLES:
+            raise ValueError("route intent target is invalid")
+        model_id = _text(
+            item["model_id"], f"route_intents[{index}].model_id", maximum=128
+        )
+        effort = _model_neutral_worker_effort(item["reasoning_effort"])
+        key = (task_id, role)
+        if key in intents:
+            raise ValueError("route intent target is duplicated")
+        intents[key] = {"model_id": model_id, "reasoning_effort": effort}
+    return intents
+
+
 def _validated_fast_lane_request(
     request: Mapping[str, Any],
     *,
@@ -7516,12 +7793,36 @@ def _validated_fast_lane_request(
     """
 
     candidate = _mapping(request, "fast-lane request")
-    _exact_keys(candidate, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
-    if candidate["schema"] != "team-efficiency/fast-lane-request-v1":
+    request_schema = candidate.get("schema")
+    request_fields = (
+        _FAST_LANE_REQUEST_V2_FIELDS
+        if request_schema == _FAST_LANE_REQUEST_V2_SCHEMA
+        else _FAST_LANE_REQUEST_FIELDS
+    )
+    _exact_keys(candidate, request_fields, "fast-lane request")
+    if request_schema not in {
+        "team-efficiency/fast-lane-request-v1",
+        _FAST_LANE_REQUEST_V2_SCHEMA,
+    }:
         raise ValueError("fast-lane request schema is invalid")
     if len(_json_bytes(candidate)) > MAX_MANIFEST_INPUT_BYTES:
         raise ValueError("fast-lane request exceeds its byte budget")
+    request_hash = _sha256_json(candidate)
+    package = _mapping(candidate["work_package"], "fast-lane work package")
+    expected_package_schema = (
+        _WORK_PACKAGE_V3_SCHEMA
+        if request_schema == _FAST_LANE_REQUEST_V2_SCHEMA
+        else _WORK_PACKAGE_V2_SCHEMA
+    )
+    if package.get("schema") != expected_package_schema:
+        raise ValueError("fast-lane request/work-package versions are incompatible")
     source_plan = decompose(candidate["work_package"])
+    if request_schema == _FAST_LANE_REQUEST_V2_SCHEMA:
+        if source_plan.get("schema") != "team-efficiency/decomposition-plan-v2":
+            raise ValueError("fast-lane request v2 requires work-package v3")
+        route_intents_value = candidate["route_intents"]
+    else:
+        route_intents_value = ()
     source_plan_hash = _sha256_json(source_plan)
     target_gates = _validated_fast_lane_target_gates(
         candidate["target_gates"], source_plan
@@ -7534,6 +7835,14 @@ def _validated_fast_lane_request(
         integration_state=integration_state,
     )
     if remediation is not None and remediation.get("_automation_stopped"):
+        route_intents = (
+            _validated_route_intents(
+                route_intents_value,
+                task_ids=frozenset(_fast_lane_unit_index(source_plan)),
+            )
+            if request_schema == _FAST_LANE_REQUEST_V2_SCHEMA
+            else {}
+        )
         routing_context = _fast_lane_routing_context(
             host_routing_context,
             source_plan=source_plan,
@@ -7586,6 +7895,8 @@ def _validated_fast_lane_request(
             "scheduler_state": scheduler_state,
             "routing_context": routing_context,
             "automation_stopped": True,
+            "route_intents": route_intents,
+            "request_hash": request_hash,
         }
 
     effective_source_plan = source_plan
@@ -7601,6 +7912,14 @@ def _validated_fast_lane_request(
                 "gates": remediation["target_gates"],
             },
         ]
+    route_intents = (
+        _validated_route_intents(
+            route_intents_value,
+            task_ids=frozenset(_fast_lane_unit_index(effective_source_plan)),
+        )
+        if request_schema == _FAST_LANE_REQUEST_V2_SCHEMA
+        else {}
+    )
     routing_context = _fast_lane_routing_context(
         host_routing_context,
         source_plan=effective_source_plan,
@@ -7632,7 +7951,41 @@ def _validated_fast_lane_request(
         "scheduler_state": scheduler_state,
         "routing_context": routing_context,
         "automation_stopped": False,
+        "route_intents": route_intents,
+        "request_hash": request_hash,
     }
+
+
+def prepare_model_neutral_fast_lane_request(
+    request: Mapping[str, Any],
+    *,
+    route_intents: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create the default request-v2 envelope from an explicit legacy request."""
+
+    source = _mapping(request, "fast-lane request")
+    request_schema = source.get("schema")
+    if request_schema == "team-efficiency/fast-lane-request-v1":
+        _exact_keys(source, _FAST_LANE_REQUEST_FIELDS, "fast-lane request")
+        package = _mapping(source["work_package"], "fast-lane work package")
+        if package.get("schema") != _WORK_PACKAGE_V2_SCHEMA:
+            raise ValueError("model-neutral request requires work-package v2")
+        prepared = json.loads(_canonical_json(source))
+        prepared["schema"] = _FAST_LANE_REQUEST_V2_SCHEMA
+        prepared["work_package"]["schema"] = _WORK_PACKAGE_V3_SCHEMA
+        prepared["route_intents"] = (
+            []
+            if route_intents is None
+            else json.loads(_canonical_json(list(route_intents)))
+        )
+    elif request_schema == _FAST_LANE_REQUEST_V2_SCHEMA:
+        prepared = json.loads(_canonical_json(source))
+        if route_intents is not None:
+            prepared["route_intents"] = json.loads(_canonical_json(list(route_intents)))
+    else:
+        raise ValueError("model-neutral request source schema is invalid")
+    _validated_fast_lane_request(prepared)
+    return prepared
 
 
 def _fast_lane_phase(value: object) -> str:
@@ -9650,8 +10003,111 @@ def _validated_fast_lane_local_worktree(value: object, *, role: str) -> dict[str
     return dict(worktree)
 
 
+def _validated_route_requirements(value: object) -> dict[str, Any]:
+    requirement = _mapping(value, "route requirements")
+    _exact_keys(requirement, _ROUTE_REQUIREMENT_FIELDS, "route requirements")
+    if requirement["schema"] != "team-efficiency/model-route-requirements-v1":
+        raise ValueError("route requirements schema is invalid")
+    if requirement["complexity"] not in {
+        "routine",
+        "moderate",
+        "complex",
+        "exceptional",
+    }:
+        raise ValueError("route requirements complexity is invalid")
+    _normalised_list(
+        requirement["capability_tags"],
+        "route requirements.capability_tags",
+        _label,
+        maximum=8,
+        required=True,
+    )
+    if requirement["effort_preference"] not in {
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    }:
+        raise ValueError("route requirements effort preference is invalid")
+    if requirement["cost_preference"] not in {
+        "cost_efficient",
+        "balanced",
+        "capability_first",
+    }:
+        raise ValueError("route requirements cost preference is invalid")
+    if requirement["worker_ultra_forbidden"] is not True:
+        raise ValueError("route requirements must forbid worker ultra")
+    intent = _mapping(requirement["explicit_intent"], "explicit route intent")
+    if intent.get("state") == "unspecified":
+        _exact_keys(intent, frozenset({"state"}), "explicit route intent")
+    elif intent.get("state") == "required":
+        _exact_keys(
+            intent,
+            frozenset({"state", "model_id", "reasoning_effort"}),
+            "explicit route intent",
+        )
+        _text(intent["model_id"], "explicit route intent.model_id", maximum=128)
+        _model_neutral_worker_effort(intent["reasoning_effort"])
+    else:
+        raise ValueError("explicit route intent state is invalid")
+    supplied_hash = _hash(
+        requirement["requirement_hash"], "route requirements.requirement_hash"
+    )
+    normalized = {
+        key: item for key, item in requirement.items() if key != "requirement_hash"
+    }
+    if supplied_hash != _sha256_json(normalized):
+        raise ValueError("route requirements hash is invalid")
+    return dict(requirement)
+
+
+def _validated_model_selection(value: object) -> dict[str, Any]:
+    selection = _mapping(value, "model selection")
+    _exact_keys(selection, _MODEL_SELECTION_FIELDS, "model selection")
+    if dict(selection) != {
+        "schema": "team-efficiency/model-selection-v1",
+        "state": "unselected",
+        "owner": "coordinator",
+        "catalog_source": "codex_tool_metadata",
+        "availability_gate": "dispatch_tool",
+        "record_schema": "team-efficiency/model-selection-record-v1",
+    }:
+        raise ValueError("model selection is invalid")
+    return dict(selection)
+
+
 def _validated_fast_lane_local_assignment(value: object) -> dict[str, Any]:
     assignment = _mapping(value, "local planned assignment")
+    if assignment.get("schema") == "team-efficiency/local-writer-plan-v2":
+        _exact_keys(
+            assignment,
+            _LOCAL_PLAN_ASSIGNMENT_V2_FIELDS,
+            "local planned assignment",
+        )
+        role = _text(assignment["role"], "local planned assignment.role", maximum=32)
+        if role not in _FAST_LANE_ROLES:
+            raise ValueError("local planned assignment role is invalid")
+        if (
+            assignment["execution_state"] != "plan_only"
+            or assignment["dispatch_state"] != "not_dispatched"
+            or assignment["execution_authorized"] is not False
+            or assignment["lease_state"] != "unclaimed"
+        ):
+            raise ValueError("local planned assignment execution state is invalid")
+        _validated_fast_lane_local_worktree(assignment["worktree"], role=role)
+        _validated_fast_lane_local_index_evidence(assignment["index_evidence"])
+        _validated_route_requirements(assignment["route_requirements"])
+        _validated_model_selection(assignment["selection"])
+        supplied_id = _hash(
+            assignment["plan_item_id"], "local planned assignment.plan_item_id"
+        )
+        normalized = {
+            key: item for key, item in assignment.items() if key != "plan_item_id"
+        }
+        if supplied_id != _sha256_json(normalized):
+            raise ValueError("local planned assignment identity is invalid")
+        return dict(assignment)
     _exact_keys(
         assignment,
         _LOCAL_PLAN_ASSIGNMENT_FIELDS,
@@ -9682,8 +10138,110 @@ def _validated_fast_lane_local_assignment(value: object) -> dict[str, Any]:
     return dict(assignment)
 
 
+def _validated_model_selection_record(
+    value: object, *, assignment: Mapping[str, Any]
+) -> dict[str, Any]:
+    record = _mapping(value, "model selection record")
+    _exact_keys(record, _MODEL_SELECTION_RECORD_FIELDS, "model selection record")
+    if record["schema"] != "team-efficiency/model-selection-record-v1":
+        raise ValueError("model selection record schema is invalid")
+    planned = _validated_fast_lane_local_assignment(assignment)
+    if planned["schema"] != "team-efficiency/local-writer-plan-v2":
+        raise ValueError("model selection requires a model-neutral assignment")
+    plan_item_id = _hash(record["plan_item_id"], "model selection.plan_item_id")
+    requirement_hash = _hash(
+        record["requirement_hash"], "model selection.requirement_hash"
+    )
+    if (
+        plan_item_id != planned["plan_item_id"]
+        or requirement_hash != planned["route_requirements"]["requirement_hash"]
+    ):
+        raise ValueError("model selection record is not bound to its assignment")
+    model_id = _text(record["model_id"], "model selection.model_id", maximum=128)
+    reasoning_effort = _model_neutral_worker_effort(record["reasoning_effort"])
+    _text(record["selection_reason"], "model selection.selection_reason", maximum=512)
+    if (
+        record["availability_gate"] != "dispatch_tool"
+        or record["execution_state"] != "selection_only"
+        or record["dispatch_state"] != "not_dispatched"
+        or record["execution_authorized"] is not False
+    ):
+        raise ValueError("model selection record claims execution authority")
+    intent = _mapping(
+        planned["route_requirements"]["explicit_intent"], "explicit route intent"
+    )
+    if intent["state"] == "required" and (
+        model_id != intent["model_id"] or reasoning_effort != intent["reasoning_effort"]
+    ):
+        raise ValueError("explicit route intent cannot be replaced")
+    supplied_hash = _hash(
+        record["selection_record_hash"], "model selection.selection_record_hash"
+    )
+    normalized = {
+        key: item for key, item in record.items() if key != "selection_record_hash"
+    }
+    if supplied_hash != _sha256_json(normalized):
+        raise ValueError("model selection record hash is invalid")
+    return dict(record)
+
+
+def record_model_selection(
+    assignment: Mapping[str, Any],
+    *,
+    model_id: str,
+    reasoning_effort: str,
+    selection_reason: str,
+) -> dict[str, Any]:
+    """Bind a coordinator choice without claiming dispatch or availability."""
+
+    planned = _validated_fast_lane_local_assignment(assignment)
+    if planned["schema"] != "team-efficiency/local-writer-plan-v2":
+        raise ValueError("model selection requires a model-neutral assignment")
+    selected_model = _text(model_id, "model selection.model_id", maximum=128)
+    selected_effort = _model_neutral_worker_effort(reasoning_effort)
+    reason = _text(selection_reason, "model selection.selection_reason", maximum=512)
+    record: dict[str, Any] = {
+        "schema": "team-efficiency/model-selection-record-v1",
+        "plan_item_id": planned["plan_item_id"],
+        "requirement_hash": planned["route_requirements"]["requirement_hash"],
+        "model_id": selected_model,
+        "reasoning_effort": selected_effort,
+        "selection_reason": reason,
+        "availability_gate": "dispatch_tool",
+        "execution_state": "selection_only",
+        "dispatch_state": "not_dispatched",
+        "execution_authorized": False,
+    }
+    record["selection_record_hash"] = _sha256_json(record)
+    return _validated_model_selection_record(record, assignment=planned)
+
+
+def validate_model_selection_record(
+    record: Mapping[str, Any], *, assignment: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate the exact model choice against its model-neutral assignment."""
+
+    return _validated_model_selection_record(record, assignment=assignment)
+
+
 def _validated_fast_lane_local_policy(value: object) -> dict[str, Any]:
     policy = _mapping(value, "local plan workflow policy")
+    if policy.get("schema") == "team-efficiency/local-plan-consumer-policy-v2":
+        _exact_keys(policy, _LOCAL_PLAN_POLICY_V2_FIELDS, "local plan workflow policy")
+        if dict(policy) != {
+            "schema": "team-efficiency/local-plan-consumer-policy-v2",
+            "consumer": "main_coordinator",
+            "dispatch_tool": "collaboration.spawn_agent",
+            "explicit_route_required": True,
+            "lease_claim_required_before_execution": True,
+            "compiler_side_effects": False,
+            "selection_owner": "coordinator",
+            "catalog_source": "codex_tool_metadata",
+            "availability_gate": "dispatch_tool",
+            "selection_record": "team-efficiency/model-selection-record-v1",
+        }:
+            raise ValueError("local plan workflow policy is invalid")
+        return dict(policy)
     _exact_keys(policy, _LOCAL_PLAN_POLICY_FIELDS, "local plan workflow policy")
     if dict(policy) != {
         "schema": "team-efficiency/local-plan-consumer-policy-v1",
@@ -9699,8 +10257,17 @@ def _validated_fast_lane_local_policy(value: object) -> dict[str, Any]:
 
 def _validated_fast_lane_local_plan(value: object) -> dict[str, Any]:
     plan = _mapping(value, "fast-lane local plan")
-    _exact_keys(plan, _LOCAL_PLAN_V2_FIELDS, "fast-lane local plan")
-    if plan["schema"] != "team-efficiency/fast-lane-plan-v2":
+    plan_schema = plan.get("schema")
+    expected_fields = (
+        _LOCAL_PLAN_V3_FIELDS
+        if plan_schema == "team-efficiency/fast-lane-plan-v3"
+        else _LOCAL_PLAN_V2_FIELDS
+    )
+    _exact_keys(plan, expected_fields, "fast-lane local plan")
+    if plan_schema not in {
+        "team-efficiency/fast-lane-plan-v2",
+        "team-efficiency/fast-lane-plan-v3",
+    }:
         raise ValueError("fast-lane local plan schema is invalid")
     if (
         plan["plan_only"] is not True
@@ -9723,6 +10290,13 @@ def _validated_fast_lane_local_plan(value: object) -> dict[str, Any]:
         raise ValueError("fast-lane local plan assignments are invalid")
     for assignment_value in assignments:
         assignment = _validated_fast_lane_local_assignment(assignment_value)
+        expected_assignment_schema = (
+            "team-efficiency/local-writer-plan-v2"
+            if plan_schema == "team-efficiency/fast-lane-plan-v3"
+            else "team-efficiency/local-writer-plan-v1"
+        )
+        if assignment["schema"] != expected_assignment_schema:
+            raise ValueError("local planned assignment version is invalid")
         if assignment["index_evidence"] != index_evidence:
             raise ValueError("local planned assignment index evidence is not bound")
 
@@ -9810,6 +10384,41 @@ def _fast_lane_local_routing_context(
         "decisions": decisions,
         "reasons": reasons,
         "default_reason": "routing_context_missing",
+        "global_failure_reason": None,
+    }
+
+
+def _fast_lane_model_neutral_routing_context(
+    source_plan: Mapping[str, Any],
+    route_intents: Mapping[tuple[str, str], Mapping[str, str]],
+) -> dict[str, Any]:
+    """Return selectable requirements; catalog choice remains coordinator-owned."""
+
+    decisions: dict[tuple[str, str], dict[str, Any]] = {}
+    for task_id, unit in sorted(_fast_lane_unit_index(source_plan).items()):
+        base = _mapping(unit.get("route_requirements"), "source route requirements")
+        complexity = _text(
+            base.get("complexity"), "source route requirements.complexity", maximum=32
+        )
+        for role in sorted(_FAST_LANE_ROLES):
+            intent = route_intents.get((task_id, role))
+            decisions[(task_id, role)] = {
+                "route_requirements": _route_requirements(
+                    complexity, role=role, explicit_intent=intent
+                ),
+                "selection": {
+                    "schema": "team-efficiency/model-selection-v1",
+                    "state": "unselected",
+                    "owner": "coordinator",
+                    "catalog_source": "codex_tool_metadata",
+                    "availability_gate": "dispatch_tool",
+                    "record_schema": "team-efficiency/model-selection-record-v1",
+                },
+            }
+    return {
+        "decisions": decisions,
+        "reasons": {},
+        "default_reason": "coordinator_model_selection",
         "global_failure_reason": None,
     }
 
@@ -9985,6 +10594,30 @@ def _fast_lane_local_assignment_output(
     worktree = _fast_lane_public_value(worktree_value)
     if type(worktree) is not dict:
         raise ValueError("local planned worktree is invalid")
+    if "route_requirements" in assignment:
+        item_value = {
+            "schema": "team-efficiency/local-writer-plan-v2",
+            "slot_id": assignment["slot_id"],
+            "task_id": task_id,
+            "role": role,
+            "goal": unit["goal"],
+            "output_boundary": unit["output_boundary"],
+            "execution_state": "plan_only",
+            "dispatch_state": "not_dispatched",
+            "execution_authorized": False,
+            "lease_state": "unclaimed",
+            "worktree": worktree,
+            "route_requirements": dict(assignment["route_requirements"]),
+            "selection": dict(assignment["selection"]),
+            "depends_on": list(unit.get("depends_on", [])),
+            "required_evidence": list(unit.get("required_evidence", [])),
+            "index_evidence": dict(index_evidence),
+        }
+        item = _fast_lane_public_value(item_value)
+        if type(item) is not dict:
+            raise ValueError("local planned assignment is invalid")
+        item["plan_item_id"] = _sha256_json(item)
+        return _validated_fast_lane_local_assignment(item)
     item_value = {
         "schema": "team-efficiency/local-writer-plan-v1",
         "slot_id": assignment["slot_id"],
@@ -10021,13 +10654,21 @@ def _compile_fast_lane_local_plan(
     enable: bool,
     local_plan_material: Mapping[str, Any],
 ) -> dict[str, Any]:
+    model_neutral = request.get("schema") == _FAST_LANE_REQUEST_V2_SCHEMA
     activation = _fast_lane_activation(reasoning_effort, enable)
     validated = _validated_fast_lane_request(request)
+    routing_context = (
+        _fast_lane_model_neutral_routing_context(
+            validated["source_plan"], validated["route_intents"]
+        )
+        if model_neutral
+        else _fast_lane_local_routing_context(
+            validated["source_plan"], validated["source_plan_hash"]
+        )
+    )
     validated = {
         **validated,
-        "routing_context": _fast_lane_local_routing_context(
-            validated["source_plan"], validated["source_plan_hash"]
-        ),
+        "routing_context": routing_context,
     }
     if validated["scheduler_state"]["running_assignments"]:
         raise _FastLaneLocalPlanError("FASTLANE_RUNTIME_STATE_UNSUPPORTED")
@@ -10054,7 +10695,11 @@ def _compile_fast_lane_local_plan(
             "FAST_LANE_PLANNED" if planned_assignments else "NO_SAFE_LOCAL_PLAN"
         )
     result_value: dict[str, Any] = {
-        "schema": "team-efficiency/fast-lane-plan-v2",
+        "schema": (
+            "team-efficiency/fast-lane-plan-v3"
+            if model_neutral
+            else "team-efficiency/fast-lane-plan-v2"
+        ),
         "status": status,
         "decision_code": decision_code,
         "plan_only": True,
@@ -10067,15 +10712,32 @@ def _compile_fast_lane_local_plan(
         "assignments": planned_assignments,
         "idle_slots": list(idle_slots),
         "index_evidence": index_evidence,
-        "workflow_policy": {
-            "schema": "team-efficiency/local-plan-consumer-policy-v1",
-            "consumer": "main_coordinator",
-            "dispatch_tool": "collaboration.spawn_agent",
-            "explicit_route_required": True,
-            "lease_claim_required_before_execution": True,
-            "compiler_side_effects": False,
-        },
+        "workflow_policy": (
+            {
+                "schema": "team-efficiency/local-plan-consumer-policy-v2",
+                "consumer": "main_coordinator",
+                "dispatch_tool": "collaboration.spawn_agent",
+                "explicit_route_required": True,
+                "lease_claim_required_before_execution": True,
+                "compiler_side_effects": False,
+                "selection_owner": "coordinator",
+                "catalog_source": "codex_tool_metadata",
+                "availability_gate": "dispatch_tool",
+                "selection_record": "team-efficiency/model-selection-record-v1",
+            }
+            if model_neutral
+            else {
+                "schema": "team-efficiency/local-plan-consumer-policy-v1",
+                "consumer": "main_coordinator",
+                "dispatch_tool": "collaboration.spawn_agent",
+                "explicit_route_required": True,
+                "lease_claim_required_before_execution": True,
+                "compiler_side_effects": False,
+            }
+        ),
     }
+    if model_neutral:
+        result_value["request_hash"] = validated["request_hash"]
     result = _fast_lane_public_value(result_value)
     if type(result) is not dict:
         raise ValueError("fast-lane local plan is invalid")
