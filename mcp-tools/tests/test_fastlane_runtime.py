@@ -253,7 +253,7 @@ def test_work_methodology_is_not_a_discoverable_skill() -> None:
     assert (runtime / "scripts" / "team_efficiency.py").is_file()
 
 
-def test_fastlane_docs_describe_the_mcp_plan_v2_boundary() -> None:
+def test_fastlane_docs_describe_the_mcp_plan_v3_and_legacy_v2_boundaries() -> None:
     contract = (ROOT / "mcp-tools/devkit_fastlane/FASTLANE_CONTRACT.md").read_text(
         encoding="utf-8"
     )
@@ -263,8 +263,9 @@ def test_fastlane_docs_describe_the_mcp_plan_v2_boundary() -> None:
     ]
 
     for document in (contract, *readmes):
-        assert "team-efficiency/fast-lane-plan-v2" in document
+        assert "team-efficiency/fast-lane-plan-v3" in document
         assert "plan_only" in document
+    assert "team-efficiency/fast-lane-plan-v2" in contract
     assert "include_paths" in contract
     assert "INDEX_PARTIAL" in contract
     assert "local_plan_material" not in contract
@@ -303,6 +304,79 @@ def test_fastlane_tool_rejects_host_private_inputs() -> None:
         helper.tearDown()
     assert result["ok"] is False
     assert result["error"]["code"] == "FASTLANE_REQUEST_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("request_schema", "package_schema", "include_route_intents"),
+    [
+        (
+            "team-efficiency/fast-lane-request-v1",
+            "team-efficiency/work-package-v3",
+            False,
+        ),
+        (
+            "team-efficiency/fast-lane-request-v2",
+            "team-efficiency/work-package-v2",
+            True,
+        ),
+    ],
+)
+def test_fastlane_rejects_mixed_request_and_work_package_versions(
+    request_schema: str, package_schema: str, include_route_intents: bool
+) -> None:
+    helper, request, _ = _sample_request()
+    try:
+        request["schema"] = request_schema
+        request["work_package"]["schema"] = package_schema
+        if include_route_intents:
+            request["route_intents"] = []
+        result = server.fastlane_compile(
+            request=request, reasoning_effort="max", enable=True
+        )
+        with pytest.raises(ValueError, match="versions are incompatible"):
+            team_efficiency._validated_fast_lane_request(request)
+    finally:
+        helper.tearDown()
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PROJECT_BINDING_INVALID"
+
+
+def test_model_neutral_route_intent_can_target_appended_remediation(
+    monkeypatch,
+) -> None:
+    helper, request, _ = _sample_request()
+    try:
+        prepared = devkit_fastlane.prepare_model_neutral_fast_lane_request(request)
+        remediation = helper.fast_lane_remediation_request(team_efficiency, prepared)
+        prepared["remediation_request"] = remediation
+        prepared["route_intents"] = [
+            {
+                "task_id": remediation["task_id"],
+                "role": "execution",
+                "model_id": "gpt-99-future",
+                "reasoning_effort": "max",
+            }
+        ]
+        monkeypatch.setattr(
+            team_efficiency,
+            "_validated_fast_lane_contexts",
+            lambda *args, **kwargs: ([], []),
+        )
+        monkeypatch.setattr(
+            team_efficiency,
+            "_validated_fast_lane_scheduler_state",
+            lambda *args, **kwargs: ({}, remediation),
+        )
+        validated = team_efficiency._validated_fast_lane_request(prepared)
+    finally:
+        helper.tearDown()
+    assert remediation["task_id"] in {
+        item["task_id"] for item in validated["source_plan"]["units"]
+    }
+    assert validated["route_intents"][(remediation["task_id"], "execution")] == {
+        "model_id": "gpt-99-future",
+        "reasoning_effort": "max",
+    }
 
 
 def test_fastlane_tool_never_spawns_or_executes(monkeypatch) -> None:
@@ -487,6 +561,93 @@ def test_fastlane_tool_uses_persisted_runtime_registry_index_and_git_head(
     assert data["index_evidence"]["snapshot_id"] == snapshot_id
     assert data["index_evidence"]["include_paths_hash"].startswith("sha256:")
     assert all(item["execution_state"] == "plan_only" for item in data["assignments"])
+
+
+def test_model_neutral_plan_preserves_future_intent_and_legacy_source_hash(
+    monkeypatch,
+) -> None:
+    helper, _, _ = _sample_request()
+    legacy_hash = team_efficiency._sha256_json(
+        team_efficiency.decompose(helper.decomposition_manifest())
+    )
+    root = None
+    try:
+        root, request, snapshot_id = _install_persistent_local_plan_runtime(
+            monkeypatch, helper
+        )
+        prepared = devkit_fastlane.prepare_model_neutral_fast_lane_request(
+            request,
+            route_intents=[
+                {
+                    "task_id": "ATLAS-12B-A",
+                    "role": "execution",
+                    "model_id": "gpt-99-future",
+                    "reasoning_effort": "max",
+                }
+            ],
+        )
+        result = server.fastlane_compile(
+            request=prepared, reasoning_effort="max", enable=True
+        )
+    finally:
+        if root is not None:
+            root.shutdown()
+        helper.tearDown()
+
+    assert legacy_hash == (
+        "sha256:f736b99d55bc562252d1fd6a98fb0f2d12813b0b50ba518f88d4f12c298a7775"
+    )
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["schema"] == "team-efficiency/fast-lane-plan-v3"
+    assert data["status"] == "planned"
+    assert data["request_hash"] == team_efficiency._sha256_json(prepared)
+    assert data["index_evidence"]["snapshot_id"] == snapshot_id
+    assert all(
+        {"model", "reasoning_effort", "recommended_route"}.isdisjoint(assignment)
+        for assignment in data["assignments"]
+    )
+    assignment = next(
+        item for item in data["assignments"] if item["task_id"] == "ATLAS-12B-A"
+    )
+    assert assignment["selection"] == {
+        "schema": "team-efficiency/model-selection-v1",
+        "state": "unselected",
+        "owner": "coordinator",
+        "catalog_source": "codex_tool_metadata",
+        "availability_gate": "dispatch_tool",
+        "record_schema": "team-efficiency/model-selection-record-v1",
+    }
+    assert assignment["route_requirements"]["explicit_intent"] == {
+        "state": "required",
+        "model_id": "gpt-99-future",
+        "reasoning_effort": "max",
+    }
+    record = devkit_fastlane.record_model_selection(
+        assignment,
+        model_id="gpt-99-future",
+        reasoning_effort="max",
+        selection_reason="The current Codex tool metadata lists the requested route.",
+    )
+    assert record["execution_state"] == "selection_only"
+    assert record["dispatch_state"] == "not_dispatched"
+    assert record["execution_authorized"] is False
+    assert record["plan_item_id"] == assignment["plan_item_id"]
+    assert (
+        record["requirement_hash"]
+        == assignment["route_requirements"]["requirement_hash"]
+    )
+    assert (
+        devkit_fastlane.validate_model_selection_record(record, assignment=assignment)
+        == record
+    )
+    with pytest.raises(ValueError, match="explicit route intent cannot be replaced"):
+        devkit_fastlane.record_model_selection(
+            assignment,
+            model_id="gpt-5.6-sol",
+            reasoning_effort="max",
+            selection_reason="Attempted fallback must be rejected.",
+        )
 
 
 def test_fastlane_tool_rejects_stale_persisted_snapshot(monkeypatch) -> None:

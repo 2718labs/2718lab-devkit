@@ -1,24 +1,27 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — Codex + MCP v1.1.4
+# 2718lab DevKit — Codex + MCP v1.1.5
 
-[![version](https://img.shields.io/badge/version-v1.1.4-blue)](./.codex-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-v1.1.5-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
 runtime for bounded project indexing, Atlas evidence, Relay lifecycle
 coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
-of reference manuals. This repository carries the versioned v1.1.4 package.
+of reference manuals. This repository carries the versioned v1.1.5 package.
 The checked-in manifest and allowlist define the executable runtime surface;
 the manual map, install, build, and verification sections below describe the
 supported workflow.
 
 The public Python compiler and CLI retain the deliberately fail-closed
-`team-efficiency/fast-lane-plan-v1` preview. The MCP `fastlane_compile` tool
-instead resolves caller-supplied workspace/snapshot selectors through its local
-RuntimeRoot and returns a verified `team-efficiency/fast-lane-plan-v2` planning
-descriptor. That descriptor is `plan_only`: it never dispatches, claims a
-lease, creates a worktree, or authorizes execution.
+`team-efficiency/fast-lane-plan-v1` preview. For new work, prepare
+`fast-lane-request-v2` with `prepare_model_neutral_fast_lane_request`; MCP
+`fastlane_compile` then resolves the workspace/snapshot selectors through its
+local RuntimeRoot and returns a verified `team-efficiency/fast-lane-plan-v3`.
+Its assignments describe requirements and leave model selection to the
+coordinator using current Codex tool metadata. Every descriptor remains
+`plan_only`: it never dispatches, claims a lease, creates a worktree, or
+authorizes execution. Request-v1/plan-v2 stays available for exact legacy replay.
 
 The prior v1.1.3 storage-governance integration references compatible Host source only
 on Ayleovelle's user-fork
@@ -61,12 +64,14 @@ and continue to fail closed.
 - The optional Codex Skill bundle is part of DevKit's documentation surface. It
   provides short, module-specific manuals without becoming a second runtime or
   an executable prompt/agent surface.
-- Fast Lane is a pure planning compiler. The MCP tool can emit bounded
-  `team-efficiency/fast-lane-plan-v2` assignments only after its private
+- Fast Lane is a pure planning compiler. New model-neutral requests emit bounded
+  `team-efficiency/fast-lane-plan-v3` assignments only after its private
   RuntimeRoot verifies a registered `INDEX_READY` snapshot, Git HEAD, and full
-  write-scope coverage. Every result remains `plan_only`; no agent, Git command,
-  lease, or worktree action is executed. The public Python compiler/CLI remains
-  the authority-inert plan-v1 diagnostic surface.
+  write-scope coverage. Assignments contain no default model name; the
+  coordinator records an exact model/effort choice before the dispatch tool
+  validates availability. Every result remains `plan_only`; no agent, Git
+  command, lease, or worktree action is executed. The public Python compiler/CLI
+  remains the authority-inert plan-v1 diagnostic surface.
 
 ## Module overview
 
@@ -84,8 +89,9 @@ and continue to fail closed.
 ## Overall workflow
 
 The repository workflow defaults to Fast Lane. `workflow-design` prepares a
-bounded input. MCP `fastlane_compile` verifies the persisted local project
-snapshot and returns a plan-v2 descriptor; `team_efficiency.py` retains the
+bounded model-neutral request-v2 input. MCP `fastlane_compile` verifies the
+persisted local project snapshot and returns a plan-v3 descriptor;
+`team_efficiency.py` retains the
 blocked plan-v1 diagnostic path. Neither path starts agents or creates/executes
 cross-session worktrees. A coordinator must separately validate route
 availability, claim a lease, and dispatch any selected work.
@@ -98,7 +104,7 @@ flowchart TD
     end
     subgraph FAST["Fast Lane"]
         F["fast-lane request"] --> G["MCP fastlane_compile<br/>private RuntimeRoot verification"]
-        G --> X["plan-v2<br/>plan_only, not dispatched"]
+        G --> X["plan-v3 requirements<br/>unselected, plan_only"]
         F --> H["public Python / CLI"] --> I["plan-v1<br/>NO_SAFE_WORK"]
     end
     B -->|MCP tools| C
@@ -179,7 +185,7 @@ source of record remains `main` and immutable release tags.
 
 Maintainers build that snapshot with the dedicated marketplace allowlist:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.4.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.5.zip
 
 ## Install and run locally
 
@@ -226,7 +232,7 @@ handles or falls back to an unrelated local start.
 The allowlisted builder creates a deterministic ZIP outside the plugin source
 tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.4.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.5.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
@@ -337,18 +343,25 @@ cleanup target.
 The Fast Lane compiler is in
 mcp-tools/devkit_fastlane/scripts/fastlane_routing.py and
 mcp-tools/devkit_fastlane/scripts/team_efficiency.py. The MCP `fastlane_compile`
-entry returns `team-efficiency/fast-lane-plan-v2` only after a read-only
+entry returns `team-efficiency/fast-lane-plan-v3` for a model-neutral request
+only after a read-only
 RuntimeRoot unit of work resolves the registered workspace and snapshot. The
 snapshot must be current, `INDEX_READY`, bound to the repository Git HEAD, and
 its persisted `include_paths` must fully cover every writer `write_scope`.
 
 - `reasoning_effort` is required and accepts only `low`, `medium`, `high`,
   `xhigh`, or `max`; the MCP output never dispatches a worker.
-- `team-efficiency/fast-lane-plan-v2` fixes `plan_only=true`,
+- `team-efficiency/fast-lane-plan-v3` fixes `plan_only=true`,
   `dispatch_state="not_dispatched"`, and `execution_authorized=false`.
-  Assignments use `team-efficiency/local-writer-plan-v1`; path-free
+  Assignments use `team-efficiency/local-writer-plan-v2`, with bounded
+  `route_requirements` and coordinator-owned `selection.state="unselected"`;
+  path-free
   `index_evidence` includes snapshot/binding hashes, `include_paths_hash`, and
   the compiled `scope_hash`.
+- `record_model_selection` binds `plan_item_id`, `requirement_hash`, the exact
+  model ID and effort, and the coordinator's reason. It is a `selection_only`,
+  `not_dispatched` record; the dispatch tool remains the availability gate.
+  An explicit request intent cannot be replaced by a fallback model.
 - `INDEX_STALE` rejects filesystem or Git drift. `INDEX_PARTIAL` rejects either
   a partial snapshot or any snapshot whose include roots omit a writer scope.
 - Caller IDs are selectors, not authority material. The public MCP request and
@@ -395,7 +408,7 @@ freeze a transient regression count.
 
 ## Version
 
-This repository represents the versioned v1.1.4 package. Release notes are
+This repository represents the versioned v1.1.5 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
 artifact allowlist, and locked dependency set. A maintainer dispatches Release
 from current `main`; it validates all declared gates, creates the annotated tag,

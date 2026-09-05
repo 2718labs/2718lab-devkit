@@ -8,6 +8,34 @@ only after the CI and artifact checks pass.
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-09-05
+
+### Added
+
+- Added the model-neutral `fast-lane-request-v2` / `work-package-v3` /
+  `fast-lane-plan-v3` path. New assignments describe complexity, capability,
+  effort, and cost requirements while the coordinator chooses from the model
+  IDs and efforts exposed by the current Codex dispatch tool.
+- Added public request preparation plus model-selection record helpers. A
+  selection record binds the exact model ID, effort, reason,
+  `requirement_hash`, and `plan_item_id` without claiming dispatch or model
+  availability.
+
+### Fixed
+
+- Future bounded model IDs, including an explicitly requested `gpt-6-astra`,
+  no longer require a DevKit model-name whitelist. Explicit model/effort intent
+  is hash-bound and cannot be silently replaced by a fallback route.
+- Reject mixed request/work-package versions in both directions; request-v1 is
+  paired with work-package-v2 and request-v2 with work-package-v3.
+
+### Security
+
+- Model-neutral plans remain `plan_only`, `not_dispatched`, and unauthorized;
+  the actual dispatch tool is the only availability gate and worker `ultra`
+  remains forbidden. Legacy v3/v4/v5 routing policy assets and legacy
+  request-v1/plan-v2 replay behavior are unchanged.
+
 ## [1.1.4] - 2026-09-04
 
 ### Added
