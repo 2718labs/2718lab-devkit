@@ -6,6 +6,12 @@ The project follows Keep a Changelog conventions. A maintainer dispatches the
 repository release workflow from current `main`; it creates a new annotated tag
 only after the CI and artifact checks pass.
 
+## [1.2.1] — Closed legacy manifest validation
+
+- Reject missing or extra fields in the retained Codex plugin manifest, including unreviewed hooks, agents and skills surfaces.
+- Cover the source preflight, CLI rejection and both extracted artifacts with regression tests.
+- Preserve read-only diagnostics and all existing runtime/host authorization boundaries.
+
 ## [1.2.0] — Current Codex packaging and compatibility preflight
 
 - Add portable Agent Plugins 1.0 root manifests alongside the retained Codex compatibility package.

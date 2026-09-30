@@ -98,6 +98,9 @@ def inspect_package(root: Path) -> dict:
     def identity():
         portable, legacy = data["portable_manifest"], data["codex_manifest"]
         allowed = {"$schema", *IDENTITY, "extensions"}
+        legacy_allowed = {*IDENTITY, "mcpServers", "interface"}
+        if set(legacy) != legacy_allowed:
+            raise PackageError("legacy_manifest_fields_differ")
         if (
             set(portable) != allowed
             or portable["$schema"]
