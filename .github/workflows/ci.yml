@@ -196,7 +196,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --disable-pip-version-check pytest==9.1.1
-          python -m pytest -q mcp-tools/tests/test_primary_artifact.py
+          python -m pytest -q mcp-tools/tests/test_primary_artifact.py mcp-tools/tests/test_package_compatibility.py
 
       - name: Build deterministic artifact
         id: build

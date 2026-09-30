@@ -20,3 +20,11 @@ task, cache, project, or workflow state into another project.
 
 Skills are reference manuals, not executable tools. The MCP runtime and its
 contracts live under \`mcp-tools/\`; use the repository README for the full map.
+
+## Current host compatibility
+
+For package-format or post-upgrade diagnosis, use the repository's
+`docs/compatibility/codex-2026-09.md` and read-only
+`.codex-plugin/check_compatibility.py` on the actual extracted package.
+A package check does not establish host broker authority, model availability or
+successful dispatch. Use current tool metadata; retain legacy evidence unchanged.

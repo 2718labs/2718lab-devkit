@@ -6,6 +6,14 @@ The project follows Keep a Changelog conventions. A maintainer dispatches the
 repository release workflow from current `main`; it creates a new annotated tag
 only after the CI and artifact checks pass.
 
+## [1.2.0] — Current Codex packaging and compatibility preflight
+
+- Add portable Agent Plugins 1.0 root manifests alongside the retained Codex compatibility package.
+- Include both entry points and a read-only compatibility checker in deterministic lean and marketplace artifacts.
+- Detect metadata/version/launch/manual drift without probing credentials, changing host settings or authorizing dispatch.
+- Document current plugin discovery, file-backed image workflow boundaries and current-catalog model selection with primary sources.
+- Preserve the 17-tool MCP surface, model-neutral planning, legacy replay and private-host fail-closed gates.
+
 ## [Unreleased]
 
 ## [1.1.5] - 2026-09-05

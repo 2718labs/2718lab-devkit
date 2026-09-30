@@ -1,14 +1,14 @@
 [简体中文](README.zh-CN.md)
 
-# 2718lab DevKit — Codex + MCP v1.1.5
+# 2718lab DevKit — Codex + MCP v1.2.0
 
-[![version](https://img.shields.io/badge/version-v1.1.5-blue)](./.codex-plugin/plugin.json)
+[![version](https://img.shields.io/badge/version-v1.2.0-blue)](./.codex-plugin/plugin.json)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 2718lab DevKit is a Codex-first engineering toolkit: a local, stdio-only MCP
 runtime for bounded project indexing, Atlas evidence, Relay lifecycle
 coordination, and deterministic Fast Lane planning, plus a compact Skill bundle
-of reference manuals. This repository carries the versioned v1.1.5 package.
+of reference manuals. This repository carries the versioned v1.2.0 package.
 The checked-in manifest and allowlist define the executable runtime surface;
 the manual map, install, build, and verification sections below describe the
 supported workflow.
@@ -48,6 +48,18 @@ and continue to fail closed.
 > subject to actual host slots, host capability, and safety gates. Cross-scope
 > work requires a declared-child split that strictly reduces conflict, or is
 > UNSPLITTABLE.
+
+## What is new in 1.2.0
+
+Portable Agent Plugins entry points now accompany the retained Codex manifests.
+Run the read-only package preflight before installing an extracted artifact:
+
+    python .codex-plugin/check_compatibility.py --plugin-root <extracted-plugin>
+
+The JSON report checks package consistency, not host permissions or model
+availability. See [the September 2026 compatibility guide](docs/compatibility/codex-2026-09.md)
+for current plugin packaging, dynamic model selection and actual host boundaries.
+The 17-tool runtime and fail-closed execution contracts remain intact.
 
 ## What is shipped
 
@@ -185,7 +197,7 @@ source of record remains `main` and immutable release tags.
 
 Maintainers build that snapshot with the dedicated marketplace allowlist:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.1.5.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --allowlist .codex-plugin/marketplace-artifact-allowlist.json --output <artifact-output-dir>/2718lab-devkit-marketplace-v1.2.0.zip
 
 ## Install and run locally
 
@@ -232,7 +244,7 @@ handles or falls back to an unrelated local start.
 The allowlisted builder creates a deterministic ZIP outside the plugin source
 tree. Choose an output directory outside the source tree:
 
-    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.1.5.zip
+    python .codex-plugin/build_main_artifact.py --plugin-root . --output <artifact-output-dir>/2718lab-devkit-v1.2.0.zip
 
 The artifact contains the manifest, .mcp.json, LICENSE, the locked Python
 project, and the runtime files selected by
@@ -408,7 +420,7 @@ freeze a transient regression count.
 
 ## Version
 
-This repository represents the versioned v1.1.5 package. Release notes are
+This repository represents the versioned v1.2.0 package. Release notes are
 in [CHANGELOG.md](CHANGELOG.md); build and install from the checked-in manifest,
 artifact allowlist, and locked dependency set. A maintainer dispatches Release
 from current `main`; it validates all declared gates, creates the annotated tag,

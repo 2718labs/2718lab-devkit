@@ -1,0 +1,23 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "2718lab-devkit": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--locked",
+        "--no-dev",
+        "python",
+        "server.py"
+      ],
+      "cwd": "./mcp-tools",
+      "env": {
+        "CODEX_DEVKIT_DATA_ROOT": "${PLUGIN_DATA}/runtime",
+        "UV_PROJECT_ENVIRONMENT": "${PLUGIN_DATA}/python",
+        "UV_CACHE_DIR": "${PLUGIN_DATA}/uv-cache",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    }
+  }
+}

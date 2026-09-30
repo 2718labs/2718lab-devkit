@@ -12,6 +12,8 @@ import zipfile
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mcp import ClientSession, StdioServerParameters
@@ -68,9 +70,7 @@ def _build_and_extract_primary_artifact(tmp_path: Path) -> Path:
     assert (
         extracted_root / "mcp-tools" / "devkit_runtime" / "composition.py"
     ).is_file()
-    assert (
-        extracted_root / "mcp-tools" / "devkit_continuity" / "service.py"
-    ).is_file()
+    assert (extracted_root / "mcp-tools" / "devkit_continuity" / "service.py").is_file()
     return extracted_root
 
 
@@ -157,8 +157,10 @@ def test_stdio_initialize_lists_exact_tools_and_returns_a_v1_result(tmp_path) ->
     assert "ERROR" not in stderr_text
 
 
+@pytest.mark.parametrize("configuration_name", [".mcp.json", "mcp.json"])
 def test_extracted_primary_artifact_starts_without_source_checkout_dependency(
     tmp_path: Path,
+    configuration_name: str,
 ) -> None:
     task_root = Path(os.environ["CODEX_TASK_TEMP"]).resolve()
     assert tmp_path.resolve().is_relative_to(task_root)
@@ -166,7 +168,10 @@ def test_extracted_primary_artifact_starts_without_source_checkout_dependency(
     artifact_mcp_root = extracted_root / "mcp-tools"
     scratch = tmp_path / "artifact-scratch"
     scratch.mkdir()
-    data_root = tmp_path / "artifact-data"
+    plugin_data = tmp_path / "artifact-data"
+    data_root = (
+        plugin_data / "runtime" if configuration_name == "mcp.json" else plugin_data
+    )
     config = RuntimeConfig.load(
         environ={"PLUGIN_DATA": str(data_root), "CODEX_TASK_TEMP": str(scratch)}
     )
@@ -203,8 +208,16 @@ def test_extracted_primary_artifact_starts_without_source_checkout_dependency(
         }
     )
     assert str(ROOT) not in child_environment["PYTHONPATH"]
-    configuration = json.loads((extracted_root / ".mcp.json").read_text("utf-8"))
+    configuration = json.loads((extracted_root / configuration_name).read_text("utf-8"))
     server_configuration = configuration["mcpServers"]["2718lab-devkit"]
+    child_environment["PLUGIN_ROOT"] = str(extracted_root)
+    child_environment["PLUGIN_DATA"] = str(plugin_data)
+    plugin_data.mkdir(parents=True, exist_ok=True)
+    for key, value in server_configuration.get("env", {}).items():
+        child_environment[key] = value.replace(
+            "${PLUGIN_ROOT}", str(extracted_root)
+        ).replace("${PLUGIN_DATA}", str(plugin_data))
+    expected_environment = Path(child_environment["UV_PROJECT_ENVIRONMENT"])
     parameters = StdioServerParameters(
         command=server_configuration["command"],
         args=server_configuration["args"],
@@ -258,7 +271,9 @@ def test_extracted_primary_artifact_starts_without_source_checkout_dependency(
     relay_after = hashlib.sha256(relay_database.read_bytes()).hexdigest()
 
     assert initialized.serverInfo.name == "2718lab-devkit"
-    assert (artifact_mcp_root / ".venv").is_dir()
+    assert expected_environment.is_dir()
+    if configuration_name == "mcp.json":
+        assert not (artifact_mcp_root / ".venv").exists()
     assert {tool.name for tool in listed.tools} == EXPECTED_TOOL_NAMES
     assert prompts.prompts == []
     assert resources.resources == []
