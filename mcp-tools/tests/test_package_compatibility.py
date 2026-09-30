@@ -175,3 +175,74 @@ def test_extracted_artifact_passes_self_contained_check(tmp_path, allowlist):
     )
     assert report.returncode == 0, report.stdout + report.stderr
     assert json.loads(report.stdout)["execution_authorized"] is False
+
+    # The shipped checker, not merely the source import, rejects a changed
+    # legacy runtime surface in each independently extracted artifact.
+    legacy_path = extracted / ".codex-plugin/plugin.json"
+    legacy = json.loads(legacy_path.read_text())
+    legacy["hooks"] = "./unreviewed-hooks.json"
+    legacy_path.write_text(json.dumps(legacy))
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(extracted / ".codex-plugin/check_compatibility.py"),
+            "--plugin-root",
+            str(extracted),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode == 1
+    rejected_report = json.loads(rejected.stdout)
+    assert rejected_report["ok"] is False
+    assert rejected_report["execution_authorized"] is False
+    assert any(
+        row.get("reason") == "legacy_manifest_fields_differ"
+        for row in rejected_report["checks"]
+    )
+
+
+@pytest.mark.parametrize(
+    "field", ["hooks", "agents", "skills", "commands", "unknown_metadata"]
+)
+def test_legacy_manifest_extra_fields_fail_closed(package, field):
+    manifest = package / ".codex-plugin/plugin.json"
+    value = json.loads(manifest.read_text())
+    value[field] = "./unreviewed-entry"
+    manifest.write_text(json.dumps(value))
+    report = CHECK.inspect_package(package)
+    assert report["ok"] is False
+    assert report["execution_authorized"] is False
+    check = next(
+        row for row in report["checks"] if row["check"] == "identity_and_overlay"
+    )
+    assert check["reason"] == "legacy_manifest_fields_differ"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".codex-plugin/check_compatibility.py"),
+            "--plugin-root",
+            str(package),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["ok"] is False
+    assert not (package / "unreviewed-entry").exists()
+
+
+@pytest.mark.parametrize("field", ["interface", "mcpServers", "license"])
+def test_legacy_manifest_missing_fields_fail_closed(package, field):
+    manifest = package / ".codex-plugin/plugin.json"
+    value = json.loads(manifest.read_text())
+    del value[field]
+    manifest.write_text(json.dumps(value))
+    report = CHECK.inspect_package(package)
+    assert report["ok"] is False
+    assert (
+        next(row for row in report["checks"] if row["check"] == "identity_and_overlay")[
+            "reason"
+        ]
+        == "legacy_manifest_fields_differ"
+    )

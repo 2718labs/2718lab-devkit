@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "2718lab-devkit",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Local MCP server for developer workflow coordination, indexing, and evidence handling.",
   "author": {
     "name": "2718lab",
